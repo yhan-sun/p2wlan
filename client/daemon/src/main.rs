@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --netmask 255.255.255.0 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
 //!
 //! # Query local runtime status
 //! p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status
@@ -182,6 +182,9 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
     if let Some(address) = arg_value(args, "--address") {
         config.network.virtual_ip = address.to_string();
     }
+    if let Some(netmask) = arg_value(args, "--netmask") {
+        config.network.netmask = netmask.to_string();
+    }
     if let Some(mtu) = arg_value(args, "--mtu").and_then(|s| s.parse::<u32>().ok()) {
         config.network.mtu = mtu;
     }
@@ -251,5 +254,24 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
     }
     if let Some(name) = arg_value(args, "--device-name") {
         config.node.device_name = name.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netmask_argument_overrides_generated_config() {
+        let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        let args = vec![
+            "p2pnet-daemon".to_string(),
+            "--netmask".to_string(),
+            "255.255.255.255".to_string(),
+        ];
+
+        apply_arg_overrides(&mut config, &args);
+
+        assert_eq!(config.network.netmask, "255.255.255.255");
     }
 }
