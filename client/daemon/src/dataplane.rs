@@ -1,0 +1,198 @@
+//! Data plane packet pump.
+//!
+//! This module is the seam between the virtual interface and the peer routing
+//! table. It reads raw IP packets from TUN, resolves the destination virtual IP
+//! to a peer, and emits outbound peer packets. The outbound side is intentionally
+//! a channel today; the next layer can consume it with WireGuard + UDP/relay
+//! transport without changing TUN packet handling.
+
+use std::sync::Arc;
+
+use p2pnet_tun::{IpPacket, VirtualInterface};
+use tokio::sync::mpsc;
+use tracing::{debug, trace, warn};
+
+use crate::error::{DaemonError, Result};
+use crate::peer::PeerManager;
+
+/// A raw IP packet routed to a specific virtual-network peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundPacket {
+    /// Destination peer node ID.
+    pub peer_id: String,
+    /// Destination virtual IP.
+    pub dst_ip: String,
+    /// Raw IP packet bytes read from TUN.
+    pub packet: Vec<u8>,
+}
+
+/// Reads packets from a virtual interface and routes them by destination IP.
+pub struct DataPlane<T> {
+    tun: T,
+    peers: Arc<PeerManager>,
+    outbound_tx: mpsc::Sender<OutboundPacket>,
+}
+
+impl<T> DataPlane<T>
+where
+    T: VirtualInterface + Send + 'static,
+{
+    /// Create a data plane and a receiver for routed outbound packets.
+    pub fn new(tun: T, peers: Arc<PeerManager>) -> (Self, mpsc::Receiver<OutboundPacket>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
+        (
+            Self {
+                tun,
+                peers,
+                outbound_tx,
+            },
+            outbound_rx,
+        )
+    }
+
+    /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
+    pub async fn run(&mut self) -> Result<()> {
+        let mut buf = vec![0u8; 65_535];
+
+        loop {
+            let n = self
+                .tun
+                .read(&mut buf)
+                .await
+                .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
+
+            if n == 0 {
+                continue;
+            }
+
+            let packet = &buf[..n];
+            let parsed = match IpPacket::new(packet) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!("Dropping invalid IP packet from TUN: {err}");
+                    continue;
+                }
+            };
+
+            let dst_ip = parsed.dst_addr_string();
+            let total_len = parsed.total_len().min(n);
+            let protocol = parsed.protocol();
+
+            let Some(peer_id) = self.peers.resolve_virtual_ip(&dst_ip).await else {
+                trace!("Dropping packet for unknown virtual IP {dst_ip} ({protocol})");
+                continue;
+            };
+
+            let routed = OutboundPacket {
+                peer_id: peer_id.clone(),
+                dst_ip: dst_ip.clone(),
+                packet: packet[..total_len].to_vec(),
+            };
+
+            self.outbound_tx
+                .send(routed)
+                .await
+                .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))?;
+            self.peers.record_sent(&peer_id, total_len as u64).await;
+
+            debug!("Routed {total_len} byte {protocol} packet to {peer_id} ({dst_ip})");
+        }
+    }
+}
+
+/// Drain and log routed packets until a real WireGuard/UDP transport is attached.
+pub async fn log_outbound_packets(mut outbound_rx: mpsc::Receiver<OutboundPacket>) {
+    while let Some(packet) = outbound_rx.recv().await {
+        debug!(
+            "Outbound packet ready for peer {} (dst={}, {} bytes)",
+            packet.peer_id,
+            packet.dst_ip,
+            packet.packet.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use p2pnet_tun::{Ipv4Packet, MockTunDevice};
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::control::PeerInfo;
+
+    fn peer(node_id: &str, virtual_ip: &str) -> PeerInfo {
+        PeerInfo {
+            node_id: node_id.to_string(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: String::new(),
+            virtual_ip: virtual_ip.to_string(),
+            online: true,
+            last_seen: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_tun_packet_to_peer_by_virtual_ip() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (mut dataplane, mut outbound_rx) = DataPlane::new(tun, peers.clone());
+        let task = tokio::spawn(async move { dataplane.run().await });
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        ctrl.inject(packet.clone()).await.unwrap();
+
+        let routed = timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(routed.peer_id, "peer-b");
+        assert_eq!(routed.dst_ip, "10.20.0.2");
+        assert_eq!(routed.packet, packet);
+
+        let conn = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(conn.bytes_sent, routed.packet.len() as u64);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn drops_packet_for_unknown_virtual_ip() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (mut dataplane, mut outbound_rx) = DataPlane::new(tun, peers);
+        let task = tokio::spawn(async move { dataplane.run().await });
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 99),
+            0x1234,
+            1,
+            b"ping",
+        );
+        ctrl.inject(packet).await.unwrap();
+
+        let no_packet = timeout(Duration::from_millis(200), outbound_rx.recv()).await;
+        assert!(no_packet.is_err());
+
+        task.abort();
+    }
+}
