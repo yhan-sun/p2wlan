@@ -46,6 +46,7 @@ fi
     --network default \
     --token "$TOKEN" \
     --device-name node-a \
+    --udp-bind 127.0.0.1:0 \
     --heartbeat-interval 5
 ) >"$TMP_DIR/node-a.log" 2>&1 &
 NODE_A_PID=$!
@@ -63,6 +64,7 @@ done
     --network default \
     --token "$TOKEN" \
     --device-name node-b \
+    --udp-bind 127.0.0.1:0 \
     --heartbeat-interval 5
 ) >"$TMP_DIR/node-b.log" 2>&1 &
 NODE_B_PID=$!
@@ -71,14 +73,18 @@ for _ in {1..80}; do
   if grep -q 'Peer joined: node-' "$TMP_DIR/node-a.log" 2>/dev/null && \
      grep -q 'Peer joined: node-' "$TMP_DIR/node-b.log" 2>/dev/null && \
      grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-a.log" 2>/dev/null && \
-     grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-b.log" 2>/dev/null; then
-    echo "[smoke] PASS: both daemons registered, discovered peers, and installed WireGuard sessions"
+     grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-b.log" 2>/dev/null && \
+     grep -Eq 'Prepared [1-9][0-9]* UDP candidate endpoints' "$TMP_DIR/node-a.log" 2>/dev/null && \
+     grep -Eq 'Prepared [1-9][0-9]* UDP candidate endpoints' "$TMP_DIR/node-b.log" 2>/dev/null && \
+     grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-a.log" 2>/dev/null && \
+     grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-b.log" 2>/dev/null; then
+    echo "[smoke] PASS: both daemons registered, discovered peers, installed WireGuard sessions, and probed UDP candidates"
     exit 0
   fi
   sleep 0.5
 done
 
-echo "[smoke] FAIL: peer discovery or WireGuard handshake did not complete" >&2
+echo "[smoke] FAIL: peer discovery, WireGuard handshake, candidate gathering, or UDP probing did not complete" >&2
 echo "--- server.log ---" >&2
 tail -80 "$TMP_DIR/server.log" >&2 || true
 echo "--- node-a.log ---" >&2

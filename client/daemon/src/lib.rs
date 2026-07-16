@@ -59,7 +59,7 @@ use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
-use dataplane::DataPlane;
+use dataplane::{DataPlane, InboundPacket};
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
@@ -133,117 +133,130 @@ impl Daemon {
         );
         info!("Control server: {}", self.config.control.server_url);
 
-        if let Some(tun) = self.init_tun()? {
+        let tun = self.init_tun()?;
+        let Some(encrypted_rx) = self.encrypted_rx.take() else {
+            return Err(DaemonError::Network(
+                "encrypted packet receiver already attached".to_string(),
+            ));
+        };
+        let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
+            DaemonError::Config(format!(
+                "invalid network.udp_bind '{}': {e}",
+                self.config.network.udp_bind
+            ))
+        })?;
+        let udp_advertise = self.config.network.udp_advertise.clone();
+        let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
+        let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
+        let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
+
+        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(1024);
+        if let Some(tun) = tun {
             let peers = self.peers.clone();
-            let control = self.control.clone();
             let transport = self.transport.clone();
-            let local_candidates = self.local_candidates.clone();
-            let udp_transport = self.udp_transport.clone();
-            let Some(encrypted_rx) = self.encrypted_rx.take() else {
-                return Err(DaemonError::Network(
-                    "encrypted packet receiver already attached".to_string(),
-                ));
-            };
-            let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
-                DaemonError::Config(format!(
-                    "invalid network.udp_bind '{}': {e}",
-                    self.config.network.udp_bind
-                ))
-            })?;
-            let udp_advertise = self.config.network.udp_advertise.clone();
-            let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
-            let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
-            let keepalive_interval =
-                Duration::from_secs(self.config.network.keepalive_interval_secs);
+            let (mut dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
+
+            let outbound_transport = transport.clone();
             tokio::spawn(async move {
-                let (mut dataplane, outbound_rx, inbound_tx) =
-                    DataPlane::new_bidirectional(tun, peers.clone());
-                let outbound_transport = transport.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = outbound_transport.run_outbound(outbound_rx).await {
-                        warn!("WireGuard transport stopped: {err}");
-                    }
-                });
-                match UdpTransport::bind(udp_bind, peers).await {
-                    Ok(udp) => {
-                        *udp_transport.write().await = Some(udp.clone());
-                        if !keepalive_interval.is_zero() {
-                            tokio::spawn(udp.clone().run_keepalives(keepalive_interval));
-                        }
-
-                        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(1024);
-                        let inbound_transport = transport.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = inbound_transport
-                                .run_inbound(udp_inbound_rx, inbound_tx)
-                                .await
-                            {
-                                warn!("WireGuard inbound transport stopped: {err}");
-                            }
-                        });
-
-                        let mut candidate_endpoints =
-                            match udp.gather_candidates(stun_servers, stun_timeout).await {
-                                Ok(candidates) => candidates,
-                                Err(err) => {
-                                    warn!("Failed to gather UDP candidates: {err}");
-                                    Vec::new()
-                                }
-                            };
-
-                        match udp.local_addr() {
-                            Ok(addr) => {
-                                if let Some(endpoint) =
-                                    advertised_udp_endpoint(addr, udp_advertise.as_deref())
-                                {
-                                    if !candidate_endpoints.contains(&endpoint) {
-                                        candidate_endpoints.insert(0, endpoint.clone());
-                                    }
-                                    info!(
-                                        "UDP transport listening on {addr}; advertising {endpoint}"
-                                    );
-                                    if let Err(err) =
-                                        control.update_endpoint(&endpoint, "unknown").await
-                                    {
-                                        warn!("Failed to queue UDP endpoint update: {err}");
-                                    }
-                                } else {
-                                    warn!(
-                                        "UDP transport listening on {addr}; endpoint not advertised because bind address is unspecified. Set --udp-advertise to publish a reachable endpoint."
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                warn!("UDP transport bound but local addr unavailable: {err}")
-                            }
-                        }
-
-                        info!(
-                            "Prepared {} UDP candidate endpoints for signaling",
-                            candidate_endpoints.len()
-                        );
-                        *local_candidates.write().await = candidate_endpoints;
-
-                        tokio::spawn(udp.clone().run_outbound(encrypted_rx));
-                        tokio::spawn(async move {
-                            if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
-                                warn!("UDP inbound transport stopped: {err}");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        warn!(
-                            "UDP transport unavailable ({err}); encrypted packets will be logged only"
-                        );
-                        tokio::spawn(log_encrypted_packets(encrypted_rx));
-                    }
+                if let Err(err) = outbound_transport.run_outbound(outbound_rx).await {
+                    warn!("WireGuard transport stopped: {err}");
                 }
+            });
 
+            let inbound_transport = transport.clone();
+            tokio::spawn(async move {
+                if let Err(err) = inbound_transport
+                    .run_inbound(udp_inbound_rx, inbound_tx)
+                    .await
+                {
+                    warn!("WireGuard inbound transport stopped: {err}");
+                }
+            });
+
+            tokio::spawn(async move {
                 if let Err(err) = dataplane.run().await {
                     warn!("Data plane stopped: {err}");
                 }
             });
+        } else {
+            let (inbound_tx, inbound_rx) = mpsc::channel(1024);
+            let inbound_transport = self.transport.clone();
+            tokio::spawn(async move {
+                if let Err(err) = inbound_transport
+                    .run_inbound(udp_inbound_rx, inbound_tx)
+                    .await
+                {
+                    warn!("WireGuard inbound transport stopped: {err}");
+                }
+            });
+            tokio::spawn(log_inbound_packets_without_tun(inbound_rx));
         }
+
+        let peers = self.peers.clone();
+        let control = self.control.clone();
+        let local_candidates = self.local_candidates.clone();
+        let udp_transport = self.udp_transport.clone();
+        tokio::spawn(async move {
+            match UdpTransport::bind(udp_bind, peers).await {
+                Ok(udp) => {
+                    *udp_transport.write().await = Some(udp.clone());
+                    if !keepalive_interval.is_zero() {
+                        tokio::spawn(udp.clone().run_keepalives(keepalive_interval));
+                    }
+
+                    let mut candidate_endpoints =
+                        match udp.gather_candidates(stun_servers, stun_timeout).await {
+                            Ok(candidates) => candidates,
+                            Err(err) => {
+                                warn!("Failed to gather UDP candidates: {err}");
+                                Vec::new()
+                            }
+                        };
+
+                    match udp.local_addr() {
+                        Ok(addr) => {
+                            if let Some(endpoint) =
+                                advertised_udp_endpoint(addr, udp_advertise.as_deref())
+                            {
+                                if !candidate_endpoints.contains(&endpoint) {
+                                    candidate_endpoints.insert(0, endpoint.clone());
+                                }
+                                info!("UDP transport listening on {addr}; advertising {endpoint}");
+                                if let Err(err) =
+                                    control.update_endpoint(&endpoint, "unknown").await
+                                {
+                                    warn!("Failed to queue UDP endpoint update: {err}");
+                                }
+                            } else {
+                                warn!(
+                                    "UDP transport listening on {addr}; endpoint not advertised because bind address is unspecified. Set --udp-advertise to publish a reachable endpoint."
+                                );
+                            }
+                        }
+                        Err(err) => warn!("UDP transport bound but local addr unavailable: {err}"),
+                    }
+
+                    info!(
+                        "Prepared {} UDP candidate endpoints for signaling",
+                        candidate_endpoints.len()
+                    );
+                    *local_candidates.write().await = candidate_endpoints;
+
+                    tokio::spawn(udp.clone().run_outbound(encrypted_rx));
+                    tokio::spawn(async move {
+                        if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
+                            warn!("UDP inbound transport stopped: {err}");
+                        }
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        "UDP transport unavailable ({err}); encrypted packets will be logged only"
+                    );
+                    tokio::spawn(log_encrypted_packets(encrypted_rx));
+                }
+            }
+        });
 
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
@@ -471,7 +484,7 @@ impl Daemon {
                 .punch_candidates(&peer_id, candidates, probe_interval, attempts)
                 .await
             {
-                Ok(sent) => debug!("Sent {sent} UDP punch probes to peer {peer_id}"),
+                Ok(sent) => info!("Sent {sent} UDP punch probes to peer {peer_id}"),
                 Err(err) => warn!("Failed to punch peer {peer_id}: {err}"),
             }
         });
@@ -591,6 +604,16 @@ fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> 
     }
 
     Some(local_addr.to_string())
+}
+
+async fn log_inbound_packets_without_tun(mut inbound_rx: mpsc::Receiver<InboundPacket>) {
+    while let Some(packet) = inbound_rx.recv().await {
+        debug!(
+            "Dropping {} decrypted inbound bytes from peer {} because TUN is disabled",
+            packet.packet.len(),
+            packet.peer_id
+        );
+    }
 }
 
 fn decode_x25519_key(hex_value: &str, label: &str) -> Result<[u8; 32]> {

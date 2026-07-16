@@ -43,6 +43,7 @@ pnpm install
 pnpm run build
 
 # Control-plane smoke test: starts server + two daemon instances without TUN/root
+# and verifies registration, WireGuard sessions, UDP candidates, and punch probes
 ./scripts/control-smoke.sh
 ```
 
