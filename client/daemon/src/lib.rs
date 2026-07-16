@@ -48,9 +48,11 @@ pub use error::{DaemonError, Result};
 // Daemon
 // ============================================================
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use p2pnet_crypto::NodeIdentity;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -59,9 +61,12 @@ use control::{ControlClient, ControlEvent};
 use dataplane::DataPlane;
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
-use peer::PeerManager;
+use p2pnet_wireguard::{
+    HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
+};
+use peer::{ConnectionState, PeerManager};
 use port_mapping::PortMappingManager;
-use transport::{log_encrypted_packets, WireGuardTransport};
+use transport::{log_encrypted_packets, EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
 
 /// The main daemon orchestrator.
@@ -76,6 +81,12 @@ pub struct Daemon {
     control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlEvent>,
     /// Peer connection manager.
     peers: Arc<PeerManager>,
+    /// Shared WireGuard transport session adapter.
+    transport: WireGuardTransport,
+    /// Encrypted outbound packets emitted by the WireGuard adapter.
+    encrypted_rx: Option<mpsc::Receiver<EncryptedPeerPacket>>,
+    /// In-flight initiator handshakes keyed by responder node ID.
+    pending_handshakes: HashMap<String, HandshakeInitiator>,
     /// Port mapping manager.
     port_mappings: Arc<PortMappingManager>,
     /// DNS resolver.
@@ -88,6 +99,7 @@ impl Daemon {
     /// Create a new daemon from config.
     pub fn new(config: Config) -> Self {
         let (control, control_rx) = ControlClient::new(&config);
+        let (transport, encrypted_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
 
         Self {
@@ -95,6 +107,9 @@ impl Daemon {
             control,
             control_rx,
             peers: Arc::new(PeerManager::new(config.clone())),
+            transport,
+            encrypted_rx: Some(encrypted_rx),
+            pending_handshakes: HashMap::new(),
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -114,6 +129,12 @@ impl Daemon {
         if let Some(tun) = self.init_tun()? {
             let peers = self.peers.clone();
             let control = self.control.clone();
+            let transport = self.transport.clone();
+            let Some(encrypted_rx) = self.encrypted_rx.take() else {
+                return Err(DaemonError::Network(
+                    "encrypted packet receiver already attached".to_string(),
+                ));
+            };
             let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
                 DaemonError::Config(format!(
                     "invalid network.udp_bind '{}': {e}",
@@ -124,7 +145,6 @@ impl Daemon {
             tokio::spawn(async move {
                 let (mut dataplane, outbound_rx, inbound_tx) =
                     DataPlane::new_bidirectional(tun, peers.clone());
-                let (transport, encrypted_rx) = WireGuardTransport::new();
                 let outbound_transport = transport.clone();
                 tokio::spawn(async move {
                     if let Err(err) = outbound_transport.run_outbound(outbound_rx).await {
@@ -207,6 +227,13 @@ impl Daemon {
                     );
                     self.peers.add_peer(&peer_info).await;
 
+                    if let Err(err) = self.maybe_initiate_handshake(&peer_info).await {
+                        warn!(
+                            "Failed to initiate WireGuard handshake with {}: {err}",
+                            peer_info.node_id
+                        );
+                    }
+
                     // Register DNS entry
                     if self.dns.is_enabled() {
                         self.dns
@@ -227,7 +254,7 @@ impl Daemon {
                 ControlEvent::PeerOffer {
                     from_node_id,
                     candidates,
-                    handshake_init: _,
+                    handshake_init,
                 } => {
                     info!(
                         "Received peer offer from {} ({} candidates)",
@@ -235,17 +262,20 @@ impl Daemon {
                         candidates.len()
                     );
                     self.peers.add_candidates(&from_node_id, &candidates).await;
-                    // In a full implementation, we would:
-                    // 1. Gather our own ICE candidates
-                    // 2. Attempt UDP hole punching
-                    // 3. Send a PeerAnswer back
-                    // 4. Fall back to relay if hole punching fails
+                    if !handshake_init.is_empty() {
+                        if let Err(err) = self
+                            .handle_peer_offer(&from_node_id, &candidates, &handshake_init)
+                            .await
+                        {
+                            warn!("Failed to handle peer offer from {from_node_id}: {err}");
+                        }
+                    }
                 }
 
                 ControlEvent::PeerAnswer {
                     from_node_id,
                     candidates,
-                    handshake_response: _,
+                    handshake_response,
                 } => {
                     info!(
                         "Received peer answer from {} ({} candidates)",
@@ -253,6 +283,14 @@ impl Daemon {
                         candidates.len()
                     );
                     self.peers.add_candidates(&from_node_id, &candidates).await;
+                    if !handshake_response.is_empty() {
+                        if let Err(err) = self
+                            .handle_peer_answer(&from_node_id, &handshake_response)
+                            .await
+                        {
+                            warn!("Failed to handle peer answer from {from_node_id}: {err}");
+                        }
+                    }
                 }
 
                 ControlEvent::PeerRejected {
@@ -315,6 +353,112 @@ impl Daemon {
         Ok(Some(tun))
     }
 
+    async fn maybe_initiate_handshake(&mut self, peer_info: &control::PeerInfo) -> Result<()> {
+        if self.transport.has_session(&peer_info.node_id).await
+            || self.pending_handshakes.contains_key(&peer_info.node_id)
+        {
+            return Ok(());
+        }
+
+        if self.config.node.public_key >= peer_info.public_key {
+            return Ok(());
+        }
+
+        let identity = self.local_identity()?;
+        let peer_public = decode_x25519_key(&peer_info.public_key, "peer public key")?;
+        let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
+        let initiation = initiator
+            .create_initiation()
+            .map_err(|e| DaemonError::Peer(format!("WireGuard initiation failed: {e}")))?;
+        let initiation_bytes = initiation.to_bytes();
+
+        self.pending_handshakes
+            .insert(peer_info.node_id.clone(), initiator);
+        self.control
+            .send_peer_offer(&peer_info.node_id, &[], &initiation_bytes)
+            .await?;
+
+        info!(
+            "Sent WireGuard handshake initiation to {} ({} bytes)",
+            peer_info.node_id,
+            initiation_bytes.len()
+        );
+        Ok(())
+    }
+
+    async fn handle_peer_offer(
+        &mut self,
+        from_node_id: &str,
+        _candidates: &[String],
+        handshake_init: &[u8],
+    ) -> Result<()> {
+        let initiation = MessageInitiation::from_bytes(handshake_init)
+            .map_err(|e| DaemonError::Peer(format!("invalid WireGuard initiation: {e}")))?;
+        let identity = self.local_identity()?;
+        let mut responder = HandshakeResponder::new(identity, None);
+        let (response, keys) = responder
+            .consume_initiation_and_respond(&initiation)
+            .map_err(|e| DaemonError::Peer(format!("WireGuard response failed: {e}")))?;
+
+        if let Some(known_peer) = self.control.peers().await.get(from_node_id).cloned() {
+            let expected_public = decode_x25519_key(&known_peer.public_key, "peer public key")?;
+            if responder.initiator_public_key() != Some(&expected_public) {
+                return Err(DaemonError::Peer(format!(
+                    "WireGuard initiation public key mismatch for peer {from_node_id}"
+                )));
+            }
+        }
+
+        self.transport
+            .add_session(from_node_id.to_string(), TransportSession::new(keys))
+            .await;
+        self.peers
+            .update_state(from_node_id, ConnectionState::Direct)
+            .await;
+
+        let response_bytes = response.to_bytes();
+        self.control
+            .send_peer_answer(from_node_id, &[], &response_bytes)
+            .await?;
+        info!(
+            "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes)",
+            response_bytes.len()
+        );
+        Ok(())
+    }
+
+    async fn handle_peer_answer(
+        &mut self,
+        from_node_id: &str,
+        handshake_response: &[u8],
+    ) -> Result<()> {
+        let response = MessageResponse::from_bytes(handshake_response)
+            .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
+        let Some(initiator) = self.pending_handshakes.get_mut(from_node_id) else {
+            warn!("No pending WireGuard handshake for answer from {from_node_id}");
+            return Ok(());
+        };
+
+        let keys = initiator
+            .consume_response(&response)
+            .map_err(|e| DaemonError::Peer(format!("WireGuard response consume failed: {e}")))?;
+        self.pending_handshakes.remove(from_node_id);
+
+        self.transport
+            .add_session(from_node_id.to_string(), TransportSession::new(keys))
+            .await;
+        self.peers
+            .update_state(from_node_id, ConnectionState::Direct)
+            .await;
+        info!("Installed WireGuard initiator session for {from_node_id}");
+        Ok(())
+    }
+
+    fn local_identity(&self) -> Result<NodeIdentity> {
+        let private_key = decode_x25519_key(&self.config.node.private_key, "node private key")?;
+        Ok(NodeIdentity::from_private_key(private_key))
+    }
+
     /// Get a reference to the peer manager.
     pub fn peers(&self) -> &PeerManager {
         &self.peers
@@ -354,6 +498,17 @@ fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> 
     }
 
     Some(local_addr.to_string())
+}
+
+fn decode_x25519_key(hex_value: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_value.trim())
+        .map_err(|e| DaemonError::Config(format!("invalid {label} hex: {e}")))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        DaemonError::Config(format!(
+            "invalid {label} length: expected 32 bytes, got {} bytes",
+            bytes.len()
+        ))
+    })
 }
 
 // ============================================================

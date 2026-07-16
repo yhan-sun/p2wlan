@@ -181,6 +181,61 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// ---- Signaling endpoints ----
+
+// CreateSignal handles POST /api/v1/signals.
+func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		FromNodeID string   `json:"from_node_id"`
+		ToNodeID   string   `json:"to_node_id"`
+		Type       string   `json:"type"`
+		Candidates []string `json:"candidates"`
+		Handshake  string   `json:"handshake"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	req.FromNodeID = strings.TrimSpace(req.FromNodeID)
+	req.ToNodeID = strings.TrimSpace(req.ToNodeID)
+	req.Type = strings.TrimSpace(req.Type)
+	req.Handshake = strings.TrimSpace(req.Handshake)
+	if req.FromNodeID == "" || req.ToNodeID == "" || req.Type == "" {
+		http.Error(w, `{"error":"from_node_id, to_node_id, and type are required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Type != "peer_offer" && req.Type != "peer_answer" {
+		http.Error(w, `{"error":"unsupported signal type"}`, http.StatusBadRequest)
+		return
+	}
+
+	signal, err := s.db.CreateSignal(req.FromNodeID, req.ToNodeID, req.Type, req.Candidates, req.Handshake)
+	if err != nil {
+		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal})
+}
+
+// ListSignals handles GET /api/v1/signals.
+func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		http.Error(w, `{"error":"node_id is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	signals, err := s.db.ListAndDeleteSignals(nodeID)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
+}
+
 // ---- Tunnel endpoints ----
 
 // CreateTunnel handles POST /api/v1/tunnels.

@@ -268,6 +268,29 @@ struct EndpointUpdateResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SignalCreateResponse {
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSignalsResponse {
+    #[serde(default)]
+    signals: Vec<SignalResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignalResponse {
+    from_node_id: String,
+    #[serde(rename = "type")]
+    signal_type: String,
+    #[serde(default)]
+    candidates: Vec<String>,
+    #[serde(default)]
+    handshake: String,
+}
+
 /// Control plane client.
 ///
 /// Connects to the Go control server via WebSocket and handles
@@ -596,6 +619,10 @@ async fn run_control_loop(
         warn!("Initial peer polling failed: {err}");
     }
 
+    if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, &event_tx).await {
+        warn!("Initial signal polling failed: {err}");
+    }
+
     let interval_secs = config.control.heartbeat_interval_secs.max(5);
     let mut tick = time::interval(Duration::from_secs(interval_secs));
 
@@ -604,6 +631,9 @@ async fn run_control_loop(
             _ = tick.tick() => {
                 if let Err(err) = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, &event_tx).await {
                     warn!("Peer polling failed: {err}");
+                }
+                if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, &event_tx).await {
+                    warn!("Signal polling failed: {err}");
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
@@ -629,10 +659,24 @@ async fn run_control_loop(
                         }
                     }
                     ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
-                        debug!("Peer offer queued locally for {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_init.len());
+                        match send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await {
+                            Ok(()) => {
+                                debug!("Sent peer offer to {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_init.len());
+                            }
+                            Err(err) => {
+                                let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err.to_string() });
+                            }
+                        }
                     }
                     ControlCommand::SendPeerAnswer { to_node_id, candidates, handshake_response } => {
-                        debug!("Peer answer queued locally for {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_response.len());
+                        match send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await {
+                            Ok(()) => {
+                                debug!("Sent peer answer to {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_response.len());
+                            }
+                            Err(err) => {
+                                let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err.to_string() });
+                            }
+                        }
                     }
                     ControlCommand::DeleteTunnel { tunnel_id } => {
                         debug!("Tunnel deletion queued locally for {tunnel_id}");
@@ -743,6 +787,111 @@ async fn update_endpoint(
             body.error
                 .unwrap_or_else(|| "endpoint update failed".to_string()),
         ));
+    }
+
+    Ok(())
+}
+
+async fn send_signal(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    from_node_id: &str,
+    to_node_id: &str,
+    signal_type: &str,
+    candidates: &[String],
+    handshake: &[u8],
+) -> Result<()> {
+    let res = http
+        .post(format!("{base_url}/api/v1/signals"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "from_node_id": from_node_id,
+            "to_node_id": to_node_id,
+            "type": signal_type,
+            "candidates": candidates,
+            "handshake": hex::encode(handshake),
+        }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("send signal request failed: {e}")))?;
+
+    if !res.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "send signal returned HTTP {}",
+            res.status()
+        )));
+    }
+
+    let body: SignalCreateResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("send signal decode failed: {e}")))?;
+
+    if !body.success {
+        return Err(DaemonError::ControlPlane(
+            body.error
+                .unwrap_or_else(|| "send signal failed".to_string()),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn poll_signals(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    self_node_id: &str,
+    event_tx: &mpsc::UnboundedSender<ControlEvent>,
+) -> Result<()> {
+    let res = http
+        .get(format!("{base_url}/api/v1/signals?node_id={self_node_id}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("list signals request failed: {e}")))?;
+
+    if !res.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "list signals returned HTTP {}",
+            res.status()
+        )));
+    }
+
+    let body: ListSignalsResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("list signals decode failed: {e}")))?;
+
+    for signal in body.signals {
+        let handshake = if signal.handshake.trim().is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(signal.handshake.trim()).map_err(|e| {
+                DaemonError::ControlPlane(format!("signal handshake hex decode failed: {e}"))
+            })?
+        };
+
+        match signal.signal_type.as_str() {
+            "peer_offer" => {
+                let _ = event_tx.send(ControlEvent::PeerOffer {
+                    from_node_id: signal.from_node_id,
+                    candidates: signal.candidates,
+                    handshake_init: handshake,
+                });
+            }
+            "peer_answer" => {
+                let _ = event_tx.send(ControlEvent::PeerAnswer {
+                    from_node_id: signal.from_node_id,
+                    candidates: signal.candidates,
+                    handshake_response: handshake,
+                });
+            }
+            other => {
+                warn!("Ignoring unsupported signal type from control plane: {other}");
+            }
+        }
     }
 
     Ok(())
