@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PORT=${PORT:-18080}
+DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 101))}
+DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 102))}
 GO_BIN=${GO_BIN:-go}
 TMP_DIR=$(mktemp -d /tmp/p2wlan-smoke.XXXXXX)
 
@@ -47,6 +49,7 @@ fi
     --token "$TOKEN" \
     --device-name node-a \
     --udp-bind 127.0.0.1:0 \
+    --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
     --heartbeat-interval 5
 ) >"$TMP_DIR/node-a.log" 2>&1 &
 NODE_A_PID=$!
@@ -65,6 +68,7 @@ done
     --token "$TOKEN" \
     --device-name node-b \
     --udp-bind 127.0.0.1:0 \
+    --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
     --heartbeat-interval 5
 ) >"$TMP_DIR/node-b.log" 2>&1 &
 NODE_B_PID=$!
@@ -78,17 +82,35 @@ for _ in {1..80}; do
      grep -Eq 'Prepared [1-9][0-9]* UDP candidate endpoints' "$TMP_DIR/node-b.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-a.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-b.log" 2>/dev/null; then
-    echo "[smoke] PASS: both daemons registered, discovered peers, installed WireGuard sessions, and probed UDP candidates"
-    exit 0
+    STATUS_A=$(curl -fsS "http://127.0.0.1:$DIAG_A_PORT/status" 2>/dev/null || true)
+    STATUS_B=$(curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
+    if printf '%s' "$STATUS_A" | grep -q '"peers"' && \
+       printf '%s' "$STATUS_A" | grep -q '"stats"' && \
+       printf '%s' "$STATUS_B" | grep -q '"peers"' && \
+       printf '%s' "$STATUS_B" | grep -q '"stats"'; then
+      "$ROOT_DIR/target/debug/p2pnet-daemon" \
+        --status \
+        --diagnostics-url "http://127.0.0.1:$DIAG_A_PORT/status" \
+        >"$TMP_DIR/status-cli.json" 2>"$TMP_DIR/status-cli.log" || true
+      if grep -q '"node_id"' "$TMP_DIR/status-cli.json" && \
+         grep -q '"peers"' "$TMP_DIR/status-cli.json"; then
+        echo "[smoke] PASS: both daemons registered, discovered peers, installed WireGuard sessions, probed UDP candidates, and served diagnostics"
+        exit 0
+      fi
+    fi
   fi
   sleep 0.5
 done
 
-echo "[smoke] FAIL: peer discovery, WireGuard handshake, candidate gathering, or UDP probing did not complete" >&2
+echo "[smoke] FAIL: peer discovery, WireGuard handshake, candidate gathering, UDP probing, or diagnostics did not complete" >&2
 echo "--- server.log ---" >&2
 tail -80 "$TMP_DIR/server.log" >&2 || true
 echo "--- node-a.log ---" >&2
 tail -120 "$TMP_DIR/node-a.log" >&2 || true
 echo "--- node-b.log ---" >&2
 tail -120 "$TMP_DIR/node-b.log" >&2 || true
+echo "--- status-cli.log ---" >&2
+tail -80 "$TMP_DIR/status-cli.log" >&2 || true
+echo "--- status-cli.json ---" >&2
+tail -80 "$TMP_DIR/status-cli.json" >&2 || true
 exit 1

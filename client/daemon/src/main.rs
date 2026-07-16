@@ -25,10 +25,13 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --relay-fallback-timeout-ms 5000 --punch-attempts 10
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
+//!
+//! # Query local runtime status
+//! p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status
 //! ```
 
-use p2pnet_daemon::{Config, Daemon};
+use p2pnet_daemon::{Config, Daemon, DaemonError};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -46,6 +49,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
 
     // Parse arguments
     let args: Vec<String> = std::env::args().collect();
+    let status_requested = args.iter().any(|a| a == "--status");
 
     // Check for --init flag (generate new config)
     if args.iter().any(|a| a == "--init") {
@@ -92,6 +96,8 @@ async fn main() -> p2pnet_daemon::Result<()> {
                 return Err(e);
             }
         }
+    } else if status_requested {
+        Config::generate_default("http://127.0.0.1", "default")?
     } else {
         info!("No config file found. Generating default config...");
         let control_url = args
@@ -118,6 +124,11 @@ async fn main() -> p2pnet_daemon::Result<()> {
     let mut config = config;
     apply_arg_overrides(&mut config, &args);
 
+    if status_requested {
+        print_status(&config, &args).await?;
+        return Ok(());
+    }
+
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);
 
@@ -131,6 +142,34 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
+}
+
+async fn print_status(config: &Config, args: &[String]) -> p2pnet_daemon::Result<()> {
+    let url = arg_value(args, "--diagnostics-url")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("http://{}/status", config.diagnostics.bind));
+    let res = reqwest::get(&url)
+        .await
+        .map_err(|e| DaemonError::Network(format!("failed to query diagnostics at {url}: {e}")))?;
+
+    let status = res.status();
+    let body = res.text().await.map_err(|e| {
+        DaemonError::Network(format!(
+            "failed to read diagnostics response from {url}: {e}"
+        ))
+    })?;
+
+    if !status.is_success() {
+        return Err(DaemonError::Network(format!(
+            "diagnostics endpoint {url} returned HTTP {status}: {body}"
+        )));
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        Err(_) => println!("{body}"),
+    }
+    Ok(())
 }
 
 fn apply_arg_overrides(config: &mut Config, args: &[String]) {
@@ -196,6 +235,13 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
         arg_value(args, "--relay-fallback-timeout-ms").and_then(|s| s.parse::<u64>().ok())
     {
         config.relay.fallback_timeout_ms = timeout_ms;
+    }
+    if let Some(bind) = arg_value(args, "--diagnostics-bind") {
+        config.diagnostics.enabled = true;
+        config.diagnostics.bind = bind.to_string();
+    }
+    if args.iter().any(|a| a == "--diagnostics-disable") {
+        config.diagnostics.enabled = false;
     }
     if args.iter().any(|a| a == "--prefer-relay") {
         config.relay.prefer_direct = false;

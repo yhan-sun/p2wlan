@@ -106,6 +106,11 @@ impl PathHealth {
         self.last_failure_at
             .map(|last_failure| last_failure.elapsed())
     }
+
+    fn success_age(&self) -> Option<Duration> {
+        self.last_success_at
+            .map(|last_success| last_success.elapsed())
+    }
 }
 
 // ============================================================
@@ -476,6 +481,19 @@ impl PeerManager {
         self.connections.read().await.values().cloned().collect()
     }
 
+    /// Get serializable diagnostics for every peer.
+    pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
+        let mut peers: Vec<_> = self
+            .connections
+            .read()
+            .await
+            .values()
+            .map(PeerDiagnostics::from)
+            .collect();
+        peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        peers
+    }
+
     /// Get connection statistics.
     pub async fn stats(&self) -> PeerManagerStats {
         let conns = self.connections.read().await;
@@ -509,6 +527,70 @@ pub struct PeerManagerStats {
     pub relay_connections: usize,
     pub total_bytes_sent: u64,
     pub total_bytes_received: u64,
+}
+
+/// Serializable peer connection diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerDiagnostics {
+    pub node_id: String,
+    pub virtual_ip: String,
+    pub endpoint: Option<String>,
+    pub nat_type: String,
+    pub state: ConnectionState,
+    pub active_path: Option<NetworkPath>,
+    pub connected_for_ms: Option<u64>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub relay_server: Option<String>,
+    pub candidates: Vec<String>,
+    pub direct: PathHealthDiagnostics,
+    pub relay: PathHealthDiagnostics,
+}
+
+impl From<&PeerConnection> for PeerDiagnostics {
+    fn from(conn: &PeerConnection) -> Self {
+        Self {
+            node_id: conn.node_id.clone(),
+            virtual_ip: conn.virtual_ip.clone(),
+            endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
+            nat_type: conn.nat_type.clone(),
+            state: conn.state,
+            active_path: conn.active_path(),
+            connected_for_ms: conn
+                .connected_at
+                .map(|connected_at| duration_millis(connected_at.elapsed())),
+            bytes_sent: conn.bytes_sent,
+            bytes_received: conn.bytes_received,
+            relay_server: conn.relay_server.clone(),
+            candidates: conn.candidates.clone(),
+            direct: PathHealthDiagnostics::from(&conn.direct_health),
+            relay: PathHealthDiagnostics::from(&conn.relay_health),
+        }
+    }
+}
+
+/// Serializable health counters for one transport path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathHealthDiagnostics {
+    pub last_success_age_ms: Option<u64>,
+    pub last_failure_age_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
+impl From<&PathHealth> for PathHealthDiagnostics {
+    fn from(health: &PathHealth) -> Self {
+        Self {
+            last_success_age_ms: health.success_age().map(duration_millis),
+            last_failure_age_ms: health.failure_age().map(duration_millis),
+            consecutive_failures: health.consecutive_failures,
+            last_error: health.last_error.clone(),
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 // ============================================================

@@ -27,6 +27,9 @@ pub struct Config {
     pub control: ControlConfig,
     /// Relay configuration.
     pub relay: RelayConfig,
+    /// Local diagnostics endpoint configuration.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     /// Port mappings.
     #[serde(default)]
     pub port_mappings: Vec<PortMappingConfig>,
@@ -177,6 +180,30 @@ fn default_true() -> bool {
 }
 fn default_relay_timeout() -> u64 {
     5000
+}
+
+/// Local diagnostics HTTP endpoint configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsConfig {
+    /// Whether to expose the local diagnostics HTTP endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local bind address for diagnostics. Keep this on loopback.
+    #[serde(default = "default_diagnostics_bind")]
+    pub bind: String,
+}
+
+fn default_diagnostics_bind() -> String {
+    "127.0.0.1:39277".to_string()
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_diagnostics_bind(),
+        }
+    }
 }
 
 /// Port mapping configuration (FRP-like).
@@ -339,6 +366,7 @@ impl Config {
                 prefer_direct: true,
                 fallback_timeout_ms: default_relay_timeout(),
             },
+            diagnostics: DiagnosticsConfig::default(),
             port_mappings: Vec::new(),
             dns: DnsConfig::default(),
             acl: AclConfig::default(),
@@ -388,6 +416,8 @@ mod tests {
         assert_eq!(config.network.network_id, "net123");
         assert_eq!(config.network.mtu, 1420);
         assert!(config.relay.prefer_direct);
+        assert!(!config.diagnostics.enabled);
+        assert_eq!(config.diagnostics.bind, "127.0.0.1:39277");
         assert!(config.port_mappings.is_empty());
     }
 
@@ -417,6 +447,8 @@ mod tests {
             decoded.network.keepalive_interval_secs,
             config.network.keepalive_interval_secs
         );
+        assert_eq!(decoded.diagnostics.enabled, config.diagnostics.enabled);
+        assert_eq!(decoded.diagnostics.bind, config.diagnostics.bind);
     }
 
     #[test]
@@ -459,6 +491,8 @@ mod tests {
         assert_eq!(decoded.network.punch_interval_ms, 200);
         assert_eq!(decoded.network.punch_attempts, 10);
         assert_eq!(decoded.network.keepalive_interval_secs, 25);
+        assert!(!decoded.diagnostics.enabled);
+        assert_eq!(decoded.diagnostics.bind, "127.0.0.1:39277");
     }
 
     #[test]
