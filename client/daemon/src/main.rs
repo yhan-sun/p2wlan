@@ -146,6 +146,11 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
     if let Some(mtu) = arg_value(args, "--mtu").and_then(|s| s.parse::<u32>().ok()) {
         config.network.mtu = mtu;
     }
+    if let Some(interval) =
+        arg_value(args, "--heartbeat-interval").and_then(|s| s.parse::<u64>().ok())
+    {
+        config.control.heartbeat_interval_secs = interval;
+    }
     if let Some(udp_bind) = arg_value(args, "--udp-bind") {
         config.network.udp_bind = udp_bind.to_string();
     }

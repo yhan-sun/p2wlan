@@ -64,6 +64,10 @@ func main() {
 	mux.HandleFunc("PATCH /api/v1/devices/{id}/endpoint", authService.RequireAuth(apiServer.UpdateDeviceEndpoint))
 	mux.HandleFunc("DELETE /api/v1/devices/{id}", authService.RequireAuth(apiServer.DeleteDevice))
 
+	// Signaling routes
+	mux.HandleFunc("POST /api/v1/signals", authService.RequireAuth(apiServer.CreateSignal))
+	mux.HandleFunc("GET /api/v1/signals", authService.RequireAuth(apiServer.ListSignals))
+
 	// Port mapping routes
 	mux.HandleFunc("POST /api/v1/tunnels", authService.RequireAuth(apiServer.CreateTunnel))
 	mux.HandleFunc("GET /api/v1/tunnels", authService.RequireAuth(apiServer.ListTunnels))

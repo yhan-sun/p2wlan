@@ -3,6 +3,7 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -73,9 +74,20 @@ func migrate(db *sql.DB) error {
 		created_at    INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS signals (
+		id          TEXT PRIMARY KEY,
+		from_node_id TEXT NOT NULL,
+		to_node_id   TEXT NOT NULL,
+		type        TEXT NOT NULL,
+		candidates  TEXT NOT NULL DEFAULT '[]',
+		handshake   TEXT NOT NULL DEFAULT '',
+		created_at  INTEGER NOT NULL
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 	CREATE INDEX IF NOT EXISTS idx_devices_network ON devices(network_id);
 	CREATE INDEX IF NOT EXISTS idx_tunnels_device ON tunnels(device_id);
+	CREATE INDEX IF NOT EXISTS idx_signals_to_node ON signals(to_node_id, created_at);
 	`
 
 	_, err := db.Exec(schema)
@@ -235,6 +247,91 @@ func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string) error {
 func (db *DB) DeleteDevice(deviceID string) error {
 	_, err := db.Exec(`DELETE FROM devices WHERE id = ?`, deviceID)
 	return err
+}
+
+// ---- Signaling operations ----
+
+// Signal represents one queued control-plane signaling message.
+type Signal struct {
+	ID         string   `json:"id"`
+	FromNodeID string   `json:"from_node_id"`
+	ToNodeID   string   `json:"to_node_id"`
+	Type       string   `json:"type"`
+	Candidates []string `json:"candidates"`
+	Handshake  string   `json:"handshake"`
+	CreatedAt  int64    `json:"created_at"`
+}
+
+// CreateSignal queues a signaling message for a target node.
+func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string, handshake string) (*Signal, error) {
+	if candidates == nil {
+		candidates = []string{}
+	}
+
+	candidatesJSON, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, err
+	}
+
+	id := fmt.Sprintf("signal-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	_, err = db.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, handshake, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), handshake, now)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Signal{
+		ID: id, FromNodeID: fromNodeID, ToNodeID: toNodeID, Type: typ,
+		Candidates: candidates, Handshake: handshake, CreatedAt: now,
+	}, nil
+}
+
+// ListAndDeleteSignals returns queued messages for a node and deletes them atomically.
+func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, handshake, created_at
+		FROM signals WHERE to_node_id = ? ORDER BY created_at ASC`, toNodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	var signals []Signal
+	for rows.Next() {
+		var s Signal
+		var candidatesJSON string
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &candidatesJSON, &s.Handshake, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(candidatesJSON), &s.Candidates); err != nil {
+			return nil, err
+		}
+		if s.Candidates == nil {
+			s.Candidates = []string{}
+		}
+		signals = append(signals, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM signals WHERE to_node_id = ?`, toNodeID); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return signals, nil
 }
 
 // ---- Tunnel operations ----

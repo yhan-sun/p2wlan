@@ -45,7 +45,8 @@ fi
     --control "http://127.0.0.1:$PORT" \
     --network default \
     --token "$TOKEN" \
-    --device-name node-a
+    --device-name node-a \
+    --heartbeat-interval 5
 ) >"$TMP_DIR/node-a.log" 2>&1 &
 NODE_A_PID=$!
 
@@ -61,20 +62,23 @@ done
     --control "http://127.0.0.1:$PORT" \
     --network default \
     --token "$TOKEN" \
-    --device-name node-b
+    --device-name node-b \
+    --heartbeat-interval 5
 ) >"$TMP_DIR/node-b.log" 2>&1 &
 NODE_B_PID=$!
 
 for _ in {1..80}; do
   if grep -q 'Peer joined: node-' "$TMP_DIR/node-a.log" 2>/dev/null && \
-     grep -q 'Peer joined: node-' "$TMP_DIR/node-b.log" 2>/dev/null; then
-    echo "[smoke] PASS: both daemons registered and discovered peers"
+     grep -q 'Peer joined: node-' "$TMP_DIR/node-b.log" 2>/dev/null && \
+     grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-a.log" 2>/dev/null && \
+     grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-b.log" 2>/dev/null; then
+    echo "[smoke] PASS: both daemons registered, discovered peers, and installed WireGuard sessions"
     exit 0
   fi
   sleep 0.5
 done
 
-echo "[smoke] FAIL: peer discovery did not complete" >&2
+echo "[smoke] FAIL: peer discovery or WireGuard handshake did not complete" >&2
 echo "--- server.log ---" >&2
 tail -80 "$TMP_DIR/server.log" >&2 || true
 echo "--- node-a.log ---" >&2
