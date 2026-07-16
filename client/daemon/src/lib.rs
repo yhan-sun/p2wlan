@@ -37,6 +37,7 @@ pub mod dns;
 pub mod error;
 pub mod peer;
 pub mod port_mapping;
+pub mod transport;
 
 // Re-export key types
 pub use config::Config;
@@ -53,11 +54,12 @@ use tracing::{error, info, warn};
 
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
-use dataplane::{log_outbound_packets, DataPlane};
+use dataplane::DataPlane;
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use peer::PeerManager;
 use port_mapping::PortMappingManager;
+use transport::{log_encrypted_packets, WireGuardTransport};
 
 /// The main daemon orchestrator.
 ///
@@ -110,7 +112,13 @@ impl Daemon {
             let peers = self.peers.clone();
             tokio::spawn(async move {
                 let (mut dataplane, outbound_rx) = DataPlane::new(tun, peers);
-                tokio::spawn(log_outbound_packets(outbound_rx));
+                let (transport, encrypted_rx) = WireGuardTransport::new();
+                tokio::spawn(async move {
+                    if let Err(err) = transport.run_outbound(outbound_rx).await {
+                        warn!("WireGuard transport stopped: {err}");
+                    }
+                });
+                tokio::spawn(log_encrypted_packets(encrypted_rx));
 
                 if let Err(err) = dataplane.run().await {
                     warn!("Data plane stopped: {err}");
