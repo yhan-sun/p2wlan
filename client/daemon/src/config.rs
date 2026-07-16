@@ -92,6 +92,12 @@ pub struct NetworkConfig {
     /// Optional endpoint advertised to peers when it differs from the local bind address.
     #[serde(default)]
     pub udp_advertise: Option<String>,
+    /// STUN servers used to discover server-reflexive UDP candidates.
+    #[serde(default)]
+    pub stun_servers: Vec<String>,
+    /// Timeout for each STUN query in milliseconds.
+    #[serde(default = "default_stun_timeout_ms")]
+    pub stun_timeout_ms: u64,
 }
 
 fn default_cidr() -> String {
@@ -108,6 +114,9 @@ fn default_interface() -> String {
 }
 fn default_udp_bind() -> String {
     "0.0.0.0:0".to_string()
+}
+fn default_stun_timeout_ms() -> u64 {
+    1500
 }
 
 /// Control plane server configuration.
@@ -295,6 +304,8 @@ impl Config {
                 interface: default_interface(),
                 udp_bind: default_udp_bind(),
                 udp_advertise: None,
+                stun_servers: Vec::new(),
+                stun_timeout_ms: default_stun_timeout_ms(),
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -368,6 +379,11 @@ mod tests {
         assert_eq!(decoded.network.virtual_ip, config.network.virtual_ip);
         assert_eq!(decoded.network.udp_bind, config.network.udp_bind);
         assert_eq!(decoded.network.udp_advertise, config.network.udp_advertise);
+        assert_eq!(decoded.network.stun_servers, config.network.stun_servers);
+        assert_eq!(
+            decoded.network.stun_timeout_ms,
+            config.network.stun_timeout_ms
+        );
     }
 
     #[test]
@@ -405,6 +421,8 @@ mod tests {
         let decoded: Config = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.network.udp_bind, "0.0.0.0:0");
         assert_eq!(decoded.network.udp_advertise, None);
+        assert!(decoded.network.stun_servers.is_empty());
+        assert_eq!(decoded.network.stun_timeout_ms, 1500);
     }
 
     #[test]
@@ -464,5 +482,7 @@ mod tests {
         assert_eq!(config.network.interface, "p2pnet0");
         assert_eq!(config.network.udp_bind, "0.0.0.0:0");
         assert_eq!(config.network.udp_advertise, None);
+        assert!(config.network.stun_servers.is_empty());
+        assert_eq!(config.network.stun_timeout_ms, 1500);
     }
 }

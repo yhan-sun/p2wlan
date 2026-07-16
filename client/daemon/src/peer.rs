@@ -213,6 +213,13 @@ impl PeerManager {
                     conn.candidates.push(c.clone());
                 }
             }
+
+            if conn.endpoint.is_none() {
+                conn.endpoint = conn
+                    .candidates
+                    .iter()
+                    .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
+            }
         }
     }
 
@@ -402,6 +409,37 @@ mod tests {
 
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.candidates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_selects_endpoint_from_candidates() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+
+        let peer_info = PeerInfo {
+            node_id: "peer1".to_string(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+        };
+
+        manager.add_peer(&peer_info).await;
+        manager
+            .add_candidates(
+                "peer1",
+                &[
+                    "not-a-socket".to_string(),
+                    "127.0.0.1:51820".to_string(),
+                    "10.0.0.1:51820".to_string(),
+                ],
+            )
+            .await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.endpoint, Some("127.0.0.1:51820".parse().unwrap()));
     }
 
     #[tokio::test]

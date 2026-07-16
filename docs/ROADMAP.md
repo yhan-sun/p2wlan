@@ -60,7 +60,7 @@ Date: 2026-07-16
 - packet pump：TUN <-> WireGuard <-> UDP。
 - CLI：`p2wlan peer add`、`p2wlan status`。
 
-当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write，以及控制面自动 WireGuard handshake/session 安装；下一步补 STUN/打洞 endpoint 选择与真实双节点 TUN ping 验证。
+当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write、控制面自动 WireGuard handshake/session 安装，以及 host/STUN candidates 收集、offer/answer 交换和 peer endpoint 选择；下一步补完整打洞状态机、keepalive/NAT 刷新与真实双节点 TUN ping 验证。
 
 验收标准：
 
@@ -98,6 +98,7 @@ Date: 2026-07-16
 - STUN server 或兼容第三方 STUN server。
 - candidate gather。
 - Signaling service。
+- candidate exchange 和 endpoint 选择。
 - probe packet 和打洞状态机。
 - 连接诊断输出。
 

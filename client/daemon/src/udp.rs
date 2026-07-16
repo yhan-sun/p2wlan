@@ -6,7 +6,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use p2pnet_nat::{gather_candidates, IceConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -40,6 +42,29 @@ impl UdpTransport {
         self.socket
             .local_addr()
             .map_err(|e| DaemonError::Network(format!("failed to read UDP local addr: {e}")))
+    }
+
+    /// Gather ICE-style candidate endpoints for this UDP socket.
+    pub async fn gather_candidates(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<Vec<String>> {
+        let config = IceConfig {
+            stun_servers,
+            stun_timeout,
+            gather_host: true,
+            gather_srflx: true,
+        };
+
+        let candidates = gather_candidates(&self.socket, &config)
+            .await
+            .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))?;
+
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.endpoint.to_string())
+            .collect())
     }
 
     /// Send a single encrypted packet.
@@ -192,6 +217,25 @@ mod tests {
             TransportSession::new(node_a_keys),
             TransportSession::new(node_b_keys),
         )
+    }
+
+    #[tokio::test]
+    async fn gathers_host_candidates_for_bound_udp_port() {
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+        let local_port = transport.local_addr().unwrap().port();
+
+        let candidates = transport
+            .gather_candidates(Vec::new(), Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with(&format!(":{local_port}"))));
     }
 
     #[tokio::test]
