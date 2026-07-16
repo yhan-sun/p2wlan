@@ -53,6 +53,7 @@ use tracing::{error, info, warn};
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
 use dns::DnsResolver;
+use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use peer::PeerManager;
 use port_mapping::PortMappingManager;
 
@@ -63,7 +64,7 @@ pub struct Daemon {
     /// Configuration.
     config: Arc<Config>,
     /// Control plane client.
-    control: ControlClient,
+    _control: ControlClient,
     /// Control event receiver.
     control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlEvent>,
     /// Peer connection manager.
@@ -84,7 +85,7 @@ impl Daemon {
 
         Self {
             config: Arc::new(config.clone()),
-            control,
+            _control: control,
             control_rx,
             peers: Arc::new(PeerManager::new(config.clone())),
             port_mappings: Arc::new(PortMappingManager::new()),
@@ -102,6 +103,8 @@ impl Daemon {
             self.config.network.network_id, self.config.network.cidr
         );
         info!("Control server: {}", self.config.control.server_url);
+
+        let _tun_device = self.init_tun()?;
 
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
@@ -204,6 +207,32 @@ impl Daemon {
         Ok(())
     }
 
+    fn init_tun(&self) -> Result<Option<TunDevice>> {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            warn!("TUN creation disabled via P2WLAN_DISABLE_TUN=1");
+            return Ok(None);
+        }
+
+        let config = InterfaceConfig::new(
+            &self.config.network.interface,
+            &self.config.network.virtual_ip,
+            &self.config.network.netmask,
+            self.config.network.mtu,
+        )
+        .map_err(|e| DaemonError::Network(format!("invalid TUN config: {e}")))?;
+
+        let tun = TunDevice::create(&config)
+            .map_err(|e| DaemonError::Network(format!("failed to create TUN interface: {e}")))?;
+        info!(
+            "TUN interface {} is up at {} MTU {}",
+            tun.name(),
+            tun.address(),
+            tun.mtu()
+        );
+
+        Ok(Some(tun))
+    }
+
     /// Get a reference to the peer manager.
     pub fn peers(&self) -> &PeerManager {
         &self.peers
@@ -274,8 +303,6 @@ mod tests {
 
         let mapping =
             port_mapping::PortMapping::new(port_mapping::Protocol::Tcp, "127.0.0.1", 8080, 30000);
-        let id = mapping.id.clone();
-
         daemon.port_mappings().create(mapping).await.unwrap();
         let list = daemon.port_mappings().list().await;
         assert_eq!(list.len(), 1);

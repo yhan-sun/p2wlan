@@ -44,7 +44,7 @@ async fn test_mock_device_roundtrip() {
 /// Test that multiple packets can be sent in sequence.
 #[tokio::test]
 async fn test_multiple_packets() {
-    let (mut dev, mut ctrl) = MockTunDevice::new_default("test0");
+    let (mut dev, ctrl) = MockTunDevice::new_default("test0");
 
     for i in 0..5u16 {
         let packet = Ipv4Packet::build_icmp_echo_request(
@@ -125,7 +125,7 @@ async fn test_device_properties() {
 /// Test handling of large packets (up to MTU).
 #[tokio::test]
 async fn test_large_packet() {
-    let (mut dev, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+    let (mut dev, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
 
     // Create a large payload (1300 bytes)
     let large_payload = vec![0xAA; 1300];

@@ -235,7 +235,7 @@ mod tests {
             mappings,
         };
 
-        let resolver = DnsResolver::new(config);
+        let _resolver = DnsResolver::new(config);
         // The initial mapping should be loaded
     }
 

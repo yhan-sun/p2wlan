@@ -30,12 +30,17 @@ go test ./...
 cd ..
 pnpm install
 pnpm run build
+
+# Control-plane smoke test: starts server + two daemon instances without TUN/root
+./scripts/control-smoke.sh
 ```
 
 如果本机 Go 出现标准库版本不一致，优先使用 Homebrew 的 GOROOT：
 
 ```bash
 GOROOT=/opt/homebrew/opt/go/libexec /opt/homebrew/opt/go/libexec/bin/go test ./...
+
+GOROOT=/opt/homebrew/opt/go/libexec GO_BIN=/opt/homebrew/opt/go/libexec/bin/go ./scripts/control-smoke.sh
 ```
 
 ## 推荐实现路线
