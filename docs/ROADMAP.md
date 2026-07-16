@@ -60,6 +60,8 @@ Date: 2026-07-16
 - packet pump：TUN <-> WireGuard <-> UDP。
 - CLI：`p2wlan peer add`、`p2wlan status`。
 
+当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send；下一步补 UDP inbound decrypt -> TUN write 与控制面自动会话安装。
+
 验收标准：
 
 - 两台机器手动配置 endpoint 后可以互 ping。
@@ -209,4 +211,3 @@ notes:
 - 如果 macOS Network Extension 权限阻塞，开发阶段先支持 utun，正式分发再切 NEPacketTunnelProvider。
 - 如果 Windows Wintun 分发阻塞，先文档化安装驱动要求，避免把客户端逻辑和驱动安装耦合。
 - 如果 NAT 直连率低，先优化诊断和 Relay 可用性，再研究更复杂的端口预测和 peer relay。
-

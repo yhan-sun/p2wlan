@@ -262,10 +262,17 @@ struct CreateTunnelResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EndpointUpdateResponse {
+    success: bool,
+    error: Option<String>,
+}
+
 /// Control plane client.
 ///
 /// Connects to the Go control server via WebSocket and handles
 /// signaling, peer discovery, and configuration updates.
+#[derive(Clone)]
 pub struct ControlClient {
     /// Channel to send events to the daemon.
     event_tx: mpsc::UnboundedSender<ControlEvent>,
@@ -612,7 +619,14 @@ async fn run_control_loop(
                         }
                     }
                     ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
-                        debug!("Endpoint update queued locally: {endpoint} ({nat_type})");
+                        match update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await {
+                            Ok(()) => {
+                                debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})");
+                            }
+                            Err(err) => {
+                                let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err.to_string() });
+                            }
+                        }
                     }
                     ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
                         debug!("Peer offer queued locally for {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_init.len());
@@ -691,6 +705,47 @@ async fn register_device(
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
 
     Ok((node_id, virtual_ip))
+}
+
+async fn update_endpoint(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    device_id: &str,
+    endpoint: &str,
+    nat_type: &str,
+) -> Result<()> {
+    let res = http
+        .patch(format!("{base_url}/api/v1/devices/{device_id}/endpoint"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "endpoint": endpoint,
+            "nat_type": nat_type,
+        }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("endpoint update request failed: {e}")))?;
+
+    if !res.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "endpoint update returned HTTP {}",
+            res.status()
+        )));
+    }
+
+    let body: EndpointUpdateResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("endpoint update decode failed: {e}")))?;
+
+    if !body.success {
+        return Err(DaemonError::ControlPlane(
+            body.error
+                .unwrap_or_else(|| "endpoint update failed".to_string()),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn poll_peers(

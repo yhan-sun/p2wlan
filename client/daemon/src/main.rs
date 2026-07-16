@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820
 //! ```
 
 use p2pnet_daemon::{Config, Daemon};
@@ -145,6 +145,12 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
     }
     if let Some(mtu) = arg_value(args, "--mtu").and_then(|s| s.parse::<u32>().ok()) {
         config.network.mtu = mtu;
+    }
+    if let Some(udp_bind) = arg_value(args, "--udp-bind") {
+        config.network.udp_bind = udp_bind.to_string();
+    }
+    if let Some(udp_advertise) = arg_value(args, "--udp-advertise") {
+        config.network.udp_advertise = Some(udp_advertise.to_string());
     }
     if let Some(name) = arg_value(args, "--device-name") {
         config.node.device_name = name.to_string();
