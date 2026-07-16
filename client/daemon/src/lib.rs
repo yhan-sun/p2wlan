@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use p2pnet_crypto::NodeIdentity;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
@@ -90,6 +90,8 @@ pub struct Daemon {
     pending_handshakes: HashMap<String, HandshakeInitiator>,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
+    /// Bound UDP transport shared with control-plane-triggered punching.
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     /// Port mapping manager.
     port_mappings: Arc<PortMappingManager>,
     /// DNS resolver.
@@ -114,6 +116,7 @@ impl Daemon {
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: HashMap::new(),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
+            udp_transport: Arc::new(RwLock::new(None)),
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -135,6 +138,7 @@ impl Daemon {
             let control = self.control.clone();
             let transport = self.transport.clone();
             let local_candidates = self.local_candidates.clone();
+            let udp_transport = self.udp_transport.clone();
             let Some(encrypted_rx) = self.encrypted_rx.take() else {
                 return Err(DaemonError::Network(
                     "encrypted packet receiver already attached".to_string(),
@@ -149,6 +153,8 @@ impl Daemon {
             let udp_advertise = self.config.network.udp_advertise.clone();
             let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
             let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
+            let keepalive_interval =
+                Duration::from_secs(self.config.network.keepalive_interval_secs);
             tokio::spawn(async move {
                 let (mut dataplane, outbound_rx, inbound_tx) =
                     DataPlane::new_bidirectional(tun, peers.clone());
@@ -160,6 +166,11 @@ impl Daemon {
                 });
                 match UdpTransport::bind(udp_bind, peers).await {
                     Ok(udp) => {
+                        *udp_transport.write().await = Some(udp.clone());
+                        if !keepalive_interval.is_zero() {
+                            tokio::spawn(udp.clone().run_keepalives(keepalive_interval));
+                        }
+
                         let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(1024);
                         let inbound_transport = transport.clone();
                         tokio::spawn(async move {
@@ -296,6 +307,7 @@ impl Daemon {
                             warn!("Failed to handle peer offer from {from_node_id}: {err}");
                         }
                     }
+                    self.start_hole_punch(&from_node_id).await;
                 }
 
                 ControlEvent::PeerAnswer {
@@ -317,6 +329,7 @@ impl Daemon {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
                         }
                     }
+                    self.start_hole_punch(&from_node_id).await;
                 }
 
                 ControlEvent::PeerRejected {
@@ -412,6 +425,56 @@ impl Daemon {
             candidates.len()
         );
         Ok(())
+    }
+
+    async fn start_hole_punch(&self, node_id: &str) {
+        let Some(udp) = self.udp_transport.read().await.clone() else {
+            debug!("UDP transport is not ready; skipping hole punch for {node_id}");
+            return;
+        };
+
+        let Some(conn) = self.peers.get_connection(node_id).await else {
+            debug!("No peer connection for {node_id}; skipping hole punch");
+            return;
+        };
+
+        let mut candidates = Vec::new();
+        for candidate in &conn.candidates {
+            if let Ok(addr) = candidate.parse::<SocketAddr>() {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+        if let Some(endpoint) = conn.endpoint {
+            if !candidates.contains(&endpoint) {
+                candidates.push(endpoint);
+            }
+        }
+
+        if candidates.is_empty() {
+            debug!("No UDP candidates for {node_id}; skipping hole punch");
+            return;
+        }
+
+        if conn.state != ConnectionState::Direct {
+            self.peers
+                .update_state(node_id, ConnectionState::HolePunching)
+                .await;
+        }
+
+        let peer_id = node_id.to_string();
+        let probe_interval = Duration::from_millis(self.config.network.punch_interval_ms);
+        let attempts = self.config.network.punch_attempts;
+        tokio::spawn(async move {
+            match udp
+                .punch_candidates(&peer_id, candidates, probe_interval, attempts)
+                .await
+            {
+                Ok(sent) => debug!("Sent {sent} UDP punch probes to peer {peer_id}"),
+                Err(err) => warn!("Failed to punch peer {peer_id}: {err}"),
+            }
+        });
     }
 
     async fn handle_peer_offer(

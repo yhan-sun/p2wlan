@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --punch-attempts 10
 //! ```
 
 use p2pnet_daemon::{Config, Daemon};
@@ -169,6 +169,20 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
         arg_value(args, "--stun-timeout-ms").and_then(|s| s.parse::<u64>().ok())
     {
         config.network.stun_timeout_ms = timeout_ms;
+    }
+    if let Some(interval_ms) =
+        arg_value(args, "--punch-interval-ms").and_then(|s| s.parse::<u64>().ok())
+    {
+        config.network.punch_interval_ms = interval_ms;
+    }
+    if let Some(attempts) = arg_value(args, "--punch-attempts").and_then(|s| s.parse::<u32>().ok())
+    {
+        config.network.punch_attempts = attempts;
+    }
+    if let Some(interval_secs) =
+        arg_value(args, "--keepalive-interval-secs").and_then(|s| s.parse::<u64>().ok())
+    {
+        config.network.keepalive_interval_secs = interval_secs;
     }
     if let Some(name) = arg_value(args, "--device-name") {
         config.node.device_name = name.to_string();

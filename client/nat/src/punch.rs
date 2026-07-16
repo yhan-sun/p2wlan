@@ -82,6 +82,24 @@ pub struct PunchResult {
     pub packets_sent: u32,
 }
 
+/// Public punch datagram type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunchPacketKind {
+    /// Probe sent to open/refresh a NAT mapping.
+    Punch,
+    /// Acknowledgement for a received probe.
+    Ack,
+}
+
+/// A decoded punch protocol datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPunchPacket {
+    /// Packet kind.
+    pub kind: PunchPacketKind,
+    /// Correlation nonce.
+    pub nonce: [u8; 8],
+}
+
 /// A parsed punch packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PunchPacket {
@@ -146,6 +164,46 @@ impl PunchPacket {
     fn is_ack(&self) -> bool {
         self.packet_type == TYPE_ACK
     }
+}
+
+impl From<PunchPacket> for DecodedPunchPacket {
+    fn from(packet: PunchPacket) -> Self {
+        let kind = if packet.is_punch() {
+            PunchPacketKind::Punch
+        } else {
+            PunchPacketKind::Ack
+        };
+
+        Self {
+            kind,
+            nonce: packet.nonce,
+        }
+    }
+}
+
+/// Decode a punch protocol datagram, returning `None` for unrelated traffic.
+pub fn decode_punch_packet(data: &[u8]) -> Option<DecodedPunchPacket> {
+    PunchPacket::decode(data).map(Into::into)
+}
+
+/// Build a fresh PUNCH datagram.
+pub fn build_punch_packet() -> [u8; PUNCH_PACKET_SIZE] {
+    PunchPacket::new_punch().encode()
+}
+
+/// Build an ACK datagram for a received PUNCH nonce.
+pub fn build_punch_ack(nonce: [u8; 8]) -> [u8; PUNCH_PACKET_SIZE] {
+    PunchPacket::new_ack(nonce).encode()
+}
+
+/// Send one PUNCH probe to a candidate endpoint.
+pub async fn send_punch(socket: &UdpSocket, peer_addr: SocketAddr) -> Result<()> {
+    let bytes = build_punch_packet();
+    socket
+        .send_to(&bytes, peer_addr)
+        .await
+        .map_err(|e| NatError::Network(format!("punch send failed: {e}")))?;
+    Ok(())
 }
 
 /// Perform UDP hole punching to establish a direct P2P connection.
@@ -272,10 +330,7 @@ pub async fn hole_punch(
 /// Should be called periodically (e.g., every 25 seconds) to prevent
 /// the NAT mapping from expiring.
 pub async fn send_keepalive(socket: &UdpSocket, peer_addr: SocketAddr) -> Result<()> {
-    let punch = PunchPacket::new_punch();
-    let bytes = punch.encode();
-    socket
-        .send_to(&bytes, peer_addr)
+    send_punch(socket, peer_addr)
         .await
         .map_err(|e| NatError::Network(format!("keepalive send failed: {e}")))?;
     Ok(())
@@ -307,6 +362,18 @@ mod tests {
         assert_eq!(decoded, ack);
         assert!(decoded.is_ack());
         assert_eq!(decoded.nonce, nonce);
+    }
+
+    #[test]
+    fn test_public_punch_helpers() {
+        let punch = build_punch_packet();
+        let decoded = decode_punch_packet(&punch).unwrap();
+        assert_eq!(decoded.kind, PunchPacketKind::Punch);
+
+        let ack = build_punch_ack(decoded.nonce);
+        let decoded_ack = decode_punch_packet(&ack).unwrap();
+        assert_eq!(decoded_ack.kind, PunchPacketKind::Ack);
+        assert_eq!(decoded_ack.nonce, decoded.nonce);
     }
 
     #[test]
