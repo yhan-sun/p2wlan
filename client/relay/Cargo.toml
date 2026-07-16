@@ -1,0 +1,14 @@
+[package]
+name = "p2pnet-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DERP-like relay server and client for P2PNet"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
