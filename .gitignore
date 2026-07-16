@@ -1,0 +1,24 @@
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Rust
+target/
+
+# Go
+bin/
+coverage.out
+
+# Node/Tauri
+node_modules/
+dist/
+build/
+.vite/
+
+# Logs/env
+*.log
+.env
+.env.*
