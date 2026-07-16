@@ -6,13 +6,14 @@
 //! relay transport layer.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use p2pnet_wireguard::TransportSession;
+use p2pnet_wireguard::{MessageTransport, TransportSession};
 use tokio::sync::{mpsc, Mutex};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::dataplane::OutboundPacket;
+use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
 
 /// A WireGuard transport packet addressed to a peer.
@@ -22,6 +23,15 @@ pub struct EncryptedPeerPacket {
     pub peer_id: String,
     /// Destination virtual IP, retained for diagnostics.
     pub dst_ip: String,
+    /// Serialized WireGuard transport message.
+    pub wire_bytes: Vec<u8>,
+}
+
+/// An encrypted WireGuard packet received from UDP or relay transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedEncryptedPacket {
+    /// Source socket address when known.
+    pub source: Option<SocketAddr>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
@@ -87,6 +97,34 @@ impl WireGuardTransport {
         }))
     }
 
+    /// Decrypt one inbound WireGuard transport packet.
+    pub async fn decrypt_inbound(&self, wire_bytes: &[u8]) -> Result<Option<InboundPacket>> {
+        let msg = MessageTransport::from_bytes(wire_bytes)
+            .map_err(|e| DaemonError::Peer(format!("WireGuard packet parse failed: {e}")))?;
+        let receiver_index = msg.receiver_index;
+
+        let mut sessions = self.sessions.lock().await;
+        let Some((peer_id, session)) = sessions
+            .iter_mut()
+            .find(|(_, session)| session.our_index() == receiver_index)
+        else {
+            debug!(
+                "No WireGuard session for receiver index {}; dropping inbound packet",
+                receiver_index
+            );
+            return Ok(None);
+        };
+
+        let packet = session
+            .decrypt(&msg)
+            .map_err(|e| DaemonError::Peer(format!("WireGuard decrypt failed: {e}")))?;
+
+        Ok(Some(InboundPacket {
+            peer_id: peer_id.clone(),
+            packet,
+        }))
+    }
+
     /// Consume routed packets and emit encrypted WireGuard packets.
     pub async fn run_outbound(
         &self,
@@ -97,6 +135,34 @@ impl WireGuardTransport {
                 self.encrypted_tx.send(encrypted).await.map_err(|_| {
                     DaemonError::Network("encrypted packet channel closed".to_string())
                 })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
+    pub async fn run_inbound(
+        &self,
+        mut encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
+        inbound_tx: mpsc::Sender<InboundPacket>,
+    ) -> Result<()> {
+        while let Some(packet) = encrypted_rx.recv().await {
+            match self.decrypt_inbound(&packet.wire_bytes).await {
+                Ok(Some(inbound)) => {
+                    inbound_tx.send(inbound).await.map_err(|_| {
+                        DaemonError::Network("inbound packet channel closed".to_string())
+                    })?;
+                }
+                Ok(None) => {
+                    debug!("Inbound encrypted packet has no matching WireGuard session");
+                }
+                Err(err) => {
+                    warn!(
+                        "Dropping inbound encrypted packet from {:?}: {err}",
+                        packet.source
+                    );
+                }
             }
         }
 
@@ -203,5 +269,48 @@ mod tests {
 
         assert!(dropped.is_none());
         assert!(encrypted_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypts_inbound_packet_with_matching_receiver_index() {
+        let (mut node_a_session, node_b_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", node_b_session).await;
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        let wire_bytes = node_a_session.encrypt_to_bytes(&packet).unwrap();
+
+        let inbound = transport
+            .decrypt_inbound(&wire_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inbound.peer_id, "peer-a");
+        assert_eq!(inbound.packet, packet);
+    }
+
+    #[tokio::test]
+    async fn drops_inbound_packet_without_matching_session() {
+        let (mut node_a_session, _node_b_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        let wire_bytes = node_a_session.encrypt_to_bytes(&packet).unwrap();
+
+        let inbound = transport.decrypt_inbound(&wire_bytes).await.unwrap();
+        assert!(inbound.is_none());
     }
 }

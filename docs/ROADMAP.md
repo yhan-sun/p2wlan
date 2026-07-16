@@ -60,7 +60,7 @@ Date: 2026-07-16
 - packet pump：TUN <-> WireGuard <-> UDP。
 - CLI：`p2wlan peer add`、`p2wlan status`。
 
-当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send；下一步补 UDP inbound decrypt -> TUN write 与控制面自动会话安装。
+当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send，以及 UDP inbound -> WireGuard decrypt -> TUN write；下一步补控制面自动 WireGuard 会话安装。
 
 验收标准：
 
