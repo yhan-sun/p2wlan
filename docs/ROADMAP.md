@@ -60,7 +60,7 @@ Date: 2026-07-16
 - packet pump：TUN <-> WireGuard <-> UDP。
 - CLI：`p2wlan peer add`、`p2wlan status`。
 
-当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write、控制面自动 WireGuard handshake/session 安装、host/STUN candidates 收集、offer/answer 交换、peer endpoint 选择，以及 UDP punch probe/ACK 处理和 direct keepalive；无 TUN/root smoke 已覆盖两 daemon 的 candidate 准备和 punch probe；下一步补更完整的打洞重试/诊断状态机与真实双节点 TUN ping 验证。
+当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write、控制面自动 WireGuard handshake/session 安装、host/STUN candidates 收集、offer/answer 交换、peer endpoint 选择、UDP punch probe/ACK 处理、direct keepalive，以及最小 relay fallback 数据面；无 TUN/root smoke 已覆盖两 daemon 的 candidate 准备和 punch probe；下一步补更完整的打洞重试/诊断状态机、真实双节点 TUN ping 验证、Relay 自动切换策略与 region 选择。
 
 验收标准：
 
@@ -119,6 +119,7 @@ Date: 2026-07-16
 - Relay server。
 - Relay session 注册和身份认证。
 - Relay frame 转发。
+- daemon relay fallback 数据面。
 - direct/relay 自动切换。
 - Relay region 选择。
 

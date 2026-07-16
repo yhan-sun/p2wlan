@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --punch-attempts 10
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --punch-attempts 10
 //! ```
 
 use p2pnet_daemon::{Config, Daemon};
@@ -183,6 +183,14 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
         arg_value(args, "--keepalive-interval-secs").and_then(|s| s.parse::<u64>().ok())
     {
         config.network.keepalive_interval_secs = interval_secs;
+    }
+    if let Some(relay_servers) = arg_value(args, "--relay") {
+        config.relay.servers = relay_servers
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
     }
     if let Some(name) = arg_value(args, "--device-name") {
         config.node.device_name = name.to_string();

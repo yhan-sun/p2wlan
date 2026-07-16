@@ -37,6 +37,7 @@ pub mod dns;
 pub mod error;
 pub mod peer;
 pub mod port_mapping;
+pub mod relay;
 pub mod transport;
 pub mod udp;
 
@@ -67,7 +68,8 @@ use p2pnet_wireguard::{
 };
 use peer::{ConnectionState, PeerManager};
 use port_mapping::PortMappingManager;
-use transport::{log_encrypted_packets, EncryptedPeerPacket, WireGuardTransport};
+use relay::RelayTransport;
+use transport::{EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
 
 /// The main daemon orchestrator.
@@ -92,6 +94,8 @@ pub struct Daemon {
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Bound UDP transport shared with control-plane-triggered punching.
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    /// Relay transport used when direct UDP is unavailable.
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     /// Port mapping manager.
     port_mappings: Arc<PortMappingManager>,
     /// DNS resolver.
@@ -117,6 +121,7 @@ impl Daemon {
             pending_handshakes: HashMap::new(),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             udp_transport: Arc::new(RwLock::new(None)),
+            relay_transport: Arc::new(RwLock::new(None)),
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -149,8 +154,20 @@ impl Daemon {
         let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
         let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
         let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
+        let relay_endpoint = self
+            .config
+            .relay
+            .servers
+            .iter()
+            .find(|endpoint| endpoint.parse::<SocketAddr>().is_ok())
+            .cloned();
 
-        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(1024);
+        let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
+        tokio::spawn(run_network_outbound(
+            encrypted_rx,
+            self.udp_transport.clone(),
+            self.relay_transport.clone(),
+        ));
         if let Some(tun) = tun {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
@@ -166,7 +183,7 @@ impl Daemon {
             let inbound_transport = transport.clone();
             tokio::spawn(async move {
                 if let Err(err) = inbound_transport
-                    .run_inbound(udp_inbound_rx, inbound_tx)
+                    .run_inbound(network_inbound_rx, inbound_tx)
                     .await
                 {
                     warn!("WireGuard inbound transport stopped: {err}");
@@ -183,13 +200,36 @@ impl Daemon {
             let inbound_transport = self.transport.clone();
             tokio::spawn(async move {
                 if let Err(err) = inbound_transport
-                    .run_inbound(udp_inbound_rx, inbound_tx)
+                    .run_inbound(network_inbound_rx, inbound_tx)
                     .await
                 {
                     warn!("WireGuard inbound transport stopped: {err}");
                 }
             });
             tokio::spawn(log_inbound_packets_without_tun(inbound_rx));
+        }
+
+        if let Some(relay_endpoint) = relay_endpoint {
+            let relay_transport = self.relay_transport.clone();
+            let relay_peers = self.peers.clone();
+            let relay_node_id = self.config.node.node_id.clone();
+            let relay_inbound_tx = network_inbound_tx.clone();
+            tokio::spawn(async move {
+                match RelayTransport::connect(&relay_endpoint, &relay_node_id, relay_peers).await {
+                    Ok((relay, relay_rx)) => {
+                        info!("Relay transport connected to {relay_endpoint}");
+                        *relay_transport.write().await = Some(relay.clone());
+                        tokio::spawn(async move {
+                            if let Err(err) = relay.run_inbound(relay_rx, relay_inbound_tx).await {
+                                warn!("Relay inbound transport stopped: {err}");
+                            }
+                        });
+                    }
+                    Err(err) => warn!("Relay transport unavailable at {relay_endpoint}: {err}"),
+                }
+            });
+        } else {
+            debug!("No socket-address relay servers configured; relay fallback disabled");
         }
 
         let peers = self.peers.clone();
@@ -242,18 +282,14 @@ impl Daemon {
                     );
                     *local_candidates.write().await = candidate_endpoints;
 
-                    tokio::spawn(udp.clone().run_outbound(encrypted_rx));
                     tokio::spawn(async move {
-                        if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
+                        if let Err(err) = udp.run_inbound(network_inbound_tx).await {
                             warn!("UDP inbound transport stopped: {err}");
                         }
                     });
                 }
                 Err(err) => {
-                    warn!(
-                        "UDP transport unavailable ({err}); encrypted packets will be logged only"
-                    );
-                    tokio::spawn(log_encrypted_packets(encrypted_rx));
+                    warn!("UDP transport unavailable ({err}); direct UDP disabled");
                 }
             }
         });
@@ -606,6 +642,48 @@ fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> 
     Some(local_addr.to_string())
 }
 
+async fn run_network_outbound(
+    mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+) {
+    while let Some(packet) = encrypted_rx.recv().await {
+        let sent_direct = if let Some(udp) = udp_transport.read().await.clone() {
+            match udp.send_packet(&packet).await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(err) => {
+                    warn!(
+                        "Direct UDP send failed for peer {}; trying relay fallback: {err}",
+                        packet.peer_id
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if sent_direct {
+            continue;
+        }
+
+        if let Some(relay) = relay_transport.read().await.clone() {
+            if let Err(err) = relay.send_packet(&packet).await {
+                warn!(
+                    "Relay fallback send failed for peer {}: {err}",
+                    packet.peer_id
+                );
+            }
+        } else {
+            debug!(
+                "Encrypted packet for peer {} has no direct UDP path and no relay fallback",
+                packet.peer_id
+            );
+        }
+    }
+}
+
 async fn log_inbound_packets_without_tun(mut inbound_rx: mpsc::Receiver<InboundPacket>) {
     while let Some(packet) = inbound_rx.recv().await {
         debug!(
@@ -690,6 +768,63 @@ mod tests {
     fn test_parse_stun_servers_rejects_invalid_endpoint() {
         let err = parse_stun_servers(&["not-a-socket".to_string()]).unwrap_err();
         assert!(err.to_string().contains("invalid STUN server"));
+    }
+
+    #[tokio::test]
+    async fn test_network_outbound_uses_relay_when_udp_unavailable() {
+        let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+        let relay_endpoint = server.addr.to_string();
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: String::new(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers)
+            .await
+            .unwrap();
+        let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+            .await
+            .unwrap();
+
+        let udp_transport = Arc::new(RwLock::new(None));
+        let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(4);
+        let worker = tokio::spawn(run_network_outbound(
+            encrypted_rx,
+            udp_transport,
+            relay_transport,
+        ));
+
+        let payload = vec![4, 9, 8, 7, 6];
+        encrypted_tx
+            .send(EncryptedPeerPacket {
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                wire_bytes: payload.clone(),
+            })
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.from_node, "node-a");
+        assert_eq!(received.data, payload);
+
+        worker.abort();
+        server.shutdown().await;
     }
 
     #[tokio::test]
