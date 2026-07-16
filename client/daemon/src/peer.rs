@@ -24,6 +24,7 @@ use crate::control::PeerInfo;
 
 /// The state of a peer connection attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     /// No connection attempted yet.
     Idle,
@@ -60,6 +61,7 @@ impl std::fmt::Display for ConnectionState {
 
 /// The transport path used for peer traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkPath {
     /// Direct UDP path.
     Direct,
@@ -827,6 +829,18 @@ mod tests {
             manager
                 .should_use_direct_for_data("peer1", true, true)
                 .await
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_enums_serialize_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ConnectionState::HolePunching).unwrap(),
+            "\"hole_punching\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkPath::Direct).unwrap(),
+            "\"direct\""
         );
     }
 
