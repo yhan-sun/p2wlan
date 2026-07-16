@@ -62,6 +62,9 @@ impl RelayTransport {
         self.peers
             .set_relay(&packet.peer_id, &self.relay_endpoint)
             .await;
+        self.peers
+            .record_sent(&packet.peer_id, packet.wire_bytes.len() as u64)
+            .await;
         debug!(
             "Sent {} encrypted bytes to peer {} through relay {}",
             packet.wire_bytes.len(),
@@ -88,7 +91,7 @@ impl RelayTransport {
             }
 
             self.peers
-                .set_relay(&message.from_node, &self.relay_endpoint)
+                .record_relay_success(&message.from_node, &self.relay_endpoint, false)
                 .await;
             inbound_tx
                 .send(ReceivedEncryptedPacket {

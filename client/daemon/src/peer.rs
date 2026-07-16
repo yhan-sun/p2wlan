@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -58,6 +58,56 @@ impl std::fmt::Display for ConnectionState {
     }
 }
 
+/// The transport path used for peer traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkPath {
+    /// Direct UDP path.
+    Direct,
+    /// Relay fallback path.
+    Relay,
+}
+
+impl std::fmt::Display for NetworkPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => write!(f, "direct"),
+            Self::Relay => write!(f, "relay"),
+        }
+    }
+}
+
+/// Health counters for one transport path.
+#[derive(Debug, Clone, Default)]
+pub struct PathHealth {
+    /// Last successful path event.
+    pub last_success_at: Option<Instant>,
+    /// Last failed path event.
+    pub last_failure_at: Option<Instant>,
+    /// Consecutive failures since the last success.
+    pub consecutive_failures: u32,
+    /// Last diagnostic error for this path.
+    pub last_error: Option<String>,
+}
+
+impl PathHealth {
+    fn record_success(&mut self) {
+        self.last_success_at = Some(Instant::now());
+        self.consecutive_failures = 0;
+        self.last_error = None;
+    }
+
+    fn record_failure(&mut self, reason: impl Into<String>) {
+        self.last_failure_at = Some(Instant::now());
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error = Some(reason.into());
+    }
+
+    fn failure_age(&self) -> Option<Duration> {
+        self.last_failure_at
+            .map(|last_failure| last_failure.elapsed())
+    }
+}
+
 // ============================================================
 // Peer Connection
 // ============================================================
@@ -85,6 +135,10 @@ pub struct PeerConnection {
     pub relay_server: Option<String>,
     /// ICE candidates for this peer.
     pub candidates: Vec<String>,
+    /// Direct UDP path health.
+    pub direct_health: PathHealth,
+    /// Relay path health.
+    pub relay_health: PathHealth,
 }
 
 impl PeerConnection {
@@ -101,6 +155,8 @@ impl PeerConnection {
             bytes_received: 0,
             relay_server: None,
             candidates: Vec::new(),
+            direct_health: PathHealth::default(),
+            relay_health: PathHealth::default(),
         }
     }
 
@@ -116,14 +172,27 @@ impl PeerConnection {
 
     /// Transition to a new state.
     pub fn transition(&mut self, new_state: ConnectionState) {
-        info!(
-            "Peer {} state: {} → {}",
-            self.node_id, self.state, new_state
-        );
+        if self.state != new_state {
+            info!(
+                "Peer {} state: {} → {}",
+                self.node_id, self.state, new_state
+            );
+        }
         if new_state == ConnectionState::Direct || new_state == ConnectionState::Relay {
-            self.connected_at = Some(Instant::now());
+            if self.connected_at.is_none() {
+                self.connected_at = Some(Instant::now());
+            }
         }
         self.state = new_state;
+    }
+
+    /// Current selected traffic path, if active.
+    pub fn active_path(&self) -> Option<NetworkPath> {
+        match self.state {
+            ConnectionState::Direct => Some(NetworkPath::Direct),
+            ConnectionState::Relay => Some(NetworkPath::Relay),
+            _ => None,
+        }
     }
 
     /// Record bytes sent.
@@ -237,6 +306,7 @@ impl PeerManager {
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);
+                conn.direct_health.record_success();
                 conn.transition(ConnectionState::Direct);
                 return Some(node_id.clone());
             }
@@ -259,11 +329,120 @@ impl PeerManager {
             .collect()
     }
 
+    /// Return candidate endpoints that should continue receiving direct-path probes.
+    pub async fn direct_probe_targets(&self) -> Vec<(String, Vec<SocketAddr>)> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| conn.state != ConnectionState::Direct)
+            .filter_map(|conn| {
+                let mut endpoints = Vec::new();
+                for candidate in &conn.candidates {
+                    if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
+                        if !endpoints.contains(&endpoint) {
+                            endpoints.push(endpoint);
+                        }
+                    }
+                }
+                if let Some(endpoint) = conn.endpoint {
+                    if !endpoints.contains(&endpoint) {
+                        endpoints.push(endpoint);
+                    }
+                }
+
+                if endpoints.is_empty() {
+                    None
+                } else {
+                    Some((conn.node_id.clone(), endpoints))
+                }
+            })
+            .collect()
+    }
+
+    /// Whether encrypted data should use direct UDP for this peer right now.
+    pub async fn should_use_direct_for_data(
+        &self,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+    ) -> bool {
+        let Some(conn) = self.connections.read().await.get(node_id).cloned() else {
+            return false;
+        };
+
+        if !prefer_direct || conn.endpoint.is_none() {
+            return false;
+        }
+
+        if conn.state == ConnectionState::Direct {
+            return true;
+        }
+
+        !relay_available
+    }
+
+    /// Whether direct retry suppression has expired for diagnostics/probing.
+    pub async fn direct_retry_due(&self, node_id: &str, retry_after: Duration) -> bool {
+        let Some(conn) = self.connections.read().await.get(node_id).cloned() else {
+            return false;
+        };
+
+        conn.direct_health
+            .failure_age()
+            .map(|age| age >= retry_after)
+            .unwrap_or(true)
+    }
+
+    /// Whether the peer currently has a verified direct path.
+    pub async fn is_direct(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(|conn| conn.state == ConnectionState::Direct)
+            .unwrap_or(false)
+    }
+
+    /// Record a successful direct-path event.
+    pub async fn record_direct_success(&self, node_id: &str, endpoint: Option<SocketAddr>) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            if let Some(endpoint) = endpoint {
+                conn.endpoint = Some(endpoint);
+            }
+            conn.direct_health.record_success();
+            conn.transition(ConnectionState::Direct);
+        }
+    }
+
+    /// Record a failed direct-path event and enter relay fallback state.
+    pub async fn record_direct_failure(&self, node_id: &str, reason: impl Into<String>) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.direct_health.record_failure(reason);
+            if conn.state != ConnectionState::Relay {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+    }
+
     /// Set the relay server for a peer.
     pub async fn set_relay(&self, node_id: &str, relay_server: &str) {
+        self.record_relay_success(node_id, relay_server, true).await;
+    }
+
+    /// Record a successful relay-path event.
+    pub async fn record_relay_success(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+    ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.relay_server = Some(relay_server.to_string());
-            conn.transition(ConnectionState::Relay);
+            conn.relay_health.record_success();
+            if switch_to_relay || conn.state != ConnectionState::Direct {
+                conn.transition(ConnectionState::Relay);
+            }
         }
     }
 
@@ -509,6 +688,91 @@ mod tests {
             manager.direct_endpoints().await,
             vec![("peer1".to_string(), selected_endpoint)]
         );
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_path_health_drives_data_path() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51822".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        assert!(
+            !manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
+        assert!(
+            manager
+                .should_use_direct_for_data("peer1", true, false)
+                .await
+        );
+
+        manager
+            .record_direct_failure("peer1", "probe timeout")
+            .await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        assert_eq!(conn.direct_health.consecutive_failures, 1);
+        assert_eq!(
+            conn.direct_health.last_error.as_deref(),
+            Some("probe timeout")
+        );
+
+        manager.set_relay("peer1", "127.0.0.1:9000").await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Relay);
+        assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
+        assert!(conn.relay_health.last_success_at.is_some());
+
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
+        assert_eq!(conn.direct_health.consecutive_failures, 0);
+        assert!(
+            manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_direct_probe_targets_exclude_direct_peers() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51823".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        assert_eq!(
+            manager.direct_probe_targets().await,
+            vec![("peer1".to_string(), vec![endpoint])]
+        );
+
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        assert!(manager.direct_probe_targets().await.is_empty());
     }
 
     #[tokio::test]
