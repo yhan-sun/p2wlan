@@ -223,6 +223,42 @@ impl PeerManager {
         }
     }
 
+    /// Select a candidate endpoint after receiving traffic from that address.
+    pub async fn select_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
+        let mut conns = self.connections.write().await;
+
+        for (node_id, conn) in conns.iter_mut() {
+            let matches_candidate = conn
+                .candidates
+                .iter()
+                .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+                .any(|candidate| candidate == endpoint);
+            let matches_current = conn.endpoint == Some(endpoint);
+
+            if matches_candidate || matches_current {
+                conn.endpoint = Some(endpoint);
+                conn.transition(ConnectionState::Direct);
+                return Some(node_id.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Return direct UDP endpoints for NAT keepalive probes.
+    pub async fn direct_endpoints(&self) -> Vec<(String, SocketAddr)> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| conn.state == ConnectionState::Direct)
+            .filter_map(|conn| {
+                conn.endpoint
+                    .map(|endpoint| (conn.node_id.clone(), endpoint))
+            })
+            .collect()
+    }
+
     /// Set the relay server for a peer.
     pub async fn set_relay(&self, node_id: &str, relay_server: &str) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
@@ -440,6 +476,39 @@ mod tests {
 
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.endpoint, Some("127.0.0.1:51820".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_selects_endpoint_from_probe_source() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+
+        let peer_info = PeerInfo {
+            node_id: "peer1".to_string(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+        };
+        let selected_endpoint: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+
+        manager.add_peer(&peer_info).await;
+        manager
+            .add_candidates("peer1", &[selected_endpoint.to_string()])
+            .await;
+
+        let selected = manager.select_endpoint_from_addr(selected_endpoint).await;
+        assert_eq!(selected, Some("peer1".to_string()));
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.endpoint, Some(selected_endpoint));
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(
+            manager.direct_endpoints().await,
+            vec![("peer1".to_string(), selected_endpoint)]
+        );
     }
 
     #[tokio::test]

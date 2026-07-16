@@ -8,9 +8,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use p2pnet_nat::{gather_candidates, IceConfig};
+use p2pnet_nat::{
+    build_punch_ack, decode_punch_packet, gather_candidates, send_keepalive, send_punch, IceConfig,
+    PunchPacketKind,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::time::{interval, sleep};
 use tracing::{debug, trace, warn};
 
 use crate::error::{DaemonError, Result};
@@ -65,6 +69,48 @@ impl UdpTransport {
             .into_iter()
             .map(|candidate| candidate.endpoint.to_string())
             .collect())
+    }
+
+    /// Send active UDP probes to every candidate for a peer.
+    pub async fn punch_candidates(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<u32> {
+        if candidates.is_empty() || attempts == 0 {
+            return Ok(0);
+        }
+
+        let mut packets_sent = 0;
+        for attempt in 0..attempts {
+            for &candidate in &candidates {
+                match send_punch(&self.socket, candidate).await {
+                    Ok(()) => {
+                        packets_sent += 1;
+                        trace!(
+                            "Sent punch probe {} to peer {} candidate {}",
+                            attempt + 1,
+                            peer_id,
+                            candidate
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to send punch probe to peer {} candidate {}: {}",
+                            peer_id, candidate, err
+                        );
+                    }
+                }
+            }
+
+            if attempt + 1 < attempts {
+                sleep(probe_interval).await;
+            }
+        }
+
+        Ok(packets_sent)
     }
 
     /// Send a single encrypted packet.
@@ -136,6 +182,31 @@ impl UdpTransport {
         }
     }
 
+    /// Periodically refresh direct UDP NAT mappings.
+    pub async fn run_keepalives(self, keepalive_interval: Duration) {
+        if keepalive_interval.is_zero() {
+            return;
+        }
+
+        let mut ticker = interval(keepalive_interval);
+        loop {
+            ticker.tick().await;
+
+            for (peer_id, endpoint) in self.peers.direct_endpoints().await {
+                match send_keepalive(&self.socket, endpoint).await {
+                    Ok(()) => {
+                        trace!("Sent direct UDP keepalive to peer {peer_id} at {endpoint}");
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to send direct UDP keepalive to peer {peer_id} at {endpoint}: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Receive encrypted UDP datagrams until the socket or channel closes.
     pub async fn run_inbound(
         self,
@@ -149,6 +220,30 @@ impl UdpTransport {
             })?;
 
             if n == 0 {
+                continue;
+            }
+
+            if let Some(packet) = decode_punch_packet(&buf[..n]) {
+                match packet.kind {
+                    PunchPacketKind::Punch => {
+                        let ack = build_punch_ack(packet.nonce);
+                        match self.socket.send_to(&ack, source).await {
+                            Ok(_) => debug!("Received UDP punch from {source}; sent ACK"),
+                            Err(err) => warn!("Failed to ACK UDP punch from {source}: {err}"),
+                        }
+
+                        if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
+                            debug!("Selected direct UDP endpoint {source} for peer {peer_id}");
+                        }
+                    }
+                    PunchPacketKind::Ack => {
+                        if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
+                            debug!("Received UDP punch ACK from peer {peer_id} at {source}");
+                        } else {
+                            trace!("Received UDP punch ACK from unknown candidate {source}");
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -236,6 +331,32 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.ends_with(&format!(":{local_port}"))));
+    }
+
+    #[tokio::test]
+    async fn punch_candidates_sends_probe_datagrams() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+
+        let sent = transport
+            .punch_candidates("peer-b", vec![receiver_addr], Duration::from_millis(10), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(sent, 2);
+
+        let mut buf = [0u8; 64];
+        let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = decode_punch_packet(&buf[..n]).unwrap();
+        assert_eq!(packet.kind, PunchPacketKind::Punch);
     }
 
     #[tokio::test]
@@ -357,6 +478,48 @@ mod tests {
             .unwrap();
         assert_eq!(received.source, Some(sender.local_addr().unwrap()));
         assert_eq!(received.wire_bytes, payload);
+
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn run_inbound_acks_punch_and_does_not_forward_to_wireguard() {
+        let peers = peer_manager();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+
+        peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
+        peers
+            .add_candidates("peer-b", &[sender_addr.to_string()])
+            .await;
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.run_inbound(tx));
+
+        sender
+            .send_to(&p2pnet_nat::build_punch_packet(), local_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _from) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack = decode_punch_packet(&buf[..n]).unwrap();
+        assert_eq!(ack.kind, PunchPacketKind::Ack);
+
+        assert!(timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+
+        let conn = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(conn.endpoint, Some(sender_addr));
+        assert_eq!(conn.state.to_string(), "direct");
 
         worker.abort();
     }

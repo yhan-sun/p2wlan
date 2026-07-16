@@ -98,6 +98,15 @@ pub struct NetworkConfig {
     /// Timeout for each STUN query in milliseconds.
     #[serde(default = "default_stun_timeout_ms")]
     pub stun_timeout_ms: u64,
+    /// Interval between active UDP hole-punch probes in milliseconds.
+    #[serde(default = "default_punch_interval_ms")]
+    pub punch_interval_ms: u64,
+    /// Number of active probe rounds sent to each peer candidate.
+    #[serde(default = "default_punch_attempts")]
+    pub punch_attempts: u32,
+    /// Periodic direct-path NAT keepalive interval in seconds.
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u64,
 }
 
 fn default_cidr() -> String {
@@ -117,6 +126,15 @@ fn default_udp_bind() -> String {
 }
 fn default_stun_timeout_ms() -> u64 {
     1500
+}
+fn default_punch_interval_ms() -> u64 {
+    200
+}
+fn default_punch_attempts() -> u32 {
+    10
+}
+fn default_keepalive_interval_secs() -> u64 {
+    25
 }
 
 /// Control plane server configuration.
@@ -306,6 +324,9 @@ impl Config {
                 udp_advertise: None,
                 stun_servers: Vec::new(),
                 stun_timeout_ms: default_stun_timeout_ms(),
+                punch_interval_ms: default_punch_interval_ms(),
+                punch_attempts: default_punch_attempts(),
+                keepalive_interval_secs: default_keepalive_interval_secs(),
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -384,6 +405,18 @@ mod tests {
             decoded.network.stun_timeout_ms,
             config.network.stun_timeout_ms
         );
+        assert_eq!(
+            decoded.network.punch_interval_ms,
+            config.network.punch_interval_ms
+        );
+        assert_eq!(
+            decoded.network.punch_attempts,
+            config.network.punch_attempts
+        );
+        assert_eq!(
+            decoded.network.keepalive_interval_secs,
+            config.network.keepalive_interval_secs
+        );
     }
 
     #[test]
@@ -423,6 +456,9 @@ mod tests {
         assert_eq!(decoded.network.udp_advertise, None);
         assert!(decoded.network.stun_servers.is_empty());
         assert_eq!(decoded.network.stun_timeout_ms, 1500);
+        assert_eq!(decoded.network.punch_interval_ms, 200);
+        assert_eq!(decoded.network.punch_attempts, 10);
+        assert_eq!(decoded.network.keepalive_interval_secs, 25);
     }
 
     #[test]
@@ -484,5 +520,8 @@ mod tests {
         assert_eq!(config.network.udp_advertise, None);
         assert!(config.network.stun_servers.is_empty());
         assert_eq!(config.network.stun_timeout_ms, 1500);
+        assert_eq!(config.network.punch_interval_ms, 200);
+        assert_eq!(config.network.punch_attempts, 10);
+        assert_eq!(config.network.keepalive_interval_secs, 25);
     }
 }

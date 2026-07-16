@@ -26,7 +26,10 @@ pub use error::{NatError, Result};
 pub use ice::{
     candidates_to_addrs, compute_priority, gather_candidates, gather_local_addresses, IceConfig,
 };
-pub use punch::{hole_punch, send_keepalive, PunchConfig, PunchResult};
+pub use punch::{
+    build_punch_ack, build_punch_packet, decode_punch_packet, hole_punch, send_keepalive,
+    send_punch, DecodedPunchPacket, PunchConfig, PunchPacketKind, PunchResult,
+};
 pub use stun::{
     compute_fingerprint, crc32, StunAttribute, StunMessage, BINDING_ERROR_RESPONSE,
     BINDING_REQUEST, BINDING_RESPONSE, MAGIC_COOKIE,
