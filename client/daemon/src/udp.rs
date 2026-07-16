@@ -161,6 +161,7 @@ impl UdpTransport {
             "Sent {} encrypted bytes to peer {} at {} (dst={})",
             sent, packet.peer_id, endpoint, packet.dst_ip
         );
+        self.peers.record_sent(&packet.peer_id, sent as u64).await;
         Ok(Some(sent))
     }
 
@@ -198,6 +199,12 @@ impl UdpTransport {
                         trace!("Sent direct UDP keepalive to peer {peer_id} at {endpoint}");
                     }
                     Err(err) => {
+                        self.peers
+                            .record_direct_failure(
+                                &peer_id,
+                                format!("direct keepalive to {endpoint} failed: {err}"),
+                            )
+                            .await;
                         debug!(
                             "Failed to send direct UDP keepalive to peer {peer_id} at {endpoint}: {err}"
                         );
@@ -245,6 +252,10 @@ impl UdpTransport {
                     }
                 }
                 continue;
+            }
+
+            if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
+                debug!("Confirmed direct UDP data path {source} for peer {peer_id}");
             }
 
             inbound_tx

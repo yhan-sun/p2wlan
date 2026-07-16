@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --punch-attempts 10
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --relay-fallback-timeout-ms 5000 --punch-attempts 10
 //! ```
 
 use p2pnet_daemon::{Config, Daemon};
@@ -191,6 +191,17 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .collect();
+    }
+    if let Some(timeout_ms) =
+        arg_value(args, "--relay-fallback-timeout-ms").and_then(|s| s.parse::<u64>().ok())
+    {
+        config.relay.fallback_timeout_ms = timeout_ms;
+    }
+    if args.iter().any(|a| a == "--prefer-relay") {
+        config.relay.prefer_direct = false;
+    }
+    if args.iter().any(|a| a == "--prefer-direct") {
+        config.relay.prefer_direct = true;
     }
     if let Some(name) = arg_value(args, "--device-name") {
         config.node.device_name = name.to_string();
