@@ -13,7 +13,7 @@ use tracing::{debug, trace, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
-use crate::transport::EncryptedPeerPacket;
+use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
@@ -110,6 +110,36 @@ impl UdpTransport {
             }
         }
     }
+
+    /// Receive encrypted UDP datagrams until the socket or channel closes.
+    pub async fn run_inbound(
+        self,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    ) -> Result<()> {
+        let mut buf = vec![0u8; 65_535];
+
+        loop {
+            let (n, source) = self.socket.recv_from(&mut buf).await.map_err(|e| {
+                DaemonError::Network(format!("UDP receive on direct transport failed: {e}"))
+            })?;
+
+            if n == 0 {
+                continue;
+            }
+
+            inbound_tx
+                .send(ReceivedEncryptedPacket {
+                    source: Some(source),
+                    wire_bytes: buf[..n].to_vec(),
+                })
+                .await
+                .map_err(|_| {
+                    DaemonError::Network("received encrypted packet channel closed".to_string())
+                })?;
+
+            debug!("Received {n} encrypted UDP bytes from {source}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +148,7 @@ mod tests {
     use std::time::Duration;
 
     use p2pnet_crypto::NodeIdentity;
-    use p2pnet_tun::Ipv4Packet;
+    use p2pnet_tun::{Ipv4Packet, MockTunDevice};
     use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -126,6 +156,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::control::PeerInfo;
+    use crate::dataplane::DataPlane;
+    use crate::transport::WireGuardTransport;
 
     fn peer(node_id: &str, virtual_ip: &str, endpoint: Option<SocketAddr>) -> PeerInfo {
         PeerInfo {
@@ -259,5 +291,79 @@ mod tests {
         assert_eq!(decrypted, ip_packet);
 
         worker.abort();
+    }
+
+    #[tokio::test]
+    async fn run_inbound_emits_received_encrypted_datagram() {
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.run_inbound(tx));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = vec![4, 9, 8, 7, 6, 5];
+        sender.send_to(&payload, local_addr).await.unwrap();
+
+        let received = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.source, Some(sender.local_addr().unwrap()));
+        assert_eq!(received.wire_bytes, payload);
+
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_inbound_decrypts_and_writes_packet_to_tun() {
+        let peers = peer_manager();
+        peers.add_peer(&peer("peer-a", "10.20.0.1", None)).await;
+
+        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.2");
+        let (mut dataplane, _outbound_rx, inbound_tx) =
+            DataPlane::new_bidirectional(tun, peers.clone());
+        let dataplane_worker = tokio::spawn(async move { dataplane.run().await });
+
+        let (mut node_a_session, node_b_session) = establish_sessions();
+        let (wireguard, _encrypted_rx) = WireGuardTransport::new();
+        wireguard.add_session("peer-a", node_b_session).await;
+        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(4);
+        let wireguard_worker = {
+            let wireguard = wireguard.clone();
+            tokio::spawn(async move { wireguard.run_inbound(udp_inbound_rx, inbound_tx).await })
+        };
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let udp_worker = tokio::spawn(udp.run_inbound(udp_inbound_tx));
+
+        let ip_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        let wire_bytes = node_a_session.encrypt_to_bytes(&ip_packet).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&wire_bytes, udp_addr).await.unwrap();
+
+        let written = timeout(Duration::from_secs(1), ctrl.recv_written())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, ip_packet);
+
+        let conn = peers.get_connection("peer-a").await.unwrap();
+        assert_eq!(conn.bytes_received, written.len() as u64);
+
+        udp_worker.abort();
+        wireguard_worker.abort();
+        dataplane_worker.abort();
     }
 }

@@ -51,7 +51,7 @@ pub use error::{DaemonError, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use acl::AclEngine;
@@ -122,15 +122,28 @@ impl Daemon {
             })?;
             let udp_advertise = self.config.network.udp_advertise.clone();
             tokio::spawn(async move {
-                let (mut dataplane, outbound_rx) = DataPlane::new(tun, peers.clone());
+                let (mut dataplane, outbound_rx, inbound_tx) =
+                    DataPlane::new_bidirectional(tun, peers.clone());
                 let (transport, encrypted_rx) = WireGuardTransport::new();
+                let outbound_transport = transport.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = transport.run_outbound(outbound_rx).await {
+                    if let Err(err) = outbound_transport.run_outbound(outbound_rx).await {
                         warn!("WireGuard transport stopped: {err}");
                     }
                 });
                 match UdpTransport::bind(udp_bind, peers).await {
                     Ok(udp) => {
+                        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(1024);
+                        let inbound_transport = transport.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = inbound_transport
+                                .run_inbound(udp_inbound_rx, inbound_tx)
+                                .await
+                            {
+                                warn!("WireGuard inbound transport stopped: {err}");
+                            }
+                        });
+
                         match udp.local_addr() {
                             Ok(addr) => {
                                 if let Some(endpoint) =
@@ -154,7 +167,12 @@ impl Daemon {
                                 warn!("UDP transport bound but local addr unavailable: {err}")
                             }
                         }
-                        tokio::spawn(udp.run_outbound(encrypted_rx));
+                        tokio::spawn(udp.clone().run_outbound(encrypted_rx));
+                        tokio::spawn(async move {
+                            if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
+                                warn!("UDP inbound transport stopped: {err}");
+                            }
+                        });
                     }
                     Err(err) => {
                         warn!(
