@@ -38,6 +38,7 @@ pub mod error;
 pub mod peer;
 pub mod port_mapping;
 pub mod transport;
+pub mod udp;
 
 // Re-export key types
 pub use config::Config;
@@ -47,6 +48,7 @@ pub use error::{DaemonError, Result};
 // Daemon
 // ============================================================
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -60,6 +62,7 @@ use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use peer::PeerManager;
 use port_mapping::PortMappingManager;
 use transport::{log_encrypted_packets, WireGuardTransport};
+use udp::UdpTransport;
 
 /// The main daemon orchestrator.
 ///
@@ -68,7 +71,7 @@ pub struct Daemon {
     /// Configuration.
     config: Arc<Config>,
     /// Control plane client.
-    _control: ControlClient,
+    control: ControlClient,
     /// Control event receiver.
     control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlEvent>,
     /// Peer connection manager.
@@ -89,7 +92,7 @@ impl Daemon {
 
         Self {
             config: Arc::new(config.clone()),
-            _control: control,
+            control,
             control_rx,
             peers: Arc::new(PeerManager::new(config.clone())),
             port_mappings: Arc::new(PortMappingManager::new()),
@@ -110,15 +113,56 @@ impl Daemon {
 
         if let Some(tun) = self.init_tun()? {
             let peers = self.peers.clone();
+            let control = self.control.clone();
+            let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
+                DaemonError::Config(format!(
+                    "invalid network.udp_bind '{}': {e}",
+                    self.config.network.udp_bind
+                ))
+            })?;
+            let udp_advertise = self.config.network.udp_advertise.clone();
             tokio::spawn(async move {
-                let (mut dataplane, outbound_rx) = DataPlane::new(tun, peers);
+                let (mut dataplane, outbound_rx) = DataPlane::new(tun, peers.clone());
                 let (transport, encrypted_rx) = WireGuardTransport::new();
                 tokio::spawn(async move {
                     if let Err(err) = transport.run_outbound(outbound_rx).await {
                         warn!("WireGuard transport stopped: {err}");
                     }
                 });
-                tokio::spawn(log_encrypted_packets(encrypted_rx));
+                match UdpTransport::bind(udp_bind, peers).await {
+                    Ok(udp) => {
+                        match udp.local_addr() {
+                            Ok(addr) => {
+                                if let Some(endpoint) =
+                                    advertised_udp_endpoint(addr, udp_advertise.as_deref())
+                                {
+                                    info!(
+                                        "UDP transport listening on {addr}; advertising {endpoint}"
+                                    );
+                                    if let Err(err) =
+                                        control.update_endpoint(&endpoint, "unknown").await
+                                    {
+                                        warn!("Failed to queue UDP endpoint update: {err}");
+                                    }
+                                } else {
+                                    warn!(
+                                        "UDP transport listening on {addr}; endpoint not advertised because bind address is unspecified. Set --udp-advertise to publish a reachable endpoint."
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                warn!("UDP transport bound but local addr unavailable: {err}")
+                            }
+                        }
+                        tokio::spawn(udp.run_outbound(encrypted_rx));
+                    }
+                    Err(err) => {
+                        warn!(
+                            "UDP transport unavailable ({err}); encrypted packets will be logged only"
+                        );
+                        tokio::spawn(log_encrypted_packets(encrypted_rx));
+                    }
+                }
 
                 if let Err(err) = dataplane.run().await {
                     warn!("Data plane stopped: {err}");
@@ -279,6 +323,21 @@ impl Daemon {
     }
 }
 
+fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> Option<String> {
+    if let Some(endpoint) = configured
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        return Some(endpoint.to_string());
+    }
+
+    if local_addr.ip().is_unspecified() {
+        return None;
+    }
+
+    Some(local_addr.to_string())
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -291,6 +350,30 @@ mod tests {
     fn test_daemon_creation() {
         let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
         let _daemon = Daemon::new(config);
+    }
+
+    #[test]
+    fn test_advertised_udp_endpoint_uses_configured_value() {
+        let local = "0.0.0.0:51820".parse().unwrap();
+        assert_eq!(
+            advertised_udp_endpoint(local, Some("203.0.113.10:51820")),
+            Some("203.0.113.10:51820".to_string())
+        );
+    }
+
+    #[test]
+    fn test_advertised_udp_endpoint_skips_unspecified_address() {
+        let local = "0.0.0.0:51820".parse().unwrap();
+        assert_eq!(advertised_udp_endpoint(local, None), None);
+    }
+
+    #[test]
+    fn test_advertised_udp_endpoint_uses_specific_bind_address() {
+        let local = "127.0.0.1:51820".parse().unwrap();
+        assert_eq!(
+            advertised_udp_endpoint(local, None),
+            Some("127.0.0.1:51820".to_string())
+        );
     }
 
     #[tokio::test]

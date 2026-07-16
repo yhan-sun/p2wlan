@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
 	"github.com/yhan-sun/p2wlan/server/database"
@@ -133,6 +134,41 @@ func (s *Server) ListNetworks(w http.ResponseWriter, r *http.Request) {
 			{"id": "default", "name": "Default Network", "cidr": "10.20.0.0/16"},
 		},
 	})
+}
+
+// UpdateDeviceEndpoint handles PATCH /api/v1/devices/{id}/endpoint.
+func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("id")
+	if strings.TrimSpace(deviceID) == "" {
+		http.Error(w, `{"error":"missing device id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Endpoint string `json:"endpoint"`
+		NATType  string `json:"nat_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	req.Endpoint = strings.TrimSpace(req.Endpoint)
+	req.NATType = strings.TrimSpace(req.NATType)
+	if req.Endpoint == "" {
+		http.Error(w, `{"error":"endpoint is required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.NATType == "" {
+		req.NATType = "unknown"
+	}
+
+	if err := s.db.UpdateDeviceEndpoint(deviceID, req.Endpoint, req.NATType); err != nil {
+		http.Error(w, `{"error":"endpoint update failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
 // DeleteDevice handles DELETE /api/v1/devices/{id}.

@@ -86,6 +86,12 @@ pub struct NetworkConfig {
     /// TUN interface name.
     #[serde(default = "default_interface")]
     pub interface: String,
+    /// Local UDP bind address for direct peer transport.
+    #[serde(default = "default_udp_bind")]
+    pub udp_bind: String,
+    /// Optional endpoint advertised to peers when it differs from the local bind address.
+    #[serde(default)]
+    pub udp_advertise: Option<String>,
 }
 
 fn default_cidr() -> String {
@@ -99,6 +105,9 @@ fn default_netmask() -> String {
 }
 fn default_interface() -> String {
     "p2pnet0".to_string()
+}
+fn default_udp_bind() -> String {
+    "0.0.0.0:0".to_string()
 }
 
 /// Control plane server configuration.
@@ -284,6 +293,8 @@ impl Config {
                 mtu: default_mtu(),
                 netmask: default_netmask(),
                 interface: default_interface(),
+                udp_bind: default_udp_bind(),
+                udp_advertise: None,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -355,6 +366,45 @@ mod tests {
         let decoded: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.node.node_id, config.node.node_id);
         assert_eq!(decoded.network.virtual_ip, config.network.virtual_ip);
+        assert_eq!(decoded.network.udp_bind, config.network.udp_bind);
+        assert_eq!(decoded.network.udp_advertise, config.network.udp_advertise);
+    }
+
+    #[test]
+    fn test_config_backward_compatible_udp_endpoint_defaults() {
+        let json = r#"{
+            "node": {
+                "node_id": "node1",
+                "public_key": "pub",
+                "private_key": "priv",
+                "device_name": "dev",
+                "platform": "linux"
+            },
+            "network": {
+                "network_id": "net1",
+                "virtual_ip": "10.20.0.1",
+                "cidr": "10.20.0.0/16",
+                "ipv6_cidr": null,
+                "mtu": 1420,
+                "netmask": "255.255.0.0",
+                "interface": "p2pnet0"
+            },
+            "control": {
+                "server_url": "http://ctrl",
+                "auth_token": "",
+                "reconnect_interval_secs": 5,
+                "heartbeat_interval_secs": 30
+            },
+            "relay": {
+                "servers": [],
+                "prefer_direct": true,
+                "fallback_timeout_ms": 5000
+            }
+        }"#;
+
+        let decoded: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.network.udp_bind, "0.0.0.0:0");
+        assert_eq!(decoded.network.udp_advertise, None);
     }
 
     #[test]
@@ -412,5 +462,7 @@ mod tests {
         assert_eq!(config.network.mtu, 1420);
         assert_eq!(config.network.netmask, "255.255.0.0");
         assert_eq!(config.network.interface, "p2pnet0");
+        assert_eq!(config.network.udp_bind, "0.0.0.0:0");
+        assert_eq!(config.network.udp_advertise, None);
     }
 }
