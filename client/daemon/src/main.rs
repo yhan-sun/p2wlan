@@ -63,7 +63,8 @@ async fn main() -> p2pnet_daemon::Result<()> {
             .map(|s| s.as_str())
             .unwrap_or("default");
 
-        let config = Config::generate_default(control_url, network_id)?;
+        let mut config = Config::generate_default(control_url, network_id)?;
+        apply_arg_overrides(&mut config, &args);
         let config_path = std::path::Path::new("p2pnet-config.json");
         config.save_to_file(config_path)?;
         info!("Config saved to {}", config_path.display());
@@ -107,11 +108,15 @@ async fn main() -> p2pnet_daemon::Result<()> {
             .map(|s| s.as_str())
             .unwrap_or("default");
 
-        let config = Config::generate_default(control_url, network_id)?;
+        let mut config = Config::generate_default(control_url, network_id)?;
+        apply_arg_overrides(&mut config, &args);
         config.save_to_file(&config_path)?;
         info!("Saved default config to {}", config_path.display());
         config
     };
+
+    let mut config = config;
+    apply_arg_overrides(&mut config, &args);
 
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);
@@ -119,4 +124,29 @@ async fn main() -> p2pnet_daemon::Result<()> {
     // Create and run the daemon
     let mut daemon = Daemon::new(config);
     daemon.run().await
+}
+
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+}
+
+fn apply_arg_overrides(config: &mut Config, args: &[String]) {
+    if let Some(token) = arg_value(args, "--token") {
+        config.control.auth_token = token.to_string();
+    }
+    if let Some(interface) = arg_value(args, "--interface") {
+        config.network.interface = interface.to_string();
+    }
+    if let Some(address) = arg_value(args, "--address") {
+        config.network.virtual_ip = address.to_string();
+    }
+    if let Some(mtu) = arg_value(args, "--mtu").and_then(|s| s.parse::<u32>().ok()) {
+        config.network.mtu = mtu;
+    }
+    if let Some(name) = arg_value(args, "--device-name") {
+        config.node.device_name = name.to_string();
+    }
 }

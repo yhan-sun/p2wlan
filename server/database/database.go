@@ -137,7 +137,22 @@ type Device struct {
 
 // CreateDevice inserts a new device and assigns a virtual IP.
 func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform string) (*Device, error) {
-	id := fmt.Sprintf("node-%s", publicKey[:16])
+	if existing, err := db.GetDeviceByPublicKey(networkID, publicKey); err == nil {
+		_, _ = db.Exec(`UPDATE devices SET user_id = ?, device_name = ?, platform = ?, last_seen = ?, online = 1 WHERE id = ?`,
+			userID, deviceName, platform, time.Now().Unix(), existing.ID)
+		existing.UserID = userID
+		existing.DeviceName = deviceName
+		existing.Platform = platform
+		existing.Online = true
+		existing.LastSeen = time.Now().Unix()
+		return existing, nil
+	}
+
+	idSuffix := publicKey
+	if len(idSuffix) > 16 {
+		idSuffix = idSuffix[:16]
+	}
+	id := fmt.Sprintf("node-%s", idSuffix)
 	now := time.Now().Unix()
 
 	// Assign virtual IP (simple: find next available in 10.20.x.x range)
@@ -158,6 +173,21 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 		PublicKey: publicKey, DeviceName: deviceName, Platform: platform,
 		VirtualIP: virtualIP, LastSeen: now, Online: true, CreatedAt: now,
 	}, nil
+}
+
+// GetDeviceByPublicKey looks up a device by network and public key.
+func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error) {
+	var d Device
+	var online int
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at
+		FROM devices WHERE network_id = ? AND public_key = ? LIMIT 1`, networkID, publicKey).
+		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &online, &d.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	d.Online = online == 1
+	return &d, nil
 }
 
 // assignVirtualIP finds the next available virtual IP in a network.

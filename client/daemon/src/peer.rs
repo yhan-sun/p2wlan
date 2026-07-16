@@ -148,7 +148,7 @@ pub struct PeerManager {
     /// Virtual IP → node ID mapping for routing.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Configuration.
-    config: Config,
+    _config: Config,
 }
 
 impl PeerManager {
@@ -157,7 +157,7 @@ impl PeerManager {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
-            config,
+            _config: config,
         }
     }
 
