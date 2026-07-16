@@ -51,6 +51,7 @@ pub use error::{DaemonError, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use p2pnet_crypto::NodeIdentity;
 use tokio::sync::{mpsc, RwLock};
@@ -87,6 +88,8 @@ pub struct Daemon {
     encrypted_rx: Option<mpsc::Receiver<EncryptedPeerPacket>>,
     /// In-flight initiator handshakes keyed by responder node ID.
     pending_handshakes: HashMap<String, HandshakeInitiator>,
+    /// Local UDP candidate endpoints advertised in signaling messages.
+    local_candidates: Arc<RwLock<Vec<String>>>,
     /// Port mapping manager.
     port_mappings: Arc<PortMappingManager>,
     /// DNS resolver.
@@ -110,6 +113,7 @@ impl Daemon {
             transport,
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: HashMap::new(),
+            local_candidates: Arc::new(RwLock::new(Vec::new())),
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -130,6 +134,7 @@ impl Daemon {
             let peers = self.peers.clone();
             let control = self.control.clone();
             let transport = self.transport.clone();
+            let local_candidates = self.local_candidates.clone();
             let Some(encrypted_rx) = self.encrypted_rx.take() else {
                 return Err(DaemonError::Network(
                     "encrypted packet receiver already attached".to_string(),
@@ -142,6 +147,8 @@ impl Daemon {
                 ))
             })?;
             let udp_advertise = self.config.network.udp_advertise.clone();
+            let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
+            let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
             tokio::spawn(async move {
                 let (mut dataplane, outbound_rx, inbound_tx) =
                     DataPlane::new_bidirectional(tun, peers.clone());
@@ -164,11 +171,23 @@ impl Daemon {
                             }
                         });
 
+                        let mut candidate_endpoints =
+                            match udp.gather_candidates(stun_servers, stun_timeout).await {
+                                Ok(candidates) => candidates,
+                                Err(err) => {
+                                    warn!("Failed to gather UDP candidates: {err}");
+                                    Vec::new()
+                                }
+                            };
+
                         match udp.local_addr() {
                             Ok(addr) => {
                                 if let Some(endpoint) =
                                     advertised_udp_endpoint(addr, udp_advertise.as_deref())
                                 {
+                                    if !candidate_endpoints.contains(&endpoint) {
+                                        candidate_endpoints.insert(0, endpoint.clone());
+                                    }
                                     info!(
                                         "UDP transport listening on {addr}; advertising {endpoint}"
                                     );
@@ -187,6 +206,13 @@ impl Daemon {
                                 warn!("UDP transport bound but local addr unavailable: {err}")
                             }
                         }
+
+                        info!(
+                            "Prepared {} UDP candidate endpoints for signaling",
+                            candidate_endpoints.len()
+                        );
+                        *local_candidates.write().await = candidate_endpoints;
+
                         tokio::spawn(udp.clone().run_outbound(encrypted_rx));
                         tokio::spawn(async move {
                             if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
@@ -371,17 +397,19 @@ impl Daemon {
             .create_initiation()
             .map_err(|e| DaemonError::Peer(format!("WireGuard initiation failed: {e}")))?;
         let initiation_bytes = initiation.to_bytes();
+        let candidates = self.local_candidates.read().await.clone();
 
         self.pending_handshakes
             .insert(peer_info.node_id.clone(), initiator);
         self.control
-            .send_peer_offer(&peer_info.node_id, &[], &initiation_bytes)
+            .send_peer_offer(&peer_info.node_id, &candidates, &initiation_bytes)
             .await?;
 
         info!(
-            "Sent WireGuard handshake initiation to {} ({} bytes)",
+            "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates)",
             peer_info.node_id,
-            initiation_bytes.len()
+            initiation_bytes.len(),
+            candidates.len()
         );
         Ok(())
     }
@@ -417,12 +445,14 @@ impl Daemon {
             .await;
 
         let response_bytes = response.to_bytes();
+        let candidates = self.local_candidates.read().await.clone();
         self.control
-            .send_peer_answer(from_node_id, &[], &response_bytes)
+            .send_peer_answer(from_node_id, &candidates, &response_bytes)
             .await?;
         info!(
-            "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes)",
-            response_bytes.len()
+            "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes, {} candidates)",
+            response_bytes.len(),
+            candidates.len()
         );
         Ok(())
     }
@@ -511,6 +541,17 @@ fn decode_x25519_key(hex_value: &str, label: &str) -> Result<[u8; 32]> {
     })
 }
 
+fn parse_stun_servers(values: &[String]) -> Result<Vec<SocketAddr>> {
+    values
+        .iter()
+        .map(|value| {
+            value.trim().parse::<SocketAddr>().map_err(|e| {
+                DaemonError::Config(format!("invalid STUN server '{}': {e}", value.trim()))
+            })
+        })
+        .collect()
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -547,6 +588,22 @@ mod tests {
             advertised_udp_endpoint(local, None),
             Some("127.0.0.1:51820".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_stun_servers() {
+        let servers =
+            parse_stun_servers(&["127.0.0.1:3478".to_string(), " 10.0.0.1:3478 ".to_string()])
+                .unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0], "127.0.0.1:3478".parse().unwrap());
+        assert_eq!(servers[1], "10.0.0.1:3478".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parse_stun_servers_rejects_invalid_endpoint() {
+        let err = parse_stun_servers(&["not-a-socket".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("invalid STUN server"));
     }
 
     #[tokio::test]
