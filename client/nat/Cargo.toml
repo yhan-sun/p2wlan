@@ -1,0 +1,12 @@
+[package]
+name = "p2pnet-nat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NAT traversal (STUN/ICE/UDP Hole Punching) for P2PNet"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,194 @@
+syntax = "proto3";
+
+package p2pnet;
+
+option go_package = "github.com/yhan-sun/p2wlan/proto;p2pnetpb";
+
+// ============================================================
+// Node & Device Messages
+// ============================================================
+
+/// A network node (device) in the P2P network.
+message Node {
+  string id = 1;              // Node ID (hex, derived from public key)
+  string public_key = 2;      // X25519 public key (hex)
+  string endpoint = 3;        // Public endpoint (ip:port), if known
+  string nat_type = 4;        // NAT type (Open, FullCone, etc.)
+  string virtual_ip = 5;      // Assigned virtual IP (10.20.x.x)
+  int64 last_seen = 6;        // Unix timestamp of last activity
+  bool online = 7;            // Whether the node is currently online
+}
+
+// ============================================================
+// Network Messages
+// ============================================================
+
+/// A virtual network (mesh).
+message Network {
+  string id = 1;              // Network ID
+  string name = 2;            // Human-readable name
+  string cidr = 3;            // CIDR (e.g. "10.20.0.0/16")
+  string ipv6_cidr = 4;       // IPv6 CIDR (optional)
+  int32 mtu = 5;              // MTU (default 1420)
+  int64 created_at = 6;       // Creation timestamp
+}
+
+// ============================================================
+// Signaling Protocol
+// ============================================================
+
+/// Signaling message exchanged via the control server.
+message SignalingMessage {
+  oneof payload {
+    NodeAnnounce announce = 1;       // Node announcing itself
+    NodeDepart depart = 2;           // Node leaving
+    EndpointUpdate endpoint = 3;     // Endpoint change notification
+    PeerOffer offer = 4;             // Offer to connect to a peer
+    PeerAnswer answer = 5;           // Answer to a peer offer
+    PeerReject reject = 6;           // Reject a peer connection
+  }
+}
+
+/// Node announcing its presence.
+message NodeAnnounce {
+  Node node = 1;
+  string network_id = 2;
+}
+
+/// Node leaving the network.
+message NodeDepart {
+  string node_id = 1;
+  string network_id = 2;
+}
+
+/// Endpoint update (e.g. after NAT discovery).
+message EndpointUpdate {
+  string node_id = 1;
+  string new_endpoint = 2;
+  string nat_type = 3;
+}
+
+/// Offer to establish a P2P connection with a peer.
+message PeerOffer {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  repeated string candidates = 3;  // ICE candidates
+  bytes handshake_init = 4;        // WireGuard handshake initiation
+}
+
+/// Answer to a peer offer.
+message PeerAnswer {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  repeated string candidates = 3;  // ICE candidates
+  bytes handshake_response = 4;    // WireGuard handshake response
+}
+
+/// Reject a peer connection.
+message PeerReject {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  string reason = 3;
+}
+
+// ============================================================
+// API Messages (Client ↔ Control Server)
+// ============================================================
+
+/// Register a new device.
+message RegisterRequest {
+  string user_token = 1;      // Auth token from login
+  string public_key = 2;      // Device public key
+  string device_name = 3;     // Human-readable device name
+  string platform = 4;        // "windows", "macos", "linux"
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string node_id = 2;
+  string virtual_ip = 3;
+  string error = 4;
+}
+
+/// List all nodes in a network.
+message ListNodesRequest {
+  string network_id = 1;
+}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+}
+
+/// Login request.
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  bool success = 1;
+  string token = 2;
+  string error = 3;
+}
+
+// ============================================================
+// Relay Messages (DERP-like)
+// ============================================================
+
+/// Relay packet forwarded between peers.
+message RelayPacket {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  bytes encrypted_payload = 3;  // End-to-end encrypted data
+}
+
+/// Relay connection request.
+message RelayConnectRequest {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  string relay_id = 3;         // Which relay server to use
+}
+
+message RelayConnectResponse {
+  bool success = 1;
+  string relay_endpoint = 2;   // Relay server address
+  string error = 3;
+}
+
+// ============================================================
+// Port Mapping (FRP-like)
+// ============================================================
+
+message PortMapping {
+  string id = 1;
+  string protocol = 2;        // "tcp" or "udp"
+  uint32 local_port = 3;      // Local port to forward to
+  uint32 remote_port = 4;     // Public port on the relay
+  string local_address = 5;   // Local address (default 127.0.0.1)
+}
+
+message CreateTunnelRequest {
+  PortMapping mapping = 1;
+}
+
+message CreateTunnelResponse {
+  bool success = 1;
+  string tunnel_id = 2;
+  string public_endpoint = 3; // Public address for accessing the tunnel
+  string error = 4;
+}
+
+message ListTunnelsRequest {}
+
+message ListTunnelsResponse {
+  repeated PortMapping tunnels = 1;
+}
+
+message DeleteTunnelRequest {
+  string tunnel_id = 1;
+}
+
+message DeleteTunnelResponse {
+  bool success = 1;
+  string error = 2;
+}

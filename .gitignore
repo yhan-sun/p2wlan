@@ -4,21 +4,37 @@
 .vscode/
 *.swp
 *.swo
+*~
+Thumbs.db
 
 # Rust
 target/
+**/*.rs.bk
+*.pdb
 
 # Go
 bin/
 coverage.out
+server/bin/
+server/vendor/
 
 # Node/Tauri
 node_modules/
 dist/
 build/
 .vite/
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
 
 # Logs/env
 *.log
 .env
 .env.*
+
+# Runtime/native artifacts
+*.dll
+*.db
+*.sqlite
+*.sqlite3
+.temp/

@@ -1,0 +1,17 @@
+[package]
+name = "p2pnet-wireguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WireGuard Noise IK handshake and transport encryption for P2PNet"
+
+[dependencies]
+p2pnet-crypto = { path = "../crypto" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+p2pnet-tun = { path = "../tun" }
