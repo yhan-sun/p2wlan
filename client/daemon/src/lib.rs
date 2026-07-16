@@ -32,6 +32,7 @@
 pub mod acl;
 pub mod config;
 pub mod control;
+pub mod dataplane;
 pub mod dns;
 pub mod error;
 pub mod peer;
@@ -52,6 +53,7 @@ use tracing::{error, info, warn};
 
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
+use dataplane::{log_outbound_packets, DataPlane};
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use peer::PeerManager;
@@ -104,7 +106,17 @@ impl Daemon {
         );
         info!("Control server: {}", self.config.control.server_url);
 
-        let _tun_device = self.init_tun()?;
+        if let Some(tun) = self.init_tun()? {
+            let peers = self.peers.clone();
+            tokio::spawn(async move {
+                let (mut dataplane, outbound_rx) = DataPlane::new(tun, peers);
+                tokio::spawn(log_outbound_packets(outbound_rx));
+
+                if let Err(err) = dataplane.run().await {
+                    warn!("Data plane stopped: {err}");
+                }
+            });
+        }
 
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
