@@ -33,6 +33,7 @@ pub mod acl;
 pub mod config;
 pub mod control;
 pub mod dataplane;
+pub mod diagnostics;
 pub mod dns;
 pub mod error;
 pub mod peer;
@@ -62,6 +63,7 @@ use tracing::{debug, error, info, warn};
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
 use dataplane::{DataPlane, InboundPacket};
+use diagnostics::run_diagnostics_server;
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
@@ -180,6 +182,26 @@ impl Daemon {
             Duration::from_millis(self.config.network.punch_interval_ms),
             self.config.network.punch_attempts.min(3).max(1),
         ));
+        if self.config.diagnostics.enabled {
+            let diagnostics_config = self.config.clone();
+            let diagnostics_peers = self.peers.clone();
+            let diagnostics_udp = self.udp_transport.clone();
+            let diagnostics_relay = self.relay_transport.clone();
+            let diagnostics_bind = self.config.diagnostics.bind.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_diagnostics_server(
+                    diagnostics_bind,
+                    diagnostics_config,
+                    diagnostics_peers,
+                    diagnostics_udp,
+                    diagnostics_relay,
+                )
+                .await
+                {
+                    warn!("Diagnostics endpoint stopped: {err}");
+                }
+            });
+        }
         if let Some(tun) = tun {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
