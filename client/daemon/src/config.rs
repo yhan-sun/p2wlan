@@ -428,7 +428,7 @@ impl Config {
                 heartbeat_interval_secs: default_heartbeat_interval(),
             },
             relay: RelayConfig {
-                servers: vec![format!("{control_url}:8080")],
+                servers: Vec::new(),
                 preferred_regions: Vec::new(),
                 selection_timeout_ms: default_relay_selection_timeout(),
                 prefer_direct: true,
@@ -483,6 +483,7 @@ mod tests {
         assert!(!config.node.public_key.is_empty());
         assert_eq!(config.network.network_id, "net123");
         assert_eq!(config.network.mtu, 1420);
+        assert!(config.relay.servers.is_empty());
         assert!(config.relay.prefer_direct);
         assert!(config.relay.preferred_regions.is_empty());
         assert_eq!(config.relay.selection_timeout_ms, 3000);

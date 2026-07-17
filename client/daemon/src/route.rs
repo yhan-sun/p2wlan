@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
-use tracing::{info, warn};
+use tracing::info;
 
 /// Platform-abstracted command runner for route operations.
 ///
@@ -69,7 +69,7 @@ impl RouteManager {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     fn new_with_runner(interface: String, runner: Box<dyn RouteCommandRunner>) -> Self {
         Self {
             interface,
