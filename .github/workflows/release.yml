@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 Package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build daemon
+        run: cargo build -p p2pnet-daemon --release --target x86_64-pc-windows-msvc
+
+      - name: Build desktop shell
+        run: pnpm tauri build --no-bundle --target x86_64-pc-windows-msvc
+
+      - name: Download Wintun runtime
+        shell: pwsh
+        run: |
+          $url = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "wintun.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
+            throw "Unexpected Wintun SHA256: $hash"
+          }
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP "wintun") -Force
+
+      - name: Assemble portable zip
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $PWD "dist-release\p2wlan-windows-x64"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\p2pnet-daemon.exe" $pkg
+          Copy-Item "target\x86_64-pc-windows-msvc\release\p2wlan-desktop.exe" $pkg
+          Copy-Item (Join-Path $env:RUNNER_TEMP "wintun\wintun\bin\amd64\wintun.dll") $pkg
+          @"
+          p2wlan Windows x64 portable package
+
+          1. Keep p2wlan-desktop.exe, p2pnet-daemon.exe, and wintun.dll in this folder.
+          2. Start p2wlan-desktop.exe.
+          3. Login or register against the control server.
+          4. Click "授权启动 TUN" and approve Windows UAC.
+
+          The app does not store your Windows password. UAC is handled by Windows.
+          "@ | Set-Content -Path (Join-Path $pkg "README-WINDOWS.txt") -Encoding UTF8
+          Compress-Archive -Path "$pkg\*" -DestinationPath "dist-release\p2wlan-windows-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-windows-x64
+          path: dist-release/p2wlan-windows-x64.zip
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/p2wlan-windows-x64.zip

@@ -1,176 +1,149 @@
-import { useState, useEffect } from "react";
-
-interface Tunnel {
-  id: string;
-  protocol: string;
-  localAddress: string;
-  localPort: number;
-  remotePort: number;
-  publicEndpoint: string;
-  active: boolean;
-}
+import { useClientStatus } from "../hooks/useClientStatus";
+import { StatusPill, zhLabel } from "../components/StatusPill";
+import { RefreshCw, Wrench, AlertCircle } from "lucide-react";
+import { rebuildRoutes } from "../lib/clientApi";
+import { useState } from "react";
 
 export default function TunnelsPage() {
-  const [tunnels, setTunnels] = useState<Tunnel[]>([]);
-  const [showCreate, setShowCreate] = useState(false);
-  const [newTunnel, setNewTunnel] = useState({
-    protocol: "tcp",
-    localAddress: "127.0.0.1",
-    localPort: 8080,
-    remotePort: 30000,
-  });
+  const { tunnel, route, refreshing, refresh } = useClientStatus();
+  const [rebuildResult, setRebuildResult] = useState<string | null>(null);
+  const [rebuilding, setRebuilding] = useState(false);
+  const primaryRoute = route?.entries[0];
 
-  useEffect(() => {
-    // Demo data
-    setTunnels([
-      { id: "tunnel-1", protocol: "tcp", localAddress: "127.0.0.1", localPort: 8080, remotePort: 30000, publicEndpoint: "relay.p2pnet.io:30000", active: true },
-    ]);
-  }, []);
-
-  const handleCreate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleRebuildRoutes = async () => {
+    setRebuilding(true);
+    setRebuildResult(null);
     try {
-      const token = localStorage.getItem("token");
-      const res = await fetch("http://localhost:8080/api/v1/tunnels", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(newTunnel),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setTunnels((prev) => [
-          ...prev,
-          {
-            id: data.tunnel_id,
-            protocol: newTunnel.protocol,
-            localAddress: newTunnel.localAddress,
-            localPort: newTunnel.localPort,
-            remotePort: newTunnel.remotePort,
-            publicEndpoint: data.public_endpoint,
-            active: true,
-          },
-        ]);
-        setShowCreate(false);
-      }
-    } catch {
-      // Handle error
-    }
-  };
-
-  const handleDelete = async (tunnelId: string) => {
-    try {
-      const token = localStorage.getItem("token");
-      await fetch(`http://localhost:8080/api/v1/tunnels/${tunnelId}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setTunnels((prev) => prev.filter((t) => t.id !== tunnelId));
-    } catch {
-      // Handle error
+      const res = await rebuildRoutes();
+      setRebuildResult(res.data.message);
+    } catch (e) {
+      setRebuildResult(e instanceof Error ? e.message : "路由重建执行失败");
+    } finally {
+      setRebuilding(false);
     }
   };
 
   return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.5rem" }}>
-        <h2>Port Mappings</h2>
-        <button className="btn btn-primary" onClick={() => setShowCreate(!showCreate)}>
-          + Create Tunnel
-        </button>
+    <div className="page-container">
+      <div className="page-header">
+        <div>
+          <h2>隧道</h2>
+          <p className="page-subtitle">查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。</p>
+        </div>
+        <div className="header-actions">
+          <button className="btn btn-ghost btn-sm" onClick={refresh} disabled={refreshing}>
+            <RefreshCw size={14} className={refreshing ? "spin" : ""} />
+            <span>刷新</span>
+          </button>
+          <button className="btn btn-primary btn-sm" onClick={handleRebuildRoutes} disabled={rebuilding}>
+            <Wrench size={14} />
+            <span>重装路由</span>
+          </button>
+        </div>
       </div>
 
-      {showCreate && (
-        <div className="card" style={{ marginBottom: "1.5rem" }}>
-          <h3 className="card-title" style={{ marginBottom: "1rem" }}>New Tunnel</h3>
-          <form onSubmit={handleCreate}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
-              <div className="form-group">
-                <label className="form-label">Protocol</label>
-                <select
-                  className="form-input"
-                  value={newTunnel.protocol}
-                  onChange={(e) => setNewTunnel({ ...newTunnel, protocol: e.target.value })}
-                >
-                  <option value="tcp">TCP</option>
-                  <option value="udp">UDP</option>
-                </select>
-              </div>
-              <div className="form-group">
-                <label className="form-label">Local Address</label>
-                <input
-                  className="form-input"
-                  value={newTunnel.localAddress}
-                  onChange={(e) => setNewTunnel({ ...newTunnel, localAddress: e.target.value })}
-                />
-              </div>
-              <div className="form-group">
-                <label className="form-label">Local Port</label>
-                <input
-                  className="form-input"
-                  type="number"
-                  value={newTunnel.localPort}
-                  onChange={(e) => setNewTunnel({ ...newTunnel, localPort: parseInt(e.target.value) })}
-                />
-              </div>
-              <div className="form-group">
-                <label className="form-label">Remote Port</label>
-                <input
-                  className="form-input"
-                  type="number"
-                  value={newTunnel.remotePort}
-                  onChange={(e) => setNewTunnel({ ...newTunnel, remotePort: parseInt(e.target.value) })}
-                />
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: "0.5rem", marginTop: "1rem" }}>
-              <button className="btn btn-primary" type="submit">Create</button>
-              <button className="btn btn-ghost" type="button" onClick={() => setShowCreate(false)}>Cancel</button>
-            </div>
-          </form>
+      {rebuildResult && (
+        <div className="banner banner-info">
+          <AlertCircle size={16} />
+          <div className="banner-content">
+            <span className="banner-desc">{rebuildResult}</span>
+          </div>
         </div>
       )}
 
-      <div className="card">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Protocol</th>
-              <th>Local</th>
-              <th>Public Endpoint</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tunnels.map((tunnel) => (
-              <tr key={tunnel.id}>
-                <td style={{ textTransform: "uppercase" }}>{tunnel.protocol}</td>
-                <td style={{ fontFamily: "monospace" }}>
-                  {tunnel.localAddress}:{tunnel.localPort}
-                </td>
-                <td style={{ fontFamily: "monospace" }}>{tunnel.publicEndpoint}</td>
-                <td>
-                  <span className={`status-dot ${tunnel.active ? "online" : "offline"}`} />
-                </td>
-                <td>
-                  <button className="btn btn-ghost" style={{ color: "var(--danger)", fontSize: "0.75rem" }} onClick={() => handleDelete(tunnel.id)}>
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {tunnels.length === 0 && (
-              <tr>
-                <td colSpan={5} style={{ textAlign: "center", color: "var(--text-secondary)" }}>
-                  No tunnels configured
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="summary-strip">
+        <div className="summary-item">
+          <span className="summary-label">网卡</span>
+          <span className="summary-value text-mono">{tunnel?.interfaceName || "—"}</span>
+        </div>
+        <div className="summary-item">
+          <span className="summary-label">状态</span>
+          <StatusPill label={tunnel?.up ? "启用 (UP)" : "关闭 (DOWN)"} tone={tunnel?.up ? "ok" : "bad"} />
+        </div>
+        <div className="summary-item">
+          <span className="summary-label">路由</span>
+          <StatusPill
+            label={zhLabel(primaryRoute?.state || "unknown")}
+            tone={primaryRoute?.state === "installed" ? "ok" : primaryRoute?.state === "conflict" ? "warn" : "muted"}
+          />
+        </div>
+        <div className="summary-item">
+          <span className="summary-label">UDP</span>
+          <span className="summary-value text-mono">{tunnel?.udpBind || "—"}</span>
+        </div>
+      </div>
+
+      <div className="split-layout">
+        <div className="column flex-col gap-md">
+          <div className="panel-section">
+            <div className="panel-header">
+              <h3>虚拟网卡</h3>
+            </div>
+            <div className="panel-body flex-col gap-sm">
+              <div className="status-row">
+                <span className="status-label-text">网卡名称</span>
+                <span className="status-value-text-mono font-bold">{tunnel?.interfaceName || "—"}</span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">IP 分配 (CIDR)</span>
+                <span className="status-value-text-mono">{tunnel?.cidr || "—"}</span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">虚拟 IP</span>
+                <span className="status-value-text-mono text-accent font-bold">{tunnel?.virtualIp || "—"}</span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">MTU</span>
+                <span className="status-value-text">{tunnel?.mtu || "—"} 字节</span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">UDP 监听</span>
+                <span className="status-value-text-mono">{tunnel?.udpBind || "—"}</span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">链路状态</span>
+                <StatusPill
+                  label={tunnel?.up ? "已启用 (UP)" : "未启用 (DOWN)"}
+                  tone={tunnel?.up ? "ok" : "bad"}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="column flex-col gap-md">
+          <div className="panel-section">
+            <div className="panel-header">
+              <h3>路由</h3>
+            </div>
+            <div className="panel-body flex-col gap-md">
+              {route?.entries && route.entries.length > 0 ? (
+                <div className="route-entries-list flex-col gap-sm">
+                  {route.entries.map((entry, index) => (
+                    <div key={index} className="route-entry-card">
+                      <div className="route-entry-header">
+                        <span className="route-dest">{entry.destination}</span>
+                        <StatusPill
+                          label={zhLabel(entry.state)}
+                          tone={entry.state === "installed" ? "ok" : entry.state === "missing" ? "bad" : "warn"}
+                        />
+                      </div>
+                      <div className="route-entry-body">
+                        <div className="route-detail-row">
+                          <span className="lbl">目标网卡</span>
+                          <span className="val-mono">{entry.interfaceName}</span>
+                        </div>
+                        <p className="route-desc-text">{entry.detail}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state-text">暂无路由状态。</div>
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -37,4 +37,5 @@ desktop/src-tauri/target/
 *.db
 *.sqlite
 *.sqlite3
+p2pnet-config.json
 .temp/

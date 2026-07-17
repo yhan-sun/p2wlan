@@ -7,7 +7,8 @@ This project can test a Windows client against a public Linux server.
 - Windows 10/11.
 - PowerShell 5+.
 - `p2pnet-daemon.exe` built locally.
-- `wintun.dll` available next to `p2pnet-daemon.exe` or in `PATH`.
+- `wintun.dll` available next to `p2pnet-daemon.exe`, next to the desktop app,
+  in `PATH`, or pointed to by `P2WLAN_WINTUN_DLL`.
 - `ssh.exe` available in `PATH`.
 - For `-Tun` mode: elevated Administrator PowerShell.
 
@@ -16,6 +17,22 @@ Build on Windows:
 ```powershell
 cargo build -p p2pnet-daemon
 ```
+
+## Portable release package
+
+GitHub Actions builds a Windows x64 portable package when a `v*` tag is pushed,
+or when the `Release` workflow is run manually.
+
+The zip contains:
+
+- `p2wlan-desktop.exe`
+- `p2pnet-daemon.exe`
+- `wintun.dll`
+- `README-WINDOWS.txt`
+
+Keep those three binaries in the same folder. Start `p2wlan-desktop.exe`, login
+or register, then click `授权启动 TUN` and approve Windows UAC. The app does not
+store the Windows password; authorization is handled by Windows.
 
 ## No-TUN NAT smoke
 

@@ -22,6 +22,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -108,10 +109,47 @@ struct WintunApi {
 }
 
 impl WintunApi {
+    fn dll_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Ok(path) = std::env::var("P2WLAN_WINTUN_DLL") {
+            if !path.trim().is_empty() {
+                candidates.push(PathBuf::from(path));
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("wintun.dll"));
+            }
+        }
+        if let Ok(dir) = std::env::current_dir() {
+            candidates.push(dir.join("wintun.dll"));
+        }
+        candidates.push(PathBuf::from("wintun.dll"));
+        candidates
+    }
+
+    fn load_library() -> Result<Library> {
+        let mut errors = Vec::new();
+        for candidate in Self::dll_candidates() {
+            match unsafe { Library::new(&candidate) } {
+                Ok(lib) => {
+                    info!("Loaded Wintun runtime from {}", candidate.display());
+                    return Ok(lib);
+                }
+                Err(err) => {
+                    errors.push(format!("{}: {err}", candidate.display()));
+                }
+            }
+        }
+        Err(Error::LibraryNotFound(format!(
+            "wintun.dll not found or not loadable. Tried: {}",
+            errors.join("; ")
+        )))
+    }
+
     /// Load the Wintun DLL and resolve all required function pointers.
     fn load() -> Result<Self> {
-        let lib = unsafe { Library::new("wintun.dll") }
-            .map_err(|e| Error::LibraryNotFound(format!("wintun.dll: {e}")))?;
+        let lib = Self::load_library()?;
 
         let create_adapter = unsafe {
             *lib.get::<WintunCreateAdapterFunc>(b"WintunCreateAdapter\0")
@@ -174,7 +212,7 @@ impl WintunApi {
 
     /// Try to get the running driver version (best-effort, non-fatal).
     fn try_get_driver_version() -> Option<u32> {
-        let lib = unsafe { Library::new("wintun.dll") }.ok()?;
+        let lib = Self::load_library().ok()?;
         let func: Symbol<WintunGetRunningDriverVersionFunc> =
             unsafe { lib.get(b"WintunGetRunningDriverVersion\0") }.ok()?;
         Some(unsafe { func() })

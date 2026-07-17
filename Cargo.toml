@@ -6,6 +6,7 @@ members = [
     "client/nat",
     "client/relay",
     "client/daemon",
+    "src-tauri",
 ]
 resolver = "2"
 
