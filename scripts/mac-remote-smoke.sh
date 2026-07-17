@@ -53,6 +53,18 @@ remote_cleanup() {
   remote "for p in \$(pgrep -f '^$REMOTE_BASE/' || true); do /bin/kill -9 \$p 2>/dev/null || true; done; ip route del 10.20.0.0/16 2>/dev/null || true; ip link del '$ALI_IF' 2>/dev/null || true" >/dev/null 2>&1 || true
 }
 
+local_tun_cleanup() {
+  route -n delete -net 10.20.0.0 -netmask 255.255.0.0 >/dev/null 2>&1 || true
+  ifconfig | awk '
+    /^utun/ { iface=$1; sub(":", "", iface); next }
+    iface && /inet 10\.20\./ { print iface, $2 }
+  ' | while read -r iface addr; do
+    if [[ -n "$iface" && -n "$addr" ]]; then
+      ifconfig "$iface" inet "$addr" -alias >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 cleanup() {
   if [[ -n "${MAC_PID:-}" ]]; then
     kill "$MAC_PID" 2>/dev/null || true
@@ -61,7 +73,7 @@ cleanup() {
   fi
   remote_cleanup
   if [[ "$MODE" == "tun" ]]; then
-    route -n delete -net 10.20.0.0 -netmask 255.255.0.0 >/dev/null 2>&1 || true
+    local_tun_cleanup
   fi
   rm -rf "$LOCAL_RUN"
 }
@@ -106,6 +118,9 @@ echo "[mac-smoke] local run: $LOCAL_RUN"
 echo "[mac-smoke] remote run: $REMOTE_RUN"
 
 remote_cleanup
+if [[ "$MODE" == "tun" ]]; then
+  local_tun_cleanup
+fi
 remote "mkdir -p '$REMOTE_RUN'; cd '$REMOTE_RUN'; env PORT=$PORT DB_PATH='$REMOTE_RUN/control.db' JWT_SECRET=smoke nohup '$REMOTE_BASE/control-server' >server.log 2>&1 & echo \$! >server.pid"
 wait_http "http://$ALI_HOST:$PORT/health" || {
   echo "[mac-smoke] control server did not become healthy" >&2
