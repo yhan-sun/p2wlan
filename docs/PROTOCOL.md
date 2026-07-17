@@ -295,6 +295,15 @@ score = type_weight + rtt_weight + success_history_weight + relay_penalty
 - Relay 工作期间每 30s 重新尝试 direct。
 - 网络接口变化时立即重新 gather candidates。
 
+Relay region 选择：
+
+- 客户端候选使用 `region@endpoint`，旧 `endpoint` 格式归入 `default` region。
+- 候选并发完成 TCP 连接和 relay 注册，单候选受 selection timeout 限制。
+- 排序键依次为配置的 region 偏好、连接与注册耗时、控制面候选顺序。
+- 首选候选失败时保留错误诊断并选择下一个可达候选。
+- relay 注册必须使用控制面分配的 node ID，确保 peer 转发目标与 relay session 身份一致。
+- 当前 relay 节点之间没有 mesh 转发；控制面必须向同一虚拟网络下发一致候选列表，跨 region 互联属于后续协议扩展。
+
 ## 8. WireGuard Endpoint 管理
 
 WireGuard peer endpoint 由路径管理器更新：
@@ -376,4 +385,3 @@ Internet client
 | 3000 | TUN_CREATE_FAILED | 虚拟网卡创建失败 |
 | 3100 | ROUTE_APPLY_FAILED | 路由应用失败 |
 | 4000 | ACL_DENIED | ACL 拒绝访问 |
-

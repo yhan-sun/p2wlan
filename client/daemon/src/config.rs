@@ -165,8 +165,14 @@ fn default_heartbeat_interval() -> u64 {
 /// Relay configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
-    /// List of relay server endpoints.
+    /// Relay candidates as `region@endpoint` or backward-compatible `endpoint` values.
     pub servers: Vec<String>,
+    /// Region labels to prefer, in priority order. Empty means latency-only selection.
+    #[serde(default)]
+    pub preferred_regions: Vec<String>,
+    /// Maximum time allowed for each concurrent relay connection attempt (ms).
+    #[serde(default = "default_relay_selection_timeout")]
+    pub selection_timeout_ms: u64,
     /// Whether to prefer direct P2P over relay.
     #[serde(default = "default_true")]
     pub prefer_direct: bool,
@@ -180,6 +186,9 @@ fn default_true() -> bool {
 }
 fn default_relay_timeout() -> u64 {
     5000
+}
+fn default_relay_selection_timeout() -> u64 {
+    3000
 }
 
 /// Local diagnostics HTTP endpoint configuration.
@@ -363,6 +372,8 @@ impl Config {
             },
             relay: RelayConfig {
                 servers: vec![format!("{control_url}:8080")],
+                preferred_regions: Vec::new(),
+                selection_timeout_ms: default_relay_selection_timeout(),
                 prefer_direct: true,
                 fallback_timeout_ms: default_relay_timeout(),
             },
@@ -416,6 +427,8 @@ mod tests {
         assert_eq!(config.network.network_id, "net123");
         assert_eq!(config.network.mtu, 1420);
         assert!(config.relay.prefer_direct);
+        assert!(config.relay.preferred_regions.is_empty());
+        assert_eq!(config.relay.selection_timeout_ms, 3000);
         assert!(!config.diagnostics.enabled);
         assert_eq!(config.diagnostics.bind, "127.0.0.1:39277");
         assert!(config.port_mappings.is_empty());
@@ -449,6 +462,14 @@ mod tests {
         );
         assert_eq!(decoded.diagnostics.enabled, config.diagnostics.enabled);
         assert_eq!(decoded.diagnostics.bind, config.diagnostics.bind);
+        assert_eq!(
+            decoded.relay.preferred_regions,
+            config.relay.preferred_regions
+        );
+        assert_eq!(
+            decoded.relay.selection_timeout_ms,
+            config.relay.selection_timeout_ms
+        );
     }
 
     #[test]
@@ -491,6 +512,8 @@ mod tests {
         assert_eq!(decoded.network.punch_interval_ms, 200);
         assert_eq!(decoded.network.punch_attempts, 10);
         assert_eq!(decoded.network.keepalive_interval_secs, 25);
+        assert!(decoded.relay.preferred_regions.is_empty());
+        assert_eq!(decoded.relay.selection_timeout_ms, 3000);
         assert!(!decoded.diagnostics.enabled);
         assert_eq!(decoded.diagnostics.bind, "127.0.0.1:39277");
     }

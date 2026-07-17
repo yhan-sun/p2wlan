@@ -177,6 +177,8 @@ impl Default for PeerInfo {
 pub enum ControlEvent {
     /// Registration confirmed. Contains assigned virtual IP and relay servers.
     Registered {
+        /// Server-assigned node ID when registration used the REST control plane.
+        node_id: Option<String>,
         virtual_ip: String,
         relay_servers: Vec<String>,
     },
@@ -463,6 +465,7 @@ impl ControlClient {
                 drop(state);
 
                 let _ = self.event_tx.send(ControlEvent::Registered {
+                    node_id: None,
                     virtual_ip,
                     relay_servers,
                 });
@@ -589,6 +592,7 @@ async fn run_control_loop(
             }
 
             let _ = event_tx.send(ControlEvent::Registered {
+                node_id: Some(node_id.clone()),
                 virtual_ip,
                 relay_servers: config.relay.servers.clone(),
             });
@@ -1097,10 +1101,12 @@ mod tests {
 
         let event = rx.recv().await.unwrap();
         if let ControlEvent::Registered {
+            node_id,
             virtual_ip,
             relay_servers,
         } = event
         {
+            assert_eq!(node_id, None);
             assert_eq!(virtual_ip, "10.20.0.5");
             assert_eq!(relay_servers.len(), 1);
         } else {

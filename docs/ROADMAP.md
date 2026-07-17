@@ -60,7 +60,7 @@ Date: 2026-07-16
 - packet pump：TUN <-> WireGuard <-> UDP。
 - CLI：`p2wlan peer add`、`p2wlan status`。
 
-当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write、控制面自动 WireGuard handshake/session 安装、host/STUN candidates 收集、offer/answer 交换、peer endpoint 选择、UDP punch probe/ACK 处理、direct keepalive、最小 relay fallback 数据面、基于 path health 的 direct/relay 自动切换，以及本地 diagnostics `/status` JSON/CLI 查询；无 TUN/root smoke 已覆盖两 daemon 的 candidate 准备、punch probe 和 diagnostics；已增加 Linux root/network namespace 真实双节点 TUN ping smoke，等待在 Linux CI/测试机持续执行；下一步补 Relay region 选择。
+当前 checkpoint（2026-07-16）：已完成 TUN -> peer route -> WireGuard encrypt -> outbound UDP send、UDP inbound -> WireGuard decrypt -> TUN write、控制面自动 WireGuard handshake/session 安装、host/STUN candidates 收集、offer/answer 交换、peer endpoint 选择、UDP punch probe/ACK 处理、direct keepalive、最小 relay fallback 数据面、基于 path health 的 direct/relay 自动切换、本地 diagnostics `/status` JSON/CLI 查询，以及基于区域偏好和连接耗时的 Relay region 自动选择；无 TUN/root smoke 已覆盖两 daemon 的 candidate 准备、punch probe 和 diagnostics；已增加 Linux root/network namespace 真实双节点 TUN ping smoke，等待在 Linux CI/测试机持续执行；下一步补 Relay 跨区域互联和运行时动态重选。
 
 验收标准：
 
@@ -121,7 +121,7 @@ Date: 2026-07-16
 - Relay frame 转发。
 - daemon relay fallback 数据面。
 - direct/relay 自动切换。
-- Relay region 选择。
+- Relay region 选择（已完成静态候选并发探测；待补跨区域互联和动态重选）。
 
 验收标准：
 
