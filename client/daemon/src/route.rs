@@ -1,8 +1,8 @@
 use std::net::Ipv4Addr;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::sync::Mutex;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tracing::info;
 
 /// Platform-abstracted command runner for route operations.
@@ -53,7 +53,7 @@ impl RouteCommandRunner for RealCommandRunner {
 #[derive(Debug)]
 #[allow(dead_code)] // fields used on Linux; non-Linux builds only construct the type
 pub struct RouteManager {
-    interface: String,
+    interface: Mutex<String>,
     routes_added: Mutex<Vec<(Ipv4Addr, Ipv4Addr)>>,
     #[cfg(target_os = "linux")]
     runner: Box<dyn RouteCommandRunner>,
@@ -62,17 +62,27 @@ pub struct RouteManager {
 impl RouteManager {
     pub fn new(interface: String) -> Self {
         Self {
-            interface,
+            interface: Mutex::new(interface),
             routes_added: Mutex::new(Vec::new()),
             #[cfg(target_os = "linux")]
             runner: Box::new(RealCommandRunner),
         }
     }
 
+    pub fn set_interface(&self, interface: String) {
+        if let Ok(mut current) = self.interface.lock() {
+            *current = interface;
+        }
+    }
+
+    fn interface(&self) -> String {
+        self.interface.lock().unwrap().clone()
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     fn new_with_runner(interface: String, runner: Box<dyn RouteCommandRunner>) -> Self {
         Self {
-            interface,
+            interface: Mutex::new(interface),
             routes_added: Mutex::new(Vec::new()),
             runner,
         }
@@ -117,10 +127,11 @@ impl RouteManager {
         let route_line = self.runner.route_show(cidr)?;
 
         if !route_line.is_empty() {
-            if route_line.contains(&self.interface) {
+            let interface = self.interface();
+            if route_line.contains(&interface) {
                 info!(
                     "Route for {cidr} already exists on {} — treating as idempotent, not owned",
-                    self.interface
+                    interface
                 );
                 // Pre-existing routes are NOT recorded to routes_added.
                 // They will NOT be deleted during cleanup since only
@@ -133,8 +144,9 @@ impl RouteManager {
             }
         }
 
-        info!("Adding route for {cidr} via {}", self.interface);
-        let success = self.runner.route_add(cidr, &self.interface)?;
+        let interface = self.interface();
+        info!("Adding route for {cidr} via {}", interface);
+        let success = self.runner.route_add(cidr, &interface)?;
 
         if !success {
             return Err(crate::DaemonError::Network(format!(
@@ -166,13 +178,107 @@ impl RouteManager {
 
         for (ip, mask) in routes {
             let cidr = format!("{}/{}", ip, ip_mask_to_prefix(mask));
-            info!("Cleaning up route for {cidr} via {}", self.interface);
-            self.runner.route_del(&cidr, &self.interface);
+            let interface = self.interface();
+            info!("Cleaning up route for {cidr} via {}", interface);
+            self.runner.route_del(&cidr, &interface);
         }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+impl RouteManager {
+    pub fn add_cidr_route(&self, cidr: &str) -> crate::Result<()> {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return Ok(());
+        }
+
+        let Some((network, mask)) = parse_cidr_to_ip_mask(cidr) else {
+            return Err(crate::DaemonError::Network(format!(
+                "invalid route CIDR: {cidr}"
+            )));
+        };
+        let interface = self.interface();
+        info!("Adding macOS route for {cidr} via {interface}");
+
+        let status = Command::new("/sbin/route")
+            .args([
+                "-n",
+                "add",
+                "-net",
+                &network.to_string(),
+                "-netmask",
+                &mask.to_string(),
+                "-interface",
+                &interface,
+            ])
+            .status()
+            .map_err(|e| crate::DaemonError::Network(format!("failed to run route add: {e}")))?;
+
+        if !status.success() {
+            let route_line = macos_route_get(&network.to_string()).unwrap_or_default();
+            if route_line.contains(&format!("interface: {interface}")) {
+                info!(
+                    "Route for {cidr} already exists on {interface} — treating as idempotent, not owned"
+                );
+                return Ok(());
+            }
+            return Err(crate::DaemonError::Network(format!(
+                "route add failed for {cidr} via {interface}; existing route: {route_line}"
+            )));
+        }
+
+        if let Ok(mut added) = self.routes_added.lock() {
+            added.push((network, mask));
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup(&self) {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return;
+        }
+
+        let routes = {
+            let mut added = self.routes_added.lock().unwrap();
+            let routes_copy = added.clone();
+            added.clear();
+            routes_copy
+        };
+
+        for (network, mask) in routes {
+            let interface = self.interface();
+            info!(
+                "Cleaning up macOS route for {}/{} via {}",
+                network,
+                ip_mask_to_prefix(mask),
+                interface
+            );
+            let _ = Command::new("/sbin/route")
+                .args([
+                    "-n",
+                    "delete",
+                    "-net",
+                    &network.to_string(),
+                    "-netmask",
+                    &mask.to_string(),
+                    "-interface",
+                    &interface,
+                ])
+                .status();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_get(destination: &str) -> std::io::Result<String> {
+    let output = Command::new("/sbin/route")
+        .args(["-n", "get", destination])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl RouteManager {
     pub fn add_cidr_route(&self, _cidr: &str) -> crate::Result<()> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
