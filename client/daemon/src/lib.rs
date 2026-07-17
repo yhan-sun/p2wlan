@@ -447,6 +447,31 @@ impl Daemon {
             });
         }
 
+        // Periodic session rekey and handshake timeout checker
+        {
+            let peers = self.peers.clone();
+            let transport = self.transport.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    // Rekey sessions that are approaching message limit
+                    for conn in peers.all_connections().await {
+                        if transport.has_session(&conn.node_id).await {
+                            // The session stores its own rekey check internally
+                            // REKEY_AFTER_MESSAGES is 2^60, so this is mostly
+                            // a placeholder until we have timer-based rekey
+                            debug!(
+                                "Rekey check for peer {} (direct={})",
+                                conn.node_id,
+                                conn.state == peer::ConnectionState::Direct
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
             match event {
@@ -656,18 +681,35 @@ impl Daemon {
         let initiation_bytes = initiation.to_bytes();
         let candidates = self.local_candidates.read().await.clone();
 
+        let peer_id_clone = peer_info.node_id.clone();
         self.pending_handshakes
-            .insert(peer_info.node_id.clone(), initiator);
+            .insert(peer_id_clone.clone(), initiator);
         self.control
-            .send_peer_offer(&peer_info.node_id, &candidates, &initiation_bytes)
+            .send_peer_offer(&peer_id_clone, &candidates, &initiation_bytes)
             .await?;
 
         info!(
             "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates)",
-            peer_info.node_id,
+            peer_id_clone,
             initiation_bytes.len(),
             candidates.len()
         );
+
+        // Spawn a timeout watcher: if no session established within 30 s,
+        // mark the peer's direct path as failed so it falls back to relay.
+        let timeout_peer = peer_id_clone;
+        let transport = self.transport.clone();
+        let peers = self.peers.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if !transport.has_session(&timeout_peer).await {
+                warn!("Handshake timeout for peer {timeout_peer}");
+                peers
+                    .record_direct_failure(&timeout_peer, "handshake timed out after 30 s")
+                    .await;
+            }
+        });
+
         Ok(())
     }
 
