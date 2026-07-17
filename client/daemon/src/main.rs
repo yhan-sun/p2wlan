@@ -4,6 +4,7 @@
 
 use clap::Parser;
 use p2pnet_daemon::{Config, Daemon, DaemonError};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -127,6 +128,10 @@ struct Cli {
     /// Diagnostics URL to query status
     #[arg(long, name = "diagnostics-url")]
     diagnostics_url: Option<String>,
+
+    /// Write daemon logs to a file instead of stderr/stdout
+    #[arg(long, name = "log-file")]
+    log_file: Option<PathBuf>,
 }
 
 fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
@@ -236,12 +241,38 @@ async fn main() -> p2pnet_daemon::Result<()> {
     }
 
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if let Some(ref log_file) = cli.log_file {
+        if let Some(parent) = log_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                DaemonError::Config(format!(
+                    "failed to create log directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+            .map_err(|e| {
+                DaemonError::Config(format!(
+                    "failed to open log file {}: {e}",
+                    log_file.display()
+                ))
+            })?;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(move || {
+                file.try_clone()
+                    .expect("failed to clone daemon log file handle")
+            })
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     info!("P2PNet Daemon starting...");
     info!("Platform: {}", std::env::consts::OS);
@@ -542,6 +573,7 @@ mod tests {
             prefer_direct: false,
             device_name: None,
             diagnostics_url: None,
+            log_file: None,
         };
 
         apply_cli_overrides(&mut config, &cli);
@@ -591,6 +623,7 @@ mod tests {
             prefer_direct: false,
             device_name: None,
             diagnostics_url: None,
+            log_file: None,
         };
 
         // 1. Invalid control URL

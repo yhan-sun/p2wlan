@@ -393,52 +393,121 @@ impl DaemonManager {
         )
     }
 
-    #[cfg(target_os = "windows")]
-    fn ps_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
+    #[cfg(any(target_os = "windows", test))]
+    fn windows_command_line_arg_quote(value: &str) -> String {
+        if !value.is_empty()
+            && !value
+                .chars()
+                .any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"')
+        {
+            return value.to_string();
+        }
+
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0;
+        for ch in value.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                    quoted.push(ch);
+                }
+            }
+        }
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+        quoted.push('"');
+        quoted
     }
 
     #[cfg(target_os = "windows")]
-    fn build_windows_elevated_inner_script(
+    fn windows_wide_str(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_wide_path(value: &Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+
+        value
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn launch_windows_elevated_daemon(
         bin_path: &Path,
         args: &[String],
-        config_path: &Path,
         log_dir: &Path,
-        log_path: &Path,
         pid_path: &Path,
-    ) -> String {
-        let stderr_path = log_dir.join("p2pnet-daemon.stderr.log");
-        let args_ps = args
-            .iter()
-            .map(|arg| Self::ps_quote(arg))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-        format!(
-            "$ErrorActionPreference = 'Stop'; \
-             New-Item -ItemType Directory -Force -Path {config_dir} | Out-Null; \
-             New-Item -ItemType Directory -Force -Path {log_dir} | Out-Null; \
-             Set-Content -Path {log} -Value ''; \
-             Set-Content -Path {stderr} -Value ''; \
-             $env:P2WLAN_DAEMON_BIN = {bin}; \
-             $p = Start-Process -FilePath {bin} -ArgumentList @({args}) -WindowStyle Hidden -RedirectStandardOutput {log} -RedirectStandardError {stderr} -PassThru; \
-             Set-Content -Path {pid} -Value $p.Id",
-            config_dir = Self::ps_quote(&config_dir.display().to_string()),
-            log_dir = Self::ps_quote(&log_dir.display().to_string()),
-            log = Self::ps_quote(&log_path.display().to_string()),
-            stderr = Self::ps_quote(&stderr_path.display().to_string()),
-            bin = Self::ps_quote(&bin_path.display().to_string()),
-            args = args_ps,
-            pid = Self::ps_quote(&pid_path.display().to_string()),
-        )
-    }
+    ) -> Result<(), String> {
+        use std::mem::size_of;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-    #[cfg(target_os = "windows")]
-    fn build_windows_uac_launcher_script(inner_script: &str) -> String {
-        format!(
-            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',{}) -Verb RunAs -WindowStyle Hidden",
-            Self::ps_quote(inner_script)
-        )
+        std::fs::create_dir_all(log_dir)
+            .map_err(|e| format!("无法创建 Windows 日志目录 {}: {e}", log_dir.display()))?;
+
+        let verb = Self::windows_wide_str("runas");
+        let file = Self::windows_wide_path(bin_path);
+        let parameters = Self::windows_wide_str(
+            &args
+                .iter()
+                .map(|arg| Self::windows_command_line_arg_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let directory = bin_path
+            .parent()
+            .map(Self::windows_wide_path)
+            .unwrap_or_else(|| Self::windows_wide_str(""));
+
+        let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = parameters.as_ptr();
+        info.lpDirectory = directory.as_ptr();
+        info.nShow = SW_HIDE;
+
+        let launched = unsafe { ShellExecuteExW(&mut info) };
+        if launched == 0 {
+            let code = unsafe { GetLastError() };
+            return if code == 1223 {
+                Err("已取消 Windows 管理员授权。".to_string())
+            } else {
+                Err(format!("无法通过 Windows UAC 启动守护进程，错误码：{code}"))
+            };
+        }
+
+        if !info.hProcess.is_null() {
+            let pid = unsafe { GetProcessId(info.hProcess) };
+            unsafe {
+                CloseHandle(info.hProcess);
+            }
+            if pid != 0 {
+                std::fs::write(pid_path, pid.to_string()).map_err(|e| {
+                    format!(
+                        "无法写入 Windows 守护进程 PID 文件 {}: {e}",
+                        pid_path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn wait_for_endpoint(url: &str, timeout: Duration) -> bool {
@@ -673,35 +742,29 @@ impl DaemonManager {
             let log_dir = Self::default_log_dir();
             let log_path = log_dir.join("p2pnet-daemon.log");
             let pid_path = Self::default_pid_path();
-            let args = Self::build_args(&options, &bind_addr, &config_path);
-            let inner = Self::build_windows_elevated_inner_script(
-                &bin_path,
-                &args,
-                &config_path,
-                &log_dir,
-                &log_path,
-                &pid_path,
-            );
-            let launcher = Self::build_windows_uac_launcher_script(&inner);
-
-            let output = Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    &launcher,
-                ])
-                .output()
-                .map_err(|e| format!("无法打开 Windows UAC 授权弹窗：{e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(if stderr.is_empty() {
-                    "Windows 管理员授权启动失败或已取消。".to_string()
-                } else {
-                    format!("Windows 管理员授权启动失败：{stderr}")
-                });
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "无法创建 Windows 守护进程配置目录 {}: {e}",
+                        parent.display()
+                    )
+                })?;
             }
+            std::fs::create_dir_all(&log_dir)
+                .map_err(|e| format!("无法创建 Windows 日志目录 {}: {e}", log_dir.display()))?;
+            std::fs::write(&log_path, "").map_err(|e| {
+                format!(
+                    "无法初始化 Windows 守护进程日志 {}: {e}",
+                    log_path.display()
+                )
+            })?;
+            Self::remove_pid_file(&pid_path);
+
+            let mut args = Self::build_args(&options, &bind_addr, &config_path);
+            args.push("--log-file".to_string());
+            args.push(log_path.display().to_string());
+
+            Self::launch_windows_elevated_daemon(&bin_path, &args, &log_dir, &pid_path)?;
 
             {
                 let mut state = self.state.lock().await;
@@ -862,6 +925,26 @@ mod tests {
         assert_eq!(options.device_name.as_deref(), Some("mac"));
         assert_eq!(options.tun_interface.as_deref(), Some("p2pnet0"));
         assert_eq!(options.mtu, Some(1420));
+    }
+
+    #[test]
+    fn test_windows_command_line_arg_quote() {
+        assert_eq!(
+            DaemonManager::windows_command_line_arg_quote("simple"),
+            "simple"
+        );
+        assert_eq!(
+            DaemonManager::windows_command_line_arg_quote(r#"C:\Program Files\p2wlan\daemon.exe"#),
+            r#""C:\Program Files\p2wlan\daemon.exe""#
+        );
+        assert_eq!(
+            DaemonManager::windows_command_line_arg_quote(r#"name"with quote"#),
+            r#""name\"with quote""#
+        );
+        assert_eq!(
+            DaemonManager::windows_command_line_arg_quote(r#"C:\path\"#),
+            r#"C:\path\"#
+        );
     }
 
     #[cfg(target_os = "macos")]
