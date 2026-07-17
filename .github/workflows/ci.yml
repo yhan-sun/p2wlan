@@ -35,7 +35,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
       - name: Go Vet
         run: |
           cd server
@@ -60,7 +60,7 @@ jobs:
           node-version: 20
           cache: 'pnpm'
       - name: Install Dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
       - name: Audit
         run: pnpm audit --audit-level high
       - name: Build

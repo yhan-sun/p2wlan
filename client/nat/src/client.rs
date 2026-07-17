@@ -203,14 +203,10 @@ pub mod test_helpers {
                 let data = &buf[..len];
                 if let Ok(req) = StunMessage::decode(data) {
                     if req.msg_type == BINDING_REQUEST {
-                        let mut resp = StunMessage::with_transaction_id(
-                            BINDING_RESPONSE,
-                            req.transaction_id,
-                        );
+                        let mut resp =
+                            StunMessage::with_transaction_id(BINDING_RESPONSE, req.transaction_id);
                         resp.add_attribute(StunAttribute::XorMappedAddress(client_addr));
-                        resp.add_attribute(StunAttribute::Software(
-                            "MockSTUN/1.0".to_string(),
-                        ));
+                        resp.add_attribute(StunAttribute::Software("MockSTUN/1.0".to_string()));
                         let encoded = resp.encode();
                         let _ = socket.send_to(&encoded, client_addr).await;
                     }

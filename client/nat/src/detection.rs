@@ -96,9 +96,7 @@ impl NatDetector {
             "0.0.0.0:0".to_string()
         };
 
-        let socket = UdpSocket::bind(&bind_addr)
-            .await
-            .map_err(NatError::Io)?;
+        let socket = UdpSocket::bind(&bind_addr).await.map_err(NatError::Io)?;
         let local_addr = socket.local_addr()?;
 
         info!("Starting NAT detection from {}", local_addr);
@@ -355,10 +353,8 @@ mod tests {
                             client_addr
                         };
 
-                        let mut resp = StunMessage::with_transaction_id(
-                            BINDING_RESPONSE,
-                            req.transaction_id,
-                        );
+                        let mut resp =
+                            StunMessage::with_transaction_id(BINDING_RESPONSE, req.transaction_id);
                         resp.add_attribute(StunAttribute::XorMappedAddress(reflexive_addr));
 
                         // If CHANGE-REQUEST requested, respond from a "different" address
