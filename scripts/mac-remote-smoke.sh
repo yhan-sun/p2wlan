@@ -12,7 +12,12 @@ if [[ "$MODE" == "--notun" ]]; then MODE=notun; fi
 if [[ "$MODE" == "--tun" ]]; then MODE=tun; fi
 
 ALI_HOST=${ALI_HOST:-47.109.40.237}
-ALI_KEY=${ALI_KEY:-"$HOME/.ssh/ali.pem"}
+CALLER_HOME=${HOME}
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  CALLER_HOME=$(eval echo "~$SUDO_USER")
+fi
+ALI_KEY=${ALI_KEY:-"$CALLER_HOME/.ssh/ali.pem"}
+ALI_KNOWN_HOSTS=${ALI_KNOWN_HOSTS:-"$CALLER_HOME/.ssh/known_hosts"}
 REMOTE_BASE=${REMOTE_BASE:-/tmp/p2wlan-remote-test}
 STUN_SERVER=${STUN_SERVER:-74.125.250.129:19302}
 PORT=${PORT:-$((19000 + $$ % 500))}
@@ -36,7 +41,12 @@ require_cmd() {
 }
 
 remote() {
-  ssh -o BatchMode=yes -i "$ALI_KEY" "root@$ALI_HOST" "$@"
+  ssh \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$ALI_KNOWN_HOSTS" \
+    -i "$ALI_KEY" \
+    "root@$ALI_HOST" "$@"
 }
 
 remote_cleanup() {
