@@ -1,41 +1,191 @@
 //! # P2PNet Daemon
 //!
 //! The main client daemon that runs the P2P virtual network.
-//!
-//! ## Current Status (Phase 5)
-//!
-//! All subsystems integrated:
-//! - TUN virtual interface creation and packet I/O
-//! - WireGuard encryption & handshake
-//! - NAT traversal (STUN / ICE / hole punching)
-//! - Relay fallback (DERP-like)
-//! - Control plane client (signaling, peer discovery)
-//! - Peer connection management
-//! - ACL (access control)
-//! - DNS resolver
-//! - Port mapping (FRP-like)
-//!
-//! ## Usage
-//!
-//! ```sh
-//! # Run with default config
-//! p2pnet-daemon --config config.json
-//!
-//! # Generate a new config
-//! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
-//!
-//! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --netmask 255.255.255.0 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay cn-shanghai@198.51.100.10:8080,cn-hongkong@203.0.113.20:8080 --relay-regions cn-shanghai,cn-hongkong --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
-//!
-//! # Query local runtime status
-//! p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status
-//! ```
 
+use clap::Parser;
 use p2pnet_daemon::{Config, Daemon, DaemonError};
+use std::path::PathBuf;
 use tracing::{error, info};
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "p2pnet-daemon")]
+#[command(version)]
+#[command(about = "P2PNet client daemon", long_about = None)]
+struct Cli {
+    /// Run with default config or specify config file path
+    #[arg(long, default_value = "p2pnet-config.json")]
+    config: PathBuf,
+
+    /// Generate a new config
+    #[arg(long)]
+    init: bool,
+
+    /// Control plane server URL
+    #[arg(long, default_value = "https://control.p2pnet.io")]
+    control: String,
+
+    /// Network ID to join or initialize
+    #[arg(long, default_value = "default")]
+    network: String,
+
+    /// Query local runtime status
+    #[arg(long)]
+    status: bool,
+
+    /// Override auth token
+    #[arg(long)]
+    token: Option<String>,
+
+    /// Override interface name
+    #[arg(long)]
+    interface: Option<String>,
+
+    /// Override virtual IP address
+    #[arg(long)]
+    address: Option<String>,
+
+    /// Override subnet mask
+    #[arg(long)]
+    netmask: Option<String>,
+
+    /// Override MTU
+    #[arg(long)]
+    mtu: Option<u32>,
+
+    /// Override heartbeat interval (seconds)
+    #[arg(long, name = "heartbeat-interval")]
+    heartbeat_interval: Option<u64>,
+
+    /// Override local UDP bind address
+    #[arg(long, name = "udp-bind")]
+    udp_bind: Option<String>,
+
+    /// Override UDP advertised endpoint
+    #[arg(long, name = "udp-advertise")]
+    udp_advertise: Option<String>,
+
+    /// Override STUN servers (comma-separated)
+    #[arg(long)]
+    stun: Option<String>,
+
+    /// Override STUN timeout (ms)
+    #[arg(long, name = "stun-timeout-ms")]
+    stun_timeout_ms: Option<u64>,
+
+    /// Override hole punch interval (ms)
+    #[arg(long, name = "punch-interval-ms")]
+    punch_interval_ms: Option<u64>,
+
+    /// Override hole punch attempts
+    #[arg(long, name = "punch-attempts")]
+    punch_attempts: Option<u32>,
+
+    /// Override keepalive interval (seconds)
+    #[arg(long, name = "keepalive-interval-secs")]
+    keepalive_interval_secs: Option<u64>,
+
+    /// Override relay servers (comma-separated)
+    #[arg(long)]
+    relay: Option<String>,
+
+    /// Override preferred relay regions (comma-separated)
+    #[arg(long, name = "relay-regions")]
+    relay_regions: Option<String>,
+
+    /// Override relay selection timeout (ms)
+    #[arg(long, name = "relay-selection-timeout-ms")]
+    relay_selection_timeout_ms: Option<u64>,
+
+    /// Override relay fallback timeout (ms)
+    #[arg(long, name = "relay-fallback-timeout-ms")]
+    relay_fallback_timeout_ms: Option<u64>,
+
+    /// Override diagnostics bind address
+    #[arg(long, name = "diagnostics-bind")]
+    diagnostics_bind: Option<String>,
+
+    /// Disable diagnostics endpoint
+    #[arg(long, name = "diagnostics-disable")]
+    diagnostics_disable: bool,
+
+    /// Prefer relay path instead of direct UDP
+    #[arg(long, name = "prefer-relay")]
+    prefer_relay: bool,
+
+    /// Prefer direct UDP path instead of relay fallback
+    #[arg(long, name = "prefer-direct")]
+    prefer_direct: bool,
+
+    /// Override device name
+    #[arg(long, name = "device-name")]
+    device_name: Option<String>,
+
+    /// Diagnostics URL to query status
+    #[arg(long, name = "diagnostics-url")]
+    diagnostics_url: Option<String>,
+}
+
+fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
+    if let Some(ref addr) = cli.address {
+        if addr.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!("Invalid IP address for --address: {}", addr));
+        }
+    }
+    if let Some(ref mask) = cli.netmask {
+        if mask.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!("Invalid netmask: {}", mask));
+        }
+    }
+    if let Some(mtu) = cli.mtu {
+        if !(576..=65535).contains(&mtu) {
+            return Err(format!("MTU must be between 576 and 65535, got {}", mtu));
+        }
+    }
+    if let Some(ref bind) = cli.udp_bind {
+        if bind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "Invalid SocketAddr for --udp-bind (expected IP:port): {}",
+                bind
+            ));
+        }
+    }
+    if let Some(ref dbind) = cli.diagnostics_bind {
+        if dbind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "Invalid SocketAddr for --diagnostics-bind (expected IP:port): {}",
+                dbind
+            ));
+        }
+    }
+    if let Some(ref stun) = cli.stun {
+        for s in stun.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            if s.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "Invalid SocketAddr in --stun (expected IP:port): {}",
+                    s
+                ));
+            }
+        }
+    }
+    if let Some(ref durl) = cli.diagnostics_url {
+        if reqwest::Url::parse(durl).is_err() {
+            return Err(format!("Invalid URL for --diagnostics-url: {}", durl));
+        }
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> p2pnet_daemon::Result<()> {
+    // Parse arguments BEFORE any side effects (including logging setup)
+    // This guarantees --help and --version exit cleanly without side effects.
+    let cli = Cli::parse();
+
+    if let Err(e) = validate_cli(&cli) {
+        eprintln!("Configuration Error: {}", e);
+        std::process::exit(1);
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -47,28 +197,10 @@ async fn main() -> p2pnet_daemon::Result<()> {
     info!("P2PNet Daemon starting...");
     info!("Platform: {}", std::env::consts::OS);
 
-    // Parse arguments
-    let args: Vec<String> = std::env::args().collect();
-    let status_requested = args.iter().any(|a| a == "--status");
-
     // Check for --init flag (generate new config)
-    if args.iter().any(|a| a == "--init") {
-        let control_url = args
-            .iter()
-            .position(|a| a == "--control")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("https://control.p2pnet.io");
-
-        let network_id = args
-            .iter()
-            .position(|a| a == "--network")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("default");
-
-        let mut config = Config::generate_default(control_url, network_id)?;
-        apply_arg_overrides(&mut config, &args);
+    if cli.init {
+        let mut config = Config::generate_default(&cli.control, &cli.network)?;
+        apply_cli_overrides(&mut config, &cli);
         let config_path = std::path::Path::new("p2pnet-config.json");
         config.save_to_file(config_path)?;
         info!("Config saved to {}", config_path.display());
@@ -77,15 +209,10 @@ async fn main() -> p2pnet_daemon::Result<()> {
     }
 
     // Load config
-    let config_path = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| std::path::PathBuf::from(s))
-        .unwrap_or_else(|| std::path::PathBuf::from("p2pnet-config.json"));
+    let config_path = &cli.config;
 
     let config = if config_path.exists() {
-        match Config::load_from_file(&config_path) {
+        match Config::load_from_file(config_path) {
             Ok(c) => {
                 info!("Loaded config from {}", config_path.display());
                 c
@@ -96,36 +223,22 @@ async fn main() -> p2pnet_daemon::Result<()> {
                 return Err(e);
             }
         }
-    } else if status_requested {
+    } else if cli.status {
         Config::generate_default("http://127.0.0.1", "default")?
     } else {
         info!("No config file found. Generating default config...");
-        let control_url = args
-            .iter()
-            .position(|a| a == "--control")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("https://control.p2pnet.io");
-
-        let network_id = args
-            .iter()
-            .position(|a| a == "--network")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("default");
-
-        let mut config = Config::generate_default(control_url, network_id)?;
-        apply_arg_overrides(&mut config, &args);
-        config.save_to_file(&config_path)?;
+        let mut config = Config::generate_default(&cli.control, &cli.network)?;
+        apply_cli_overrides(&mut config, &cli);
+        config.save_to_file(config_path)?;
         info!("Saved default config to {}", config_path.display());
         config
     };
 
     let mut config = config;
-    apply_arg_overrides(&mut config, &args);
+    apply_cli_overrides(&mut config, &cli);
 
-    if status_requested {
-        print_status(&config, &args).await?;
+    if cli.status {
+        print_status(&config, &cli).await?;
         return Ok(());
     }
 
@@ -137,17 +250,12 @@ async fn main() -> p2pnet_daemon::Result<()> {
     daemon.run().await
 }
 
-fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-}
-
-async fn print_status(config: &Config, args: &[String]) -> p2pnet_daemon::Result<()> {
-    let url = arg_value(args, "--diagnostics-url")
-        .map(ToString::to_string)
+async fn print_status(config: &Config, cli: &Cli) -> p2pnet_daemon::Result<()> {
+    let url = cli
+        .diagnostics_url
+        .clone()
         .unwrap_or_else(|| format!("http://{}/status", config.diagnostics.bind));
+
     let res = reqwest::get(&url)
         .await
         .map_err(|e| DaemonError::Network(format!("failed to query diagnostics at {url}: {e}")))?;
@@ -172,34 +280,32 @@ async fn print_status(config: &Config, args: &[String]) -> p2pnet_daemon::Result
     Ok(())
 }
 
-fn apply_arg_overrides(config: &mut Config, args: &[String]) {
-    if let Some(token) = arg_value(args, "--token") {
-        config.control.auth_token = token.to_string();
+fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
+    if let Some(ref token) = cli.token {
+        config.control.auth_token = token.clone();
     }
-    if let Some(interface) = arg_value(args, "--interface") {
-        config.network.interface = interface.to_string();
+    if let Some(ref interface) = cli.interface {
+        config.network.interface = interface.clone();
     }
-    if let Some(address) = arg_value(args, "--address") {
-        config.network.virtual_ip = address.to_string();
+    if let Some(ref address) = cli.address {
+        config.network.virtual_ip = address.clone();
     }
-    if let Some(netmask) = arg_value(args, "--netmask") {
-        config.network.netmask = netmask.to_string();
+    if let Some(ref netmask) = cli.netmask {
+        config.network.netmask = netmask.clone();
     }
-    if let Some(mtu) = arg_value(args, "--mtu").and_then(|s| s.parse::<u32>().ok()) {
+    if let Some(mtu) = cli.mtu {
         config.network.mtu = mtu;
     }
-    if let Some(interval) =
-        arg_value(args, "--heartbeat-interval").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(interval) = cli.heartbeat_interval {
         config.control.heartbeat_interval_secs = interval;
     }
-    if let Some(udp_bind) = arg_value(args, "--udp-bind") {
-        config.network.udp_bind = udp_bind.to_string();
+    if let Some(ref udp_bind) = cli.udp_bind {
+        config.network.udp_bind = udp_bind.clone();
     }
-    if let Some(udp_advertise) = arg_value(args, "--udp-advertise") {
-        config.network.udp_advertise = Some(udp_advertise.to_string());
+    if let Some(ref udp_advertise) = cli.udp_advertise {
+        config.network.udp_advertise = Some(udp_advertise.clone());
     }
-    if let Some(stun_servers) = arg_value(args, "--stun") {
+    if let Some(ref stun_servers) = cli.stun {
         config.network.stun_servers = stun_servers
             .split(',')
             .map(str::trim)
@@ -207,26 +313,19 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
             .map(ToString::to_string)
             .collect();
     }
-    if let Some(timeout_ms) =
-        arg_value(args, "--stun-timeout-ms").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(timeout_ms) = cli.stun_timeout_ms {
         config.network.stun_timeout_ms = timeout_ms;
     }
-    if let Some(interval_ms) =
-        arg_value(args, "--punch-interval-ms").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(interval_ms) = cli.punch_interval_ms {
         config.network.punch_interval_ms = interval_ms;
     }
-    if let Some(attempts) = arg_value(args, "--punch-attempts").and_then(|s| s.parse::<u32>().ok())
-    {
+    if let Some(attempts) = cli.punch_attempts {
         config.network.punch_attempts = attempts;
     }
-    if let Some(interval_secs) =
-        arg_value(args, "--keepalive-interval-secs").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(interval_secs) = cli.keepalive_interval_secs {
         config.network.keepalive_interval_secs = interval_secs;
     }
-    if let Some(relay_servers) = arg_value(args, "--relay") {
+    if let Some(ref relay_servers) = cli.relay {
         config.relay.servers = relay_servers
             .split(',')
             .map(str::trim)
@@ -234,7 +333,7 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
             .map(ToString::to_string)
             .collect();
     }
-    if let Some(preferred_regions) = arg_value(args, "--relay-regions") {
+    if let Some(ref preferred_regions) = cli.relay_regions {
         config.relay.preferred_regions = preferred_regions
             .split(',')
             .map(str::trim)
@@ -242,31 +341,27 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
             .map(ToString::to_string)
             .collect();
     }
-    if let Some(timeout_ms) =
-        arg_value(args, "--relay-selection-timeout-ms").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(timeout_ms) = cli.relay_selection_timeout_ms {
         config.relay.selection_timeout_ms = timeout_ms;
     }
-    if let Some(timeout_ms) =
-        arg_value(args, "--relay-fallback-timeout-ms").and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(timeout_ms) = cli.relay_fallback_timeout_ms {
         config.relay.fallback_timeout_ms = timeout_ms;
     }
-    if let Some(bind) = arg_value(args, "--diagnostics-bind") {
+    if let Some(ref bind) = cli.diagnostics_bind {
         config.diagnostics.enabled = true;
-        config.diagnostics.bind = bind.to_string();
+        config.diagnostics.bind = bind.clone();
     }
-    if args.iter().any(|a| a == "--diagnostics-disable") {
+    if cli.diagnostics_disable {
         config.diagnostics.enabled = false;
     }
-    if args.iter().any(|a| a == "--prefer-relay") {
+    if cli.prefer_relay {
         config.relay.prefer_direct = false;
     }
-    if args.iter().any(|a| a == "--prefer-direct") {
+    if cli.prefer_direct {
         config.relay.prefer_direct = true;
     }
-    if let Some(name) = arg_value(args, "--device-name") {
-        config.node.device_name = name.to_string();
+    if let Some(ref name) = cli.device_name {
+        config.node.device_name = name.clone();
     }
 }
 
@@ -277,19 +372,38 @@ mod tests {
     #[test]
     fn network_arguments_override_generated_config() {
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
-        let args = vec![
-            "p2pnet-daemon".to_string(),
-            "--netmask".to_string(),
-            "255.255.255.255".to_string(),
-            "--relay".to_string(),
-            "cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string(),
-            "--relay-regions".to_string(),
-            "cn-east,us-west".to_string(),
-            "--relay-selection-timeout-ms".to_string(),
-            "750".to_string(),
-        ];
+        let cli = Cli {
+            config: PathBuf::from("p2pnet-config.json"),
+            init: false,
+            control: "http://127.0.0.1".to_string(),
+            network: "default".to_string(),
+            status: false,
+            token: None,
+            interface: None,
+            address: None,
+            netmask: Some("255.255.255.255".to_string()),
+            mtu: None,
+            heartbeat_interval: None,
+            udp_bind: None,
+            udp_advertise: None,
+            stun: None,
+            stun_timeout_ms: None,
+            punch_interval_ms: None,
+            punch_attempts: None,
+            keepalive_interval_secs: None,
+            relay: Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string()),
+            relay_regions: Some("cn-east,us-west".to_string()),
+            relay_selection_timeout_ms: Some(750),
+            relay_fallback_timeout_ms: None,
+            diagnostics_bind: None,
+            diagnostics_disable: false,
+            prefer_relay: false,
+            prefer_direct: false,
+            device_name: None,
+            diagnostics_url: None,
+        };
 
-        apply_arg_overrides(&mut config, &args);
+        apply_cli_overrides(&mut config, &cli);
 
         assert_eq!(config.network.netmask, "255.255.255.255");
         assert_eq!(

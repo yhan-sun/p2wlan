@@ -176,7 +176,7 @@ impl Daemon {
             self.udp_transport.clone(),
             fallback_timeout,
             Duration::from_millis(self.config.network.punch_interval_ms),
-            self.config.network.punch_attempts.min(3).max(1),
+            self.config.network.punch_attempts.clamp(1, 3),
         ));
         if self.config.diagnostics.enabled {
             let diagnostics_config = self.config.clone();

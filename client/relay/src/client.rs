@@ -194,7 +194,7 @@ impl RelayClient {
                 }
 
                 // Parse header
-                if &buf[..4] != MAGIC {
+                if buf[..4] != MAGIC {
                     warn!("Invalid magic from relay server");
                     break;
                 }

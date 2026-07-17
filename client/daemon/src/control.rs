@@ -136,7 +136,7 @@ pub enum ControlMessage {
 // ============================================================
 
 /// Information about a known peer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PeerInfo {
     /// Peer node ID.
     pub node_id: String,
@@ -152,20 +152,6 @@ pub struct PeerInfo {
     pub online: bool,
     /// Last seen timestamp.
     pub last_seen: u64,
-}
-
-impl Default for PeerInfo {
-    fn default() -> Self {
-        Self {
-            node_id: String::new(),
-            public_key: String::new(),
-            endpoint: String::new(),
-            nat_type: String::new(),
-            virtual_ip: String::new(),
-            online: false,
-            last_seen: 0,
-        }
-    }
 }
 
 // ============================================================
@@ -796,6 +782,7 @@ async fn update_endpoint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_signal(
     http: &reqwest::Client,
     base_url: &str,

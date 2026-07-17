@@ -73,8 +73,10 @@ impl NatDetector {
 
     /// Create a detector with default settings and the given STUN servers.
     pub fn with_servers(servers: Vec<SocketAddr>) -> Self {
-        let mut config = DetectionConfig::default();
-        config.stun_servers = servers;
+        let config = DetectionConfig {
+            stun_servers: servers,
+            ..Default::default()
+        };
         Self::new(config)
     }
 
@@ -96,7 +98,7 @@ impl NatDetector {
 
         let socket = UdpSocket::bind(&bind_addr)
             .await
-            .map_err(|e| NatError::Io(e))?;
+            .map_err(NatError::Io)?;
         let local_addr = socket.local_addr()?;
 
         info!("Starting NAT detection from {}", local_addr);
@@ -330,46 +332,41 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, client_addr)) => {
-                        if let Ok(req) = StunMessage::decode(&buf[..len]) {
-                            if req.msg_type == BINDING_REQUEST {
-                                // Check for CHANGE-REQUEST
-                                let mut _change_ip = false;
-                                let mut _change_port = false;
-                                for attr in &req.attributes {
-                                    if let StunAttribute::ChangeRequest {
-                                        change_ip: ci,
-                                        change_port: cp,
-                                    } = attr
-                                    {
-                                        _change_ip = *ci;
-                                        _change_port = *cp;
-                                    }
-                                }
-
-                                let reflexive_addr = if let Some(port) = port_override {
-                                    SocketAddr::new(client_addr.ip(), port)
-                                } else {
-                                    client_addr
-                                };
-
-                                let mut resp = StunMessage::with_transaction_id(
-                                    BINDING_RESPONSE,
-                                    req.transaction_id,
-                                );
-                                resp.add_attribute(StunAttribute::XorMappedAddress(reflexive_addr));
-
-                                // If CHANGE-REQUEST requested, respond from a "different" address
-                                // (In this test we can't easily change the source address,
-                                // so we just respond normally — the test will check the reflexive addr)
-                                let encoded = resp.encode();
-                                let _ = socket.send_to(&encoded, client_addr).await;
+            while let Ok((len, client_addr)) = socket.recv_from(&mut buf).await {
+                if let Ok(req) = StunMessage::decode(&buf[..len]) {
+                    if req.msg_type == BINDING_REQUEST {
+                        // Check for CHANGE-REQUEST
+                        let mut _change_ip = false;
+                        let mut _change_port = false;
+                        for attr in &req.attributes {
+                            if let StunAttribute::ChangeRequest {
+                                change_ip: ci,
+                                change_port: cp,
+                            } = attr
+                            {
+                                _change_ip = *ci;
+                                _change_port = *cp;
                             }
                         }
+
+                        let reflexive_addr = if let Some(port) = port_override {
+                            SocketAddr::new(client_addr.ip(), port)
+                        } else {
+                            client_addr
+                        };
+
+                        let mut resp = StunMessage::with_transaction_id(
+                            BINDING_RESPONSE,
+                            req.transaction_id,
+                        );
+                        resp.add_attribute(StunAttribute::XorMappedAddress(reflexive_addr));
+
+                        // If CHANGE-REQUEST requested, respond from a "different" address
+                        // (In this test we can't easily change the source address,
+                        // so we just respond normally — the test will check the reflexive addr)
+                        let encoded = resp.encode();
+                        let _ = socket.send_to(&encoded, client_addr).await;
                     }
-                    Err(_) => break,
                 }
             }
         });

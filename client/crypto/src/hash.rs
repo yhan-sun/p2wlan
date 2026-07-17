@@ -64,7 +64,7 @@ pub fn hmac(key: &[u8], message: &[u8]) -> Hash {
     }
 
     let mut inner_hasher = Blake2s256::new();
-    inner_hasher.update(&inner_pad);
+    inner_hasher.update(inner_pad);
     inner_hasher.update(message);
     let inner: Hash = inner_hasher.finalize().into();
 
@@ -75,8 +75,8 @@ pub fn hmac(key: &[u8], message: &[u8]) -> Hash {
     }
 
     let mut outer_hasher = Blake2s256::new();
-    outer_hasher.update(&outer_pad);
-    outer_hasher.update(&inner);
+    outer_hasher.update(outer_pad);
+    outer_hasher.update(inner);
     outer_hasher.finalize().into()
 }
 

@@ -94,14 +94,15 @@ impl Endpoint {
         })
     }
 
-    /// Convert to a "ip:port" string.
-    pub fn to_string(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
-    }
-
     /// Convert to a `SocketAddr`.
     pub fn to_socket_addr(&self) -> Option<SocketAddr> {
         self.to_string().parse().ok()
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.ip, self.port)
     }
 }
 
