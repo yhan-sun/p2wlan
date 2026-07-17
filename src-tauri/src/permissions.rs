@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use std::process::Command;
 
+#[cfg(unix)]
 use crate::daemon_manager::DaemonManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +93,7 @@ fn find_wintun_dll() -> Option<PathBuf> {
 
 pub fn check_permission_status() -> PermissionStatus {
     let mut checks = Vec::new();
-    let mut details = Vec::new();
+    let mut details: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
