@@ -126,6 +126,10 @@ struct Cli {
 }
 
 fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
+    // Validate control plane URL
+    if reqwest::Url::parse(&cli.control).is_err() {
+        return Err(format!("Invalid URL for --control: {}", cli.control));
+    }
     if let Some(ref addr) = cli.address {
         if addr.parse::<std::net::Ipv4Addr>().is_err() {
             return Err(format!("Invalid IP address for --address: {}", addr));
@@ -149,6 +153,14 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
             ));
         }
     }
+    if let Some(ref adv) = cli.udp_advertise {
+        if adv.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "Invalid SocketAddr for --udp-advertise (expected IP:port): {}",
+                adv
+            ));
+        }
+    }
     if let Some(ref dbind) = cli.diagnostics_bind {
         if dbind.parse::<std::net::SocketAddr>().is_err() {
             return Err(format!(
@@ -163,6 +175,20 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
                 return Err(format!(
                     "Invalid SocketAddr in --stun (expected IP:port): {}",
                     s
+                ));
+            }
+        }
+    }
+    if let Some(ref relay) = cli.relay {
+        for r in relay.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            let endpoint = match r.split_once('@') {
+                Some((_, ep)) => ep,
+                None => r,
+            };
+            if endpoint.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "Invalid Relay server endpoint in '{}' (expected [region@]IP:port): {}",
+                    r, endpoint
                 ));
             }
         }
@@ -201,7 +227,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
     if cli.init {
         let mut config = Config::generate_default(&cli.control, &cli.network)?;
         apply_cli_overrides(&mut config, &cli);
-        let config_path = std::path::Path::new("p2pnet-config.json");
+        let config_path = &cli.config;
         config.save_to_file(config_path)?;
         info!("Config saved to {}", config_path.display());
         info!("Node ID: {}", config.node.node_id);
@@ -415,5 +441,128 @@ mod tests {
         );
         assert_eq!(config.relay.preferred_regions, vec!["cn-east", "us-west"]);
         assert_eq!(config.relay.selection_timeout_ms, 750);
+    }
+
+    #[test]
+    fn test_validate_cli_invalid_cases() {
+        // Create base Cli
+        let base_cli = Cli {
+            config: PathBuf::from("p2pnet-config.json"),
+            init: false,
+            control: "https://control.p2pnet.io".to_string(),
+            network: "default".to_string(),
+            status: false,
+            token: None,
+            interface: None,
+            address: None,
+            netmask: None,
+            mtu: None,
+            heartbeat_interval: None,
+            udp_bind: None,
+            udp_advertise: None,
+            stun: None,
+            stun_timeout_ms: None,
+            punch_interval_ms: None,
+            punch_attempts: None,
+            keepalive_interval_secs: None,
+            relay: None,
+            relay_regions: None,
+            relay_selection_timeout_ms: None,
+            relay_fallback_timeout_ms: None,
+            diagnostics_bind: None,
+            diagnostics_disable: false,
+            prefer_relay: false,
+            prefer_direct: false,
+            device_name: None,
+            diagnostics_url: None,
+        };
+
+        // 1. Invalid control URL
+        let mut cli = base_cli.clone();
+        cli.control = "not-a-url".to_string();
+        assert!(validate_cli(&cli).is_err());
+
+        // 2. Invalid address
+        let mut cli = base_cli.clone();
+        cli.address = Some("999.999.999.999".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 3. Invalid netmask
+        let mut cli = base_cli.clone();
+        cli.netmask = Some("bad-netmask".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 4. Invalid MTU
+        let mut cli = base_cli.clone();
+        cli.mtu = Some(100);
+        assert!(validate_cli(&cli).is_err());
+
+        // 5. Invalid udp-bind
+        let mut cli = base_cli.clone();
+        cli.udp_bind = Some("bad-bind".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 6. Invalid udp-advertise
+        let mut cli = base_cli.clone();
+        cli.udp_advertise = Some("bad:99999".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 7. Invalid relay server endpoint format
+        let mut cli = base_cli.clone();
+        cli.relay = Some("bad:99999".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        let mut cli = base_cli.clone();
+        cli.relay = Some("cn-east@bad:99999".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // Valid cases should pass
+        let mut cli = base_cli.clone();
+        cli.control = "http://127.0.0.1:18080".to_string();
+        cli.address = Some("10.20.0.2".to_string());
+        cli.netmask = Some("255.255.255.0".to_string());
+        cli.mtu = Some(1420);
+        cli.udp_bind = Some("0.0.0.0:51820".to_string());
+        cli.udp_advertise = Some("203.0.113.10:51820".to_string());
+        cli.relay = Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string());
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn test_clap_parsing() {
+        use clap::Parser;
+
+        // Verify valid parsing
+        let parsed = Cli::try_parse_from([
+            "p2pnet-daemon",
+            "--config",
+            "custom.json",
+            "--control",
+            "http://127.0.0.1:8080",
+            "--network",
+            "testnet",
+            "--init",
+        ]);
+        assert!(parsed.is_ok());
+        let cli = parsed.unwrap();
+        assert_eq!(cli.config, PathBuf::from("custom.json"));
+        assert_eq!(cli.control, "http://127.0.0.1:8080");
+        assert_eq!(cli.network, "testnet");
+        assert!(cli.init);
+
+        // Verify version and help parse cleanly
+        let parsed_help = Cli::try_parse_from(["p2pnet-daemon", "--help"]);
+        assert!(parsed_help.is_err()); // Clap returns an Error of kind DisplayHelp
+        assert_eq!(
+            parsed_help.unwrap_err().kind(),
+            clap::error::ErrorKind::DisplayHelp
+        );
+
+        let parsed_version = Cli::try_parse_from(["p2pnet-daemon", "--version"]);
+        assert!(parsed_version.is_err());
+        assert_eq!(
+            parsed_version.unwrap_err().kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
     }
 }

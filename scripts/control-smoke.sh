@@ -9,18 +9,37 @@ GO_BIN=${GO_BIN:-go}
 TMP_DIR=$(mktemp -d /tmp/p2wlan-smoke.XXXXXX)
 
 cleanup() {
-  if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
-  if [[ -n "${NODE_A_PID:-}" ]]; then kill "$NODE_A_PID" 2>/dev/null || true; fi
-  if [[ -n "${NODE_B_PID:-}" ]]; then kill "$NODE_B_PID" 2>/dev/null || true; fi
+  if [[ -n "${NODE_A_PID:-}" ]]; then
+    pkill -P "$NODE_A_PID" 2>/dev/null || true
+    kill "$NODE_A_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${NODE_B_PID:-}" ]]; then
+    pkill -P "$NODE_B_PID" 2>/dev/null || true
+    kill "$NODE_B_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    pkill -P "$SERVER_PID" 2>/dev/null || true
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  pkill -f "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "[smoke] temp dir: $TMP_DIR"
 
+echo "[smoke] building control server..."
 (
   cd "$ROOT_DIR/server"
-  PORT="$PORT" DB_PATH="$TMP_DIR/control.db" JWT_SECRET=smoke "$GO_BIN" run .
-) >"$TMP_DIR/server.log" 2>&1 &
+  "$GO_BIN" build -o "$TMP_DIR/control-server" .
+)
+
+echo "[smoke] building p2pnet-daemon..."
+(
+  cd "$ROOT_DIR"
+  cargo build -p p2pnet-daemon
+)
+
+PORT="$PORT" DB_PATH="$TMP_DIR/control.db" JWT_SECRET=smoke "$TMP_DIR/control-server" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 for _ in {1..40}; do
@@ -40,18 +59,16 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
-(
-  cd "$ROOT_DIR"
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info cargo run -p p2pnet-daemon -- \
-    --config "$TMP_DIR/node-a.json" \
-    --control "http://127.0.0.1:$PORT" \
-    --network default \
-    --token "$TOKEN" \
-    --device-name node-a \
-    --udp-bind 127.0.0.1:0 \
-    --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
-    --heartbeat-interval 5
-) >"$TMP_DIR/node-a.log" 2>&1 &
+P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2pnet-daemon" \
+  --config "$TMP_DIR/node-a.json" \
+  --control "http://127.0.0.1:$PORT" \
+  --network default \
+  --token "$TOKEN" \
+  --device-name node-a \
+  --udp-bind 127.0.0.1:0 \
+  --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
+  --heartbeat-interval 5 \
+  >"$TMP_DIR/node-a.log" 2>&1 &
 NODE_A_PID=$!
 
 for _ in {1..40}; do
@@ -59,18 +76,16 @@ for _ in {1..40}; do
   sleep 0.25
 done
 
-(
-  cd "$ROOT_DIR"
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info cargo run -p p2pnet-daemon -- \
-    --config "$TMP_DIR/node-b.json" \
-    --control "http://127.0.0.1:$PORT" \
-    --network default \
-    --token "$TOKEN" \
-    --device-name node-b \
-    --udp-bind 127.0.0.1:0 \
-    --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
-    --heartbeat-interval 5
-) >"$TMP_DIR/node-b.log" 2>&1 &
+P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2pnet-daemon" \
+  --config "$TMP_DIR/node-b.json" \
+  --control "http://127.0.0.1:$PORT" \
+  --network default \
+  --token "$TOKEN" \
+  --device-name node-b \
+  --udp-bind 127.0.0.1:0 \
+  --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
+  --heartbeat-interval 5 \
+  >"$TMP_DIR/node-b.log" 2>&1 &
 NODE_B_PID=$!
 
 for _ in {1..80}; do
