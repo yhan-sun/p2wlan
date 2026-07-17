@@ -171,7 +171,9 @@ func isAllowedOrigin(origin string, extra map[string]struct{}) bool {
 	if _, ok := extra[origin]; ok {
 		return true
 	}
-	if strings.HasPrefix(origin, "tauri://") || strings.HasPrefix(origin, "https://tauri.") {
+	if strings.HasPrefix(origin, "tauri://") ||
+		strings.HasPrefix(origin, "http://tauri.") ||
+		strings.HasPrefix(origin, "https://tauri.") {
 		return true
 	}
 	if strings.HasPrefix(origin, "http://localhost:") ||

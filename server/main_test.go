@@ -15,6 +15,8 @@ func TestWithCORSAllowsDesktopAndLocalDevOrigins(t *testing.T) {
 		"http://localhost:1420",
 		"http://127.0.0.1:1420",
 		"tauri://localhost",
+		"http://tauri.localhost",
+		"https://tauri.localhost",
 	} {
 		req := httptest.NewRequest(http.MethodOptions, "/api/v1/login", nil)
 		req.Header.Set("Origin", origin)
