@@ -462,7 +462,6 @@ impl Daemon {
             ..
         }) = control_event_registered
         {
-            relay_started = true;
             let relay_node_id = node_id
                 .clone()
                 .unwrap_or_else(|| self.config.node.node_id.clone());
@@ -471,45 +470,52 @@ impl Daemon {
             } else {
                 relay_servers.clone()
             };
-            let preferred_regions = self.config.relay.preferred_regions.clone();
-            let selection_timeout =
-                Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
-            let relay_transport = self.relay_transport.clone();
-            let relay_selection = self.relay_selection.clone();
-            let relay_peers = self.peers.clone();
-            let relay_inbound_tx = network_inbound_tx.clone();
+            if relay_servers.is_empty() {
+                debug!(
+                    "No relay servers configured; direct UDP only unless peers provide relay later"
+                );
+            } else {
+                relay_started = true;
+                let preferred_regions = self.config.relay.preferred_regions.clone();
+                let selection_timeout =
+                    Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
+                let relay_transport = self.relay_transport.clone();
+                let relay_selection = self.relay_selection.clone();
+                let relay_peers = self.peers.clone();
+                let relay_inbound_tx = network_inbound_tx.clone();
 
-            self.task_manager
-                .spawn_result("relay-inbound", false, async move {
-                    let RelaySelectionOutcome {
-                        transport,
-                        relay_rx,
-                        diagnostics,
-                    } = select_relay(
-                        &relay_servers,
-                        &preferred_regions,
-                        selection_timeout,
-                        &relay_node_id,
-                        relay_peers,
-                    )
+                self.task_manager
+                    .spawn_result("relay-inbound", false, async move {
+                        let RelaySelectionOutcome {
+                            transport,
+                            relay_rx,
+                            diagnostics,
+                        } = select_relay(
+                            &relay_servers,
+                            &preferred_regions,
+                            selection_timeout,
+                            &relay_node_id,
+                            relay_peers,
+                        )
+                        .await;
+                        *relay_selection.write().await = diagnostics;
+
+                        if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                            info!(
+                                "Selected relay region {} at {} ({} ms connect latency)",
+                                relay.region(),
+                                relay.endpoint(),
+                                relay.connect_latency_ms()
+                            );
+                            *relay_transport.write().await = Some(relay.clone());
+                            relay.run_inbound(relay_rx, relay_inbound_tx).await
+                        } else {
+                            warn!("No configured relay candidate was reachable");
+                            Ok(())
+                        }
+                    })
                     .await;
-                    *relay_selection.write().await = diagnostics;
-
-                    if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                        info!(
-                            "Selected relay region {} at {} ({} ms connect latency)",
-                            relay.region(),
-                            relay.endpoint(),
-                            relay.connect_latency_ms()
-                        );
-                        *relay_transport.write().await = Some(relay.clone());
-                        relay.run_inbound(relay_rx, relay_inbound_tx).await
-                    } else {
-                        warn!("No configured relay candidate was reachable");
-                        Ok(())
-                    }
-                })
-                .await;
+            }
         }
 
         // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
@@ -681,7 +687,6 @@ impl Daemon {
                 } => {
                     self.health.mark_control_success().await;
                     if !relay_started {
-                        relay_started = true;
                         let relay_node_id =
                             node_id.unwrap_or_else(|| self.config.node.node_id.clone());
                         let relay_servers = if relay_servers.is_empty() {
@@ -689,6 +694,11 @@ impl Daemon {
                         } else {
                             relay_servers
                         };
+                        if relay_servers.is_empty() {
+                            debug!("No relay servers advertised by control plane");
+                            continue;
+                        }
+                        relay_started = true;
                         let preferred_regions = self.config.relay.preferred_regions.clone();
                         let selection_timeout =
                             Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
@@ -699,35 +709,35 @@ impl Daemon {
 
                         self.task_manager
                             .spawn_result("relay-inbound", false, async move {
-                            let RelaySelectionOutcome {
-                                transport,
-                                relay_rx,
-                                diagnostics,
-                            } = select_relay(
-                                &relay_servers,
-                                &preferred_regions,
-                                selection_timeout,
-                                &relay_node_id,
-                                relay_peers,
-                            )
-                            .await;
-                            *relay_selection.write().await = diagnostics;
+                                let RelaySelectionOutcome {
+                                    transport,
+                                    relay_rx,
+                                    diagnostics,
+                                } = select_relay(
+                                    &relay_servers,
+                                    &preferred_regions,
+                                    selection_timeout,
+                                    &relay_node_id,
+                                    relay_peers,
+                                )
+                                .await;
+                                *relay_selection.write().await = diagnostics;
 
-                            if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                                info!(
-                                    "Selected relay region {} at {} ({} ms connect latency)",
-                                    relay.region(),
-                                    relay.endpoint(),
-                                    relay.connect_latency_ms()
-                                );
-                                *relay_transport.write().await = Some(relay.clone());
-                                relay.run_inbound(relay_rx, relay_inbound_tx).await
-                            } else {
-                                warn!("No configured relay candidate was reachable");
-                                Ok(())
-                            }
-                        })
-                        .await;
+                                if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                                    info!(
+                                        "Selected relay region {} at {} ({} ms connect latency)",
+                                        relay.region(),
+                                        relay.endpoint(),
+                                        relay.connect_latency_ms()
+                                    );
+                                    *relay_transport.write().await = Some(relay.clone());
+                                    relay.run_inbound(relay_rx, relay_inbound_tx).await
+                                } else {
+                                    warn!("No configured relay candidate was reachable");
+                                    Ok(())
+                                }
+                            })
+                            .await;
                     }
                 }
 
