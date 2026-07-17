@@ -251,6 +251,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
         let mut config = Config::generate_default(&cli.control, &cli.network)?;
         apply_cli_overrides(&mut config, &cli);
         let config_path = &cli.config;
+        config.config_path = Some(config_path.clone());
         config.save_to_file(config_path)?;
         info!("Config saved to {}", config_path.display());
         info!("Node ID: {}", config.node.node_id);
@@ -262,8 +263,9 @@ async fn main() -> p2pnet_daemon::Result<()> {
 
     let config = if config_path.exists() {
         match Config::load_from_file(config_path) {
-            Ok(c) => {
+            Ok(mut c) => {
                 info!("Loaded config from {}", config_path.display());
+                c.config_path = Some(config_path.clone());
                 c
             }
             Err(e) => {
@@ -278,6 +280,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
         info!("No config file found. Generating default config...");
         let mut config = Config::generate_default(&cli.control, &cli.network)?;
         apply_cli_overrides(&mut config, &cli);
+        config.config_path = Some(config_path.clone());
         config.save_to_file(config_path)?;
         info!("Saved default config to {}", config_path.display());
         config

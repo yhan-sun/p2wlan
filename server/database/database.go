@@ -2,7 +2,10 @@
 package database
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -98,19 +101,62 @@ func migrate(db *sql.DB) error {
 
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_net_ip ON devices(network_id, virtual_ip);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_net_pubkey ON devices(network_id, public_key);
+
+	-- Stage 2: authorization and device identity
+	CREATE TABLE IF NOT EXISTS device_challenges (
+		id          TEXT PRIMARY KEY,
+		device_id   TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+		challenge   BLOB NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		consumed    INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	);
+	CREATE INDEX IF NOT EXISTS idx_dev_chan_device ON device_challenges(device_id);
+	CREATE INDEX IF NOT EXISTS idx_dev_chan_expires ON device_challenges(expires_at);
+
+	CREATE TABLE IF NOT EXISTS device_credentials (
+		id          TEXT PRIMARY KEY,
+		device_id   TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+		token_hash  BLOB NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		revoked     INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	);
+	CREATE INDEX IF NOT EXISTS idx_dev_cred_device ON device_credentials(device_id);
+	CREATE INDEX IF NOT EXISTS idx_dev_cred_hash ON device_credentials(token_hash);
+	CREATE INDEX IF NOT EXISTS idx_dev_cred_expires ON device_credentials(expires_at);
+
+	CREATE TABLE IF NOT EXISTS network_memberships (
+		id          TEXT PRIMARY KEY,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		network_id  TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+		role        TEXT NOT NULL DEFAULT 'member',
+		created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		UNIQUE(user_id, network_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_net_mem_user ON network_memberships(user_id);
+	CREATE INDEX IF NOT EXISTS idx_net_mem_network ON network_memberships(network_id);
+
+	-- Add ed25519_public_key column to existing devices (IF NOT EXISTS is handled via ALTER IGNORE)
 	`
 
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
 
-	// Insert default system user and network to satisfy foreign keys
+	_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN ed25519_public_key TEXT NOT NULL DEFAULT ''`)
+
+	// Insert default system user and network to satisfy foreign keys,
+	// then grant the system user membership to the default network.
 	initData := `
 	INSERT OR IGNORE INTO users (id, email, password_hash, created_at)
 	VALUES ('system', 'system@p2wlan.local', '', 0);
 
 	INSERT OR IGNORE INTO networks (id, name, cidr, owner_id, created_at)
 	VALUES ('default', 'Default Network', '10.20.0.0/16', 'system', 0);
+
+	INSERT OR IGNORE INTO network_memberships (id, user_id, network_id, role)
+	VALUES ('mem-default-system', 'system', 'default', 'owner');
 	`
 	_, err := db.Exec(initData)
 	return err
@@ -126,6 +172,15 @@ type User struct {
 	CreatedAt    int64  `json:"created_at"`
 }
 
+// Network represents a virtual network.
+type Network struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CIDR      string `json:"cidr"`
+	OwnerID   string `json:"owner_id"`
+	CreatedAt int64  `json:"created_at"`
+}
+
 // CreateUser inserts a new user.
 func (db *DB) CreateUser(email, passwordHash string) (*User, error) {
 	id := fmt.Sprintf("user-%d", time.Now().UnixNano())
@@ -137,6 +192,8 @@ func (db *DB) CreateUser(email, passwordHash string) (*User, error) {
 		return nil, err
 	}
 
+	// Auto-join the user to the default network (for backward compatibility)
+	db.CreateNetworkMembership(id, "default", "member")
 	return &User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now}, nil
 }
 
@@ -150,6 +207,257 @@ func (db *DB) GetUserByEmail(email string) (*User, error) {
 	}
 	return &u, nil
 }
+
+
+
+// ---- Authorization types ----
+
+// DeviceChallenge represents a one-time challenge for device identity verification.
+type DeviceChallenge struct {
+    ID        string `json:"id"`
+    DeviceID  string `json:"device_id"`
+    Challenge []byte `json:"challenge"`
+    ExpiresAt int64  `json:"expires_at"`
+    Consumed  bool   `json:"consumed"`
+    CreatedAt int64  `json:"created_at"`
+}
+
+// DeviceCredential represents a device-specific authentication token.
+type DeviceCredential struct {
+    ID        string `json:"id"`
+    DeviceID  string `json:"device_id"`
+    TokenHash []byte `json:"-"`
+    ExpiresAt int64  `json:"expires_at"`
+    Revoked   bool   `json:"revoked"`
+    CreatedAt int64  `json:"created_at"`
+}
+
+// NetworkMembership links a user to a network.
+type NetworkMembership struct {
+    ID        string `json:"id"`
+    UserID    string `json:"user_id"`
+    NetworkID string `json:"network_id"`
+    Role      string `json:"role"`
+    CreatedAt int64  `json:"created_at"`
+}
+
+// ---- Challenge operations ----
+
+// CreateChallenge generates a new device challenge.
+func (db *DB) CreateChallenge(deviceID string, challenge []byte, expiresAt int64) (*DeviceChallenge, error) {
+    id := fmt.Sprintf("challenge-%d", time.Now().UnixNano())
+    now := time.Now().Unix()
+    _, err := db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
+        VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, challenge, expiresAt, now)
+    if err != nil {
+        return nil, err
+    }
+    return &DeviceChallenge{
+        ID: id, DeviceID: deviceID, Challenge: challenge,
+        ExpiresAt: expiresAt, Consumed: false, CreatedAt: now,
+    }, nil
+}
+
+// GetChallenge retrieves a challenge by ID.
+func (db *DB) GetChallenge(challengeID string) (*DeviceChallenge, error) {
+    var c DeviceChallenge
+    var consumed int
+    err := db.QueryRow(`SELECT id, device_id, challenge, expires_at, consumed, created_at
+        FROM device_challenges WHERE id = ?`, challengeID).
+        Scan(&c.ID, &c.DeviceID, &c.Challenge, &c.ExpiresAt, &consumed, &c.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    c.Consumed = consumed == 1
+    return &c, nil
+}
+
+// ConsumeChallenge marks a challenge as consumed (one-time use).
+func (db *DB) ConsumeChallenge(challengeID string) error {
+    _, err := db.Exec(`UPDATE device_challenges SET consumed = 1 WHERE id = ?`, challengeID)
+    return err
+}
+
+// ---- Credential operations ----
+
+// CreateDeviceCredential creates a new device credential and returns the credential
+// record along with the raw token. The token is only returned once; only its hash is stored.
+func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCredential, string, error) {
+	rawBytes := make([]byte, 32)
+	if _, err := rand.Read(rawBytes); err != nil {
+		return nil, "", fmt.Errorf("generate credential token: %w", err)
+	}
+	rawToken := "dc-" + hex.EncodeToString(rawBytes)
+	hash := hashToken(rawToken)
+	id := fmt.Sprintf("cred-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	expires := now + ttlSec
+
+	_, err := db.Exec(`INSERT INTO device_credentials (id, device_id, token_hash, expires_at, revoked, created_at)
+		VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, hash, expires, now)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return &DeviceCredential{
+		ID: id, DeviceID: deviceID, TokenHash: hash,
+		ExpiresAt: expires, Revoked: false, CreatedAt: now,
+	}, rawToken, nil
+}
+
+// ValidateDeviceCredential validates a credential token and returns the credential and device.
+func (db *DB) ValidateDeviceCredential(token string) (*DeviceCredential, *Device, error) {
+	hash := hashToken(token)
+
+	var cred DeviceCredential
+	var revoked int
+	err := db.QueryRow(`SELECT id, device_id, token_hash, expires_at, revoked, created_at
+		FROM device_credentials WHERE token_hash = ?`, hash).
+		Scan(&cred.ID, &cred.DeviceID, &cred.TokenHash, &cred.ExpiresAt, &revoked, &cred.CreatedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid credential: %w", err)
+	}
+	cred.Revoked = revoked == 1
+
+	if cred.Revoked {
+		return nil, nil, fmt.Errorf("credential revoked")
+	}
+	if time.Now().Unix() > cred.ExpiresAt {
+		return nil, nil, fmt.Errorf("credential expired")
+	}
+
+	device, err := db.GetDevice(cred.DeviceID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("device not found: %w", err)
+	}
+
+	return &cred, device, nil
+}
+
+// RevokeDeviceCredential revokes a device credential.
+func (db *DB) RevokeDeviceCredential(credentialID string) error {
+    _, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE id = ?`, credentialID)
+    return err
+}
+
+// ---- Network membership operations ----
+
+// CreateNetworkMembership adds a user to a network.
+func (db *DB) CreateNetworkMembership(userID, networkID, role string) (*NetworkMembership, error) {
+    id := fmt.Sprintf("mem-%d", time.Now().UnixNano())
+    now := time.Now().Unix()
+    _, err := db.Exec(`INSERT OR IGNORE INTO network_memberships (id, user_id, network_id, role, created_at)
+        VALUES (?, ?, ?, ?, ?)`, id, userID, networkID, role, now)
+    if err != nil {
+        return nil, err
+    }
+    return &NetworkMembership{
+        ID: id, UserID: userID, NetworkID: networkID,
+        Role: role, CreatedAt: now,
+    }, nil
+}
+
+// GetUserNetworks returns all networks the user is a member of.
+func (db *DB) GetUserNetworks(userID string) ([]Network, error) {
+    rows, err := db.Query(`SELECT n.id, n.name, n.cidr, n.owner_id, n.created_at
+        FROM networks n
+        JOIN network_memberships m ON m.network_id = n.id
+        WHERE m.user_id = ?`, userID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var networks []Network
+    for rows.Next() {
+        var n Network
+        if err := rows.Scan(&n.ID, &n.Name, &n.CIDR, &n.OwnerID, &n.CreatedAt); err != nil {
+            return nil, err
+        }
+        networks = append(networks, n)
+    }
+    return networks, nil
+}
+
+// UserHasNetworkAccess checks if a user has access to a specific network.
+func (db *DB) UserHasNetworkAccess(userID, networkID string) (bool, error) {
+    var count int
+    err := db.QueryRow(`SELECT COUNT(*) FROM network_memberships
+        WHERE user_id = ? AND network_id = ?`, userID, networkID).Scan(&count)
+    if err != nil {
+        return false, err
+    }
+    return count > 0, nil
+}
+
+// DeviceBelongsToUser checks whether the device is owned by the given user.
+func (db *DB) DeviceBelongsToUser(deviceID, userID string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM devices WHERE id = ? AND user_id = ?`, deviceID, userID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// DeviceAccessibleByUser checks ownership or network membership access.
+func (db *DB) DeviceAccessibleByUser(deviceID, userID string) (bool, error) {
+	owned, err := db.DeviceBelongsToUser(deviceID, userID)
+	if err != nil {
+		return false, err
+	}
+	if owned {
+		return true, nil
+	}
+	var count int
+	err = db.QueryRow(`SELECT COUNT(*) FROM devices d
+		JOIN network_memberships m ON m.network_id = d.network_id
+		WHERE d.id = ? AND m.user_id = ?`, deviceID, userID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// GetDevice retrieves a device by ID.
+func (db *DB) GetDevice(deviceID string) (*Device, error) {
+	var d Device
+	var online int
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at, COALESCE(ed25519_public_key, '')
+		FROM devices WHERE id = ?`, deviceID).
+		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &online, &d.CreatedAt, &d.Ed25519PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	d.Online = online == 1
+	return &d, nil
+}
+
+// CreateNetwork creates a private network owned by the given user.
+func (db *DB) CreateNetwork(ownerID, name, cidr string) (*Network, error) {
+	if name == "" {
+		return nil, fmt.Errorf("network name is required")
+	}
+	if cidr == "" {
+		cidr = "10.20.0.0/16"
+	}
+	if _, _, err := net.ParseCIDR(cidr); err != nil {
+		return nil, fmt.Errorf("invalid cidr: %w", err)
+	}
+	id := fmt.Sprintf("net-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	_, err := db.Exec(`INSERT INTO networks (id, name, cidr, owner_id, created_at) VALUES (?, ?, ?, ?, ?)`,
+		id, name, cidr, ownerID, now)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.CreateNetworkMembership(ownerID, id, "owner"); err != nil {
+		return nil, err
+	}
+	return &Network{ID: id, Name: name, CIDR: cidr, OwnerID: ownerID, CreatedAt: now}, nil
+}
+
 
 // ---- Device operations ----
 
@@ -166,11 +474,12 @@ type Device struct {
 	Endpoint   string `json:"endpoint"`
 	LastSeen   int64  `json:"last_seen"`
 	Online     bool   `json:"online"`
+	Ed25519PublicKey string `json:"ed25519_public_key,omitempty"`
 	CreatedAt  int64  `json:"created_at"`
 }
 
 // CreateDevice inserts a new device and assigns a virtual IP.
-func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform string) (*Device, error) {
+func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform, ed25519PublicKey string) (*Device, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, err
@@ -192,8 +501,8 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 		}
 
 		now := time.Now().Unix()
-		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, last_seen = ?, online = 1 WHERE id = ?`,
-			deviceName, platform, now, existing.ID)
+		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END WHERE id = ?`,
+			deviceName, platform, now, ed25519PublicKey, ed25519PublicKey, existing.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -214,7 +523,7 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 	if len(idSuffix) > 16 {
 		idSuffix = idSuffix[:16]
 	}
-	id := fmt.Sprintf("node-%s", idSuffix)
+	id := fmt.Sprintf("node-%s-%d", idSuffix, time.Now().UnixNano())
 	now := time.Now().Unix()
 
 	virtualIP, err := db.assignVirtualIP(tx, networkID)
@@ -222,9 +531,9 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 		return nil, err
 	}
 
-	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, last_seen, online, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-		id, userID, networkID, publicKey, deviceName, platform, virtualIP, now, now)
+	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, last_seen, online, created_at, ed25519_public_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		id, userID, networkID, publicKey, deviceName, platform, virtualIP, now, now, ed25519PublicKey)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +545,8 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 	return &Device{
 		ID: id, UserID: userID, NetworkID: networkID,
 		PublicKey: publicKey, DeviceName: deviceName, Platform: platform,
-		VirtualIP: virtualIP, LastSeen: now, Online: true, CreatedAt: now,
+		VirtualIP: virtualIP, LastSeen: now, Online: true,
+		Ed25519PublicKey: ed25519PublicKey, CreatedAt: now,
 	}, nil
 }
 
@@ -244,10 +554,10 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error) {
 	var d Device
 	var online int
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at, COALESCE(ed25519_public_key, '')
 		FROM devices WHERE network_id = ? AND public_key = ? LIMIT 1`, networkID, publicKey).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &online, &d.CreatedAt)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &online, &d.CreatedAt, &d.Ed25519PublicKey)
 	if err != nil {
 		return nil, err
 	}
@@ -405,7 +715,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	var signals []Signal
+	signals := []Signal{}
 	for rows.Next() {
 		var s Signal
 		var candidatesJSON string
@@ -473,6 +783,21 @@ func (db *DB) CreateTunnel(deviceID, protocol string, localPort, remotePort int,
 	}, nil
 }
 
+// GetTunnel retrieves a tunnel by ID.
+func (db *DB) GetTunnel(tunnelID string) (*Tunnel, error) {
+	var t Tunnel
+	var active int
+	err := db.QueryRow(`SELECT id, device_id, protocol, local_port, remote_port, local_address, public_endpoint, active, created_at
+		FROM tunnels WHERE id = ?`, tunnelID).
+		Scan(&t.ID, &t.DeviceID, &t.Protocol, &t.LocalPort, &t.RemotePort,
+			&t.LocalAddress, &t.PublicEndpoint, &active, &t.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	t.Active = active == 1
+	return &t, nil
+}
+
 // DeleteTunnel removes a port mapping.
 func (db *DB) DeleteTunnel(tunnelID string) error {
 	_, err := db.Exec(`DELETE FROM tunnels WHERE id = ?`, tunnelID)
@@ -500,4 +825,20 @@ func (db *DB) ListTunnelsByDevice(deviceID string) ([]Tunnel, error) {
 		tunnels = append(tunnels, t)
 	}
 	return tunnels, nil
+}
+
+
+// hashToken returns a SHA-256 hash of an opaque credential token.
+func hashToken(token string) []byte {
+	h := sha256.Sum256([]byte(token))
+	return h[:]
+}
+
+// ForeignKeysEnabled reports whether SQLite foreign key enforcement is active.
+func (db *DB) ForeignKeysEnabled() (bool, error) {
+	var enabled int
+	if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		return false, err
+	}
+	return enabled == 1, nil
 }

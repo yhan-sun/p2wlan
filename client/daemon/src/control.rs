@@ -13,6 +13,7 @@
 //! with protobuf available for higher performance in production.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -330,8 +331,15 @@ impl ControlClient {
     /// and no HTTP requests will be made even if a token is present. This is
     /// used for manual/offline mode.
     ///
+    /// `config_path` is an optional path to save the config file after
+    /// obtaining a device credential (so it persists across restarts).
+    ///
     /// Returns the client handle and an event receiver.
-    pub fn new(config: &Config, enabled: bool) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
+    pub fn new(
+        config: &Config,
+        enabled: bool,
+        config_path: Option<PathBuf>,
+    ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -351,8 +359,9 @@ impl ControlClient {
         if enabled && !config.control.auth_token.trim().is_empty() {
             let config = config.clone();
             let event_tx = client.event_tx.clone();
+            let cfg_path = config_path.clone();
             tokio::spawn(async move {
-                run_control_loop(config, event_tx, state, cmd_rx).await;
+                run_control_loop(config, event_tx, state, cmd_rx, cfg_path).await;
             });
         }
 
@@ -565,18 +574,31 @@ impl ControlClient {
 }
 
 async fn run_control_loop(
-    config: Config,
+    mut config: Config,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     state: Arc<RwLock<ClientState>>,
     mut cmd_rx: mpsc::UnboundedReceiver<ControlCommand>,
+    config_path: Option<PathBuf>,
 ) {
     let http = reqwest::Client::new();
     let base_url = normalize_http_base_url(&config.control.server_url);
-    let token = config.control.auth_token.clone();
+    // Prefer an existing device credential; fall back to user JWT for first registration.
+    let mut token = if !config.control.device_credential.trim().is_empty() {
+        config.control.device_credential.clone()
+    } else {
+        config.control.auth_token.clone()
+    };
 
     info!("Connecting to control plane at {base_url}");
 
-    let self_node_id = match register_device(&http, &base_url, &token, &config).await {
+    // Device registration always uses the user JWT (device credentials are issued after).
+    let register_token = if !config.control.auth_token.trim().is_empty() {
+        config.control.auth_token.clone()
+    } else {
+        token.clone()
+    };
+
+    let self_node_id = match register_device(&http, &base_url, &register_token, &config).await {
         Ok((node_id, virtual_ip, cidr)) => {
             {
                 let mut state = state.write().await;
@@ -590,6 +612,47 @@ async fn run_control_loop(
                 cidr: Some(cidr),
                 relay_servers: config.relay.servers.clone(),
             });
+
+            // If Ed25519 keys are available and no credential has been issued,
+            // attempt the challenge-response flow to obtain a device credential.
+            // NOTE: credential flow is best-effort for now; if it fails the daemon
+            // continues with the user JWT. Device credential support is the
+            // transition target for all daemon-to-control-plane communication.
+            if !config.control.credential_issued
+                && !config.node.ed25519_private_key.is_empty()
+                && !config.node.ed25519_public_key.is_empty()
+            {
+                info!("Attempting Ed25519 challenge for device credential...");
+                match obtain_device_credential(
+                    &http,
+                    &base_url,
+                    &register_token,
+                    &node_id,
+                    &config.node.ed25519_private_key,
+                    &config.node.ed25519_public_key,
+                )
+                .await
+                {
+                    Ok(device_credential) => {
+                        info!("Device credential obtained successfully");
+                        config.control.device_credential = device_credential.clone();
+                        config.control.credential_issued = true;
+                        token = device_credential;
+                        // Persist the device credential for restarts; subsequent control-plane
+                        // operations in this session use the device credential instead of the
+                        // long-lived user JWT.
+                        if let Some(ref path) = config_path {
+                            if let Err(e) = config.save_to_file(path) {
+                                warn!("Failed to save config with device credential: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to obtain device credential (non-fatal): {e}");
+                    }
+                }
+            }
+
             node_id
         }
         Err(err) => {
@@ -688,6 +751,111 @@ async fn run_control_loop(
             else => break,
         }
     }
+}
+
+/// Obtain a device credential via challenge-response.
+async fn obtain_device_credential(
+    http: &reqwest::Client,
+    base_url: &str,
+    user_token: &str,
+    device_id: &str,
+    ed25519_private_key_hex: &str,
+    ed25519_public_key_hex: &str,
+) -> Result<String> {
+    // Step 1: Request a challenge
+    let challenge_resp = http
+        .post(format!("{base_url}/api/v1/challenges"))
+        .bearer_auth(user_token)
+        .json(&serde_json::json!({
+            "device_id": device_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("challenge request failed: {e}")))?;
+
+    if !challenge_resp.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "challenge request returned HTTP {}",
+            challenge_resp.status()
+        )));
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct ChallengeResponse {
+        challenge_id: String,
+        challenge: String,
+        expires_at: i64,
+    }
+
+    let challenge_body: ChallengeResponse = challenge_resp
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("challenge decode failed: {e}")))?;
+
+    let challenge_bytes = hex::decode(&challenge_body.challenge)
+        .map_err(|e| DaemonError::ControlPlane(format!("challenge hex decode failed: {e}")))?;
+
+    // Step 2: Sign the challenge with Ed25519
+    let ed25519_private_key = hex::decode(ed25519_private_key_hex).map_err(|e| {
+        DaemonError::ControlPlane(format!("ed25519 private key hex decode failed: {e}"))
+    })?;
+
+    if ed25519_private_key.len() != 32 {
+        return Err(DaemonError::ControlPlane(
+            "invalid ed25519 private key length".into(),
+        ));
+    }
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&ed25519_private_key);
+    let keypair = p2pnet_crypto::Ed25519KeyPair::from_private_key(&key_bytes);
+    let signature = keypair.sign(&challenge_bytes);
+    let signature_hex = hex::encode(signature);
+
+    // Step 3: Submit the signed challenge to get a device credential
+    let cred_resp = http
+        .post(format!("{base_url}/api/v1/devices/credential"))
+        .bearer_auth(user_token)
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "ed25519_public_key": ed25519_public_key_hex,
+            "challenge_id": challenge_body.challenge_id,
+            "challenge_signature": signature_hex,
+        }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("credential request failed: {e}")))?;
+
+    if !cred_resp.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "credential request returned HTTP {}",
+            cred_resp.status()
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct CredentialResponse {
+        success: bool,
+        device_credential: Option<String>,
+        error: Option<String>,
+    }
+
+    let cred_body: CredentialResponse = cred_resp.json().await.map_err(|e| {
+        DaemonError::ControlPlane(format!("credential response decode failed: {e}"))
+    })?;
+
+    if !cred_body.success {
+        return Err(DaemonError::ControlPlane(
+            cred_body
+                .error
+                .unwrap_or_else(|| "credential request failed".to_string()),
+        ));
+    }
+
+    cred_body.device_credential.ok_or_else(|| {
+        DaemonError::ControlPlane("credential response missing device_credential".into())
+    })
 }
 
 fn normalize_http_base_url(server_url: &str) -> String {
@@ -1076,7 +1244,7 @@ mod tests {
     #[test]
     fn test_control_client_creation() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config, true);
+        let (client, _rx) = ControlClient::new(&config, true, None);
         // Client created successfully, no events yet
         drop(client);
     }
@@ -1086,7 +1254,7 @@ mod tests {
         let mut config = test_config();
         config.control.auth_token = "test-token".to_string();
         // When disabled, no background control loop is spawned
-        let (client, _rx) = ControlClient::new(&config, false);
+        let (client, _rx) = ControlClient::new(&config, false, None);
         drop(client);
     }
 
@@ -1098,7 +1266,7 @@ mod tests {
         config.control.auth_token = "test-token".to_string();
         config.control.server_url = "http://127.0.0.1:1".to_string(); // unreachable
 
-        let (client, mut rx) = ControlClient::new(&config, false);
+        let (client, mut rx) = ControlClient::new(&config, false, None);
 
         // Give any accidental background task a moment to fire events.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1112,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_client_handle_registered() {
         let config = test_config();
-        let (client, mut rx) = ControlClient::new(&config, true);
+        let (client, mut rx) = ControlClient::new(&config, true, None);
 
         client
             .handle_message(ControlMessage::Registered {
@@ -1142,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_client_handle_peer_join_leave() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config, true);
+        let (client, _rx) = ControlClient::new(&config, true, None);
 
         client
             .handle_message(ControlMessage::PeerJoin {
