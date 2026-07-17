@@ -86,14 +86,17 @@ for _ in {1..80}; do
     STATUS_B=$(curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
     if printf '%s' "$STATUS_A" | grep -q '"peers"' && \
        printf '%s' "$STATUS_A" | grep -q '"stats"' && \
+       printf '%s' "$STATUS_A" | grep -q '"relay_selection"' && \
        printf '%s' "$STATUS_B" | grep -q '"peers"' && \
-       printf '%s' "$STATUS_B" | grep -q '"stats"'; then
+       printf '%s' "$STATUS_B" | grep -q '"stats"' && \
+       printf '%s' "$STATUS_B" | grep -q '"relay_selection"'; then
       "$ROOT_DIR/target/debug/p2pnet-daemon" \
         --status \
         --diagnostics-url "http://127.0.0.1:$DIAG_A_PORT/status" \
         >"$TMP_DIR/status-cli.json" 2>"$TMP_DIR/status-cli.log" || true
       if grep -q '"node_id"' "$TMP_DIR/status-cli.json" && \
-         grep -q '"peers"' "$TMP_DIR/status-cli.json"; then
+         grep -q '"peers"' "$TMP_DIR/status-cli.json" && \
+         grep -q '"relay_selection"' "$TMP_DIR/status-cli.json"; then
         echo "[smoke] PASS: both daemons registered, discovered peers, installed WireGuard sessions, probed UDP candidates, and served diagnostics"
         exit 0
       fi

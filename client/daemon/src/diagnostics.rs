@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
-use crate::relay::RelayTransport;
+use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
 use crate::udp::UdpTransport;
 
 /// Runtime diagnostics snapshot returned by the local endpoint.
@@ -27,6 +27,7 @@ pub struct DiagnosticsSnapshot {
     pub udp_local_addr: Option<String>,
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
+    pub relay_selection: RelaySelectionDiagnostics,
     pub peers: Vec<PeerDiagnostics>,
     pub stats: PeerManagerStats,
 }
@@ -38,6 +39,7 @@ pub async fn run_diagnostics_server(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind).await.map_err(|e| {
         DaemonError::Network(format!(
@@ -49,7 +51,15 @@ pub async fn run_diagnostics_server(
         .map_err(|e| DaemonError::Network(format!("failed to read diagnostics local addr: {e}")))?;
     info!("Diagnostics endpoint listening at http://{local_addr}/status");
 
-    serve_diagnostics(listener, config, peers, udp_transport, relay_transport).await
+    serve_diagnostics(
+        listener,
+        config,
+        peers,
+        udp_transport,
+        relay_transport,
+        relay_selection,
+    )
+    .await
 }
 
 async fn serve_diagnostics(
@@ -58,6 +68,7 @@ async fn serve_diagnostics(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
 ) -> Result<()> {
     loop {
         let (stream, _remote_addr) = listener
@@ -69,9 +80,17 @@ async fn serve_diagnostics(
         let peers = peers.clone();
         let udp_transport = udp_transport.clone();
         let relay_transport = relay_transport.clone();
+        let relay_selection = relay_selection.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(stream, config, peers, udp_transport, relay_transport).await
+            if let Err(err) = handle_connection(
+                stream,
+                config,
+                peers,
+                udp_transport,
+                relay_transport,
+                relay_selection,
+            )
+            .await
             {
                 debug!("diagnostics request failed: {err}");
             }
@@ -85,6 +104,7 @@ async fn handle_connection(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
 ) -> Result<()> {
     let mut buffer = [0u8; 1024];
     let n = timeout(Duration::from_secs(3), stream.read(&mut buffer))
@@ -108,7 +128,14 @@ async fn handle_connection(
     match path {
         "/health" => write_response(&mut stream, 200, "text/plain", "ok\n").await?,
         "/status" => {
-            let snapshot = build_snapshot(config, peers, udp_transport, relay_transport).await;
+            let snapshot = build_snapshot(
+                config,
+                peers,
+                udp_transport,
+                relay_transport,
+                relay_selection,
+            )
+            .await;
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body).await?;
         }
@@ -126,6 +153,7 @@ async fn build_snapshot(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
 ) -> DiagnosticsSnapshot {
     let udp_local_addr = udp_transport
         .read()
@@ -142,6 +170,7 @@ async fn build_snapshot(
         udp_local_addr,
         relay_servers: config.relay.servers.clone(),
         relay_connected,
+        relay_selection: relay_selection.read().await.clone(),
         peers: peers.diagnostics().await,
         stats: peers.stats().await,
     }
@@ -204,6 +233,7 @@ mod tests {
             peers,
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
         ));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -220,6 +250,10 @@ mod tests {
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.peers[0].node_id, "node-b");
+        assert_eq!(
+            snapshot.relay_selection,
+            RelaySelectionDiagnostics::default()
+        );
         assert_eq!(
             snapshot.peers[0].direct.last_error.as_deref(),
             Some("probe timeout")

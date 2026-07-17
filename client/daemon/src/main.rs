@@ -25,7 +25,7 @@
 //! p2pnet-daemon --init --control https://control.p2pnet.io --network net123
 //!
 //! # Run as Administrator/root
-//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --netmask 255.255.255.0 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay 198.51.100.10:8080 --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
+//! p2pnet-daemon --interface p2pnet0 --address 10.20.0.1 --netmask 255.255.255.0 --mtu 1420 --udp-bind 0.0.0.0:51820 --udp-advertise 203.0.113.10:51820 --stun 1.1.1.1:3478 --relay cn-shanghai@198.51.100.10:8080,cn-hongkong@203.0.113.20:8080 --relay-regions cn-shanghai,cn-hongkong --diagnostics-bind 127.0.0.1:39277 --relay-fallback-timeout-ms 5000 --punch-attempts 10
 //!
 //! # Query local runtime status
 //! p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status
@@ -234,6 +234,19 @@ fn apply_arg_overrides(config: &mut Config, args: &[String]) {
             .map(ToString::to_string)
             .collect();
     }
+    if let Some(preferred_regions) = arg_value(args, "--relay-regions") {
+        config.relay.preferred_regions = preferred_regions
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    if let Some(timeout_ms) =
+        arg_value(args, "--relay-selection-timeout-ms").and_then(|s| s.parse::<u64>().ok())
+    {
+        config.relay.selection_timeout_ms = timeout_ms;
+    }
     if let Some(timeout_ms) =
         arg_value(args, "--relay-fallback-timeout-ms").and_then(|s| s.parse::<u64>().ok())
     {
@@ -262,16 +275,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn netmask_argument_overrides_generated_config() {
+    fn network_arguments_override_generated_config() {
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let args = vec![
             "p2pnet-daemon".to_string(),
             "--netmask".to_string(),
             "255.255.255.255".to_string(),
+            "--relay".to_string(),
+            "cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string(),
+            "--relay-regions".to_string(),
+            "cn-east,us-west".to_string(),
+            "--relay-selection-timeout-ms".to_string(),
+            "750".to_string(),
         ];
 
         apply_arg_overrides(&mut config, &args);
 
         assert_eq!(config.network.netmask, "255.255.255.255");
+        assert_eq!(
+            config.relay.servers,
+            vec![
+                "cn-east@127.0.0.1:8080".to_string(),
+                "us-west@127.0.0.1:8081".to_string()
+            ]
+        );
+        assert_eq!(config.relay.preferred_regions, vec!["cn-east", "us-west"]);
+        assert_eq!(config.relay.selection_timeout_ms, 750);
     }
 }

@@ -71,7 +71,7 @@ use p2pnet_wireguard::{
 };
 use peer::{ConnectionState, PeerManager};
 use port_mapping::PortMappingManager;
-use relay::RelayTransport;
+use relay::{select_relay, RelaySelectionDiagnostics, RelaySelectionOutcome, RelayTransport};
 use transport::{EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
 
@@ -99,6 +99,8 @@ pub struct Daemon {
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     /// Relay transport used when direct UDP is unavailable.
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    /// Latest relay candidate selection diagnostics.
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     /// Port mapping manager.
     port_mappings: Arc<PortMappingManager>,
     /// DNS resolver.
@@ -125,6 +127,7 @@ impl Daemon {
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
+            relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -159,13 +162,6 @@ impl Daemon {
         let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
-        let relay_endpoint = self
-            .config
-            .relay
-            .servers
-            .iter()
-            .find(|endpoint| endpoint.parse::<SocketAddr>().is_ok())
-            .cloned();
 
         let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
         tokio::spawn(run_network_outbound(
@@ -187,6 +183,7 @@ impl Daemon {
             let diagnostics_peers = self.peers.clone();
             let diagnostics_udp = self.udp_transport.clone();
             let diagnostics_relay = self.relay_transport.clone();
+            let diagnostics_relay_selection = self.relay_selection.clone();
             let diagnostics_bind = self.config.diagnostics.bind.clone();
             tokio::spawn(async move {
                 if let Err(err) = run_diagnostics_server(
@@ -195,6 +192,7 @@ impl Daemon {
                     diagnostics_peers,
                     diagnostics_udp,
                     diagnostics_relay,
+                    diagnostics_relay_selection,
                 )
                 .await
                 {
@@ -243,33 +241,11 @@ impl Daemon {
             tokio::spawn(log_inbound_packets_without_tun(inbound_rx));
         }
 
-        if let Some(relay_endpoint) = relay_endpoint {
-            let relay_transport = self.relay_transport.clone();
-            let relay_peers = self.peers.clone();
-            let relay_node_id = self.config.node.node_id.clone();
-            let relay_inbound_tx = network_inbound_tx.clone();
-            tokio::spawn(async move {
-                match RelayTransport::connect(&relay_endpoint, &relay_node_id, relay_peers).await {
-                    Ok((relay, relay_rx)) => {
-                        info!("Relay transport connected to {relay_endpoint}");
-                        *relay_transport.write().await = Some(relay.clone());
-                        tokio::spawn(async move {
-                            if let Err(err) = relay.run_inbound(relay_rx, relay_inbound_tx).await {
-                                warn!("Relay inbound transport stopped: {err}");
-                            }
-                        });
-                    }
-                    Err(err) => warn!("Relay transport unavailable at {relay_endpoint}: {err}"),
-                }
-            });
-        } else {
-            debug!("No socket-address relay servers configured; relay fallback disabled");
-        }
-
         let peers = self.peers.clone();
         let control = self.control.clone();
         let local_candidates = self.local_candidates.clone();
         let udp_transport = self.udp_transport.clone();
+        let udp_inbound_tx = network_inbound_tx.clone();
         tokio::spawn(async move {
             match UdpTransport::bind(udp_bind, peers).await {
                 Ok(udp) => {
@@ -317,7 +293,7 @@ impl Daemon {
                     *local_candidates.write().await = candidate_endpoints;
 
                     tokio::spawn(async move {
-                        if let Err(err) = udp.run_inbound(network_inbound_tx).await {
+                        if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
                             warn!("UDP inbound transport stopped: {err}");
                         }
                     });
@@ -328,16 +304,68 @@ impl Daemon {
             }
         });
 
+        // Relay registration must use the node ID assigned by the control plane.
+        let mut relay_started = false;
+
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
             match event {
                 ControlEvent::Registered {
+                    node_id,
                     virtual_ip,
-                    relay_servers: _,
+                    relay_servers,
                 } => {
                     info!("Registered with control server! Virtual IP: {}", virtual_ip);
-                    // Update config with assigned virtual IP
-                    // Start NAT detection...
+                    if !relay_started {
+                        relay_started = true;
+                        let relay_node_id =
+                            node_id.unwrap_or_else(|| self.config.node.node_id.clone());
+                        let relay_servers = if relay_servers.is_empty() {
+                            self.config.relay.servers.clone()
+                        } else {
+                            relay_servers
+                        };
+                        let preferred_regions = self.config.relay.preferred_regions.clone();
+                        let selection_timeout =
+                            Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
+                        let relay_transport = self.relay_transport.clone();
+                        let relay_selection = self.relay_selection.clone();
+                        let relay_peers = self.peers.clone();
+                        let relay_inbound_tx = network_inbound_tx.clone();
+
+                        tokio::spawn(async move {
+                            let RelaySelectionOutcome {
+                                transport,
+                                relay_rx,
+                                diagnostics,
+                            } = select_relay(
+                                &relay_servers,
+                                &preferred_regions,
+                                selection_timeout,
+                                &relay_node_id,
+                                relay_peers,
+                            )
+                            .await;
+                            *relay_selection.write().await = diagnostics;
+
+                            if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                                info!(
+                                    "Selected relay region {} at {} ({} ms connect latency)",
+                                    relay.region(),
+                                    relay.endpoint(),
+                                    relay.connect_latency_ms()
+                                );
+                                *relay_transport.write().await = Some(relay.clone());
+                                if let Err(err) =
+                                    relay.run_inbound(relay_rx, relay_inbound_tx).await
+                                {
+                                    warn!("Relay inbound transport stopped: {err}");
+                                }
+                            } else {
+                                warn!("No configured relay candidate was reachable");
+                            }
+                        });
+                    }
                 }
 
                 ControlEvent::PeerJoined(peer_info) => {
