@@ -98,7 +98,7 @@ func main() {
 	// HTTP server
 	addr := fmt.Sprintf(":%s", port)
 	// Wrap with body size limiter middleware (1MB max)
-	limitedMux := limitBodySize(mux)
+	limitedMux := withCORS(limitBodySize(mux))
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -133,6 +133,53 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+}
+
+// withCORS allows the desktop shell and local dev UI to call the control API.
+// Extra origins can be supplied with CONTROL_ALLOWED_ORIGINS as a comma list.
+func withCORS(next http.Handler) http.Handler {
+	allowed := parseAllowedOrigins(getEnv("CONTROL_ALLOWED_ORIGINS", ""))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && isAllowedOrigin(origin, allowed) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func parseAllowedOrigins(raw string) map[string]struct{} {
+	origins := map[string]struct{}{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			origins[item] = struct{}{}
+		}
+	}
+	return origins
+}
+
+func isAllowedOrigin(origin string, extra map[string]struct{}) bool {
+	if _, ok := extra[origin]; ok {
+		return true
+	}
+	if strings.HasPrefix(origin, "tauri://") || strings.HasPrefix(origin, "https://tauri.") {
+		return true
+	}
+	if strings.HasPrefix(origin, "http://localhost:") ||
+		strings.HasPrefix(origin, "http://127.0.0.1:") ||
+		strings.HasPrefix(origin, "http://[::1]:") {
+		return true
+	}
+	return false
 }
 
 // rateLimit is a simple per-process token-bucket style limiter for auth endpoints.

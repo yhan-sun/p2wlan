@@ -1,102 +1,203 @@
-import { useState, useEffect } from "react";
-
-interface DashboardData {
-  onlineNodes: number;
-  totalNodes: number;
-  activeTunnels: number;
-  directConns: number;
-  relayConns: number;
-  networkCIDR: string;
-  virtualIP: string;
-}
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  Activity,
+  AlertTriangle,
+  RefreshCw,
+  Settings,
+  ShieldCheck,
+  Square,
+} from "lucide-react";
+import ControlAuthPanel from "../components/ControlAuthPanel";
+import { StatusPill, zhLabel } from "../components/StatusPill";
+import { useClientStatus } from "../hooks/useClientStatus";
+import { getSettings } from "../lib/clientApi";
 
 export default function DashboardPage() {
-  const [data, setData] = useState<DashboardData>({
-    onlineNodes: 0,
-    totalNodes: 0,
-    activeTunnels: 0,
-    directConns: 0,
-    relayConns: 0,
-    networkCIDR: "10.20.0.0/16",
-    virtualIP: "10.20.0.1",
-  });
+  const {
+    daemon,
+    peers,
+    tunnel,
+    route,
+    lastError,
+    refresh,
+    connectElevated,
+    disconnect,
+    refreshing,
+  } = useClientStatus();
+  const [actionLoading, setActionLoading] = useState(false);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [showControlAuth, setShowControlAuth] = useState(false);
+  const navigate = useNavigate();
 
-  useEffect(() => {
-    // In production, fetch from Tauri backend
-    // For now, show demo data
-    setData({
-      onlineNodes: 3,
-      totalNodes: 5,
-      activeTunnels: 1,
-      directConns: 2,
-      relayConns: 1,
-      networkCIDR: "10.20.0.0/16",
-      virtualIP: "10.20.0.1",
-    });
-  }, []);
+  const startTun = async () => {
+    setActionLoading(true);
+    setActionMessage(null);
+    if (!getSettings().authToken.trim()) {
+      setShowControlAuth(true);
+      setActionMessage("请先登录或注册控制面账号，再启动 TUN。");
+      setActionLoading(false);
+      return;
+    }
+    try {
+      const msg = await connectElevated();
+      setActionMessage(msg);
+      setShowControlAuth(false);
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : "启动失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const stopTun = async () => {
+    setActionLoading(true);
+    setActionMessage(null);
+    try {
+      const msg = await disconnect();
+      setActionMessage(msg);
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : "停止失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const routeState = route?.entries[0]?.state ?? "unknown";
+  const running = daemon.lifecycle === "running";
+  const activePeers = peers.filter((peer) => peer.state === "direct" || peer.state === "relay");
 
   return (
-    <div>
-      <h2 style={{ marginBottom: "1.5rem" }}>Dashboard</h2>
-
-      <div className="stats-grid">
-        <div className="card stat-card">
-          <div className="stat-value" style={{ color: "var(--success)" }}>{data.onlineNodes}</div>
-          <div className="stat-label">Online Nodes</div>
+    <div className="page-container simple-dashboard">
+      <div className="page-header">
+        <div>
+          <h2>p2wlan</h2>
+          <p className="page-subtitle">登录控制面，授权启动 TUN，建立虚拟内网。</p>
         </div>
-        <div className="card stat-card">
-          <div className="stat-value">{data.totalNodes}</div>
-          <div className="stat-label">Total Nodes</div>
-        </div>
-        <div className="card stat-card">
-          <div className="stat-value" style={{ color: "var(--accent)" }}>{data.directConns}</div>
-          <div className="stat-label">Direct P2P</div>
-        </div>
-        <div className="card stat-card">
-          <div className="stat-value" style={{ color: "var(--warning)" }}>{data.relayConns}</div>
-          <div className="stat-label">Via Relay</div>
+        <div className="header-actions">
+          <button className="btn btn-ghost btn-sm" onClick={refresh} disabled={refreshing || actionLoading}>
+            <RefreshCw size={14} className={refreshing ? "spin" : ""} />
+            <span>刷新</span>
+          </button>
+          {running ? (
+            <button className="btn btn-danger btn-sm" onClick={stopTun} disabled={actionLoading}>
+              <Square size={14} />
+              <span>停止</span>
+            </button>
+          ) : (
+            <button className="btn btn-primary btn-sm" onClick={startTun} disabled={actionLoading}>
+              <ShieldCheck size={14} />
+              <span>{actionLoading ? "等待系统授权..." : "授权启动 TUN"}</span>
+            </button>
+          )}
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: "1.5rem" }}>
-        <div className="card-header">
-          <h3 className="card-title">Network Info</h3>
+      {lastError && (
+        <div className="banner banner-error">
+          <AlertTriangle size={16} />
+          <div className="banner-content">
+            <span className="banner-title">守护进程未连接</span>
+            <span className="banner-desc">{lastError}</span>
+          </div>
+          <button className="btn btn-ghost btn-xs text-danger" onClick={() => navigate("/diagnostics")}>
+            诊断
+          </button>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
-          <div>
-            <div className="form-label">Virtual IP</div>
-            <div style={{ fontFamily: "monospace" }}>{data.virtualIP}</div>
+      )}
+
+      {actionMessage && (
+        <div className="banner banner-info">
+          <Activity size={16} />
+          <div className="banner-content">
+            <span className="banner-desc">{actionMessage}</span>
           </div>
-          <div>
-            <div className="form-label">Network CIDR</div>
-            <div style={{ fontFamily: "monospace" }}>{data.networkCIDR}</div>
+        </div>
+      )}
+
+      {showControlAuth && (
+        <div className="panel-section">
+          <div className="panel-header">
+            <h3>控制面账号</h3>
           </div>
-          <div>
-            <div className="form-label">P2P Ratio</div>
-            <div>
-              {data.directConns + data.relayConns > 0
-                ? Math.round(
-                    (data.directConns / (data.directConns + data.relayConns)) * 100
-                  )
-                : 0}
-              %
+          <div className="panel-body flex-col gap-md">
+            <p className="text-sm text-secondary">
+              TUN 启动前需要控制面 token，用于注册设备和分配虚拟 IP。
+            </p>
+            <ControlAuthPanel onAuthenticated={startTun} />
+          </div>
+        </div>
+      )}
+
+      <div className="simple-status-grid">
+        <section className="panel-section">
+          <div className="panel-header">
+            <h3>当前状态</h3>
+            <StatusPill
+              label={running ? "运行中" : zhLabel(daemon.lifecycle)}
+              tone={running ? "ok" : daemon.lifecycle === "error" ? "bad" : "muted"}
+            />
+          </div>
+          <div className="panel-body flex-col gap-sm">
+            <div className="status-row">
+              <span className="status-label-text">控制服务器</span>
+              <span className="status-value-text-mono">{daemon.controlServer}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-label-text">虚拟 IP</span>
+              <span className="status-value-text-mono">{daemon.virtualIp || "未分配"}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-label-text">TUN 网卡</span>
+              <span className="status-value-text-mono">{daemon.tunInterface || tunnel?.interfaceName || "未创建"} / {daemon.mtu}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-label-text">Overlay 路由</span>
+              <StatusPill
+                label={zhLabel(routeState)}
+                tone={routeState === "installed" ? "ok" : routeState === "conflict" ? "warn" : "muted"}
+              />
+            </div>
+            <div className="status-row">
+              <span className="status-label-text">在线节点</span>
+              <span className="status-value-text-mono">{activePeers.length}</span>
             </div>
           </div>
-          <div>
-            <div className="form-label">Active Tunnels</div>
-            <div>{data.activeTunnels}</div>
-          </div>
-        </div>
-      </div>
+        </section>
 
-      <div className="card">
-        <div className="card-header">
-          <h3 className="card-title">Connection Status</h3>
-          <span className="status-dot online" />
-        </div>
-        <p style={{ color: "var(--text-secondary)", fontSize: "0.875rem" }}>
-          Connected to control server. All systems operational.
-        </p>
+        <section className="panel-section">
+          <div className="panel-header">
+            <h3>操作</h3>
+          </div>
+          <div className="panel-body flex-col gap-md">
+            <p className="text-sm text-secondary">
+              {running
+                ? "TUN 已运行，可以在另一台设备登录同一控制面后测试虚拟 IP 互通。"
+                : "启动时会交给系统管理员授权。macOS 可能在短时间内复用刚输入过的授权，因此重复启动不一定再次弹窗；p2wlan 不会读取或保存密码。"}
+            </p>
+            {running ? (
+              <button className="btn btn-danger" onClick={stopTun} disabled={actionLoading}>
+                <Square size={14} />
+                <span>停止 TUN</span>
+              </button>
+            ) : (
+              <button className="btn btn-primary" onClick={startTun} disabled={actionLoading}>
+                <ShieldCheck size={14} />
+                <span>{actionLoading ? "等待系统授权..." : "授权启动 TUN"}</span>
+              </button>
+            )}
+            <div className="simple-action-row">
+              <button className="btn btn-ghost" onClick={() => navigate("/diagnostics")}>
+                <Activity size={14} />
+                <span>诊断</span>
+              </button>
+              <button className="btn btn-ghost" onClick={() => navigate("/settings")}>
+                <Settings size={14} />
+                <span>设置</span>
+              </button>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   );

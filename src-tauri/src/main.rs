@@ -1,0 +1,136 @@
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod daemon_manager;
+mod permissions;
+mod tray;
+
+use daemon_manager::{DaemonManager, DaemonStartOptions};
+use std::path::PathBuf;
+use tauri::{Manager, State};
+
+pub struct AppState {
+    pub daemon_manager: DaemonManager,
+}
+
+#[tauri::command]
+fn permission_status() -> Result<permissions::PermissionStatus, String> {
+    Ok(permissions::check_permission_status())
+}
+
+#[tauri::command]
+async fn daemon_status(
+    state: State<'_, AppState>,
+    diagnostics_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    state.daemon_manager.status(diagnostics_url).await
+}
+
+#[tauri::command]
+async fn daemon_start(
+    state: State<'_, AppState>,
+    options: Option<DaemonStartOptions>,
+) -> Result<String, String> {
+    state.daemon_manager.start(options).await
+}
+
+#[tauri::command]
+async fn daemon_start_elevated(
+    state: State<'_, AppState>,
+    options: Option<DaemonStartOptions>,
+) -> Result<String, String> {
+    state.daemon_manager.start_elevated(options).await
+}
+
+#[tauri::command]
+async fn daemon_stop(
+    state: State<'_, AppState>,
+    diagnostics_url: Option<String>,
+) -> Result<String, String> {
+    state.daemon_manager.stop(diagnostics_url).await
+}
+
+#[tauri::command]
+fn open_logs() -> Result<String, String> {
+    // Determine log directory:
+    // macOS: ~/Library/Logs/p2wlan
+    // Linux: ~/.p2wlan/logs
+    // Windows: %LOCALAPPDATA%/p2wlan/logs
+    let log_dir = if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .map(|h| h.join("Library").join("Logs").join("p2wlan"))
+            .ok_or_else(|| "Could not locate macOS Library directory".to_string())?
+    } else if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA")
+            .map(|l| PathBuf::from(l).join("p2wlan").join("logs"))
+            .map_err(|_| {
+                "Could not read LOCALAPPDATA environment variable on Windows".to_string()
+            })?
+    } else {
+        dirs::home_dir()
+            .map(|h| h.join(".p2wlan").join("logs"))
+            .ok_or_else(|| "Could not locate user home directory".to_string())?
+    };
+
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir).map_err(|e| {
+            format!(
+                "Failed to create log directory {}: {}",
+                log_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    // Open path using platform command
+    let open_result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&log_dir).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&log_dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&log_dir).spawn()
+    };
+
+    open_result
+        .map(|_| format!("Opened log directory: {}", log_dir.display()))
+        .map_err(|e| format!("Failed to open log directory: {}", e))
+}
+
+fn main() {
+    let daemon_manager = DaemonManager::new();
+    let app_state = AppState { daemon_manager };
+
+    let app = tauri::Builder::default()
+        .manage(app_state)
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
+                    tauri_plugin_log::Builder::default()
+                        .level(log::LevelFilter::Info)
+                        .build(),
+                )?;
+            }
+            // Create native tray. Fail the app startup if this cannot be installed,
+            // otherwise the desktop shell would silently lose its primary control path.
+            tray::create_tray(app.handle())?;
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            daemon_status,
+            daemon_start,
+            daemon_start_elevated,
+            daemon_stop,
+            open_logs,
+            permission_status
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                state.daemon_manager.cleanup();
+            }
+        }
+    });
+}
