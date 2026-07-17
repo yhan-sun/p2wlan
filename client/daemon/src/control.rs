@@ -324,10 +324,14 @@ enum ControlCommand {
 }
 
 impl ControlClient {
-    /// Create a new control client (not yet connected).
+    /// Create a new control client.
+    ///
+    /// When `enabled` is `false`, the background control loop is not spawned
+    /// and no HTTP requests will be made even if a token is present. This is
+    /// used for manual/offline mode.
     ///
     /// Returns the client handle and an event receiver.
-    pub fn new(config: &Config) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
+    pub fn new(config: &Config, enabled: bool) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -344,7 +348,7 @@ impl ControlClient {
             state: state.clone(),
         };
 
-        if !config.control.auth_token.trim().is_empty() {
+        if enabled && !config.control.auth_token.trim().is_empty() {
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             tokio::spawn(async move {
@@ -741,9 +745,7 @@ async fn register_device(
     let virtual_ip = body
         .virtual_ip
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
-    let cidr = body
-        .cidr
-        .unwrap_or_else(|| "10.20.0.0/16".to_string());
+    let cidr = body.cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
 
     Ok((node_id, virtual_ip, cidr))
 }
@@ -1074,15 +1076,43 @@ mod tests {
     #[test]
     fn test_control_client_creation() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config);
+        let (client, _rx) = ControlClient::new(&config, true);
         // Client created successfully, no events yet
+        drop(client);
+    }
+
+    #[test]
+    fn test_control_client_creation_disabled() {
+        let mut config = test_config();
+        config.control.auth_token = "test-token".to_string();
+        // When disabled, no background control loop is spawned
+        let (client, _rx) = ControlClient::new(&config, false);
+        drop(client);
+    }
+
+    /// Regression: with token + unreachable control, disabled mode must not
+    /// emit ServerError/Disconnected (which would otherwise shut down the daemon).
+    #[tokio::test]
+    async fn test_control_client_disabled_emits_no_events() {
+        let mut config = test_config();
+        config.control.auth_token = "test-token".to_string();
+        config.control.server_url = "http://127.0.0.1:1".to_string(); // unreachable
+
+        let (client, mut rx) = ControlClient::new(&config, false);
+
+        // Give any accidental background task a moment to fire events.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled ControlClient must not emit control events"
+        );
         drop(client);
     }
 
     #[tokio::test]
     async fn test_control_client_handle_registered() {
         let config = test_config();
-        let (client, mut rx) = ControlClient::new(&config);
+        let (client, mut rx) = ControlClient::new(&config, true);
 
         client
             .handle_message(ControlMessage::Registered {
@@ -1112,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_client_handle_peer_join_leave() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config);
+        let (client, _rx) = ControlClient::new(&config, true);
 
         client
             .handle_message(ControlMessage::PeerJoin {
