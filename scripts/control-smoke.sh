@@ -73,7 +73,7 @@ P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2pnet-daemon" \
 NODE_A_PID=$!
 
 for _ in {1..40}; do
-  if grep -q 'Registered with control server! Virtual IP: 10.20.0.2' "$TMP_DIR/node-a.log" 2>/dev/null; then break; fi
+  if grep -q 'Control plane registration confirmed. Assigned IP: 10.20.0.2' "$TMP_DIR/node-a.log" 2>/dev/null; then break; fi
   sleep 0.25
 done
 

@@ -136,7 +136,10 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
         Err(_) => return Err(format!("Invalid URL for --control: {}", cli.control)),
     };
     if control_url.scheme() != "http" && control_url.scheme() != "https" {
-        return Err(format!("Only http and https schemes are allowed for --control: {}", cli.control));
+        return Err(format!(
+            "Only http and https schemes are allowed for --control: {}",
+            cli.control
+        ));
     }
     if let Some(ref addr) = cli.address {
         if addr.parse::<std::net::Ipv4Addr>().is_err() {
@@ -212,7 +215,10 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
             Err(_) => return Err(format!("Invalid URL for --diagnostics-url: {}", durl)),
         };
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(format!("Only http and https schemes are allowed for --diagnostics-url: {}", durl));
+            return Err(format!(
+                "Only http and https schemes are allowed for --diagnostics-url: {}",
+                durl
+            ));
         }
     }
     Ok(())

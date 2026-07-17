@@ -39,9 +39,9 @@ pub mod error;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
+pub mod route;
 pub mod transport;
 pub mod udp;
-pub mod route;
 
 // Re-export key types
 pub use config::Config;
@@ -115,7 +115,8 @@ pub struct Daemon {
 impl Daemon {
     /// Create a new daemon from config.
     pub fn new(config: Config) -> Self {
-        let (control, control_rx) = ControlClient::new(&config);
+        let control_enabled = !config.network.manual;
+        let (control, control_rx) = ControlClient::new(&config, control_enabled);
         let (transport, encrypted_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
@@ -169,14 +170,15 @@ impl Daemon {
                         relay_servers: rs,
                     } => {
                         info!("Control plane registration confirmed. Assigned IP: {}", vip);
-                        
+
                         // Validate virtual IP
                         if vip.parse::<std::net::Ipv4Addr>().is_err() {
                             return Err(DaemonError::Network(format!(
-                                "Server returned invalid virtual IP: {}", vip
+                                "Server returned invalid virtual IP: {}",
+                                vip
                             )));
                         }
-                        
+
                         // Validate CIDR
                         let actual_cidr = dyn_cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
                         if !is_ip_in_cidr(&vip, &actual_cidr) {
@@ -185,7 +187,7 @@ impl Daemon {
                                 vip, actual_cidr
                             )));
                         }
-                        
+
                         virtual_ip = vip;
                         if let Some(derived_mask) = cidr_to_netmask(&actual_cidr) {
                             netmask = derived_mask;
@@ -197,7 +199,7 @@ impl Daemon {
                         if !rs.is_empty() {
                             relay_servers = rs;
                         }
-                        
+
                         control_event_registered = Some(ControlEvent::Registered {
                             node_id: Some(assigned_node_id.clone()),
                             virtual_ip: virtual_ip.clone(),
@@ -389,56 +391,59 @@ impl Daemon {
         let mut relay_started = false;
 
         // If we had a cached control_event_registered, process it first
-        if let Some(event) = control_event_registered {
-            if let ControlEvent::Registered { ref node_id, ref relay_servers, .. } = event {
-                relay_started = true;
-                let relay_node_id = node_id.clone().unwrap_or_else(|| self.config.node.node_id.clone());
-                let relay_servers = if relay_servers.is_empty() {
-                    self.config.relay.servers.clone()
-                } else {
-                    relay_servers.clone()
-                };
-                let preferred_regions = self.config.relay.preferred_regions.clone();
-                let selection_timeout =
-                    Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
-                let relay_transport = self.relay_transport.clone();
-                let relay_selection = self.relay_selection.clone();
-                let relay_peers = self.peers.clone();
-                let relay_inbound_tx = network_inbound_tx.clone();
+        if let Some(ControlEvent::Registered {
+            ref node_id,
+            ref relay_servers,
+            ..
+        }) = control_event_registered
+        {
+            relay_started = true;
+            let relay_node_id = node_id
+                .clone()
+                .unwrap_or_else(|| self.config.node.node_id.clone());
+            let relay_servers = if relay_servers.is_empty() {
+                self.config.relay.servers.clone()
+            } else {
+                relay_servers.clone()
+            };
+            let preferred_regions = self.config.relay.preferred_regions.clone();
+            let selection_timeout =
+                Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
+            let relay_transport = self.relay_transport.clone();
+            let relay_selection = self.relay_selection.clone();
+            let relay_peers = self.peers.clone();
+            let relay_inbound_tx = network_inbound_tx.clone();
 
-                tokio::spawn(async move {
-                    let RelaySelectionOutcome {
-                        transport,
-                        relay_rx,
-                        diagnostics,
-                    } = select_relay(
-                        &relay_servers,
-                        &preferred_regions,
-                        selection_timeout,
-                        &relay_node_id,
-                        relay_peers,
-                    )
-                    .await;
-                    *relay_selection.write().await = diagnostics;
+            tokio::spawn(async move {
+                let RelaySelectionOutcome {
+                    transport,
+                    relay_rx,
+                    diagnostics,
+                } = select_relay(
+                    &relay_servers,
+                    &preferred_regions,
+                    selection_timeout,
+                    &relay_node_id,
+                    relay_peers,
+                )
+                .await;
+                *relay_selection.write().await = diagnostics;
 
-                    if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                        info!(
-                            "Selected relay region {} at {} ({} ms connect latency)",
-                            relay.region(),
-                            relay.endpoint(),
-                            relay.connect_latency_ms()
-                        );
-                        *relay_transport.write().await = Some(relay.clone());
-                        if let Err(err) =
-                            relay.run_inbound(relay_rx, relay_inbound_tx).await
-                        {
-                            warn!("Relay inbound transport stopped: {err}");
-                        }
-                    } else {
-                        warn!("No configured relay candidate was reachable");
+                if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                    info!(
+                        "Selected relay region {} at {} ({} ms connect latency)",
+                        relay.region(),
+                        relay.endpoint(),
+                        relay.connect_latency_ms()
+                    );
+                    *relay_transport.write().await = Some(relay.clone());
+                    if let Err(err) = relay.run_inbound(relay_rx, relay_inbound_tx).await {
+                        warn!("Relay inbound transport stopped: {err}");
                     }
-                });
-            }
+                } else {
+                    warn!("No configured relay candidate was reachable");
+                }
+            });
         }
 
         // Process control events
@@ -615,13 +620,8 @@ impl Daemon {
             return Ok(None);
         }
 
-        let config = InterfaceConfig::new(
-            &self.config.network.interface,
-            vip,
-            netmask,
-            mtu,
-        )
-        .map_err(|e| DaemonError::Network(format!("invalid TUN config: {e}")))?;
+        let config = InterfaceConfig::new(&self.config.network.interface, vip, netmask, mtu)
+            .map_err(|e| DaemonError::Network(format!("invalid TUN config: {e}")))?;
 
         let tun = TunDevice::create(&config)
             .map_err(|e| DaemonError::Network(format!("failed to create TUN interface: {e}")))?;
@@ -1034,8 +1034,59 @@ fn parse_stun_servers(values: &[String]) -> Result<Vec<SocketAddr>> {
 }
 
 // ============================================================
-// Tests
+// Drop, helpers, and Tests
 // ============================================================
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        info!("Daemon cleanup: removing routes...");
+        self.route_manager.cleanup();
+    }
+}
+
+fn cidr_to_netmask(cidr: &str) -> Option<String> {
+    let (_, prefix_str) = cidr.split_once('/')?;
+    let prefix: u32 = prefix_str.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask_u32 = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
+    let mask = std::net::Ipv4Addr::from(mask_u32);
+    Some(mask.to_string())
+}
+
+fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
+    let Some((net_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(net_ip) = net_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+
+    let ip_u32 = u32::from(ip);
+    let net_u32 = u32::from(net_ip);
+
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
+
+    (ip_u32 & mask) == (net_u32 & mask)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1044,6 +1095,15 @@ mod tests {
     #[test]
     fn test_daemon_creation() {
         let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let _daemon = Daemon::new(config);
+    }
+
+    #[test]
+    fn test_daemon_creation_manual_mode() {
+        let mut config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+        config.network.manual = true;
+        config.control.auth_token = "present-but-ignored".to_string();
+        // Must not attempt control-plane registration even with a token.
         let _daemon = Daemon::new(config);
     }
 
@@ -1255,45 +1315,4 @@ mod tests {
         let list = daemon.port_mappings().list().await;
         assert_eq!(list.len(), 1);
     }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        info!("Daemon cleanup: removing routes...");
-        self.route_manager.cleanup();
-    }
-}
-
-fn cidr_to_netmask(cidr: &str) -> Option<String> {
-    let (_, prefix_str) = cidr.split_once('/')?;
-    let prefix: u32 = prefix_str.parse().ok()?;
-    if prefix > 32 {
-        return None;
-    }
-    let mask_u32 = if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    };
-    let mask = std::net::Ipv4Addr::from(mask_u32);
-    Some(mask.to_string())
-}
-
-fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
-    let Some((net_str, prefix_str)) = cidr.split_once('/') else { return false; };
-    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false; };
-    let Ok(net_ip) = net_str.parse::<std::net::Ipv4Addr>() else { return false; };
-    let Ok(prefix) = prefix_str.parse::<u32>() else { return false; };
-    if prefix > 32 { return false; }
-    
-    let ip_u32 = u32::from(ip);
-    let net_u32 = u32::from(net_ip);
-    
-    let mask = if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    };
-    
-    (ip_u32 & mask) == (net_u32 & mask)
 }
