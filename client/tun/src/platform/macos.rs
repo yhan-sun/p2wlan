@@ -4,6 +4,7 @@
 //! device. On macOS, utun devices are kernel extensions that provide
 //! TUN-like functionality.
 
+use std::ffi::CStr;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -21,8 +22,8 @@ use crate::interface::VirtualInterface;
 /// Control panel ID for utun (com.apple.net.utun_control).
 const CTL_NAME: &str = "com.apple.net.utun_control";
 
-/// UTUN_CONTROL_NAME constant from utun.h
-const UTUN_CONTROL_NAME: u32 = 1;
+/// UTUN_OPT_IFNAME constant from net/if_utun.h.
+const UTUN_OPT_IFNAME: u32 = 2;
 
 /// macOS utun device.
 pub struct UtunDevice {
@@ -111,26 +112,36 @@ impl UtunDevice {
             }
         }
 
-        // Get the assigned unit number from the socket option
-        let mut unit: u32 = 0;
-        let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+        // Get the actual interface name assigned by the kernel. macOS utun
+        // names are kernel-assigned and must be queried from the control
+        // socket; deriving the name from a unit number can point at the wrong
+        // utun device and route traffic away from this fd.
+        let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
+        let mut len = ifname.len() as libc::socklen_t;
         unsafe {
             if libc::getsockopt(
                 raw_fd,
                 libc::SYSPROTO_CONTROL,
-                UTUN_CONTROL_NAME as libc::c_int,
-                &mut unit as *mut u32 as *mut libc::c_void,
+                UTUN_OPT_IFNAME as libc::c_int,
+                ifname.as_mut_ptr() as *mut libc::c_void,
                 &mut len,
             ) < 0
             {
                 let err = io::Error::last_os_error();
                 return Err(Error::Platform(format!(
-                    "getsockopt UTUN_CONTROL_NAME failed: {err}"
+                    "getsockopt UTUN_OPT_IFNAME failed: {err}"
                 )));
             }
         }
 
-        let actual_name = format!("utun{unit}");
+        let actual_name = unsafe { CStr::from_ptr(ifname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if actual_name.is_empty() {
+            return Err(Error::Platform(
+                "getsockopt UTUN_OPT_IFNAME returned an empty interface name".to_string(),
+            ));
+        }
         tracing::info!("utun interface created: {actual_name}");
 
         // Set the IP address
