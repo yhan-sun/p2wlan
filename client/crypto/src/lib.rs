@@ -35,8 +35,8 @@ pub use error::{CryptoError, Result};
 pub use hash::{hash, hash2, hmac, keyed_hash, Hash};
 pub use hkdf::{expand, extract, hkdf2, hkdf3};
 pub use noise::{
-    SymmetricState, CONSTRUCTION, IDENTIFIER, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES,
-    REKEY_AFTER_TIME,
+    SymmetricState, CONSTRUCTION, IDENTIFIER, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME,
+    REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME,
 };
 pub use sign::Ed25519KeyPair;
 

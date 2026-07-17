@@ -17,14 +17,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time;
-use tracing::{debug, info, warn};
-
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, RwLock};
+use tokio::time;
+use tracing::{debug, error, info, warn};
 
 // ============================================================
 // Control Plane Messages
@@ -201,6 +200,14 @@ pub enum ControlEvent {
     ServerError { code: u16, message: String },
     /// Disconnected from control server.
     Disconnected,
+    /// Permanent authentication failure — re-authentication required.
+    ReauthRequired { message: String },
+    /// Control plane recovered after a disconnect / re-registration.
+    ControlRecovered {
+        node_id: Option<String>,
+        virtual_ip: String,
+        cidr: Option<String>,
+    },
 }
 
 /// Control plane client state.
@@ -579,11 +586,27 @@ const MAX_BACKOFF_SECS: u64 = 300;
 const INITIAL_BACKOFF_SECS: u64 = 2;
 
 /// Compute exponential backoff with jitter, capped at MAX_BACKOFF_SECS.
+/// attempt 0 → ~2s, attempt 1 → ~4s, attempt 2 → ~8s, …
 fn backoff_delay(attempt: u32) -> Duration {
-    let base = INITIAL_BACKOFF_SECS.saturating_mul(1u64.saturating_pow(attempt));
-    let capped = base.min(MAX_BACKOFF_SECS);
-    let jitter = rand::thread_rng().gen_range(0.0..=0.5) * capped as f64;
-    Duration::from_secs_f64(capped as f64 + jitter)
+    let exp = attempt.min(8);
+    let base = INITIAL_BACKOFF_SECS
+        .saturating_mul(1u64 << exp)
+        .min(MAX_BACKOFF_SECS);
+    let jitter = rand::thread_rng().gen_range(0.0..=0.5) * base as f64;
+    Duration::from_secs_f64(base as f64 + jitter)
+}
+
+fn is_permanent_auth_error(err: &str) -> bool {
+    // Explicit HTTP 401/403 from our error messages.
+    err.contains("HTTP 401")
+        || err.contains("HTTP 403")
+        || err.contains("register request returned HTTP 401")
+        || err.contains("register request returned HTTP 403")
+        || err.contains("list nodes request returned HTTP 401")
+        || err.contains("list nodes request returned HTTP 403")
+        || err.contains("list signals returned HTTP 401")
+        || err.contains("list signals returned HTTP 403")
+        || err.contains("permanent auth")
 }
 
 async fn run_control_loop(
@@ -602,7 +625,7 @@ async fn run_control_loop(
     } else {
         config.control.auth_token.clone()
     };
-    let register_token = if !config.control.auth_token.trim().is_empty() {
+    let user_token = if !config.control.auth_token.trim().is_empty() {
         config.control.auth_token.clone()
     } else {
         token.clone()
@@ -610,187 +633,291 @@ async fn run_control_loop(
 
     info!("Connecting to control plane at {base_url}");
 
-    let self_node_id = match register_device(&http, &base_url, &register_token, &config).await {
-        Ok((node_id, virtual_ip, cidr)) => {
-            {
-                let mut s = state.write().await;
-                s.registered = true;
-                s.virtual_ip = Some(virtual_ip.clone());
-            }
-
-            let _ = event_tx.send(ControlEvent::Registered {
-                node_id: Some(node_id.clone()),
-                virtual_ip,
-                cidr: Some(cidr),
-                relay_servers: config.relay.servers.clone(),
-            });
-
-            // Attempt Ed25519 challenge for device credential
-            if !config.control.credential_issued
-                && !config.node.ed25519_private_key.is_empty()
-                && !config.node.ed25519_public_key.is_empty()
-            {
-                info!("Attempting Ed25519 challenge for device credential...");
-                match obtain_device_credential(
-                    &http,
-                    &base_url,
-                    &register_token,
-                    &node_id,
-                    &config.node.ed25519_private_key,
-                    &config.node.ed25519_public_key,
-                )
-                .await
-                {
-                    Ok(device_credential) => {
-                        info!("Device credential obtained successfully");
-                        config.control.device_credential = device_credential.clone();
-                        config.control.credential_issued = true;
-                        token = device_credential;
-                        if let Some(ref path) = config_path {
-                            if let Err(e) = config.save_to_file(path) {
-                                warn!("Failed to save config with device credential: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to obtain device credential (non-fatal): {e}");
-                    }
-                }
-            }
-
-            node_id
-        }
-        Err(err) => {
-            warn!("Control registration failed: {err}");
-            let _ = event_tx.send(ControlEvent::ServerError {
-                code: 1000,
-                message: err.to_string(),
-            });
-            let _ = event_tx.send(ControlEvent::Disconnected);
-            return;
-        }
-    };
-
-    // Initial poll
-    if let Err(err) = poll_peers(
-        &http,
-        &base_url,
-        &token,
-        &config,
-        &self_node_id,
-        &state,
-        event_tx,
-    )
-    .await
-    {
-        warn!("Initial peer polling failed: {err}");
-    }
-    if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
-        warn!("Initial signal polling failed: {err}");
-    }
-
-    let interval_secs = config.control.heartbeat_interval_secs.max(5);
-    let mut tick = time::interval(Duration::from_secs(interval_secs));
-
-    // Track consecutive failures for backoff
-    let mut poll_failures: u32 = 0;
-    let mut perm_auth_failure: bool = false;
-
+    // Outer recovery loop: re-registers after transient disconnects.
     loop {
-        if perm_auth_failure {
-            warn!("Permanent auth failure; control loop giving up");
-            let _ = event_tx.send(ControlEvent::ServerError {
-                code: 401,
-                message: "permanent auth failure — re-authentication required".into(),
-            });
-            break;
-        }
+        // ---- Registration with exponential backoff ----
+        let self_node_id = {
+            let mut attempt: u32 = 0;
+            loop {
+                match register_device(&http, &base_url, &token, &config).await {
+                    Ok((node_id, virtual_ip, cidr)) => {
+                        {
+                            let mut s = state.write().await;
+                            s.registered = true;
+                            s.virtual_ip = Some(virtual_ip.clone());
+                        }
 
-        tokio::select! {
-            _ = tick.tick() => {
-                // Peer polling with exponential backoff
-                let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
-                let sig_result = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await;
-                match (&poll_result, &sig_result) {
-                    (Err(_), _) | (_, Err(_)) => {
-                        poll_failures = poll_failures.saturating_add(1);
-                        let delay = backoff_delay(poll_failures);
-                        warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}");
-                        // If the failure was an auth error, mark permanent
-                        if let Err(e) = &poll_result {
-                            if e.to_string().contains("401") || e.to_string().contains("403") {
-                                perm_auth_failure = true;
+                        let _ = event_tx.send(ControlEvent::Registered {
+                            node_id: Some(node_id.clone()),
+                            virtual_ip: virtual_ip.clone(),
+                            cidr: Some(cidr),
+                            relay_servers: config.relay.servers.clone(),
+                        });
+
+                        // Attempt Ed25519 challenge for device credential
+                        if !config.control.credential_issued
+                            && !config.node.ed25519_private_key.is_empty()
+                            && !config.node.ed25519_public_key.is_empty()
+                        {
+                            info!("Attempting Ed25519 challenge for device credential...");
+                            match obtain_device_credential(
+                                &http,
+                                &base_url,
+                                &user_token,
+                                &node_id,
+                                &config.node.ed25519_private_key,
+                                &config.node.ed25519_public_key,
+                            )
+                            .await
+                            {
+                                Ok(device_credential) => {
+                                    info!("Device credential obtained successfully");
+                                    config.control.device_credential = device_credential.clone();
+                                    config.control.credential_issued = true;
+                                    token = device_credential;
+                                    if let Some(ref path) = config_path {
+                                        if let Err(e) = config.save_to_file(path) {
+                                            warn!(
+                                                "Failed to save config with device credential: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to obtain device credential (non-fatal): {e}");
+                                }
                             }
                         }
-                        tokio::time::sleep(delay).await;
+
+                        break node_id;
                     }
-                    (Ok(_), Ok(_)) => {
-                        if poll_failures > 0 {
-                            info!("Polling recovered after {poll_failures} failures");
+                    Err(err) => {
+                        let err_str = err.to_string();
+                        if is_permanent_auth_error(&err_str) {
+                            if token != user_token && !user_token.trim().is_empty() {
+                                warn!(
+                                    "Stored device credential was rejected; retrying registration with user token"
+                                );
+                                token = user_token.clone();
+                                config.control.device_credential.clear();
+                                config.control.credential_issued = false;
+                                continue;
+                            }
+                            error!(
+                                "Control registration permanent auth failure — re-authentication required: {err_str}"
+                            );
+                            let _ =
+                                event_tx.send(ControlEvent::ReauthRequired { message: err_str });
+                            // Stop fast retries; wait for Shutdown or a long pause then re-check.
+                            loop {
+                                tokio::select! {
+                                    Some(cmd) = cmd_rx.recv() => {
+                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                            let _ = event_tx.send(ControlEvent::Disconnected);
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                                        // Allow operator to fix credentials and retry once per minute.
+                                        warn!("Retrying registration after permanent-auth cooldown");
+                                        break;
+                                    }
+                                    else => {
+                                        let _ = event_tx.send(ControlEvent::Disconnected);
+                                        return;
+                                    }
+                                }
+                            }
+                            // After cooldown, try again (outer attempt loop).
+                            continue;
                         }
-                        poll_failures = 0;
+
+                        attempt = attempt.saturating_add(1);
+                        let delay = backoff_delay(attempt.saturating_sub(1));
+                        warn!(
+                            "Control registration failed (attempt {attempt}); retrying in {delay:?}: {err_str}"
+                        );
+                        // Interruptible sleep so Shutdown is honoured.
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            Some(cmd) = cmd_rx.recv() => {
+                                if matches!(cmd, ControlCommand::Shutdown) {
+                                    let _ = event_tx.send(ControlEvent::Disconnected);
+                                    return;
+                                }
+                            }
+                            else => {
+                                let _ = event_tx.send(ControlEvent::Disconnected);
+                                return;
+                            }
+                        }
                     }
                 }
             }
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
-                        let res = create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await;
-                        match res {
-                            Ok((tunnel_id, public_endpoint)) => {
-                                let _ = event_tx.send(ControlEvent::TunnelCreated { tunnel_id, public_endpoint });
+        };
+
+        // ---- Polling cycle ----
+        // Initial poll
+        if let Err(err) = poll_peers(
+            &http,
+            &base_url,
+            &token,
+            &config,
+            &self_node_id,
+            &state,
+            event_tx,
+        )
+        .await
+        {
+            warn!("Initial peer polling failed: {err}");
+        }
+        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
+            warn!("Initial signal polling failed: {err}");
+        }
+
+        let interval_secs = config.control.heartbeat_interval_secs.max(5);
+        let mut tick = time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        let mut poll_failures: u32 = 0;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
+                    let sig_result = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await;
+                    match (&poll_result, &sig_result) {
+                        (Err(e), _) | (_, Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure during polling: {err_str}");
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                tokio::select! {
+                                    Some(cmd) = cmd_rx.recv() => {
+                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                            let _ = event_tx.send(ControlEvent::Disconnected);
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                                    else => {
+                                        let _ = event_tx.send(ControlEvent::Disconnected);
+                                        return;
+                                    }
+                                }
+                                break;
                             }
-                            Err(err) => {
-                                let code = if err.to_string().contains("401") || err.to_string().contains("403") { 401u16 } else { 3000u16 };
-                                let _ = event_tx.send(ControlEvent::ServerError { code, message: err.to_string() });
-                                if code == 401 { perm_auth_failure = true; }
+                            poll_failures = poll_failures.saturating_add(1);
+                            let delay = backoff_delay(poll_failures.saturating_sub(1));
+                            warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}: {err_str}");
+                            // After several consecutive failures, force a full re-register
+                            // so device session and peer map are refreshed after control restart.
+                            if poll_failures >= 3 {
+                                warn!("Polling failed {poll_failures} times; re-registering with control plane");
+                                break;
                             }
+                            tokio::time::sleep(delay).await;
                         }
-                    }
-                    ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
-                        let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
-                        match &res {
-                            Ok(()) => { debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})"); }
-                            Err(err) => {
-                                let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err.to_string() });
-                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
+                        (Ok(_), Ok(_)) => {
+                            if poll_failures > 0 {
+                                info!("Polling recovered after {poll_failures} failures");
+                                let vip = state.read().await.virtual_ip.clone().unwrap_or_default();
+                                let _ = event_tx.send(ControlEvent::ControlRecovered {
+                                    node_id: Some(self_node_id.clone()),
+                                    virtual_ip: vip,
+                                    cidr: None,
+                                });
                             }
+                            poll_failures = 0;
                         }
-                    }
-                    ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
-                        let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await;
-                        match &res {
-                            Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
-                            Err(err) => {
-                                let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err.to_string() });
-                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
-                            }
-                        }
-                    }
-                    ControlCommand::SendPeerAnswer { to_node_id, candidates, handshake_response } => {
-                        let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await;
-                        match &res {
-                            Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
-                            Err(err) => {
-                                let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err.to_string() });
-                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
-                            }
-                        }
-                    }
-                    ControlCommand::DeleteTunnel { tunnel_id } => {
-                        debug!("Tunnel deletion queued locally for {tunnel_id}");
-                    }
-                    ControlCommand::Shutdown => {
-                        let _ = event_tx.send(ControlEvent::Disconnected);
-                        break;
                     }
                 }
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
+                            let res = create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await;
+                            match res {
+                                Ok((tunnel_id, public_endpoint)) => {
+                                    let _ = event_tx.send(ControlEvent::TunnelCreated { tunnel_id, public_endpoint });
+                                }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let code = if is_permanent_auth_error(&err_str) { 401u16 } else { 3000u16 };
+                                    let _ = event_tx.send(ControlEvent::ServerError { code, message: err_str });
+                                    if code == 401 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
+                            let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
+                            match &res {
+                                Ok(()) => { debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})"); }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err_str.clone() });
+                                    if is_permanent_auth_error(&err_str) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await;
+                            match &res {
+                                Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err_str.clone() });
+                                    if is_permanent_auth_error(&err_str) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, handshake_response } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await;
+                            match &res {
+                                Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err_str.clone() });
+                                    if is_permanent_auth_error(&err_str) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ControlCommand::DeleteTunnel { tunnel_id } => {
+                            debug!("Tunnel deletion queued locally for {tunnel_id}");
+                        }
+                        ControlCommand::Shutdown => {
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+                            return;
+                        }
+                    }
+                }
+                else => {
+                    // Command channel closed — exit.
+                    let _ = event_tx.send(ControlEvent::Disconnected);
+                    return;
+                }
             }
-            else => break,
         }
-    }
 
-    let _ = event_tx.send(ControlEvent::Disconnected);
+        // Reached here by breaking the poll loop (auth failure or consecutive poll failures).
+        // Mark unregistered so peers are refreshed on next successful register/poll.
+        {
+            let mut s = state.write().await;
+            s.registered = false;
+        }
+        let _ = event_tx.send(ControlEvent::Disconnected);
+        info!("Re-entering control registration cycle");
+        // brief pause before re-register to avoid hammering a restarting server
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    } // end outer loop — will hit the `return` inside on Shutdown, or loop around
 }
 
 /// Obtain a device credential via challenge-response.

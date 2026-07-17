@@ -71,6 +71,26 @@ impl WireGuardTransport {
         self.sessions.lock().await.contains_key(peer_id)
     }
 
+    /// Return whether a peer's session needs rekey.
+    pub async fn session_needs_rekey(&self, peer_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(peer_id)
+            .map(|s| s.needs_rekey())
+            .unwrap_or(false)
+    }
+
+    /// Return whether a peer's session has expired (reject threshold exceeded).
+    pub async fn session_is_expired(&self, peer_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(peer_id)
+            .map(|s| s.is_expired())
+            .unwrap_or(false)
+    }
+
     /// Encrypt one outbound packet.
     pub async fn encrypt_outbound(
         &self,

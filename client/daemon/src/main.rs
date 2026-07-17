@@ -5,7 +5,7 @@
 use clap::Parser;
 use p2pnet_daemon::{Config, Daemon, DaemonError};
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "p2pnet-daemon")]
@@ -297,57 +297,88 @@ async fn main() -> p2pnet_daemon::Result<()> {
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);
 
-    // Create and run the daemon
+    // Create and run the daemon with a shared shutdown signal.
     let mut daemon = Daemon::new(config);
+    let shutdown_tx = daemon.shutdown_sender();
 
-    // Graceful shutdown: wait for SIGINT/SIGTERM or daemon exit
-    let daemon_handle = tokio::spawn(async move { daemon.run().await });
+    // Graceful shutdown: wait for SIGINT/SIGTERM or daemon exit.
+    // Pin the join future so we can select without moving the handle twice.
+    let mut daemon_handle = tokio::spawn(async move { daemon.run().await });
 
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            result = daemon_handle => {
-                match result {
-                    Ok(Ok(())) => info!("Daemon exited cleanly"),
-                    Ok(Err(e)) => {
-                        error!("Daemon exited with error: {e}");
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        error!("Daemon task failed: {e}");
-                        return Err(DaemonError::TaskCrash(e.to_string()));
+    let shutdown_reason = {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
                     }
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down...");
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down...");
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT, shutting down...");
+                    Some("SIGINT")
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down...");
+                    Some("SIGTERM")
+                }
             }
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::select! {
-            result = daemon_handle => {
-                match result {
-                    Ok(Ok(())) => info!("Daemon exited cleanly"),
-                    Ok(Err(e)) => {
-                        error!("Daemon exited with error: {e}");
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        error!("Daemon task failed: {e}");
-                        return Err(DaemonError::TaskCrash(e.to_string()));
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
                     }
                 }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT, shutting down...");
+                    Some("SIGINT")
+                }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down...");
+        }
+    };
+
+    if let Some(reason) = shutdown_reason {
+        let _ = shutdown_tx.send(true);
+        match tokio::time::timeout(std::time::Duration::from_secs(10), daemon_handle).await {
+            Ok(Ok(Ok(()))) => info!("Daemon exited cleanly after {reason}"),
+            Ok(Ok(Err(e))) => {
+                error!("Daemon exited with error after {reason}: {e}");
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                error!("Daemon task failed after {reason}: {e}");
+                return Err(DaemonError::TaskCrash(e.to_string()));
+            }
+            Err(_) => {
+                warn!("Timed out waiting for daemon to stop after {reason}");
             }
         }
     }

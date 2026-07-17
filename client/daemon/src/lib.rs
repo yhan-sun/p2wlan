@@ -40,6 +40,7 @@ pub mod peer;
 pub mod port_mapping;
 pub mod relay;
 pub mod route;
+pub mod tasks;
 pub mod transport;
 pub mod udp;
 
@@ -64,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent};
 use dataplane::{DataPlane, InboundPacket};
-use diagnostics::run_diagnostics_server;
+use diagnostics::{run_diagnostics_server, DiagnosticsContext};
 use dns::DnsResolver;
 use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
@@ -75,6 +76,19 @@ use port_mapping::PortMappingManager;
 use relay::{select_relay, RelaySelectionDiagnostics, RelaySelectionOutcome, RelayTransport};
 use transport::{EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
+
+/// Shared pending-handshake state (timeout-safe).
+#[derive(Default)]
+struct PendingHandshakeState {
+    pending: HashMap<String, HandshakeInitiator>,
+    /// Number of initiation attempts per peer (bounded retries).
+    attempts: HashMap<String, u32>,
+}
+
+/// Maximum number of handshake re-initiation attempts before giving up.
+const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
+/// Handshake timeout before pending entry is cleared.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
 /// The main daemon orchestrator.
 ///
@@ -92,8 +106,8 @@ pub struct Daemon {
     transport: WireGuardTransport,
     /// Encrypted outbound packets emitted by the WireGuard adapter.
     encrypted_rx: Option<mpsc::Receiver<EncryptedPeerPacket>>,
-    /// In-flight initiator handshakes keyed by responder node ID.
-    pending_handshakes: HashMap<String, HandshakeInitiator>,
+    /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
+    pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Bound UDP transport shared with control-plane-triggered punching.
@@ -110,6 +124,14 @@ pub struct Daemon {
     acl: Arc<RwLock<AclEngine>>,
     /// Route table manager.
     route_manager: Arc<route::RouteManager>,
+    /// Shared health state for diagnostics / supervision.
+    health: Arc<tasks::HealthState>,
+    /// Task manager for spawning and supervising background tasks.
+    task_manager: Arc<tasks::TaskManager>,
+    /// Shutdown signal sender (true = shut down).
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Shutdown signal receiver cloned into background tasks.
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Daemon {
@@ -122,6 +144,10 @@ impl Daemon {
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 
+        let health = tasks::HealthState::new();
+        let task_manager = tasks::TaskManager::new(health.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         Self {
             config: Arc::new(config.clone()),
             control,
@@ -129,7 +155,7 @@ impl Daemon {
             peers: Arc::new(PeerManager::new(config.clone())),
             transport,
             encrypted_rx: Some(encrypted_rx),
-            pending_handshakes: HashMap::new(),
+            pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
@@ -138,7 +164,22 @@ impl Daemon {
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
             route_manager,
+            health,
+            task_manager,
+            shutdown_tx,
+            shutdown_rx,
         }
+    }
+
+    /// Return a clone of the shutdown sender so main can signal SIGTERM/SIGINT.
+    pub fn shutdown_sender(&self) -> tokio::sync::watch::Sender<bool> {
+        self.shutdown_tx.clone()
+    }
+
+    /// Request a graceful shutdown.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.task_manager.request_shutdown();
     }
 
     /// Run the daemon main loop.
@@ -171,6 +212,7 @@ impl Daemon {
                         relay_servers: rs,
                     } => {
                         info!("Control plane registration confirmed. Assigned IP: {}", vip);
+                        self.health.mark_control_success().await;
 
                         // Validate virtual IP
                         if vip.parse::<std::net::Ipv4Addr>().is_err() {
@@ -214,6 +256,9 @@ impl Daemon {
                             "Server returned error code {code}: {message}"
                         )));
                     }
+                    ControlEvent::ReauthRequired { message } => {
+                        return Err(DaemonError::Auth(message));
+                    }
                     _ => {
                         warn!("Received event before registration, ignoring: {:?}", event);
                     }
@@ -248,41 +293,54 @@ impl Daemon {
         let prefer_direct = self.config.relay.prefer_direct;
 
         let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
-        tokio::spawn(run_network_outbound(
-            encrypted_rx,
-            self.peers.clone(),
-            prefer_direct,
-            self.udp_transport.clone(),
-            self.relay_transport.clone(),
-        ));
-        tokio::spawn(run_direct_probe_loop(
-            self.peers.clone(),
-            self.udp_transport.clone(),
-            fallback_timeout,
-            Duration::from_millis(self.config.network.punch_interval_ms),
-            self.config.network.punch_attempts.clamp(1, 3),
-        ));
+        self.task_manager
+            .spawn(
+                "network-outbound",
+                true,
+                run_network_outbound(
+                    encrypted_rx,
+                    self.peers.clone(),
+                    prefer_direct,
+                    self.udp_transport.clone(),
+                    self.relay_transport.clone(),
+                ),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "direct-probe",
+                false,
+                run_direct_probe_loop(
+                    self.peers.clone(),
+                    self.udp_transport.clone(),
+                    fallback_timeout,
+                    Duration::from_millis(self.config.network.punch_interval_ms),
+                    self.config.network.punch_attempts.clamp(1, 3),
+                ),
+            )
+            .await;
         if self.config.diagnostics.enabled {
-            let diagnostics_config = self.config.clone();
-            let diagnostics_peers = self.peers.clone();
-            let diagnostics_udp = self.udp_transport.clone();
-            let diagnostics_relay = self.relay_transport.clone();
-            let diagnostics_relay_selection = self.relay_selection.clone();
             let diagnostics_bind = self.config.diagnostics.bind.clone();
-            tokio::spawn(async move {
-                if let Err(err) = run_diagnostics_server(
-                    diagnostics_bind,
-                    diagnostics_config,
-                    diagnostics_peers,
-                    diagnostics_udp,
-                    diagnostics_relay,
-                    diagnostics_relay_selection,
-                )
-                .await
-                {
-                    warn!("Diagnostics endpoint stopped: {err}");
-                }
-            });
+            let diagnostics_context = DiagnosticsContext::new(
+                self.config.clone(),
+                self.peers.clone(),
+                self.udp_transport.clone(),
+                self.relay_transport.clone(),
+                self.relay_selection.clone(),
+                self.health.clone(),
+                self.task_manager.clone(),
+            );
+            let shutdown_rx = self.shutdown_rx.clone();
+            self.task_manager
+                .spawn("diagnostics", false, async move {
+                    if let Err(err) =
+                        run_diagnostics_server(diagnostics_bind, diagnostics_context, shutdown_rx)
+                            .await
+                    {
+                        warn!("Diagnostics endpoint stopped: {err}");
+                    }
+                })
+                .await;
         }
         if let Some(tun) = tun {
             let peers = self.peers.clone();
@@ -290,39 +348,41 @@ impl Daemon {
             let (mut dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
 
             let outbound_transport = transport.clone();
-            tokio::spawn(async move {
-                if let Err(err) = outbound_transport.run_outbound(outbound_rx).await {
-                    warn!("WireGuard transport stopped: {err}");
-                }
-            });
+            self.task_manager
+                .spawn_result("wireguard-outbound", true, async move {
+                    outbound_transport.run_outbound(outbound_rx).await
+                })
+                .await;
 
             let inbound_transport = transport.clone();
-            tokio::spawn(async move {
-                if let Err(err) = inbound_transport
-                    .run_inbound(network_inbound_rx, inbound_tx)
-                    .await
-                {
-                    warn!("WireGuard inbound transport stopped: {err}");
-                }
-            });
+            self.task_manager
+                .spawn_result("wireguard-inbound", true, async move {
+                    inbound_transport
+                        .run_inbound(network_inbound_rx, inbound_tx)
+                        .await
+                })
+                .await;
 
-            tokio::spawn(async move {
-                if let Err(err) = dataplane.run().await {
-                    warn!("Data plane stopped: {err}");
-                }
-            });
+            self.task_manager
+                .spawn_result("dataplane", true, async move { dataplane.run().await })
+                .await;
         } else {
             let (inbound_tx, inbound_rx) = mpsc::channel(1024);
             let inbound_transport = self.transport.clone();
-            tokio::spawn(async move {
-                if let Err(err) = inbound_transport
-                    .run_inbound(network_inbound_rx, inbound_tx)
-                    .await
-                {
-                    warn!("WireGuard inbound transport stopped: {err}");
-                }
-            });
-            tokio::spawn(log_inbound_packets_without_tun(inbound_rx));
+            self.task_manager
+                .spawn_result("wireguard-inbound", true, async move {
+                    inbound_transport
+                        .run_inbound(network_inbound_rx, inbound_tx)
+                        .await
+                })
+                .await;
+            self.task_manager
+                .spawn(
+                    "tun-disabled-inbound-log",
+                    false,
+                    log_inbound_packets_without_tun(inbound_rx),
+                )
+                .await;
         }
 
         let peers = self.peers.clone();
@@ -330,13 +390,11 @@ impl Daemon {
         let local_candidates = self.local_candidates.clone();
         let udp_transport = self.udp_transport.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
-        tokio::spawn(async move {
+        self.task_manager
+            .spawn_result("udp-direct", false, async move {
             match UdpTransport::bind(udp_bind, peers).await {
                 Ok(udp) => {
                     *udp_transport.write().await = Some(udp.clone());
-                    if !keepalive_interval.is_zero() {
-                        tokio::spawn(udp.clone().run_keepalives(keepalive_interval));
-                    }
 
                     let mut candidate_endpoints =
                         match udp.gather_candidates(stun_servers, stun_timeout).await {
@@ -376,17 +434,23 @@ impl Daemon {
                     );
                     *local_candidates.write().await = candidate_endpoints;
 
-                    tokio::spawn(async move {
-                        if let Err(err) = udp.run_inbound(udp_inbound_tx).await {
-                            warn!("UDP inbound transport stopped: {err}");
+                    if keepalive_interval.is_zero() {
+                        udp.run_inbound(udp_inbound_tx).await
+                    } else {
+                        let keepalive_udp = udp.clone();
+                        tokio::select! {
+                            result = udp.run_inbound(udp_inbound_tx) => result,
+                            _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
                         }
-                    });
+                    }
                 }
                 Err(err) => {
                     warn!("UDP transport unavailable ({err}); direct UDP disabled");
+                    Ok(())
                 }
             }
-        });
+        })
+        .await;
 
         // Relay registration must use the node ID assigned by the control plane.
         let mut relay_started = false;
@@ -415,72 +479,207 @@ impl Daemon {
             let relay_peers = self.peers.clone();
             let relay_inbound_tx = network_inbound_tx.clone();
 
-            tokio::spawn(async move {
-                let RelaySelectionOutcome {
-                    transport,
-                    relay_rx,
-                    diagnostics,
-                } = select_relay(
-                    &relay_servers,
-                    &preferred_regions,
-                    selection_timeout,
-                    &relay_node_id,
-                    relay_peers,
-                )
-                .await;
-                *relay_selection.write().await = diagnostics;
+            self.task_manager
+                .spawn_result("relay-inbound", false, async move {
+                    let RelaySelectionOutcome {
+                        transport,
+                        relay_rx,
+                        diagnostics,
+                    } = select_relay(
+                        &relay_servers,
+                        &preferred_regions,
+                        selection_timeout,
+                        &relay_node_id,
+                        relay_peers,
+                    )
+                    .await;
+                    *relay_selection.write().await = diagnostics;
 
-                if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                    info!(
-                        "Selected relay region {} at {} ({} ms connect latency)",
-                        relay.region(),
-                        relay.endpoint(),
-                        relay.connect_latency_ms()
-                    );
-                    *relay_transport.write().await = Some(relay.clone());
-                    if let Err(err) = relay.run_inbound(relay_rx, relay_inbound_tx).await {
-                        warn!("Relay inbound transport stopped: {err}");
+                    if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                        info!(
+                            "Selected relay region {} at {} ({} ms connect latency)",
+                            relay.region(),
+                            relay.endpoint(),
+                            relay.connect_latency_ms()
+                        );
+                        *relay_transport.write().await = Some(relay.clone());
+                        relay.run_inbound(relay_rx, relay_inbound_tx).await
+                    } else {
+                        warn!("No configured relay candidate was reachable");
+                        Ok(())
                     }
-                } else {
-                    warn!("No configured relay candidate was reachable");
-                }
-            });
+                })
+                .await;
         }
 
-        // Periodic session rekey and handshake timeout checker
+        // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
         {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    tick.tick().await;
-                    // Rekey sessions that are approaching message limit
-                    for conn in peers.all_connections().await {
-                        if transport.has_session(&conn.node_id).await {
-                            // The session stores its own rekey check internally
-                            // REKEY_AFTER_MESSAGES is 2^60, so this is mostly
-                            // a placeholder until we have timer-based rekey
-                            debug!(
-                                "Rekey check for peer {} (direct={})",
-                                conn.node_id,
-                                conn.state == peer::ConnectionState::Direct
-                            );
+            let pending = self.pending_handshakes.clone();
+            let control = self.control.clone();
+            let local_candidates = self.local_candidates.clone();
+            let node_private_key = self.config.node.private_key.clone();
+            let node_public_key = self.config.node.public_key.clone();
+            self.task_manager
+                .spawn("rekey", false, async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        tick.tick().await;
+                        let conns = peers.all_connections().await;
+                        for conn in conns {
+                            // Remove expired sessions and trigger rekey handshake.
+                            let needs = transport.session_needs_rekey(&conn.node_id).await;
+                            let expired = transport.session_is_expired(&conn.node_id).await;
+                            if !needs && !expired {
+                                continue;
+                            }
+                            if expired {
+                                info!(
+                                    "Session for peer {} expired; removing and rekeying",
+                                    conn.node_id
+                                );
+                                transport.remove_session(&conn.node_id).await;
+                            } else {
+                                info!(
+                                    "Session for peer {} needs rekey (message/time threshold)",
+                                    conn.node_id
+                                );
+                            }
+
+                            // Only the lexicographically smaller public key initiates rekey.
+                            // We don't have peer public key here easily; use peer connection.
+                            // Skip if already pending.
+                            {
+                                let state = pending.lock().await;
+                                if state.pending.contains_key(&conn.node_id) {
+                                    continue;
+                                }
+                                if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
+                                    >= MAX_HANDSHAKE_ATTEMPTS
+                                {
+                                    warn!(
+                                        "Rekey for {} skipped: max attempts reached",
+                                        conn.node_id
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            // Build a new handshake initiation if we have the peer's public key.
+                            let Some(_peer_conn) = peers.get_connection(&conn.node_id).await else {
+                                continue;
+                            };
+                            // PeerConnection doesn't store public key; look up from control.
+                            // Best-effort: if control has the peer, use it.
+                            // (control.peers is async)
+                            // We intentionally skip rekey initiation if we can't get the key —
+                            // the peer may also rekey from its side.
+                            let control_peers = control.peers().await;
+                            let Some(peer_info) = control_peers.get(&conn.node_id) else {
+                                debug!("No control peer info for rekey of {}", conn.node_id);
+                                continue;
+                            };
+                            if node_public_key >= peer_info.public_key {
+                                // Let the other side initiate.
+                                continue;
+                            }
+
+                            let Ok(private_key) =
+                                decode_x25519_key(&node_private_key, "node private key")
+                            else {
+                                continue;
+                            };
+                            let Ok(peer_public) =
+                                decode_x25519_key(&peer_info.public_key, "peer public key")
+                            else {
+                                continue;
+                            };
+                            let identity = NodeIdentity::from_private_key(private_key);
+                            let mut initiator =
+                                HandshakeInitiator::new(identity, peer_public, None);
+                            let Ok(initiation) = initiator.create_initiation() else {
+                                continue;
+                            };
+                            let initiation_bytes = initiation.to_bytes();
+                            let candidates = local_candidates.read().await.clone();
+
+                            {
+                                let mut state = pending.lock().await;
+                                *state.attempts.entry(conn.node_id.clone()).or_insert(0) += 1;
+                                state.pending.insert(conn.node_id.clone(), initiator);
+                            }
+
+                            if let Err(err) = control
+                                .send_peer_offer(&conn.node_id, &candidates, &initiation_bytes)
+                                .await
+                            {
+                                warn!("Rekey offer to {} failed: {err}", conn.node_id);
+                                let mut state = pending.lock().await;
+                                state.pending.remove(&conn.node_id);
+                            } else {
+                                info!(
+                                    "Rekey: sent handshake initiation to {} ({} bytes)",
+                                    conn.node_id,
+                                    initiation_bytes.len()
+                                );
+                                // Timeout cleanup
+                                let pending2 = pending.clone();
+                                let timeout_peer = conn.node_id.clone();
+                                let transport2 = transport.clone();
+                                let peers2 = peers.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS))
+                                        .await;
+                                    if !transport2.has_session(&timeout_peer).await {
+                                        warn!("Rekey handshake timeout for peer {timeout_peer}");
+                                        peers2
+                                            .record_direct_failure(
+                                                &timeout_peer,
+                                                "rekey handshake timed out",
+                                            )
+                                            .await;
+                                    }
+                                    let mut state = pending2.lock().await;
+                                    state.pending.remove(&timeout_peer);
+                                });
+                            }
                         }
                     }
-                }
-            });
+                })
+                .await;
         }
 
-        // Process control events
-        while let Some(event) = self.control_rx.recv().await {
-            match event {
+        // Process control events until shutdown is requested.
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let mut task_shutdown_rx = self.task_manager.shutdown_rx();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Shutdown signal received in main event loop");
+                        break;
+                    }
+                }
+                _ = task_shutdown_rx.changed() => {
+                    if *task_shutdown_rx.borrow() {
+                        warn!("Task manager requested daemon shutdown");
+                        break;
+                    }
+                }
+                event = self.control_rx.recv() => {
+                    let Some(event) = event else {
+                        warn!("Control event channel closed");
+                        break;
+                    };
+                    match event {
                 ControlEvent::Registered {
                     node_id,
                     virtual_ip: _,
                     cidr: _,
                     relay_servers,
                 } => {
+                    self.health.mark_control_success().await;
                     if !relay_started {
                         relay_started = true;
                         let relay_node_id =
@@ -498,7 +697,8 @@ impl Daemon {
                         let relay_peers = self.peers.clone();
                         let relay_inbound_tx = network_inbound_tx.clone();
 
-                        tokio::spawn(async move {
+                        self.task_manager
+                            .spawn_result("relay-inbound", false, async move {
                             let RelaySelectionOutcome {
                                 transport,
                                 relay_rx,
@@ -521,15 +721,13 @@ impl Daemon {
                                     relay.connect_latency_ms()
                                 );
                                 *relay_transport.write().await = Some(relay.clone());
-                                if let Err(err) =
-                                    relay.run_inbound(relay_rx, relay_inbound_tx).await
-                                {
-                                    warn!("Relay inbound transport stopped: {err}");
-                                }
+                                relay.run_inbound(relay_rx, relay_inbound_tx).await
                             } else {
                                 warn!("No configured relay candidate was reachable");
+                                Ok(())
                             }
-                        });
+                        })
+                        .await;
                     }
                 }
 
@@ -630,13 +828,32 @@ impl Daemon {
                 }
 
                 ControlEvent::Disconnected => {
-                    warn!("Disconnected from control server");
-                    break;
+                    // Control loop will re-register; do not shut down the daemon.
+                    self.health.set_control_connected(false);
+                    warn!("Disconnected from control server; waiting for recovery");
+                }
+
+                ControlEvent::ReauthRequired { message } => {
+                    error!("Reauthentication required: {message}");
+                    self.health.set_reauth_required(true);
+                    // Keep running so operator can re-auth; do not exit daemon.
+                }
+
+                ControlEvent::ControlRecovered { .. } => {
+                    info!("Control plane recovered after disconnection");
+                    self.health.mark_control_success().await;
+                }
+                    }
                 }
             }
         }
 
         info!("Daemon shutting down");
+        // Explicit cleanup: notify control loop and clean routes without relying on Drop.
+        self.request_shutdown();
+        let _ = self.control.shutdown().await;
+        self.task_manager.shutdown_all(Duration::from_secs(5)).await;
+        self.route_manager.cleanup();
         Ok(())
     }
 
@@ -662,10 +879,25 @@ impl Daemon {
     }
 
     async fn maybe_initiate_handshake(&mut self, peer_info: &control::PeerInfo) -> Result<()> {
-        if self.transport.has_session(&peer_info.node_id).await
-            || self.pending_handshakes.contains_key(&peer_info.node_id)
-        {
+        if self.transport.has_session(&peer_info.node_id).await {
             return Ok(());
+        }
+
+        {
+            let state = self.pending_handshakes.lock().await;
+            if state.pending.contains_key(&peer_info.node_id) {
+                if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
+                    >= MAX_HANDSHAKE_ATTEMPTS
+                {
+                    warn!(
+                        "Handshake to {} reached max attempts ({})",
+                        peer_info.node_id, MAX_HANDSHAKE_ATTEMPTS
+                    );
+                    return Ok(());
+                }
+                // Still pending — don't duplicate.
+                return Ok(());
+            }
         }
 
         if self.config.node.public_key >= peer_info.public_key {
@@ -682,32 +914,45 @@ impl Daemon {
         let candidates = self.local_candidates.read().await.clone();
 
         let peer_id_clone = peer_info.node_id.clone();
-        self.pending_handshakes
-            .insert(peer_id_clone.clone(), initiator);
+        {
+            let mut state = self.pending_handshakes.lock().await;
+            let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            state.pending.insert(peer_id_clone.clone(), initiator);
+        }
+
         self.control
             .send_peer_offer(&peer_id_clone, &candidates, &initiation_bytes)
             .await?;
 
         info!(
-            "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates)",
+            "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates, attempt {})",
             peer_id_clone,
             initiation_bytes.len(),
-            candidates.len()
+            candidates.len(),
+            {
+                let state = self.pending_handshakes.lock().await;
+                state.attempts.get(&peer_id_clone).copied().unwrap_or(0)
+            },
         );
 
-        // Spawn a timeout watcher: if no session established within 30 s,
-        // mark the peer's direct path as failed so it falls back to relay.
+        // Spawn timeout watcher that cleans up pending entry on timeout.
+        // Uses the shared Arc<Mutex<>> so the spawned task can remove the entry.
+        let pending = self.pending_handshakes.clone();
         let timeout_peer = peer_id_clone;
         let transport = self.transport.clone();
         let peers = self.peers.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
             if !transport.has_session(&timeout_peer).await {
                 warn!("Handshake timeout for peer {timeout_peer}");
                 peers
-                    .record_direct_failure(&timeout_peer, "handshake timed out after 30 s")
+                    .record_direct_failure(&timeout_peer, "handshake timed out")
                     .await;
             }
+            // Remove from pending so retry is possible.
+            let mut state = pending.lock().await;
+            state.pending.remove(&timeout_peer);
         });
 
         Ok(())
@@ -833,7 +1078,11 @@ impl Daemon {
     ) -> Result<()> {
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
-        let Some(initiator) = self.pending_handshakes.get_mut(from_node_id) else {
+        let initiator = {
+            let mut state = self.pending_handshakes.lock().await;
+            state.pending.remove(from_node_id)
+        };
+        let Some(mut initiator) = initiator else {
             warn!("No pending WireGuard handshake for answer from {from_node_id}");
             return Ok(());
         };
@@ -841,10 +1090,17 @@ impl Daemon {
         let keys = initiator
             .consume_response(&response)
             .map_err(|e| DaemonError::Peer(format!("WireGuard response consume failed: {e}")))?;
-        self.pending_handshakes.remove(from_node_id);
 
+        // Reset attempt count on success so future rekey attempts can proceed.
+        {
+            let mut state = self.pending_handshakes.lock().await;
+            state.attempts.remove(from_node_id);
+        }
+
+        // Replace old session with new one (rekey case).
+        let new_session = TransportSession::new(keys);
         self.transport
-            .add_session(from_node_id.to_string(), TransportSession::new(keys))
+            .add_session(from_node_id.to_string(), new_session)
             .await;
         self.peers
             .update_state(from_node_id, ConnectionState::Connecting)

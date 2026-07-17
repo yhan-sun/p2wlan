@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
 use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
+use crate::tasks::{HealthState, TaskManager};
 use crate::udp::UdpTransport;
 
 /// Runtime diagnostics snapshot returned by the local endpoint.
@@ -30,16 +31,48 @@ pub struct DiagnosticsSnapshot {
     pub relay_selection: RelaySelectionDiagnostics,
     pub peers: Vec<PeerDiagnostics>,
     pub stats: PeerManagerStats,
+    pub health: crate::tasks::HealthSnapshot,
 }
 
-/// Run the local diagnostics HTTP endpoint until the listener fails.
-pub async fn run_diagnostics_server(
-    bind: String,
+/// Shared state needed to build diagnostics responses.
+#[derive(Clone)]
+pub struct DiagnosticsContext {
     config: Arc<Config>,
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
+    health: Arc<HealthState>,
+    task_manager: Arc<TaskManager>,
+}
+
+impl DiagnosticsContext {
+    pub fn new(
+        config: Arc<Config>,
+        peers: Arc<PeerManager>,
+        udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+        relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+        relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
+        health: Arc<HealthState>,
+        task_manager: Arc<TaskManager>,
+    ) -> Self {
+        Self {
+            config,
+            peers,
+            udp_transport,
+            relay_transport,
+            relay_selection,
+            health,
+            task_manager,
+        }
+    }
+}
+
+/// Run the local diagnostics HTTP endpoint until the listener fails.
+pub async fn run_diagnostics_server(
+    bind: String,
+    context: DiagnosticsContext,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind).await.map_err(|e| {
         DaemonError::Network(format!(
@@ -51,61 +84,40 @@ pub async fn run_diagnostics_server(
         .map_err(|e| DaemonError::Network(format!("failed to read diagnostics local addr: {e}")))?;
     info!("Diagnostics endpoint listening at http://{local_addr}/status");
 
-    serve_diagnostics(
-        listener,
-        config,
-        peers,
-        udp_transport,
-        relay_transport,
-        relay_selection,
-    )
-    .await
+    serve_diagnostics(listener, context, shutdown_rx).await
 }
 
 async fn serve_diagnostics(
     listener: TcpListener,
-    config: Arc<Config>,
-    peers: Arc<PeerManager>,
-    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
-    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
-    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
+    context: DiagnosticsContext,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut shutdown_rx = shutdown_rx;
     loop {
-        let (stream, _remote_addr) = listener
-            .accept()
-            .await
-            .map_err(|e| DaemonError::Network(format!("diagnostics accept failed: {e}")))?;
-
-        let config = config.clone();
-        let peers = peers.clone();
-        let udp_transport = udp_transport.clone();
-        let relay_transport = relay_transport.clone();
-        let relay_selection = relay_selection.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(
-                stream,
-                config,
-                peers,
-                udp_transport,
-                relay_transport,
-                relay_selection,
-            )
-            .await
-            {
-                debug!("diagnostics request failed: {err}");
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Diagnostics server received shutdown signal");
+                    break;
+                }
             }
-        });
+            result = listener.accept() => {
+                let (stream, _remote_addr) = result
+                    .map_err(|e| DaemonError::Network(format!("diagnostics accept failed: {e}")))?;
+
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(stream, context).await {
+                        debug!("diagnostics request failed: {err}");
+                    }
+                });
+            }
+        }
     }
+    Ok(())
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    config: Arc<Config>,
-    peers: Arc<PeerManager>,
-    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
-    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
-    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
-) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -> Result<()> {
     let mut buffer = [0u8; 1024];
     let n = timeout(Duration::from_secs(3), stream.read(&mut buffer))
         .await
@@ -128,14 +140,7 @@ async fn handle_connection(
     match path {
         "/health" => write_response(&mut stream, 200, "text/plain", "ok\n").await?,
         "/status" => {
-            let snapshot = build_snapshot(
-                config,
-                peers,
-                udp_transport,
-                relay_transport,
-                relay_selection,
-            )
-            .await;
+            let snapshot = build_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body).await?;
         }
@@ -148,31 +153,30 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn build_snapshot(
-    config: Arc<Config>,
-    peers: Arc<PeerManager>,
-    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
-    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
-    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
-) -> DiagnosticsSnapshot {
-    let udp_local_addr = udp_transport
+async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
+    let udp_local_addr = context
+        .udp_transport
         .read()
         .await
         .as_ref()
         .and_then(|udp| udp.local_addr().ok())
         .map(|addr| addr.to_string());
-    let relay_connected = relay_transport.read().await.is_some();
+    let relay_connected = context.relay_transport.read().await.is_some();
+
+    let tasks = context.task_manager.task_statuses().await;
+    let health_snap = context.health.snapshot(&tasks).await;
 
     DiagnosticsSnapshot {
-        node_id: config.node.node_id.clone(),
-        virtual_ip: config.network.virtual_ip.clone(),
-        network_id: config.network.network_id.clone(),
+        node_id: context.config.node.node_id.clone(),
+        virtual_ip: context.config.network.virtual_ip.clone(),
+        network_id: context.config.network.network_id.clone(),
         udp_local_addr,
-        relay_servers: config.relay.servers.clone(),
+        relay_servers: context.config.relay.servers.clone(),
         relay_connected,
-        relay_selection: relay_selection.read().await.clone(),
-        peers: peers.diagnostics().await,
-        stats: peers.stats().await,
+        relay_selection: context.relay_selection.read().await.clone(),
+        peers: context.peers.diagnostics().await,
+        stats: context.peers.stats().await,
+        health: health_snap,
     }
 }
 
@@ -227,14 +231,19 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let worker = tokio::spawn(serve_diagnostics(
-            listener,
+        let health = HealthState::new();
+        let task_manager = TaskManager::new(health.clone());
+        let context = DiagnosticsContext::new(
             config,
             peers,
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
-        ));
+            health,
+            task_manager,
+        );
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream

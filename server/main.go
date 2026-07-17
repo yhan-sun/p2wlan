@@ -16,8 +16,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -73,11 +73,11 @@ func main() {
 	mux.HandleFunc("POST /api/v1/register", rateLimit(apiServer.Register, 10, time.Minute))
 	mux.HandleFunc("POST /api/v1/challenges", authService.RequireAuth(apiServer.CreateChallenge))
 	mux.HandleFunc("POST /api/v1/devices/credential", authService.RequireAuth(apiServer.SubmitDeviceCredential))
-	mux.HandleFunc("POST /api/v1/devices", authService.RequireAuth(apiServer.RegisterDevice))
 	mux.HandleFunc("GET /api/v1/networks", authService.RequireAuth(apiServer.ListNetworks))
 
 	// Dual-auth routes (accept user JWT or device credential)
 	anyAuth := auth.RequireAnyAuth(authService, db)
+	mux.HandleFunc("POST /api/v1/devices", anyAuth(apiServer.RegisterDevice))
 	mux.HandleFunc("GET /api/v1/nodes", anyAuth(apiServer.ListNodes))
 	mux.HandleFunc("POST /api/v1/signals", anyAuth(apiServer.CreateSignal))
 	mux.HandleFunc("GET /api/v1/signals", anyAuth(apiServer.ListSignals))
@@ -94,8 +94,6 @@ func main() {
 
 	// WebSocket signaling
 	mux.HandleFunc("/ws", signaling.ServeWS(hub, authService))
-
-
 
 	// HTTP server
 	addr := fmt.Sprintf(":%s", port)
@@ -137,7 +135,6 @@ func main() {
 	log.Println("Server stopped")
 }
 
-
 // rateLimit is a simple per-process token-bucket style limiter for auth endpoints.
 // maxEvents requests are allowed per window per remote IP.
 func rateLimit(next http.HandlerFunc, maxEvents int, window time.Duration) http.HandlerFunc {
@@ -178,7 +175,6 @@ func getEnv(key, defaultVal string) string {
 	}
 	return defaultVal
 }
-
 
 // limitBodySize wraps an http.Handler with a 1 MB body size limit.
 func limitBodySize(next http.Handler) http.Handler {
