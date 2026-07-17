@@ -299,7 +299,61 @@ async fn main() -> p2pnet_daemon::Result<()> {
 
     // Create and run the daemon
     let mut daemon = Daemon::new(config);
-    daemon.run().await
+
+    // Graceful shutdown: wait for SIGINT/SIGTERM or daemon exit
+    let daemon_handle = tokio::spawn(async move { daemon.run().await });
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = daemon_handle => {
+                match result {
+                    Ok(Ok(())) => info!("Daemon exited cleanly"),
+                    Ok(Err(e)) => {
+                        error!("Daemon exited with error: {e}");
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        error!("Daemon task failed: {e}");
+                        return Err(DaemonError::TaskCrash(e.to_string()));
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down...");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = daemon_handle => {
+                match result {
+                    Ok(Ok(())) => info!("Daemon exited cleanly"),
+                    Ok(Err(e)) => {
+                        error!("Daemon exited with error: {e}");
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        error!("Daemon task failed: {e}");
+                        return Err(DaemonError::TaskCrash(e.to_string()));
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down...");
+            }
+        }
+    }
+
+    info!("Shutdown complete.");
+    Ok(())
 }
 
 async fn print_status(config: &Config, cli: &Cli) -> p2pnet_daemon::Result<()> {

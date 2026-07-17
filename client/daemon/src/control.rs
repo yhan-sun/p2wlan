@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
+use rand::Rng;
 
 // ============================================================
 // Control Plane Messages
@@ -341,7 +342,7 @@ impl ControlClient {
         config_path: Option<PathBuf>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let state = Arc::new(RwLock::new(ClientState {
             registered: false,
@@ -361,7 +362,7 @@ impl ControlClient {
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
             tokio::spawn(async move {
-                run_control_loop(config, event_tx, state, cmd_rx, cfg_path).await;
+                run_control_loop(config, &event_tx, state, &mut cmd_rx, cfg_path).await;
             });
         }
 
@@ -573,37 +574,48 @@ impl ControlClient {
     }
 }
 
+/// Maximum exponential-backoff delay before giving up.
+const MAX_BACKOFF_SECS: u64 = 300;
+const INITIAL_BACKOFF_SECS: u64 = 2;
+
+/// Compute exponential backoff with jitter, capped at MAX_BACKOFF_SECS.
+fn backoff_delay(attempt: u32) -> Duration {
+    let base = INITIAL_BACKOFF_SECS.saturating_mul(1u64.saturating_pow(attempt));
+    let capped = base.min(MAX_BACKOFF_SECS);
+    let jitter = rand::thread_rng().gen_range(0.0..=0.5) * capped as f64;
+    Duration::from_secs_f64(capped as f64 + jitter)
+}
+
 async fn run_control_loop(
     mut config: Config,
-    event_tx: mpsc::UnboundedSender<ControlEvent>,
+    event_tx: &mpsc::UnboundedSender<ControlEvent>,
     state: Arc<RwLock<ClientState>>,
-    mut cmd_rx: mpsc::UnboundedReceiver<ControlCommand>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
     config_path: Option<PathBuf>,
 ) {
     let http = reqwest::Client::new();
     let base_url = normalize_http_base_url(&config.control.server_url);
+
     // Prefer an existing device credential; fall back to user JWT for first registration.
     let mut token = if !config.control.device_credential.trim().is_empty() {
         config.control.device_credential.clone()
     } else {
         config.control.auth_token.clone()
     };
-
-    info!("Connecting to control plane at {base_url}");
-
-    // Device registration always uses the user JWT (device credentials are issued after).
     let register_token = if !config.control.auth_token.trim().is_empty() {
         config.control.auth_token.clone()
     } else {
         token.clone()
     };
 
+    info!("Connecting to control plane at {base_url}");
+
     let self_node_id = match register_device(&http, &base_url, &register_token, &config).await {
         Ok((node_id, virtual_ip, cidr)) => {
             {
-                let mut state = state.write().await;
-                state.registered = true;
-                state.virtual_ip = Some(virtual_ip.clone());
+                let mut s = state.write().await;
+                s.registered = true;
+                s.virtual_ip = Some(virtual_ip.clone());
             }
 
             let _ = event_tx.send(ControlEvent::Registered {
@@ -613,11 +625,7 @@ async fn run_control_loop(
                 relay_servers: config.relay.servers.clone(),
             });
 
-            // If Ed25519 keys are available and no credential has been issued,
-            // attempt the challenge-response flow to obtain a device credential.
-            // NOTE: credential flow is best-effort for now; if it fails the daemon
-            // continues with the user JWT. Device credential support is the
-            // transition target for all daemon-to-control-plane communication.
+            // Attempt Ed25519 challenge for device credential
             if !config.control.credential_issued
                 && !config.node.ed25519_private_key.is_empty()
                 && !config.node.ed25519_public_key.is_empty()
@@ -638,9 +646,6 @@ async fn run_control_loop(
                         config.control.device_credential = device_credential.clone();
                         config.control.credential_issued = true;
                         token = device_credential;
-                        // Persist the device credential for restarts; subsequent control-plane
-                        // operations in this session use the device credential instead of the
-                        // long-lived user JWT.
                         if let Some(ref path) = config_path {
                             if let Err(e) = config.save_to_file(path) {
                                 warn!("Failed to save config with device credential: {e}");
@@ -666,6 +671,7 @@ async fn run_control_loop(
         }
     };
 
+    // Initial poll
     if let Err(err) = poll_peers(
         &http,
         &base_url,
@@ -673,69 +679,101 @@ async fn run_control_loop(
         &config,
         &self_node_id,
         &state,
-        &event_tx,
+        event_tx,
     )
     .await
     {
         warn!("Initial peer polling failed: {err}");
     }
-
-    if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, &event_tx).await {
+    if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
         warn!("Initial signal polling failed: {err}");
     }
 
     let interval_secs = config.control.heartbeat_interval_secs.max(5);
     let mut tick = time::interval(Duration::from_secs(interval_secs));
 
+    // Track consecutive failures for backoff
+    let mut poll_failures: u32 = 0;
+    let mut perm_auth_failure: bool = false;
+
     loop {
+        if perm_auth_failure {
+            warn!("Permanent auth failure; control loop giving up");
+            let _ = event_tx.send(ControlEvent::ServerError {
+                code: 401,
+                message: "permanent auth failure — re-authentication required".into(),
+            });
+            break;
+        }
+
         tokio::select! {
             _ = tick.tick() => {
-                if let Err(err) = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, &event_tx).await {
-                    warn!("Peer polling failed: {err}");
-                }
-                if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, &event_tx).await {
-                    warn!("Signal polling failed: {err}");
+                // Peer polling with exponential backoff
+                let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
+                let sig_result = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await;
+                match (&poll_result, &sig_result) {
+                    (Err(_), _) | (_, Err(_)) => {
+                        poll_failures = poll_failures.saturating_add(1);
+                        let delay = backoff_delay(poll_failures);
+                        warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}");
+                        // If the failure was an auth error, mark permanent
+                        if let Err(e) = &poll_result {
+                            if e.to_string().contains("401") || e.to_string().contains("403") {
+                                perm_auth_failure = true;
+                            }
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                    (Ok(_), Ok(_)) => {
+                        if poll_failures > 0 {
+                            info!("Polling recovered after {poll_failures} failures");
+                        }
+                        poll_failures = 0;
+                    }
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
-                        match create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await {
+                        let res = create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await;
+                        match res {
                             Ok((tunnel_id, public_endpoint)) => {
                                 let _ = event_tx.send(ControlEvent::TunnelCreated { tunnel_id, public_endpoint });
                             }
                             Err(err) => {
-                                let _ = event_tx.send(ControlEvent::ServerError { code: 3000, message: err.to_string() });
+                                let code = if err.to_string().contains("401") || err.to_string().contains("403") { 401u16 } else { 3000u16 };
+                                let _ = event_tx.send(ControlEvent::ServerError { code, message: err.to_string() });
+                                if code == 401 { perm_auth_failure = true; }
                             }
                         }
                     }
                     ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
-                        match update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await {
-                            Ok(()) => {
-                                debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})");
-                            }
+                        let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
+                        match &res {
+                            Ok(()) => { debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})"); }
                             Err(err) => {
                                 let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err.to_string() });
+                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
                             }
                         }
                     }
                     ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
-                        match send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await {
-                            Ok(()) => {
-                                debug!("Sent peer offer to {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_init.len());
-                            }
+                        let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await;
+                        match &res {
+                            Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
                             Err(err) => {
                                 let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err.to_string() });
+                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
                             }
                         }
                     }
                     ControlCommand::SendPeerAnswer { to_node_id, candidates, handshake_response } => {
-                        match send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await {
-                            Ok(()) => {
-                                debug!("Sent peer answer to {to_node_id}: {} candidates, {} handshake bytes", candidates.len(), handshake_response.len());
-                            }
+                        let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await;
+                        match &res {
+                            Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
                             Err(err) => {
                                 let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err.to_string() });
+                                if err.to_string().contains("401") || err.to_string().contains("403") { perm_auth_failure = true; }
                             }
                         }
                     }
@@ -751,6 +789,8 @@ async fn run_control_loop(
             else => break,
         }
     }
+
+    let _ = event_tx.send(ControlEvent::Disconnected);
 }
 
 /// Obtain a device credential via challenge-response.
