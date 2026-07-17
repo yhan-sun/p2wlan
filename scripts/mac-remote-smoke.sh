@@ -191,8 +191,36 @@ if [[ "$MODE" == "tun" ]]; then
 
   echo "[mac-smoke] Mac VIP: $MAC_VIP"
   echo "[mac-smoke] Ali VIP: $ALI_VIP"
-  ping -c 3 "$ALI_VIP"
-  remote "ping -c 3 '$MAC_VIP'"
+  echo "--- mac route to Ali VIP ---"
+  route -n get "$ALI_VIP" || true
+  echo "--- mac 10.20 routes ---"
+  netstat -rn -f inet | awk '$1 ~ /^10\.20/ {print}' || true
+  echo "--- mac utun interfaces ---"
+  ifconfig | awk '/^utun/{iface=$1; print; next} iface && /inet /{print; iface=""}' || true
+
+  MAC_PING_LOG="$LOCAL_RUN/ping-mac-to-ali.log"
+  ALI_PING_LOG="$LOCAL_RUN/ping-ali-to-mac.log"
+  if ! ping -S "$MAC_VIP" -c 3 "$ALI_VIP" >"$MAC_PING_LOG" 2>&1; then
+    echo "--- mac -> ali ping failed ---" >&2
+    cat "$MAC_PING_LOG" >&2 || true
+    echo "--- mac status after ping ---" >&2
+    "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$MAC_DIAG/status" >&2 || true
+    echo "--- ali status after ping ---" >&2
+    remote "'$REMOTE_BASE/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
+    exit 1
+  fi
+  cat "$MAC_PING_LOG"
+
+  if ! remote "ping -I '$ALI_VIP' -c 3 '$MAC_VIP'" >"$ALI_PING_LOG" 2>&1; then
+    echo "--- ali -> mac ping failed ---" >&2
+    cat "$ALI_PING_LOG" >&2 || true
+    echo "--- mac status after reverse ping ---" >&2
+    "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$MAC_DIAG/status" >&2 || true
+    echo "--- ali status after reverse ping ---" >&2
+    remote "'$REMOTE_BASE/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
+    exit 1
+  fi
+  cat "$ALI_PING_LOG"
 fi
 
 echo "[mac-smoke] PASS: Mac $MODE smoke completed"
