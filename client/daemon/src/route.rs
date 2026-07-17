@@ -1,8 +1,8 @@
 use std::net::Ipv4Addr;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 use std::sync::Mutex;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tracing::info;
 
 /// Platform-abstracted command runner for route operations.
@@ -278,7 +278,138 @@ fn macos_route_get(destination: &str) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+impl RouteManager {
+    pub fn add_cidr_route(&self, cidr: &str) -> crate::Result<()> {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return Ok(());
+        }
+
+        let Some((network, mask)) = parse_cidr_to_ip_mask(cidr) else {
+            return Err(crate::DaemonError::Network(format!(
+                "invalid route CIDR: {cidr}"
+            )));
+        };
+        let prefix = ip_mask_to_prefix(mask);
+        let destination_prefix = format!("{network}/{prefix}");
+        let interface = self.interface();
+
+        let existing = windows_get_route_aliases(&destination_prefix)?;
+        if !existing.is_empty() {
+            if existing.iter().any(|alias| alias == &interface) {
+                info!(
+                    "Route for {destination_prefix} already exists on {interface} — treating as idempotent, not owned"
+                );
+                return Ok(());
+            }
+            return Err(crate::DaemonError::Network(format!(
+                "routing conflict: route to {destination_prefix} already exists on another interface: {}",
+                existing.join(", ")
+            )));
+        }
+
+        info!("Adding Windows route for {destination_prefix} via {interface}");
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &format!(
+                    "New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
+                    ps_quote(&destination_prefix),
+                    ps_quote(&interface)
+                ),
+            ])
+            .status()
+            .map_err(|e| crate::DaemonError::Network(format!("failed to run New-NetRoute: {e}")))?;
+
+        if !status.success() {
+            return Err(crate::DaemonError::Network(format!(
+                "New-NetRoute failed for {destination_prefix} via {interface}; run as Administrator and verify the Wintun interface exists"
+            )));
+        }
+
+        if let Ok(mut added) = self.routes_added.lock() {
+            added.push((network, mask));
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup(&self) {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return;
+        }
+
+        let routes = {
+            let mut added = self.routes_added.lock().unwrap();
+            let routes_copy = added.clone();
+            added.clear();
+            routes_copy
+        };
+
+        for (network, mask) in routes {
+            let destination_prefix = format!("{}/{}", network, ip_mask_to_prefix(mask));
+            let interface = self.interface();
+            info!("Cleaning up Windows route for {destination_prefix} via {interface}");
+            let _ = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    &format!(
+                        "Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
+                        ps_quote(&destination_prefix),
+                        ps_quote(&interface)
+                    ),
+                ])
+                .status();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!(
+                "Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias",
+                ps_quote(destination_prefix)
+            ),
+        ])
+        .output()
+        .map_err(|e| crate::DaemonError::Network(format!("failed to run Get-NetRoute: {e}")))?;
+
+    if !output.status.success() {
+        return Err(crate::DaemonError::Network(format!(
+            "Get-NetRoute failed for {destination_prefix}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 impl RouteManager {
     pub fn add_cidr_route(&self, _cidr: &str) -> crate::Result<()> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
