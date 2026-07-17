@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long)]
     address: Option<String>,
 
+    /// Run in manual/offline mode (disable control-plane auto-assignment)
+    #[arg(long)]
+    manual: bool,
+
     /// Override subnet mask
     #[arg(long)]
     netmask: Option<String>,
@@ -127,8 +131,12 @@ struct Cli {
 
 fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
     // Validate control plane URL
-    if reqwest::Url::parse(&cli.control).is_err() {
-        return Err(format!("Invalid URL for --control: {}", cli.control));
+    let control_url = match reqwest::Url::parse(&cli.control) {
+        Ok(url) => url,
+        Err(_) => return Err(format!("Invalid URL for --control: {}", cli.control)),
+    };
+    if control_url.scheme() != "http" && control_url.scheme() != "https" {
+        return Err(format!("Only http and https schemes are allowed for --control: {}", cli.control));
     }
     if let Some(ref addr) = cli.address {
         if addr.parse::<std::net::Ipv4Addr>().is_err() {
@@ -182,7 +190,12 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
     if let Some(ref relay) = cli.relay {
         for r in relay.split(',').map(str::trim).filter(|x| !x.is_empty()) {
             let endpoint = match r.split_once('@') {
-                Some((_, ep)) => ep,
+                Some((region, ep)) => {
+                    if region.is_empty() {
+                        return Err(format!("Empty region in relay spec '{}'", r));
+                    }
+                    ep
+                }
                 None => r,
             };
             if endpoint.parse::<std::net::SocketAddr>().is_err() {
@@ -194,8 +207,12 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
         }
     }
     if let Some(ref durl) = cli.diagnostics_url {
-        if reqwest::Url::parse(durl).is_err() {
-            return Err(format!("Invalid URL for --diagnostics-url: {}", durl));
+        let parsed = match reqwest::Url::parse(durl) {
+            Ok(url) => url,
+            Err(_) => return Err(format!("Invalid URL for --diagnostics-url: {}", durl)),
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!("Only http and https schemes are allowed for --diagnostics-url: {}", durl));
         }
     }
     Ok(())
@@ -316,6 +333,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if let Some(ref address) = cli.address {
         config.network.virtual_ip = address.clone();
     }
+    if cli.manual {
+        config.network.manual = true;
+    }
     if let Some(ref netmask) = cli.netmask {
         config.network.netmask = netmask.clone();
     }
@@ -407,6 +427,7 @@ mod tests {
             token: None,
             interface: None,
             address: None,
+            manual: false,
             netmask: Some("255.255.255.255".to_string()),
             mtu: None,
             heartbeat_interval: None,
@@ -455,6 +476,7 @@ mod tests {
             token: None,
             interface: None,
             address: None,
+            manual: false,
             netmask: None,
             mtu: None,
             heartbeat_interval: None,
@@ -514,6 +536,16 @@ mod tests {
 
         let mut cli = base_cli.clone();
         cli.relay = Some("cn-east@bad:99999".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 8. Empty region in relay spec
+        let mut cli = base_cli.clone();
+        cli.relay = Some("@127.0.0.1:8080".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        // 9. Invalid control scheme (non-http/https)
+        let mut cli = base_cli.clone();
+        cli.control = "ftp://127.0.0.1".to_string();
         assert!(validate_cli(&cli).is_err());
 
         // Valid cases should pass
