@@ -26,6 +26,7 @@ pub mod error;
 pub mod hash;
 pub mod hkdf;
 pub mod noise;
+pub mod sign;
 
 // Re-export primary types
 pub use aead::{decrypt, encrypt, nonce_from_counter, AeadKey, AeadNonce, TAG_SIZE, ZERO_NONCE};
@@ -37,6 +38,7 @@ pub use noise::{
     SymmetricState, CONSTRUCTION, IDENTIFIER, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES,
     REKEY_AFTER_TIME,
 };
+pub use sign::Ed25519KeyPair;
 
 /// A node identity, consisting of an X25519 key pair.
 ///

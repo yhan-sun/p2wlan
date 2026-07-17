@@ -38,7 +38,7 @@ func TestDatabase_CreateDevice_UniqueIPAllocation(t *testing.T) {
 			defer wg.Done()
 			pubKey := fmt.Sprintf("%02d-pubkey-device", index)
 			devName := fmt.Sprintf("device-%d", index)
-			device, err := db.CreateDevice(user.ID, "default", pubKey, devName, "linux")
+			device, err := db.CreateDevice(user.ID, "default", pubKey, devName, "linux", "")
 			if err != nil {
 				errorsChan <- err
 				return
@@ -85,13 +85,13 @@ func TestDatabase_UniqueConstraints(t *testing.T) {
 	user, _ := db.CreateUser("user@p2wlan.local", "pwd")
 
 	// Create device A
-	_, err = db.CreateDevice(user.ID, "default", "pubkey-a", "device-a", "linux")
+	_, err = db.CreateDevice(user.ID, "default", "pubkey-a", "device-a", "linux", "")
 	if err != nil {
 		t.Fatalf("CreateDevice failed: %v", err)
 	}
 
 	// Try to create device B with duplicate public key -> should return existing or update, not fail
-	devB, err := db.CreateDevice(user.ID, "default", "pubkey-a", "device-b", "linux")
+	devB, err := db.CreateDevice(user.ID, "default", "pubkey-a", "device-b", "linux", "")
 	if err != nil {
 		t.Fatalf("Expected duplicate public key update to pass, but got: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestDatabase_UniqueConstraints(t *testing.T) {
 
 	// Try to register the same public key with another user -> should fail (Stage 2 requirement check)
 	userB, _ := db.CreateUser("user-b@p2wlan.local", "pwd")
-	_, err = db.CreateDevice(userB.ID, "default", "pubkey-a", "device-c", "linux")
+	_, err = db.CreateDevice(userB.ID, "default", "pubkey-a", "device-c", "linux", "")
 	if err == nil {
 		t.Error("Expected failure when registering same public key under a different user, but succeeded")
 	}

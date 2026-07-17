@@ -24,6 +24,14 @@ pub enum CryptoError {
     /// Invalid input data.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// Invalid cryptographic key.
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
+
+    /// Signature verification failed with details.
+    #[error("signature verification failed: {0}")]
+    SignatureVerification(String),
 }
 
 /// Convenience type alias.

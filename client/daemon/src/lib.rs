@@ -116,7 +116,8 @@ impl Daemon {
     /// Create a new daemon from config.
     pub fn new(config: Config) -> Self {
         let control_enabled = !config.network.manual;
-        let (control, control_rx) = ControlClient::new(&config, control_enabled);
+        let config_path = config.config_path.clone();
+        let (control, control_rx) = ControlClient::new(&config, control_enabled, config_path);
         let (transport, encrypted_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));

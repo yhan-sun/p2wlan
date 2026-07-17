@@ -8,6 +8,7 @@
 //! - Port mappings
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::Path;
 
 use crate::error::{DaemonError, Result};
@@ -19,6 +20,9 @@ use crate::error::{DaemonError, Result};
 /// Full daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// File path this config was loaded from (not serialized).
+    #[serde(skip)]
+    pub config_path: Option<std::path::PathBuf>,
     /// Node identity.
     pub node: NodeConfig,
     /// Network settings.
@@ -56,6 +60,12 @@ pub struct NodeConfig {
     /// Platform string.
     #[serde(default = "default_platform")]
     pub platform: String,
+    /// Ed25519 public key (hex) for device identity signing.
+    #[serde(default)]
+    pub ed25519_public_key: String,
+    /// Ed25519 private key (hex) — do NOT log this value.
+    #[serde(default)]
+    pub ed25519_private_key: String,
 }
 
 fn default_device_name() -> String {
@@ -148,8 +158,15 @@ fn default_keepalive_interval_secs() -> u64 {
 pub struct ControlConfig {
     /// Control server URL (e.g. "https://control.p2pnet.io:443").
     pub server_url: String,
-    /// Authentication token (obtained after login/register).
+    /// User authentication token (JWT) obtained after login/register.
     pub auth_token: String,
+    /// Device credential token for API authentication (replaces user JWT
+    /// for device-level operations after Ed25519 challenge is completed).
+    #[serde(default)]
+    pub device_credential: String,
+    /// Whether the device credential has been issued.
+    #[serde(default)]
+    pub credential_issued: bool,
     /// Reconnect interval in seconds.
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval_secs: u64,
@@ -330,26 +347,60 @@ impl Config {
         Ok(config)
     }
 
-    /// Save configuration to a JSON file.
+    /// Save configuration to a JSON file using atomic write (temp + rename)
+    /// and sets 0600 permissions on Unix.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DaemonError::Config(format!("failed to serialize config: {e}")))?;
-        std::fs::write(path, content)
-            .map_err(|e| DaemonError::Config(format!("failed to write config: {e}")))?;
+
+        // Write to temp file first for atomicity
+        let tmp_path = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| DaemonError::Config(format!("failed to create temp config: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = file
+                .metadata()
+                .map_err(|e| {
+                    DaemonError::Config(format!("failed to get temp config metadata: {e}"))
+                })?
+                .permissions();
+            perms.set_mode(0o600);
+            file.set_permissions(perms).map_err(|e| {
+                DaemonError::Config(format!("failed to set config permissions: {e}"))
+            })?;
+        }
+
+        file.write_all(content.as_bytes())
+            .map_err(|e| DaemonError::Config(format!("failed to write temp config: {e}")))?;
+
+        file.sync_all()
+            .map_err(|e| DaemonError::Config(format!("failed to sync temp config: {e}")))?;
+        drop(file);
+
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| DaemonError::Config(format!("failed to rename config: {e}")))?;
+
         Ok(())
     }
 
-    /// Generate a default config with a new identity.
+    /// Generate a default config with a new identity (X25519 + Ed25519).
     pub fn generate_default(control_url: &str, network_id: &str) -> Result<Self> {
         let identity = p2pnet_crypto::NodeIdentity::generate();
+        let ed25519 = p2pnet_crypto::Ed25519KeyPair::generate();
 
         Ok(Self {
+            config_path: None,
             node: NodeConfig {
                 node_id: identity.node_id().to_string(),
                 public_key: hex::encode(identity.public_key()),
                 private_key: hex::encode(identity.private_key()),
                 device_name: default_device_name(),
                 platform: default_platform(),
+                ed25519_public_key: hex::encode(ed25519.public_key()),
+                ed25519_private_key: hex::encode(ed25519.private_key()),
             },
             network: NetworkConfig {
                 network_id: network_id.to_string(),
@@ -371,6 +422,8 @@ impl Config {
             control: ControlConfig {
                 server_url: control_url.to_string(),
                 auth_token: String::new(),
+                device_credential: String::new(),
+                credential_issued: false,
                 reconnect_interval_secs: default_reconnect_interval(),
                 heartbeat_interval_secs: default_heartbeat_interval(),
             },
@@ -478,6 +531,7 @@ mod tests {
 
     #[test]
     fn test_config_backward_compatible_udp_endpoint_defaults() {
+        // Old config without ed25519 keys should still deserialize
         let json = r#"{
             "node": {
                 "node_id": "node1",
