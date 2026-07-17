@@ -104,12 +104,6 @@ func (s *Server) Register(w http.ResponseWriter, r *http.Request) {
 
 // RegisterDevice handles POST /api/v1/devices.
 func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
-	claims, err := auth.GetClaims(r.Context())
-	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		return
-	}
-
 	var req struct {
 		PublicKey          string `json:"public_key"`
 		DeviceName         string `json:"device_name"`
@@ -152,14 +146,41 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify user has access to the network
-	hasAccess, err := s.db.UserHasNetworkAccess(claims.UserID, req.NetworkID)
-	if err != nil {
-		http.Error(w, `{"error":"network access check failed"}`, http.StatusInternalServerError)
-		return
-	}
-	if !hasAccess {
-		http.Error(w, `{"error":"user does not have access to this network"}`, http.StatusForbidden)
+	userID := ""
+	networkID := req.NetworkID
+	deviceCredentialAuth := false
+
+	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
+		deviceCredentialAuth = true
+		device, err := s.db.GetDevice(deviceClaims.DeviceID)
+		if err != nil {
+			http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
+			return
+		}
+		if req.PublicKey != device.PublicKey {
+			http.Error(w, `{"error":"device credential cannot register a different public key"}`, http.StatusForbidden)
+			return
+		}
+		if req.NetworkID != deviceClaims.NetworkID {
+			http.Error(w, `{"error":"device credential cannot change networks"}`, http.StatusForbidden)
+			return
+		}
+		userID = deviceClaims.UserID
+		networkID = deviceClaims.NetworkID
+	} else if claims, err := auth.GetClaims(r.Context()); err == nil {
+		userID = claims.UserID
+		// Verify user has access to the network.
+		hasAccess, err := s.db.UserHasNetworkAccess(userID, networkID)
+		if err != nil {
+			http.Error(w, `{"error":"network access check failed"}`, http.StatusInternalServerError)
+			return
+		}
+		if !hasAccess {
+			http.Error(w, `{"error":"user does not have access to this network"}`, http.StatusForbidden)
+			return
+		}
+	} else {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
@@ -173,14 +194,14 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	device, err := s.db.CreateDevice(claims.UserID, req.NetworkID, req.PublicKey, req.DeviceName, req.Platform, ed25519PubKey)
+	device, err := s.db.CreateDevice(userID, networkID, req.PublicKey, req.DeviceName, req.Platform, ed25519PubKey)
 	if err != nil {
 		http.Error(w, `{"error":"device registration failed"}`, http.StatusInternalServerError)
 		return
 	}
 
 	var cidr string
-	err = s.db.QueryRow(`SELECT cidr FROM networks WHERE id = ?`, req.NetworkID).Scan(&cidr)
+	err = s.db.QueryRow(`SELECT cidr FROM networks WHERE id = ?`, networkID).Scan(&cidr)
 	if err != nil {
 		cidr = "10.20.0.0/16"
 	}
@@ -193,7 +214,7 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Issue device credential if Ed25519 identity was verified
-	if ed25519PubKey != "" && req.ChallengeID != "" && req.ChallengeSignature != "" {
+	if !deviceCredentialAuth && ed25519PubKey != "" && req.ChallengeID != "" && req.ChallengeSignature != "" {
 		cred, token, err := s.db.CreateDeviceCredential(device.ID, 30*24*3600) // 30-day TTL
 		if err == nil {
 			response["device_credential"] = token

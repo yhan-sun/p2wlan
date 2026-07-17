@@ -3,8 +3,12 @@
 //! Uses ChaCha20-Poly1305 AEAD with counter-based nonces.
 //! Implements replay protection via a sliding window.
 
+use std::time::{Duration, Instant};
+
 use p2pnet_crypto::aead::{decrypt_with_counter, encrypt_with_counter};
-use p2pnet_crypto::Hash;
+use p2pnet_crypto::{
+    Hash, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME,
+};
 
 use crate::error::{Result, WireGuardError};
 use crate::handshake::TransportKeyPair;
@@ -34,6 +38,13 @@ pub struct TransportSession {
     replay_bitmap: u64,
     /// Whether we've received at least one packet.
     replay_initialized: bool,
+    /// When this session was created (for time-based rekey / reject).
+    created_at: Instant,
+    /// Optional overrides used by tests to exercise rekey without waiting 2 minutes.
+    rekey_after_messages: u64,
+    rekey_after_time: Duration,
+    reject_after_messages: u64,
+    reject_after_time: Duration,
 }
 
 impl TransportSession {
@@ -48,7 +59,37 @@ impl TransportSession {
             recv_highest: 0,
             replay_bitmap: 0,
             replay_initialized: false,
+            created_at: Instant::now(),
+            rekey_after_messages: REKEY_AFTER_MESSAGES,
+            rekey_after_time: Duration::from_secs(REKEY_AFTER_TIME),
+            reject_after_messages: REJECT_AFTER_MESSAGES,
+            reject_after_time: Duration::from_secs(REJECT_AFTER_TIME),
         }
+    }
+
+    /// Override rekey/reject thresholds (tests and controlled environments).
+    pub fn with_thresholds(
+        mut self,
+        rekey_after_messages: u64,
+        rekey_after_time: Duration,
+        reject_after_messages: u64,
+        reject_after_time: Duration,
+    ) -> Self {
+        self.rekey_after_messages = rekey_after_messages;
+        self.rekey_after_time = rekey_after_time;
+        self.reject_after_messages = reject_after_messages;
+        self.reject_after_time = reject_after_time;
+        self
+    }
+
+    /// Age of this session.
+    pub fn age(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Instant when this session was created.
+    pub fn created_at(&self) -> Instant {
+        self.created_at
     }
 
     /// Get our session index.
@@ -76,6 +117,11 @@ impl TransportSession {
     ///
     /// A WireGuard transport data message (Type 4).
     pub fn encrypt(&mut self, packet: &[u8]) -> Result<MessageTransport> {
+        if self.is_expired() {
+            return Err(WireGuardError::InvalidPacket(
+                "session expired; rekey required".into(),
+            ));
+        }
         if self.send_counter == u64::MAX {
             return Err(WireGuardError::NonceOverflow);
         }
@@ -112,6 +158,11 @@ impl TransportSession {
     ///
     /// The decrypted IP packet, or an error if decryption fails or replay is detected.
     pub fn decrypt(&mut self, msg: &MessageTransport) -> Result<Vec<u8>> {
+        if self.is_expired() {
+            return Err(WireGuardError::InvalidPacket(
+                "session expired; rekey required".into(),
+            ));
+        }
         // Verify the message is addressed to us
         if msg.receiver_index != self.our_index {
             return Err(WireGuardError::InvalidPacket(format!(
@@ -200,9 +251,14 @@ impl TransportSession {
         }
     }
 
-    /// Check if rekeying is needed (counter approaching limit).
+    /// Check if rekeying is needed (message counter or time threshold).
     pub fn needs_rekey(&self) -> bool {
-        self.send_counter >= p2pnet_crypto::REKEY_AFTER_MESSAGES
+        self.send_counter >= self.rekey_after_messages || self.age() >= self.rekey_after_time
+    }
+
+    /// Check if the session has exceeded its hard lifetime and must be rejected.
+    pub fn is_expired(&self) -> bool {
+        self.send_counter >= self.reject_after_messages || self.age() >= self.reject_after_time
     }
 }
 
@@ -213,6 +269,9 @@ impl std::fmt::Debug for TransportSession {
             .field("peer_index", &self.peer_index)
             .field("send_counter", &self.send_counter)
             .field("recv_highest", &self.recv_highest)
+            .field("age_secs", &self.age().as_secs())
+            .field("needs_rekey", &self.needs_rekey())
+            .field("is_expired", &self.is_expired())
             .finish_non_exhaustive()
     }
 }
@@ -418,5 +477,29 @@ mod tests {
         // Either way, it should not produce valid plaintext
         let result = receiver.decrypt(&wrong);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_needs_rekey_by_message_threshold() {
+        let (sender, _) = establish_session();
+        let mut session =
+            sender.with_thresholds(3, Duration::from_secs(3600), 10, Duration::from_secs(7200));
+        assert!(!session.needs_rekey());
+        session.encrypt(b"a").unwrap();
+        session.encrypt(b"b").unwrap();
+        session.encrypt(b"c").unwrap();
+        assert!(session.needs_rekey());
+        assert!(!session.is_expired());
+    }
+
+    #[test]
+    fn test_session_expires_by_reject_threshold() {
+        let (sender, _) = establish_session();
+        let mut session =
+            sender.with_thresholds(1, Duration::from_secs(3600), 2, Duration::from_secs(7200));
+        session.encrypt(b"a").unwrap();
+        assert!(session.needs_rekey());
+        session.encrypt(b"b").unwrap();
+        assert!(session.is_expired());
     }
 }

@@ -208,74 +208,72 @@ func (db *DB) GetUserByEmail(email string) (*User, error) {
 	return &u, nil
 }
 
-
-
 // ---- Authorization types ----
 
 // DeviceChallenge represents a one-time challenge for device identity verification.
 type DeviceChallenge struct {
-    ID        string `json:"id"`
-    DeviceID  string `json:"device_id"`
-    Challenge []byte `json:"challenge"`
-    ExpiresAt int64  `json:"expires_at"`
-    Consumed  bool   `json:"consumed"`
-    CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+	DeviceID  string `json:"device_id"`
+	Challenge []byte `json:"challenge"`
+	ExpiresAt int64  `json:"expires_at"`
+	Consumed  bool   `json:"consumed"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // DeviceCredential represents a device-specific authentication token.
 type DeviceCredential struct {
-    ID        string `json:"id"`
-    DeviceID  string `json:"device_id"`
-    TokenHash []byte `json:"-"`
-    ExpiresAt int64  `json:"expires_at"`
-    Revoked   bool   `json:"revoked"`
-    CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+	DeviceID  string `json:"device_id"`
+	TokenHash []byte `json:"-"`
+	ExpiresAt int64  `json:"expires_at"`
+	Revoked   bool   `json:"revoked"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // NetworkMembership links a user to a network.
 type NetworkMembership struct {
-    ID        string `json:"id"`
-    UserID    string `json:"user_id"`
-    NetworkID string `json:"network_id"`
-    Role      string `json:"role"`
-    CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+	UserID    string `json:"user_id"`
+	NetworkID string `json:"network_id"`
+	Role      string `json:"role"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // ---- Challenge operations ----
 
 // CreateChallenge generates a new device challenge.
 func (db *DB) CreateChallenge(deviceID string, challenge []byte, expiresAt int64) (*DeviceChallenge, error) {
-    id := fmt.Sprintf("challenge-%d", time.Now().UnixNano())
-    now := time.Now().Unix()
-    _, err := db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
+	id := fmt.Sprintf("challenge-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	_, err := db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
         VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, challenge, expiresAt, now)
-    if err != nil {
-        return nil, err
-    }
-    return &DeviceChallenge{
-        ID: id, DeviceID: deviceID, Challenge: challenge,
-        ExpiresAt: expiresAt, Consumed: false, CreatedAt: now,
-    }, nil
+	if err != nil {
+		return nil, err
+	}
+	return &DeviceChallenge{
+		ID: id, DeviceID: deviceID, Challenge: challenge,
+		ExpiresAt: expiresAt, Consumed: false, CreatedAt: now,
+	}, nil
 }
 
 // GetChallenge retrieves a challenge by ID.
 func (db *DB) GetChallenge(challengeID string) (*DeviceChallenge, error) {
-    var c DeviceChallenge
-    var consumed int
-    err := db.QueryRow(`SELECT id, device_id, challenge, expires_at, consumed, created_at
+	var c DeviceChallenge
+	var consumed int
+	err := db.QueryRow(`SELECT id, device_id, challenge, expires_at, consumed, created_at
         FROM device_challenges WHERE id = ?`, challengeID).
-        Scan(&c.ID, &c.DeviceID, &c.Challenge, &c.ExpiresAt, &consumed, &c.CreatedAt)
-    if err != nil {
-        return nil, err
-    }
-    c.Consumed = consumed == 1
-    return &c, nil
+		Scan(&c.ID, &c.DeviceID, &c.Challenge, &c.ExpiresAt, &consumed, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	c.Consumed = consumed == 1
+	return &c, nil
 }
 
 // ConsumeChallenge marks a challenge as consumed (one-time use).
 func (db *DB) ConsumeChallenge(challengeID string) error {
-    _, err := db.Exec(`UPDATE device_challenges SET consumed = 1 WHERE id = ?`, challengeID)
-    return err
+	_, err := db.Exec(`UPDATE device_challenges SET consumed = 1 WHERE id = ?`, challengeID)
+	return err
 }
 
 // ---- Credential operations ----
@@ -336,58 +334,58 @@ func (db *DB) ValidateDeviceCredential(token string) (*DeviceCredential, *Device
 
 // RevokeDeviceCredential revokes a device credential.
 func (db *DB) RevokeDeviceCredential(credentialID string) error {
-    _, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE id = ?`, credentialID)
-    return err
+	_, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE id = ?`, credentialID)
+	return err
 }
 
 // ---- Network membership operations ----
 
 // CreateNetworkMembership adds a user to a network.
 func (db *DB) CreateNetworkMembership(userID, networkID, role string) (*NetworkMembership, error) {
-    id := fmt.Sprintf("mem-%d", time.Now().UnixNano())
-    now := time.Now().Unix()
-    _, err := db.Exec(`INSERT OR IGNORE INTO network_memberships (id, user_id, network_id, role, created_at)
+	id := fmt.Sprintf("mem-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	_, err := db.Exec(`INSERT OR IGNORE INTO network_memberships (id, user_id, network_id, role, created_at)
         VALUES (?, ?, ?, ?, ?)`, id, userID, networkID, role, now)
-    if err != nil {
-        return nil, err
-    }
-    return &NetworkMembership{
-        ID: id, UserID: userID, NetworkID: networkID,
-        Role: role, CreatedAt: now,
-    }, nil
+	if err != nil {
+		return nil, err
+	}
+	return &NetworkMembership{
+		ID: id, UserID: userID, NetworkID: networkID,
+		Role: role, CreatedAt: now,
+	}, nil
 }
 
 // GetUserNetworks returns all networks the user is a member of.
 func (db *DB) GetUserNetworks(userID string) ([]Network, error) {
-    rows, err := db.Query(`SELECT n.id, n.name, n.cidr, n.owner_id, n.created_at
+	rows, err := db.Query(`SELECT n.id, n.name, n.cidr, n.owner_id, n.created_at
         FROM networks n
         JOIN network_memberships m ON m.network_id = n.id
         WHERE m.user_id = ?`, userID)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-    var networks []Network
-    for rows.Next() {
-        var n Network
-        if err := rows.Scan(&n.ID, &n.Name, &n.CIDR, &n.OwnerID, &n.CreatedAt); err != nil {
-            return nil, err
-        }
-        networks = append(networks, n)
-    }
-    return networks, nil
+	var networks []Network
+	for rows.Next() {
+		var n Network
+		if err := rows.Scan(&n.ID, &n.Name, &n.CIDR, &n.OwnerID, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		networks = append(networks, n)
+	}
+	return networks, nil
 }
 
 // UserHasNetworkAccess checks if a user has access to a specific network.
 func (db *DB) UserHasNetworkAccess(userID, networkID string) (bool, error) {
-    var count int
-    err := db.QueryRow(`SELECT COUNT(*) FROM network_memberships
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM network_memberships
         WHERE user_id = ? AND network_id = ?`, userID, networkID).Scan(&count)
-    if err != nil {
-        return false, err
-    }
-    return count > 0, nil
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // DeviceBelongsToUser checks whether the device is owned by the given user.
@@ -458,24 +456,23 @@ func (db *DB) CreateNetwork(ownerID, name, cidr string) (*Network, error) {
 	return &Network{ID: id, Name: name, CIDR: cidr, OwnerID: ownerID, CreatedAt: now}, nil
 }
 
-
 // ---- Device operations ----
 
 // Device represents a registered device/node.
 type Device struct {
-	ID         string `json:"id"`
-	UserID     string `json:"user_id"`
-	NetworkID  string `json:"network_id"`
-	PublicKey  string `json:"public_key"`
-	DeviceName string `json:"device_name"`
-	Platform   string `json:"platform"`
-	VirtualIP  string `json:"virtual_ip"`
-	NATType    string `json:"nat_type"`
-	Endpoint   string `json:"endpoint"`
-	LastSeen   int64  `json:"last_seen"`
-	Online     bool   `json:"online"`
+	ID               string `json:"id"`
+	UserID           string `json:"user_id"`
+	NetworkID        string `json:"network_id"`
+	PublicKey        string `json:"public_key"`
+	DeviceName       string `json:"device_name"`
+	Platform         string `json:"platform"`
+	VirtualIP        string `json:"virtual_ip"`
+	NATType          string `json:"nat_type"`
+	Endpoint         string `json:"endpoint"`
+	LastSeen         int64  `json:"last_seen"`
+	Online           bool   `json:"online"`
 	Ed25519PublicKey string `json:"ed25519_public_key,omitempty"`
-	CreatedAt  int64  `json:"created_at"`
+	CreatedAt        int64  `json:"created_at"`
 }
 
 // CreateDevice inserts a new device and assigns a virtual IP.
@@ -627,8 +624,16 @@ func (db *DB) assignVirtualIP(tx *sql.Tx, networkID string) (string, error) {
 	return "", fmt.Errorf("IP address pool exhausted for network %s", networkID)
 }
 
+// DeviceOnlineTTL is how long a device remains "online" without a last_seen update.
+// Defaults to 90 seconds — a few missed heartbeats of the typical 5–15s poll interval.
+const DeviceOnlineTTL = 90
+
 // ListDevicesByNetwork returns all devices in a network.
+// Devices whose last_seen is older than DeviceOnlineTTL are reported as offline
+// even if the online flag is still set (lease / TTL semantics).
 func (db *DB) ListDevicesByNetwork(networkID string) ([]Device, error) {
+	now := time.Now().Unix()
+
 	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at
 		FROM devices WHERE network_id = ?`, networkID)
 	if err != nil {
@@ -644,10 +649,22 @@ func (db *DB) ListDevicesByNetwork(networkID string) ([]Device, error) {
 			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &online, &d.CreatedAt); err != nil {
 			return nil, err
 		}
-		d.Online = online == 1
+		// Lease semantics: last_seen older than TTL or never seen (0) => offline.
+		if online == 1 && d.LastSeen > 0 && now-d.LastSeen <= DeviceOnlineTTL {
+			d.Online = true
+		} else {
+			d.Online = false
+		}
 		devices = append(devices, d)
 	}
 	return devices, nil
+}
+
+// MarkStaleDevicesOffline sets online=0 for devices whose last_seen is older than ttlSeconds.
+func (db *DB) MarkStaleDevicesOffline(ttlSeconds int64) error {
+	cutoff := time.Now().Unix() - ttlSeconds
+	_, err := db.Exec(`UPDATE devices SET online = 0 WHERE online = 1 AND last_seen > 0 AND last_seen < ?`, cutoff)
+	return err
 }
 
 // UpdateDeviceEndpoint updates a device's endpoint and NAT type.
@@ -826,7 +843,6 @@ func (db *DB) ListTunnelsByDevice(deviceID string) ([]Tunnel, error) {
 	}
 	return tunnels, nil
 }
-
 
 // hashToken returns a SHA-256 hash of an opaque credential token.
 func hashToken(token string) []byte {
