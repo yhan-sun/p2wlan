@@ -23,6 +23,8 @@ NODE_A_LINK_IP=${NODE_A_LINK_IP:-172.28.77.2}
 NODE_B_LINK_IP=${NODE_B_LINK_IP:-172.28.77.3}
 NODE_A_VIP=${NODE_A_VIP:-10.20.0.2}
 NODE_B_VIP=${NODE_B_VIP:-10.20.0.3}
+NODE_A_UDP_PORT=${NODE_A_UDP_PORT:-$((22000 + $$ % 1000))}
+NODE_B_UDP_PORT=${NODE_B_UDP_PORT:-$((NODE_A_UDP_PORT + 1))}
 DIAG_PORT=${DIAG_PORT:-39277}
 
 skip() {
@@ -37,6 +39,9 @@ cleanup() {
   if [[ -n "${NODE_A_PID:-}" ]]; then kill "$NODE_A_PID" 2>/dev/null || true; fi
   if [[ -n "${NODE_B_PID:-}" ]]; then kill "$NODE_B_PID" 2>/dev/null || true; fi
   if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
+  if [[ "${IPTABLES_BRIDGE_RULE_ADDED:-0}" == "1" ]] && command -v iptables >/dev/null 2>&1; then
+    iptables -D FORWARD -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null || true
+  fi
   if command -v ip >/dev/null 2>&1; then
     ip netns pids "$NS_A" 2>/dev/null | xargs -r kill 2>/dev/null || true
     ip netns pids "$NS_B" 2>/dev/null | xargs -r kill 2>/dev/null || true
@@ -101,8 +106,13 @@ echo "[tun-smoke] namespaces: $NS_A $NS_B"
 ip netns add "$NS_A"
 ip netns add "$NS_B"
 ip link add "$BRIDGE" type bridge
+ip link set "$BRIDGE" type bridge stp_state 0 forward_delay 0
 ip addr add "$BRIDGE_IP/24" dev "$BRIDGE"
 ip link set "$BRIDGE" up
+if command -v iptables >/dev/null 2>&1; then
+  iptables -I FORWARD 1 -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT
+  IPTABLES_BRIDGE_RULE_ADDED=1
+fi
 
 ip link add "$VETH_A_HOST" type veth peer name "$VETH_A_NS"
 ip link set "$VETH_A_HOST" master "$BRIDGE"
@@ -121,6 +131,16 @@ ip -n "$NS_B" link set lo up
 ip -n "$NS_B" addr add "$NODE_B_LINK_IP/24" dev "$VETH_B_NS"
 ip -n "$NS_B" link set "$VETH_B_NS" up
 ip -n "$NS_B" route replace default via "$BRIDGE_IP"
+
+for _ in {1..40}; do
+  if ip netns exec "$NS_A" ping -c1 -W1 "$NODE_B_LINK_IP" >/dev/null 2>&1 && \
+     ip netns exec "$NS_B" ping -c1 -W1 "$NODE_A_LINK_IP" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+ip netns exec "$NS_A" ping -c1 -W1 "$NODE_B_LINK_IP" >/dev/null 2>&1 || fail "node A link namespace cannot reach node B link IP"
+ip netns exec "$NS_B" ping -c1 -W1 "$NODE_A_LINK_IP" >/dev/null 2>&1 || fail "node B link namespace cannot reach node A link IP"
 
 (
   cd "$ROOT_DIR/server"
@@ -151,7 +171,8 @@ ip netns exec "$NS_A" env RUST_LOG=info "$DAEMON_BIN" \
   --interface "$TUN_A" \
   --address "$NODE_A_VIP" \
   --netmask 255.255.255.255 \
-  --udp-bind 0.0.0.0:0 \
+  --udp-bind 0.0.0.0:$NODE_A_UDP_PORT \
+  --udp-advertise "$NODE_A_LINK_IP:$NODE_A_UDP_PORT" \
   --diagnostics-bind 127.0.0.1:$DIAG_PORT \
   --heartbeat-interval 5 \
   >"$TMP_DIR/node-a.log" 2>&1 &
@@ -177,7 +198,8 @@ ip netns exec "$NS_B" env RUST_LOG=info "$DAEMON_BIN" \
   --interface "$TUN_B" \
   --address "$NODE_B_VIP" \
   --netmask 255.255.255.255 \
-  --udp-bind 0.0.0.0:0 \
+  --udp-bind 0.0.0.0:$NODE_B_UDP_PORT \
+  --udp-advertise "$NODE_B_LINK_IP:$NODE_B_UDP_PORT" \
   --diagnostics-bind 127.0.0.1:$DIAG_PORT \
   --heartbeat-interval 5 \
   >"$TMP_DIR/node-b.log" 2>&1 &

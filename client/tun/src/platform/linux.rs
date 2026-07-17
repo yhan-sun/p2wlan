@@ -4,9 +4,9 @@
 //! from tokio for non-blocking async I/O.
 
 use std::ffi::CString;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use async_trait::async_trait;
 use nix::fcntl::{open, OFlag};
@@ -235,15 +235,12 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
 
     // Build sockaddr_in for the address
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-    ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    set_ifreq_name(&mut ifr, name);
 
     // Set address
-    ifr.ifr_ifru.ifru_addr.sin_family = libc::AF_INET as u16;
-    ifr.ifr_ifru.ifru_addr.sin_addr.s_addr = u32::from(addr).to_be();
+    ifr.ifr_ifru.ifru_addr = sockaddr_from_ipv4(addr);
     unsafe {
-        if libc::ioctl(sock, libc::SIOCSIFADDR, &ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCSIFADDR as _, &ifr) < 0 {
             let err = io::Error::last_os_error();
             tracing::error!("SIOCSIFADDR failed: {err}");
             return Err(Error::Platform(format!("SIOCSIFADDR failed: {err}")));
@@ -251,10 +248,9 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
     }
 
     // Set netmask
-    ifr.ifr_ifru.ifru_netmask.sin_family = libc::AF_INET as u16;
-    ifr.ifr_ifru.ifru_netmask.sin_addr.s_addr = u32::from(netmask).to_be();
+    ifr.ifr_ifru.ifru_netmask = sockaddr_from_ipv4(netmask);
     unsafe {
-        if libc::ioctl(sock, libc::SIOCSIFNETMASK, &ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &ifr) < 0 {
             let err = io::Error::last_os_error();
             tracing::error!("SIOCSIFNETMASK failed: {err}");
             return Err(Error::Platform(format!("SIOCSIFNETMASK failed: {err}")));
@@ -278,13 +274,11 @@ fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
     });
 
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-    ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    set_ifreq_name(&mut ifr, name);
     ifr.ifr_ifru.ifru_mtu = mtu as i32;
 
     unsafe {
-        if libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCSIFMTU as _, &ifr) < 0 {
             let err = io::Error::last_os_error();
             tracing::error!("SIOCSIFMTU failed: {err}");
             return Err(Error::Platform(format!("SIOCSIFMTU failed: {err}")));
@@ -308,23 +302,22 @@ fn set_interface_up(name: &str) -> Result<()> {
     });
 
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-    ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    set_ifreq_name(&mut ifr, name);
 
     // Get current flags
     unsafe {
-        if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
             let err = io::Error::last_os_error();
             return Err(Error::Platform(format!("SIOCGIFFLAGS failed: {err}")));
         }
     }
 
     // Set IFF_UP | IFF_RUNNING
-    ifr.ifr_ifru.ifru_flags |= libc::IFF_UP | libc::IFF_RUNNING;
+    let flags = unsafe { ifr.ifr_ifru.ifru_flags };
+    ifr.ifr_ifru.ifru_flags = flags | (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
 
     unsafe {
-        if libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) < 0 {
             let err = io::Error::last_os_error();
             tracing::error!("SIOCSIFFLAGS failed: {err}");
             return Err(Error::Platform(format!("SIOCSIFFLAGS failed: {err}")));
@@ -333,6 +326,29 @@ fn set_interface_up(name: &str) -> Result<()> {
 
     tracing::info!("Interface {name} is up");
     Ok(())
+}
+
+fn set_ifreq_name(ifr: &mut libc::ifreq, name: &str) {
+    let name_bytes = name.as_bytes();
+    let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
+    for (dst, src) in ifr.ifr_name[..copy_len]
+        .iter_mut()
+        .zip(name_bytes[..copy_len].iter())
+    {
+        *dst = *src as libc::c_char;
+    }
+}
+
+fn sockaddr_from_ipv4(addr: Ipv4Addr) -> libc::sockaddr {
+    let sockaddr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(addr).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sockaddr) }
 }
 
 /// RAII guard that runs a closure when dropped.
