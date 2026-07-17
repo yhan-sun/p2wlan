@@ -89,6 +89,8 @@ struct PendingHandshakeState {
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Handshake timeout before pending entry is cleared.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+/// Short grace period for UDP/STUN candidate gathering before signaling a WireGuard offer.
+const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
 
 /// The main daemon orchestrator.
 ///
@@ -278,6 +280,9 @@ impl Daemon {
 
         // Initialize TUN using the resolved IP details
         let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
+        if let Some(ref tun) = tun {
+            self.route_manager.set_interface(tun.name().to_string());
+        }
 
         // Install overlay route
         self.route_manager.add_cidr_route(&cidr)?;
@@ -929,7 +934,7 @@ impl Daemon {
             .create_initiation()
             .map_err(|e| DaemonError::Peer(format!("WireGuard initiation failed: {e}")))?;
         let initiation_bytes = initiation.to_bytes();
-        let candidates = self.local_candidates.read().await.clone();
+        let candidates = self.wait_for_local_candidates().await;
 
         let peer_id_clone = peer_info.node_id.clone();
         {
@@ -974,6 +979,28 @@ impl Daemon {
         });
 
         Ok(())
+    }
+
+    async fn wait_for_local_candidates(&self) -> Vec<String> {
+        let mut waited = Duration::ZERO;
+        let step = Duration::from_millis(50);
+        let timeout = Duration::from_millis(CANDIDATE_READY_TIMEOUT_MS);
+
+        loop {
+            let candidates = self.local_candidates.read().await.clone();
+            if !candidates.is_empty() {
+                return candidates;
+            }
+            if waited >= timeout {
+                warn!(
+                    "Proceeding with WireGuard signaling before UDP candidates are ready after {} ms",
+                    timeout.as_millis()
+                );
+                return candidates;
+            }
+            sleep(step).await;
+            waited += step;
+        }
     }
 
     async fn start_hole_punch(&self, node_id: &str) {
@@ -1077,7 +1104,7 @@ impl Daemon {
             .await;
 
         let response_bytes = response.to_bytes();
-        let candidates = self.local_candidates.read().await.clone();
+        let candidates = self.wait_for_local_candidates().await;
         self.control
             .send_peer_answer(from_node_id, &candidates, &response_bytes)
             .await?;
