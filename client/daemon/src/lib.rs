@@ -41,6 +41,7 @@ pub mod port_mapping;
 pub mod relay;
 pub mod transport;
 pub mod udp;
+pub mod route;
 
 // Re-export key types
 pub use config::Config;
@@ -107,6 +108,8 @@ pub struct Daemon {
     dns: Arc<DnsResolver>,
     /// ACL engine.
     acl: Arc<RwLock<AclEngine>>,
+    /// Route table manager.
+    route_manager: Arc<route::RouteManager>,
 }
 
 impl Daemon {
@@ -115,6 +118,7 @@ impl Daemon {
         let (control, control_rx) = ControlClient::new(&config);
         let (transport, encrypted_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
+        let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 
         Self {
             config: Arc::new(config.clone()),
@@ -131,6 +135,7 @@ impl Daemon {
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
+            route_manager,
         }
     }
 
@@ -144,7 +149,83 @@ impl Daemon {
         );
         info!("Control server: {}", self.config.control.server_url);
 
-        let tun = self.init_tun()?;
+        let mut virtual_ip = self.config.network.virtual_ip.clone();
+        let mut netmask = self.config.network.netmask.clone();
+        let mut cidr = self.config.network.cidr.clone();
+        let mut assigned_node_id = self.config.node.node_id.clone();
+        let mut relay_servers = self.config.relay.servers.clone();
+
+        let mut control_event_registered = None;
+
+        if !self.config.network.manual {
+            info!("Running in managed mode. Waiting for control plane registration...");
+            // Wait for Registered event
+            while let Some(event) = self.control_rx.recv().await {
+                match event {
+                    ControlEvent::Registered {
+                        node_id,
+                        virtual_ip: vip,
+                        cidr: dyn_cidr,
+                        relay_servers: rs,
+                    } => {
+                        info!("Control plane registration confirmed. Assigned IP: {}", vip);
+                        
+                        // Validate virtual IP
+                        if vip.parse::<std::net::Ipv4Addr>().is_err() {
+                            return Err(DaemonError::Network(format!(
+                                "Server returned invalid virtual IP: {}", vip
+                            )));
+                        }
+                        
+                        // Validate CIDR
+                        let actual_cidr = dyn_cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
+                        if !is_ip_in_cidr(&vip, &actual_cidr) {
+                            return Err(DaemonError::Network(format!(
+                                "Server returned virtual IP {} that is outside network CIDR {}",
+                                vip, actual_cidr
+                            )));
+                        }
+                        
+                        virtual_ip = vip;
+                        if let Some(derived_mask) = cidr_to_netmask(&actual_cidr) {
+                            netmask = derived_mask;
+                        }
+                        cidr = actual_cidr;
+                        if let Some(nid) = node_id {
+                            assigned_node_id = nid;
+                        }
+                        if !rs.is_empty() {
+                            relay_servers = rs;
+                        }
+                        
+                        control_event_registered = Some(ControlEvent::Registered {
+                            node_id: Some(assigned_node_id.clone()),
+                            virtual_ip: virtual_ip.clone(),
+                            cidr: Some(cidr.clone()),
+                            relay_servers: relay_servers.clone(),
+                        });
+                        break;
+                    }
+                    ControlEvent::ServerError { code, message } => {
+                        return Err(DaemonError::ControlPlane(format!(
+                            "Server returned error code {code}: {message}"
+                        )));
+                    }
+                    _ => {
+                        warn!("Received event before registration, ignoring: {:?}", event);
+                    }
+                }
+            }
+        } else {
+            info!("Running in manual/offline mode. Using local configurations.");
+        }
+
+        // Initialize TUN using the resolved IP details
+        let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
+
+        // Install overlay route
+        self.route_manager.add_cidr_route(&cidr)?;
+
         let Some(encrypted_rx) = self.encrypted_rx.take() else {
             return Err(DaemonError::Network(
                 "encrypted packet receiver already attached".to_string(),
@@ -307,15 +388,68 @@ impl Daemon {
         // Relay registration must use the node ID assigned by the control plane.
         let mut relay_started = false;
 
+        // If we had a cached control_event_registered, process it first
+        if let Some(event) = control_event_registered {
+            if let ControlEvent::Registered { ref node_id, ref relay_servers, .. } = event {
+                relay_started = true;
+                let relay_node_id = node_id.clone().unwrap_or_else(|| self.config.node.node_id.clone());
+                let relay_servers = if relay_servers.is_empty() {
+                    self.config.relay.servers.clone()
+                } else {
+                    relay_servers.clone()
+                };
+                let preferred_regions = self.config.relay.preferred_regions.clone();
+                let selection_timeout =
+                    Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
+                let relay_transport = self.relay_transport.clone();
+                let relay_selection = self.relay_selection.clone();
+                let relay_peers = self.peers.clone();
+                let relay_inbound_tx = network_inbound_tx.clone();
+
+                tokio::spawn(async move {
+                    let RelaySelectionOutcome {
+                        transport,
+                        relay_rx,
+                        diagnostics,
+                    } = select_relay(
+                        &relay_servers,
+                        &preferred_regions,
+                        selection_timeout,
+                        &relay_node_id,
+                        relay_peers,
+                    )
+                    .await;
+                    *relay_selection.write().await = diagnostics;
+
+                    if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                        info!(
+                            "Selected relay region {} at {} ({} ms connect latency)",
+                            relay.region(),
+                            relay.endpoint(),
+                            relay.connect_latency_ms()
+                        );
+                        *relay_transport.write().await = Some(relay.clone());
+                        if let Err(err) =
+                            relay.run_inbound(relay_rx, relay_inbound_tx).await
+                        {
+                            warn!("Relay inbound transport stopped: {err}");
+                        }
+                    } else {
+                        warn!("No configured relay candidate was reachable");
+                    }
+                });
+            }
+        }
+
         // Process control events
         while let Some(event) = self.control_rx.recv().await {
             match event {
                 ControlEvent::Registered {
                     node_id,
-                    virtual_ip,
+                    virtual_ip: _,
+                    cidr: _,
                     relay_servers,
                 } => {
-                    info!("Registered with control server! Virtual IP: {}", virtual_ip);
                     if !relay_started {
                         relay_started = true;
                         let relay_node_id =
@@ -382,7 +516,6 @@ impl Daemon {
                         );
                     }
 
-                    // Register DNS entry
                     if self.dns.is_enabled() {
                         self.dns
                             .register(
@@ -467,7 +600,6 @@ impl Daemon {
 
                 ControlEvent::Disconnected => {
                     warn!("Disconnected from control server");
-                    // In a full implementation, we would retry with backoff
                     break;
                 }
             }
@@ -477,7 +609,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn init_tun(&self) -> Result<Option<TunDevice>> {
+    fn init_tun_with(&self, vip: &str, netmask: &str, mtu: u32) -> Result<Option<TunDevice>> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
             warn!("TUN creation disabled via P2WLAN_DISABLE_TUN=1");
             return Ok(None);
@@ -485,9 +617,9 @@ impl Daemon {
 
         let config = InterfaceConfig::new(
             &self.config.network.interface,
-            &self.config.network.virtual_ip,
-            &self.config.network.netmask,
-            self.config.network.mtu,
+            vip,
+            netmask,
+            mtu,
         )
         .map_err(|e| DaemonError::Network(format!("invalid TUN config: {e}")))?;
 
@@ -1123,4 +1255,45 @@ mod tests {
         let list = daemon.port_mappings().list().await;
         assert_eq!(list.len(), 1);
     }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        info!("Daemon cleanup: removing routes...");
+        self.route_manager.cleanup();
+    }
+}
+
+fn cidr_to_netmask(cidr: &str) -> Option<String> {
+    let (_, prefix_str) = cidr.split_once('/')?;
+    let prefix: u32 = prefix_str.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask_u32 = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
+    let mask = std::net::Ipv4Addr::from(mask_u32);
+    Some(mask.to_string())
+}
+
+fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
+    let Some((net_str, prefix_str)) = cidr.split_once('/') else { return false; };
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false; };
+    let Ok(net_ip) = net_str.parse::<std::net::Ipv4Addr>() else { return false; };
+    let Ok(prefix) = prefix_str.parse::<u32>() else { return false; };
+    if prefix > 32 { return false; }
+    
+    let ip_u32 = u32::from(ip);
+    let net_u32 = u32::from(net_ip);
+    
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
+    
+    (ip_u32 & mask) == (net_u32 & mask)
 }

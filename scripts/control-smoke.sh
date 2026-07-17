@@ -22,6 +22,7 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
   fi
   pkill -f "$TMP_DIR" 2>/dev/null || true
+  rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 

@@ -73,6 +73,9 @@ fn default_platform() -> String {
 pub struct NetworkConfig {
     /// Network ID to join.
     pub network_id: String,
+    /// Whether to run in manual/offline mode.
+    #[serde(default)]
+    pub manual: bool,
     /// Assigned virtual IPv4 address.
     pub virtual_ip: String,
     /// Network CIDR (e.g. "10.20.0.0/16").
@@ -350,6 +353,7 @@ impl Config {
             },
             network: NetworkConfig {
                 network_id: network_id.to_string(),
+                manual: false,
                 virtual_ip: "10.20.0.1".to_string(),
                 cidr: default_cidr(),
                 ipv6_cidr: None,

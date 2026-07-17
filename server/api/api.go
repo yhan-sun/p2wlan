@@ -100,10 +100,17 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var cidr string
+	err = s.db.QueryRow(`SELECT cidr FROM networks WHERE id = ?`, req.NetworkID).Scan(&cidr)
+	if err != nil {
+		cidr = "10.20.0.0/16"
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
 		"node_id":    device.ID,
 		"virtual_ip": device.VirtualIP,
+		"cidr":       cidr,
 	})
 }
 

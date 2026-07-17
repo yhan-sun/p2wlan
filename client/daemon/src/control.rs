@@ -166,6 +166,7 @@ pub enum ControlEvent {
         /// Server-assigned node ID when registration used the REST control plane.
         node_id: Option<String>,
         virtual_ip: String,
+        cidr: Option<String>,
         relay_servers: Vec<String>,
     },
     /// A new peer has joined.
@@ -218,6 +219,7 @@ struct RegisterDeviceResponse {
     success: bool,
     node_id: Option<String>,
     virtual_ip: Option<String>,
+    cidr: Option<String>,
     error: Option<String>,
 }
 
@@ -453,6 +455,7 @@ impl ControlClient {
                 let _ = self.event_tx.send(ControlEvent::Registered {
                     node_id: None,
                     virtual_ip,
+                    cidr: Some("10.20.0.0/16".to_string()),
                     relay_servers,
                 });
             }
@@ -570,7 +573,7 @@ async fn run_control_loop(
     info!("Connecting to control plane at {base_url}");
 
     let self_node_id = match register_device(&http, &base_url, &token, &config).await {
-        Ok((node_id, virtual_ip)) => {
+        Ok((node_id, virtual_ip, cidr)) => {
             {
                 let mut state = state.write().await;
                 state.registered = true;
@@ -580,6 +583,7 @@ async fn run_control_loop(
             let _ = event_tx.send(ControlEvent::Registered {
                 node_id: Some(node_id.clone()),
                 virtual_ip,
+                cidr: Some(cidr),
                 relay_servers: config.relay.servers.clone(),
             });
             node_id
@@ -698,7 +702,7 @@ async fn register_device(
     base_url: &str,
     token: &str,
     config: &Config,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .bearer_auth(token)
@@ -737,8 +741,11 @@ async fn register_device(
     let virtual_ip = body
         .virtual_ip
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
+    let cidr = body
+        .cidr
+        .unwrap_or_else(|| "10.20.0.0/16".to_string());
 
-    Ok((node_id, virtual_ip))
+    Ok((node_id, virtual_ip, cidr))
 }
 
 async fn update_endpoint(
@@ -1090,6 +1097,7 @@ mod tests {
         if let ControlEvent::Registered {
             node_id,
             virtual_ip,
+            cidr: _,
             relay_servers,
         } = event
         {

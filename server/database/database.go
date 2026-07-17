@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -17,9 +18,15 @@ type DB struct {
 
 // New opens (or creates) the SQLite database and runs migrations.
 func New(path string) (*DB, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
 	if err := migrate(db); err != nil {
@@ -88,9 +95,24 @@ func migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_devices_network ON devices(network_id);
 	CREATE INDEX IF NOT EXISTS idx_tunnels_device ON tunnels(device_id);
 	CREATE INDEX IF NOT EXISTS idx_signals_to_node ON signals(to_node_id, created_at);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_net_ip ON devices(network_id, virtual_ip);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_net_pubkey ON devices(network_id, public_key);
 	`
 
-	_, err := db.Exec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Insert default system user and network to satisfy foreign keys
+	initData := `
+	INSERT OR IGNORE INTO users (id, email, password_hash, created_at)
+	VALUES ('system', 'system@p2wlan.local', '', 0);
+
+	INSERT OR IGNORE INTO networks (id, name, cidr, owner_id, created_at)
+	VALUES ('default', 'Default Network', '10.20.0.0/16', 'system', 0);
+	`
+	_, err := db.Exec(initData)
 	return err
 }
 
@@ -149,15 +171,43 @@ type Device struct {
 
 // CreateDevice inserts a new device and assigns a virtual IP.
 func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform string) (*Device, error) {
-	if existing, err := db.GetDeviceByPublicKey(networkID, publicKey); err == nil {
-		_, _ = db.Exec(`UPDATE devices SET user_id = ?, device_name = ?, platform = ?, last_seen = ?, online = 1 WHERE id = ?`,
-			userID, deviceName, platform, time.Now().Unix(), existing.ID)
-		existing.UserID = userID
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var existing Device
+	var online int
+	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, online, created_at
+		FROM devices WHERE public_key = ? LIMIT 1`, publicKey).
+		Scan(&existing.ID, &existing.UserID, &existing.NetworkID, &existing.PublicKey, &existing.DeviceName, &existing.Platform,
+			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existing.LastSeen, &online, &existing.CreatedAt)
+	if err == nil {
+		if existing.UserID != userID {
+			return nil, fmt.Errorf("public key is already registered by another user")
+		}
+		if existing.NetworkID != networkID {
+			return nil, fmt.Errorf("public key is already registered in another network")
+		}
+
+		now := time.Now().Unix()
+		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, last_seen = ?, online = 1 WHERE id = ?`,
+			deviceName, platform, now, existing.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+
 		existing.DeviceName = deviceName
 		existing.Platform = platform
+		existing.LastSeen = now
 		existing.Online = true
-		existing.LastSeen = time.Now().Unix()
-		return existing, nil
+		return &existing, nil
+	} else if err != sql.ErrNoRows {
+		return nil, err
 	}
 
 	idSuffix := publicKey
@@ -167,16 +217,19 @@ func (db *DB) CreateDevice(userID, networkID, publicKey, deviceName, platform st
 	id := fmt.Sprintf("node-%s", idSuffix)
 	now := time.Now().Unix()
 
-	// Assign virtual IP (simple: find next available in 10.20.x.x range)
-	virtualIP, err := db.assignVirtualIP(networkID)
+	virtualIP, err := db.assignVirtualIP(tx, networkID)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = db.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, last_seen, online, created_at)
+	_, err = tx.Exec(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, last_seen, online, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
 		id, userID, networkID, publicKey, deviceName, platform, virtualIP, now, now)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -202,15 +255,66 @@ func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error)
 	return &d, nil
 }
 
-// assignVirtualIP finds the next available virtual IP in a network.
-func (db *DB) assignVirtualIP(networkID string) (string, error) {
-	// Simple: count existing devices, assign 10.20.0.(N+2)
-	var count int
-	err := db.QueryRow(`SELECT COUNT(*) FROM devices WHERE network_id = ?`, networkID).Scan(&count)
-	if err != nil {
-		return "", err
+func nextIP(ip net.IP) net.IP {
+	next := make(net.IP, len(ip))
+	copy(next, ip)
+	for i := len(next) - 1; i >= 0; i-- {
+		next[i]++
+		if next[i] > 0 {
+			break
+		}
 	}
-	return fmt.Sprintf("10.20.0.%d", count+2), nil
+	return next
+}
+
+// assignVirtualIP finds the next available virtual IP in a network.
+func (db *DB) assignVirtualIP(tx *sql.Tx, networkID string) (string, error) {
+	var cidr string
+	err := tx.QueryRow(`SELECT cidr FROM networks WHERE id = ?`, networkID).Scan(&cidr)
+	if err != nil {
+		return "", fmt.Errorf("query network cidr: %w", err)
+	}
+
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", fmt.Errorf("parse network cidr '%s': %w", cidr, err)
+	}
+
+	rows, err := tx.Query(`SELECT virtual_ip FROM devices WHERE network_id = ?`, networkID)
+	if err != nil {
+		return "", fmt.Errorf("query allocated IPs: %w", err)
+	}
+	defer rows.Close()
+
+	allocated := make(map[string]bool)
+	for rows.Next() {
+		var vip string
+		if err := rows.Scan(&vip); err != nil {
+			return "", err
+		}
+		allocated[vip] = true
+	}
+
+	curr := nextIP(ipnet.IP) // Network Address (skip)
+	curr = nextIP(curr)      // Start from .2
+
+	broadcast := make(net.IP, len(ipnet.IP))
+	for i := range broadcast {
+		broadcast[i] = ipnet.IP[i] | ^ipnet.Mask[i]
+	}
+
+	for ipnet.Contains(curr) {
+		if curr.Equal(broadcast) {
+			break
+		}
+		ipStr := curr.String()
+		if !allocated[ipStr] {
+			return ipStr, nil
+		}
+		curr = nextIP(curr)
+	}
+
+	return "", fmt.Errorf("IP address pool exhausted for network %s", networkID)
 }
 
 // ListDevicesByNetwork returns all devices in a network.

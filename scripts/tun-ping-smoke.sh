@@ -169,8 +169,6 @@ ip netns exec "$NS_A" env RUST_LOG=info "$DAEMON_BIN" \
   --token "$TOKEN" \
   --device-name node-a \
   --interface "$TUN_A" \
-  --address "$NODE_A_VIP" \
-  --netmask 255.255.255.255 \
   --udp-bind 0.0.0.0:$NODE_A_UDP_PORT \
   --udp-advertise "$NODE_A_LINK_IP:$NODE_A_UDP_PORT" \
   --diagnostics-bind 127.0.0.1:$DIAG_PORT \
@@ -179,15 +177,15 @@ ip netns exec "$NS_A" env RUST_LOG=info "$DAEMON_BIN" \
 NODE_A_PID=$!
 
 for _ in {1..80}; do
-  if grep -q "Registered with control server! Virtual IP: $NODE_A_VIP" "$TMP_DIR/node-a.log" 2>/dev/null && \
+  if grep -q "Registered with control server! Virtual IP: " "$TMP_DIR/node-a.log" 2>/dev/null && \
      ip -n "$NS_A" link show "$TUN_A" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
 ip -n "$NS_A" link show "$TUN_A" >/dev/null 2>&1 || fail "node A TUN interface was not created"
-grep -q "Registered with control server! Virtual IP: $NODE_A_VIP" "$TMP_DIR/node-a.log" 2>/dev/null || fail "node A did not receive expected virtual IP $NODE_A_VIP"
-ip -n "$NS_A" route replace "$NODE_B_VIP/32" dev "$TUN_A" src "$NODE_A_VIP"
+NODE_A_VIP=$(grep -oE "Registered with control server! Virtual IP: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$TMP_DIR/node-a.log" | awk '{print $NF}')
+if [[ -z "$NODE_A_VIP" ]]; then fail "failed to extract node A VIP"; fi
 
 ip netns exec "$NS_B" env RUST_LOG=info "$DAEMON_BIN" \
   --config "$TMP_DIR/node-b.json" \
@@ -196,8 +194,6 @@ ip netns exec "$NS_B" env RUST_LOG=info "$DAEMON_BIN" \
   --token "$TOKEN" \
   --device-name node-b \
   --interface "$TUN_B" \
-  --address "$NODE_B_VIP" \
-  --netmask 255.255.255.255 \
   --udp-bind 0.0.0.0:$NODE_B_UDP_PORT \
   --udp-advertise "$NODE_B_LINK_IP:$NODE_B_UDP_PORT" \
   --diagnostics-bind 127.0.0.1:$DIAG_PORT \
@@ -206,15 +202,15 @@ ip netns exec "$NS_B" env RUST_LOG=info "$DAEMON_BIN" \
 NODE_B_PID=$!
 
 for _ in {1..120}; do
-  if grep -q "Registered with control server! Virtual IP: $NODE_B_VIP" "$TMP_DIR/node-b.log" 2>/dev/null && \
+  if grep -q "Registered with control server! Virtual IP: " "$TMP_DIR/node-b.log" 2>/dev/null && \
      ip -n "$NS_B" link show "$TUN_B" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
 ip -n "$NS_B" link show "$TUN_B" >/dev/null 2>&1 || fail "node B TUN interface was not created"
-grep -q "Registered with control server! Virtual IP: $NODE_B_VIP" "$TMP_DIR/node-b.log" 2>/dev/null || fail "node B did not receive expected virtual IP $NODE_B_VIP"
-ip -n "$NS_B" route replace "$NODE_A_VIP/32" dev "$TUN_B" src "$NODE_B_VIP"
+NODE_B_VIP=$(grep -oE "Registered with control server! Virtual IP: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$TMP_DIR/node-b.log" | awk '{print $NF}')
+if [[ -z "$NODE_B_VIP" ]]; then fail "failed to extract node B VIP"; fi
 
 for _ in {1..120}; do
   if grep -q 'Installed WireGuard .* session for node-' "$TMP_DIR/node-a.log" 2>/dev/null && \
@@ -246,5 +242,18 @@ ip netns exec "$NS_A" "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1
 ip netns exec "$NS_B" "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$DIAG_PORT/status" >"$TMP_DIR/status-b.json" 2>"$TMP_DIR/status-b.log" || fail "node B diagnostics query failed"
 grep -q '"active_path": "direct"' "$TMP_DIR/status-a.json" || fail "node A did not report direct active path"
 grep -q '"active_path": "direct"' "$TMP_DIR/status-b.json" || fail "node B did not report direct active path"
+
+echo "[tun-smoke] Stopping daemon on Node A to verify route cleanup..."
+kill "$NODE_A_PID"
+for _ in {1..40}; do
+  if ! ip netns exec "$NS_A" ip route show | grep -q "$TUN_A"; then
+    break
+  fi
+  sleep 0.25
+done
+if ip netns exec "$NS_A" ip route show | grep -q "$TUN_A"; then
+  fail "Route was not cleaned up on daemon exit"
+fi
+echo "[tun-smoke] PASS: Route cleaned up successfully on exit"
 
 echo "[tun-smoke] PASS: two Linux network namespaces pinged over real TUN via WireGuard/direct UDP"
