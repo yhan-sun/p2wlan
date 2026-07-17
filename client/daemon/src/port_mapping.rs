@@ -110,6 +110,7 @@ impl PortMapping {
 // ============================================================
 
 /// Manages all port mappings.
+#[derive(Default)]
 pub struct PortMappingManager {
     /// Active mappings by tunnel ID.
     mappings: Arc<RwLock<HashMap<String, PortMapping>>>,

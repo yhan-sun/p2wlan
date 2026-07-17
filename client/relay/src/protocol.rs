@@ -112,7 +112,7 @@ impl Frame {
             )));
         }
 
-        if &data[..4] != MAGIC {
+        if data[..4] != MAGIC {
             return Err(RelayError::Protocol(format!(
                 "invalid magic: {:02X?} (expected {:02X?})",
                 &data[..4],
@@ -296,7 +296,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     reader.read_exact(&mut header).await?;
 
-    if &header[..4] != MAGIC {
+    if header[..4] != MAGIC {
         return Err(RelayError::Protocol(format!(
             "invalid magic: {:02X?}",
             &header[..4]

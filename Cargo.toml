@@ -19,6 +19,7 @@ repository = "https://github.com/yhan-sun/p2wlan"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+clap = { version = "4.4", features = ["derive"] }
 
 # Serialization
 bytes = "1"

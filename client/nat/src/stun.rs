@@ -403,9 +403,7 @@ impl StunMessage {
             attr_buf.extend_from_slice(&value);
             // Pad to 4-byte boundary
             let padding = (4 - (value.len() % 4)) % 4;
-            for _ in 0..padding {
-                attr_buf.push(0);
-            }
+            attr_buf.resize(attr_buf.len() + padding, 0);
         }
 
         // Build header

@@ -12,6 +12,7 @@ p2pnet-wireguard = { path = "../wireguard" }
 p2pnet-nat = { path = "../nat" }
 p2pnet-relay = { path = "../relay" }
 tokio = { workspace = true }
+clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

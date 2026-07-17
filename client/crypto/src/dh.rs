@@ -33,7 +33,7 @@ pub struct DhKeyPair {
 impl DhKeyPair {
     /// Generate a new random X25519 key pair.
     pub fn generate() -> Self {
-        let secret = StaticSecret::random_from_rng(&mut OsRng);
+        let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }

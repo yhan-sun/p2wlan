@@ -185,10 +185,10 @@ impl PeerConnection {
                 self.node_id, self.state, new_state
             );
         }
-        if new_state == ConnectionState::Direct || new_state == ConnectionState::Relay {
-            if self.connected_at.is_none() {
-                self.connected_at = Some(Instant::now());
-            }
+        if (new_state == ConnectionState::Direct || new_state == ConnectionState::Relay)
+            && self.connected_at.is_none()
+        {
+            self.connected_at = Some(Instant::now());
         }
         self.state = new_state;
     }

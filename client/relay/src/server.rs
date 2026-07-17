@@ -128,7 +128,7 @@ async fn handle_client(stream: TcpStream, peer_table: PeerTable) -> Result<()> {
         }
 
         // Parse header
-        if &buf[..4] != MAGIC {
+        if buf[..4] != MAGIC {
             warn!("Invalid magic from {:?}", client_addr);
             break;
         }
