@@ -27,7 +27,7 @@ pub struct RealCommandRunner;
 impl RouteCommandRunner for RealCommandRunner {
     fn route_show(&self, cidr: &str) -> Result<String, crate::DaemonError> {
         let output = Command::new("ip")
-            .args(&["route", "show", "to", cidr])
+            .args(["route", "show", "to", cidr])
             .output()
             .map_err(|e| {
                 crate::DaemonError::Network(format!("failed to run ip route show: {e}"))
@@ -37,7 +37,7 @@ impl RouteCommandRunner for RealCommandRunner {
 
     fn route_add(&self, cidr: &str, interface: &str) -> Result<bool, crate::DaemonError> {
         let status = Command::new("ip")
-            .args(&["route", "add", cidr, "dev", interface])
+            .args(["route", "add", cidr, "dev", interface])
             .status()
             .map_err(|e| crate::DaemonError::Network(format!("failed to run ip route add: {e}")))?;
         Ok(status.success())
@@ -45,7 +45,7 @@ impl RouteCommandRunner for RealCommandRunner {
 
     fn route_del(&self, cidr: &str, interface: &str) {
         let _ = Command::new("ip")
-            .args(&["route", "del", cidr, "dev", interface])
+            .args(["route", "del", cidr, "dev", interface])
             .status();
     }
 }

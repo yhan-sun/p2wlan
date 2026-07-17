@@ -93,7 +93,10 @@ fn find_wintun_dll() -> Option<PathBuf> {
 
 pub fn check_permission_status() -> PermissionStatus {
     let mut checks = Vec::new();
+    #[cfg(target_os = "macos")]
     let mut details: Vec<String> = Vec::new();
+    #[cfg(not(target_os = "macos"))]
+    let details: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
