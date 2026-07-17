@@ -268,6 +268,14 @@ impl Daemon {
             info!("Running in manual/offline mode. Using local configurations.");
         }
 
+        let mut resolved_config = (*self.config).clone();
+        resolved_config.network.virtual_ip = virtual_ip.clone();
+        resolved_config.network.netmask = netmask.clone();
+        resolved_config.network.cidr = cidr.clone();
+        resolved_config.node.node_id = assigned_node_id.clone();
+        resolved_config.relay.servers = relay_servers.clone();
+        self.config = Arc::new(resolved_config);
+
         // Initialize TUN using the resolved IP details
         let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
 
