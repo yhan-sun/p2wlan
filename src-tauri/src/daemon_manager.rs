@@ -229,6 +229,7 @@ impl DaemonManager {
         Self::default_log_dir().join("p2pnet-daemon.pid")
     }
 
+    #[allow(dead_code)]
     fn log_tail(path: &Path, max_lines: usize) -> Option<String> {
         let raw = std::fs::read_to_string(path).ok()?;
         let lines = raw
@@ -242,6 +243,7 @@ impl DaemonManager {
         Some(lines[start..].join("\n"))
     }
 
+    #[allow(dead_code)]
     fn timeout_message_with_log(prefix: &str, log_path: &Path) -> String {
         match Self::log_tail(log_path, 30) {
             Some(tail) => format!(
