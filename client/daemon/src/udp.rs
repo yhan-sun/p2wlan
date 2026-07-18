@@ -244,16 +244,27 @@ impl UdpTransport {
                     PunchPacketKind::Punch => {
                         let ack = build_punch_ack(packet.nonce);
                         match self.socket.send_to(&ack, source).await {
-                            Ok(_) => debug!("Received UDP punch from {source}; sent ACK"),
+                            Ok(_) => {
+                                debug!("Received UDP punch from {source}; sent ACK");
+                                if let Some(peer_id) =
+                                    self.peers.learn_endpoint_from_addr(source).await
+                                {
+                                    self.peers
+                                        .record_direct_probe_success(&peer_id, source)
+                                        .await;
+                                    debug!(
+                                        "Recorded direct UDP probe success from peer {peer_id} at {source}"
+                                    );
+                                }
+                            }
                             Err(err) => warn!("Failed to ACK UDP punch from {source}: {err}"),
-                        }
-
-                        if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
-                            debug!("Selected direct UDP endpoint {source} for peer {peer_id}");
                         }
                     }
                     PunchPacketKind::Ack => {
-                        if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
+                        if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
+                            self.peers
+                                .record_direct_probe_success(&peer_id, source)
+                                .await;
                             debug!("Received UDP punch ACK from peer {peer_id} at {source}");
                         } else {
                             trace!("Received UDP punch ACK from unknown candidate {source}");
@@ -263,8 +274,8 @@ impl UdpTransport {
                 continue;
             }
 
-            if let Some(peer_id) = self.peers.select_endpoint_from_addr(source).await {
-                debug!("Confirmed direct UDP data path {source} for peer {peer_id}");
+            if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
+                trace!("Learned encrypted UDP source {source} for peer {peer_id}");
             }
 
             inbound_tx
@@ -552,7 +563,8 @@ mod tests {
 
         let conn = peers.get_connection("peer-b").await.unwrap();
         assert_eq!(conn.endpoint, Some(sender_addr));
-        assert_eq!(conn.state.to_string(), "direct");
+        assert_eq!(conn.state.to_string(), "hole_punching");
+        assert!(conn.direct_health.last_success_at.is_some());
 
         worker.abort();
     }
@@ -573,7 +585,12 @@ mod tests {
         let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(4);
         let wireguard_worker = {
             let wireguard = wireguard.clone();
-            tokio::spawn(async move { wireguard.run_inbound(udp_inbound_rx, inbound_tx).await })
+            let peers = peers.clone();
+            tokio::spawn(async move {
+                wireguard
+                    .run_inbound_with_peers(udp_inbound_rx, inbound_tx, Some(peers))
+                    .await
+            })
         };
 
         let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -601,6 +618,8 @@ mod tests {
 
         let conn = peers.get_connection("peer-a").await.unwrap();
         assert_eq!(conn.bytes_received, written.len() as u64);
+        assert_eq!(conn.state.to_string(), "direct");
+        assert_eq!(conn.endpoint, Some(sender.local_addr().unwrap()));
 
         udp_worker.abort();
         wireguard_worker.abort();

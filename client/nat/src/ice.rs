@@ -18,9 +18,10 @@
 //! | ServerReflexive | 100 |
 //! | Relay | 0 |
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use if_addrs::IfAddr;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
@@ -77,43 +78,108 @@ pub fn compute_priority(candidate_type: CandidateType) -> u32 {
 
 /// Gather local network interface addresses.
 ///
-/// Uses a practical approach: connect a UDP socket to a well-known address
-/// to determine the primary outgoing interface. Also includes loopback.
+/// Enumerates interface addresses first, then supplements them with UDP route
+/// probes. Interface enumeration is important on hosts with VPN/utun routes
+/// that hijack every public route probe, while the actual LAN address remains
+/// available on a physical interface.
 pub fn gather_local_addresses() -> Vec<IpAddr> {
     let mut addresses = Vec::new();
 
-    // Try connecting to a public address to get the primary interface address
-    // (UDP connect doesn't send packets, just sets the routing)
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:53").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() && !ip.is_unspecified() {
-                    addresses.push(ip);
-                }
-            }
+    for (name, ip) in interface_addresses() {
+        if is_candidate_interface_name(&name) && is_candidate_host_ip(ip) {
+            push_unique(&mut addresses, ip);
         }
     }
 
-    // Try IPv6
-    if let Ok(socket) = std::net::UdpSocket::bind("[::]:0") {
-        if socket.connect("[2001:4860:4860::8888]:53").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() && !ip.is_unspecified() && !addresses.contains(&ip) {
-                    addresses.push(ip);
-                }
-            }
+    for probe in ["1.1.1.1:53", "8.8.8.8:53", "223.5.5.5:53"] {
+        if let Some(ip) = route_probe_source_ip("0.0.0.0:0", probe) {
+            push_unique(&mut addresses, ip);
+        }
+    }
+
+    for probe in ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"] {
+        if let Some(ip) = route_probe_source_ip("[::]:0", probe) {
+            push_unique(&mut addresses, ip);
         }
     }
 
     // Always include loopback
     let loopback_v4 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-    if !addresses.contains(&loopback_v4) {
-        addresses.push(loopback_v4);
-    }
+    push_unique(&mut addresses, loopback_v4);
 
     addresses
+}
+
+fn interface_addresses() -> Vec<(String, IpAddr)> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .map(|iface| {
+                let ip = match iface.addr {
+                    IfAddr::V4(v4) => IpAddr::V4(v4.ip),
+                    IfAddr::V6(v6) => IpAddr::V6(v6.ip),
+                };
+                (iface.name, ip)
+            })
+            .collect(),
+        Err(err) => {
+            debug!("failed to enumerate local interfaces: {}", err);
+            Vec::new()
+        }
+    }
+}
+
+fn route_probe_source_ip(bind: &str, probe: &str) -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if is_candidate_host_ip(ip) {
+        Some(ip)
+    } else {
+        None
+    }
+}
+
+fn push_unique(addresses: &mut Vec<IpAddr>, ip: IpAddr) {
+    if !addresses.contains(&ip) {
+        addresses.push(ip);
+    }
+}
+
+fn is_candidate_host_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_candidate_ipv4(ip),
+        IpAddr::V6(ip) => is_candidate_ipv6(ip),
+    }
+}
+
+fn is_candidate_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !ip.is_link_local()
+}
+
+fn is_candidate_ipv6(ip: Ipv6Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !is_ipv6_unicast_link_local(ip)
+}
+
+fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_candidate_interface_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ![
+        "lo", "utun", "tun", "tap", "wg", "p2pnet", "p2wlan", "wintun", "docker", "br-", "veth",
+        "llw", "awdl",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Gather ICE candidates for the given socket.
@@ -222,6 +288,59 @@ mod tests {
 
         // Should always include loopback
         assert!(addrs.contains(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+
+        let unique: std::collections::HashSet<_> = addrs.iter().copied().collect();
+        assert_eq!(unique.len(), addrs.len());
+    }
+
+    #[test]
+    fn test_candidate_host_ip_filter() {
+        assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
+            224, 0, 0, 1
+        ))));
+        assert!(!is_candidate_host_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_candidate_host_ip(IpAddr::V6(
+            "fe80::1".parse().unwrap()
+        )));
+        assert!(is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 2, 4
+        ))));
+    }
+
+    #[test]
+    fn test_candidate_interface_name_filter() {
+        assert!(is_candidate_interface_name("en0"));
+        assert!(is_candidate_interface_name("Ethernet"));
+        assert!(is_candidate_interface_name("Wi-Fi"));
+
+        for name in [
+            "lo0", "utun6", "tun0", "tap0", "wg0", "p2pnet0", "p2wlan", "wintun", "docker0",
+            "br-123", "vethabc", "llw0", "awdl0",
+        ] {
+            assert!(!is_candidate_interface_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_push_unique_keeps_first_address() {
+        let mut addrs = Vec::new();
+        push_unique(&mut addrs, IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4)));
+        push_unique(&mut addrs, IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4)));
+        push_unique(&mut addrs, IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)));
+        assert_eq!(
+            addrs,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4)),
+                IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            ]
+        );
     }
 
     #[tokio::test]

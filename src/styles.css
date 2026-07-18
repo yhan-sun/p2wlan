@@ -1031,6 +1031,73 @@ select.form-input option {
   color: var(--text-muted);
 }
 
+.choice-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.choice-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: flex-start;
+  padding: 0.7rem;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.choice-row:hover {
+  border-color: color-mix(in oklch, var(--accent) 34%, var(--border-color));
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.choice-row.active {
+  border-color: color-mix(in oklch, var(--accent) 58%, var(--border-color));
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+}
+
+.choice-row input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.choice-dot {
+  width: 0.85rem;
+  height: 0.85rem;
+  margin-top: 0.18rem;
+  border-radius: 999px;
+  border: 1px solid var(--text-muted);
+  box-shadow: inset 0 0 0 3px var(--bg-panel);
+  background: transparent;
+}
+
+.choice-row.active .choice-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.choice-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.choice-copy .title {
+  color: var(--text-primary);
+  font-weight: 650;
+}
+
+.choice-copy .desc {
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
 .error-list {
   padding-left: 1.25rem;
 }

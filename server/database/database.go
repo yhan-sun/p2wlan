@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // DB wraps the sql.DB connection.
@@ -23,12 +23,20 @@ type DB struct {
 
 // New opens (or creates) the SQLite database and runs migrations.
 func New(path string) (*DB, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 
+	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable wal mode: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy timeout: %w", err)
+	}
 	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
@@ -696,6 +704,8 @@ type Signal struct {
 	CreatedAt  int64    `json:"created_at"`
 }
 
+const signalTTLSeconds int64 = 120
+
 // CreateSignal queues a signaling message for a target node.
 func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string, handshake string) (*Signal, error) {
 	if candidates == nil {
@@ -709,9 +719,24 @@ func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string
 
 	id := fmt.Sprintf("signal-%d", time.Now().UnixNano())
 	now := time.Now().Unix()
-	_, err = db.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, handshake, created_at)
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err = tx.Exec(`DELETE FROM signals WHERE created_at < ?`, now-signalTTLSeconds); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`DELETE FROM signals WHERE from_node_id = ? AND to_node_id = ? AND type = ?`, fromNodeID, toNodeID, typ); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, handshake, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), handshake, now)
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -729,8 +754,13 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	}
 	defer tx.Rollback()
 
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`DELETE FROM signals WHERE created_at < ?`, now-signalTTLSeconds); err != nil {
+		return nil, err
+	}
+
 	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, handshake, created_at
-		FROM signals WHERE to_node_id = ? ORDER BY created_at ASC`, toNodeID)
+		FROM signals WHERE to_node_id = ? AND created_at >= ? ORDER BY created_at ASC`, toNodeID, now-signalTTLSeconds)
 	if err != nil {
 		return nil, err
 	}

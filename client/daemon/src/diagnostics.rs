@@ -22,6 +22,7 @@ use crate::udp::UdpTransport;
 /// Runtime diagnostics snapshot returned by the local endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
+    pub process_id: u32,
     pub node_id: String,
     pub virtual_ip: String,
     pub network_id: String,
@@ -44,9 +45,11 @@ pub struct DiagnosticsContext {
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     health: Arc<HealthState>,
     task_manager: Arc<TaskManager>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl DiagnosticsContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<Config>,
         peers: Arc<PeerManager>,
@@ -55,6 +58,7 @@ impl DiagnosticsContext {
         relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
         health: Arc<HealthState>,
         task_manager: Arc<TaskManager>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
     ) -> Self {
         Self {
             config,
@@ -64,6 +68,7 @@ impl DiagnosticsContext {
             relay_selection,
             health,
             task_manager,
+            shutdown_tx,
         }
     }
 }
@@ -125,24 +130,28 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .map_err(|e| DaemonError::Network(format!("diagnostics read failed: {e}")))?;
 
     let request = String::from_utf8_lossy(&buffer[..n]);
-    let path = request
+    let (method, path) = request
         .lines()
         .next()
         .and_then(|line| {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next()) {
-                (Some("GET"), Some(path)) => Some(path),
+                (Some(method), Some(path)) => Some((method, path)),
                 _ => None,
             }
         })
-        .unwrap_or("/");
+        .unwrap_or(("GET", "/"));
 
-    match path {
-        "/health" => write_response(&mut stream, 200, "text/plain", "ok\n").await?,
-        "/status" => {
+    match (method, path) {
+        ("GET", "/health") => write_response(&mut stream, 200, "text/plain", "ok\n").await?,
+        ("GET", "/status") => {
             let snapshot = build_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body).await?;
+        }
+        ("POST", "/shutdown") => {
+            write_response(&mut stream, 200, "text/plain", "shutting down\n").await?;
+            let _ = context.shutdown_tx.send(true);
         }
         _ => {
             warn!("Unknown diagnostics path requested: {path}");
@@ -167,6 +176,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let health_snap = context.health.snapshot(&tasks).await;
 
     DiagnosticsSnapshot {
+        process_id: std::process::id(),
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
@@ -233,6 +243,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let health = HealthState::new();
         let task_manager = TaskManager::new(health.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let context = DiagnosticsContext::new(
             config,
             peers,
@@ -241,8 +252,8 @@ mod tests {
             Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
             health,
             task_manager,
+            shutdown_tx,
         );
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -256,6 +267,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
+        assert_eq!(snapshot.process_id, std::process::id());
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.peers[0].node_id, "node-b");
@@ -268,6 +280,20 @@ mod tests {
             Some("probe timeout")
         );
 
-        worker.abort();
+        let mut shutdown_stream = TcpStream::connect(addr).await.unwrap();
+        shutdown_stream
+            .write_all(b"POST /shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut shutdown_response = String::new();
+        shutdown_stream
+            .read_to_string(&mut shutdown_response)
+            .await
+            .unwrap();
+
+        assert!(shutdown_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(shutdown_response.contains("shutting down"));
+
+        worker.await.unwrap().unwrap();
     }
 }

@@ -18,6 +18,8 @@ use tracing::info;
 use crate::config::Config;
 use crate::control::PeerInfo;
 
+const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
+
 // ============================================================
 // Connection State
 // ============================================================
@@ -299,8 +301,12 @@ impl PeerManager {
         }
     }
 
-    /// Select a candidate endpoint after receiving traffic from that address.
-    pub async fn select_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
+    /// Learn a candidate endpoint after receiving a probe or packet from that address.
+    ///
+    /// This intentionally does not mark the peer as Direct. UDP punch probes only
+    /// prove that a candidate address is visible; the direct path is confirmed
+    /// only after an encrypted WireGuard packet decrypts successfully.
+    pub async fn learn_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
         let mut conns = self.connections.write().await;
 
         for (node_id, conn) in conns.iter_mut() {
@@ -313,13 +319,16 @@ impl PeerManager {
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);
-                conn.direct_health.record_success();
-                conn.transition(ConnectionState::Direct);
                 return Some(node_id.clone());
             }
         }
 
         None
+    }
+
+    /// Backwards-compatible alias for endpoint learning.
+    pub async fn select_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
+        self.learn_endpoint_from_addr(endpoint).await
     }
 
     /// Return direct UDP endpoints for NAT keepalive probes.
@@ -386,7 +395,14 @@ impl PeerManager {
             return true;
         }
 
-        !relay_available
+        if !relay_available {
+            return true;
+        }
+
+        conn.direct_health
+            .success_age()
+            .map(|age| age <= DIRECT_TRIAL_WINDOW)
+            .unwrap_or(false)
     }
 
     /// Whether direct retry suppression has expired for diagnostics/probing.
@@ -419,6 +435,24 @@ impl PeerManager {
             }
             conn.direct_health.record_success();
             conn.transition(ConnectionState::Direct);
+        }
+    }
+
+    /// Record that a UDP punch endpoint is reachable without fully promoting it
+    /// to Direct. Direct is only confirmed after a WireGuard packet decrypts
+    /// successfully from the endpoint.
+    pub async fn record_direct_probe_success(&self, node_id: &str, endpoint: SocketAddr) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.endpoint = Some(endpoint);
+            conn.direct_health.record_success();
+            if matches!(
+                conn.state,
+                ConnectionState::Idle
+                    | ConnectionState::Connecting
+                    | ConnectionState::FallbackToRelay
+            ) {
+                conn.transition(ConnectionState::HolePunching);
+            }
         }
     }
 
@@ -742,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peer_manager_selects_endpoint_from_probe_source() {
+    async fn test_peer_manager_learns_endpoint_from_probe_source_without_confirming_direct() {
         let config = test_config();
         let manager = PeerManager::new(config);
 
@@ -762,16 +796,13 @@ mod tests {
             .add_candidates("peer1", &[selected_endpoint.to_string()])
             .await;
 
-        let selected = manager.select_endpoint_from_addr(selected_endpoint).await;
+        let selected = manager.learn_endpoint_from_addr(selected_endpoint).await;
         assert_eq!(selected, Some("peer1".to_string()));
 
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.endpoint, Some(selected_endpoint));
-        assert_eq!(conn.state, ConnectionState::Direct);
-        assert_eq!(
-            manager.direct_endpoints().await,
-            vec![("peer1".to_string(), selected_endpoint)]
-        );
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert!(manager.direct_endpoints().await.is_empty());
     }
 
     #[tokio::test]
@@ -819,6 +850,17 @@ mod tests {
         assert_eq!(conn.state, ConnectionState::Relay);
         assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
         assert!(conn.relay_health.last_success_at.is_some());
+
+        manager.record_direct_probe_success("peer1", endpoint).await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Relay);
+        assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
+        assert!(conn.direct_health.last_success_at.is_some());
+        assert!(
+            manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
 
         manager.record_direct_success("peer1", Some(endpoint)).await;
         let conn = manager.get_connection("peer1").await.unwrap();

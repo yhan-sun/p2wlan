@@ -18,6 +18,8 @@ export type DaemonLifecycle = "running" | "stopped" | "unknown" | "error";
 
 export type RelayPolicy = "auto" | "direct-first" | "relay-only";
 
+export type CloseBehavior = "keep-running" | "stop-and-quit";
+
 export type DiagnosticCheckStatus = "pass" | "warn" | "fail" | "unknown" | "skipped";
 
 export type DataSource = "live" | "fallback" | "cached";
@@ -92,6 +94,7 @@ export interface RelaySelectionDiagnostics {
 
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
+  process_id?: number;
   node_id: string;
   virtual_ip: string;
   network_id: string;
@@ -206,6 +209,8 @@ export interface ClientSettings {
   relayPolicy: RelayPolicy;
   relayServers: string;
   startOnBoot: boolean;
+  closeBehavior: CloseBehavior;
+  /** @deprecated use closeBehavior. Kept for migration from older builds. */
   minimizeToTray: boolean;
 }
 
@@ -245,6 +250,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   relayPolicy: "auto",
   relayServers: "",
   startOnBoot: false,
+  closeBehavior: "keep-running",
   minimizeToTray: true,
 };
 

@@ -114,6 +114,63 @@ func TestCreateTunnelRejectsDuplicateProtocolPort(t *testing.T) {
 	}
 }
 
+func TestSignalsDeduplicateByPairAndType(t *testing.T) {
+	db, device := createTestDevice(t, "signal-dedupe@p2wlan.local", "signal-source")
+	defer db.Close()
+
+	target, err := db.CreateDevice(device.UserID, "default", "signal-target-pubkey", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target failed: %v", err)
+	}
+
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"old"}, "old-handshake"); err != nil {
+		t.Fatalf("CreateSignal old failed: %v", err)
+	}
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"new"}, "new-handshake"); err != nil {
+		t.Fatalf("CreateSignal new failed: %v", err)
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals failed: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one deduplicated signal, got %d", len(signals))
+	}
+	if signals[0].Handshake != "new-handshake" {
+		t.Fatalf("expected latest handshake, got %q", signals[0].Handshake)
+	}
+	if len(signals[0].Candidates) != 1 || signals[0].Candidates[0] != "new" {
+		t.Fatalf("expected latest candidates, got %#v", signals[0].Candidates)
+	}
+}
+
+func TestSignalsIgnoreExpiredRows(t *testing.T) {
+	db, device := createTestDevice(t, "signal-ttl@p2wlan.local", "signal-ttl-source")
+	defer db.Close()
+
+	target, err := db.CreateDevice(device.UserID, "default", "signal-ttl-target-pubkey", "signal-ttl-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target failed: %v", err)
+	}
+
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"stale"}, "stale-handshake"); err != nil {
+		t.Fatalf("CreateSignal stale failed: %v", err)
+	}
+	_, err = db.Exec(`UPDATE signals SET created_at = ? WHERE to_node_id = ?`, time.Now().Unix()-signalTTLSeconds-1, target.ID)
+	if err != nil {
+		t.Fatalf("failed to age signal: %v", err)
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals failed: %v", err)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("expected expired signal to be ignored, got %d", len(signals))
+	}
+}
+
 func createTestDevice(t *testing.T, email, deviceName string) (*DB, *Device) {
 	t.Helper()
 
@@ -257,5 +314,21 @@ func TestDeviceOnlineTTL(t *testing.T) {
 		if d.ID == dev.ID && !d.Online {
 			t.Errorf("freshly updated device should be online, got offline")
 		}
+	}
+
+	// Empty endpoint is a valid lease heartbeat when the client has no public
+	// UDP endpoint to advertise.
+	if err := db.UpdateDeviceEndpoint(dev.ID, "", "unknown"); err != nil {
+		t.Fatalf("UpdateDeviceEndpoint empty heartbeat failed: %v", err)
+	}
+	refreshed, err := db.GetDevice(dev.ID)
+	if err != nil {
+		t.Fatalf("GetDevice after empty heartbeat failed: %v", err)
+	}
+	if !refreshed.Online {
+		t.Fatal("empty endpoint heartbeat should keep device online")
+	}
+	if refreshed.Endpoint != "" {
+		t.Fatalf("expected empty endpoint after heartbeat, got %q", refreshed.Endpoint)
 	}
 }
