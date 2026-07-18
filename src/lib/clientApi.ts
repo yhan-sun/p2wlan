@@ -132,6 +132,39 @@ export async function authenticateWithControl(
   if (!password) throw new Error("请输入密码");
   if (password.length < 6) throw new Error("密码至少需要 6 个字符");
 
+  if (isTauri()) {
+    try {
+      const session = await tryInvoke<AuthSession>("control_authenticate", {
+        request: {
+          mode,
+          controlServer,
+          email,
+          password,
+        },
+      });
+      if (session?.token) {
+        const settings = getSettings();
+        const nextSettings = {
+          ...settings,
+          controlServer: session.controlServer,
+          authToken: session.token,
+        };
+        saveSettings(nextSettings);
+        localStorage.setItem("token", session.token);
+        appendLog(`${mode === "register" ? "registered" : "logged in"} control user (${email}) via native bridge`);
+        return {
+          data: session,
+          source: "live",
+        };
+      }
+    } catch (err) {
+      if (err instanceof Error) {
+        throw new Error(zhAuthError(err.message));
+      }
+      throw new Error(zhAuthError(String(err)));
+    }
+  }
+
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 8000);
   try {

@@ -22,6 +22,11 @@ export type DiagnosticCheckStatus = "pass" | "warn" | "fail" | "unknown" | "skip
 
 export type DataSource = "live" | "fallback" | "cached";
 
+const DEFAULT_TUN_INTERFACE =
+  typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("win")
+    ? "p2wlan"
+    : "p2pnet0";
+
 export interface PathHealthDiagnostics {
   last_success_age_ms: number | null;
   last_failure_age_ms: number | null;
@@ -234,7 +239,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   networkId: "default",
   mtu: 1420,
   overlayCidr: "10.20.0.0/16",
-  tunInterface: "p2pnet0",
+  tunInterface: DEFAULT_TUN_INTERFACE,
   diagnosticsUrl: "http://127.0.0.1:39277/status",
   authToken: "",
   relayPolicy: "auto",
