@@ -130,6 +130,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .map_err(|e| DaemonError::Network(format!("diagnostics read failed: {e}")))?;
 
     let request = String::from_utf8_lossy(&buffer[..n]);
+    let cors_origin = allowed_cors_origin(&request);
     let (method, path) = request
         .lines()
         .next()
@@ -143,23 +144,43 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .unwrap_or(("GET", "/"));
 
     match (method, path) {
-        ("GET", "/health") => write_response(&mut stream, 200, "text/plain", "ok\n").await?,
+        ("GET", "/health") => {
+            write_response(&mut stream, 200, "text/plain", "ok\n", cors_origin).await?
+        }
         ("GET", "/status") => {
             let snapshot = build_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;
-            write_response(&mut stream, 200, "application/json", &body).await?;
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("POST", "/shutdown") => {
-            write_response(&mut stream, 200, "text/plain", "shutting down\n").await?;
+            write_response(
+                &mut stream,
+                200,
+                "text/plain",
+                "shutting down\n",
+                cors_origin,
+            )
+            .await?;
             let _ = context.shutdown_tx.send(true);
         }
         _ => {
             warn!("Unknown diagnostics path requested: {path}");
-            write_response(&mut stream, 404, "text/plain", "not found\n").await?;
+            write_response(&mut stream, 404, "text/plain", "not found\n", cors_origin).await?;
         }
     }
 
     Ok(())
+}
+
+fn allowed_cors_origin(request: &str) -> Option<&str> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("origin") {
+            return None;
+        }
+        let origin = value.trim();
+        matches!(origin, "http://localhost:1420" | "http://127.0.0.1:1420").then_some(origin)
+    })
 }
 
 async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
@@ -195,14 +216,18 @@ async fn write_response(
     status: u16,
     content_type: &str,
     body: &str,
+    cors_origin: Option<&str>,
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         _ => "Error",
     };
+    let cors_header = cors_origin
+        .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cors_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -218,6 +243,22 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
+
+    #[test]
+    fn cors_origin_is_restricted_to_local_dev_server() {
+        assert_eq!(
+            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
+            Some("http://localhost:1420")
+        );
+        assert_eq!(
+            allowed_cors_origin("GET /status HTTP/1.1\r\norigin: http://127.0.0.1:1420\r\n\r\n"),
+            Some("http://127.0.0.1:1420")
+        );
+        assert_eq!(
+            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: https://example.com\r\n\r\n"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn diagnostics_server_returns_status_json() {
@@ -258,13 +299,16 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:1420\r\n\r\n",
+            )
             .await
             .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Access-Control-Allow-Origin: http://127.0.0.1:1420\r\n"));
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
         assert_eq!(snapshot.process_id, std::process::id());

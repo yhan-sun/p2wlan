@@ -151,6 +151,9 @@ export interface PeerStatus {
   bytesReceived: number;
   relayServer: string | null;
   lastError: string | null;
+  candidates?: string[];
+  directHealth?: PathHealthDiagnostics;
+  relayHealth?: PathHealthDiagnostics;
 }
 
 export interface TunnelStatus {

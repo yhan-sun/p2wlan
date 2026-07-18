@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { getSettings, saveSettings, validateSettings } from "../lib/clientApi";
-import type { ClientSettings, CloseBehavior, RelayPolicy } from "../types/client";
-import { Save, AlertTriangle, ShieldCheck } from "lucide-react";
+import type { ClientSettings, CloseBehavior } from "../types/client";
+import { Save, AlertTriangle, ShieldCheck, ChevronDown, ChevronUp } from "lucide-react";
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<ClientSettings>(() => getSettings());
   const [errors, setErrors] = useState<string[]>([]);
   const [saveStatus, setSaveStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const handleFieldChange = <K extends keyof ClientSettings>(key: K, value: ClientSettings[K]) => {
     setSettings(prev => ({
@@ -39,18 +40,18 @@ export default function SettingsPage() {
     if (res.error) {
       setSaveStatus({ type: "error", message: res.error });
     } else {
-      setSaveStatus({ type: "success", message: "设置已保存。" });
-      // Notify parent/hook of potential update changes if needed
+      setSaveStatus({ type: "success", message: "设置已成功保存。" });
       window.dispatchEvent(new Event("storage"));
+      setTimeout(() => setSaveStatus(null), 3000);
     }
   };
 
   return (
-    <div className="page-container">
+    <div className="page-container settings-page">
       <div className="page-header">
         <div>
           <h2>设置</h2>
-          <p className="page-subtitle">配置控制面、虚拟网卡、中继策略和桌面行为。</p>
+          <p className="page-subtitle">配置网络标识、中继选线与桌面行为策略。</p>
         </div>
       </div>
 
@@ -65,7 +66,7 @@ export default function SettingsPage() {
 
       {errors.length > 0 && (
         <div className="banner banner-error flex-col items-start gap-xs">
-              <span className="banner-title">配置错误</span>
+          <span className="banner-title">配置错误</span>
           <ul className="error-list text-sm">
             {errors.map((err, idx) => (
               <li key={idx}>{err}</li>
@@ -76,11 +77,11 @@ export default function SettingsPage() {
 
       <form onSubmit={handleSave} className="settings-form flex-col gap-md">
         <div className="split-layout">
-          {/* Column 1: Core Networking & Daemon Details */}
+          {/* Left Column: Basic Networking settings */}
           <div className="column flex-col gap-md">
             <div className="panel-section">
               <div className="panel-header">
-                <h3>控制面</h3>
+                <h3>基本网络配置</h3>
               </div>
               <div className="panel-body flex-col gap-md">
                 <div className="form-group">
@@ -92,7 +93,7 @@ export default function SettingsPage() {
                     onChange={(e) => handleFieldChange("controlServer", e.target.value)}
                     required
                   />
-                  <span className="form-hint">用于节点注册、信令交换和网络配置分配。</span>
+                  <span className="form-hint">用户注册与设备认证的控制面服务器地址。</span>
                 </div>
 
                 <div className="form-group">
@@ -104,7 +105,7 @@ export default function SettingsPage() {
                     onChange={(e) => handleFieldChange("deviceName", e.target.value)}
                     required
                   />
-                  <span className="form-hint">显示给同一虚拟网络中的其他设备。</span>
+                  <span className="form-hint">本设备在虚拟内网中显示的广播名称。</span>
                 </div>
 
                 <div className="form-group">
@@ -116,111 +117,41 @@ export default function SettingsPage() {
                     onChange={(e) => handleFieldChange("networkId", e.target.value)}
                     required
                   />
-                  <span className="form-hint">要加入的虚拟网络范围。</span>
+                  <span className="form-hint">加入的专用虚拟内网网络标识符。</span>
                 </div>
 
                 <div className="form-group">
-                  <label className="form-label">认证 token</label>
-                  <input
-                    className="form-input text-mono"
-                    type="password"
-                    value={settings.authToken}
-                    onChange={(e) => handleFieldChange("authToken", e.target.value)}
-                    placeholder="登录或注册后会自动写入..."
-                  />
-                  <span className="form-hint">用于守护进程向控制面注册设备。</span>
+                  <label className="form-label">当前选路</label>
+                  <div className="readonly-row">
+                    <span className="readonly-value">自动直连，中继兜底</span>
+                  </div>
+                  <span className="form-hint">实际路径由守护进程按 NAT、UDP 可达性和中继可用性自动决策。</span>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Column 2: TUN & Relay Settings */}
+          {/* Right Column: Desktop & MTU Settings */}
           <div className="column flex-col gap-md">
             <div className="panel-section">
               <div className="panel-header">
-                <h3>网络</h3>
+                <h3>系统与行为</h3>
               </div>
               <div className="panel-body flex-col gap-md">
                 <div className="form-group">
-                  <label className="form-label">网卡名称</label>
+                  <label className="form-label">物理 MTU</label>
                   <input
-                    className="form-input text-mono"
-                    type="text"
-                    value={settings.tunInterface}
-                    onChange={(e) => handleFieldChange("tunInterface", e.target.value)}
-                    required
-                  />
-                  <span className="form-hint">TUN 设备名称，例如 tun0、p2pnet0。</span>
-                </div>
-
-                <div className="form-group-row">
-                  <div className="form-group">
-                  <label className="form-label">MTU</label>
-                    <input
-                      className="form-input"
-                      type="number"
-                      value={settings.mtu}
-                      onChange={(e) => handleFieldChange("mtu", parseInt(e.target.value) || 0)}
-                      required
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Overlay CIDR</label>
-                    <input
-                      className="form-input text-mono"
-                      type="text"
-                      value={settings.overlayCidr}
-                      onChange={(e) => handleFieldChange("overlayCidr", e.target.value)}
-                      placeholder="10.20.0.0/16"
-                    />
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">诊断地址</label>
-                  <input
-                    className="form-input text-mono"
-                    type="url"
-                    value={settings.diagnosticsUrl}
-                    onChange={(e) => handleFieldChange("diagnosticsUrl", e.target.value)}
-                    required
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">中继策略</label>
-                  <select
                     className="form-input"
-                    value={settings.relayPolicy}
-                    onChange={(e) => handleFieldChange("relayPolicy", e.target.value as RelayPolicy)}
-                  >
-                    <option value="auto">自动：优先直连，失败后中继</option>
-                    <option value="direct-first">优先直连 P2P</option>
-                    <option value="relay-only">仅使用中继</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            <div className="panel-section">
-              <div className="panel-header">
-                <h3>桌面</h3>
-              </div>
-              <div className="panel-body flex-col gap-sm">
-                <label className="checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={settings.startOnBoot}
-                    onChange={(e) => handleFieldChange("startOnBoot", e.target.checked)}
+                    type="number"
+                    value={settings.mtu}
+                    onChange={(e) => handleFieldChange("mtu", parseInt(e.target.value) || 0)}
+                    required
                   />
-                  <span className="checkbox-label flex-col">
-                    <span className="title text-sm">登录系统后启动</span>
-                    <span className="desc text-xs text-muted">系统登录后自动启动桌面客户端。</span>
-                  </span>
-                </label>
+                  <span className="form-hint">隧道网络接口的最大传输单元大小。</span>
+                </div>
 
                 <div className="form-group">
-                  <label className="form-label">关闭窗口时</label>
+                  <label className="form-label">关闭窗口行为</label>
                   <div className="choice-list">
                     <label
                       className={`choice-row ${settings.closeBehavior === "keep-running" ? "active" : ""}`}
@@ -234,8 +165,8 @@ export default function SettingsPage() {
                       />
                       <span className="choice-dot" aria-hidden="true" />
                       <span className="choice-copy">
-                        <span className="title text-sm">保留后台运行</span>
-                        <span className="desc text-xs text-muted">窗口隐藏到状态栏，TUN 与虚拟内网继续工作。</span>
+                        <span className="title text-sm">后台静默运行</span>
+                        <span className="desc text-xs text-muted">关闭主窗口时窗口缩小到系统状态栏，不中断内网。</span>
                       </span>
                     </label>
 
@@ -251,8 +182,8 @@ export default function SettingsPage() {
                       />
                       <span className="choice-dot" aria-hidden="true" />
                       <span className="choice-copy">
-                        <span className="title text-sm">停止 TUN 并退出</span>
-                        <span className="desc text-xs text-muted">关闭窗口时先关闭守护进程，再退出 p2wlan。</span>
+                        <span className="title text-sm">完全停止并退出</span>
+                        <span className="desc text-xs text-muted">关闭主窗口时同时注销网卡、停止后台守护进程并退出。</span>
                       </span>
                     </label>
                   </div>
@@ -262,20 +193,75 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="form-actions flex-row justify-between gap-sm">
+        {/* Collapsible Advanced Settings Region */}
+        <div className="panel-section advanced-section">
           <button
             type="button"
-            className="btn btn-ghost text-warning"
-            onClick={() => {
-              localStorage.removeItem("p2wlan.setup.completed");
-              alert("配置向导状态已重置，下次启动会重新显示。");
-            }}
+            className="advanced-header-toggle flex-row justify-between items-center"
+            onClick={() => setShowAdvanced(!showAdvanced)}
           >
-            <span>重置向导</span>
+            <span>高级配置项</span>
+            {showAdvanced ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
           </button>
+
+          {showAdvanced && (
+            <div className="panel-body flex-col gap-md pt-md border-t border-light">
+              <div className="form-group">
+                <label className="form-label">认证 Token</label>
+                <input
+                  className="form-input text-mono"
+                  type="password"
+                  value={settings.authToken}
+                  onChange={(e) => handleFieldChange("authToken", e.target.value)}
+                  placeholder="未配置 Token"
+                />
+                <span className="form-hint">直接修改或查看登录后在本地缓存的控制面 Session 密钥。</span>
+              </div>
+
+              <div className="form-group-row">
+                <div className="form-group flex-1">
+                  <label className="form-label">网卡设备名称</label>
+                  <input
+                    className="form-input text-mono"
+                    type="text"
+                    value={settings.tunInterface}
+                    onChange={(e) => handleFieldChange("tunInterface", e.target.value)}
+                    required
+                  />
+                  <span className="form-hint">虚拟 TUN 接口的物理层命名。</span>
+                </div>
+                <div className="form-group flex-1">
+                  <label className="form-label">Overlay CIDR 地址块</label>
+                  <input
+                    className="form-input text-mono"
+                    type="text"
+                    value={settings.overlayCidr}
+                    onChange={(e) => handleFieldChange("overlayCidr", e.target.value)}
+                    placeholder="10.20.0.0/16"
+                  />
+                  <span className="form-hint">虚拟子网段寻址规范。</span>
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">本地守护进程诊断端口 (URL)</label>
+                <input
+                  className="form-input text-mono"
+                  type="url"
+                  value={settings.diagnosticsUrl}
+                  onChange={(e) => handleFieldChange("diagnosticsUrl", e.target.value)}
+                  required
+                />
+                <span className="form-hint">桌面客户端用来监听和轮询守护进程状态的 API 诊断服务终点。</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="form-actions flex-row justify-end gap-sm border-t border-light pt-md">
           <button type="submit" className="btn btn-primary">
             <Save size={14} />
-            <span>保存</span>
+            <span>保存设置</span>
           </button>
         </div>
       </form>

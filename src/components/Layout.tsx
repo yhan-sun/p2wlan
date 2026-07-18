@@ -1,6 +1,6 @@
 import { NavLink, useNavigate } from "react-router-dom";
 import { ReactNode, useEffect, useState } from "react";
-import { Activity, LayoutDashboard, Settings, LogOut, Power } from "lucide-react";
+import { Activity, LayoutDashboard, Settings, LogOut, Power, Network } from "lucide-react";
 import { getDaemonStatus, quitApp } from "../lib/clientApi";
 import { StatusPill, healthTone, zhLabel } from "./StatusPill";
 import type { DaemonStatus } from "../types/client";
@@ -11,7 +11,8 @@ interface LayoutProps {
 }
 
 const navItems = [
-  { path: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
+  { path: "/dashboard", label: "概览", icon: LayoutDashboard },
+  { path: "/nodes", label: "设备", icon: Network },
   { path: "/settings", label: "设置", icon: Settings },
   { path: "/diagnostics", label: "诊断", icon: Activity },
 ];

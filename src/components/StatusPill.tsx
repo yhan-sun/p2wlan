@@ -29,11 +29,15 @@ export function zhLabel(value: string | null | undefined): string {
     case "running":
       return "运行中";
     case "stopped":
-      return "已停止";
+      return "未启动";
     case "unknown":
       return "未知";
     case "error":
       return "异常";
+    case "unreachable":
+      return "不可达";
+    case "connected":
+      return "已连接";
     case "healthy":
       return "健康";
     case "degraded":
@@ -47,11 +51,11 @@ export function zhLabel(value: string | null | undefined): string {
     case "connecting":
       return "连接中";
     case "hole_punching":
-      return "打洞中";
+      return "正在打洞";
     case "direct":
       return "直连";
     case "fallback_to_relay":
-      return "切换中继";
+      return "切换到中继";
     case "relay":
       return "中继";
     case "failed":

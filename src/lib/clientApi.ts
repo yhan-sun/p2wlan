@@ -411,6 +411,9 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     bytesReceived: peer.bytes_received,
     relayServer: peer.relay_server,
     lastError: peer.direct.last_error ?? peer.relay.last_error,
+    candidates: peer.candidates,
+    directHealth: peer.direct,
+    relayHealth: peer.relay,
   };
 }
 

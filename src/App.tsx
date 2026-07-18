@@ -19,7 +19,7 @@ function App() {
   }
 
   return (
-    <HashRouter>
+    <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <Layout onLogout={() => { localStorage.removeItem("token"); setToken(""); }}>
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
