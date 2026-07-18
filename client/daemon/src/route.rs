@@ -296,7 +296,10 @@ impl RouteManager {
 
         let existing = windows_get_route_aliases(&destination_prefix)?;
         if !existing.is_empty() {
-            if existing.iter().any(|alias| alias == &interface) {
+            if existing
+                .iter()
+                .any(|alias| windows_interface_alias_eq(alias, &interface))
+            {
                 info!(
                     "Route for {destination_prefix} already exists on {interface} — treating as idempotent, not owned"
                 );
@@ -318,6 +321,35 @@ impl RouteManager {
             .map_err(|e| crate::DaemonError::Network(format!("failed to run New-NetRoute: {e}")))?;
 
         if !output.status.success() {
+            if windows_route_already_exists(&output) {
+                let existing_after = windows_get_route_aliases(&destination_prefix)
+                    .unwrap_or_else(|err| {
+                        info!(
+                            "New-NetRoute reported an existing route for {destination_prefix}, but follow-up route query failed: {err}"
+                        );
+                        Vec::new()
+                    });
+
+                if existing_after.is_empty()
+                    || existing_after
+                        .iter()
+                        .any(|alias| windows_interface_alias_eq(alias, &interface))
+                {
+                    info!(
+                        "Windows route for {destination_prefix} via {interface} already exists — treating New-NetRoute as idempotent"
+                    );
+                    if let Ok(mut added) = self.routes_added.lock() {
+                        added.push((network, mask));
+                    }
+                    return Ok(());
+                }
+
+                return Err(crate::DaemonError::Network(format!(
+                    "routing conflict: route to {destination_prefix} already exists on another interface: {}",
+                    existing_after.join(", ")
+                )));
+            }
+
             return Err(crate::DaemonError::Network(format!(
                 "New-NetRoute failed for {destination_prefix} via {interface}: {}",
                 powershell_failure_detail(&output)
@@ -360,7 +392,7 @@ impl RouteManager {
 #[cfg(target_os = "windows")]
 fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
     let output = windows_powershell_command(&format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
+        "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
         ps_quote(destination_prefix)
     ))
         .output()
@@ -379,6 +411,18 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
         .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_route_already_exists(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    stderr.contains("already exists") || stdout.contains("already exists")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_alias_eq(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
 }
 
 #[cfg(target_os = "windows")]

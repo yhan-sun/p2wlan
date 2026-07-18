@@ -222,9 +222,18 @@ impl UdpTransport {
         let mut buf = vec![0u8; 65_535];
 
         loop {
-            let (n, source) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-                DaemonError::Network(format!("UDP receive on direct transport failed: {e}"))
-            })?;
+            let (n, source) = match self.socket.recv_from(&mut buf).await {
+                Ok(packet) => packet,
+                Err(err) if is_ignorable_udp_receive_error(&err) => {
+                    debug!("Ignoring transient UDP receive error on direct transport: {err}");
+                    continue;
+                }
+                Err(err) => {
+                    return Err(DaemonError::Network(format!(
+                        "UDP receive on direct transport failed: {err}"
+                    )));
+                }
+            };
 
             if n == 0 {
                 continue;
@@ -270,6 +279,19 @@ impl UdpTransport {
 
             debug!("Received {n} encrypted UDP bytes from {source}");
         }
+    }
+}
+
+fn is_ignorable_udp_receive_error(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        error.raw_os_error() == Some(10054) || error.kind() == std::io::ErrorKind::ConnectionReset
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = error;
+        false
     }
 }
 
