@@ -153,7 +153,7 @@ select:focus-visible {
   font-size: 0.75rem;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   margin-top: 0.125rem;
 }
 
@@ -297,7 +297,7 @@ select:focus-visible {
   font-size: 0.675rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.25px;
+  letter-spacing: 0;
   min-height: 1.25rem;
 }
 
@@ -597,7 +597,7 @@ select:focus-visible {
   color: var(--text-muted);
   text-transform: uppercase;
   font-weight: 600;
-  letter-spacing: 0.18px;
+  letter-spacing: 0;
 }
 
 .panel-value-mono {
@@ -644,7 +644,7 @@ select:focus-visible {
   font-size: 0.875rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.2px;
+  letter-spacing: 0;
   color: var(--text-primary);
 }
 
@@ -834,7 +834,7 @@ select:focus-visible {
   color: var(--text-muted);
   background: rgba(255, 255, 255, 0.02);
   border-bottom: 1px solid var(--border-color);
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
 }
 
 .table td {
@@ -1463,7 +1463,7 @@ button, .btn, .sidebar-link, .segmented-button, .choice-row {
   font-size: 0.75rem;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
 }
 
 .status-bar-card .card-value {

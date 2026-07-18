@@ -11,7 +11,7 @@ import {
   ArrowRight,
 } from "lucide-react";
 import ControlAuthPanel from "../components/ControlAuthPanel";
-import { StatusPill, zhLabel, formatAge, pathTone } from "../components/StatusPill";
+import { StatusPill, zhLabel, formatAge, formatBytes, pathTone } from "../components/StatusPill";
 import { useClientStatus } from "../hooks/useClientStatus";
 import { getSettings, openLogs } from "../lib/clientApi";
 
@@ -26,6 +26,8 @@ export default function DashboardPage() {
     connectElevated,
     disconnect,
     refreshing,
+    operation,
+    lastFetchedAt,
   } = useClientStatus();
   const [actionLoading, setActionLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
@@ -44,9 +46,9 @@ export default function DashboardPage() {
       return;
     }
     try {
-      const msg = await connectElevated();
+      await connectElevated();
       setActionTone("info");
-      setActionMessage(msg);
+      setActionMessage(null);
       setShowControlAuth(false);
     } catch (err) {
       setActionTone("error");
@@ -60,9 +62,9 @@ export default function DashboardPage() {
     setActionLoading(true);
     setActionMessage(null);
     try {
-      const msg = await disconnect();
+      await disconnect();
       setActionTone("info");
-      setActionMessage(msg);
+      setActionMessage(null);
     } catch (err) {
       setActionTone("error");
       setActionMessage(err instanceof Error ? err.message : "停止失败");
@@ -82,12 +84,30 @@ export default function DashboardPage() {
     }
   };
 
-  const running = daemon.lifecycle === "running";
-  const activePeers = peers.filter((peer) => peer.path === "direct" || peer.path === "relay");
+  const operationBusy =
+    operation.phase === "authorizing" ||
+    operation.phase === "launching" ||
+    operation.phase === "waiting_for_daemon" ||
+    operation.phase === "stopping";
+  const running = daemon.lifecycle === "running" && daemon.reachable;
+  const onlineCount = daemon.peerStats.direct_connections + daemon.peerStats.relay_connections;
+  const hasLiveMetrics = running;
 
   // Determine top status values
-  const tunStatusText = running ? "运行中" : daemon.lifecycle === "error" ? "异常" : "未启动";
-  const tunStatusTone = running ? "ok" : daemon.lifecycle === "error" ? "bad" : "muted";
+  const tunStatusText = operationBusy
+    ? operation.message
+    : running
+      ? "运行中"
+      : operation.phase === "error" || daemon.lifecycle === "error"
+        ? "异常"
+        : "未启动";
+  const tunStatusTone = operationBusy
+    ? "warn"
+    : running
+      ? "ok"
+      : operation.phase === "error" || daemon.lifecycle === "error"
+        ? "bad"
+        : "muted";
 
   const controlStatusText = daemon.reauthRequired
     ? "需要重新登录"
@@ -121,6 +141,7 @@ export default function DashboardPage() {
 
   // Banner status message
   const statusBanner = (() => {
+    if (operationBusy) return null;
     if (!daemon.reachable && lastError) {
       return { title: "守护进程未连接", detail: lastError };
     }
@@ -135,6 +156,16 @@ export default function DashboardPage() {
     }
     return null;
   })();
+
+  const operationElapsed = Math.max(0, Math.floor((Date.now() - operation.startedAtMs) / 1000));
+  const controlHeartbeat = !hasLiveMetrics
+    ? "—"
+    : daemon.lastControlSuccessSecsAgo == null
+      ? daemon.controlConnected
+        ? "刚刚"
+        : "未知"
+      : formatAge(daemon.lastControlSuccessSecsAgo * 1000);
+  const localUpdated = lastFetchedAt == null ? "—" : formatAge(Date.now() - lastFetchedAt);
 
   const previewPeers = peers.slice(0, 3);
 
@@ -204,15 +235,25 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {actionLoading && (
-        <div className="banner banner-info">
+      {operationBusy && (
+        <div className="banner banner-info" role="status" aria-live="polite">
           <ShieldCheck size={16} />
           <div className="banner-content">
-            <span className="banner-title">等待系统授权</span>
+            <span className="banner-title">{operation.message}</span>
             <span className="banner-desc">
-              请确认密码窗口。Windows 首次启动可能需要 30 到 45 秒。
+              {operation.phase === "authorizing"
+                ? "请在系统窗口确认管理员授权。p2wlan 不会读取或保存密码。"
+                : operation.phase === "stopping"
+                  ? "正在注销虚拟网卡并清理 Overlay 路由。"
+                  : "守护进程正在连接控制面并初始化虚拟网卡，可继续使用其他页面。"}
+              {operationElapsed > 4 ? ` 已等待 ${operationElapsed} 秒。` : ""}
             </span>
           </div>
+          {operationElapsed > 4 && (
+            <button className="btn btn-ghost btn-xs" onClick={handleOpenLogs}>
+              查看日志
+            </button>
+          )}
         </div>
       )}
 
@@ -257,18 +298,18 @@ export default function DashboardPage() {
               <p className="text-sm text-secondary">
                 {running
                   ? "虚拟网络已建立。此设备可在虚拟内网 10.20.0.0/16 范围内与其他在线设备通信。"
-                  : "启动虚拟网卡需要超级管理员特权 (sudo)，以配置虚拟网口和系统路由表。"}
+                  : "启动虚拟网卡需要系统管理员权限，以配置虚拟网口和系统路由表。"}
               </p>
               <div className="flex-row gap-md items-center">
-                {running ? (
-                  <button className="btn btn-danger flex-1" onClick={stopTun} disabled={actionLoading}>
+                {running || operation.phase === "stopping" ? (
+                  <button className="btn btn-danger flex-1" onClick={stopTun} disabled={actionLoading || operationBusy}>
                     <Square size={14} />
-                    <span>停止 TUN</span>
+                    <span>{operation.phase === "stopping" ? "正在停止..." : "停止 TUN"}</span>
                   </button>
                 ) : (
-                  <button className="btn btn-primary flex-1" onClick={startTun} disabled={actionLoading}>
+                  <button className="btn btn-primary flex-1" onClick={startTun} disabled={actionLoading || operationBusy}>
                     <ShieldCheck size={14} />
-                    <span>{actionLoading ? "等待授权..." : "授权启动 TUN"}</span>
+                    <span>{operationBusy ? operation.message : "授权启动 TUN"}</span>
                   </button>
                 )}
               </div>
@@ -294,25 +335,43 @@ export default function DashboardPage() {
             </div>
             <div className="panel-body flex-col gap-sm">
               <div className="status-row">
-                <span className="status-label-text">在线设备</span>
-                <span className="status-value-text-mono font-semibold">{activePeers.length} 台</span>
-              </div>
-              <div className="status-row">
-                <span className="status-label-text">直连数量 (P2P)</span>
-                <span className="status-value-text-mono text-success font-semibold">
-                  {daemon.peerStats.direct_connections}
+                <span className="status-label-text">已发现设备</span>
+                <span className="status-value-text-mono font-semibold">
+                  {hasLiveMetrics ? `${daemon.peerStats.total_peers} 台` : "—"}
                 </span>
               </div>
               <div className="status-row">
-                <span className="status-label-text">中继数量 (Relay)</span>
-                <span className="status-value-text-mono text-warning font-semibold">
-                  {daemon.peerStats.relay_connections}
+                <span className="status-label-text">当前在线</span>
+                <span className="status-value-text-mono font-semibold">
+                  {hasLiveMetrics ? `${onlineCount} 台` : "—"}
                 </span>
               </div>
               <div className="status-row">
-                <span className="status-label-text">同步时间</span>
+                <span className="status-label-text">连接路径</span>
+                <span className="status-value-text-mono">
+                  {hasLiveMetrics
+                    ? `直连 ${daemon.peerStats.direct_connections} · 中继 ${daemon.peerStats.relay_connections}`
+                    : "—"}
+                </span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">总流量</span>
+                <span className="status-value-text-mono">
+                  {hasLiveMetrics
+                    ? `↓ ${formatBytes(daemon.peerStats.total_bytes_received)} · ↑ ${formatBytes(daemon.peerStats.total_bytes_sent)}`
+                    : "—"}
+                </span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">控制面心跳</span>
                 <span className="status-value-text-mono text-secondary text-sm">
-                  {daemon.updatedAt ? new Date(daemon.updatedAt).toLocaleTimeString() : "—"}
+                  {controlHeartbeat}
+                </span>
+              </div>
+              <div className="status-row">
+                <span className="status-label-text">状态更新</span>
+                <span className="status-value-text-mono text-secondary text-sm">
+                  {localUpdated}
                 </span>
               </div>
             </div>

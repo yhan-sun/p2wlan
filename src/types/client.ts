@@ -16,6 +16,15 @@ export type HealthStatus = "healthy" | "degraded" | "unhealthy" | "shutting_down
 
 export type DaemonLifecycle = "running" | "stopped" | "unknown" | "error";
 
+export type DaemonOperationPhase =
+  | "stopped"
+  | "authorizing"
+  | "launching"
+  | "waiting_for_daemon"
+  | "running"
+  | "stopping"
+  | "error";
+
 export type RelayPolicy = "auto" | "direct-first" | "relay-only";
 
 export type CloseBehavior = "keep-running" | "stop-and-quit";
@@ -107,6 +116,18 @@ export interface DiagnosticsSnapshot {
   health: HealthSnapshot;
 }
 
+export interface DaemonOperationStatus {
+  phase: DaemonOperationPhase;
+  message: string;
+  startedAtMs: number;
+  lastError: string | null;
+}
+
+export interface DesktopStatus {
+  operation: DaemonOperationStatus;
+  diagnostics: DiagnosticsSnapshot | null;
+}
+
 export interface DaemonStatus {
   lifecycle: DaemonLifecycle;
   reachable: boolean;
@@ -182,6 +203,16 @@ export interface RouteStatus {
   entries: RouteEntry[];
   lastError: string | null;
   source: DataSource;
+}
+
+export interface ClientStatusSnapshot {
+  daemon: DaemonStatus;
+  peers: PeerStatus[];
+  tunnel: TunnelStatus;
+  route: RouteStatus;
+  operation: DaemonOperationStatus;
+  source: DataSource;
+  error?: string;
 }
 
 export interface DiagnosticCheck {
@@ -267,6 +298,15 @@ export function emptyPeerStats(): PeerManagerStats {
   };
 }
 
+export function stoppedOperationStatus(): DaemonOperationStatus {
+  return {
+    phase: "stopped",
+    message: "TUN 未启动",
+    startedAtMs: Date.now(),
+    lastError: null,
+  };
+}
+
 export function stoppedDaemonStatus(settings: ClientSettings, error?: string): DaemonStatus {
   return {
     lifecycle: error ? "error" : "stopped",
@@ -284,7 +324,7 @@ export function stoppedDaemonStatus(settings: ClientSettings, error?: string): D
     controlServer: settings.controlServer,
     reauthRequired: false,
     healthStatus: "unhealthy",
-    healthReason: error ?? "守护进程不可访问",
+    healthReason: error ?? "守护进程未启动",
     relayConnected: false,
     relayEndpoint: null,
     relayRegion: null,
@@ -293,7 +333,7 @@ export function stoppedDaemonStatus(settings: ClientSettings, error?: string): D
       : [],
     natType: "unknown",
     activePathSummary: "offline",
-    lastError: error ?? "诊断端点无法访问守护进程",
+    lastError: error ?? null,
     lastControlSuccessSecsAgo: null,
     peerStats: emptyPeerStats(),
     criticalTasks: [],
