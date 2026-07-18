@@ -10,6 +10,62 @@ permissions:
   contents: write
 
 jobs:
+  macos:
+    name: macOS Universal DMG
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install icon generation dependencies
+        run: python3 -m pip install pillow
+
+      - name: Generate app icons
+        run: scripts/generate-icons.py
+
+      - name: Build universal macOS app and DMG
+        run: scripts/package-macos.sh --target universal-apple-darwin
+
+      - name: Assemble macOS release artifacts
+        run: |
+          mkdir -p dist-release
+          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist-release/p2wlan-macos-universal.dmg
+          ditto -c -k --keepParent target/universal-apple-darwin/release/bundle/macos/p2wlan.app dist-release/p2wlan-macos-universal.app.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-macos-universal
+          path: |
+            dist-release/p2wlan-macos-universal.dmg
+            dist-release/p2wlan-macos-universal.app.zip
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-release/p2wlan-macos-universal.dmg
+            dist-release/p2wlan-macos-universal.app.zip
+
   windows:
     name: Windows x64 Package
     runs-on: windows-latest

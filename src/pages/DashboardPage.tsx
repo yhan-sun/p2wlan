@@ -66,6 +66,21 @@ export default function DashboardPage() {
   const routeState = route?.entries[0]?.state ?? "unknown";
   const running = daemon.lifecycle === "running";
   const activePeers = peers.filter((peer) => peer.state === "direct" || peer.state === "relay");
+  const statusBanner = (() => {
+    if (!daemon.reachable && lastError) {
+      return { title: "守护进程未连接", detail: lastError };
+    }
+    if (daemon.reauthRequired) {
+      return { title: "需要重新登录", detail: "控制面 token 已失效，请重新登录后再启动或刷新 TUN。" };
+    }
+    if (daemon.reachable && !daemon.controlConnected) {
+      return { title: "控制面连接异常", detail: lastError ?? "守护进程仍在运行，但暂时没有连上控制服务器。" };
+    }
+    if (lastError) {
+      return { title: "网络路径异常", detail: lastError };
+    }
+    return null;
+  })();
 
   return (
     <div className="page-container simple-dashboard">
@@ -93,12 +108,12 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {lastError && (
+      {statusBanner && (
         <div className="banner banner-error">
           <AlertTriangle size={16} />
           <div className="banner-content">
-            <span className="banner-title">守护进程未连接</span>
-            <span className="banner-desc">{lastError}</span>
+            <span className="banner-title">{statusBanner.title}</span>
+            <span className="banner-desc">{statusBanner.detail}</span>
           </div>
           <button className="btn btn-ghost btn-xs text-danger" onClick={() => navigate("/diagnostics")}>
             诊断

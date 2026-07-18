@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "resources": {
+      "resources/p2pnet-daemon": "p2pnet-daemon"
+    }
+  }
+}

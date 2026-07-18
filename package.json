@@ -1,12 +1,14 @@
 {
   "name": "p2wlan-desktop",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "icons": "python3 scripts/generate-icons.py",
+    "package:macos": "scripts/package-macos.sh",
     "tauri": "tauri"
   },
   "dependencies": {
