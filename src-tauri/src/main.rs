@@ -59,17 +59,15 @@ fn open_logs() -> Result<String, String> {
     let log_dir = if cfg!(target_os = "macos") {
         dirs::home_dir()
             .map(|h| h.join("Library").join("Logs").join("p2wlan"))
-            .ok_or_else(|| "Could not locate macOS Library directory".to_string())?
+            .ok_or_else(|| "无法定位 macOS 日志目录".to_string())?
     } else if cfg!(target_os = "windows") {
         std::env::var("LOCALAPPDATA")
             .map(|l| PathBuf::from(l).join("p2wlan").join("logs"))
-            .map_err(|_| {
-                "Could not read LOCALAPPDATA environment variable on Windows".to_string()
-            })?
+            .map_err(|_| "无法读取 Windows LOCALAPPDATA 环境变量".to_string())?
     } else {
         dirs::home_dir()
             .map(|h| h.join(".p2wlan").join("logs"))
-            .ok_or_else(|| "Could not locate user home directory".to_string())?
+            .ok_or_else(|| "无法定位用户主目录".to_string())?
     };
 
     if !log_dir.exists() {
@@ -92,8 +90,8 @@ fn open_logs() -> Result<String, String> {
     };
 
     open_result
-        .map(|_| format!("Opened log directory: {}", log_dir.display()))
-        .map_err(|e| format!("Failed to open log directory: {}", e))
+        .map(|_| format!("已打开日志目录：{}", log_dir.display()))
+        .map_err(|e| format!("打开日志目录失败：{}", e))
 }
 
 fn main() {

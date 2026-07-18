@@ -62,14 +62,14 @@ jobs:
           Copy-Item "target\x86_64-pc-windows-msvc\release\p2wlan-desktop.exe" $pkg
           Copy-Item (Join-Path $env:RUNNER_TEMP "wintun\wintun\bin\amd64\wintun.dll") $pkg
           @"
-          p2wlan Windows x64 portable package
+          p2wlan Windows x64 便携版
 
-          1. Keep p2wlan-desktop.exe, p2pnet-daemon.exe, and wintun.dll in this folder.
-          2. Start p2wlan-desktop.exe.
-          3. Login or register against the control server.
-          4. Click "授权启动 TUN" and approve Windows UAC.
+          1. 请把 p2wlan-desktop.exe、p2pnet-daemon.exe、wintun.dll 放在同一个文件夹。
+          2. 双击启动 p2wlan-desktop.exe。
+          3. 登录或注册控制面账号。
+          4. 点击“授权启动 TUN”，在 Windows UAC 弹窗中选择“是”。
 
-          The app does not store your Windows password. UAC is handled by Windows.
+          p2wlan 不会读取或保存 Windows 密码，管理员授权由 Windows 系统完成。
           "@ | Set-Content -Path (Join-Path $pkg "README-WINDOWS.txt") -Encoding UTF8
           Compress-Archive -Path "$pkg\*" -DestinationPath "dist-release\p2wlan-windows-x64.zip" -Force
 
