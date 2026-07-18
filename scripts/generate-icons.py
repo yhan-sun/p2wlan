@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFilter
 ROOT = Path(__file__).resolve().parents[1]
 ICON_DIR = ROOT / "src-tauri" / "icons"
 SOURCE_SIZE = 1024
+VISUAL_SCALE = 0.84
 
 
 def lerp(a: int, b: int, t: float) -> int:
@@ -144,6 +145,16 @@ def make_icon() -> Image.Image:
     return icon
 
 
+def add_visual_padding(source: Image.Image) -> Image.Image:
+    """Inset the mark so it matches native macOS/Windows icon visual weight."""
+    canvas = Image.new("RGBA", source.size, (0, 0, 0, 0))
+    inset_size = round(SOURCE_SIZE * VISUAL_SCALE)
+    inset = source.resize((inset_size, inset_size), Image.Resampling.LANCZOS)
+    offset = (SOURCE_SIZE - inset_size) // 2
+    canvas.alpha_composite(inset, (offset, offset))
+    return canvas
+
+
 def save_resized(source: Image.Image, path: Path, size: int) -> None:
     img = source.resize((size, size), Image.Resampling.LANCZOS)
     img.save(path)
@@ -169,7 +180,7 @@ def generate_ico(source: Image.Image) -> None:
 
 def main() -> None:
     ICON_DIR.mkdir(parents=True, exist_ok=True)
-    source = make_icon()
+    source = add_visual_padding(make_icon())
     source.save(ICON_DIR / "icon-source.png")
     save_resized(source, ICON_DIR / "icon.png", 512)
     save_resized(source, ICON_DIR / "32x32.png", 32)

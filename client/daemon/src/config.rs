@@ -135,7 +135,14 @@ fn default_netmask() -> String {
     "255.255.0.0".to_string()
 }
 fn default_interface() -> String {
-    "p2pnet0".to_string()
+    #[cfg(target_os = "windows")]
+    {
+        "p2wlan".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "p2pnet0".to_string()
+    }
 }
 fn default_udp_bind() -> String {
     "0.0.0.0:0".to_string()
@@ -631,6 +638,9 @@ mod tests {
         assert_eq!(config.network.cidr, "10.20.0.0/16");
         assert_eq!(config.network.mtu, 1420);
         assert_eq!(config.network.netmask, "255.255.0.0");
+        #[cfg(target_os = "windows")]
+        assert_eq!(config.network.interface, "p2wlan");
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(config.network.interface, "p2pnet0");
         assert_eq!(config.network.udp_bind, "0.0.0.0:0");
         assert_eq!(config.network.udp_advertise, None);

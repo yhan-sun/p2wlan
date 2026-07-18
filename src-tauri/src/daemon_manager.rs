@@ -229,6 +229,33 @@ impl DaemonManager {
         Self::default_log_dir().join("p2pnet-daemon.pid")
     }
 
+    fn log_tail(path: &Path, max_lines: usize) -> Option<String> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let lines = raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+        let start = lines.len().saturating_sub(max_lines);
+        Some(lines[start..].join("\n"))
+    }
+
+    fn timeout_message_with_log(prefix: &str, log_path: &Path) -> String {
+        match Self::log_tail(log_path, 30) {
+            Some(tail) => format!(
+                "{prefix}\n日志文件：{}\n\n最近日志：\n{}",
+                log_path.display(),
+                tail
+            ),
+            None => format!(
+                "{prefix} 请查看日志：{}（当前没有读到日志内容）",
+                log_path.display()
+            ),
+        }
+    }
+
     fn read_pid_file(pid_path: &Path) -> Option<u32> {
         let raw = std::fs::read_to_string(pid_path).ok()?;
         raw.trim().parse::<u32>().ok()
@@ -858,9 +885,9 @@ impl DaemonManager {
             } else {
                 let mut state = self.state.lock().await;
                 state.elevated_started_by_app = false;
-                Err(format!(
-                    "已完成管理员授权，但守护进程未在 20 秒内响应诊断端点。请查看日志：{}",
-                    log_path.display()
+                Err(Self::timeout_message_with_log(
+                    "已完成管理员授权，但守护进程未在 20 秒内响应诊断端点。",
+                    &log_path,
                 ))
             }
         }
@@ -908,14 +935,14 @@ impl DaemonManager {
                 state.last_error = None;
             }
 
-            if Self::wait_for_endpoint(&target_url, Duration::from_secs(20)).await {
+            if Self::wait_for_endpoint(&target_url, Duration::from_secs(45)).await {
                 Ok("TUN 模式已通过 Windows 管理员权限启动。".to_string())
             } else {
                 let mut state = self.state.lock().await;
                 state.elevated_started_by_app = false;
-                Err(format!(
-                    "已完成 Windows 管理员授权，但守护进程未在 20 秒内响应诊断端点。请查看日志：{}",
-                    log_path.display()
+                Err(Self::timeout_message_with_log(
+                    "已完成 Windows 管理员授权，但守护进程未在 45 秒内响应诊断端点。",
+                    &log_path,
                 ))
             }
         }

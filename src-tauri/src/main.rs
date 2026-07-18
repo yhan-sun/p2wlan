@@ -1,10 +1,12 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod control_auth;
 mod daemon_manager;
 mod permissions;
 mod tray;
 
+use control_auth::{ControlAuthRequest, ControlAuthSession};
 use daemon_manager::{DaemonManager, DaemonStartOptions};
 use std::path::PathBuf;
 use tauri::{Manager, State};
@@ -48,6 +50,11 @@ async fn daemon_stop(
     diagnostics_url: Option<String>,
 ) -> Result<String, String> {
     state.daemon_manager.stop(diagnostics_url).await
+}
+
+#[tauri::command]
+async fn control_authenticate(request: ControlAuthRequest) -> Result<ControlAuthSession, String> {
+    control_auth::authenticate(request).await
 }
 
 #[tauri::command]
@@ -118,6 +125,7 @@ fn main() {
             daemon_start,
             daemon_start_elevated,
             daemon_stop,
+            control_authenticate,
             open_logs,
             permission_status
         ])
