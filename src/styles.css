@@ -205,11 +205,20 @@ select:focus-visible {
 .sidebar-footer {
   padding: 0.75rem 0.5rem;
   border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
-.logout-btn {
+.logout-btn,
+.quit-btn {
   justify-content: flex-start;
   color: var(--text-secondary);
+}
+
+.quit-btn:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in oklch, var(--danger) 36%, transparent);
 }
 
 .full-width {
@@ -746,6 +755,18 @@ select:focus-visible {
   gap: 0.75rem;
 }
 
+.banner-content {
+  min-width: 0;
+  flex: 1;
+}
+
+.banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+}
+
 .banner-error {
   background: var(--danger-light);
   border-color: rgba(239, 68, 68, 0.25);
@@ -771,6 +792,8 @@ select:focus-visible {
 
 .banner-desc {
   font-size: 0.825rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Tables */

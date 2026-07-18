@@ -23,6 +23,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -501,6 +502,15 @@ fn spawn_read_thread(
     })
 }
 
+fn hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 /// Set the IPv4 address and netmask on an interface using netsh.
 fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
     let prefix_len = u32::from(netmask).count_ones();
@@ -508,7 +518,7 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
 
     info!("Setting interface {name} address: {cidr}");
 
-    let output = std::process::Command::new("netsh")
+    let output = hidden_command("netsh")
         .args([
             "interface",
             "ipv4",
@@ -538,7 +548,7 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
 fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
     info!("Setting MTU for {name}: {mtu}");
 
-    let output = std::process::Command::new("netsh")
+    let output = hidden_command("netsh")
         .args([
             "interface",
             "ipv4",

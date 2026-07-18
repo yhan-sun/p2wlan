@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Activity,
   AlertTriangle,
+  FolderOpen,
   RefreshCw,
   Settings,
   ShieldCheck,
@@ -11,7 +12,9 @@ import {
 import ControlAuthPanel from "../components/ControlAuthPanel";
 import { StatusPill, zhLabel } from "../components/StatusPill";
 import { useClientStatus } from "../hooks/useClientStatus";
-import { getSettings } from "../lib/clientApi";
+import { getSettings, openLogs } from "../lib/clientApi";
+
+type ActionTone = "info" | "error";
 
 export default function DashboardPage() {
   const {
@@ -27,6 +30,7 @@ export default function DashboardPage() {
   } = useClientStatus();
   const [actionLoading, setActionLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [actionTone, setActionTone] = useState<ActionTone>("info");
   const [showControlAuth, setShowControlAuth] = useState(false);
   const navigate = useNavigate();
 
@@ -35,15 +39,18 @@ export default function DashboardPage() {
     setActionMessage(null);
     if (!getSettings().authToken.trim()) {
       setShowControlAuth(true);
+      setActionTone("error");
       setActionMessage("请先登录或注册控制面账号，再启动 TUN。");
       setActionLoading(false);
       return;
     }
     try {
       const msg = await connectElevated();
+      setActionTone("info");
       setActionMessage(msg);
       setShowControlAuth(false);
     } catch (err) {
+      setActionTone("error");
       setActionMessage(err instanceof Error ? err.message : "启动失败");
     } finally {
       setActionLoading(false);
@@ -55,11 +62,24 @@ export default function DashboardPage() {
     setActionMessage(null);
     try {
       const msg = await disconnect();
+      setActionTone("info");
       setActionMessage(msg);
     } catch (err) {
+      setActionTone("error");
       setActionMessage(err instanceof Error ? err.message : "停止失败");
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const handleOpenLogs = async () => {
+    setActionTone("info");
+    try {
+      const res = await openLogs();
+      setActionMessage(res.data.message);
+    } catch (err) {
+      setActionTone("error");
+      setActionMessage(err instanceof Error ? err.message : "无法打开日志目录");
     }
   };
 
@@ -115,18 +135,42 @@ export default function DashboardPage() {
             <span className="banner-title">{statusBanner.title}</span>
             <span className="banner-desc">{statusBanner.detail}</span>
           </div>
-          <button className="btn btn-ghost btn-xs text-danger" onClick={() => navigate("/diagnostics")}>
-            诊断
-          </button>
+          <div className="banner-actions">
+            <button className="btn btn-ghost btn-xs text-danger" onClick={() => navigate("/diagnostics")}>
+              诊断
+            </button>
+            <button className="btn btn-ghost btn-xs text-danger" onClick={handleOpenLogs}>
+              <FolderOpen size={12} />
+              日志
+            </button>
+          </div>
+        </div>
+      )}
+
+      {actionLoading && (
+        <div className="banner banner-info">
+          <ShieldCheck size={16} />
+          <div className="banner-content">
+            <span className="banner-title">等待系统授权</span>
+            <span className="banner-desc">
+              请确认 macOS 密码窗口或 Windows UAC 弹窗。Windows 弹窗可能在任务栏闪烁，确认后首次启动可能需要 30 到 45 秒。
+            </span>
+          </div>
         </div>
       )}
 
       {actionMessage && (
-        <div className="banner banner-info">
-          <Activity size={16} />
+        <div className={`banner banner-${actionTone === "error" ? "error" : "info"}`}>
+          {actionTone === "error" ? <AlertTriangle size={16} /> : <Activity size={16} />}
           <div className="banner-content">
             <span className="banner-desc">{actionMessage}</span>
           </div>
+          {actionTone === "error" && (
+            <button className="btn btn-ghost btn-xs text-danger" onClick={handleOpenLogs}>
+              <FolderOpen size={12} />
+              日志
+            </button>
+          )}
         </div>
       )}
 

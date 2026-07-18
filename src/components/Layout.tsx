@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from "react-router-dom";
 import { ReactNode, useEffect, useState } from "react";
-import { Activity, LayoutDashboard, Settings, LogOut } from "lucide-react";
-import { getDaemonStatus } from "../lib/clientApi";
+import { Activity, LayoutDashboard, Settings, LogOut, Power } from "lucide-react";
+import { getDaemonStatus, quitApp } from "../lib/clientApi";
 import { StatusPill, healthTone, zhLabel } from "./StatusPill";
 import type { DaemonStatus } from "../types/client";
 
@@ -92,6 +92,15 @@ export default function Layout({ children, onLogout }: LayoutProps) {
           >
             <LogOut size={14} />
             <span>退出登录</span>
+          </button>
+          <button
+            className="btn btn-ghost quit-btn full-width"
+            onClick={() => {
+              void quitApp();
+            }}
+          >
+            <Power size={14} />
+            <span>退出程序</span>
           </button>
         </div>
       </aside>
