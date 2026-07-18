@@ -780,6 +780,28 @@ export async function openLogs(): Promise<ApiResult<{ opened: boolean; message: 
   };
 }
 
+export async function quitApp(): Promise<ApiResult<{ message: string }>> {
+  if (isTauri()) {
+    try {
+      const res = await tryInvoke<string>("app_quit");
+      appendLog(`app quit requested: ${res}`);
+      return { data: { message: String(res) }, source: "live" };
+    } catch (err) {
+      appendLog(`app quit failed: ${err}`);
+      return {
+        data: { message: String(err) },
+        source: "fallback",
+        error: String(err),
+      };
+    }
+  }
+  return {
+    data: { message: "退出程序需要桌面客户端。" },
+    source: "fallback",
+    error: "浏览器模式无法退出桌面程序",
+  };
+}
+
 export async function getPermissionStatus(): Promise<ApiResult<PermissionStatus>> {
   if (isTauri()) {
     try {

@@ -114,18 +114,27 @@ export function useClientStatus(): ClientStatusState {
   const connect = useCallback(async () => {
     const result = await startDaemon();
     await refresh();
+    if (result.error || !result.data.started) {
+      throw new Error(result.data.message || result.error || "启动守护进程失败");
+    }
     return result.data.message;
   }, [refresh]);
 
   const connectElevated = useCallback(async () => {
     const result = await startDaemonElevated();
     await refresh();
+    if (result.error || !result.data.started) {
+      throw new Error(result.data.message || result.error || "提权启动 TUN 失败");
+    }
     return result.data.message;
   }, [refresh]);
 
   const disconnect = useCallback(async () => {
     const result = await stopDaemon();
     await refresh();
+    if (result.error || !result.data.stopped) {
+      throw new Error(result.data.message || result.error || "停止守护进程失败");
+    }
     return result.data.message;
   }, [refresh]);
 

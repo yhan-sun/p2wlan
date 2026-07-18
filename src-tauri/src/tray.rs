@@ -4,6 +4,17 @@ use tauri::{
     AppHandle, Manager,
 };
 
+pub fn quit_app(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        state.daemon_manager.cleanup();
+    }
+    app_handle.exit(0);
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        std::process::exit(0);
+    });
+}
+
 pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
     // 1. Build menu items
     let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
@@ -62,10 +73,7 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
                     }
                 }
                 "quit" => {
-                    if let Some(state) = app_handle.try_state::<crate::AppState>() {
-                        state.daemon_manager.cleanup();
-                    }
-                    app_handle.exit(0);
+                    quit_app(app_handle);
                 }
                 _ => {}
             }

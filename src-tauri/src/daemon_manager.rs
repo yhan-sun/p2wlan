@@ -256,6 +256,23 @@ impl DaemonManager {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn append_launcher_log(log_path: &Path, line: &str) -> Result<(), String> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("无法创建守护进程日志目录 {}: {e}", parent.display()))?;
+        }
+        let stamp = chrono_like_timestamp();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| format!("无法写入守护进程日志 {}: {e}", log_path.display()))?;
+        writeln!(file, "{stamp}  desktop-launcher: {line}")
+            .map_err(|e| format!("无法写入守护进程日志 {}: {e}", log_path.display()))
+    }
+
     fn read_pid_file(pid_path: &Path) -> Option<u32> {
         let raw = std::fs::read_to_string(pid_path).ok()?;
         raw.trim().parse::<u32>().ok()
@@ -264,6 +281,66 @@ impl DaemonManager {
     fn remove_pid_file(pid_path: &Path) {
         if pid_path.exists() {
             let _ = std::fs::remove_file(pid_path);
+        }
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(windows)]
+        {
+            let output = Self::windows_hidden_command("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output();
+            let Ok(output) = output else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().any(|line| {
+                line.contains(&format!("\",\"{pid}\",")) || line.contains(&format!(",\"{pid}\","))
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
+    fn process_name_matches_daemon(pid: u32) -> bool {
+        if let Some(command_line) = Self::process_command_line(pid) {
+            return command_line.contains("p2pnet-daemon");
+        }
+
+        #[cfg(windows)]
+        {
+            let output = Self::windows_hidden_command("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output();
+            let Ok(output) = output else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            stdout.contains("p2pnet-daemon.exe")
+        }
+
+        #[cfg(not(windows))]
+        {
+            false
         }
     }
 
@@ -285,7 +362,7 @@ impl DaemonManager {
             let script = format!(
                 "(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
             );
-            let output = Command::new("powershell.exe")
+            let output = Self::windows_hidden_command("powershell.exe")
                 .args(["-NoProfile", "-Command", &script])
                 .output();
             output
@@ -346,7 +423,7 @@ impl DaemonManager {
             let script = format!(
                 "$p = Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*p2pnet-daemon*' -and $_.CommandLine -like '*--diagnostics-bind*' -and $_.CommandLine -like '*{escaped_bind}*' }} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) {{ $p }}"
             );
-            let output = Command::new("powershell.exe")
+            let output = Self::windows_hidden_command("powershell.exe")
                 .args(["-NoProfile", "-Command", &script])
                 .output()
                 .ok()?;
@@ -366,10 +443,71 @@ impl DaemonManager {
         }
     }
 
+    fn find_single_daemon_pid() -> Option<u32> {
+        #[cfg(unix)]
+        {
+            let output = Command::new("ps")
+                .args(["ax", "-o", "pid=", "-o", "command="])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let current_pid = std::process::id();
+            let mut matches = Vec::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim_start();
+                let Some(split_at) = trimmed.find(char::is_whitespace) else {
+                    continue;
+                };
+                let Ok(pid) = trimmed[..split_at].trim().parse::<u32>() else {
+                    continue;
+                };
+                if pid == current_pid {
+                    continue;
+                }
+                let command_line = trimmed[split_at..].trim_start();
+                if command_line.contains("p2pnet-daemon") {
+                    matches.push(pid);
+                }
+            }
+            (matches.len() == 1).then_some(matches[0])
+        }
+
+        #[cfg(windows)]
+        {
+            let output = Self::windows_hidden_command("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'p2pnet-daemon.exe'\" | Select-Object -ExpandProperty ProcessId",
+                ])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let matches = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then_some(matches[0])
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
+
     fn terminate_pid(pid: u32) -> Result<(), String> {
         #[cfg(windows)]
         {
-            let output = Command::new("taskkill")
+            let output = Self::windows_hidden_command("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output()
                 .map_err(|e| format!("无法执行 taskkill: {e}"))?;
@@ -415,8 +553,9 @@ impl DaemonManager {
                 {
                     let shell = format!("kill {}", pid);
                     let script = format!(
-                        "do shell script \"{}\" with administrator privileges",
-                        Self::applescript_quote(&shell)
+                        "do shell script \"{}\" with administrator privileges with prompt \"{}\"",
+                        Self::applescript_quote(&shell),
+                        Self::applescript_quote("p2wlan 需要管理员权限以停止 TUN 守护进程。p2wlan 不会读取或保存你的密码。")
                     );
                     let output = Command::new("osascript")
                         .arg("-e")
@@ -479,11 +618,14 @@ impl DaemonManager {
         let Some(pid) = Self::read_pid_file(pid_path) else {
             return Ok(false);
         };
-        let Some(command_line) = Self::process_command_line(pid) else {
+        if !Self::process_exists(pid) {
             Self::remove_pid_file(pid_path);
             return Ok(false);
-        };
-        if !command_line.contains("p2pnet-daemon") {
+        }
+        let verified = Self::process_command_line(pid)
+            .map(|command_line| command_line.contains("p2pnet-daemon"))
+            .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
+        if !verified {
             Self::remove_pid_file(pid_path);
             return Err(format!(
                 "PID 文件指向的进程不是 p2pnet-daemon，已拒绝结束进程：{}",
@@ -596,6 +738,16 @@ impl DaemonManager {
     }
 
     #[cfg(target_os = "windows")]
+    fn windows_hidden_command(program: &str) -> Command {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut command = Command::new(program);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    #[cfg(target_os = "windows")]
     fn windows_wide_path(value: &Path) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
 
@@ -684,6 +836,45 @@ impl DaemonManager {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         false
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn wait_for_endpoint_or_pid_exit(
+        url: &str,
+        timeout: Duration,
+        pid_path: &Path,
+        log_path: &Path,
+    ) -> Result<(), String> {
+        let start_time = Instant::now();
+        let mut observed_pid = None;
+        while start_time.elapsed() < timeout {
+            if Self::check_endpoint(url).await {
+                return Ok(());
+            }
+            if let Some(pid) = Self::read_pid_file(pid_path) {
+                observed_pid = Some(pid);
+                if !Self::process_exists(pid) {
+                    Self::remove_pid_file(pid_path);
+                    return Err(Self::timeout_message_with_log(
+                        &format!(
+                            "守护进程已获得系统授权，但进程很快退出（PID {pid}），诊断端点未响应。"
+                        ),
+                        log_path,
+                    ));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let prefix = match observed_pid {
+            Some(pid) => format!(
+                "已完成系统授权，守护进程仍在运行（PID {pid}），但 {timeout:?} 内未响应诊断端点。"
+            ),
+            None => {
+                format!("已完成系统授权，但没有读到守护进程 PID，{timeout:?} 内也未响应诊断端点。")
+            }
+        };
+        Err(Self::timeout_message_with_log(&prefix, log_path))
     }
 
     pub async fn start(&self, options: Option<DaemonStartOptions>) -> Result<String, String> {
@@ -850,8 +1041,9 @@ impl DaemonManager {
                 &pid_path,
             );
             let script = format!(
-                "do shell script \"{}\" with administrator privileges",
-                Self::applescript_quote(&shell)
+                "do shell script \"{}\" with administrator privileges with prompt \"{}\"",
+                Self::applescript_quote(&shell),
+                Self::applescript_quote("p2wlan 需要管理员权限以创建虚拟网卡并安装 Overlay 路由。p2wlan 不会读取或保存你的密码。")
             );
 
             let output = Command::new("osascript")
@@ -924,6 +1116,15 @@ impl DaemonManager {
             args.push("--log-file".to_string());
             args.push(log_path.display().to_string());
 
+            Self::append_launcher_log(
+                &log_path,
+                &format!(
+                    "launching {} with diagnostics {} and interface {}",
+                    bin_path.display(),
+                    bind_addr,
+                    options.tun_interface.as_deref().unwrap_or("(default)")
+                ),
+            )?;
             Self::launch_windows_elevated_daemon(&bin_path, &args, &log_dir, &pid_path)?;
 
             {
@@ -935,15 +1136,23 @@ impl DaemonManager {
                 state.last_error = None;
             }
 
-            if Self::wait_for_endpoint(&target_url, Duration::from_secs(45)).await {
-                Ok("TUN 模式已通过 Windows 管理员权限启动。".to_string())
-            } else {
-                let mut state = self.state.lock().await;
-                state.elevated_started_by_app = false;
-                Err(Self::timeout_message_with_log(
-                    "已完成 Windows 管理员授权，但守护进程未在 45 秒内响应诊断端点。",
-                    &log_path,
-                ))
+            match Self::wait_for_endpoint_or_pid_exit(
+                &target_url,
+                Duration::from_secs(45),
+                &pid_path,
+                &log_path,
+            )
+            .await
+            {
+                Ok(()) => {
+                    Self::append_launcher_log(&log_path, "diagnostics endpoint is ready")?;
+                    Ok("TUN 模式已通过 Windows 管理员权限启动。".to_string())
+                }
+                Err(err) => {
+                    let mut state = self.state.lock().await;
+                    state.elevated_started_by_app = false;
+                    Err(err)
+                }
             }
         }
 
@@ -976,6 +1185,12 @@ impl DaemonManager {
         if !terminated {
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
+                Self::terminate_pid_with_system_authorization(pid)?;
+                terminated = true;
+            }
+        }
+        if !terminated {
+            if let Some(pid) = Self::find_single_daemon_pid() {
                 Self::terminate_pid_with_system_authorization(pid)?;
                 terminated = true;
             }
@@ -1018,6 +1233,16 @@ impl DaemonManager {
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn chrono_like_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format!("unix:{secs}")
 }
 
 #[cfg(test)]

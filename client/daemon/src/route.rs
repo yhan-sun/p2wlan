@@ -309,19 +309,11 @@ impl RouteManager {
         }
 
         info!("Adding Windows route for {destination_prefix} via {interface}");
-        let status = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &format!(
-                    "New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
-                    ps_quote(&destination_prefix),
-                    ps_quote(&interface)
-                ),
-            ])
+        let status = windows_powershell_command(&format!(
+            "New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
+            ps_quote(&destination_prefix),
+            ps_quote(&interface)
+        ))
             .status()
             .map_err(|e| crate::DaemonError::Network(format!("failed to run New-NetRoute: {e}")))?;
 
@@ -354,19 +346,11 @@ impl RouteManager {
             let destination_prefix = format!("{}/{}", network, ip_mask_to_prefix(mask));
             let interface = self.interface();
             info!("Cleaning up Windows route for {destination_prefix} via {interface}");
-            let _ = Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    &format!(
-                        "Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
-                        ps_quote(&destination_prefix),
-                        ps_quote(&interface)
-                    ),
-                ])
+            let _ = windows_powershell_command(&format!(
+                "Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
+                ps_quote(&destination_prefix),
+                ps_quote(&interface)
+            ))
                 .status();
         }
     }
@@ -374,18 +358,10 @@ impl RouteManager {
 
 #[cfg(target_os = "windows")]
 fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                "Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias",
-                ps_quote(destination_prefix)
-            ),
-        ])
+    let output = windows_powershell_command(&format!(
+        "Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias",
+        ps_quote(destination_prefix)
+    ))
         .output()
         .map_err(|e| crate::DaemonError::Network(format!("failed to run Get-NetRoute: {e}")))?;
 
@@ -407,6 +383,23 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
 #[cfg(target_os = "windows")]
 fn ps_quote(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell_command(script: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut command = Command::new("powershell.exe");
+    command.creation_flags(CREATE_NO_WINDOW).args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
+    command
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

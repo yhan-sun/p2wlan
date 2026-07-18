@@ -101,6 +101,12 @@ fn open_logs() -> Result<String, String> {
         .map_err(|e| format!("打开日志目录失败：{}", e))
 }
 
+#[tauri::command]
+fn app_quit(app: tauri::AppHandle) -> Result<String, String> {
+    tray::quit_app(&app);
+    Ok("正在退出 p2wlan。".to_string())
+}
+
 fn main() {
     let daemon_manager = DaemonManager::new();
     let app_state = AppState { daemon_manager };
@@ -127,7 +133,8 @@ fn main() {
             daemon_stop,
             control_authenticate,
             open_logs,
-            permission_status
+            permission_status,
+            app_quit
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

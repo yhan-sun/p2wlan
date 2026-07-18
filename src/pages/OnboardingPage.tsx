@@ -63,6 +63,9 @@ export default function OnboardingPage() {
     }
     try {
       const res = await startDaemonElevated();
+      if (res.error || !res.data.started) {
+        throw new Error(res.data.message || res.error || "提权启动失败");
+      }
       setStartMessage(res.data.message);
       setShowControlAuth(false);
       await runChecks();
