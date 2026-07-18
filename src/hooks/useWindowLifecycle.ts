@@ -29,6 +29,7 @@ export function useWindowLifecycle() {
         }
 
         try {
+          await appWindow.hide();
           await quitApp();
         } catch (err) {
           console.error("Failed to quit p2wlan from close request", err);

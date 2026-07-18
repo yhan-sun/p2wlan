@@ -9,11 +9,14 @@
 import {
   type ApiResult,
   type ClientSettings,
+  type ClientStatusSnapshot,
   type CloseBehavior,
+  type DaemonOperationStatus,
   type DaemonStatus,
   type DiagnosticCheck,
   type DiagnosticsReport,
   type DiagnosticsSnapshot,
+  type DesktopStatus,
   type PeerDiagnostics,
   type PeerStatus,
   type RouteStatus,
@@ -21,6 +24,7 @@ import {
   type PermissionStatus,
   DEFAULT_SETTINGS,
   stoppedDaemonStatus,
+  stoppedOperationStatus,
 } from "../types/client";
 
 const SETTINGS_KEY = "p2wlan.client.settings";
@@ -49,8 +53,35 @@ interface AuthResponseBody {
   error?: string;
 }
 
-function isTauri(): boolean {
+export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function daemonStartOptions(settings: ClientSettings) {
+  return {
+    diagnosticsUrl: settings.diagnosticsUrl,
+    controlServer: settings.controlServer,
+    authToken: settings.authToken,
+    networkId: settings.networkId,
+    deviceName: settings.deviceName,
+    tunInterface: settings.tunInterface,
+    mtu: settings.mtu,
+  };
+}
+
+export async function configureDaemon(): Promise<DaemonOperationStatus | null> {
+  if (!isTauri()) return null;
+  const settings = getSettings();
+  return tryInvoke<DaemonOperationStatus>("daemon_configure", {
+    options: daemonStartOptions(settings),
+  });
+}
+
+export function clearControlSession(): void {
+  const settings = getSettings();
+  saveSettings({ ...settings, authToken: "" });
+  localStorage.removeItem("token");
+  void configureDaemon();
 }
 
 async function tryInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
@@ -417,108 +448,152 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
   };
 }
 
-export async function getDaemonStatus(): Promise<ApiResult<DaemonStatus>> {
+function tunnelFromDaemon(
+  daemon: DaemonStatus,
+  settings: ClientSettings,
+  source: ApiResult<unknown>["source"]
+): TunnelStatus {
+  const running = daemon.lifecycle === "running" && daemon.reachable;
+  return {
+    interfaceName: settings.tunInterface,
+    mtu: settings.mtu,
+    cidr: settings.overlayCidr,
+    virtualIp: daemon.virtualIp,
+    udpBind: daemon.udpLocalAddr,
+    installed: running && Boolean(daemon.virtualIp),
+    up: running,
+    source,
+  };
+}
+
+function routeFromDaemon(daemon: DaemonStatus, settings: ClientSettings): RouteStatus {
+  const running = daemon.lifecycle === "running" && daemon.reachable;
+  const state = running ? (daemon.virtualIp ? "installed" : "missing") : "unknown";
+  return {
+    overlayCidr: settings.overlayCidr,
+    interfaceName: settings.tunInterface,
+    entries: [
+      {
+        destination: settings.overlayCidr,
+        interfaceName: settings.tunInterface,
+        state,
+        detail: running
+          ? daemon.virtualIp
+            ? "守护进程健康，Overlay 路由按已安装处理"
+            : "守护进程运行中，但尚未分配虚拟 IP"
+          : "守护进程离线，路由状态未知",
+      },
+    ],
+    lastError: daemon.lastError,
+    source: "fallback",
+  };
+}
+
+function daemonFromDesktopStatus(
+  desktop: DesktopStatus,
+  settings: ClientSettings
+): DaemonStatus {
+  if (desktop.diagnostics) {
+    return mapSnapshotToDaemonStatus(desktop.diagnostics, settings);
+  }
+
+  const error = desktop.operation.phase === "error" ? desktop.operation.lastError ?? desktop.operation.message : undefined;
+  const daemon = stoppedDaemonStatus(settings, error);
+  if (
+    desktop.operation.phase === "authorizing" ||
+    desktop.operation.phase === "launching" ||
+    desktop.operation.phase === "waiting_for_daemon" ||
+    desktop.operation.phase === "stopping"
+  ) {
+    daemon.lifecycle = "unknown";
+    daemon.healthStatus = "degraded";
+    daemon.healthReason = desktop.operation.message;
+    daemon.lastError = null;
+  }
+  return daemon;
+}
+
+export function clientStatusFromDesktopStatus(desktop: DesktopStatus): ClientStatusSnapshot {
   const settings = getSettings();
+  const daemon = daemonFromDesktopStatus(desktop, settings);
+  const source = desktop.diagnostics ? "live" : isTauri() ? "cached" : "fallback";
+  const error =
+    desktop.operation.phase === "error"
+      ? desktop.operation.lastError ?? desktop.operation.message
+      : undefined;
+
+  return {
+    daemon,
+    peers: desktop.diagnostics?.peers.map(mapPeer) ?? [],
+    tunnel: tunnelFromDaemon(daemon, settings, source),
+    route: routeFromDaemon(daemon, settings),
+    operation: desktop.operation,
+    source,
+    error,
+  };
+}
+
+export async function getClientStatusSnapshot(): Promise<ClientStatusSnapshot> {
+  const settings = getSettings();
+  let desktop: DesktopStatus;
 
   if (isTauri()) {
     try {
-      const fromTauri = await tryInvoke<DiagnosticsSnapshot>("daemon_status", {
-        diagnosticsUrl: settings.diagnosticsUrl,
-      });
-      if (fromTauri) {
-        return { data: mapSnapshotToDaemonStatus(fromTauri, settings), source: "live" };
-      }
-    } catch (err) {
-      return {
-        data: stoppedDaemonStatus(settings, String(err)),
-        source: "fallback",
-        error: String(err),
+      desktop =
+        (await tryInvoke<DesktopStatus>("desktop_status", {
+          diagnosticsUrl: settings.diagnosticsUrl,
+        })) ?? {
+          operation: stoppedOperationStatus(),
+          diagnostics: null,
+        };
+    } catch (error) {
+      const message = String(error);
+      desktop = {
+        operation: {
+          ...stoppedOperationStatus(),
+          phase: "error",
+          message: "无法读取桌面状态",
+          lastError: message,
+        },
+        diagnostics: null,
       };
     }
+  } else {
+    const diagnostics = await fetchDiagnosticsSnapshot(settings.diagnosticsUrl);
+    desktop = {
+      operation: diagnostics
+        ? {
+            phase: "running",
+            message: "TUN 已连接",
+            startedAtMs: Date.now(),
+            lastError: null,
+          }
+        : stoppedOperationStatus(),
+      diagnostics,
+    };
   }
 
-  const snapshot = await fetchDiagnosticsSnapshot(settings.diagnosticsUrl);
-  if (snapshot) {
-    return { data: mapSnapshotToDaemonStatus(snapshot, settings), source: "live" };
-  }
+  return clientStatusFromDesktopStatus(desktop);
+}
 
-  return {
-    data: stoppedDaemonStatus(settings, "诊断端点不可访问"),
-    source: "fallback",
-    error: "诊断端点不可访问",
-  };
+export async function getDaemonStatus(): Promise<ApiResult<DaemonStatus>> {
+  const snapshot = await getClientStatusSnapshot();
+  return { data: snapshot.daemon, source: snapshot.source, error: snapshot.error };
 }
 
 export async function listPeers(): Promise<ApiResult<PeerStatus[]>> {
-  const settings = getSettings();
-  const snapshot = await fetchDiagnosticsSnapshot(settings.diagnosticsUrl);
-  if (!snapshot) {
-    return {
-      data: [],
-      source: "fallback",
-      error: "诊断端点不可访问",
-    };
-  }
-  return {
-    data: snapshot.peers.map(mapPeer),
-    source: "live",
-  };
+  const snapshot = await getClientStatusSnapshot();
+  return { data: snapshot.peers, source: snapshot.source, error: snapshot.error };
 }
 
 export async function getTunnelStatus(): Promise<ApiResult<TunnelStatus>> {
-  const settings = getSettings();
-  const status = await getDaemonStatus();
-  const running = status.data.lifecycle === "running" && status.data.reachable;
-  return {
-    data: {
-      interfaceName: settings.tunInterface,
-      mtu: settings.mtu,
-      cidr: settings.overlayCidr,
-      virtualIp: status.data.virtualIp,
-      udpBind: status.data.udpLocalAddr,
-      installed: running && Boolean(status.data.virtualIp),
-      up: running,
-      source: status.source,
-    },
-    source: status.source,
-    error: status.error,
-  };
+  const snapshot = await getClientStatusSnapshot();
+  return { data: snapshot.tunnel, source: snapshot.source, error: snapshot.error };
 }
 
 export async function getRouteStatus(): Promise<ApiResult<RouteStatus>> {
-  const settings = getSettings();
-  const status = await getDaemonStatus();
-  const running = status.data.lifecycle === "running" && status.data.reachable;
-  const entryState = running
-    ? status.data.virtualIp
-      ? "installed"
-      : "missing"
-    : "unknown";
-  return {
-    data: {
-      overlayCidr: settings.overlayCidr,
-      interfaceName: settings.tunInterface,
-      entries: [
-        {
-          destination: settings.overlayCidr,
-          interfaceName: settings.tunInterface,
-          state: entryState,
-          detail: running
-            ? status.data.virtualIp
-              ? "守护进程健康，Overlay 路由按已安装处理"
-              : "守护进程运行中，但尚未分配虚拟 IP"
-            : "守护进程离线，路由状态未知",
-        },
-      ],
-      lastError: status.data.lastError,
-      source: status.source === "live" ? "fallback" : "fallback",
-    },
-    source: "fallback",
-    error:
-      status.source === "live"
-        ? "诊断 API 尚未暴露真实路由生命周期，当前显示推断状态"
-        : status.error,
-  };
+  const snapshot = await getClientStatusSnapshot();
+  return { data: snapshot.route, source: "fallback", error: snapshot.error };
 }
 
 export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
@@ -711,18 +786,12 @@ export async function startDaemonElevated(): Promise<ApiResult<{ started: boolea
   const settings = getSettings();
   if (isTauri()) {
     try {
-      const options = {
-        diagnosticsUrl: settings.diagnosticsUrl,
-        controlServer: settings.controlServer,
-        authToken: settings.authToken,
-        networkId: settings.networkId,
-        deviceName: settings.deviceName,
-        tunInterface: settings.tunInterface,
-        mtu: settings.mtu,
-      };
-      const res = await tryInvoke<string>("daemon_start_elevated", { options });
-      appendLog(`daemon elevated start succeeded: ${res}`);
-      return { data: { started: true, message: String(res) }, source: "live" };
+      const operation = await tryInvoke<DaemonOperationStatus>("daemon_start_elevated", {
+        options: daemonStartOptions(settings),
+      });
+      const message = operation?.message ?? "已请求系统授权。";
+      appendLog(`daemon elevated start requested: ${message}`);
+      return { data: { started: true, message }, source: "live" };
     } catch (err) {
       appendLog(`daemon elevated start failed: ${err}`);
       return {
@@ -746,11 +815,12 @@ export async function stopDaemon(): Promise<ApiResult<{ stopped: boolean; messag
   const settings = getSettings();
   if (isTauri()) {
     try {
-      const res = await tryInvoke<string>("daemon_stop", {
+      const operation = await tryInvoke<DaemonOperationStatus>("daemon_stop", {
         diagnosticsUrl: settings.diagnosticsUrl,
       });
-      appendLog(`daemon stop succeeded: ${res}`);
-      return { data: { stopped: true, message: String(res) }, source: "live" };
+      const message = operation?.message ?? "正在停止 TUN。";
+      appendLog(`daemon stop requested: ${message}`);
+      return { data: { stopped: true, message }, source: "live" };
     } catch (err) {
       appendLog(`daemon stop failed: ${err}`);
       return {

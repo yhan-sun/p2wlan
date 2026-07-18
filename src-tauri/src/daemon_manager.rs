@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 
@@ -17,12 +17,63 @@ pub struct DaemonStartOptions {
     pub mtu: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonOperationPhase {
+    Stopped,
+    Authorizing,
+    Launching,
+    WaitingForDaemon,
+    Running,
+    Stopping,
+    Error,
+}
+
+impl DaemonOperationPhase {
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Authorizing | Self::Launching | Self::WaitingForDaemon | Self::Stopping
+        )
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonOperationStatus {
+    pub phase: DaemonOperationPhase,
+    pub message: String,
+    pub started_at_ms: u64,
+    pub last_error: Option<String>,
+}
+
+impl DaemonOperationStatus {
+    fn stopped() -> Self {
+        Self {
+            phase: DaemonOperationPhase::Stopped,
+            message: "TUN 未启动".to_string(),
+            started_at_ms: now_ms(),
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStatus {
+    pub operation: DaemonOperationStatus,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
 pub struct ManagedDaemonState {
     pub child: Option<Child>,
     pub started_by_app: bool,
     pub elevated_started_by_app: bool,
     pub diagnostics_url: String,
     pub last_error: Option<String>,
+    pub operation: DaemonOperationStatus,
+    pub last_start_options: Option<DaemonStartOptions>,
+    pub consecutive_status_failures: u8,
 }
 
 impl ManagedDaemonState {
@@ -33,8 +84,18 @@ impl ManagedDaemonState {
             elevated_started_by_app: false,
             diagnostics_url: "http://127.0.0.1:39277/status".to_string(),
             last_error: None,
+            operation: DaemonOperationStatus::stopped(),
+            last_start_options: None,
+            consecutive_status_failures: 0,
         }
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -47,6 +108,159 @@ impl DaemonManager {
         Self {
             state: Arc::new(Mutex::new(ManagedDaemonState::new())),
         }
+    }
+
+    async fn set_operation(
+        &self,
+        phase: DaemonOperationPhase,
+        message: impl Into<String>,
+        last_error: Option<String>,
+    ) -> DaemonOperationStatus {
+        let mut state = self.state.lock().await;
+        state.operation = DaemonOperationStatus {
+            phase,
+            message: message.into(),
+            started_at_ms: now_ms(),
+            last_error,
+        };
+        if matches!(
+            phase,
+            DaemonOperationPhase::Running | DaemonOperationPhase::Stopped
+        ) {
+            state.consecutive_status_failures = 0;
+        }
+        state.operation.clone()
+    }
+
+    pub async fn operation_status(&self) -> DaemonOperationStatus {
+        self.state.lock().await.operation.clone()
+    }
+
+    pub async fn configure(&self, options: DaemonStartOptions) -> DaemonOperationStatus {
+        let mut state = self.state.lock().await;
+        if let Some(url) = options.diagnostics_url.as_ref() {
+            state.diagnostics_url = url.clone();
+        }
+        state.last_start_options = Some(options);
+        state.operation.clone()
+    }
+
+    pub async fn desktop_status(&self, diagnostics_url: Option<String>) -> DesktopStatus {
+        let target_url = match diagnostics_url {
+            Some(url) => url,
+            None => self.state.lock().await.diagnostics_url.clone(),
+        };
+        let diagnostics = self.status(Some(target_url)).await.ok();
+
+        if diagnostics.is_some() {
+            let mut state = self.state.lock().await;
+            state.consecutive_status_failures = 0;
+            if !state.operation.phase.is_busy()
+                && state.operation.phase != DaemonOperationPhase::Running
+            {
+                state.operation = DaemonOperationStatus {
+                    phase: DaemonOperationPhase::Running,
+                    message: "TUN 已连接".to_string(),
+                    started_at_ms: now_ms(),
+                    last_error: None,
+                };
+            }
+        } else {
+            let mut state = self.state.lock().await;
+            if state.operation.phase == DaemonOperationPhase::Running {
+                state.consecutive_status_failures =
+                    state.consecutive_status_failures.saturating_add(1);
+                if state.consecutive_status_failures >= 3 {
+                    state.operation = DaemonOperationStatus {
+                        phase: DaemonOperationPhase::Error,
+                        message: "守护进程未响应".to_string(),
+                        started_at_ms: now_ms(),
+                        last_error: Some("连续 3 次无法访问本地诊断端点".to_string()),
+                    };
+                }
+            }
+        }
+
+        DesktopStatus {
+            operation: self.operation_status().await,
+            diagnostics,
+        }
+    }
+
+    pub async fn begin_start_elevated(
+        &self,
+        options: Option<DaemonStartOptions>,
+    ) -> Result<DaemonOperationStatus, String> {
+        let resolved_options = {
+            let mut state = self.state.lock().await;
+            if state.operation.phase.is_busy() {
+                return Err(format!("当前正在{}，请稍候。", state.operation.message));
+            }
+            let options = options
+                .or_else(|| state.last_start_options.clone())
+                .ok_or_else(|| "请先打开控制台并登录，再从托盘启动 TUN。".to_string())?;
+            if options
+                .auth_token
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err("请先打开控制台并登录，再启动 TUN。".to_string());
+            }
+            if let Some(url) = options.diagnostics_url.as_ref() {
+                state.diagnostics_url = url.clone();
+            }
+            state.last_start_options = Some(options.clone());
+            state.operation = DaemonOperationStatus {
+                phase: DaemonOperationPhase::Authorizing,
+                message: "等待系统授权".to_string(),
+                started_at_ms: now_ms(),
+                last_error: None,
+            };
+            options
+        };
+
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = manager.start_elevated(Some(resolved_options)).await {
+                manager
+                    .set_operation(DaemonOperationPhase::Error, "TUN 启动失败", Some(error))
+                    .await;
+            }
+        });
+
+        Ok(self.operation_status().await)
+    }
+
+    pub async fn begin_stop(
+        &self,
+        diagnostics_url: Option<String>,
+    ) -> Result<DaemonOperationStatus, String> {
+        {
+            let state = self.state.lock().await;
+            if state.operation.phase.is_busy()
+                && state.operation.phase != DaemonOperationPhase::Stopping
+            {
+                return Err(format!("当前正在{}，请稍候。", state.operation.message));
+            }
+            if state.operation.phase == DaemonOperationPhase::Stopping {
+                return Ok(state.operation.clone());
+            }
+        }
+
+        let status = self
+            .set_operation(DaemonOperationPhase::Stopping, "正在停止 TUN", None)
+            .await;
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = manager.stop(diagnostics_url).await {
+                manager
+                    .set_operation(DaemonOperationPhase::Error, "TUN 停止失败", Some(error))
+                    .await;
+            }
+        });
+        Ok(status)
     }
 
     pub fn resolve_daemon_binary(env_var: Option<&str>, current_dir: &Path) -> Option<PathBuf> {
@@ -954,6 +1168,17 @@ impl DaemonManager {
         false
     }
 
+    async fn wait_for_endpoint_down(url: &str, timeout: Duration) -> bool {
+        let start_time = Instant::now();
+        while start_time.elapsed() < timeout {
+            if !Self::check_endpoint(url).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        !Self::check_endpoint(url).await
+    }
+
     #[cfg(target_os = "windows")]
     async fn wait_for_endpoint_or_pid_exit(
         url: &str,
@@ -1123,6 +1348,8 @@ impl DaemonManager {
         };
 
         if Self::check_endpoint(&target_url).await {
+            self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+                .await;
             return Ok("守护进程已经运行。".to_string());
         }
         if options
@@ -1137,6 +1364,12 @@ impl DaemonManager {
 
         #[cfg(target_os = "macos")]
         {
+            self.set_operation(
+                DaemonOperationPhase::Authorizing,
+                "等待 macOS 系统授权",
+                None,
+            )
+            .await;
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
                 .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。".to_string())?;
@@ -1162,11 +1395,12 @@ impl DaemonManager {
                 Self::applescript_quote("p2wlan 需要管理员权限以创建虚拟网卡并安装 Overlay 路由。p2wlan 不会读取或保存你的密码。")
             );
 
-            let output = Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .map_err(|e| format!("无法打开系统授权弹窗：{e}"))?;
+            let output = tokio::task::spawn_blocking(move || {
+                Command::new("osascript").arg("-e").arg(script).output()
+            })
+            .await
+            .map_err(|e| format!("系统授权任务异常结束：{e}"))?
+            .map_err(|e| format!("无法打开系统授权弹窗：{e}"))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 if stderr.contains("-128") {
@@ -1179,6 +1413,13 @@ impl DaemonManager {
                 });
             }
 
+            self.set_operation(
+                DaemonOperationPhase::WaitingForDaemon,
+                "正在连接控制面并创建 TUN",
+                None,
+            )
+            .await;
+
             {
                 let mut state = self.state.lock().await;
                 state.child = None;
@@ -1189,6 +1430,8 @@ impl DaemonManager {
             }
 
             if Self::wait_for_endpoint(&target_url, Duration::from_secs(20)).await {
+                self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+                    .await;
                 Ok("TUN 模式已通过管理员权限启动。".to_string())
             } else {
                 let mut state = self.state.lock().await;
@@ -1202,6 +1445,12 @@ impl DaemonManager {
 
         #[cfg(target_os = "windows")]
         {
+            self.set_operation(
+                DaemonOperationPhase::Authorizing,
+                "等待 Windows 管理员授权",
+                None,
+            )
+            .await;
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
                 .ok_or_else(|| "找不到 p2pnet-daemon.exe 可执行文件。".to_string())?;
@@ -1243,6 +1492,13 @@ impl DaemonManager {
             )?;
             Self::launch_windows_elevated_daemon(&bin_path, &args, &log_dir, &pid_path)?;
 
+            self.set_operation(
+                DaemonOperationPhase::WaitingForDaemon,
+                "正在初始化 Wintun 并连接控制面",
+                None,
+            )
+            .await;
+
             {
                 let mut state = self.state.lock().await;
                 state.child = None;
@@ -1262,6 +1518,8 @@ impl DaemonManager {
             {
                 Ok(()) => {
                     Self::append_launcher_log(&log_path, "diagnostics endpoint is ready")?;
+                    self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+                        .await;
                     Ok("TUN 模式已通过 Windows 管理员权限启动。".to_string())
                 }
                 Err(err) => {
@@ -1279,6 +1537,8 @@ impl DaemonManager {
     }
 
     pub async fn stop(&self, diagnostics_url: Option<String>) -> Result<String, String> {
+        self.set_operation(DaemonOperationPhase::Stopping, "正在停止 TUN", None)
+            .await;
         let target_url = {
             let state = self.state.lock().await;
             diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
@@ -1292,17 +1552,21 @@ impl DaemonManager {
                 state.started_by_app = false;
                 state.elevated_started_by_app = false;
                 Self::remove_pid_file(&Self::default_pid_path());
+                state.operation = DaemonOperationStatus::stopped();
+                state.consecutive_status_failures = 0;
                 return Ok("守护进程已停止。".to_string());
             }
         }
 
         if Self::request_daemon_shutdown(&target_url).await
-            && !Self::wait_for_endpoint(&target_url, Duration::from_secs(8)).await
+            && Self::wait_for_endpoint_down(&target_url, Duration::from_secs(2)).await
         {
             let mut state = self.state.lock().await;
             state.started_by_app = false;
             state.elevated_started_by_app = false;
             Self::remove_pid_file(&Self::default_pid_path());
+            state.operation = DaemonOperationStatus::stopped();
+            state.consecutive_status_failures = 0;
             return Ok("已停止 TUN 守护进程。".to_string());
         }
 
@@ -1334,16 +1598,20 @@ impl DaemonManager {
             }
         }
 
-        let mut stopped = !Self::wait_for_endpoint(&target_url, Duration::from_secs(4)).await;
+        let mut stopped = Self::wait_for_endpoint_down(&target_url, Duration::from_secs(3)).await;
         if !stopped {
             terminated = Self::terminate_daemons_by_name_with_system_authorization()? || terminated;
-            stopped = !Self::wait_for_endpoint(&target_url, Duration::from_secs(8)).await;
+            stopped = Self::wait_for_endpoint_down(&target_url, Duration::from_secs(3)).await;
         }
 
         {
             let mut state = self.state.lock().await;
             state.started_by_app = false;
             state.elevated_started_by_app = false;
+            if stopped {
+                state.operation = DaemonOperationStatus::stopped();
+                state.consecutive_status_failures = 0;
+            }
         }
 
         if terminated && stopped {
@@ -1391,6 +1659,118 @@ fn chrono_like_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_options(diagnostics_url: String) -> DaemonStartOptions {
+        DaemonStartOptions {
+            diagnostics_url: Some(diagnostics_url),
+            control_server: Some("http://127.0.0.1:18080".to_string()),
+            auth_token: Some("test-token".to_string()),
+            network_id: Some("test-network".to_string()),
+            device_name: Some("test-device".to_string()),
+            tun_interface: Some("p2wlan-test".to_string()),
+            mtu: Some(1420),
+        }
+    }
+
+    async fn status_server_once(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}/status")
+    }
+
+    fn unused_local_status_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}/status")
+    }
+
+    #[test]
+    fn operation_phase_busy_states_are_explicit() {
+        assert!(!DaemonOperationPhase::Stopped.is_busy());
+        assert!(DaemonOperationPhase::Authorizing.is_busy());
+        assert!(DaemonOperationPhase::Launching.is_busy());
+        assert!(DaemonOperationPhase::WaitingForDaemon.is_busy());
+        assert!(DaemonOperationPhase::Stopping.is_busy());
+        assert!(!DaemonOperationPhase::Running.is_busy());
+        assert!(!DaemonOperationPhase::Error.is_busy());
+    }
+
+    #[tokio::test]
+    async fn configure_updates_runtime_profile_without_persisting_to_disk() {
+        let manager = DaemonManager::new();
+        let diagnostics_url = unused_local_status_url();
+        let operation = manager
+            .configure(test_options(diagnostics_url.clone()))
+            .await;
+
+        assert_eq!(operation.phase, DaemonOperationPhase::Stopped);
+        let state = manager.state.lock().await;
+        assert_eq!(state.diagnostics_url, diagnostics_url);
+        let options = state.last_start_options.as_ref().unwrap();
+        assert_eq!(options.auth_token.as_deref(), Some("test-token"));
+        assert_eq!(options.device_name.as_deref(), Some("test-device"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_down_accepts_an_unreachable_listener() {
+        assert!(
+            DaemonManager::wait_for_endpoint_down(
+                &unused_local_status_url(),
+                Duration::from_millis(100)
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_status_promotes_an_external_live_daemon_to_running() {
+        let manager = DaemonManager::new();
+        let url = status_server_once(r#"{"process_id":1234}"#).await;
+
+        let status = manager.desktop_status(Some(url)).await;
+
+        assert!(status.diagnostics.is_some());
+        assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+        assert_eq!(status.operation.message, "TUN 已连接");
+    }
+
+    #[tokio::test]
+    async fn desktop_status_requires_three_failures_before_marking_running_daemon_error() {
+        let manager = DaemonManager::new();
+        manager
+            .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+            .await;
+        let url = unused_local_status_url();
+
+        for expected_failures in 1..=2 {
+            let status = manager.desktop_status(Some(url.clone())).await;
+            assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+            assert_eq!(
+                manager.state.lock().await.consecutive_status_failures,
+                expected_failures
+            );
+        }
+
+        let status = manager.desktop_status(Some(url)).await;
+        assert_eq!(status.operation.phase, DaemonOperationPhase::Error);
+        assert_eq!(
+            status.operation.last_error.as_deref(),
+            Some("连续 3 次无法访问本地诊断端点")
+        );
+    }
 
     #[test]
     fn test_resolve_daemon_binary_priority() {

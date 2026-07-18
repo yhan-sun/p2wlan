@@ -7,7 +7,7 @@ mod permissions;
 mod tray;
 
 use control_auth::{ControlAuthRequest, ControlAuthSession};
-use daemon_manager::{DaemonManager, DaemonStartOptions};
+use daemon_manager::{DaemonManager, DaemonOperationStatus, DaemonStartOptions, DesktopStatus};
 use std::path::PathBuf;
 use tauri::{Manager, State};
 
@@ -29,6 +29,22 @@ async fn daemon_status(
 }
 
 #[tauri::command]
+async fn desktop_status(
+    state: State<'_, AppState>,
+    diagnostics_url: Option<String>,
+) -> Result<DesktopStatus, String> {
+    Ok(state.daemon_manager.desktop_status(diagnostics_url).await)
+}
+
+#[tauri::command]
+async fn daemon_configure(
+    state: State<'_, AppState>,
+    options: DaemonStartOptions,
+) -> Result<DaemonOperationStatus, String> {
+    Ok(state.daemon_manager.configure(options).await)
+}
+
+#[tauri::command]
 async fn daemon_start(
     state: State<'_, AppState>,
     options: Option<DaemonStartOptions>,
@@ -40,16 +56,16 @@ async fn daemon_start(
 async fn daemon_start_elevated(
     state: State<'_, AppState>,
     options: Option<DaemonStartOptions>,
-) -> Result<String, String> {
-    state.daemon_manager.start_elevated(options).await
+) -> Result<DaemonOperationStatus, String> {
+    state.daemon_manager.begin_start_elevated(options).await
 }
 
 #[tauri::command]
 async fn daemon_stop(
     state: State<'_, AppState>,
     diagnostics_url: Option<String>,
-) -> Result<String, String> {
-    state.daemon_manager.stop(diagnostics_url).await
+) -> Result<DaemonOperationStatus, String> {
+    state.daemon_manager.begin_stop(diagnostics_url).await
 }
 
 #[tauri::command]
@@ -107,16 +123,14 @@ async fn app_quit(
     state: State<'_, AppState>,
     diagnostics_url: Option<String>,
 ) -> Result<String, String> {
-    let stop_result = state.daemon_manager.stop(diagnostics_url).await;
-    let message = match stop_result {
-        Ok(message) => format!("{} 正在退出 p2wlan。", message),
-        Err(err) => format!("停止 TUN 时遇到问题：{} 正在退出 p2wlan。", err),
-    };
+    let daemon_manager = state.daemon_manager.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if let Err(error) = daemon_manager.stop(diagnostics_url).await {
+            log::error!("Failed to stop daemon while quitting: {error}");
+        }
         tray::exit_app(&app);
     });
-    Ok(message)
+    Ok("正在停止 TUN 并退出 p2wlan。".to_string())
 }
 
 fn main() {
@@ -140,6 +154,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            desktop_status,
+            daemon_configure,
             daemon_start,
             daemon_start_elevated,
             daemon_stop,
