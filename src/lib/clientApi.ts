@@ -289,10 +289,6 @@ function activePathSummary(snapshot: DiagnosticsSnapshot): string {
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
   if (snapshot.health.reason) return snapshot.health.reason;
   if (snapshot.relay_selection.last_error) return snapshot.relay_selection.last_error;
-  for (const peer of snapshot.peers) {
-    if (peer.direct.last_error) return `${peer.node_id}: ${peer.direct.last_error}`;
-    if (peer.relay.last_error) return `${peer.node_id}: ${peer.relay.last_error}`;
-  }
   const failedTask = snapshot.health.critical_tasks.find((t) => t.error);
   if (failedTask?.error) return `${failedTask.name}: ${failedTask.error}`;
   return null;
