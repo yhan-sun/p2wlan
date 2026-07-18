@@ -586,6 +586,10 @@ impl ControlClient {
 /// Maximum exponential-backoff delay before giving up.
 const MAX_BACKOFF_SECS: u64 = 300;
 const INITIAL_BACKOFF_SECS: u64 = 2;
+/// Signaling carries WireGuard handshake offers/answers. Keep it independent
+/// from the slower peer/heartbeat poll so handshakes do not race their timeout.
+const SIGNAL_POLL_INTERVAL_SECS: u64 = 1;
+const MIN_PEER_POLL_INTERVAL_SECS: u64 = 5;
 
 /// Compute exponential backoff with jitter, capped at MAX_BACKOFF_SECS.
 /// attempt 0 → ~2s, attempt 1 → ~4s, attempt 2 → ~8s, …
@@ -785,18 +789,37 @@ async fn run_control_loop(
             warn!("Initial signal polling failed: {err}");
         }
 
-        let interval_secs = config.control.heartbeat_interval_secs.max(5);
-        let mut tick = time::interval(Duration::from_secs(interval_secs));
-        tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let peer_interval_secs = config
+            .control
+            .heartbeat_interval_secs
+            .max(MIN_PEER_POLL_INTERVAL_SECS);
+        let mut peer_tick = time::interval(Duration::from_secs(peer_interval_secs));
+        peer_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut signal_tick = time::interval(Duration::from_secs(SIGNAL_POLL_INTERVAL_SECS));
+        signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         let mut poll_failures: u32 = 0;
+        let mut signal_failures: u32 = 0;
+        let mut advertised_endpoint = String::new();
+        let mut advertised_nat_type = "unknown".to_string();
         loop {
             tokio::select! {
-                _ = tick.tick() => {
+                _ = peer_tick.tick() => {
+                    if let Err(err) = update_endpoint(
+                        &http,
+                        &base_url,
+                        &token,
+                        &self_node_id,
+                        &advertised_endpoint,
+                        &advertised_nat_type,
+                    )
+                    .await
+                    {
+                        warn!("Device lease refresh failed: {err}");
+                    }
                     let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
-                    let sig_result = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await;
-                    match (&poll_result, &sig_result) {
-                        (Err(e), _) | (_, Err(e)) => {
+                    match &poll_result {
+                        Err(e) => {
                             let err_str = e.to_string();
                             if is_permanent_auth_error(&err_str) {
                                 error!("Permanent auth failure during polling: {err_str}");
@@ -829,7 +852,7 @@ async fn run_control_loop(
                             }
                             tokio::time::sleep(delay).await;
                         }
-                        (Ok(_), Ok(_)) => {
+                        Ok(_) => {
                             if poll_failures > 0 {
                                 info!("Polling recovered after {poll_failures} failures");
                                 let vip = state.read().await.virtual_ip.clone().unwrap_or_default();
@@ -840,6 +863,45 @@ async fn run_control_loop(
                                 });
                             }
                             poll_failures = 0;
+                        }
+                    }
+                }
+                _ = signal_tick.tick() => {
+                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
+                        Ok(()) => {
+                            signal_failures = 0;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure during signal polling: {err_str}");
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                tokio::select! {
+                                    Some(cmd) = cmd_rx.recv() => {
+                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                            let _ = event_tx.send(ControlEvent::Disconnected);
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                                    else => {
+                                        let _ = event_tx.send(ControlEvent::Disconnected);
+                                        return;
+                                    }
+                                }
+                                break;
+                            }
+
+                            signal_failures = signal_failures.saturating_add(1);
+                            warn!(
+                                "Signal polling failed (attempt {signal_failures}); continuing: {err_str}"
+                            );
+                            if signal_failures >= 3 {
+                                warn!("Signal polling failed {signal_failures} times; re-registering with control plane");
+                                break;
+                            }
                         }
                     }
                 }
@@ -864,7 +926,11 @@ async fn run_control_loop(
                         ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
                             let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
                             match &res {
-                                Ok(()) => { debug!("Updated endpoint for {self_node_id}: {endpoint} ({nat_type})"); }
+                                Ok(()) => {
+                                    advertised_endpoint = endpoint;
+                                    advertised_nat_type = nat_type;
+                                    debug!("Updated endpoint for {self_node_id}: {advertised_endpoint} ({advertised_nat_type})");
+                                }
                                 Err(err) => {
                                     let err_str = err.to_string();
                                     let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err_str.clone() });
@@ -1281,6 +1347,9 @@ async fn poll_peers(
 
         for node in body.nodes {
             if node.id == self_node_id || node.public_key == config.node.public_key {
+                continue;
+            }
+            if !node.online {
                 continue;
             }
 

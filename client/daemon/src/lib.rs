@@ -88,7 +88,7 @@ struct PendingHandshakeState {
 /// Maximum number of handshake re-initiation attempts before giving up.
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Handshake timeout before pending entry is cleared.
-const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
 /// Short grace period for UDP/STUN candidate gathering before signaling a WireGuard offer.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
 
@@ -346,6 +346,7 @@ impl Daemon {
                 self.relay_selection.clone(),
                 self.health.clone(),
                 self.task_manager.clone(),
+                self.shutdown_tx.clone(),
             );
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager
@@ -372,10 +373,11 @@ impl Daemon {
                 .await;
 
             let inbound_transport = transport.clone();
+            let inbound_peers = self.peers.clone();
             self.task_manager
                 .spawn_result("wireguard-inbound", true, async move {
                     inbound_transport
-                        .run_inbound(network_inbound_rx, inbound_tx)
+                        .run_inbound_with_peers(network_inbound_rx, inbound_tx, Some(inbound_peers))
                         .await
                 })
                 .await;
@@ -386,10 +388,11 @@ impl Daemon {
         } else {
             let (inbound_tx, inbound_rx) = mpsc::channel(1024);
             let inbound_transport = self.transport.clone();
+            let inbound_peers = self.peers.clone();
             self.task_manager
                 .spawn_result("wireguard-inbound", true, async move {
                     inbound_transport
-                        .run_inbound(network_inbound_rx, inbound_tx)
+                        .run_inbound_with_peers(network_inbound_rx, inbound_tx, Some(inbound_peers))
                         .await
                 })
                 .await;
@@ -545,19 +548,26 @@ impl Daemon {
             let node_private_key = self.config.node.private_key.clone();
             let node_public_key = self.config.node.public_key.clone();
             self.task_manager
-                .spawn("rekey", false, async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(30));
+                .spawn("handshake-maintenance", false, async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(10));
                     loop {
                         tick.tick().await;
                         let conns = peers.all_connections().await;
                         for conn in conns {
-                            // Remove expired sessions and trigger rekey handshake.
+                            // Establish missing sessions and refresh sessions that need rekey.
+                            let has_session = transport.has_session(&conn.node_id).await;
                             let needs = transport.session_needs_rekey(&conn.node_id).await;
                             let expired = transport.session_is_expired(&conn.node_id).await;
-                            if !needs && !expired {
+                            if has_session && !needs && !expired {
                                 continue;
                             }
-                            if expired {
+                            let is_rekey = has_session;
+                            if !has_session {
+                                debug!(
+                                    "No WireGuard session for {}; retrying handshake",
+                                    conn.node_id
+                                );
+                            } else if expired {
                                 info!(
                                     "Session for peer {} expired; removing and rekeying",
                                     conn.node_id
@@ -570,8 +580,7 @@ impl Daemon {
                                 );
                             }
 
-                            // Only the lexicographically smaller public key initiates rekey.
-                            // We don't have peer public key here easily; use peer connection.
+                            // Only the lexicographically smaller public key initiates handshakes.
                             // Skip if already pending.
                             {
                                 let state = pending.lock().await;
@@ -582,25 +591,22 @@ impl Daemon {
                                     >= MAX_HANDSHAKE_ATTEMPTS
                                 {
                                     warn!(
-                                        "Rekey for {} skipped: max attempts reached",
+                                        "Handshake for {} reached max attempts; resetting retry budget",
                                         conn.node_id
                                     );
-                                    continue;
+                                    drop(state);
+                                    pending.lock().await.attempts.remove(&conn.node_id);
                                 }
                             }
 
-                            // Build a new handshake initiation if we have the peer's public key.
-                            let Some(_peer_conn) = peers.get_connection(&conn.node_id).await else {
-                                continue;
-                            };
                             // PeerConnection doesn't store public key; look up from control.
                             // Best-effort: if control has the peer, use it.
                             // (control.peers is async)
-                            // We intentionally skip rekey initiation if we can't get the key —
+                            // We intentionally skip initiation if we can't get the key —
                             // the peer may also rekey from its side.
                             let control_peers = control.peers().await;
                             let Some(peer_info) = control_peers.get(&conn.node_id) else {
-                                debug!("No control peer info for rekey of {}", conn.node_id);
+                                debug!("No control peer info for handshake with {}", conn.node_id);
                                 continue;
                             };
                             if node_public_key >= peer_info.public_key {
@@ -627,25 +633,39 @@ impl Daemon {
                             let initiation_bytes = initiation.to_bytes();
                             let candidates = local_candidates.read().await.clone();
 
-                            {
+                            let attempt_no = {
                                 let mut state = pending.lock().await;
-                                *state.attempts.entry(conn.node_id.clone()).or_insert(0) += 1;
+                                let attempts =
+                                    state.attempts.entry(conn.node_id.clone()).or_insert(0);
+                                *attempts = attempts.saturating_add(1);
+                                let attempt_no = *attempts;
                                 state.pending.insert(conn.node_id.clone(), initiator);
-                            }
+                                attempt_no
+                            };
 
                             if let Err(err) = control
                                 .send_peer_offer(&conn.node_id, &candidates, &initiation_bytes)
                                 .await
                             {
-                                warn!("Rekey offer to {} failed: {err}", conn.node_id);
+                                warn!("Handshake offer to {} failed: {err}", conn.node_id);
                                 let mut state = pending.lock().await;
                                 state.pending.remove(&conn.node_id);
                             } else {
-                                info!(
-                                    "Rekey: sent handshake initiation to {} ({} bytes)",
-                                    conn.node_id,
-                                    initiation_bytes.len()
-                                );
+                                if is_rekey {
+                                    info!(
+                                        "Rekey: sent handshake initiation to {} ({} bytes, attempt {})",
+                                        conn.node_id,
+                                        initiation_bytes.len(),
+                                        attempt_no
+                                    );
+                                } else {
+                                    info!(
+                                        "Retry: sent handshake initiation to {} ({} bytes, attempt {})",
+                                        conn.node_id,
+                                        initiation_bytes.len(),
+                                        attempt_no
+                                    );
+                                }
                                 // Timeout cleanup
                                 let pending2 = pending.clone();
                                 let timeout_peer = conn.node_id.clone();
@@ -655,16 +675,23 @@ impl Daemon {
                                     tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS))
                                         .await;
                                     if !transport2.has_session(&timeout_peer).await {
-                                        warn!("Rekey handshake timeout for peer {timeout_peer}");
+                                        warn!("Handshake timeout for peer {timeout_peer}");
                                         peers2
                                             .record_direct_failure(
                                                 &timeout_peer,
-                                                "rekey handshake timed out",
+                                                "handshake timed out",
                                             )
                                             .await;
                                     }
                                     let mut state = pending2.lock().await;
-                                    state.pending.remove(&timeout_peer);
+                                    if state.attempts.get(&timeout_peer).copied()
+                                        == Some(attempt_no)
+                                    {
+                                        state.pending.remove(&timeout_peer);
+                                        if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
+                                            state.attempts.remove(&timeout_peer);
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -913,17 +940,18 @@ impl Daemon {
         {
             let state = self.pending_handshakes.lock().await;
             if state.pending.contains_key(&peer_info.node_id) {
-                if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
-                    >= MAX_HANDSHAKE_ATTEMPTS
-                {
-                    warn!(
-                        "Handshake to {} reached max attempts ({})",
-                        peer_info.node_id, MAX_HANDSHAKE_ATTEMPTS
-                    );
-                    return Ok(());
-                }
                 // Still pending — don't duplicate.
                 return Ok(());
+            }
+            if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
+                >= MAX_HANDSHAKE_ATTEMPTS
+            {
+                drop(state);
+                self.pending_handshakes
+                    .lock()
+                    .await
+                    .attempts
+                    .remove(&peer_info.node_id);
             }
         }
 
@@ -941,12 +969,14 @@ impl Daemon {
         let candidates = self.wait_for_local_candidates().await;
 
         let peer_id_clone = peer_info.node_id.clone();
-        {
+        let attempt_no = {
             let mut state = self.pending_handshakes.lock().await;
             let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
             *attempts = attempts.saturating_add(1);
+            let attempt_no = *attempts;
             state.pending.insert(peer_id_clone.clone(), initiator);
-        }
+            attempt_no
+        };
 
         self.control
             .send_peer_offer(&peer_id_clone, &candidates, &initiation_bytes)
@@ -979,7 +1009,12 @@ impl Daemon {
             }
             // Remove from pending so retry is possible.
             let mut state = pending.lock().await;
-            state.pending.remove(&timeout_peer);
+            if state.attempts.get(&timeout_peer).copied() == Some(attempt_no) {
+                state.pending.remove(&timeout_peer);
+                if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
+                    state.attempts.remove(&timeout_peer);
+                }
+            }
         });
 
         Ok(())
@@ -1127,24 +1162,27 @@ impl Daemon {
     ) -> Result<()> {
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
-        let initiator = {
+        let keys = {
             let mut state = self.pending_handshakes.lock().await;
-            state.pending.remove(from_node_id)
-        };
-        let Some(mut initiator) = initiator else {
-            warn!("No pending WireGuard handshake for answer from {from_node_id}");
-            return Ok(());
-        };
+            let Some(initiator) = state.pending.get_mut(from_node_id) else {
+                warn!("No pending WireGuard handshake for answer from {from_node_id}");
+                return Ok(());
+            };
 
-        let keys = initiator
-            .consume_response(&response)
-            .map_err(|e| DaemonError::Peer(format!("WireGuard response consume failed: {e}")))?;
+            let keys = match initiator.consume_response(&response) {
+                Ok(keys) => keys,
+                Err(err) => {
+                    warn!(
+                        "Ignoring WireGuard answer from {from_node_id} that does not match the pending handshake: {err}"
+                    );
+                    return Ok(());
+                }
+            };
 
-        // Reset attempt count on success so future rekey attempts can proceed.
-        {
-            let mut state = self.pending_handshakes.lock().await;
+            state.pending.remove(from_node_id);
             state.attempts.remove(from_node_id);
-        }
+            keys
+        };
 
         // Replace old session with new one (rekey case).
         let new_session = TransportSession::new(keys);
@@ -1270,6 +1308,7 @@ async fn run_network_outbound(
     while let Some(packet) = encrypted_rx.recv().await {
         let relay = relay_transport.read().await.clone();
         let relay_available = relay.is_some();
+        let direct_confirmed = peers.is_direct(&packet.peer_id).await;
         let use_direct = peers
             .should_use_direct_for_data(&packet.peer_id, prefer_direct, relay_available)
             .await;
@@ -1311,7 +1350,7 @@ async fn run_network_outbound(
             false
         };
 
-        if sent_direct {
+        if sent_direct && direct_confirmed {
             continue;
         }
 
@@ -1572,6 +1611,42 @@ mod tests {
     fn test_parse_stun_servers_rejects_invalid_endpoint() {
         let err = parse_stun_servers(&["not-a-socket".to_string()]).unwrap_err();
         assert!(err.to_string().contains("invalid STUN server"));
+    }
+
+    #[tokio::test]
+    async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let mut daemon = Daemon::new(config);
+        let peer_id = "peer-stale-answer";
+
+        let peer_identity = NodeIdentity::generate();
+        let mut initiator = HandshakeInitiator::new(
+            daemon.local_identity().unwrap(),
+            peer_identity.public_key(),
+            None,
+        );
+        let initiation = initiator.create_initiation().unwrap();
+
+        {
+            let mut state = daemon.pending_handshakes.lock().await;
+            state.pending.insert(peer_id.to_string(), initiator);
+            state.attempts.insert(peer_id.to_string(), 1);
+        }
+
+        let mut responder = HandshakeResponder::new(peer_identity, None);
+        let (mut stale_response, _) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        stale_response.receiver_index ^= 0x1111_0001;
+
+        daemon
+            .handle_peer_answer(peer_id, &stale_response.to_bytes())
+            .await
+            .unwrap();
+
+        let state = daemon.pending_handshakes.lock().await;
+        assert!(state.pending.contains_key(peer_id));
+        assert_eq!(state.attempts.get(peer_id), Some(&1));
     }
 
     #[tokio::test]

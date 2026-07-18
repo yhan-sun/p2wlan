@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
+use crate::peer::PeerManager;
 
 /// A WireGuard transport packet addressed to a peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,12 +165,34 @@ impl WireGuardTransport {
     /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
     pub async fn run_inbound(
         &self,
-        mut encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
+        encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
         inbound_tx: mpsc::Sender<InboundPacket>,
     ) -> Result<()> {
+        self.run_inbound_with_peers(encrypted_rx, inbound_tx, None)
+            .await
+    }
+
+    /// Consume encrypted network packets and confirm direct UDP only after
+    /// successful WireGuard decryption.
+    pub async fn run_inbound_with_peers(
+        &self,
+        mut encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
+        inbound_tx: mpsc::Sender<InboundPacket>,
+        peers: Option<Arc<PeerManager>>,
+    ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
+            let source = packet.source;
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
+                    if let (Some(peers), Some(source)) = (peers.as_ref(), source) {
+                        peers
+                            .record_direct_success(&inbound.peer_id, Some(source))
+                            .await;
+                        debug!(
+                            "Confirmed direct UDP data path from {source} for peer {}",
+                            inbound.peer_id
+                        );
+                    }
                     inbound_tx.send(inbound).await.map_err(|_| {
                         DaemonError::Network("inbound packet channel closed".to_string())
                     })?;
@@ -178,10 +201,7 @@ impl WireGuardTransport {
                     debug!("Inbound encrypted packet has no matching WireGuard session");
                 }
                 Err(err) => {
-                    warn!(
-                        "Dropping inbound encrypted packet from {:?}: {err}",
-                        packet.source
-                    );
+                    warn!("Dropping inbound encrypted packet from {:?}: {err}", source);
                 }
             }
         }

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { getSettings, saveSettings, validateSettings } from "../lib/clientApi";
-import type { ClientSettings, RelayPolicy } from "../types/client";
+import type { ClientSettings, CloseBehavior, RelayPolicy } from "../types/client";
 import { Save, AlertTriangle, ShieldCheck } from "lucide-react";
 
 export default function SettingsPage() {
@@ -12,6 +12,14 @@ export default function SettingsPage() {
     setSettings(prev => ({
       ...prev,
       [key]: value
+    }));
+  };
+
+  const handleCloseBehaviorChange = (closeBehavior: CloseBehavior) => {
+    setSettings(prev => ({
+      ...prev,
+      closeBehavior,
+      minimizeToTray: closeBehavior === "keep-running",
     }));
   };
 
@@ -211,17 +219,44 @@ export default function SettingsPage() {
                   </span>
                 </label>
 
-                <label className="checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={settings.minimizeToTray}
-                    onChange={(e) => handleFieldChange("minimizeToTray", e.target.checked)}
-                  />
-                  <span className="checkbox-label flex-col">
-                    <span className="title text-sm">最小化到托盘</span>
-                    <span className="desc text-xs text-muted">关闭窗口时保留在状态栏运行。</span>
-                  </span>
-                </label>
+                <div className="form-group">
+                  <label className="form-label">关闭窗口时</label>
+                  <div className="choice-list">
+                    <label
+                      className={`choice-row ${settings.closeBehavior === "keep-running" ? "active" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="closeBehavior"
+                        value="keep-running"
+                        checked={settings.closeBehavior === "keep-running"}
+                        onChange={() => handleCloseBehaviorChange("keep-running")}
+                      />
+                      <span className="choice-dot" aria-hidden="true" />
+                      <span className="choice-copy">
+                        <span className="title text-sm">保留后台运行</span>
+                        <span className="desc text-xs text-muted">窗口隐藏到状态栏，TUN 与虚拟内网继续工作。</span>
+                      </span>
+                    </label>
+
+                    <label
+                      className={`choice-row ${settings.closeBehavior === "stop-and-quit" ? "active" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="closeBehavior"
+                        value="stop-and-quit"
+                        checked={settings.closeBehavior === "stop-and-quit"}
+                        onChange={() => handleCloseBehaviorChange("stop-and-quit")}
+                      />
+                      <span className="choice-dot" aria-hidden="true" />
+                      <span className="choice-copy">
+                        <span className="title text-sm">停止 TUN 并退出</span>
+                        <span className="desc text-xs text-muted">关闭窗口时先关闭守护进程，再退出 p2wlan。</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

@@ -102,9 +102,21 @@ fn open_logs() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn app_quit(app: tauri::AppHandle) -> Result<String, String> {
-    tray::quit_app(&app);
-    Ok("正在退出 p2wlan。".to_string())
+async fn app_quit(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    diagnostics_url: Option<String>,
+) -> Result<String, String> {
+    let stop_result = state.daemon_manager.stop(diagnostics_url).await;
+    let message = match stop_result {
+        Ok(message) => format!("{} 正在退出 p2wlan。", message),
+        Err(err) => format!("停止 TUN 时遇到问题：{} 正在退出 p2wlan。", err),
+    };
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tray::exit_app(&app);
+    });
+    Ok(message)
 }
 
 fn main() {

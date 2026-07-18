@@ -486,12 +486,16 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	req.Endpoint = strings.TrimSpace(req.Endpoint)
 	req.NATType = strings.TrimSpace(req.NATType)
-	if req.Endpoint == "" {
-		http.Error(w, `{"error":"endpoint is required"}`, http.StatusBadRequest)
+	if len(req.Endpoint) > 256 {
+		http.Error(w, `{"error":"endpoint too long"}`, http.StatusBadRequest)
 		return
 	}
 	if req.NATType == "" {
 		req.NATType = "unknown"
+	}
+	if len(req.NATType) > 64 {
+		http.Error(w, `{"error":"nat_type too long"}`, http.StatusBadRequest)
+		return
 	}
 
 	if err := s.db.UpdateDeviceEndpoint(pathDeviceID, req.Endpoint, req.NATType); err != nil {

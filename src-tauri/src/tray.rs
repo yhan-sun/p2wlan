@@ -4,10 +4,7 @@ use tauri::{
     AppHandle, Manager,
 };
 
-pub fn quit_app(app_handle: &AppHandle) {
-    if let Some(state) = app_handle.try_state::<crate::AppState>() {
-        state.daemon_manager.cleanup();
-    }
+pub fn exit_app(app_handle: &AppHandle) {
     app_handle.exit(0);
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(900));
@@ -73,7 +70,18 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
                     }
                 }
                 "quit" => {
-                    quit_app(app_handle);
+                    let app = app_handle.clone();
+                    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+                        let daemon_manager = state.daemon_manager.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = daemon_manager.stop(None).await {
+                                log::error!("Failed to stop daemon before tray quit: {}", e);
+                            }
+                            exit_app(&app);
+                        });
+                    } else {
+                        exit_app(app_handle);
+                    }
                 }
                 _ => {}
             }

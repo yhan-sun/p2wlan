@@ -9,6 +9,7 @@
 import {
   type ApiResult,
   type ClientSettings,
+  type CloseBehavior,
   type DaemonStatus,
   type DiagnosticCheck,
   type DiagnosticsReport,
@@ -58,12 +59,22 @@ async function tryInvoke<T>(command: string, args?: Record<string, unknown>): Pr
   return (await invoke<T>(command, args)) as T;
 }
 
+function normalizeCloseBehavior(settings: Partial<ClientSettings>): CloseBehavior {
+  if (settings.closeBehavior === "keep-running" || settings.closeBehavior === "stop-and-quit") {
+    return settings.closeBehavior;
+  }
+  if (settings.minimizeToTray === false) return "stop-and-quit";
+  return DEFAULT_SETTINGS.closeBehavior;
+}
+
 export function getSettings(): ClientSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<ClientSettings>;
     const settings = { ...DEFAULT_SETTINGS, ...parsed };
+    settings.closeBehavior = normalizeCloseBehavior(parsed);
+    settings.minimizeToTray = settings.closeBehavior === "keep-running";
     const legacyLocalControl =
       settings.controlServer === "http://127.0.0.1:8080" ||
       settings.controlServer === "http://localhost:8080";
@@ -85,9 +96,14 @@ export function saveSettings(settings: ClientSettings): ApiResult<ClientSettings
   if (errors.length > 0) {
     return { data: settings, source: "fallback", error: errors.join("; ") };
   }
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  const normalizedSettings: ClientSettings = {
+    ...settings,
+    closeBehavior: normalizeCloseBehavior(settings),
+    minimizeToTray: normalizeCloseBehavior(settings) === "keep-running",
+  };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalizedSettings));
   appendLog(`settings saved (control=${settings.controlServer}, mtu=${settings.mtu})`);
-  return { data: settings, source: "live" };
+  return { data: normalizedSettings, source: "live" };
 }
 
 async function readJsonBody<T>(res: Response): Promise<T | null> {
@@ -256,6 +272,9 @@ export function validateSettings(settings: ClientSettings): string[] {
   }
   if (settings.overlayCidr && !/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(settings.overlayCidr)) {
     errors.push("Overlay CIDR 格式应类似 10.20.0.0/16");
+  }
+  if (settings.closeBehavior !== "keep-running" && settings.closeBehavior !== "stop-and-quit") {
+    errors.push("关闭窗口行为配置无效");
   }
   return errors;
 }
@@ -785,9 +804,12 @@ export async function openLogs(): Promise<ApiResult<{ opened: boolean; message: 
 }
 
 export async function quitApp(): Promise<ApiResult<{ message: string }>> {
+  const settings = getSettings();
   if (isTauri()) {
     try {
-      const res = await tryInvoke<string>("app_quit");
+      const res = await tryInvoke<string>("app_quit", {
+        diagnosticsUrl: settings.diagnosticsUrl,
+      });
       appendLog(`app quit requested: ${res}`);
       return { data: { message: String(res) }, source: "live" };
     } catch (err) {

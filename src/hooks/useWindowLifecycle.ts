@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getSettings, quitApp } from "../lib/clientApi";
 
 function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -14,25 +15,23 @@ export function useWindowLifecycle() {
     const setupListener = async () => {
       const appWindow = getCurrentWindow();
       unlisten = await appWindow.onCloseRequested(async (event) => {
-        // Read local storage settings
-        let minimize = true; // default fallback
+        let closeBehavior = "keep-running";
         try {
-          const raw = localStorage.getItem("p2wlan.client.settings");
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (parsed.minimizeToTray !== undefined) {
-              minimize = parsed.minimizeToTray;
-            }
-          }
+          closeBehavior = getSettings().closeBehavior;
         } catch {
-          // ignore
+          closeBehavior = "keep-running";
         }
 
-        if (minimize) {
-          // Prevent window from closing
-          event.preventDefault();
-          // Hide window instead
+        event.preventDefault();
+        if (closeBehavior === "keep-running") {
           await appWindow.hide();
+          return;
+        }
+
+        try {
+          await quitApp();
+        } catch (err) {
+          console.error("Failed to quit p2wlan from close request", err);
         }
       });
     };
