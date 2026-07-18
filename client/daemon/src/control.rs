@@ -229,6 +229,8 @@ struct RegisterDeviceResponse {
     node_id: Option<String>,
     virtual_ip: Option<String>,
     cidr: Option<String>,
+    #[serde(default)]
+    relay_servers: Vec<String>,
     error: Option<String>,
 }
 
@@ -640,18 +642,26 @@ async fn run_control_loop(
             let mut attempt: u32 = 0;
             loop {
                 match register_device(&http, &base_url, &token, &config).await {
-                    Ok((node_id, virtual_ip, cidr)) => {
+                    Ok((node_id, virtual_ip, cidr, server_relay_servers)) => {
                         {
                             let mut s = state.write().await;
                             s.registered = true;
                             s.virtual_ip = Some(virtual_ip.clone());
                         }
+                        if !server_relay_servers.is_empty() {
+                            config.relay.servers = server_relay_servers.clone();
+                        }
+                        let relay_servers = if server_relay_servers.is_empty() {
+                            config.relay.servers.clone()
+                        } else {
+                            server_relay_servers
+                        };
 
                         let _ = event_tx.send(ControlEvent::Registered {
                             node_id: Some(node_id.clone()),
                             virtual_ip: virtual_ip.clone(),
                             cidr: Some(cidr),
-                            relay_servers: config.relay.servers.clone(),
+                            relay_servers,
                         });
 
                         // Attempt Ed25519 challenge for device credential
@@ -1041,7 +1051,7 @@ async fn register_device(
     base_url: &str,
     token: &str,
     config: &Config,
-) -> Result<(String, String, String)> {
+) -> Result<(String, String, String, Vec<String>)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .bearer_auth(token)
@@ -1082,7 +1092,7 @@ async fn register_device(
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
     let cidr = body.cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
 
-    Ok((node_id, virtual_ip, cidr))
+    Ok((node_id, virtual_ip, cidr, body.relay_servers))
 }
 
 async fn update_endpoint(

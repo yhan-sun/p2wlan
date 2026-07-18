@@ -186,7 +186,7 @@ fn default_reconnect_interval() -> u64 {
     5
 }
 fn default_heartbeat_interval() -> u64 {
-    30
+    5
 }
 
 /// Relay configuration.
@@ -561,7 +561,7 @@ mod tests {
                 "server_url": "http://ctrl",
                 "auth_token": "",
                 "reconnect_interval_secs": 5,
-                "heartbeat_interval_secs": 30
+                "heartbeat_interval_secs": 5
             },
             "relay": {
                 "servers": [],

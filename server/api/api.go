@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -18,14 +20,30 @@ import (
 
 // Server handles API requests.
 type Server struct {
-	auth *auth.Service
-	hub  *signaling.Hub
-	db   *database.DB
+	auth         *auth.Service
+	hub          *signaling.Hub
+	db           *database.DB
+	relayServers []string
 }
 
 // NewServer creates a new API server.
 func NewServer(auth *auth.Service, hub *signaling.Hub, db *database.DB) *Server {
-	return &Server{auth: auth, hub: hub, db: db}
+	return &Server{auth: auth, hub: hub, db: db, relayServers: parseRelayServers()}
+}
+
+func parseRelayServers() []string {
+	raw := strings.TrimSpace(os.Getenv("RELAY_SERVERS"))
+	if raw == "" {
+		return []string{}
+	}
+	servers := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			servers = append(servers, part)
+		}
+	}
+	return servers
 }
 
 // ---- Auth endpoints ----
@@ -207,10 +225,11 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"success":    true,
-		"node_id":    device.ID,
-		"virtual_ip": device.VirtualIP,
-		"cidr":       cidr,
+		"success":       true,
+		"node_id":       device.ID,
+		"virtual_ip":    device.VirtualIP,
+		"cidr":          cidr,
+		"relay_servers": s.relayServers,
 	}
 
 	// Issue device credential if Ed25519 identity was verified
@@ -678,13 +697,26 @@ func (s *Server) CreateTunnel(w http.ResponseWriter, r *http.Request) {
 	if req.LocalAddr == "" {
 		req.LocalAddr = "127.0.0.1"
 	}
-	if req.LocalPort < 1 || req.LocalPort > 65535 || req.RemotePort < 1 || req.RemotePort > 65535 {
+	req.Protocol = strings.ToLower(strings.TrimSpace(req.Protocol))
+	if req.Protocol != "tcp" && req.Protocol != "udp" {
+		http.Error(w, `{"error":"protocol must be tcp or udp"}`, http.StatusBadRequest)
+		return
+	}
+	if req.LocalPort < 1 || req.LocalPort > 65535 || req.RemotePort < 0 || req.RemotePort > 65535 {
 		http.Error(w, `{"error":"invalid port range"}`, http.StatusBadRequest)
 		return
 	}
 
 	tunnel, err := s.db.CreateTunnel(deviceID, req.Protocol, req.LocalPort, req.RemotePort, req.LocalAddr)
 	if err != nil {
+		if errors.Is(err, database.ErrTunnelPortInUse) {
+			http.Error(w, `{"error":"remote port already allocated"}`, http.StatusConflict)
+			return
+		}
+		if errors.Is(err, database.ErrTunnelPortExhausted) {
+			http.Error(w, `{"error":"remote port pool exhausted"}`, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, `{"error":"tunnel creation failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -692,6 +724,7 @@ func (s *Server) CreateTunnel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":         true,
 		"tunnel_id":       tunnel.ID,
+		"remote_port":     tunnel.RemotePort,
 		"public_endpoint": tunnel.PublicEndpoint,
 	})
 }

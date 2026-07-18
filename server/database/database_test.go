@@ -3,6 +3,7 @@ package database
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,71 @@ func TestDatabase_CreateDevice_UniqueIPAllocation(t *testing.T) {
 	if len(allocatedIPs) != deviceCount {
 		t.Errorf("Expected %d unique IPs, got %d", deviceCount, len(allocatedIPs))
 	}
+}
+
+func TestCreateTunnelAutoAllocatesRemotePorts(t *testing.T) {
+	db, device := createTestDevice(t, "auto-tunnel@p2wlan.local", "auto-tunnel-device")
+	defer db.Close()
+
+	first, err := db.CreateTunnel(device.ID, "tcp", 8080, 0, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateTunnel first failed: %v", err)
+	}
+	second, err := db.CreateTunnel(device.ID, "tcp", 8081, 0, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateTunnel second failed: %v", err)
+	}
+
+	if first.RemotePort != tunnelPortStart {
+		t.Fatalf("expected first auto port %d, got %d", tunnelPortStart, first.RemotePort)
+	}
+	if second.RemotePort != tunnelPortStart+1 {
+		t.Fatalf("expected second auto port %d, got %d", tunnelPortStart+1, second.RemotePort)
+	}
+	if first.PublicEndpoint != fmt.Sprintf("relay.p2pnet.io:%d", first.RemotePort) {
+		t.Fatalf("unexpected public endpoint: %s", first.PublicEndpoint)
+	}
+}
+
+func TestCreateTunnelRejectsDuplicateProtocolPort(t *testing.T) {
+	db, device := createTestDevice(t, "dup-tunnel@p2wlan.local", "dup-tunnel-device")
+	defer db.Close()
+
+	if _, err := db.CreateTunnel(device.ID, "tcp", 8080, 32000, "127.0.0.1"); err != nil {
+		t.Fatalf("CreateTunnel initial failed: %v", err)
+	}
+	if _, err := db.CreateTunnel(device.ID, "tcp", 8081, 32000, "127.0.0.1"); err == nil {
+		t.Fatal("expected duplicate tcp remote port to fail")
+	} else if err != ErrTunnelPortInUse {
+		t.Fatalf("expected ErrTunnelPortInUse, got %v", err)
+	}
+
+	if _, err := db.CreateTunnel(device.ID, "udp", 8081, 32000, "127.0.0.1"); err != nil {
+		t.Fatalf("same numeric port should be allowed for udp after tcp allocation: %v", err)
+	}
+}
+
+func createTestDevice(t *testing.T, email, deviceName string) (*DB, *Device) {
+	t.Helper()
+
+	db, err := New(filepath.Join(t.TempDir(), "p2wlan.db"))
+	if err != nil {
+		t.Fatalf("New database: %v", err)
+	}
+
+	user, err := db.CreateUser(email, "pwd")
+	if err != nil {
+		db.Close()
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	device, err := db.CreateDevice(user.ID, "default", deviceName+"-pubkey", deviceName, "linux", "")
+	if err != nil {
+		db.Close()
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	return db, device
 }
 
 func TestDatabase_UniqueConstraints(t *testing.T) {

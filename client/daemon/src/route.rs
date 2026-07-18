@@ -4,6 +4,8 @@ use std::process::Command;
 use std::sync::Mutex;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tracing::info;
+#[cfg(target_os = "windows")]
+use tracing::warn;
 
 /// Platform-abstracted command runner for route operations.
 ///
@@ -303,6 +305,7 @@ impl RouteManager {
                 info!(
                     "Route for {destination_prefix} already exists on {interface} — treating as idempotent, not owned"
                 );
+                windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
                 return Ok(());
             }
             return Err(crate::DaemonError::Network(format!(
@@ -338,6 +341,7 @@ impl RouteManager {
                     info!(
                         "Windows route for {destination_prefix} via {interface} already exists — treating New-NetRoute as idempotent"
                     );
+                    windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
                     if let Ok(mut added) = self.routes_added.lock() {
                         added.push((network, mask));
                     }
@@ -359,6 +363,7 @@ impl RouteManager {
         if let Ok(mut added) = self.routes_added.lock() {
             added.push((network, mask));
         }
+        windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
 
         Ok(())
     }
@@ -423,6 +428,34 @@ fn windows_route_already_exists(output: &std::process::Output) -> bool {
 #[cfg(target_os = "windows")]
 fn windows_interface_alias_eq(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str) {
+    const RULE_NAME: &str = "p2wlan Overlay ICMPv4 Echo Request";
+    let output = windows_powershell_command(&format!(
+        "$ErrorActionPreference = 'Stop'; $name = '{}'; $cidr = '{}'; $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -eq $rule) {{ New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -LocalAddress $cidr -RemoteAddress $cidr -Profile Any | Out-Null }} else {{ Enable-NetFirewallRule -DisplayName $name | Out-Null }}",
+        ps_quote(RULE_NAME),
+        ps_quote(destination_prefix)
+    ))
+    .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            info!("Windows firewall rule ensured for ICMPv4 echo on overlay {destination_prefix}");
+        }
+        Ok(output) => {
+            warn!(
+                "Could not ensure Windows firewall ICMPv4 echo rule for {destination_prefix}: {}",
+                powershell_failure_detail(&output)
+            );
+        }
+        Err(err) => {
+            warn!(
+                "Could not run Windows firewall ICMPv4 echo rule command for {destination_prefix}: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

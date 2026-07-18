@@ -244,6 +244,10 @@ impl Daemon {
                         if !rs.is_empty() {
                             relay_servers = rs;
                         }
+                        if relay_servers.is_empty() {
+                            relay_servers =
+                                infer_default_relay_servers(&self.config.control.server_url);
+                        }
 
                         control_event_registered = Some(ControlEvent::Registered {
                             node_id: Some(assigned_node_id.clone()),
@@ -1200,6 +1204,62 @@ fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> 
     Some(local_addr.to_string())
 }
 
+fn infer_default_relay_servers(control_server_url: &str) -> Vec<String> {
+    if std::env::var("P2WLAN_DISABLE_DEFAULT_RELAY").as_deref() == Ok("1") {
+        return Vec::new();
+    }
+    if let Ok(configured) = std::env::var("P2WLAN_DEFAULT_RELAY") {
+        return configured
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+
+    let Some(host) = control_server_host(control_server_url) else {
+        return Vec::new();
+    };
+    let normalized = host.trim_matches(['[', ']']);
+    if normalized.is_empty()
+        || normalized.eq_ignore_ascii_case("localhost")
+        || normalized.eq_ignore_ascii_case("ctrl.test")
+        || normalized.ends_with(".test")
+        || normalized == "127.0.0.1"
+        || normalized == "::1"
+    {
+        return Vec::new();
+    }
+
+    let endpoint = if host.starts_with('[') {
+        format!("{host}:18081")
+    } else if host.contains(':') {
+        format!("[{host}]:18081")
+    } else {
+        format!("{host}:18081")
+    };
+    vec![format!("default@{endpoint}")]
+}
+
+fn control_server_host(control_server_url: &str) -> Option<String> {
+    let trimmed = control_server_url.trim();
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = without_scheme.split('/').next()?.split('@').next_back()?;
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        return Some(authority[..=end].to_string());
+    }
+    authority
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+}
+
 async fn run_network_outbound(
     mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>,
     peers: Arc<PeerManager>,
@@ -1473,6 +1533,29 @@ mod tests {
             advertised_udp_endpoint(local, None),
             Some("127.0.0.1:51820".to_string())
         );
+    }
+
+    #[test]
+    fn test_infer_default_relay_servers_from_public_control_host() {
+        assert_eq!(
+            infer_default_relay_servers("http://47.109.40.237:18080"),
+            vec!["default@47.109.40.237:18081".to_string()]
+        );
+        assert_eq!(
+            infer_default_relay_servers("https://relay.example.com/api"),
+            vec!["default@relay.example.com:18081".to_string()]
+        );
+        assert_eq!(
+            infer_default_relay_servers("http://[2001:db8::1]:18080"),
+            vec!["default@[2001:db8::1]:18081".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_infer_default_relay_servers_skips_local_and_test_hosts() {
+        assert!(infer_default_relay_servers("http://127.0.0.1:18080").is_empty());
+        assert!(infer_default_relay_servers("http://localhost:18080").is_empty());
+        assert!(infer_default_relay_servers("https://ctrl.test").is_empty());
     }
 
     #[test]

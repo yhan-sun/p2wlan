@@ -7,8 +7,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -97,6 +99,7 @@ func migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 	CREATE INDEX IF NOT EXISTS idx_devices_network ON devices(network_id);
 	CREATE INDEX IF NOT EXISTS idx_tunnels_device ON tunnels(device_id);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnels_protocol_remote_port ON tunnels(protocol, remote_port);
 	CREATE INDEX IF NOT EXISTS idx_signals_to_node ON signals(to_node_id, created_at);
 
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_net_ip ON devices(network_id, virtual_ip);
@@ -780,16 +783,54 @@ type Tunnel struct {
 	CreatedAt      int64  `json:"created_at"`
 }
 
+const (
+	tunnelPortStart = 30000
+	tunnelPortEnd   = 60999
+)
+
+var (
+	// ErrTunnelPortInUse means a requested public port is already allocated.
+	ErrTunnelPortInUse = errors.New("tunnel remote port already allocated")
+	// ErrTunnelPortExhausted means the automatic public port pool is full.
+	ErrTunnelPortExhausted = errors.New("tunnel remote port pool exhausted")
+)
+
 // CreateTunnel inserts a new port mapping.
 func (db *DB) CreateTunnel(deviceID, protocol string, localPort, remotePort int, localAddr string) (*Tunnel, error) {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
 	id := fmt.Sprintf("tunnel-%d", time.Now().UnixNano())
 	now := time.Now().Unix()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if remotePort == 0 {
+		remotePort, err = db.allocateTunnelPort(tx, protocol)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		inUse, err := db.tunnelPortInUse(tx, protocol, remotePort)
+		if err != nil {
+			return nil, err
+		}
+		if inUse {
+			return nil, ErrTunnelPortInUse
+		}
+	}
+
 	publicEndpoint := fmt.Sprintf("relay.p2pnet.io:%d", remotePort)
 
-	_, err := db.Exec(`INSERT INTO tunnels (id, device_id, protocol, local_port, remote_port, local_address, public_endpoint, active, created_at)
+	_, err = tx.Exec(`INSERT INTO tunnels (id, device_id, protocol, local_port, remote_port, local_address, public_endpoint, active, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
 		id, deviceID, protocol, localPort, remotePort, localAddr, publicEndpoint, now)
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -798,6 +839,52 @@ func (db *DB) CreateTunnel(deviceID, protocol string, localPort, remotePort int,
 		LocalPort: localPort, RemotePort: remotePort, LocalAddress: localAddr,
 		PublicEndpoint: publicEndpoint, Active: true, CreatedAt: now,
 	}, nil
+}
+
+func (db *DB) allocateTunnelPort(tx *sql.Tx, protocol string) (int, error) {
+	rows, err := tx.Query(`SELECT remote_port FROM tunnels WHERE protocol = ? AND remote_port BETWEEN ? AND ? ORDER BY remote_port`,
+		protocol, tunnelPortStart, tunnelPortEnd)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	next := tunnelPortStart
+	for rows.Next() {
+		var used int
+		if err := rows.Scan(&used); err != nil {
+			return 0, err
+		}
+		if used < next {
+			continue
+		}
+		if used == next {
+			next++
+			continue
+		}
+		if used > next {
+			return next, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if next > tunnelPortEnd {
+		return 0, ErrTunnelPortExhausted
+	}
+	return next, nil
+}
+
+func (db *DB) tunnelPortInUse(tx *sql.Tx, protocol string, remotePort int) (bool, error) {
+	var existing int
+	err := tx.QueryRow(`SELECT 1 FROM tunnels WHERE protocol = ? AND remote_port = ? LIMIT 1`, protocol, remotePort).Scan(&existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetTunnel retrieves a tunnel by ID.
