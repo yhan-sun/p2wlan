@@ -309,17 +309,18 @@ impl RouteManager {
         }
 
         info!("Adding Windows route for {destination_prefix} via {interface}");
-        let status = windows_powershell_command(&format!(
-            "New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
+        let output = windows_powershell_command(&format!(
+            "$ErrorActionPreference = 'Stop'; New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
             ps_quote(&destination_prefix),
             ps_quote(&interface)
         ))
-            .status()
+            .output()
             .map_err(|e| crate::DaemonError::Network(format!("failed to run New-NetRoute: {e}")))?;
 
-        if !status.success() {
+        if !output.status.success() {
             return Err(crate::DaemonError::Network(format!(
-                "New-NetRoute failed for {destination_prefix} via {interface}; run as Administrator and verify the Wintun interface exists"
+                "New-NetRoute failed for {destination_prefix} via {interface}: {}",
+                powershell_failure_detail(&output)
             )));
         }
 
@@ -347,7 +348,7 @@ impl RouteManager {
             let interface = self.interface();
             info!("Cleaning up Windows route for {destination_prefix} via {interface}");
             let _ = windows_powershell_command(&format!(
-                "Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
+                "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
                 ps_quote(&destination_prefix),
                 ps_quote(&interface)
             ))
@@ -359,7 +360,7 @@ impl RouteManager {
 #[cfg(target_os = "windows")]
 fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
     let output = windows_powershell_command(&format!(
-        "Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias",
+        "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
         ps_quote(destination_prefix)
     ))
         .output()
@@ -368,7 +369,7 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
     if !output.status.success() {
         return Err(crate::DaemonError::Network(format!(
             "Get-NetRoute failed for {destination_prefix}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            powershell_failure_detail(&output)
         )));
     }
 
@@ -378,6 +379,34 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
         .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match (stderr.is_empty(), stdout.is_empty(), output.status.code()) {
+        (false, false, code) => format!(
+            "exit={}; stderr={}; stdout={}",
+            code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+            stderr,
+            stdout
+        ),
+        (false, true, code) => format!(
+            "exit={}; stderr={}",
+            code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+            stderr
+        ),
+        (true, false, code) => format!(
+            "exit={}; stdout={}",
+            code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+            stdout
+        ),
+        (true, true, code) => format!(
+            "exit={}; no PowerShell output",
+            code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+        ),
+    }
 }
 
 #[cfg(target_os = "windows")]
