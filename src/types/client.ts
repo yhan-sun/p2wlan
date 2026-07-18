@@ -43,10 +43,12 @@ export interface PathHealthDiagnostics {
   last_failure_age_ms: number | null;
   consecutive_failures: number;
   last_error: string | null;
+  latency_ms: number | null;
 }
 
 export interface PeerDiagnostics {
   node_id: string;
+  device_name?: string;
   virtual_ip: string;
   endpoint: string | null;
   nat_type: string;
@@ -126,6 +128,7 @@ export interface DaemonOperationStatus {
 export interface DesktopStatus {
   operation: DaemonOperationStatus;
   diagnostics: DiagnosticsSnapshot | null;
+  diagnosticsUrl?: string;
 }
 
 export interface DaemonStatus {
@@ -140,6 +143,7 @@ export interface DaemonStatus {
   tunInterface: string;
   mtu: number;
   udpLocalAddr: string | null;
+  diagnosticsUrl: string;
   controlConnected: boolean;
   controlServer: string;
   reauthRequired: boolean;
@@ -320,6 +324,7 @@ export function stoppedDaemonStatus(settings: ClientSettings, error?: string): D
     tunInterface: settings.tunInterface,
     mtu: settings.mtu,
     udpLocalAddr: null,
+    diagnosticsUrl: settings.diagnosticsUrl,
     controlConnected: false,
     controlServer: settings.controlServer,
     reauthRequired: false,

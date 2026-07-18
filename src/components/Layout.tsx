@@ -17,6 +17,22 @@ const navItems = [
   { path: "/diagnostics", label: "诊断", icon: Activity },
 ];
 
+function compactOperationLabel(phase: string): string {
+  switch (phase) {
+    case "authorizing":
+      return "授权中";
+    case "launching":
+    case "waiting_for_daemon":
+      return "启动中";
+    case "stopping":
+      return "停止中";
+    case "error":
+      return "异常";
+    default:
+      return "处理中";
+  }
+}
+
 export default function Layout({ children, onLogout }: LayoutProps) {
   const navigate = useNavigate();
   const { daemon, operation } = useClientStatus();
@@ -34,8 +50,9 @@ export default function Layout({ children, onLogout }: LayoutProps) {
           <div className="sidebar-status-header">
             <span>守护进程</span>
             <StatusPill
-              label={operationActive ? operation.message : daemon.lifecycle === "running" ? "在线" : zhLabel(daemon.lifecycle)}
+              label={operationActive ? compactOperationLabel(operation.phase) : daemon.lifecycle === "running" ? "在线" : zhLabel(daemon.lifecycle)}
               tone={operationActive ? "warn" : healthTone(daemon.healthStatus)}
+              title={operationActive ? operation.message : undefined}
             />
           </div>
           {daemon.virtualIp && <div className="sidebar-status-ip">{daemon.virtualIp}</div>}

@@ -685,6 +685,12 @@ func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string) error {
 	return err
 }
 
+// UpdateDeviceName changes the user-visible name of a registered device.
+func (db *DB) UpdateDeviceName(deviceID, deviceName string) error {
+	_, err := db.Exec(`UPDATE devices SET device_name = ? WHERE id = ?`, deviceName, deviceID)
+	return err
+}
+
 // DeleteDevice removes a device.
 func (db *DB) DeleteDevice(deviceID string) error {
 	_, err := db.Exec(`DELETE FROM devices WHERE id = ?`, deviceID)

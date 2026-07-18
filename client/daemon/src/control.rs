@@ -141,6 +141,9 @@ pub enum ControlMessage {
 pub struct PeerInfo {
     /// Peer node ID.
     pub node_id: String,
+    /// Human-readable device name from the control plane.
+    #[serde(default)]
+    pub device_name: String,
     /// Peer public key (hex).
     pub public_key: String,
     /// Peer public endpoint (ip:port).
@@ -172,6 +175,8 @@ pub enum ControlEvent {
     },
     /// A new peer has joined.
     PeerJoined(PeerInfo),
+    /// Existing peer metadata changed without changing connection presence.
+    PeerUpdated(PeerInfo),
     /// A peer has left.
     PeerLeft(String),
     /// Received a peer offer (ICE candidates for hole punching).
@@ -243,6 +248,8 @@ struct ListNodesResponse {
 #[derive(Debug, Deserialize)]
 struct DeviceResponse {
     id: String,
+    #[serde(default)]
+    device_name: String,
     public_key: String,
     #[serde(default)]
     endpoint: String,
@@ -492,6 +499,7 @@ impl ControlClient {
             } => {
                 let peer = PeerInfo {
                     node_id: node_id.clone(),
+                    device_name: String::new(),
                     public_key,
                     endpoint,
                     nat_type,
@@ -1341,6 +1349,7 @@ async fn poll_peers(
 
     let mut seen = HashMap::new();
     let mut joined = Vec::new();
+    let mut updated = Vec::new();
 
     {
         let mut state = state.write().await;
@@ -1355,6 +1364,7 @@ async fn poll_peers(
 
             let peer = PeerInfo {
                 node_id: node.id.clone(),
+                device_name: node.device_name,
                 public_key: node.public_key,
                 endpoint: node.endpoint,
                 nat_type: node.nat_type,
@@ -1364,8 +1374,12 @@ async fn poll_peers(
             };
 
             seen.insert(peer.node_id.clone(), peer.clone());
-            if !state.peers.contains_key(&peer.node_id) {
-                joined.push(peer.clone());
+            match state.peers.get(&peer.node_id) {
+                Some(known) if known.device_name != peer.device_name => {
+                    updated.push(peer.clone());
+                }
+                None => joined.push(peer.clone()),
+                _ => {}
             }
             state.peers.insert(peer.node_id.clone(), peer);
         }
@@ -1385,6 +1399,9 @@ async fn poll_peers(
 
     for peer in joined {
         let _ = event_tx.send(ControlEvent::PeerJoined(peer));
+    }
+    for peer in updated {
+        let _ = event_tx.send(ControlEvent::PeerUpdated(peer));
     }
 
     Ok(())

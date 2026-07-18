@@ -1,9 +1,12 @@
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
+
+const DIAGNOSTICS_PORT_SCAN_LIMIT: u16 = 32;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +66,7 @@ impl DaemonOperationStatus {
 pub struct DesktopStatus {
     pub operation: DaemonOperationStatus,
     pub diagnostics: Option<serde_json::Value>,
+    pub diagnostics_url: String,
 }
 
 pub struct ManagedDaemonState {
@@ -105,8 +109,37 @@ pub struct DaemonManager {
 
 impl DaemonManager {
     pub fn new() -> Self {
+        #[cfg(test)]
+        let managed_state = ManagedDaemonState::new();
+        #[cfg(not(test))]
+        let managed_state = {
+            let mut managed_state = ManagedDaemonState::new();
+            let pid_path = Self::default_pid_path();
+            if let Some(pid) = Self::read_pid_file(&pid_path) {
+                let is_daemon = Self::process_exists(pid)
+                    && Self::process_command_line(pid)
+                        .map(|command_line| command_line.contains("p2pnet-daemon"))
+                        .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
+                if is_daemon {
+                    if let Some(url) = Self::read_persisted_diagnostics_url() {
+                        managed_state.diagnostics_url = url;
+                        managed_state.elevated_started_by_app = true;
+                        managed_state.operation = DaemonOperationStatus {
+                            phase: DaemonOperationPhase::Running,
+                            message: "检测到后台 TUN".to_string(),
+                            started_at_ms: now_ms(),
+                            last_error: None,
+                        };
+                    }
+                } else {
+                    Self::remove_pid_file(&pid_path);
+                    Self::remove_persisted_diagnostics_url();
+                }
+            }
+            managed_state
+        };
         Self {
-            state: Arc::new(Mutex::new(ManagedDaemonState::new())),
+            state: Arc::new(Mutex::new(managed_state)),
         }
     }
 
@@ -138,19 +171,31 @@ impl DaemonManager {
 
     pub async fn configure(&self, options: DaemonStartOptions) -> DaemonOperationStatus {
         let mut state = self.state.lock().await;
-        if let Some(url) = options.diagnostics_url.as_ref() {
-            state.diagnostics_url = url.clone();
+        let tracks_daemon = state.started_by_app
+            || state.elevated_started_by_app
+            || state.operation.phase != DaemonOperationPhase::Stopped;
+        if !tracks_daemon {
+            if let Some(url) = options.diagnostics_url.as_ref() {
+                state.diagnostics_url = url.clone();
+            }
         }
         state.last_start_options = Some(options);
         state.operation.clone()
     }
 
     pub async fn desktop_status(&self, diagnostics_url: Option<String>) -> DesktopStatus {
-        let target_url = match diagnostics_url {
-            Some(url) => url,
-            None => self.state.lock().await.diagnostics_url.clone(),
+        let target_url = {
+            let state = self.state.lock().await;
+            let tracks_daemon = state.started_by_app
+                || state.elevated_started_by_app
+                || state.operation.phase != DaemonOperationPhase::Stopped;
+            if tracks_daemon {
+                state.diagnostics_url.clone()
+            } else {
+                diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
+            }
         };
-        let diagnostics = self.status(Some(target_url)).await.ok();
+        let diagnostics = self.status(Some(target_url.clone())).await.ok();
 
         if diagnostics.is_some() {
             let mut state = self.state.lock().await;
@@ -184,6 +229,7 @@ impl DaemonManager {
         DesktopStatus {
             operation: self.operation_status().await,
             diagnostics,
+            diagnostics_url: target_url,
         }
     }
 
@@ -420,14 +466,59 @@ impl DaemonManager {
     }
 
     pub fn diagnostics_bind_from_url(url: &str) -> String {
-        url::Url::parse(url)
-            .ok()
-            .and_then(|parsed| {
-                let host = parsed.host_str()?.to_string();
-                let port = parsed.port()?;
-                Some(format!("{host}:{port}"))
-            })
+        Self::diagnostics_socket_addr_from_url(url)
+            .map(|address| address.to_string())
             .unwrap_or_else(|| "127.0.0.1:39277".to_string())
+    }
+
+    fn diagnostics_socket_addr_from_url(url: &str) -> Option<SocketAddr> {
+        let parsed = url::Url::parse(url).ok()?;
+        let ip = match parsed.host()? {
+            url::Host::Ipv4(ip) => IpAddr::V4(ip),
+            url::Host::Ipv6(ip) => IpAddr::V6(ip),
+            url::Host::Domain(host) if host.eq_ignore_ascii_case("localhost") => {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            _ => return None,
+        };
+        if !ip.is_loopback() {
+            return None;
+        }
+        Some(SocketAddr::new(ip, parsed.port()?))
+    }
+
+    fn available_diagnostics_url(preferred_url: &str) -> Result<String, String> {
+        let mut parsed = url::Url::parse(preferred_url)
+            .map_err(|error| format!("本地诊断 URL 无效：{error}"))?;
+        let preferred = Self::diagnostics_socket_addr_from_url(preferred_url).ok_or_else(|| {
+            "本地诊断地址必须使用带端口的 127.0.0.1、[::1] 或 localhost".to_string()
+        })?;
+
+        for offset in 0..DIAGNOSTICS_PORT_SCAN_LIMIT {
+            let Some(port) = preferred.port().checked_add(offset) else {
+                break;
+            };
+            let candidate = SocketAddr::new(preferred.ip(), port);
+            match TcpListener::bind(candidate) {
+                Ok(listener) => {
+                    drop(listener);
+                    parsed
+                        .set_port(Some(port))
+                        .map_err(|_| "无法写入自动选择的诊断端口".to_string())?;
+                    return Ok(parsed.to_string());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => {
+                    return Err(format!("无法检测本地诊断端口 {candidate}：{error}"));
+                }
+            }
+        }
+
+        Err(format!(
+            "诊断端口 {} 及后续 {} 个端口均已被占用",
+            preferred.port(),
+            DIAGNOSTICS_PORT_SCAN_LIMIT - 1
+        ))
     }
 
     pub fn default_config_path() -> PathBuf {
@@ -484,6 +575,35 @@ impl DaemonManager {
 
     fn default_pid_path() -> PathBuf {
         Self::default_log_dir().join("p2pnet-daemon.pid")
+    }
+
+    fn default_endpoint_path() -> PathBuf {
+        Self::default_log_dir().join("p2pnet-daemon.endpoint")
+    }
+
+    fn persist_diagnostics_url(url: &str) -> Result<(), String> {
+        let path = Self::default_endpoint_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("无法创建诊断端点目录 {}：{error}", parent.display()))?;
+        }
+        std::fs::write(&path, url)
+            .map_err(|error| format!("无法记录诊断端点 {}：{error}", path.display()))
+    }
+
+    #[cfg(not(test))]
+    fn read_persisted_diagnostics_url() -> Option<String> {
+        let url = std::fs::read_to_string(Self::default_endpoint_path()).ok()?;
+        let url = url.trim().to_string();
+        Self::diagnostics_socket_addr_from_url(&url)?;
+        Some(url)
+    }
+
+    fn remove_persisted_diagnostics_url() {
+        let path = Self::default_endpoint_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[allow(dead_code)]
@@ -1219,7 +1339,7 @@ impl DaemonManager {
     }
 
     pub async fn start(&self, options: Option<DaemonStartOptions>) -> Result<String, String> {
-        let options = options.unwrap_or(DaemonStartOptions {
+        let mut options = options.unwrap_or(DaemonStartOptions {
             diagnostics_url: None,
             control_server: None,
             auth_token: None,
@@ -1228,7 +1348,7 @@ impl DaemonManager {
             tun_interface: None,
             mtu: None,
         });
-        let target_url = {
+        let preferred_url = {
             let state = self.state.lock().await;
             options
                 .diagnostics_url
@@ -1237,7 +1357,7 @@ impl DaemonManager {
         };
 
         // 1. Is daemon already running?
-        if Self::check_endpoint(&target_url).await {
+        if Self::diagnostics_process_id(&preferred_url).await.is_some() {
             return Ok("守护进程已经运行。".to_string());
         }
 
@@ -1247,6 +1367,9 @@ impl DaemonManager {
                     .to_string(),
             );
         }
+
+        let target_url = Self::available_diagnostics_url(&preferred_url)?;
+        options.diagnostics_url = Some(target_url.clone());
 
         // 2. Resolve binary path
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1275,9 +1398,14 @@ impl DaemonManager {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("启动守护进程失败：{}", e))?;
+        if let Err(error) = Self::persist_diagnostics_url(&target_url) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
 
         // 5. Update state
         {
@@ -1286,6 +1414,7 @@ impl DaemonManager {
             state.started_by_app = true;
             state.elevated_started_by_app = false;
             state.diagnostics_url = target_url.clone();
+            state.last_start_options = Some(options.clone());
             state.last_error = None;
         }
 
@@ -1330,7 +1459,7 @@ impl DaemonManager {
         &self,
         options: Option<DaemonStartOptions>,
     ) -> Result<String, String> {
-        let options = options.unwrap_or(DaemonStartOptions {
+        let mut options = options.unwrap_or(DaemonStartOptions {
             diagnostics_url: None,
             control_server: None,
             auth_token: None,
@@ -1339,7 +1468,7 @@ impl DaemonManager {
             tun_interface: None,
             mtu: None,
         });
-        let target_url = {
+        let preferred_url = {
             let state = self.state.lock().await;
             options
                 .diagnostics_url
@@ -1347,7 +1476,7 @@ impl DaemonManager {
                 .unwrap_or_else(|| state.diagnostics_url.clone())
         };
 
-        if Self::check_endpoint(&target_url).await {
+        if Self::diagnostics_process_id(&preferred_url).await.is_some() {
             self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
                 .await;
             return Ok("守护进程已经运行。".to_string());
@@ -1360,6 +1489,14 @@ impl DaemonManager {
             .is_empty()
         {
             return Err("请先登录或注册控制面账号，再提权启动 TUN 模式。".to_string());
+        }
+
+        let target_url = Self::available_diagnostics_url(&preferred_url)?;
+        options.diagnostics_url = Some(target_url.clone());
+        {
+            let mut state = self.state.lock().await;
+            state.diagnostics_url = target_url.clone();
+            state.last_start_options = Some(options.clone());
         }
 
         #[cfg(target_os = "macos")]
@@ -1412,6 +1549,7 @@ impl DaemonManager {
                     format!("管理员授权启动失败：{stderr}")
                 });
             }
+            Self::persist_diagnostics_url(&target_url)?;
 
             self.set_operation(
                 DaemonOperationPhase::WaitingForDaemon,
@@ -1491,6 +1629,7 @@ impl DaemonManager {
                 ),
             )?;
             Self::launch_windows_elevated_daemon(&bin_path, &args, &log_dir, &pid_path)?;
+            Self::persist_diagnostics_url(&target_url)?;
 
             self.set_operation(
                 DaemonOperationPhase::WaitingForDaemon,
@@ -1541,7 +1680,14 @@ impl DaemonManager {
             .await;
         let target_url = {
             let state = self.state.lock().await;
-            diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
+            if state.started_by_app
+                || state.elevated_started_by_app
+                || state.operation.phase != DaemonOperationPhase::Stopped
+            {
+                state.diagnostics_url.clone()
+            } else {
+                diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
+            }
         };
 
         {
@@ -1554,6 +1700,7 @@ impl DaemonManager {
                 Self::remove_pid_file(&Self::default_pid_path());
                 state.operation = DaemonOperationStatus::stopped();
                 state.consecutive_status_failures = 0;
+                Self::remove_persisted_diagnostics_url();
                 return Ok("守护进程已停止。".to_string());
             }
         }
@@ -1567,6 +1714,7 @@ impl DaemonManager {
             Self::remove_pid_file(&Self::default_pid_path());
             state.operation = DaemonOperationStatus::stopped();
             state.consecutive_status_failures = 0;
+            Self::remove_persisted_diagnostics_url();
             return Ok("已停止 TUN 守护进程。".to_string());
         }
 
@@ -1611,6 +1759,7 @@ impl DaemonManager {
             if stopped {
                 state.operation = DaemonOperationStatus::stopped();
                 state.consecutive_status_failures = 0;
+                Self::remove_persisted_diagnostics_url();
             }
         }
 
@@ -1633,6 +1782,7 @@ impl DaemonManager {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
+                Self::remove_persisted_diagnostics_url();
             } else if state.elevated_started_by_app {
                 let pid_path = Self::default_pid_path();
                 if Self::terminate_recorded_daemon(&pid_path) != Ok(true) {
@@ -1641,6 +1791,7 @@ impl DaemonManager {
                         let _ = Self::terminate_pid_with_system_authorization(pid);
                     }
                 }
+                Self::remove_persisted_diagnostics_url();
             }
         }
     }
@@ -1748,12 +1899,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_status_keeps_the_selected_port_while_daemon_is_running() {
+        let manager = DaemonManager::new();
+        let selected_url = status_server_once(r#"{"process_id":1234}"#).await;
+        let stale_requested_url = unused_local_status_url();
+        {
+            let mut state = manager.state.lock().await;
+            state.diagnostics_url = selected_url.clone();
+            state.operation = DaemonOperationStatus {
+                phase: DaemonOperationPhase::Running,
+                message: "TUN 已连接".to_string(),
+                started_at_ms: now_ms(),
+                last_error: None,
+            };
+        }
+
+        let status = manager.desktop_status(Some(stale_requested_url)).await;
+
+        assert!(status.diagnostics.is_some());
+        assert_eq!(status.diagnostics_url, selected_url);
+    }
+
+    #[tokio::test]
     async fn desktop_status_requires_three_failures_before_marking_running_daemon_error() {
         let manager = DaemonManager::new();
         manager
             .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
             .await;
         let url = unused_local_status_url();
+        manager.state.lock().await.diagnostics_url = url.clone();
 
         for expected_failures in 1..=2 {
             let status = manager.desktop_status(Some(url.clone())).await;
@@ -1806,6 +1980,42 @@ mod tests {
             DaemonManager::diagnostics_bind_from_url("http://127.0.0.1/status"),
             "127.0.0.1:39277"
         );
+        assert_eq!(
+            DaemonManager::diagnostics_bind_from_url("http://[::1]:39277/status"),
+            "[::1]:39277"
+        );
+    }
+
+    #[test]
+    fn diagnostics_port_selection_keeps_a_free_preferred_port() {
+        let preferred = unused_local_status_url();
+        assert_eq!(
+            DaemonManager::available_diagnostics_url(&preferred).unwrap(),
+            preferred
+        );
+    }
+
+    #[test]
+    fn diagnostics_port_selection_avoids_an_occupied_port() {
+        let listener = (40_000..50_000)
+            .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("no test port available");
+        let address = listener.local_addr().unwrap();
+        let preferred = format!("http://{address}/status");
+
+        let selected = DaemonManager::available_diagnostics_url(&preferred).unwrap();
+        let selected_address = DaemonManager::diagnostics_socket_addr_from_url(&selected).unwrap();
+
+        assert_ne!(selected, preferred);
+        assert!(selected_address.port() > address.port());
+        assert!(selected_address.port() - address.port() < DIAGNOSTICS_PORT_SCAN_LIMIT);
+    }
+
+    #[test]
+    fn diagnostics_port_selection_rejects_non_loopback_hosts() {
+        let error =
+            DaemonManager::available_diagnostics_url("http://0.0.0.0:39277/status").unwrap_err();
+        assert!(error.contains("127.0.0.1"));
     }
 
     #[test]

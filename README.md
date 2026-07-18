@@ -1,115 +1,254 @@
-# P2WLAN
+<div align="center">
+  <img src="src-tauri/icons/icon.png" width="96" alt="P2WLAN icon" />
+  <h1>P2WLAN</h1>
+  <p><strong>让分散在不同网络中的设备，像连接在同一个局域网。</strong></p>
+  <p>开源、跨平台、P2P 优先的虚拟内网。直连失败时自动切换加密中继。</p>
 
-P2WLAN 是一个面向私有化部署的 P2P 虚拟内网系统设计稿。目标是实现高性能、跨平台、低内存、尽量原生调用系统网络 API 的虚拟局域网能力，支持节点间 P2P 通信、NAT 穿透、中继 fallback、端口映射和内网互访。
+  <p>
+    <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><img src="https://img.shields.io/github/v/release/yhan-sun/p2wlan?style=flat-square&display_name=tag" alt="Release" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square" alt="MIT License" /></a>
+    <img src="https://img.shields.io/badge/core-Rust-dea584?style=flat-square" alt="Rust core" />
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-4c8bf5?style=flat-square" alt="Platforms" />
+  </p>
 
-当前仓库已经合入第一版半成品实现：Rust 客户端核心、Go 控制面服务、React 桌面 UI 原型和 protobuf 草案均已入库。代码可以编译和测试，但还不是可直接生产使用的完整虚拟内网产品。
+  <p>
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>下载客户端</strong></a>
+    · <a href="P2PNet-Design.md">设计文档</a>
+    · <a href="docs/ROADMAP.md">路线图</a>
+    · <a href="https://github.com/yhan-sun/p2wlan/issues">反馈问题</a>
+  </p>
+</div>
 
-## 文档入口
+![P2WLAN desktop client](docs/assets/p2wlan-devices.jpg)
 
-- [P2PNet-Design.md](./P2PNet-Design.md): 项目总体设计文档，包含产品目标、架构、技术选型和验收标准。
-- [docs/PROTOCOL.md](./docs/PROTOCOL.md): 协议与状态机草案，包含身份、信令、NAT 穿透、Relay 和端口映射协议。
-- [docs/ROADMAP.md](./docs/ROADMAP.md): 分阶段开发路线图、验收标准、测试矩阵和风险控制。
-- [docs/RESEARCH_NOTES.md](./docs/RESEARCH_NOTES.md): 参考项目与技术调研笔记。
-- [docs/AI_IMPLEMENTATION_PROMPT.md](./docs/AI_IMPLEMENTATION_PROMPT.md): 可直接交给 Coding Agent 的实现提示词。
-- [docs/NEXT_PHASE_IMPLEMENTATION_PROMPT.md](./docs/NEXT_PHASE_IMPLEMENTATION_PROMPT.md): 当前 Linux 私测版完善任务的详细执行与验收提示词。
+## P2WLAN 是什么
 
-## 当前代码结构
+P2WLAN 是一个面向个人、开发者和自托管用户的虚拟内网项目。它在设备上创建系统虚拟网卡，为每台设备分配稳定的虚拟 IP，并优先通过 UDP 打洞建立端到端加密的 P2P 通道。
 
-- `client/`: Rust workspace，包含 TUN、crypto、WireGuard、NAT、Relay 和 daemon 模块。
-- `server/`: Go 控制面服务，包含认证、设备/数据库 API 和 signaling WebSocket。
-- `src/`: React + Vite 桌面 UI 原型。
-- `proto/`: 网络协议 protobuf 草案。
+当 NAT、企业网络或防火墙阻止直连时，客户端会自动回退到 Relay。应用负责登录、系统授权、设备状态、延迟、诊断和后台生命周期，用户不需要手工配置路由表。
 
-## 当前实现状态
+项目当前处于 **Preview** 阶段，已经完成 macOS 双向 TUN 实机互通、Windows Wintun 与 Linux TUN 数据面实现，并持续通过 Rust、Go 和前端 CI。它适合试用、开发和自托管验证；用于重要生产网络前，请先阅读[安全说明](#安全说明)和[平台状态](#平台状态)。
 
-- 已打通：daemon 注册控制面、分配虚拟 IP、轮询 peer map、TUN 出站包按虚拟 IP 路由到 peer。
-- 已打通：出站包通过已建立的 WireGuard transport session 加密，并经 direct UDP socket 发送到 peer endpoint。
-- 已打通：direct UDP 入站 datagram 可进入 WireGuard transport 解密，并将解密后的 IP 包写回 TUN。
-- 已打通：控制面可通过 REST signaling 队列交换 WireGuard handshake offer/answer，并由 daemon 自动安装 transport session。
-- 已打通：daemon 可通过 `network.udp_bind` / `--udp-bind` 绑定 UDP，本地或公网可见地址可通过 `network.udp_advertise` / `--udp-advertise` 上报控制面。
-- 已打通：daemon 可收集 host/STUN UDP candidates，并通过 signaling offer/answer 交换；peer 端会从 candidates 中选择可解析 endpoint。
-- 已打通：daemon 收到 peer candidates 后会主动发送 UDP punch probes，入站 PNCH 包会自动 ACK 且不会进入 WireGuard 数据面，direct endpoint 会定期发送 keepalive 刷新 NAT 映射。
-- 已打通：daemon 可连接配置的 relay server（`relay.servers` / `--relay`），当 direct UDP 未验证、无 endpoint 或发送失败时可把加密 WireGuard datagram 通过 relay fallback 转发，relay 入站流量会回灌 WireGuard 解密。
-- 已打通：Relay region 自动选择支持 `region@endpoint` 候选、区域偏好、并发连接耗时比较和不可达候选回退；relay 使用控制面分配的 node ID 注册，选择报告可从 diagnostics 查看。
-- 已打通：peer path health 会记录 direct/relay 成功和失败；direct 通过 UDP punch ACK 或入站数据确认，失败后自动切到 relay，并在后台继续 probe direct 以便恢复。
-- 已打通：daemon 可通过 `--diagnostics-bind 127.0.0.1:39277` 暴露本地 `/status` JSON，并可用 `p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status` 查看 peer path health、bytes、endpoint、relay 状态和失败原因。
-- 已提供：Linux root/network namespace 真实双节点 TUN ping smoke，覆盖双向 ICMP、WireGuard/direct UDP 数据面和 diagnostics 路径状态。
-- 仍待补齐：在 Linux CI/测试机持续执行真实 TUN smoke、Relay 跨区域互联与动态重选。
+## 核心能力
 
-## 本地验证
+- **P2P 优先**：STUN/ICE 风格候选收集、UDP Hole Punching、NAT 保活和直连恢复。
+- **中继兜底**：直连不可用时自动使用 Relay，网络变化或 Relay 重启后自动重连。
+- **加密数据面**：Noise/WireGuard 风格握手与 ChaCha20-Poly1305 加密，Relay 只转发密文。
+- **真实虚拟网卡**：macOS `utun`、Linux TUN、Windows Wintun，支持虚拟 IP 双向访问。
+- **原生桌面体验**：Tauri 桌面外壳、系统托盘、管理员授权、后台运行和安全退出。
+- **可观察连接**：设备列表、直连/中继路径、真实 RTT、流量、端点、NAT 和故障诊断。
+- **可自托管**：Go 控制面、SQLite 数据库和轻量 Relay 均可独立部署。
+- **低资源设计**：Rust 网络核心、按需任务和窗口隐藏降频，适合长期后台运行。
+
+## 四步开始使用
+
+1. 从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载对应平台客户端。
+2. 打开 P2WLAN，注册或登录控制面账号。
+3. 点击“授权启动 TUN”，在系统授权窗口中确认管理员权限。
+4. 在另一台设备登录同一账号并启动 TUN，然后使用设备列表中的虚拟 IP 测试：
 
 ```bash
-# 格式化与代码风格检查
+ping 10.20.0.5
+```
+
+### macOS
+
+下载 `p2wlan-macos-universal.dmg`，拖入 Applications 后运行。当前 Preview 包使用 ad-hoc 签名，尚未完成 Apple 公证；如果 Gatekeeper 阻止首次打开，请右键应用并选择“打开”。
+
+### Windows
+
+下载并解压 `p2wlan-windows-x64.zip`，保持以下文件位于同一目录，然后运行 `p2wlan-desktop.exe`：
+
+```text
+p2wlan-desktop.exe
+p2pnet-daemon.exe
+wintun.dll
+```
+
+启动 TUN 时 Windows 会显示 UAC 授权窗口。P2WLAN 不读取或保存系统管理员密码。
+
+### Linux
+
+Linux daemon 与 TUN 数据面已经通过 network namespace 双节点测试。桌面安装包仍在完善中，现阶段建议从源码构建。
+
+## 平台状态
+
+| 平台 | 桌面客户端 | 虚拟网卡 | 当前状态 |
+| --- | --- | --- | --- |
+| macOS Apple Silicon / Intel | Tauri Universal | `utun` | 已完成双向虚拟 IP 实机互通 |
+| Windows 10/11 x64 | 便携版 | Wintun | 已实现并提供远程 smoke 脚本，仍需扩大硬件覆盖 |
+| Linux x64 | 可从源码运行 | `/dev/net/tun` | daemon 与真实 TUN smoke 已通过，安装包待完善 |
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    A["设备 A<br/>Desktop + daemon + TUN"]
+    B["设备 B<br/>Desktop + daemon + TUN"]
+    C["Control<br/>认证、IP 分配、信令"]
+    R["Relay<br/>加密流量兜底"]
+
+    A <-->|"优先：加密 Direct UDP"| B
+    A -->|"注册与候选交换"| C
+    B -->|"注册与候选交换"| C
+    A -.->|"直连失败"| R
+    B -.->|"直连失败"| R
+```
+
+控制面负责身份认证、虚拟 IP 分配、设备发现和握手信令，不转发正常 P2P 数据。Relay 只在直连不可用时转发已加密的数据包。
+
+## 自托管
+
+控制面和 Relay 都是单个 Go 服务，可部署在同一台具有公网地址的 Linux 服务器上。
+
+```bash
+cd server
+mkdir -p data
+go build -o p2wlan-control .
+go build -o p2wlan-relay ./relay
+```
+
+启动 Relay：
+
+```bash
+RELAY_BIND=:18081 ./p2wlan-relay
+```
+
+启动控制面，请替换示例密钥和公网地址：
+
+```bash
+JWT_SECRET="replace-with-a-long-random-secret" \
+DB_PATH="./data/p2wlan.db" \
+PORT=18080 \
+RELAY_SERVERS="default@relay.example.com:18081" \
+./p2wlan-control
+```
+
+默认端口：
+
+| 服务 | 协议 | 默认端口 | 用途 |
+| --- | --- | --- | --- |
+| Control | HTTP / WebSocket | `18080` | 登录、设备注册、信令和 IP 分配 |
+| Relay | TCP | `18081` | 加密数据包中继 |
+| Diagnostics | Loopback HTTP | `39277` 起 | 本机状态，仅允许回环地址 |
+| Direct transport | UDP | 系统动态分配 | P2P 数据与 NAT 探测 |
+
+公网部署建议在 Control 前配置 HTTPS/WSS 反向代理，并限制数据库和诊断端口只能从可信网络访问。完整部署与协议说明见 [docs/PROTOCOL.md](docs/PROTOCOL.md) 和 [P2PNet-Design.md](P2PNet-Design.md)。
+
+## 从源码构建
+
+### 环境要求
+
+- Rust stable
+- Go 1.22+
+- Node.js 20+
+- pnpm 10+
+- Linux 桌面构建需要 GTK/WebKit2GTK 开发依赖
+
+```bash
+git clone https://github.com/yhan-sun/p2wlan.git
+cd p2wlan
+pnpm install --frozen-lockfile
+
+# Rust daemon
+cargo build -p p2pnet-daemon
+
+# 桌面客户端开发版
+cargo tauri dev
+```
+
+macOS 安装包应通过项目脚本构建，脚本会把 daemon 放入应用资源目录：
+
+```bash
+pnpm run icons
+pnpm run package:macos
+```
+
+更多发行说明见 [docs/RELEASE_PACKAGING.md](docs/RELEASE_PACKAGING.md)。
+
+## 验证与测试
+
+```bash
 cargo fmt --all --check
-
-# Rust 静态代码分析检查
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-# Rust 单元与集成测试
 cargo test --workspace --all-targets
 
-# Go 控制面代码静态分析与测试
 cd server
 go vet ./...
 go test ./... -count=1
 cd ..
 
-# 前端依赖安装、安全审计及构建
-pnpm install
 pnpm audit --audit-level high
 pnpm run build
-
-# Control-plane smoke test: 启动 Go 服务端和两个 Rust 客户端实例（不需要 root/TUN）
-# 验证注册、加密会话、信令、NAT 候选交换、打洞和诊断接口
 ./scripts/control-smoke.sh
+```
 
-# Real data-plane smoke test: 需要 Linux root 权限、iproute2、ping 和 curl
-# 会在真实 Linux 虚拟网络空间创建 TUN 网卡并验证数据通信
-cargo build -p p2pnet-daemon
+真实 TUN 测试需要管理员权限：
+
+```bash
+# Linux network namespace 双节点测试
 sudo -E ./scripts/tun-ping-smoke.sh
+
+# macOS 本机与远程 Linux 双向 ping
+sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```
 
-设置 `P2WLAN_REQUIRE_TUN_SMOKE=1` 可将平台、权限或依赖缺失从 skip 改为失败，适合 Linux CI 强制执行。
+Windows 测试流程见 [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md)，macOS 测试流程见 [docs/MAC_TESTING.md](docs/MAC_TESTING.md)。
 
-本地运行 daemon 时可打开诊断端口：
+## 仓库结构
 
-```bash
-p2pnet-daemon --config p2pnet-config.json --diagnostics-bind 127.0.0.1:39277
-p2pnet-daemon --status --diagnostics-url http://127.0.0.1:39277/status
+```text
+client/       Rust 网络核心：TUN、加密、WireGuard、NAT、Relay、daemon
+server/       Go 控制面、认证、SQLite、信令和 Relay server
+src/          React 桌面客户端界面
+src-tauri/    Tauri 原生外壳、托盘、权限和 daemon 生命周期
+scripts/      构建、打包和跨平台 smoke 测试
+docs/         协议、路线图、研究和平台测试文档
+proto/        Protobuf 协议草案
 ```
 
-Relay 候选可使用 `region@endpoint` 标注区域，未标注的旧格式仍归入 `default` 区域：
+## 路线图
 
-```bash
-p2pnet-daemon \
-  --relay cn-shanghai@198.51.100.10:8080,cn-hongkong@203.0.113.20:8080 \
-  --relay-regions cn-shanghai,cn-hongkong \
-  --relay-selection-timeout-ms 3000
-```
+- [x] 控制面认证、设备注册和虚拟 IP 自动分配
+- [x] macOS、Windows、Linux 虚拟网卡数据面
+- [x] 加密会话、UDP 打洞、Direct/Relay 自动切换
+- [x] 控制面与 Relay 断线重连
+- [x] 桌面授权、托盘、后台生命周期和设备诊断
+- [x] 设备 RTT、重命名和本地诊断端口自动避让
+- [ ] macOS Developer ID 签名与公证
+- [ ] Windows 安装器和更广泛的 Win10/Win11 兼容验证
+- [ ] Linux 桌面安装包
+- [ ] Relay 跨区域互联与动态重选
+- [ ] DNS、ACL、子网路由和端口映射产品化
+- [ ] 吞吐量、延迟、内存占用和故障恢复基准
 
-选择顺序为区域偏好、连接与注册耗时、配置顺序。当前 relay server 尚无跨区域互联，同一虚拟网络应使用一致的候选列表；endpoint 当前必须是可解析的 `IP:port` 或 `[IPv6]:port`。
+详细计划与验收标准见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
-如果本机 Go 出现标准库版本不一致，优先使用 Homebrew 的 GOROOT：
+## 安全说明
 
-```bash
-GOROOT=/opt/homebrew/opt/go/libexec /opt/homebrew/opt/go/libexec/bin/go test ./...
+- 系统管理员授权由 macOS/Windows/Linux 自身处理，客户端不会读取或保存管理员密码。
+- Control 可以看到账号、设备、虚拟 IP、候选端点和连接元数据。
+- Relay 可以看到源/目标节点标识和流量大小，但转发的是加密数据。
+- 当前版本尚未经过独立安全审计，不建议直接承载高敏感生产流量。
+- 对安全要求较高的场景，请自托管 Control/Relay、启用 TLS，并自行审查发布产物。
 
-GOROOT=/opt/homebrew/opt/go/libexec GO_BIN=/opt/homebrew/opt/go/libexec/bin/go ./scripts/control-smoke.sh
-```
+如发现安全问题，请避免在公开 Issue 中披露敏感细节，优先通过仓库维护者的私有联系方式报告。
 
-## 推荐实现路线
+## 参与贡献
 
-1. 先做 Rust 客户端核心：虚拟网卡抽象、Linux TUN、包读写测试。
-2. 再接入用户态 WireGuard 引擎，完成同局域网内两节点虚拟 IP 通信。
-3. 完善 UDP hole punching 探测、keepalive 和重连状态机，实现真正跨 NAT P2P。
-4. 增加 Relay fallback，覆盖对称 NAT、企业网络和 UDP 受限环境。
-5. 最后补齐 UI、DNS、ACL、子网路由和端口映射。
+欢迎提交 Issue、Pull Request、平台测试结果和网络环境复现信息。尤其需要以下帮助：
 
-## 项目定位
+- 不同家庭 NAT、校园网、企业网和移动热点下的直连率数据
+- Windows 10/11 与不同网卡驱动环境的兼容验证
+- Linux 发行版安装和权限方案
+- Relay 跨区域设计、安全审计和性能基准
+- 中文/英文文档与客户端本地化
 
-P2WLAN 的目标不是一开始复制完整商业级 Tailscale/ZeroTier，而是先做一个可运行、可验证、可逐步扩展的虚拟内网内核：
+提交代码前请运行“验证与测试”中的质量门禁，并尽量为行为变化增加测试。
 
-- 数据面优先，确保两台机器能通过虚拟 IP 通信。
-- P2P 优先，Relay 只作为失败兜底。
-- 控制面集中管理，数据面端到端加密。
-- 先支持 Linux/macOS/Windows 桌面端，再扩展移动端。
+如果 P2WLAN 对你有用，请给项目一个 [Star](https://github.com/yhan-sun/p2wlan)。Star、Issue 和真实网络测试反馈都会直接帮助项目走向稳定版本。
+
+## License
+
+[MIT License](LICENSE)

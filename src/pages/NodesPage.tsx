@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useClientStatus } from "../hooks/useClientStatus";
 import {
   StatusPill,
@@ -11,20 +11,30 @@ import {
 import {
   RefreshCw,
   Copy,
-  ChevronDown,
-  ChevronUp,
   Terminal,
   Network,
   Info,
-  CheckCircle,
-  XCircle,
   AlertTriangle,
+  Gauge,
+  Pencil,
 } from "lucide-react";
-import { getSettings } from "../lib/clientApi";
+import DeviceEditorDialog from "../components/DeviceEditorDialog";
+import { getSettings, renamePeerDevice } from "../lib/clientApi";
+import type { PeerStatus } from "../types/client";
+
+function latencyTone(latencyMs: number | null): string {
+  if (latencyMs == null) return "latency-unknown";
+  if (latencyMs <= 60) return "latency-good";
+  if (latencyMs <= 150) return "latency-medium";
+  return "latency-high";
+}
 
 export default function NodesPage() {
   const { daemon, peers, refreshing, refresh } = useClientStatus();
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [editingPeer, setEditingPeer] = useState<PeerStatus | null>(null);
+  const [nameOverrides, setNameOverrides] = useState<Record<string, string>>({});
+  const [savingName, setSavingName] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copiedType, setCopiedType] = useState<"ip" | "ping" | null>(null);
 
@@ -61,8 +71,31 @@ export default function NodesPage() {
     }
   };
 
-  const toggleExpand = (id: string) => {
-    setExpandedId(expandedId === id ? null : id);
+  const closeEditor = useCallback(() => {
+    if (savingName) return;
+    setEditingPeer(null);
+    setEditError(null);
+  }, [savingName]);
+
+  const openEditor = (peer: PeerStatus) => {
+    setEditError(null);
+    setEditingPeer({ ...peer, name: nameOverrides[peer.id] ?? peer.name });
+  };
+
+  const saveDeviceName = async (deviceName: string) => {
+    if (!editingPeer) return;
+    setSavingName(true);
+    setEditError(null);
+    const result = await renamePeerDevice(editingPeer.id, deviceName);
+    if (result.error) {
+      setEditError(result.error);
+      setSavingName(false);
+      return;
+    }
+    setNameOverrides((current) => ({ ...current, [editingPeer.id]: result.data.deviceName }));
+    setSavingName(false);
+    setEditingPeer(null);
+    void refresh();
   };
 
   // Stats
@@ -135,17 +168,15 @@ export default function NodesPage() {
           {/* Devices Cards List */}
           <div className="devices-list flex-col gap-sm">
             {peers.map((peer) => {
-              const isExpanded = expandedId === peer.id;
-              const directOk = peer.directHealth && peer.directHealth.consecutive_failures === 0;
+              const displayName = nameOverrides[peer.id] ?? peer.name;
 
               return (
                 <div key={peer.id} className="device-card-row">
-                  {/* Card Header Summary */}
-                  <div className="device-card-header flex-row items-center justify-between">
+                  <div className="device-card-header">
                     <div className="device-info-col flex-row items-center gap-md">
                       <div className="device-main flex-col">
                         <span className="device-name font-semibold" title={peer.id}>
-                          {peer.name}
+                          {displayName}
                         </span>
                         <span className="device-ip text-mono text-accent font-semibold">
                           {peer.virtualIp}
@@ -156,11 +187,35 @@ export default function NodesPage() {
                           label={zhLabel(peer.state)}
                           tone={connectionTone(peer.state)}
                         />
-                        <StatusPill label={zhLabel(peer.path)} tone={pathTone(peer.path)} />
+                        {peer.path !== peer.state && (
+                          <StatusPill label={zhLabel(peer.path)} tone={pathTone(peer.path)} />
+                        )}
                       </div>
                     </div>
 
                     <div className="device-meta-col flex-row items-center gap-lg">
+                      <div className="device-meta-item latency-meta flex-col text-right">
+                        <span className="meta-label">延迟</span>
+                        <span
+                          className={`meta-value latency-value ${latencyTone(peer.latencyMs)}`}
+                          title={
+                            peer.latencyMs == null
+                              ? "尚未获得当前路径的往返延迟"
+                              : `最近一次路径探测往返延迟：${peer.latencyMs} 毫秒`
+                          }
+                          aria-label={
+                            peer.latencyMs == null
+                              ? "延迟未知"
+                              : `延迟 ${peer.latencyMs} 毫秒`
+                          }
+                        >
+                          <Gauge size={13} aria-hidden="true" />
+                          <span className="latency-number">
+                            {peer.latencyMs != null ? Math.round(peer.latencyMs) : "--"}
+                          </span>
+                          {peer.latencyMs != null && <span className="latency-unit">ms</span>}
+                        </span>
+                      </div>
                       <div className="device-meta-item flex-col text-right hide-mobile">
                         <span className="meta-label">流量</span>
                         <span className="meta-value text-mono text-xs">
@@ -175,124 +230,69 @@ export default function NodesPage() {
                       </div>
                       <div className="device-actions-row flex-row gap-xs items-center">
                         <button
-                          className="btn btn-ghost btn-xs"
+                          className={`btn btn-ghost btn-icon device-row-action ${
+                            copiedId === peer.id && copiedType === "ip" ? "is-copied" : ""
+                          }`}
                           onClick={() => handleCopy(peer.virtualIp, peer.id, "ip")}
-                          title="复制虚拟 IP"
-                        >
-                          <Copy size={12} />
-                          <span>
-                            {copiedId === peer.id && copiedType === "ip"
+                          title={
+                            copiedId === peer.id && copiedType === "ip"
                               ? "已复制"
-                              : copiedId === peer.id && copiedType === null
-                              ? "复制失败"
-                              : "复制 IP"}
-                          </span>
+                              : "复制虚拟 IP"
+                          }
+                          aria-label={
+                            copiedId === peer.id && copiedType === "ip"
+                              ? "虚拟 IP 已复制"
+                              : "复制虚拟 IP"
+                          }
+                        >
+                          <Copy size={14} />
                         </button>
                         <button
-                          className="btn btn-ghost btn-xs"
+                          className={`btn btn-ghost btn-icon device-row-action ${
+                            copiedId === peer.id && copiedType === "ping" ? "is-copied" : ""
+                          }`}
                           onClick={() =>
                             handleCopy(`ping ${peer.virtualIp}`, peer.id, "ping")
                           }
-                          title="复制 ping 命令"
-                        >
-                          <Terminal size={12} />
-                          <span>
-                            {copiedId === peer.id && copiedType === "ping"
+                          title={
+                            copiedId === peer.id && copiedType === "ping"
                               ? "已复制"
-                              : copiedId === peer.id && copiedType === null
-                              ? "复制失败"
-                              : "Ping"}
-                          </span>
+                              : "复制 ping 命令"
+                          }
+                          aria-label={
+                            copiedId === peer.id && copiedType === "ping"
+                              ? "Ping 命令已复制"
+                              : "复制 ping 命令"
+                          }
+                        >
+                          <Terminal size={14} />
                         </button>
                         <button
-                          className="btn btn-ghost btn-xs btn-icon"
-                          onClick={() => toggleExpand(peer.id)}
-                          title="展开诊断详情"
+                          className="btn btn-ghost btn-xs device-edit-button"
+                          onClick={() => openEditor(peer)}
+                          title="编辑设备"
                         >
-                          {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          <Pencil size={13} />
+                          <span>编辑</span>
                         </button>
                       </div>
                     </div>
                   </div>
-
-                  {/* Expanded Diagnostics Details */}
-                  {isExpanded && (
-                    <div className="device-card-details border-t border-light mt-sm pt-sm flex-col gap-sm">
-                      <div className="details-grid">
-                        <div className="details-item">
-                          <span className="details-label">完整节点 ID:</span>
-                          <span className="details-value text-mono text-secondary">{peer.id}</span>
-                        </div>
-                        <div className="details-item">
-                          <span className="details-label">物理端点:</span>
-                          <span className="details-value text-mono text-secondary">
-                            {peer.endpoint || "—"}
-                          </span>
-                        </div>
-                        <div className="details-item">
-                          <span className="details-label">NAT 类型:</span>
-                          <span className="details-value text-secondary">{peer.natType}</span>
-                        </div>
-                        <div className="details-item">
-                          <span className="details-label">中继服务器:</span>
-                          <span className="details-value text-mono text-secondary">
-                            {peer.relayServer || "—"}
-                          </span>
-                        </div>
-                        <div className="details-item">
-                          <span className="details-label">直连打洞:</span>
-                          <span className="details-value flex-row items-center gap-xs">
-                            {directOk ? (
-                              <>
-                                <CheckCircle size={12} className="text-success" />
-                                <span className="text-success text-sm">成功</span>
-                              </>
-                            ) : (
-                              <>
-                                <XCircle size={12} className="text-danger" />
-                                <span className="text-danger text-sm">
-                                  {peer.directHealth?.last_error || "未连接"}
-                                </span>
-                              </>
-                            )}
-                          </span>
-                        </div>
-                      </div>
-
-                      {peer.candidates && peer.candidates.length > 0 && (
-                        <div className="candidates-section mt-xs">
-                          <span className="details-label mb-xs block">候选物理端点:</span>
-                          <div className="candidates-list flex-row flex-wrap gap-xs">
-                            {peer.candidates.map((cand, idx) => (
-                              <span key={idx} className="candidate-badge text-mono text-xs">
-                                {cand}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="raw-json-diagnostics border-t border-light pt-sm mt-xs">
-                        <span className="details-label mb-xs block">诊断 JSON 摘要:</span>
-                        <pre className="json-pre">
-                          {JSON.stringify(
-                            {
-                              direct: peer.directHealth,
-                              relay: peer.relayHealth,
-                              bytes: { sent: peer.bytesSent, received: peer.bytesReceived },
-                            },
-                            null,
-                            2
-                          )}
-                        </pre>
-                      </div>
-                    </div>
-                  )}
                 </div>
               );
             })}
           </div>
         </>
+      )}
+      {editingPeer && (
+        <DeviceEditorDialog
+          peer={editingPeer}
+          saving={savingName}
+          error={editError}
+          onClose={closeEditor}
+          onSave={saveDeviceName}
+          onCopyIp={() => handleCopy(editingPeer.virtualIp, editingPeer.id, "ip")}
+        />
       )}
     </div>
   );

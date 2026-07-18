@@ -27,10 +27,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::error::{RelayError, Result};
 use crate::protocol::*;
+
+const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A message received from the relay (data from a peer or a control message).
 #[derive(Debug, Clone)]
@@ -113,6 +116,14 @@ impl RelayClient {
         addr: SocketAddr,
         node_id: &str,
     ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
+        Self::connect_to_addr_with_keepalive(addr, node_id, RELAY_KEEPALIVE_INTERVAL).await
+    }
+
+    async fn connect_to_addr_with_keepalive(
+        addr: SocketAddr,
+        node_id: &str,
+        keepalive_interval: Duration,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
         debug!("Connecting to relay server at {}", addr);
 
         let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
@@ -140,33 +151,50 @@ impl RelayClient {
         // Write task: processes commands and writes to the TCP stream
         let _write_task = tokio::spawn(async move {
             let mut writer = writer;
-            while let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    ClientCommand::SendFrame(frame) => {
-                        if writer.write_all(&frame.encode()).await.is_err() {
+            let mut keepalive = tokio::time::interval(keepalive_interval);
+            keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            keepalive.tick().await;
+
+            loop {
+                tokio::select! {
+                    command = cmd_rx.recv() => {
+                        let Some(cmd) = command else {
                             break;
-                        }
-                    }
-                    ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
-                        Ok(frame) => {
-                            if writer.write_all(&frame.encode()).await.is_err() {
+                        };
+                        match cmd {
+                            ClientCommand::SendFrame(frame) => {
+                                if writer.write_all(&frame.encode()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
+                                Ok(frame) => {
+                                    if writer.write_all(&frame.encode()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to build forward frame: {}", e);
+                                }
+                            },
+                            ClientCommand::Ping => {
+                                let frame = Frame::ping();
+                                if writer.write_all(&frame.encode()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            ClientCommand::Close => {
+                                let frame = Frame::close(CLOSE_NORMAL);
+                                let _ = writer.write_all(&frame.encode()).await;
                                 break;
                             }
                         }
-                        Err(e) => {
-                            warn!("Failed to build forward frame: {}", e);
-                        }
-                    },
-                    ClientCommand::Ping => {
+                    }
+                    _ = keepalive.tick() => {
                         let frame = Frame::ping();
                         if writer.write_all(&frame.encode()).await.is_err() {
                             break;
                         }
-                    }
-                    ClientCommand::Close => {
-                        let frame = Frame::close(CLOSE_NORMAL);
-                        let _ = writer.write_all(&frame.encode()).await;
-                        break;
                     }
                 }
             }
@@ -366,6 +394,33 @@ mod tests {
             .unwrap();
 
         // If connect() returned successfully, registration was confirmed
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_connection_sends_keepalive_ping() {
+        let server = RelayServer::start_random().await.unwrap();
+        let addr = server.addr;
+        let (_client, mut rx) = RelayClient::connect_to_addr_with_keepalive(
+            addr,
+            "idle-node",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        let pong = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let message = rx.recv().await.expect("relay stream closed");
+                if message.from_node.is_empty() && message.data.starts_with(b"pong:") {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("relay keepalive pong timed out");
+
+        assert!(pong.data.starts_with(b"pong:"));
         server.shutdown().await;
     }
 

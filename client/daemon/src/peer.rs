@@ -91,6 +91,8 @@ pub struct PathHealth {
     pub consecutive_failures: u32,
     /// Last diagnostic error for this path.
     pub last_error: Option<String>,
+    /// Most recent measured round-trip time for this path.
+    pub latency_ms: Option<u64>,
 }
 
 impl PathHealth {
@@ -98,6 +100,11 @@ impl PathHealth {
         self.last_success_at = Some(Instant::now());
         self.consecutive_failures = 0;
         self.last_error = None;
+    }
+
+    fn record_success_with_latency(&mut self, latency: Duration) {
+        self.record_success();
+        self.latency_ms = Some(duration_millis(latency));
     }
 
     fn record_failure(&mut self, reason: impl Into<String>) {
@@ -126,6 +133,8 @@ impl PathHealth {
 pub struct PeerConnection {
     /// Peer node ID.
     pub node_id: String,
+    /// Human-readable peer device name.
+    pub device_name: String,
     /// Peer's virtual IP.
     pub virtual_ip: String,
     /// Peer's public endpoint (ip:port) if known.
@@ -155,6 +164,7 @@ impl PeerConnection {
     pub fn new(node_id: &str, virtual_ip: &str) -> Self {
         Self {
             node_id: node_id.to_string(),
+            device_name: String::new(),
             virtual_ip: virtual_ip.to_string(),
             endpoint: None,
             nat_type: String::new(),
@@ -249,6 +259,7 @@ impl PeerManager {
             .or_insert_with(|| PeerConnection::new(&info.node_id, &info.virtual_ip));
 
         conn.virtual_ip = info.virtual_ip.clone();
+        conn.device_name = info.device_name.clone();
         conn.nat_type = info.nat_type.clone();
         if let Ok(addr) = info.endpoint.parse::<SocketAddr>() {
             conn.endpoint = Some(addr);
@@ -442,9 +453,23 @@ impl PeerManager {
     /// to Direct. Direct is only confirmed after a WireGuard packet decrypts
     /// successfully from the endpoint.
     pub async fn record_direct_probe_success(&self, node_id: &str, endpoint: SocketAddr) {
+        self.record_direct_probe_success_with_latency(node_id, endpoint, None)
+            .await;
+    }
+
+    /// Record a successful direct-path probe and its measured round-trip time.
+    pub async fn record_direct_probe_success_with_latency(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        latency: Option<Duration>,
+    ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.endpoint = Some(endpoint);
-            conn.direct_health.record_success();
+            match latency {
+                Some(latency) => conn.direct_health.record_success_with_latency(latency),
+                None => conn.direct_health.record_success(),
+            }
             if matches!(
                 conn.state,
                 ConnectionState::Idle
@@ -569,6 +594,7 @@ pub struct PeerManagerStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDiagnostics {
     pub node_id: String,
+    pub device_name: String,
     pub virtual_ip: String,
     pub endpoint: Option<String>,
     pub nat_type: String,
@@ -587,6 +613,7 @@ impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
         Self {
             node_id: conn.node_id.clone(),
+            device_name: conn.device_name.clone(),
             virtual_ip: conn.virtual_ip.clone(),
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
@@ -612,6 +639,7 @@ pub struct PathHealthDiagnostics {
     pub last_failure_age_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    pub latency_ms: Option<u64>,
 }
 
 impl From<&PathHealth> for PathHealthDiagnostics {
@@ -621,6 +649,7 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             last_failure_age_ms: health.failure_age().map(duration_millis),
             consecutive_failures: health.consecutive_failures,
             last_error: health.last_error.clone(),
+            latency_ms: health.latency_ms,
         }
     }
 }
@@ -697,6 +726,7 @@ mod tests {
 
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
+            device_name: "Office Mac".to_string(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),
@@ -708,6 +738,7 @@ mod tests {
         manager.add_peer(&peer_info).await;
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.virtual_ip, "10.20.0.2");
+        assert_eq!(conn.device_name, "Office Mac");
 
         // Resolve virtual IP
         let node_id = manager.resolve_virtual_ip("10.20.0.2").await.unwrap();
@@ -724,6 +755,7 @@ mod tests {
 
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
+            device_name: String::new(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),
@@ -751,6 +783,7 @@ mod tests {
 
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
+            device_name: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -782,6 +815,7 @@ mod tests {
 
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
+            device_name: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -814,6 +848,7 @@ mod tests {
         manager
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
+                device_name: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -895,6 +930,7 @@ mod tests {
         manager
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
+                device_name: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -922,6 +958,7 @@ mod tests {
         for (id, ip) in [("p1", "10.20.0.2"), ("p2", "10.20.0.3")] {
             let peer_info = PeerInfo {
                 node_id: id.to_string(),
+                device_name: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: "1.2.3.4:5000".to_string(),
                 nat_type: "FullCone".to_string(),
@@ -953,6 +990,7 @@ mod tests {
 
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
+            device_name: String::new(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),
