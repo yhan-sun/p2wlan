@@ -29,6 +29,7 @@ url = "2.5"
 dirs = "5.0"
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
+arboard = { version = "3.6.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.8"

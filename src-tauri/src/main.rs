@@ -133,6 +133,17 @@ async fn app_quit(
     Ok("正在停止 TUN 并退出 p2wlan。".to_string())
 }
 
+#[tauri::command]
+fn window_chrome_ready(_app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    if let Some(window) = _app.get_webview_window("main") {
+        window
+            .set_decorations(false)
+            .map_err(|error| format!("无法隐藏系统标题栏：{error}"))?;
+    }
+    Ok(())
+}
+
 fn main() {
     let daemon_manager = DaemonManager::new();
     let app_state = AppState { daemon_manager };
@@ -162,7 +173,8 @@ fn main() {
             control_authenticate,
             open_logs,
             permission_status,
-            app_quit
+            app_quit,
+            window_chrome_ready
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

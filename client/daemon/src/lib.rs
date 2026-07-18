@@ -505,35 +505,21 @@ impl Daemon {
                 let relay_inbound_tx = network_inbound_tx.clone();
 
                 self.task_manager
-                    .spawn_result("relay-inbound", false, async move {
-                        let RelaySelectionOutcome {
-                            transport,
-                            relay_rx,
-                            diagnostics,
-                        } = select_relay(
-                            &relay_servers,
-                            &preferred_regions,
+                    .spawn(
+                        "relay-inbound",
+                        false,
+                        RelaySupervisor {
+                            relay_servers,
+                            preferred_regions,
                             selection_timeout,
-                            &relay_node_id,
-                            relay_peers,
-                        )
-                        .await;
-                        *relay_selection.write().await = diagnostics;
-
-                        if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                            info!(
-                                "Selected relay region {} at {} ({} ms connect latency)",
-                                relay.region(),
-                                relay.endpoint(),
-                                relay.connect_latency_ms()
-                            );
-                            *relay_transport.write().await = Some(relay.clone());
-                            relay.run_inbound(relay_rx, relay_inbound_tx).await
-                        } else {
-                            warn!("No configured relay candidate was reachable");
-                            Ok(())
+                            node_id: relay_node_id,
+                            peers: relay_peers,
+                            relay_transport,
+                            relay_selection,
+                            inbound_tx: relay_inbound_tx,
                         }
-                    })
+                        .run(),
+                    )
                     .await;
             }
         }
@@ -752,35 +738,21 @@ impl Daemon {
                         let relay_inbound_tx = network_inbound_tx.clone();
 
                         self.task_manager
-                            .spawn_result("relay-inbound", false, async move {
-                                let RelaySelectionOutcome {
-                                    transport,
-                                    relay_rx,
-                                    diagnostics,
-                                } = select_relay(
-                                    &relay_servers,
-                                    &preferred_regions,
+                            .spawn(
+                                "relay-inbound",
+                                false,
+                                RelaySupervisor {
+                                    relay_servers,
+                                    preferred_regions,
                                     selection_timeout,
-                                    &relay_node_id,
-                                    relay_peers,
-                                )
-                                .await;
-                                *relay_selection.write().await = diagnostics;
-
-                                if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
-                                    info!(
-                                        "Selected relay region {} at {} ({} ms connect latency)",
-                                        relay.region(),
-                                        relay.endpoint(),
-                                        relay.connect_latency_ms()
-                                    );
-                                    *relay_transport.write().await = Some(relay.clone());
-                                    relay.run_inbound(relay_rx, relay_inbound_tx).await
-                                } else {
-                                    warn!("No configured relay candidate was reachable");
-                                    Ok(())
+                                    node_id: relay_node_id,
+                                    peers: relay_peers,
+                                    relay_transport,
+                                    relay_selection,
+                                    inbound_tx: relay_inbound_tx,
                                 }
-                            })
+                                .run(),
+                            )
                             .await;
                     }
                 }
@@ -808,6 +780,10 @@ impl Daemon {
                             )
                             .await;
                     }
+                }
+
+                ControlEvent::PeerUpdated(peer_info) => {
+                    self.peers.add_peer(&peer_info).await;
                 }
 
                 ControlEvent::PeerLeft(node_id) => {
@@ -1298,6 +1274,71 @@ fn control_server_host(control_server_url: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+struct RelaySupervisor {
+    relay_servers: Vec<String>,
+    preferred_regions: Vec<String>,
+    selection_timeout: Duration,
+    node_id: String,
+    peers: Arc<PeerManager>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
+    inbound_tx: mpsc::Sender<transport::ReceivedEncryptedPacket>,
+}
+
+impl RelaySupervisor {
+    async fn run(self) {
+        let mut retry_delay = Duration::from_secs(1);
+        let max_retry_delay = Duration::from_secs(30);
+
+        loop {
+            let RelaySelectionOutcome {
+                transport,
+                relay_rx,
+                diagnostics,
+            } = select_relay(
+                &self.relay_servers,
+                &self.preferred_regions,
+                self.selection_timeout,
+                &self.node_id,
+                self.peers.clone(),
+            )
+            .await;
+            *self.relay_selection.write().await = diagnostics;
+
+            if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
+                info!(
+                    "Selected relay region {} at {} ({} ms connect latency)",
+                    relay.region(),
+                    relay.endpoint(),
+                    relay.connect_latency_ms()
+                );
+                *self.relay_transport.write().await = Some(relay.clone());
+                retry_delay = Duration::from_secs(1);
+
+                let endpoint = relay.endpoint().to_string();
+                let ended = relay.run_inbound(relay_rx, self.inbound_tx.clone()).await;
+                *self.relay_transport.write().await = None;
+
+                let reason = match ended {
+                    Ok(()) => format!("relay {endpoint} disconnected; reconnecting"),
+                    Err(error) => format!("relay {endpoint} failed: {error}; reconnecting"),
+                };
+                self.relay_selection.write().await.last_error = Some(reason.clone());
+                warn!("{reason}");
+            } else {
+                *self.relay_transport.write().await = None;
+                warn!(
+                    "No configured relay candidate was reachable; retrying in {} seconds",
+                    retry_delay.as_secs()
+                );
+            }
+
+            sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+        }
+    }
+}
+
 async fn run_network_outbound(
     mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>,
     peers: Arc<PeerManager>,
@@ -1534,6 +1575,9 @@ fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2pnet_relay::Frame;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn test_daemon_creation() {
@@ -1588,6 +1632,73 @@ mod tests {
             infer_default_relay_servers("http://[2001:db8::1]:18080"),
             vec!["default@[2001:db8::1]:18081".to_string()]
         );
+    }
+
+    async fn accept_relay_registration(listener: &TcpListener, node_id: &str) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).await.unwrap();
+        let payload_len = u16::from_be_bytes([header[6], header[7]]) as usize;
+        let mut payload = vec![0u8; payload_len];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&header[..4], b"DERP");
+        assert_eq!(header[5], p2pnet_relay::protocol::MSG_REGISTER);
+        assert_eq!(payload, node_id.as_bytes());
+        stream
+            .write_all(&Frame::registered(node_id).encode())
+            .await
+            .unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_reconnects_after_stream_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let (reconnected_tx, mut reconnected_rx) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let first = accept_relay_registration(&listener, "node-a").await;
+            drop(first);
+
+            let _second = accept_relay_registration(&listener, "node-a").await;
+            reconnected_tx.send(()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let peers = Arc::new(PeerManager::new(config));
+        let relay_transport = Arc::new(RwLock::new(None));
+        let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let supervisor = tokio::spawn(
+            RelaySupervisor {
+                relay_servers: vec![endpoint],
+                preferred_regions: Vec::new(),
+                selection_timeout: Duration::from_millis(500),
+                node_id: "node-a".to_string(),
+                peers,
+                relay_transport: relay_transport.clone(),
+                relay_selection: relay_selection.clone(),
+                inbound_tx,
+            }
+            .run(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), reconnected_rx.recv())
+            .await
+            .expect("relay supervisor did not reconnect")
+            .expect("relay test server stopped");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while relay_transport.read().await.is_none() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconnected relay was not published");
+        assert!(relay_selection.read().await.last_error.is_none());
+
+        supervisor.abort();
+        server.abort();
     }
 
     #[test]
@@ -1660,6 +1771,7 @@ mod tests {
         peers
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
+                device_name: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: String::new(),
                 nat_type: "Unknown".to_string(),
@@ -1721,6 +1833,7 @@ mod tests {
         peers
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
+                device_name: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: direct_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),

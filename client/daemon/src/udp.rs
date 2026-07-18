@@ -4,16 +4,17 @@
 //! ID. This module is the direct UDP sink: it resolves each peer endpoint from
 //! `PeerManager` and sends the encrypted datagram to that socket address.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
-    build_punch_ack, decode_punch_packet, gather_candidates, send_keepalive, send_punch, IceConfig,
+    build_punch_ack, build_punch_packet, decode_punch_packet, gather_candidates, IceConfig,
     PunchPacketKind,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, sleep};
 use tracing::{debug, trace, warn};
 
@@ -21,11 +22,16 @@ use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
+type ProbeNonce = [u8; 8];
+type PendingProbe = (Instant, SocketAddr);
+type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
     socket: Arc<UdpSocket>,
     peers: Arc<PeerManager>,
+    pending_probes: PendingProbes,
 }
 
 impl UdpTransport {
@@ -38,7 +44,29 @@ impl UdpTransport {
         Ok(Self {
             socket: Arc::new(socket),
             peers,
+            pending_probes: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    async fn send_probe(&self, peer_addr: SocketAddr) -> Result<()> {
+        let bytes = build_punch_packet();
+        let nonce = decode_punch_packet(&bytes)
+            .map(|packet| packet.nonce)
+            .ok_or_else(|| DaemonError::Network("failed to create UDP probe".to_string()))?;
+
+        {
+            let mut pending = self.pending_probes.lock().await;
+            pending.retain(|_, (sent_at, _)| sent_at.elapsed() < Duration::from_secs(60));
+            pending.insert(nonce, (Instant::now(), peer_addr));
+        }
+
+        if let Err(error) = self.socket.send_to(&bytes, peer_addr).await {
+            self.pending_probes.lock().await.remove(&nonce);
+            return Err(DaemonError::Network(format!(
+                "UDP probe send to {peer_addr} failed: {error}"
+            )));
+        }
+        Ok(())
     }
 
     /// Return the local UDP socket address.
@@ -86,7 +114,7 @@ impl UdpTransport {
         let mut packets_sent = 0;
         for attempt in 0..attempts {
             for &candidate in &candidates {
-                match send_punch(&self.socket, candidate).await {
+                match self.send_probe(candidate).await {
                     Ok(()) => {
                         packets_sent += 1;
                         trace!(
@@ -194,7 +222,7 @@ impl UdpTransport {
             ticker.tick().await;
 
             for (peer_id, endpoint) in self.peers.direct_endpoints().await {
-                match send_keepalive(&self.socket, endpoint).await {
+                match self.send_probe(endpoint).await {
                     Ok(()) => {
                         trace!("Sent direct UDP keepalive to peer {peer_id} at {endpoint}");
                     }
@@ -261,11 +289,20 @@ impl UdpTransport {
                         }
                     }
                     PunchPacketKind::Ack => {
+                        let latency = {
+                            let mut pending = self.pending_probes.lock().await;
+                            pending
+                                .remove(&packet.nonce)
+                                .filter(|(_, endpoint)| *endpoint == source)
+                                .map(|(sent_at, _)| sent_at.elapsed())
+                        };
                         if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
                             self.peers
-                                .record_direct_probe_success(&peer_id, source)
+                                .record_direct_probe_success_with_latency(&peer_id, source, latency)
                                 .await;
-                            debug!("Received UDP punch ACK from peer {peer_id} at {source}");
+                            debug!(
+                                "Received UDP punch ACK from peer {peer_id} at {source} (rtt={latency:?})"
+                            );
                         } else {
                             trace!("Received UDP punch ACK from unknown candidate {source}");
                         }
@@ -326,6 +363,7 @@ mod tests {
     fn peer(node_id: &str, virtual_ip: &str, endpoint: Option<SocketAddr>) -> PeerInfo {
         PeerInfo {
             node_id: node_id.to_string(),
+            device_name: String::new(),
             public_key: "pk".to_string(),
             endpoint: endpoint.map(|addr| addr.to_string()).unwrap_or_default(),
             nat_type: "FullCone".to_string(),
@@ -565,6 +603,54 @@ mod tests {
         assert_eq!(conn.endpoint, Some(sender_addr));
         assert_eq!(conn.state.to_string(), "hole_punching");
         assert!(conn.direct_health.last_success_at.is_some());
+
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_ack_records_peer_round_trip_latency() {
+        let peers = peer_manager();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+
+        peers
+            .add_peer(&peer("peer-b", "10.20.0.2", Some(remote_addr)))
+            .await;
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+        transport.send_probe(remote_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _from) = timeout(Duration::from_secs(1), remote.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let probe = decode_punch_packet(&buf[..n]).unwrap();
+        remote
+            .send_to(&build_punch_ack(probe.nonce), local_addr)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let diagnostics = peers.diagnostics().await;
+                if diagnostics[0].direct.latency_ms.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let diagnostics = peers.diagnostics().await;
+        assert!(diagnostics[0].direct.latency_ms.is_some());
+        assert_eq!(diagnostics[0].direct.consecutive_failures, 0);
 
         worker.abort();
     }

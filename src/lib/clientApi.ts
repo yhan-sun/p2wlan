@@ -374,10 +374,25 @@ function activePathSummary(snapshot: DiagnosticsSnapshot): string {
 }
 
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
-  if (snapshot.health.reason) return snapshot.health.reason;
-  if (snapshot.relay_selection.last_error) return snapshot.relay_selection.last_error;
+  const directPathAvailable = snapshot.stats.direct_connections > 0;
+  const isOptionalRelayIssue = (message: string) => {
+    const normalized = message.toLowerCase();
+    return normalized.includes("relay-inbound") || normalized.startsWith("relay ");
+  };
+
+  if (
+    snapshot.health.reason &&
+    !(directPathAvailable && isOptionalRelayIssue(snapshot.health.reason))
+  ) {
+    return snapshot.health.reason;
+  }
+  if (snapshot.relay_selection.last_error && !directPathAvailable) {
+    return snapshot.relay_selection.last_error;
+  }
   const failedTask = snapshot.health.critical_tasks.find((t) => t.error);
-  if (failedTask?.error) return `${failedTask.name}: ${failedTask.error}`;
+  if (failedTask?.error && !(directPathAvailable && failedTask.name === "relay-inbound")) {
+    return `${failedTask.name}: ${failedTask.error}`;
+  }
   return null;
 }
 
@@ -397,6 +412,7 @@ function mapSnapshotToDaemonStatus(
     tunInterface: settings.tunInterface,
     mtu: settings.mtu,
     udpLocalAddr: snapshot.udp_local_addr,
+    diagnosticsUrl: settings.diagnosticsUrl,
     controlConnected: snapshot.health.control_connected,
     controlServer: settings.controlServer,
     reauthRequired: snapshot.health.reauth_required,
@@ -425,12 +441,14 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     peer.relay.last_success_age_ms ??
     peer.connected_for_ms;
   const latencyMs =
-    peer.direct.last_success_age_ms != null && peer.direct.consecutive_failures === 0
-      ? null
-      : null;
+    path === "direct"
+      ? peer.direct.latency_ms
+      : path === "relay"
+        ? peer.relay.latency_ms
+        : null;
   return {
     id: peer.node_id,
-    name: peer.node_id.slice(0, 12),
+    name: peer.device_name?.trim() || peer.node_id.slice(0, 12),
     virtualIp: peer.virtual_ip,
     state: peer.state,
     path: path === "direct" || path === "relay" ? path : "offline",
@@ -494,11 +512,14 @@ function daemonFromDesktopStatus(
   settings: ClientSettings
 ): DaemonStatus {
   if (desktop.diagnostics) {
-    return mapSnapshotToDaemonStatus(desktop.diagnostics, settings);
+    const daemon = mapSnapshotToDaemonStatus(desktop.diagnostics, settings);
+    daemon.diagnosticsUrl = desktop.diagnosticsUrl ?? settings.diagnosticsUrl;
+    return daemon;
   }
 
   const error = desktop.operation.phase === "error" ? desktop.operation.lastError ?? desktop.operation.message : undefined;
   const daemon = stoppedDaemonStatus(settings, error);
+  daemon.diagnosticsUrl = desktop.diagnosticsUrl ?? settings.diagnosticsUrl;
   if (
     desktop.operation.phase === "authorizing" ||
     desktop.operation.phase === "launching" ||
@@ -586,6 +607,62 @@ export async function listPeers(): Promise<ApiResult<PeerStatus[]>> {
   return { data: snapshot.peers, source: snapshot.source, error: snapshot.error };
 }
 
+export async function renamePeerDevice(
+  peerId: string,
+  deviceNameInput: string
+): Promise<ApiResult<{ deviceName: string }>> {
+  const settings = getSettings();
+  const deviceName = deviceNameInput.trim();
+  const fallback = { deviceName };
+  if (!deviceName) {
+    return { data: fallback, source: "fallback", error: "设备名称不能为空" };
+  }
+  if ([...deviceName].length > 128) {
+    return { data: fallback, source: "fallback", error: "设备名称不能超过 128 个字符" };
+  }
+  if (!settings.authToken.trim()) {
+    return { data: fallback, source: "fallback", error: "登录状态已失效，请重新登录" };
+  }
+
+  try {
+    const controlServer = normalizeControlServer(settings.controlServer);
+    const response = await fetch(
+      `${controlServer}/api/v1/devices/${encodeURIComponent(peerId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${settings.authToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ device_name: deviceName }),
+      }
+    );
+    const body = await readJsonBody<{ success?: boolean; error?: string }>(response);
+    if (!response.ok || !body?.success) {
+      let message = body?.error || "设备名称保存失败";
+      if (response.status === 401 || response.status === 403) {
+        message = "当前账号没有权限修改该设备";
+      } else if (response.status === 404) {
+        message = "控制服务器暂不支持设备重命名，请先更新服务端";
+      }
+      appendLog(`device rename failed (${peerId}): ${message}`);
+      return { data: fallback, source: "fallback", error: message };
+    }
+    appendLog(`device renamed (${peerId})`);
+    return { data: fallback, source: "live" };
+  } catch (error) {
+    const message =
+      error instanceof TypeError
+        ? "无法连接控制服务器，请检查网络后重试"
+        : error instanceof Error
+          ? error.message
+          : "设备名称保存失败";
+    appendLog(`device rename failed (${peerId}): ${message}`);
+    return { data: fallback, source: "fallback", error: message };
+  }
+}
+
 export async function getTunnelStatus(): Promise<ApiResult<TunnelStatus>> {
   const snapshot = await getClientStatusSnapshot();
   return { data: snapshot.tunnel, source: snapshot.source, error: snapshot.error };
@@ -602,7 +679,7 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
   const status = statusResult.data;
   const snapshot =
     statusResult.source === "live"
-      ? await fetchDiagnosticsSnapshot(settings.diagnosticsUrl)
+      ? await fetchDiagnosticsSnapshot(status.diagnosticsUrl)
       : null;
 
   const checks: DiagnosticCheck[] = [];

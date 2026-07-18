@@ -506,6 +506,55 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// UpdateDevice handles PATCH /api/v1/devices/{id}.
+func (s *Server) UpdateDevice(w http.ResponseWriter, r *http.Request) {
+	pathDeviceID := strings.TrimSpace(r.PathValue("id"))
+	if pathDeviceID == "" {
+		http.Error(w, `{"error":"missing device id"}`, http.StatusBadRequest)
+		return
+	}
+
+	authorized := false
+	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
+		authorized = pathDeviceID == deviceClaims.DeviceID
+	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
+		belongs, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
+		authorized = err == nil && belongs
+	}
+	if !authorized {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		DeviceName string `json:"device_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+	req.DeviceName = strings.TrimSpace(req.DeviceName)
+	if req.DeviceName == "" {
+		http.Error(w, `{"error":"device_name is required"}`, http.StatusBadRequest)
+		return
+	}
+	if len([]rune(req.DeviceName)) > 128 {
+		http.Error(w, `{"error":"device_name too long"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.UpdateDeviceName(pathDeviceID, req.DeviceName); err != nil {
+		http.Error(w, `{"error":"device update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	device, err := s.db.GetDevice(pathDeviceID)
+	if err != nil {
+		http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "device": device})
+}
+
 // DeleteDevice handles DELETE /api/v1/devices/{id}.
 func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	deviceClaims, err := auth.GetDeviceClaims(r.Context())

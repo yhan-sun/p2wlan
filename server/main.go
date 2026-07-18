@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/tunnels", anyAuth(apiServer.CreateTunnel))
 	mux.HandleFunc("GET /api/v1/tunnels", anyAuth(apiServer.ListTunnels))
 	mux.HandleFunc("DELETE /api/v1/tunnels/{id}", anyAuth(apiServer.DeleteTunnel))
+	mux.HandleFunc("PATCH /api/v1/devices/{id}", anyAuth(apiServer.UpdateDevice))
 
 	// Device-only routes (device credential required)
 	deviceAuth := auth.RequireDeviceAuth(db)

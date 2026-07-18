@@ -194,6 +194,22 @@ func createTestDevice(t *testing.T, email, deviceName string) (*DB, *Device) {
 	return db, device
 }
 
+func TestUpdateDeviceName(t *testing.T) {
+	db, device := createTestDevice(t, "rename@p2wlan.local", "old-name")
+	defer db.Close()
+
+	if err := db.UpdateDeviceName(device.ID, "studio-mac"); err != nil {
+		t.Fatalf("UpdateDeviceName failed: %v", err)
+	}
+	updated, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice failed: %v", err)
+	}
+	if updated.DeviceName != "studio-mac" {
+		t.Fatalf("expected updated name, got %q", updated.DeviceName)
+	}
+}
+
 func TestDatabase_UniqueConstraints(t *testing.T) {
 	tmpFile := "test_unique_db.db"
 	defer os.Remove(tmpFile)

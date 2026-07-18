@@ -179,7 +179,14 @@ fn allowed_cors_origin(request: &str) -> Option<&str> {
             return None;
         }
         let origin = value.trim();
-        matches!(origin, "http://localhost:1420" | "http://127.0.0.1:1420").then_some(origin)
+        matches!(
+            origin,
+            "http://localhost:14327"
+                | "http://127.0.0.1:14327"
+                | "http://localhost:1420"
+                | "http://127.0.0.1:1420"
+        )
+        .then_some(origin)
     })
 }
 
@@ -247,6 +254,10 @@ mod tests {
     #[test]
     fn cors_origin_is_restricted_to_local_dev_server() {
         assert_eq!(
+            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: http://localhost:14327\r\n\r\n"),
+            Some("http://localhost:14327")
+        );
+        assert_eq!(
             allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
             Some("http://localhost:1420")
         );
@@ -270,6 +281,7 @@ mod tests {
         peers
             .add_peer(&PeerInfo {
                 node_id: "node-b".to_string(),
+                device_name: "Office Mac".to_string(),
                 public_key: "pk".to_string(),
                 endpoint: "127.0.0.1:51820".to_string(),
                 nat_type: "Unknown".to_string(),
@@ -315,6 +327,7 @@ mod tests {
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.peers[0].node_id, "node-b");
+        assert_eq!(snapshot.peers[0].device_name, "Office Mac");
         assert_eq!(
             snapshot.relay_selection,
             RelaySelectionDiagnostics::default()
