@@ -1277,6 +1277,7 @@ impl DaemonManager {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     async fn wait_for_endpoint(url: &str, timeout: Duration) -> bool {
         let start_time = Instant::now();
         while start_time.elapsed() < timeout {
