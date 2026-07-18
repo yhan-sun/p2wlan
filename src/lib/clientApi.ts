@@ -70,6 +70,10 @@ export function getSettings(): ClientSettings {
     if (legacyLocalControl && !settings.authToken) {
       settings.controlServer = DEFAULT_SETTINGS.controlServer;
     }
+    const isWindows = typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("win");
+    if (isWindows && settings.tunInterface === "p2pnet0") {
+      settings.tunInterface = DEFAULT_SETTINGS.tunInterface;
+    }
     return settings;
   } catch {
     return { ...DEFAULT_SETTINGS };
