@@ -95,7 +95,10 @@ pub fn check_permission_status() -> PermissionStatus {
     let mut checks = Vec::new();
     #[cfg(target_os = "macos")]
     let mut details: Vec<String> = Vec::new();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(
+        target_os = "linux",
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     let details: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -105,31 +108,32 @@ pub fn check_permission_status() -> PermissionStatus {
 
         checks.push(PermissionCheck {
             id: "root_user".to_string(),
-            label: "Effective User ID Check".to_string(),
+            label: "有效用户权限".to_string(),
             status: if is_root {
                 "pass".to_string()
             } else {
                 "fail".to_string()
             },
             detail: if is_root {
-                format!("Running as root (euid={})", euid)
+                format!("已以 root 身份运行 (euid={})", euid)
             } else {
-                format!(
-                    "Running as standard user (euid={}). TUN and routing changes will fail.",
-                    euid
-                )
+                format!("当前是普通用户 (euid={})，TUN 创建和路由修改会失败。", euid)
             },
         });
 
         let dev_tun_exists = Path::new("/dev/net/tun").exists() || Path::new("/dev/tun").exists();
         checks.push(PermissionCheck {
             id: "dev_tun".to_string(),
-            label: "TUN Device node".to_string(),
-            status: if dev_tun_exists { "pass".to_string() } else { "warn".to_string() },
-            detail: if dev_tun_exists {
-                "TUN device node exists in /dev".to_string()
+            label: "TUN 设备节点".to_string(),
+            status: if dev_tun_exists {
+                "pass".to_string()
             } else {
-                "Standard /dev/net/tun not found. macOS uses dynamic utun interfaces, which requires root euid.".to_string()
+                "warn".to_string()
+            },
+            detail: if dev_tun_exists {
+                "/dev 中存在 TUN 设备节点".to_string()
+            } else {
+                "未找到标准 /dev/net/tun。macOS 使用动态 utun 网卡，需要 root 权限。".to_string()
             },
         });
 
@@ -149,17 +153,13 @@ pub fn check_permission_status() -> PermissionStatus {
         };
 
         let recommended_action = if needs_elevation {
-            "Start p2pnet-daemon with sudo to allow virtual adapter creation and routing updates."
-                .to_string()
+            "请通过管理员授权启动 p2pnet-daemon，以允许创建虚拟网卡和修改路由。".to_string()
         } else {
-            "Elevation is available. TUN creation still needs runtime verification.".to_string()
+            "权限已满足，TUN 创建仍需运行时验证。".to_string()
         };
 
         if needs_elevation {
-            details.push(
-                "Process lacks root privileges required for ioctl calls on network interfaces."
-                    .to_string(),
-            );
+            details.push("当前进程缺少网络接口 ioctl 调用所需的 root 权限。".to_string());
         }
 
         PermissionStatus {
@@ -185,28 +185,35 @@ pub fn check_permission_status() -> PermissionStatus {
 
         checks.push(PermissionCheck {
             id: "root_user".to_string(),
-            label: "Effective User ID Check".to_string(),
-            status: if is_root { "pass".to_string() } else { "fail".to_string() },
-            detail: if is_root {
-                format!("Running as root (euid={})", euid)
+            label: "有效用户权限".to_string(),
+            status: if is_root {
+                "pass".to_string()
             } else {
-                format!("Running as standard user (euid={}). cap_net_admin capability needed otherwise.", euid)
+                "fail".to_string()
+            },
+            detail: if is_root {
+                format!("已以 root 身份运行 (euid={})", euid)
+            } else {
+                format!(
+                    "当前是普通用户 (euid={})，需要 root 或 cap_net_admin 能力。",
+                    euid
+                )
             },
         });
 
         let dev_net_tun = Path::new("/dev/net/tun").exists();
         checks.push(PermissionCheck {
             id: "dev_net_tun".to_string(),
-            label: "TUN device path /dev/net/tun".to_string(),
+            label: "TUN 设备路径 /dev/net/tun".to_string(),
             status: if dev_net_tun {
                 "pass".to_string()
             } else {
                 "fail".to_string()
             },
             detail: if dev_net_tun {
-                "/dev/net/tun device node is accessible".to_string()
+                "/dev/net/tun 设备节点可访问".to_string()
             } else {
-                "/dev/net/tun not found. TUN adapter creation is impossible.".to_string()
+                "未找到 /dev/net/tun，无法创建 TUN 网卡。".to_string()
             },
         });
 
@@ -223,9 +230,9 @@ pub fn check_permission_status() -> PermissionStatus {
         };
 
         let recommended_action = if needs_elevation {
-            "Run daemon with sudo or apply CAP_NET_ADMIN capabilities to the binary using setcap: sudo setcap cap_net_admin+ep <path>".to_string()
+            "请使用 sudo 启动 daemon，或通过 setcap 给二进制添加 CAP_NET_ADMIN：sudo setcap cap_net_admin+ep <path>".to_string()
         } else {
-            "Ready. Daemon has sufficient privileges.".to_string()
+            "权限已满足，daemon 可以创建网卡并修改路由。".to_string()
         };
 
         PermissionStatus {
@@ -251,23 +258,29 @@ pub fn check_permission_status() -> PermissionStatus {
 
         checks.push(PermissionCheck {
             id: "win_admin".to_string(),
-            label: "Windows Administrator".to_string(),
+            label: "Windows 管理员权限".to_string(),
             status: if is_admin { "pass" } else { "fail" }.to_string(),
             detail: if is_admin {
-                "Running with Administrator privileges.".to_string()
+                "当前已具备管理员权限。".to_string()
             } else {
-                "Administrator privileges are required to install Wintun adapters and update routes.".to_string()
+                "安装 Wintun 虚拟网卡和更新路由需要管理员权限。".to_string()
             },
         });
         checks.push(PermissionCheck {
             id: "wintun_dll".to_string(),
-            label: "Wintun runtime".to_string(),
-            status: if wintun_path.is_some() { "pass" } else { "fail" }.to_string(),
+            label: "Wintun 运行库".to_string(),
+            status: if wintun_path.is_some() {
+                "pass"
+            } else {
+                "fail"
+            }
+            .to_string(),
             detail: wintun_path
                 .as_ref()
-                .map(|path| format!("Found wintun.dll at {}", path.display()))
+                .map(|path| format!("已找到 wintun.dll：{}", path.display()))
                 .unwrap_or_else(|| {
-                    "wintun.dll was not found next to the app/daemon, in P2WLAN_WINTUN_DLL, or in PATH.".to_string()
+                    "未在客户端/daemon 同级目录、P2WLAN_WINTUN_DLL 或 PATH 中找到 wintun.dll。"
+                        .to_string()
                 }),
         });
 
@@ -285,17 +298,16 @@ pub fn check_permission_status() -> PermissionStatus {
             },
             needs_elevation: !is_admin,
             recommended_action: if is_admin && wintun_path.is_some() {
-                "Ready. Windows has Administrator privileges and Wintun runtime is available."
-                    .to_string()
+                "Windows 管理员权限和 Wintun 运行库均已就绪。".to_string()
             } else if !is_admin {
-                "Click Authorize TUN to approve Windows UAC. Keep wintun.dll next to p2pnet-daemon.exe or set P2WLAN_WINTUN_DLL.".to_string()
+                "请点击“授权启动 TUN”，并在 Windows UAC 弹窗中确认。请确保 wintun.dll 与 p2pnet-daemon.exe 在同一目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
             } else {
-                "Place wintun.dll next to p2pnet-daemon.exe, next to the desktop app, or set P2WLAN_WINTUN_DLL.".to_string()
+                "请把 wintun.dll 放到 p2pnet-daemon.exe 或桌面客户端同级目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
             },
             sudo_command: None,
             details: vec![
-                "Windows TUN mode uses Wintun and requires Administrator approval.".to_string(),
-                "The desktop app does not store the Windows password; UAC is handled by the operating system.".to_string(),
+                "Windows TUN 模式使用 Wintun，需要管理员授权。".to_string(),
+                "p2wlan 不会读取或保存 Windows 密码，UAC 授权由系统完成。".to_string(),
             ],
             checks,
         }
@@ -308,10 +320,9 @@ pub fn check_permission_status() -> PermissionStatus {
             can_create_tun: "unknown".to_string(),
             can_modify_routes: "unknown".to_string(),
             needs_elevation: true,
-            recommended_action:
-                "Ensure daemon is executed with root or network admin capabilities.".to_string(),
+            recommended_action: "请确保 daemon 以 root 或网络管理员权限运行。".to_string(),
             sudo_command: None,
-            details: vec!["Unsupported platform detected.".to_string()],
+            details: vec!["检测到暂不支持的平台。".to_string()],
             checks,
         }
     }

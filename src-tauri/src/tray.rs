@@ -6,11 +6,11 @@ use tauri::{
 
 pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
     // 1. Build menu items
-    let show = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
-    let connect = MenuItem::with_id(app, "connect", "Connect Daemon", true, None::<&str>)?;
-    let disconnect = MenuItem::with_id(app, "disconnect", "Disconnect Daemon", true, None::<&str>)?;
-    let open_logs = MenuItem::with_id(app, "open_logs", "Open Logs", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
+    let connect = MenuItem::with_id(app, "connect", "启动 TUN", true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(app, "disconnect", "停止 TUN", true, None::<&str>)?;
+    let open_logs = MenuItem::with_id(app, "open_logs", "打开日志", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 p2wlan", true, None::<&str>)?;
 
     // 2. Combine into a menu
     let menu = Menu::with_items(app, &[&show, &connect, &disconnect, &open_logs, &quit])?;
@@ -22,7 +22,7 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
     let tray_icon = tauri::image::Image::new(js_img.rgba(), js_img.width(), js_img.height());
 
     TrayIconBuilder::with_id("p2wlan_tray")
-        .tooltip("p2wlan Console")
+        .tooltip("p2wlan 控制台")
         .icon(tray_icon)
         .menu(&menu)
         .on_menu_event(|app_handle: &tauri::AppHandle, event| {

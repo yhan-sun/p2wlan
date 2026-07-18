@@ -142,16 +142,16 @@ impl DaemonManager {
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("Daemon not reachable: {}", e))?;
+            .map_err(|e| format!("守护进程不可达：{}", e))?;
 
         if !res.status().is_success() {
-            return Err(format!("Daemon returned status code: {}", res.status()));
+            return Err(format!("守护进程返回异常状态码：{}", res.status()));
         }
 
         let json = res
             .json::<serde_json::Value>()
             .await
-            .map_err(|e| format!("Failed to parse status JSON: {}", e))?;
+            .map_err(|e| format!("解析守护进程状态失败：{}", e))?;
 
         Ok(json)
     }
@@ -541,7 +541,7 @@ impl DaemonManager {
 
         // 1. Is daemon already running?
         if Self::check_endpoint(&target_url).await {
-            return Ok("Daemon is already running".to_string());
+            return Ok("守护进程已经运行。".to_string());
         }
 
         if !Self::has_network_admin_privileges() {
@@ -554,19 +554,14 @@ impl DaemonManager {
         // 2. Resolve binary path
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-            .ok_or_else(|| "Could not locate p2pnet-daemon binary in environment PATH, dev targets, or resources folder.".to_string())?;
+            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。请确认它与桌面客户端在同一目录，或设置 P2WLAN_DAEMON_BIN。".to_string())?;
 
         // 3. Extract bind address from URL (default 127.0.0.1:39277)
         let bind_addr = Self::diagnostics_bind_from_url(&target_url);
         let config_path = Self::default_config_path();
         if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create daemon config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建守护进程配置目录失败 {}：{}", parent.display(), e))?;
         }
 
         let args = Self::build_args(&options, &bind_addr, &config_path);
@@ -585,7 +580,7 @@ impl DaemonManager {
 
         let child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to launch daemon process: {}", e))?;
+            .map_err(|e| format!("启动守护进程失败：{}", e))?;
 
         // 5. Update state
         {
@@ -608,8 +603,7 @@ impl DaemonManager {
                 let mut state = self.state.lock().await;
                 if let Some(ref mut c) = state.child {
                     if let Ok(Some(exit_status)) = c.try_wait() {
-                        let err_msg =
-                            format!("Daemon exited prematurely with status: {}", exit_status);
+                        let err_msg = format!("守护进程提前退出，状态：{}", exit_status);
                         state.last_error = Some(err_msg.clone());
                         state.child = None;
                         state.started_by_app = false;
@@ -627,11 +621,11 @@ impl DaemonManager {
         }
 
         if is_ready {
-            Ok("Daemon started successfully and is reachable".to_string())
+            Ok("守护进程已启动并可访问。".to_string())
         } else {
             // Did not become ready in 5 seconds
             self.stop(Some(target_url)).await?;
-            Err("Daemon was launched but failed to bind/respond on diagnostics endpoint within 5 seconds.".to_string())
+            Err("守护进程已启动，但 5 秒内没有绑定或响应诊断端点。".to_string())
         }
     }
 
@@ -807,9 +801,9 @@ impl DaemonManager {
         if !started_by_app && !elevated_started_by_app {
             // Is it currently running?
             if Self::check_endpoint(&target_url).await {
-                return Err("Daemon was not started by this app. Control server/daemon must be stopped externally.".to_string());
+                return Err("当前守护进程不是由本客户端启动，请在外部停止它。".to_string());
             } else {
-                return Ok("Daemon is already stopped".to_string());
+                return Ok("守护进程已经停止。".to_string());
             }
         }
 
@@ -819,7 +813,7 @@ impl DaemonManager {
             let _ = child.wait();
             state.started_by_app = false;
             state.elevated_started_by_app = false;
-            Ok("Daemon process stopped successfully".to_string())
+            Ok("守护进程已停止。".to_string())
         } else if elevated_started_by_app {
             drop(state);
             let pid_path = Self::default_pid_path();
@@ -829,14 +823,14 @@ impl DaemonManager {
             state.started_by_app = false;
             state.elevated_started_by_app = false;
             if terminated || stopped {
-                Ok("Elevated daemon process stopped successfully".to_string())
+                Ok("已停止管理员权限运行的 TUN 守护进程。".to_string())
             } else {
-                Ok("Elevated daemon was already stopped".to_string())
+                Ok("管理员权限运行的 TUN 守护进程已经停止。".to_string())
             }
         } else {
             state.started_by_app = false;
             state.elevated_started_by_app = false;
-            Ok("Daemon was already stopped".to_string())
+            Ok("守护进程已经停止。".to_string())
         }
     }
 
