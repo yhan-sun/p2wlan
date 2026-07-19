@@ -134,3 +134,66 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist-release/p2wlan-windows-x64.zip
+
+  linux-cli:
+    name: Linux x64 CLI Package
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build daemon CLI
+        run: cargo build -p p2pnet-daemon --release --target x86_64-unknown-linux-gnu
+
+      - name: Assemble Linux CLI tarball
+        run: |
+          set -euo pipefail
+          pkg="dist-release/p2wlan-linux-x64-cli"
+          mkdir -p "$pkg"
+          cp target/x86_64-unknown-linux-gnu/release/p2pnet-daemon "$pkg/"
+          cp LICENSE "$pkg/"
+          cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
+          p2wlan Linux x64 CLI Preview
+
+          Contents:
+          - p2pnet-daemon: Linux command-line client daemon with real TUN support
+          - LICENSE
+
+          Quick start:
+          1. Make sure /dev/net/tun exists and run with root privileges.
+          2. Initialize a config:
+             sudo ./p2pnet-daemon --init --control http://CONTROL_HOST:18080 --network default
+          3. Start the daemon:
+             sudo ./p2pnet-daemon --control http://CONTROL_HOST:18080 --network default
+          4. Query local diagnostics from another terminal:
+             ./p2pnet-daemon --status
+
+          Useful overrides:
+          - --relay default@RELAY_HOST:18081
+          - --udp-bind 0.0.0.0:0
+          - --udp-advertise PUBLIC_OR_LAN_IP:PORT
+          - --prefer-relay
+
+          Notes:
+          - Real TUN mode needs CAP_NET_ADMIN/root.
+          - For self-hosting, run the Go control and relay services separately.
+          - This Preview CLI is intended for server, headless Linux, and smoke testing.
+          EOF
+          chmod +x "$pkg/p2pnet-daemon"
+          tar -C dist-release -czf dist-release/p2wlan-linux-x64-cli.tar.gz p2wlan-linux-x64-cli
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-linux-x64-cli
+          path: dist-release/p2wlan-linux-x64-cli.tar.gz
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/p2wlan-linux-x64-cli.tar.gz

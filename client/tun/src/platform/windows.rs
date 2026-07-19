@@ -11,7 +11,8 @@
 //! 3. Starts a session with a ring buffer.
 //! 4. A background thread reads packets from the ring buffer and sends
 //!    them through a tokio channel for async consumption.
-//! 5. Writes go directly to the ring buffer (non-blocking).
+//! 5. Writes allocate a Wintun send packet, copy the IP packet into it, and
+//!    submit it to the ring buffer (non-blocking).
 //!
 //! ## IP Address Configuration
 //!
@@ -82,8 +83,10 @@ type WintunReceivePacketFunc =
 type WintunReleaseReceivePacketFunc =
     unsafe extern "C" fn(session: *mut std::ffi::c_void, packet: *const u8);
 
-type WintunSendPacketFunc =
-    unsafe extern "C" fn(session: *mut std::ffi::c_void, packet: *const u8, packet_size: u32);
+type WintunAllocateSendPacketFunc =
+    unsafe extern "C" fn(session: *mut std::ffi::c_void, packet_size: u32) -> *mut u8;
+
+type WintunSendPacketFunc = unsafe extern "C" fn(session: *mut std::ffi::c_void, packet: *const u8);
 
 type WintunGetAdapterLuidFunc =
     unsafe extern "C" fn(adapter: *mut std::ffi::c_void, luid: *mut u64);
@@ -105,6 +108,7 @@ struct WintunApi {
     get_read_wait_event: WintunGetReadWaitEventFunc,
     receive_packet: WintunReceivePacketFunc,
     release_receive_packet: WintunReleaseReceivePacketFunc,
+    allocate_send_packet: WintunAllocateSendPacketFunc,
     send_packet: WintunSendPacketFunc,
     get_adapter_luid: WintunGetAdapterLuidFunc,
 }
@@ -187,6 +191,11 @@ impl WintunApi {
                 .map_err(|_| Error::SymbolNotFound("WintunReleaseReceivePacket".to_string()))?
         };
 
+        let allocate_send_packet = unsafe {
+            *lib.get::<WintunAllocateSendPacketFunc>(b"WintunAllocateSendPacket\0")
+                .map_err(|_| Error::SymbolNotFound("WintunAllocateSendPacket".to_string()))?
+        };
+
         let send_packet = unsafe {
             *lib.get::<WintunSendPacketFunc>(b"WintunSendPacket\0")
                 .map_err(|_| Error::SymbolNotFound("WintunSendPacket".to_string()))?
@@ -206,6 +215,7 @@ impl WintunApi {
             get_read_wait_event,
             receive_packet,
             release_receive_packet,
+            allocate_send_packet,
             send_packet,
             get_adapter_luid,
         })
@@ -375,12 +385,37 @@ impl VirtualInterface for WintunDevice {
             return Ok(0);
         }
 
-        // WintunSendPacket copies the data into the ring buffer.
-        // It returns immediately (non-blocking), but can fail if the
-        // ring buffer is full (the function just doesn't send).
+        let packet_size = u32::try_from(buf.len()).map_err(|_| {
+            Error::Platform(format!(
+                "packet too large for Wintun send ring: {} bytes",
+                buf.len()
+            ))
+        })?;
+
+        // Wintun requires outbound packets to be allocated from its send ring
+        // before submission. WintunSendPacket only accepts pointers returned by
+        // WintunAllocateSendPacket; passing an arbitrary Rust slice pointer can
+        // make inbound peer packets disappear before they reach the Windows IP
+        // stack.
         let session_ptr = self.session as *mut std::ffi::c_void;
+        let packet_ptr = unsafe { (self.api.allocate_send_packet)(session_ptr, packet_size) };
+
+        if packet_ptr.is_null() {
+            let err = io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(111) => Err(Error::SendBufferFull),
+                Some(code) => Err(Error::Platform(format!(
+                    "WintunAllocateSendPacket failed: error code {code}"
+                ))),
+                None => Err(Error::Platform(
+                    "WintunAllocateSendPacket failed without OS error".to_string(),
+                )),
+            };
+        }
+
         unsafe {
-            (self.api.send_packet)(session_ptr, buf.as_ptr(), buf.len() as u32);
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), packet_ptr, buf.len());
+            (self.api.send_packet)(session_ptr, packet_ptr);
         }
 
         Ok(buf.len())

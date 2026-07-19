@@ -193,6 +193,8 @@ impl DaemonManager {
             }
         }
 
+        let should_rediscover =
+            state.elevated_started_by_app || state.operation.phase != DaemonOperationPhase::Stopped;
         if state.elevated_started_by_app {
             let pid_path = Self::default_pid_path();
             if let Some(pid) = Self::read_pid_file(&pid_path) {
@@ -205,9 +207,26 @@ impl DaemonManager {
                 }
                 Self::remove_pid_file(&pid_path);
             }
-            state.elevated_started_by_app = false;
         }
 
+        if should_rediscover {
+            let bind_addr = Self::diagnostics_bind_from_url(&state.diagnostics_url);
+            if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
+                state.elevated_started_by_app = true;
+                #[cfg(not(test))]
+                {
+                    let pid_path = Self::default_pid_path();
+                    if let Some(parent) = pid_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(pid_path, pid.to_string());
+                }
+                log::info!("Recovered running p2pnet-daemon PID {pid} for diagnostics {bind_addr}");
+                return true;
+            }
+        }
+
+        state.elevated_started_by_app = false;
         false
     }
 
@@ -2098,6 +2117,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn spawn_daemon_named_child(bind_addr: &str) -> (tempfile::TempDir, Child) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script = temp_dir.path().join("p2pnet-daemon-test");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntrap 'kill \"$child\" 2>/dev/null' TERM EXIT\nsleep 30 &\nchild=$!\nwait \"$child\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let child = Command::new(&script)
+            .args(["--diagnostics-bind", bind_addr])
+            .spawn()
+            .unwrap();
+        (temp_dir, child)
+    }
+
     #[test]
     fn operation_phase_busy_states_are_explicit() {
         assert!(!DaemonOperationPhase::Stopped.is_busy());
@@ -2246,6 +2287,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_status_rediscovers_daemon_by_diagnostics_bind() {
+        let manager = DaemonManager::new();
+        let url = unused_local_status_url();
+        let bind_addr = DaemonManager::diagnostics_bind_from_url(&url);
+        let (_temp_dir, mut child) = spawn_daemon_named_child(&bind_addr);
+        manager
+            .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+            .await;
+        manager.state.lock().await.diagnostics_url = url.clone();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let status = manager.desktop_status(Some(url)).await;
+
+        assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+        assert!(manager.state.lock().await.elevated_started_by_app);
+
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let _ = child.wait();
+    }
+
     #[test]
     fn test_resolve_daemon_binary_priority() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2288,11 +2353,13 @@ mod tests {
 
     #[test]
     fn diagnostics_port_selection_keeps_a_free_preferred_port() {
-        let preferred = unused_local_status_url();
-        assert_eq!(
-            DaemonManager::available_diagnostics_url(&preferred).unwrap(),
-            preferred
-        );
+        for _ in 0..16 {
+            let preferred = unused_local_status_url();
+            if DaemonManager::available_diagnostics_url(&preferred).unwrap() == preferred {
+                return;
+            }
+        }
+        panic!("could not observe an unclaimed preferred diagnostics port");
     }
 
     #[test]
