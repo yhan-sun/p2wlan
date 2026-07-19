@@ -296,7 +296,11 @@ impl RouteManager {
         let destination_prefix = format!("{network}/{prefix}");
         let interface = self.interface();
 
-        let existing = windows_get_route_aliases(&destination_prefix)?;
+        let mut existing = windows_get_route_aliases(&destination_prefix)?;
+        if windows_remove_stale_managed_routes(&destination_prefix, &interface, &existing) {
+            existing = windows_get_route_aliases(&destination_prefix)?;
+        }
+
         if !existing.is_empty() {
             if existing
                 .iter()
@@ -325,13 +329,26 @@ impl RouteManager {
 
         if !output.status.success() {
             if windows_route_already_exists(&output) {
-                let existing_after = windows_get_route_aliases(&destination_prefix)
+                let mut existing_after = windows_get_route_aliases(&destination_prefix)
                     .unwrap_or_else(|err| {
                         info!(
                             "New-NetRoute reported an existing route for {destination_prefix}, but follow-up route query failed: {err}"
                         );
                         Vec::new()
                     });
+                if windows_remove_stale_managed_routes(
+                    &destination_prefix,
+                    &interface,
+                    &existing_after,
+                ) {
+                    existing_after = windows_get_route_aliases(&destination_prefix)
+                        .unwrap_or_else(|err| {
+                            info!(
+                                "Windows stale route cleanup for {destination_prefix} ran, but follow-up route query failed: {err}"
+                            );
+                            Vec::new()
+                        });
+                }
 
                 if existing_after.is_empty()
                     || existing_after
@@ -397,7 +414,7 @@ impl RouteManager {
 #[cfg(target_os = "windows")]
 fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
     let output = windows_powershell_command(&format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
+        "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
         ps_quote(destination_prefix)
     ))
         .output()
@@ -419,10 +436,67 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
 }
 
 #[cfg(target_os = "windows")]
+fn windows_remove_stale_managed_routes(
+    destination_prefix: &str,
+    current_interface: &str,
+    aliases: &[String],
+) -> bool {
+    let stale_aliases: Vec<&str> = aliases
+        .iter()
+        .map(String::as_str)
+        .filter(|alias| !windows_interface_alias_eq(alias, current_interface))
+        .filter(|alias| windows_is_managed_interface_alias(alias))
+        .collect();
+
+    for alias in &stale_aliases {
+        info!(
+            "Removing stale Windows route for {destination_prefix} via {alias} before using {current_interface}"
+        );
+        let output = windows_powershell_command(&format!(
+            "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceAlias '{}' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
+            ps_quote(destination_prefix),
+            ps_quote(alias)
+        ))
+        .output();
+
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                warn!(
+                    "Could not remove stale Windows route for {destination_prefix} via {alias}: {}",
+                    powershell_failure_detail(&output)
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "Could not run stale Windows route cleanup for {destination_prefix} via {alias}: {err}"
+                );
+            }
+        }
+    }
+
+    !stale_aliases.is_empty()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_is_managed_interface_alias(alias: &str) -> bool {
+    let alias = alias.trim().to_ascii_lowercase();
+    alias == "p2wlan" || alias.starts_with("p2wlan-") || alias.starts_with("p2pnet")
+}
+
+#[cfg(target_os = "windows")]
 fn windows_route_already_exists(output: &std::process::Output) -> bool {
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    stderr.contains("already exists") || stdout.contains("already exists")
+    windows_route_already_exists_message(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_route_already_exists_message(stdout: &str, stderr: &str) -> bool {
+    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    text.contains("already exists")
+        || (text.contains("msft_netroute") && text.contains("system error 87"))
 }
 
 #[cfg(target_os = "windows")]
@@ -651,5 +725,35 @@ mod tests {
             0,
             "failed route add must not be recorded as owned"
         );
+    }
+}
+
+#[cfg(test)]
+mod windows_helper_tests {
+    use super::*;
+
+    #[test]
+    fn detects_managed_windows_interface_aliases() {
+        assert!(windows_is_managed_interface_alias("p2wlan"));
+        assert!(windows_is_managed_interface_alias("P2WLAN-test"));
+        assert!(windows_is_managed_interface_alias("p2pnet0"));
+        assert!(!windows_is_managed_interface_alias("Ethernet"));
+        assert!(!windows_is_managed_interface_alias("Wi-Fi"));
+    }
+
+    #[test]
+    fn detects_windows_route_duplicate_errors() {
+        assert!(windows_route_already_exists_message(
+            "",
+            "New-NetRoute : Instance MSFT_NetRoute already exists"
+        ));
+        assert!(windows_route_already_exists_message(
+            "",
+            "FullyQualifiedErrorId : Windows System Error 87,New-NetRoute\nMSFT_NetRoute"
+        ));
+        assert!(!windows_route_already_exists_message(
+            "",
+            "New-NetRoute : Access is denied"
+        ));
     }
 }
