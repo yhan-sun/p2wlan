@@ -410,7 +410,8 @@ impl DaemonManager {
         // Full `/status` snapshots can be briefly slow while peer/relay state is changing.
         let health_url = Self::health_url_from_status_url(url).unwrap_or_else(|| url.to_string());
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
+            .no_proxy()
+            .timeout(Duration::from_millis(1500))
             .build();
         if let Ok(client) = client {
             if let Ok(res) = client.get(health_url).send().await {
@@ -433,6 +434,7 @@ impl DaemonManager {
         };
 
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(2500))
             .build()
             .map_err(|e| e.to_string())?;
@@ -457,6 +459,7 @@ impl DaemonManager {
 
     async fn diagnostics_process_id(url: &str) -> Option<u32> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(800))
             .build()
             .ok()?;
@@ -491,6 +494,7 @@ impl DaemonManager {
             return false;
         };
         let client = match reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(800))
             .build()
         {
