@@ -122,11 +122,30 @@ function useClientStatusController(): ClientStatusState {
     }
   }, [applySnapshot]);
 
+  const desktopMayStillHaveRunningDaemon = useCallback((desktop: DesktopStatus) => {
+    if (!isTauri() || desktop.diagnostics) return false;
+    if (desktop.diagnosticsAlive || desktop.operation.phase === "running") return true;
+    if (desktop.operation.phase === "waiting_for_daemon") return true;
+
+    const statusText = [
+      desktop.operation.message,
+      desktop.operation.lastError,
+      desktop.diagnosticsError,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return (
+      desktop.operation.phase === "error" &&
+      (statusText.includes("守护进程未响应") ||
+        statusText.includes("诊断端点") ||
+        statusText.includes("健康检查端点") ||
+        statusText.includes("本地健康检查"))
+    );
+  }, []);
+
   const applyDesktopStatus = useCallback((desktop: DesktopStatus) => {
-    const shouldRecoverRunningStatus =
-      isTauri() &&
-      !desktop.diagnostics &&
-      (desktop.diagnosticsAlive || desktop.operation.phase === "running");
+    const shouldRecoverRunningStatus = desktopMayStillHaveRunningDaemon(desktop);
 
     if (!shouldRecoverRunningStatus) {
       applySnapshot(clientStatusFromDesktopStatus(desktop));
@@ -141,7 +160,7 @@ function useClientStatusController(): ClientStatusState {
       .finally(() => {
         eventFallbackInFlight.current = false;
       });
-  }, [applySnapshot]);
+  }, [applySnapshot, desktopMayStillHaveRunningDaemon]);
 
   useEffect(() => {
     let disposed = false;
