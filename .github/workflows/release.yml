@@ -136,64 +136,87 @@ jobs:
           files: dist-release/p2wlan-windows-x64.zip
 
   linux-cli:
-    name: Linux x64 CLI Package
+    name: Linux ${{ matrix.arch }} CLI Package
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-unknown-linux-gnu
+            cross_packages: ""
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            cross_packages: gcc-aarch64-linux-gnu
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
-      - name: Build daemon CLI
-        run: cargo build -p p2pnet-daemon --release --target x86_64-unknown-linux-gnu
+      - name: Install cross compiler
+        if: matrix.cross_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_packages }}
+
+      - name: Build Linux CLI and daemon
+        run: cargo build -p p2wlan-cli -p p2pnet-daemon --release --target ${{ matrix.target }}
 
       - name: Assemble Linux CLI tarball
         run: |
           set -euo pipefail
-          pkg="dist-release/p2wlan-linux-x64-cli"
+          name="p2wlan-linux-${{ matrix.arch }}-cli"
+          pkg="dist-release/$name"
           mkdir -p "$pkg"
-          cp target/x86_64-unknown-linux-gnu/release/p2pnet-daemon "$pkg/"
+          cp target/${{ matrix.target }}/release/p2wlan "$pkg/"
+          cp target/${{ matrix.target }}/release/p2pnet-daemon "$pkg/"
+          cp scripts/install-linux-cli.sh "$pkg/install.sh"
           cp LICENSE "$pkg/"
           cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
-          p2wlan Linux x64 CLI Preview
+          p2wlan Linux CLI Preview
 
           Contents:
-          - p2pnet-daemon: Linux command-line client daemon with real TUN support
+          - p2wlan: user-facing command-line client
+          - p2pnet-daemon: background daemon with real Linux TUN support
+          - install.sh: system-wide installer
           - LICENSE
 
           Quick start:
-          1. Make sure /dev/net/tun exists and run with root privileges.
-          2. Initialize a config:
-             sudo ./p2pnet-daemon --init --control http://CONTROL_HOST:18080 --network default
-          3. Start the daemon:
-             sudo ./p2pnet-daemon --control http://CONTROL_HOST:18080 --network default
-          4. Query local diagnostics from another terminal:
-             ./p2pnet-daemon --status
+          1. sudo ./install.sh
+          2. p2wlan login -u you@example.com
+          3. p2wlan up
+          4. p2wlan status
 
-          Useful overrides:
-          - --relay default@RELAY_HOST:18081
-          - --udp-bind 0.0.0.0:0
-          - --udp-advertise PUBLIC_OR_LAN_IP:PORT
-          - --prefer-relay
+          Common commands:
+          - p2wlan config show
+          - p2wlan config set device-name linux-server
+          - p2wlan logs -f
+          - p2wlan down
+          - p2wlan help
 
           Notes:
-          - Real TUN mode needs CAP_NET_ADMIN/root.
+          - `p2wlan up` requests sudo only when creating TUN and routes.
+          - Login and configuration commands must be run without sudo.
+          - Supplying `-p` is supported for automation, but interactive password input is safer.
           - For self-hosting, run the Go control and relay services separately.
-          - This Preview CLI is intended for server, headless Linux, and smoke testing.
           EOF
-          chmod +x "$pkg/p2pnet-daemon"
-          tar -C dist-release -czf dist-release/p2wlan-linux-x64-cli.tar.gz p2wlan-linux-x64-cli
+          chmod +x "$pkg/p2wlan" "$pkg/p2pnet-daemon" "$pkg/install.sh"
+          tar -C dist-release -czf "dist-release/$name.tar.gz" "$name"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-linux-x64-cli
-          path: dist-release/p2wlan-linux-x64-cli.tar.gz
+          name: p2wlan-linux-${{ matrix.arch }}-cli
+          path: dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-release/p2wlan-linux-x64-cli.tar.gz
+          files: dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz

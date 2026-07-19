@@ -355,10 +355,17 @@ impl Config {
     }
 
     /// Save configuration to a JSON file using atomic write (temp + rename)
-    /// and sets 0600 permissions on Unix.
+    /// and sets 0600 permissions on Unix. When an elevated daemon updates an
+    /// existing user config, preserve that file's owner across the rename.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DaemonError::Config(format!("failed to serialize config: {e}")))?;
+
+        #[cfg(unix)]
+        let existing_owner = std::fs::metadata(path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.uid(), metadata.gid())
+        });
 
         // Write to temp file first for atomicity
         let tmp_path = path.with_extension("tmp");
@@ -378,6 +385,16 @@ impl Config {
             file.set_permissions(perms).map_err(|e| {
                 DaemonError::Config(format!("failed to set config permissions: {e}"))
             })?;
+
+            if let Some((uid, gid)) = existing_owner {
+                use std::os::fd::AsRawFd;
+                if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+                    return Err(DaemonError::Config(format!(
+                        "failed to preserve config ownership: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            }
         }
 
         file.write_all(content.as_bytes())
