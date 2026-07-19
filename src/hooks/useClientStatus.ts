@@ -71,6 +71,7 @@ function useClientStatusController(): ClientStatusState {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastFetchedAt, setLastFetchedAt] = useState<number | null>(null);
   const inFlight = useRef(false);
+  const eventFallbackInFlight = useRef(false);
   const lastOperationLogKey = useRef<string | null>(null);
 
   const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof getClientStatusSnapshot>>) => {
@@ -121,6 +122,27 @@ function useClientStatusController(): ClientStatusState {
     }
   }, [applySnapshot]);
 
+  const applyDesktopStatus = useCallback((desktop: DesktopStatus) => {
+    const shouldRecoverRunningStatus =
+      isTauri() &&
+      !desktop.diagnostics &&
+      (desktop.diagnosticsAlive || desktop.operation.phase === "running");
+
+    if (!shouldRecoverRunningStatus) {
+      applySnapshot(clientStatusFromDesktopStatus(desktop));
+      return;
+    }
+
+    if (eventFallbackInFlight.current) return;
+    eventFallbackInFlight.current = true;
+    void getClientStatusSnapshot()
+      .then(applySnapshot)
+      .catch(() => applySnapshot(clientStatusFromDesktopStatus(desktop)))
+      .finally(() => {
+        eventFallbackInFlight.current = false;
+      });
+  }, [applySnapshot]);
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | null = null;
@@ -150,7 +172,7 @@ function useClientStatusController(): ClientStatusState {
       void import("@tauri-apps/api/event")
         .then(async ({ listen }) => {
           const stopListening = await listen<DesktopStatus>("p2wlan-status", event => {
-            if (!disposed) applySnapshot(clientStatusFromDesktopStatus(event.payload));
+            if (!disposed) applyDesktopStatus(event.payload);
           });
           if (disposed) {
             stopListening();
@@ -186,7 +208,7 @@ function useClientStatusController(): ClientStatusState {
       window.removeEventListener("storage", handleStorage);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [applySnapshot, refresh]);
+  }, [applyDesktopStatus, refresh]);
 
   const connect = useCallback(async () => {
     const result = await startDaemon();
