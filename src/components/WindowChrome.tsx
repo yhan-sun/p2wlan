@@ -1,4 +1,4 @@
-import { useEffect, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, type MouseEvent as ReactMouseEvent } from "react";
 import { Maximize2, Minus, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -45,10 +45,12 @@ export default function WindowChrome({ platform }: WindowChromeProps) {
 
   if (platform === "web") return null;
 
-  const handleDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+  const handleDrag = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (event.button !== 0 || event.detail > 1) return;
     if (event.target instanceof Element && event.target.closest("button")) return;
-    void withCurrentWindow(window => window.startDragging());
+    void getCurrentWindow().startDragging().catch(error => {
+      console.error("Failed to start window dragging", error);
+    });
   };
 
   const handleDoubleClick = () => {
@@ -58,11 +60,15 @@ export default function WindowChrome({ platform }: WindowChromeProps) {
   return (
     <div
       className={`window-chrome window-chrome-${platform}`}
-      data-tauri-drag-region
-      onPointerDown={handleDrag}
       onDoubleClick={handleDoubleClick}
       role="presentation"
     >
+      <div
+        className="window-drag-region"
+        data-tauri-drag-region
+        onMouseDown={handleDrag}
+        role="presentation"
+      />
       {platform !== "macos" && (
         <div className="window-controls" data-no-window-drag>
           <button

@@ -183,7 +183,7 @@ export default function SettingsPage() {
                       <span className="choice-dot" aria-hidden="true" />
                       <span className="choice-copy">
                         <span className="title text-sm">完全停止并退出</span>
-                        <span className="desc text-xs text-muted">关闭主窗口时同时注销网卡、停止后台守护进程并退出。</span>
+                        <span className="desc text-xs text-muted">关闭主窗口时先确认，再注销网卡、停止后台守护进程并退出。</span>
                       </span>
                     </label>
                   </div>

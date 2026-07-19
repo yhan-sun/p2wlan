@@ -1,13 +1,13 @@
 import { NavLink, useNavigate } from "react-router-dom";
 import { ReactNode } from "react";
 import { Activity, LayoutDashboard, Settings, LogOut, Power, Network } from "lucide-react";
-import { quitApp } from "../lib/clientApi";
 import { StatusPill, healthTone, zhLabel } from "./StatusPill";
 import { useClientStatus } from "../hooks/useClientStatus";
 
 interface LayoutProps {
   children: ReactNode;
   onLogout: () => void;
+  onRequestQuit: () => void;
 }
 
 const navItems = [
@@ -33,7 +33,7 @@ function compactOperationLabel(phase: string): string {
   }
 }
 
-export default function Layout({ children, onLogout }: LayoutProps) {
+export default function Layout({ children, onLogout, onRequestQuit }: LayoutProps) {
   const navigate = useNavigate();
   const { daemon, operation } = useClientStatus();
   const operationActive = operation.phase !== "stopped" && operation.phase !== "running";
@@ -90,9 +90,7 @@ export default function Layout({ children, onLogout }: LayoutProps) {
           </button>
           <button
             className="btn btn-ghost quit-btn full-width"
-            onClick={() => {
-              void quitApp();
-            }}
+            onClick={onRequestQuit}
           >
             <Power size={14} />
             <span>退出程序</span>

@@ -12,11 +12,12 @@ import { useWindowLifecycle } from "./hooks/useWindowLifecycle";
 import { ClientStatusProvider } from "./hooks/useClientStatus";
 import { clearControlSession } from "./lib/clientApi";
 import WindowChrome, { detectDesktopPlatform } from "./components/WindowChrome";
+import QuitConfirmationDialog from "./components/QuitConfirmationDialog";
 
 function App() {
   const [token, setToken] = useState<string>(() => localStorage.getItem("token") || "");
   const platform = detectDesktopPlatform();
-  useWindowLifecycle();
+  const windowLifecycle = useWindowLifecycle();
 
   return (
     <div className={`app-frame app-frame-${platform}`}>
@@ -32,6 +33,7 @@ function App() {
                   clearControlSession();
                   setToken("");
                 }}
+                onRequestQuit={windowLifecycle.requestQuit}
               >
                 <Routes>
                   <Route path="/" element={<Navigate to="/dashboard" replace />} />
@@ -48,6 +50,14 @@ function App() {
           </HashRouter>
         )}
       </div>
+      {windowLifecycle.quitConfirmationOpen ? (
+        <QuitConfirmationDialog
+          quitting={windowLifecycle.quitting}
+          error={windowLifecycle.quitError}
+          onCancel={windowLifecycle.cancelQuit}
+          onConfirm={() => void windowLifecycle.confirmQuit()}
+        />
+      ) : null}
     </div>
   );
 }

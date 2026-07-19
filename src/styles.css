@@ -135,12 +135,24 @@ select:focus-visible {
   -webkit-user-select: none;
 }
 
+.window-drag-region {
+  position: absolute;
+  inset: 0;
+  cursor: grab;
+}
+
+.window-drag-region:active {
+  cursor: grabbing;
+}
+
 .window-controls {
   position: absolute;
   top: 0;
   right: 0;
+  z-index: 1;
   display: flex;
   height: 36px;
+  cursor: default;
 }
 
 .window-control {
@@ -1950,6 +1962,87 @@ button, .btn, .sidebar-link, .segmented-button, .choice-row {
   border-top: 1px solid var(--border-light);
 }
 
+/* Destructive app exit confirmation */
+.quit-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2300;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: color-mix(in oklch, var(--bg-primary) 78%, transparent);
+}
+
+.quit-dialog {
+  width: min(29rem, 100%);
+  overflow: hidden;
+  color: var(--text-primary);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 1.25rem 3rem color-mix(in oklch, var(--bg-primary) 70%, transparent);
+}
+
+.quit-dialog-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.8rem;
+  padding: 1.1rem 1.15rem 0.85rem;
+}
+
+.quit-dialog-icon {
+  width: 2.25rem;
+  min-width: 2.25rem;
+  height: 2.25rem;
+  display: grid;
+  place-items: center;
+  color: var(--warning);
+  background: var(--warning-light);
+  border: 1px solid color-mix(in oklch, var(--warning) 25%, transparent);
+  border-radius: var(--radius-md);
+}
+
+.quit-dialog-heading h3 {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.quit-dialog-heading p {
+  margin-top: 0.2rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.quit-impact-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0 1.15rem 1rem 4.2rem;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.quit-impact-list li::marker {
+  color: var(--text-muted);
+}
+
+.quit-dialog-error {
+  margin: 0 1.15rem 1rem;
+  padding: 0.6rem 0.7rem;
+  color: var(--danger);
+  background: var(--danger-light);
+  border: 1px solid color-mix(in oklch, var(--danger) 26%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+}
+
+.quit-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  padding: 0.9rem 1.15rem;
+  border-top: 1px solid var(--border-light);
+}
+
 @media (max-width: 580px) {
   .device-dialog-backdrop {
     align-items: end;
@@ -1962,6 +2055,23 @@ button, .btn, .sidebar-link, .segmented-button, .choice-row {
 
   .device-details-list {
     grid-template-columns: 1fr;
+  }
+
+  .quit-dialog-backdrop {
+    align-items: end;
+    padding: 0.75rem;
+  }
+
+  .quit-impact-list {
+    margin-left: 2.75rem;
+  }
+
+  .quit-dialog-actions {
+    flex-direction: column-reverse;
+  }
+
+  .quit-dialog-actions .btn {
+    width: 100%;
   }
 }
 
