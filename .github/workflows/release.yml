@@ -196,6 +196,10 @@ jobs:
           Common commands:
           - p2wlan config show
           - p2wlan config set device-name linux-server
+          - p2wlan config set udp-bind 0.0.0.0:60207
+          - p2wlan config set udp-advertise <public-ip>:60207
+          - p2wlan doctor
+          - p2wlan update
           - p2wlan logs -f
           - p2wlan down
           - p2wlan help
@@ -204,6 +208,7 @@ jobs:
           - `p2wlan up` requests sudo only when creating TUN and routes.
           - Login and configuration commands must be run without sudo.
           - Supplying `-p` is supported for automation, but interactive password input is safer.
+          - Cloud direct UDP needs an open fixed UDP port in the provider security group and OS firewall.
           - For self-hosting, run the Go control and relay services separately.
           EOF
           chmod +x "$pkg/p2wlan" "$pkg/p2pnet-daemon" "$pkg/install.sh"

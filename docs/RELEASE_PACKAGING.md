@@ -36,6 +36,7 @@ The release workflow uploads:
 - `p2wlan-macos-universal.app.zip`
 - `p2wlan-windows-x64.zip`
 - `p2wlan-linux-x64-cli.tar.gz`
+- `p2wlan-linux-arm64-cli.tar.gz`
 
 The app is ad-hoc signed but not notarized yet. If macOS Gatekeeper blocks a
 downloaded build, use right-click > Open for internal testing. Public notarized
@@ -72,6 +73,7 @@ sudo ./install.sh
 p2wlan login -u you@example.com
 p2wlan up
 p2wlan status
+p2wlan doctor
 p2wlan logs -f
 p2wlan down
 ```
@@ -80,6 +82,23 @@ Persistent configuration is stored in `~/.config/p2wlan/p2pnet-config.json`.
 Runtime logs and the PID record are stored under `~/.local/state/p2wlan`.
 Only `up` requires elevated privileges; login and configuration remain owned by
 the invoking user.
+
+Cloud servers should use a fixed UDP port and advertise the public endpoint if
+direct UDP is expected:
+
+```bash
+p2wlan config set udp-bind 0.0.0.0:60207
+p2wlan config set udp-advertise <public-ip>:60207
+p2wlan config set relay-policy auto
+```
+
+The same UDP port must be allowed by the cloud security group and host firewall.
+Published Linux CLI builds can update themselves:
+
+```bash
+p2wlan update
+p2wlan update --version v0.1.22
+```
 
 ## Icon Generation
 

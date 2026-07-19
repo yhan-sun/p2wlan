@@ -4,15 +4,20 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CONTROL_SERVER: &str = "http://47.109.40.237:18080";
 const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
+const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
+const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、diagnostics、relay、relay-policy、direct-timeout";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -59,6 +64,10 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Diagnose local config, daemon status, direct UDP, and relay fallback
+    Doctor,
+    /// Download and install the latest Linux CLI release
+    Update(UpdateArgs),
     /// Internal elevated launcher used by `p2wlan up`
     #[command(name = "__start-daemon", hide = true)]
     InternalStart(InternalStartArgs),
@@ -85,10 +94,26 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, relay, or relay-policy
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, diagnostics, relay, relay-policy, or direct-timeout
         key: String,
         value: String,
     },
+}
+
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// GitHub repository, for example yhan-sun/p2wlan
+    #[arg(long, default_value = DEFAULT_UPDATE_REPO)]
+    repo: String,
+    /// Install a specific release tag instead of the latest release
+    #[arg(long, value_name = "TAG")]
+    version: Option<String>,
+    /// Installation directory for p2wlan and p2pnet-daemon
+    #[arg(long, value_name = "DIR")]
+    install_dir: Option<PathBuf>,
+    /// Only print what would be installed
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -106,6 +131,19 @@ struct AuthResponse {
     success: Option<bool>,
     token: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: Option<String>,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[tokio::main]
@@ -130,6 +168,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Status { json } => status(&config_path, json).await,
         Commands::Logs { lines, follow } => logs(lines, follow),
         Commands::Config { command } => config_command(&config_path, command),
+        Commands::Doctor => doctor(&config_path).await,
+        Commands::Update(args) => update(&config_path, args).await,
         Commands::InternalStart(args) => start_daemon_as_root(args).await,
     }
 }
@@ -428,6 +468,188 @@ async fn status(config_path: &Path, json: bool) -> Result<(), String> {
     }
 }
 
+async fn doctor(config_path: &Path) -> Result<(), String> {
+    println!("p2wlan doctor");
+    println!("版本：{}", env!("CARGO_PKG_VERSION"));
+    println!("配置文件：{}", config_path.display());
+
+    if !config_path.exists() {
+        println!("配置：不存在");
+        println!("建议：先运行 p2wlan login -u <邮箱>");
+        return Ok(());
+    }
+
+    let config = load_config(config_path)?;
+    let mut suggestions = Vec::new();
+    println!(
+        "登录：{}",
+        if config.control.auth_token.is_empty() {
+            suggestions.push("运行 p2wlan login -u <邮箱> 完成登录".to_string());
+            "no"
+        } else {
+            "yes"
+        }
+    );
+    println!("控制面：{}", config.control.server_url);
+    println!("网络：{}", config.network.network_id);
+    println!(
+        "虚拟网卡：{} MTU {}",
+        config.network.interface, config.network.mtu
+    );
+    println!("UDP bind：{}", config.network.udp_bind);
+    println!(
+        "UDP advertise：{}",
+        config
+            .network
+            .udp_advertise
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("(unset)")
+    );
+    println!(
+        "Relay policy：{}",
+        if config.relay.prefer_direct {
+            "auto/direct-first"
+        } else {
+            "relay-only"
+        }
+    );
+
+    if let Ok(bind) = config.network.udp_bind.parse::<SocketAddr>() {
+        if bind.port() == 0 {
+            suggestions.push(
+                "云服务器建议固定 UDP 端口，例如：p2wlan config set udp-bind 0.0.0.0:60207"
+                    .to_string(),
+            );
+        }
+    } else {
+        suggestions.push("修正 udp-bind，它必须是 ip:port".to_string());
+    }
+    if config
+        .network
+        .udp_advertise
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        suggestions.push(
+            "云服务器需要发布公网 UDP 地址，例如：p2wlan config set udp-advertise <公网IP>:60207"
+                .to_string(),
+        );
+    }
+    if !config.relay.prefer_direct {
+        suggestions
+            .push("如果希望优先直连，请运行：p2wlan config set relay-policy auto".to_string());
+    }
+
+    match fetch_status(&status_url(&config)).await {
+        Ok(snapshot) => {
+            println!("Daemon：运行中");
+            println!("虚拟 IP：{}", value_text(&snapshot, "virtual_ip", "未知"));
+            println!(
+                "UDP local：{}",
+                value_text(&snapshot, "udp_local_addr", "未知")
+            );
+            println!(
+                "Relay：{}",
+                if snapshot
+                    .get("relay_connected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "已连接"
+                } else {
+                    "未连接"
+                }
+            );
+            let stats = snapshot.get("stats").unwrap_or(&Value::Null);
+            println!(
+                "Peer：total={} direct={} relay={}",
+                value_u64(stats, "total_peers"),
+                value_u64(stats, "direct_connections"),
+                value_u64(stats, "relay_connections")
+            );
+            print_peer_diagnostics(&snapshot);
+            if value_u64(stats, "relay_connections") > 0
+                && value_u64(stats, "direct_connections") == 0
+            {
+                suggestions.push(
+                    "当前 Peer 只走 Relay。请确认两端云厂商安全组和系统防火墙都放行同一个 UDP 端口"
+                        .to_string(),
+                );
+            }
+        }
+        Err(error) => {
+            println!("Daemon：未运行（{error}）");
+            suggestions.push("运行 p2wlan up 启动 TUN daemon".to_string());
+        }
+    }
+
+    println!("建议：");
+    if suggestions.is_empty() {
+        println!("- 暂无明显配置问题；如果仍只走 Relay，请检查对端防火墙和云安全组 UDP 入站规则。");
+    } else {
+        for suggestion in dedupe_strings(suggestions) {
+            println!("- {suggestion}");
+        }
+    }
+    Ok(())
+}
+
+async fn update(config_path: &Path, args: UpdateArgs) -> Result<(), String> {
+    let arch = linux_release_arch()?;
+    let install_dir = args
+        .install_dir
+        .or_else(|| env::var_os("P2WLAN_INSTALL_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_INSTALL_DIR));
+    let release = fetch_github_release(&args.repo, args.version.as_deref()).await?;
+    let asset_name = format!("p2wlan-linux-{arch}-cli.tar.gz");
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| format!("release {} 没有找到资产 {asset_name}", release.tag_name))?;
+
+    println!("当前版本：{}", env!("CARGO_PKG_VERSION"));
+    println!("目标版本：{}", release.tag_name);
+    println!("安装目录：{}", install_dir.display());
+    if let Some(url) = &release.html_url {
+        println!("Release：{url}");
+    }
+
+    let target_version = release.tag_name.trim_start_matches('v');
+    if args.version.is_none() && target_version == env!("CARGO_PKG_VERSION") {
+        println!("已经是最新版本。");
+        return Ok(());
+    }
+    if args.dry_run {
+        println!("dry-run：将下载并安装 {}", asset.name);
+        return Ok(());
+    }
+
+    let daemon_running = match load_config(config_path) {
+        Ok(config) => fetch_status(&status_url(&config)).await.is_ok(),
+        Err(_) => false,
+    };
+
+    let work_dir = temp_update_dir()?;
+    fs::create_dir_all(&work_dir)
+        .map_err(|error| format!("无法创建临时目录 {}：{error}", work_dir.display()))?;
+    let archive_path = work_dir.join(&asset.name);
+    download_to_file(&asset.browser_download_url, &archive_path).await?;
+    extract_tar_gz(&archive_path, &work_dir)?;
+
+    let package_dir = work_dir.join(format!("p2wlan-linux-{arch}-cli"));
+    install_release_binaries(&package_dir, &install_dir)?;
+    let _ = fs::remove_dir_all(&work_dir);
+
+    println!("已更新到 {}。", release.tag_name);
+    if daemon_running {
+        println!("提示：daemon 正在运行，执行 p2wlan down && p2wlan up 后会使用新版 daemon。");
+    }
+    Ok(())
+}
+
 fn logs(lines: usize, follow: bool) -> Result<(), String> {
     let path = state_dir().join("p2pnet-daemon.log");
     if follow {
@@ -474,6 +696,24 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             println!("device-name = {}", config.node.device_name);
             println!("interface = {}", config.network.interface);
             println!("mtu = {}", config.network.mtu);
+            println!("udp-bind = {}", config.network.udp_bind);
+            println!(
+                "udp-advertise = {}",
+                config
+                    .network
+                    .udp_advertise
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("(unset)")
+            );
+            println!(
+                "stun = {}",
+                if config.network.stun_servers.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    config.network.stun_servers.join(",")
+                }
+            );
             println!("relay = {}", config.relay.servers.join(","));
             println!(
                 "relay-policy = {}",
@@ -483,6 +723,7 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                     "relay"
                 }
             );
+            println!("direct-timeout = {}ms", config.relay.fallback_timeout_ms);
             println!("diagnostics = {}", config.diagnostics.bind);
             Ok(())
         }
@@ -542,6 +783,42 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             }
             config.network.mtu = mtu;
         }
+        "udp-bind" => {
+            let endpoint = parse_socket_addr(value, "udp-bind")?;
+            config.network.udp_bind = endpoint.to_string();
+        }
+        "udp-advertise" => {
+            if is_clear_value(value) {
+                config.network.udp_advertise = None;
+            } else {
+                let endpoint = parse_socket_addr(value, "udp-advertise")?;
+                if endpoint.ip().is_unspecified() || endpoint.port() == 0 {
+                    return Err("udp-advertise 必须是可被其他设备访问的 ip:port".to_string());
+                }
+                config.network.udp_advertise = Some(endpoint.to_string());
+            }
+        }
+        "stun" => {
+            if is_clear_value(value) {
+                config.network.stun_servers.clear();
+            } else {
+                let servers = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| parse_socket_addr(item, "stun").map(|addr| addr.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                config.network.stun_servers = servers;
+            }
+        }
+        "diagnostics" => {
+            let endpoint = parse_socket_addr(value, "diagnostics")?;
+            if !endpoint.ip().is_loopback() {
+                return Err("diagnostics 必须绑定在 127.0.0.1 或 ::1".to_string());
+            }
+            config.diagnostics.enabled = true;
+            config.diagnostics.bind = endpoint.to_string();
+        }
         "relay" => {
             config.relay.servers = value
                 .split(',')
@@ -555,13 +832,41 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             "relay" => config.relay.prefer_direct = false,
             _ => return Err("relay-policy 只支持 auto、direct 或 relay".to_string()),
         },
+        "direct-timeout" => {
+            let timeout = parse_millis(value, "direct-timeout")?;
+            if !(100..=60000).contains(&timeout) {
+                return Err("direct-timeout 必须在 100ms 到 60000ms 之间".to_string());
+            }
+            config.relay.fallback_timeout_ms = timeout;
+        }
         _ => {
             return Err(format!(
-                "不支持的配置项 {key}；可用项：control、network、device-name、interface、mtu、relay、relay-policy"
+                "不支持的配置项 {key}；可用项：{SUPPORTED_CONFIG_KEYS}"
             ))
         }
     }
     Ok(())
+}
+
+fn parse_socket_addr(value: &str, label: &str) -> Result<SocketAddr, String> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("{label} 必须是有效 ip:port：{error}"))
+}
+
+fn parse_millis(value: &str, label: &str) -> Result<u64, String> {
+    let trimmed = value.trim().trim_end_matches("ms");
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("{label} 必须是毫秒整数，例如 5000 或 5000ms"))
+}
+
+fn is_clear_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "none" | "off" | "false" | "clear" | "unset" | "disable" | "disabled"
+    )
 }
 
 fn load_or_create_config(path: &Path) -> Result<Config, String> {
@@ -624,6 +929,251 @@ fn auth_error(message: &str, status: u16) -> String {
 fn clear_device_credential(config: &mut Config) {
     config.control.device_credential.clear();
     config.control.credential_issued = false;
+}
+
+fn print_peer_diagnostics(snapshot: &Value) {
+    let Some(peers) = snapshot.get("peers").and_then(Value::as_array) else {
+        return;
+    };
+    if peers.is_empty() {
+        return;
+    }
+
+    println!("Peer details：");
+    for peer in peers.iter().take(12) {
+        let node_id = peer
+            .get("node_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let name = peer
+            .get("device_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(node_id);
+        let virtual_ip = peer
+            .get("virtual_ip")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let state = peer
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let active_path = peer
+            .get("active_path")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let endpoint = peer
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("(none)");
+        let candidate_count = peer
+            .get("candidates")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        println!(
+            "- {} ({}) state={} path={} endpoint={} candidates={}",
+            short_text(name, 24),
+            virtual_ip,
+            state,
+            active_path,
+            endpoint,
+            candidate_count
+        );
+        if let Some(error) = peer
+            .get("direct")
+            .and_then(|direct| direct.get("last_error"))
+            .and_then(Value::as_str)
+        {
+            println!("  direct-error={error}");
+        }
+    }
+}
+
+fn short_text(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        value.to_string()
+    } else {
+        format!("{}...", value.chars().take(max_len).collect::<String>())
+    }
+}
+
+fn value_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.contains(&value) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+async fn fetch_github_release(repo: &str, tag: Option<&str>) -> Result<GitHubRelease, String> {
+    let endpoint = github_release_endpoint(repo, tag)?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("无法初始化更新请求：{error}"))?
+        .get(endpoint)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("p2wlan-cli/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("无法连接 GitHub Releases：{error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("GitHub Releases 返回 HTTP {status}"));
+    }
+    response
+        .json::<GitHubRelease>()
+        .await
+        .map_err(|error| format!("GitHub Releases 响应无效：{error}"))
+}
+
+fn github_release_endpoint(repo: &str, tag: Option<&str>) -> Result<String, String> {
+    let repo = repo.trim();
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| "repo 必须形如 owner/name".to_string())?;
+    if !is_github_slug(owner) || !is_github_slug(name) {
+        return Err("repo 只能包含字母、数字、点、下划线和短横线".to_string());
+    }
+    if let Some(tag) = tag {
+        let tag = tag.trim();
+        if tag.is_empty() || !is_github_slug(tag) {
+            return Err("version 只能包含字母、数字、点、下划线和短横线".to_string());
+        }
+        Ok(format!(
+            "https://api.github.com/repos/{owner}/{name}/releases/tags/{tag}"
+        ))
+    } else {
+        Ok(format!(
+            "https://api.github.com/repos/{owner}/{name}/releases/latest"
+        ))
+    }
+}
+
+fn is_github_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn linux_release_arch() -> Result<&'static str, String> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x64"),
+        ("linux", "aarch64") => Ok("arm64"),
+        (os, arch) => Err(format!(
+            "update 目前仅支持 Linux x64/arm64，当前是 {os}/{arch}"
+        )),
+    }
+}
+
+fn temp_update_dir() -> Result<PathBuf, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("系统时间异常：{error}"))?
+        .as_millis();
+    Ok(env::temp_dir().join(format!("p2wlan-update-{}-{now}", std::process::id())))
+}
+
+async fn download_to_file(url: &str, path: &Path) -> Result<(), String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("无法初始化下载请求：{error}"))?
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("p2wlan-cli/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .map_err(|error| format!("下载更新包失败：{error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("下载更新包返回 HTTP {status}"));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取更新包失败：{error}"))?;
+    fs::write(path, bytes.as_ref())
+        .map_err(|error| format!("无法写入更新包 {}：{error}", path.display()))
+}
+
+fn extract_tar_gz(archive: &Path, directory: &Path) -> Result<(), String> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(directory)
+        .status()
+        .map_err(|error| format!("无法执行 tar：{error}"))?;
+    if !status.success() {
+        return Err(format!("解压更新包失败（{status}）"));
+    }
+    Ok(())
+}
+
+fn install_release_binaries(package_dir: &Path, install_dir: &Path) -> Result<(), String> {
+    let cli = package_dir.join("p2wlan");
+    let daemon = package_dir.join("p2pnet-daemon");
+    if !cli.is_file() || !daemon.is_file() {
+        return Err(format!(
+            "更新包缺少 p2wlan 或 p2pnet-daemon：{}",
+            package_dir.display()
+        ));
+    }
+    if !is_root() {
+        println!(
+            "需要管理员权限安装到 {}，正在请求 sudo...",
+            install_dir.display()
+        );
+    }
+    run_install_command(vec![
+        OsString::from("-d"),
+        install_dir.as_os_str().to_os_string(),
+    ])?;
+    run_install_command(vec![
+        OsString::from("-m"),
+        OsString::from("0755"),
+        cli.as_os_str().to_os_string(),
+        install_dir.join("p2wlan").as_os_str().to_os_string(),
+    ])?;
+    run_install_command(vec![
+        OsString::from("-m"),
+        OsString::from("0755"),
+        daemon.as_os_str().to_os_string(),
+        install_dir.join("p2pnet-daemon").as_os_str().to_os_string(),
+    ])?;
+    Ok(())
+}
+
+fn run_install_command(args: Vec<OsString>) -> Result<(), String> {
+    let mut command = if is_root() {
+        Command::new("install")
+    } else {
+        let mut command = Command::new("sudo");
+        command.arg("install");
+        command
+    };
+    let status = command
+        .args(args)
+        .status()
+        .map_err(|error| format!("无法执行 install：{error}"))?;
+    if !status.success() {
+        return Err(format!("安装文件失败（{status}）"));
+    }
+    Ok(())
 }
 
 async fn fetch_status(url: &str) -> Result<Value, String> {
@@ -849,13 +1399,13 @@ mod tests {
 
     #[test]
     fn parses_login_short_options() {
-        let cli =
-            Cli::try_parse_from(["p2wlan", "login", "-u", "pyu@qq.com", "-p", "pyu01234"]).unwrap();
+        let cli = Cli::try_parse_from(["p2wlan", "login", "-u", "pyu@qq.com", "-p", "password123"])
+            .unwrap();
         let Commands::Login(args) = cli.command else {
             panic!("expected login command");
         };
         assert_eq!(args.username, "pyu@qq.com");
-        assert_eq!(args.password.as_deref(), Some("pyu01234"));
+        assert_eq!(args.password.as_deref(), Some("password123"));
     }
 
     #[test]
@@ -865,15 +1415,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_update_options() {
+        let cli = Cli::try_parse_from([
+            "p2wlan",
+            "update",
+            "--dry-run",
+            "--version",
+            "v0.1.22",
+            "--install-dir",
+            "/tmp/bin",
+        ])
+        .unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert!(args.dry_run);
+        assert_eq!(args.version.as_deref(), Some("v0.1.22"));
+        assert_eq!(args.install_dir.as_deref(), Some(Path::new("/tmp/bin")));
+    }
+
+    #[test]
     fn validates_and_sets_safe_config_values() {
         let mut config = Config::generate_default(DEFAULT_CONTROL_SERVER, DEFAULT_NETWORK).unwrap();
         set_config_value(&mut config, "mtu", "1380").unwrap();
         set_config_value(&mut config, "relay-policy", "relay").unwrap();
         set_config_value(&mut config, "device-name", "linux-server").unwrap();
+        set_config_value(&mut config, "udp-bind", "0.0.0.0:60207").unwrap();
+        set_config_value(&mut config, "udp-advertise", "203.0.113.10:60207").unwrap();
+        set_config_value(&mut config, "stun", "1.1.1.1:3478,8.8.8.8:3478").unwrap();
+        set_config_value(&mut config, "direct-timeout", "7000ms").unwrap();
         assert_eq!(config.network.mtu, 1380);
         assert!(!config.relay.prefer_direct);
         assert_eq!(config.node.device_name, "linux-server");
+        assert_eq!(config.network.udp_bind, "0.0.0.0:60207");
+        assert_eq!(
+            config.network.udp_advertise.as_deref(),
+            Some("203.0.113.10:60207")
+        );
+        assert_eq!(config.network.stun_servers.len(), 2);
+        assert_eq!(config.relay.fallback_timeout_ms, 7000);
+        set_config_value(&mut config, "udp-advertise", "off").unwrap();
+        assert!(config.network.udp_advertise.is_none());
         assert!(set_config_value(&mut config, "mtu", "10").is_err());
+        assert!(set_config_value(&mut config, "udp-advertise", "0.0.0.0:60207").is_err());
+        assert!(set_config_value(&mut config, "diagnostics", "0.0.0.0:39277").is_err());
         assert!(set_config_value(&mut config, "auth-token", "secret").is_err());
     }
 
