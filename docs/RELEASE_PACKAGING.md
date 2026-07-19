@@ -80,7 +80,14 @@ p2wlan help
 Install a specific release tag:
 
 ```bash
-sudo env P2WLAN_VERSION=v0.1.23 sh /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh --version v0.1.24
+```
+
+Preview or install to a user-writable directory:
+
+```bash
+sh /tmp/p2wlan-install.sh --version v0.1.24 --dry-run
+sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
 ```
 
 Or install from an already downloaded release tarball:
@@ -121,8 +128,12 @@ Published Linux CLI builds can update themselves:
 
 ```bash
 p2wlan update
-p2wlan update --version v0.1.23
+p2wlan update --version v0.1.24
 ```
+
+`p2wlan doctor` prints peer UDP candidate previews and flags peers that only
+advertise private or loopback endpoints, which usually means the peer still
+needs `udp-advertise <public-ip>:<port>` plus matching firewall rules.
 
 ## Icon Generation
 

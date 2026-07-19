@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -570,6 +570,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "relay_connections")
             );
             print_peer_diagnostics(&snapshot);
+            suggestions.extend(peer_direct_suggestions(&snapshot));
             if value_u64(stats, "relay_connections") > 0
                 && value_u64(stats, "direct_connections") == 0
             {
@@ -971,14 +972,17 @@ fn print_peer_diagnostics(snapshot: &Value) {
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
+        let candidates = peer_candidate_strings(peer);
+        let candidate_preview = endpoint_preview(&candidates, 3);
         println!(
-            "- {} ({}) state={} path={} endpoint={} candidates={}",
+            "- {} ({}) state={} path={} endpoint={} candidates={}{}",
             short_text(name, 24),
             virtual_ip,
             state,
             active_path,
             endpoint,
-            candidate_count
+            candidate_count,
+            candidate_preview
         );
         if let Some(error) = peer
             .get("direct")
@@ -987,6 +991,142 @@ fn print_peer_diagnostics(snapshot: &Value) {
         {
             println!("  direct-error={error}");
         }
+    }
+}
+
+fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
+    let Some(peers) = snapshot.get("peers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut private_only_peers = Vec::new();
+    let mut direct_failures = 0_u64;
+    for peer in peers {
+        let has_direct_error = peer
+            .get("direct")
+            .and_then(|direct| direct.get("last_error"))
+            .and_then(Value::as_str)
+            .is_some();
+        if has_direct_error {
+            direct_failures += 1;
+        }
+
+        let endpoints = peer_diagnostic_endpoints(peer);
+        if endpoints.is_empty() {
+            continue;
+        }
+        let has_public_endpoint = endpoints.iter().any(is_public_udp_endpoint);
+        let has_private_or_local_endpoint = endpoints
+            .iter()
+            .any(|endpoint| is_private_or_local_ip(endpoint.ip()));
+        if has_direct_error && !has_public_endpoint && has_private_or_local_endpoint {
+            private_only_peers.push(peer_display_name(peer));
+        }
+    }
+
+    let mut suggestions = Vec::new();
+    if !private_only_peers.is_empty() {
+        suggestions.push(format!(
+            "对端 {} 只上报了私网/回环 UDP 候选；请在对应设备配置 udp-advertise <公网IP>:<端口>，并放行同一个 UDP 入站端口。",
+            private_only_peers.join("、")
+        ));
+    } else if direct_failures > 0 {
+        suggestions.push(
+            "检测到 Direct UDP 探测失败；请确认两端 udp-bind/udp-advertise、云安全组和系统防火墙使用同一个 UDP 端口。"
+                .to_string(),
+        );
+    }
+    suggestions
+}
+
+fn peer_diagnostic_endpoints(peer: &Value) -> Vec<SocketAddr> {
+    let mut endpoints = Vec::new();
+    if let Some(endpoint) = peer.get("endpoint").and_then(Value::as_str) {
+        push_socket_addr(&mut endpoints, endpoint);
+    }
+    for candidate in peer_candidate_strings(peer) {
+        push_socket_addr(&mut endpoints, &candidate);
+    }
+    endpoints
+}
+
+fn peer_candidate_strings(peer: &Value) -> Vec<String> {
+    peer.get("candidates")
+        .and_then(Value::as_array)
+        .map(|candidates| {
+            candidates
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_socket_addr(endpoints: &mut Vec<SocketAddr>, value: &str) {
+    if let Ok(endpoint) = value.parse::<SocketAddr>() {
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+}
+
+fn is_public_udp_endpoint(endpoint: &SocketAddr) -> bool {
+    endpoint.port() != 0 && !is_private_or_local_ip(endpoint.ip())
+}
+
+fn is_private_or_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn peer_display_name(peer: &Value) -> String {
+    let node_id = peer
+        .get("node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let name = peer
+        .get("device_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(node_id);
+    let virtual_ip = peer
+        .get("virtual_ip")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("{}({})", short_text(name, 18), virtual_ip)
+}
+
+fn endpoint_preview(endpoints: &[String], max_items: usize) -> String {
+    if endpoints.is_empty() {
+        return String::new();
+    }
+    let preview = endpoints
+        .iter()
+        .take(max_items)
+        .map(|endpoint| short_text(endpoint, 32))
+        .collect::<Vec<_>>()
+        .join(",");
+    if endpoints.len() > max_items {
+        format!(" [{}…]", preview)
+    } else {
+        format!(" [{preview}]")
     }
 }
 
@@ -1428,7 +1568,7 @@ mod tests {
             "update",
             "--dry-run",
             "--version",
-            "v0.1.23",
+            "v0.1.24",
             "--install-dir",
             "/tmp/bin",
         ])
@@ -1437,7 +1577,7 @@ mod tests {
             panic!("expected update command");
         };
         assert!(args.dry_run);
-        assert_eq!(args.version.as_deref(), Some("v0.1.23"));
+        assert_eq!(args.version.as_deref(), Some("v0.1.24"));
         assert_eq!(args.install_dir.as_deref(), Some(Path::new("/tmp/bin")));
     }
 
@@ -1467,6 +1607,42 @@ mod tests {
         assert!(set_config_value(&mut config, "udp-advertise", "0.0.0.0:60207").is_err());
         assert!(set_config_value(&mut config, "diagnostics", "0.0.0.0:39277").is_err());
         assert!(set_config_value(&mut config, "auth-token", "secret").is_err());
+    }
+
+    #[test]
+    fn doctor_suggests_udp_advertise_for_private_only_peer_candidates() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "windows-cloud",
+                "virtual_ip": "10.20.0.5",
+                "endpoint": "192.168.2.4:49877",
+                "candidates": ["192.168.2.4:49877", "127.0.0.1:60207"],
+                "direct": { "last_error": "no UDP punch ACK after 30 probes" }
+            }]
+        });
+        let suggestions = peer_direct_suggestions(&snapshot);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("windows-cloud(10.20.0.5)"));
+        assert!(suggestions[0].contains("udp-advertise"));
+    }
+
+    #[test]
+    fn doctor_does_not_flag_peer_with_public_candidate_as_private_only() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "linux-server",
+                "virtual_ip": "10.20.0.7",
+                "endpoint": "203.0.113.10:60207",
+                "candidates": ["203.0.113.10:60207"],
+                "direct": { "last_error": "no direct probe ACK after 6 retry probes" }
+            }]
+        });
+        let suggestions = peer_direct_suggestions(&snapshot);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("Direct UDP 探测失败"));
+        assert!(!suggestions[0].contains("只上报了私网/回环"));
     }
 
     #[test]
