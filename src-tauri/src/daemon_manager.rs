@@ -260,7 +260,7 @@ impl DaemonManager {
             state.last_start_options = Some(options.clone());
             state.operation = DaemonOperationStatus {
                 phase: DaemonOperationPhase::Authorizing,
-                message: "等待系统授权".to_string(),
+                message: Self::authorization_message(),
                 started_at_ms: now_ms(),
                 last_error: None,
             };
@@ -545,6 +545,31 @@ impl DaemonManager {
     #[cfg(not(any(unix, windows)))]
     fn has_network_admin_privileges() -> bool {
         false
+    }
+
+    fn authorization_message() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            if Self::has_network_admin_privileges() {
+                "已具备 Windows 管理员权限，正在启动 TUN".to_string()
+            } else {
+                "等待 Windows UAC 管理员授权".to_string()
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if Self::has_network_admin_privileges() {
+                "已具备 macOS 管理员权限，正在启动 TUN".to_string()
+            } else {
+                "等待 macOS 系统授权".to_string()
+            }
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            "等待系统授权".to_string()
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1308,6 +1333,60 @@ impl DaemonManager {
     }
 
     #[cfg(target_os = "windows")]
+    async fn cleanup_stale_windows_daemon_before_start(
+        preferred_url: &str,
+        log_path: &Path,
+    ) -> Result<(), String> {
+        if Self::diagnostics_process_id(preferred_url).await.is_some() {
+            return Ok(());
+        }
+
+        let pid_path = Self::default_pid_path();
+        let bind_addr = Self::diagnostics_bind_from_url(preferred_url);
+        let mut terminated = false;
+
+        if let Some(pid) = Self::read_pid_file(&pid_path) {
+            if Self::process_exists(pid) {
+                let verified = Self::process_command_line(pid)
+                    .map(|command_line| command_line.contains("p2pnet-daemon"))
+                    .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
+                if verified {
+                    let _ = Self::append_launcher_log(
+                        log_path,
+                        &format!("stopping stale recorded daemon PID {pid} before relaunch"),
+                    );
+                    Self::terminate_pid_with_system_authorization(pid)?;
+                    terminated = true;
+                } else {
+                    Self::remove_pid_file(&pid_path);
+                }
+            } else {
+                Self::remove_pid_file(&pid_path);
+            }
+        }
+
+        if !terminated {
+            if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
+                let _ = Self::append_launcher_log(
+                    log_path,
+                    &format!(
+                        "stopping stale daemon PID {pid} bound to diagnostics {bind_addr} before relaunch"
+                    ),
+                );
+                Self::terminate_pid_with_system_authorization(pid)?;
+                terminated = true;
+            }
+        }
+
+        if terminated {
+            let _ = Self::wait_for_endpoint_down(preferred_url, Duration::from_secs(3)).await;
+            Self::remove_pid_file(&pid_path);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
     async fn wait_for_endpoint_or_pid_exit(
         url: &str,
         timeout: Duration,
@@ -1499,6 +1578,17 @@ impl DaemonManager {
             return Err("请先登录或注册控制面账号，再提权启动 TUN 模式。".to_string());
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
+            Self::cleanup_stale_windows_daemon_before_start(&preferred_url, &log_path).await?;
+            if Self::diagnostics_process_id(&preferred_url).await.is_some() {
+                self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+                    .await;
+                return Ok("守护进程已经运行。".to_string());
+            }
+        }
+
         let target_url = Self::available_diagnostics_url(&preferred_url)?;
         options.diagnostics_url = Some(target_url.clone());
         {
@@ -1593,7 +1683,7 @@ impl DaemonManager {
         {
             self.set_operation(
                 DaemonOperationPhase::Authorizing,
-                "等待 Windows 管理员授权",
+                Self::authorization_message(),
                 None,
             )
             .await;

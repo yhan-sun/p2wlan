@@ -319,13 +319,25 @@ impl RouteManager {
         }
 
         info!("Adding Windows route for {destination_prefix} via {interface}");
-        let output = windows_powershell_command(&format!(
+        let route_script = format!(
             "$ErrorActionPreference = 'Stop'; New-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
             ps_quote(&destination_prefix),
             ps_quote(&interface)
-        ))
-            .output()
-            .map_err(|e| crate::DaemonError::Network(format!("failed to run New-NetRoute: {e}")))?;
+        );
+        let output = match windows_powershell_output(
+            &route_script,
+            std::time::Duration::from_secs(8),
+        ) {
+            Ok(output) => output,
+            Err(err) => {
+                warn!(
+                    "New-NetRoute did not complete for {destination_prefix} via {interface}: {err}; trying netsh fallback"
+                );
+                windows_netsh_add_route(&destination_prefix, &interface, network, mask, self)?;
+                windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
+                return Ok(());
+            }
+        };
 
         if !output.status.success() {
             if windows_route_already_exists(&output) {
@@ -371,10 +383,19 @@ impl RouteManager {
                 )));
             }
 
-            return Err(crate::DaemonError::Network(format!(
-                "New-NetRoute failed for {destination_prefix} via {interface}: {}",
-                powershell_failure_detail(&output)
-            )));
+            let primary_error = powershell_failure_detail(&output);
+            warn!(
+                "New-NetRoute failed for {destination_prefix} via {interface}: {primary_error}; trying netsh fallback"
+            );
+            if let Err(fallback_error) =
+                windows_netsh_add_route(&destination_prefix, &interface, network, mask, self)
+            {
+                return Err(crate::DaemonError::Network(format!(
+                    "New-NetRoute failed for {destination_prefix} via {interface}: {primary_error}; netsh fallback failed: {fallback_error}"
+                )));
+            }
+            windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
+            return Ok(());
         }
 
         if let Ok(mut added) = self.routes_added.lock() {
@@ -401,24 +422,21 @@ impl RouteManager {
             let destination_prefix = format!("{}/{}", network, ip_mask_to_prefix(mask));
             let interface = self.interface();
             info!("Cleaning up Windows route for {destination_prefix} via {interface}");
-            let _ = windows_powershell_command(&format!(
+            let _ = windows_powershell_output(&format!(
                 "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
                 ps_quote(&destination_prefix),
                 ps_quote(&interface)
-            ))
-                .status();
+            ), std::time::Duration::from_secs(5));
         }
     }
 }
 
 #[cfg(target_os = "windows")]
 fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<String>> {
-    let output = windows_powershell_command(&format!(
+    let output = windows_powershell_output(&format!(
         "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
         ps_quote(destination_prefix)
-    ))
-        .output()
-        .map_err(|e| crate::DaemonError::Network(format!("failed to run Get-NetRoute: {e}")))?;
+    ), std::time::Duration::from_secs(5))?;
 
     if !output.status.success() {
         return Err(crate::DaemonError::Network(format!(
@@ -452,12 +470,11 @@ fn windows_remove_stale_managed_routes(
         info!(
             "Removing stale Windows route for {destination_prefix} via {alias} before using {current_interface}"
         );
-        let output = windows_powershell_command(&format!(
+        let output = windows_powershell_output(&format!(
             "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceAlias '{}' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
             ps_quote(destination_prefix),
             ps_quote(alias)
-        ))
-        .output();
+        ), std::time::Duration::from_secs(5));
 
         match output {
             Ok(output) if output.status.success() => {}
@@ -496,6 +513,7 @@ fn windows_route_already_exists(output: &std::process::Output) -> bool {
 fn windows_route_already_exists_message(stdout: &str, stderr: &str) -> bool {
     let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     text.contains("already exists")
+        || text.contains("object already exists")
         || (text.contains("msft_netroute") && text.contains("system error 87"))
 }
 
@@ -507,12 +525,11 @@ fn windows_interface_alias_eq(left: &str, right: &str) -> bool {
 #[cfg(target_os = "windows")]
 fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str) {
     const RULE_NAME: &str = "p2wlan Overlay ICMPv4 Echo Request";
-    let output = windows_powershell_command(&format!(
+    let output = windows_powershell_output(&format!(
         "$ErrorActionPreference = 'Stop'; $name = '{}'; $cidr = '{}'; $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -eq $rule) {{ New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -LocalAddress $cidr -RemoteAddress $cidr -Profile Any | Out-Null }} else {{ Enable-NetFirewallRule -DisplayName $name | Out-Null }}",
         ps_quote(RULE_NAME),
         ps_quote(destination_prefix)
-    ))
-    .output();
+    ), std::time::Duration::from_secs(8));
 
     match output {
         Ok(output) if output.status.success() => {
@@ -533,7 +550,72 @@ fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str) {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_netsh_add_route(
+    destination_prefix: &str,
+    interface: &str,
+    network: Ipv4Addr,
+    mask: Ipv4Addr,
+    manager: &RouteManager,
+) -> crate::Result<()> {
+    let output = windows_command_output_with_timeout(
+        {
+            let mut command = windows_hidden_command("netsh.exe");
+            command
+                .args(["interface", "ipv4", "add", "route"])
+                .arg(format!("prefix={destination_prefix}"))
+                .arg(format!("interface={interface}"))
+                .arg("nexthop=0.0.0.0")
+                .arg("store=active");
+            command
+        },
+        std::time::Duration::from_secs(8),
+    )
+    .map_err(|error| {
+        crate::DaemonError::Network(format!("failed to run netsh route add: {error}"))
+    })?;
+
+    if output.status.success() {
+        if let Ok(mut added) = manager.routes_added.lock() {
+            added.push((network, mask));
+        }
+        info!("Windows route for {destination_prefix} via {interface} added using netsh");
+        return Ok(());
+    }
+
+    if windows_route_already_exists(&output) {
+        let existing_after = windows_get_route_aliases(destination_prefix).unwrap_or_default();
+        if existing_after.is_empty()
+            || existing_after
+                .iter()
+                .any(|alias| windows_interface_alias_eq(alias, interface))
+        {
+            if let Ok(mut added) = manager.routes_added.lock() {
+                added.push((network, mask));
+            }
+            info!(
+                "Windows route for {destination_prefix} via {interface} already exists after netsh fallback"
+            );
+            return Ok(());
+        }
+        return Err(crate::DaemonError::Network(format!(
+            "routing conflict: route to {destination_prefix} already exists on another interface: {}",
+            existing_after.join(", ")
+        )));
+    }
+
+    Err(crate::DaemonError::Network(format!(
+        "netsh route add failed for {destination_prefix} via {interface}: {}",
+        command_failure_detail(&output)
+    )))
+}
+
+#[cfg(target_os = "windows")]
 fn powershell_failure_detail(output: &std::process::Output) -> String {
+    command_failure_detail(output)
+}
+
+#[cfg(target_os = "windows")]
+fn command_failure_detail(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     match (stderr.is_empty(), stdout.is_empty(), output.status.code()) {
@@ -580,6 +662,60 @@ fn windows_powershell_command(script: &str) -> Command {
         script,
     ]);
     command
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell_output(
+    script: &str,
+    timeout: std::time::Duration,
+) -> crate::Result<std::process::Output> {
+    windows_command_output_with_timeout(windows_powershell_command(script), timeout).map_err(
+        |error| {
+            crate::DaemonError::Network(format!(
+                "PowerShell command timed out or failed after {:?}: {error}",
+                timeout
+            ))
+        },
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command_output_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("command exceeded {:?}", timeout),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
