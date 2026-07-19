@@ -129,6 +129,9 @@ export interface DesktopStatus {
   operation: DaemonOperationStatus;
   diagnostics: DiagnosticsSnapshot | null;
   diagnosticsUrl?: string;
+  diagnosticsAlive?: boolean;
+  diagnosticsStale?: boolean;
+  diagnosticsError?: string | null;
 }
 
 export interface DaemonStatus {
