@@ -70,15 +70,41 @@ wintun.dll
 
 ### Linux
 
-下载 `p2wlan-linux-x64-cli.tar.gz` 可运行无桌面的 Linux 命令行客户端。真实 TUN 模式需要 root 或等效 `CAP_NET_ADMIN` 权限：
+下载对应架构的 `p2wlan-linux-x64-cli.tar.gz` 或 `p2wlan-linux-arm64-cli.tar.gz`，安装无桌面的 Linux 命令行客户端：
 
 ```bash
 tar -xzf p2wlan-linux-x64-cli.tar.gz
 cd p2wlan-linux-x64-cli
-sudo ./p2pnet-daemon --init --control http://CONTROL_HOST:18080 --network default
-sudo ./p2pnet-daemon --control http://CONTROL_HOST:18080 --network default
-./p2pnet-daemon --status
+sudo ./install.sh
+
+p2wlan login -u pyu@qq.com
+p2wlan up
+p2wlan status
 ```
+
+自动化环境也可以直接传入密码：
+
+```bash
+p2wlan login -u pyu@qq.com -p 'your-password'
+```
+
+直接传入的密码可能被 shell history 或本机进程列表记录，日常使用建议省略 `-p`，在隐藏输入提示中填写。`p2wlan up` 会在创建 TUN 和系统路由时自动请求 `sudo`，其余命令不要使用 `sudo`。
+
+常用管理命令：
+
+```bash
+p2wlan help
+p2wlan config show
+p2wlan config set device-name linux-server
+p2wlan config set mtu 1420
+p2wlan config set relay default@47.109.40.237:18081
+p2wlan logs -n 100
+p2wlan logs -f
+p2wlan down
+p2wlan logout
+```
+
+配置默认保存在 `~/.config/p2wlan/p2pnet-config.json`，权限为 `0600`。可通过 `p2wlan config path` 查看实际位置；私钥、token、设备凭据和控制面分配的虚拟 IP 不应手工编辑。
 
 Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/server 场景的 CLI 包。
 
@@ -88,7 +114,7 @@ Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/serv
 | --- | --- | --- | --- |
 | macOS Apple Silicon / Intel | Tauri Universal | `utun` | 已完成双向虚拟 IP 实机互通 |
 | Windows 10/11 x64 | 便携版 | Wintun | 已实现并提供远程 smoke 脚本，仍需扩大硬件覆盖 |
-| Linux x64 | CLI release 包 | `/dev/net/tun` | 提供 headless 命令行包，daemon 与真实 TUN smoke 已通过 |
+| Linux x64/arm64 | CLI release 包 | `/dev/net/tun` | 提供 `p2wlan` 管理命令，daemon 与真实 TUN smoke 已通过 |
 
 ## 工作原理
 

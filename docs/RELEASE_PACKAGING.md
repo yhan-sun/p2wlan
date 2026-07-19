@@ -55,9 +55,11 @@ the daemon with administrator privileges when TUN mode starts.
 
 ## Linux CLI
 
-The release workflow builds a headless Linux x64 CLI tarball containing:
+The release workflow builds headless Linux x64 and arm64 CLI tarballs containing:
 
+- `p2wlan`
 - `p2pnet-daemon`
+- `install.sh`
 - `LICENSE`
 - `README-LINUX-CLI.txt`
 
@@ -66,10 +68,18 @@ smoke testing. Running real TUN mode requires root privileges or equivalent
 `CAP_NET_ADMIN` capability:
 
 ```bash
-sudo ./p2pnet-daemon --init --control http://CONTROL_HOST:18080 --network default
-sudo ./p2pnet-daemon --control http://CONTROL_HOST:18080 --network default
-./p2pnet-daemon --status
+sudo ./install.sh
+p2wlan login -u you@example.com
+p2wlan up
+p2wlan status
+p2wlan logs -f
+p2wlan down
 ```
+
+Persistent configuration is stored in `~/.config/p2wlan/p2pnet-config.json`.
+Runtime logs and the PID record are stored under `~/.local/state/p2wlan`.
+Only `up` requires elevated privileges; login and configuration remain owned by
+the invoking user.
 
 ## Icon Generation
 

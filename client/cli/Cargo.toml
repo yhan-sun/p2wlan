@@ -1,0 +1,21 @@
+[package]
+name = "p2wlan-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux command-line client for p2wlan"
+
+[[bin]]
+name = "p2wlan"
+path = "src/main.rs"
+
+[dependencies]
+p2pnet-daemon = { path = "../daemon" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
+libc = { workspace = true }
+
