@@ -41,6 +41,13 @@ P2WLAN 是一个面向个人、开发者和自托管用户的虚拟内网项目�
 - **可自托管**：Go 控制面、SQLite 数据库和轻量 Relay 均可独立部署。
 - **低资源设计**：Rust 网络核心、按需任务和窗口隐藏降频，适合长期后台运行。
 
+## 适合场景
+
+- **云电脑访问云服务器**：让 Windows 云电脑、Linux 云服务器和本地电脑出现在同一段 `10.20.0.0/16` 虚拟内网里。
+- **远程运维**：用虚拟 IP 访问 SSH、RDP、数据库、Web 管理面板和开发服务，避免把业务端口直接暴露到公网。
+- **跨云组网**：把不同云厂商、不同地域、家庭宽带和移动热点下的设备临时拉成一个小型私有网络。
+- **自托管验证**：在自己的公网服务器上部署 Control/Relay，用真实 TUN 和真实网络环境测试 P2P 直连率。
+
 ## 四步开始使用
 
 1. 从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载对应平台客户端。
@@ -97,7 +104,11 @@ p2wlan help
 p2wlan config show
 p2wlan config set device-name linux-server
 p2wlan config set mtu 1420
+p2wlan config set udp-bind 0.0.0.0:60207
+p2wlan config set udp-advertise 203.0.113.10:60207
 p2wlan config set relay default@control.example.com:18081
+p2wlan doctor
+p2wlan update
 p2wlan logs -n 100
 p2wlan logs -f
 p2wlan down
@@ -107,6 +118,62 @@ p2wlan logout
 配置默认保存在 `~/.config/p2wlan/p2pnet-config.json`，权限为 `0600`。可通过 `p2wlan config path` 查看实际位置；私钥、token、设备凭据和控制面分配的虚拟 IP 不应手工编辑。
 
 Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/server 场景的 CLI 包。
+
+### Linux CLI 配置参考
+
+`p2wlan config set <key> <value>` 当前支持：
+
+| 配置项 | 示例 | 说明 |
+| --- | --- | --- |
+| `control` | `http://control.example.com:18080` | 控制面地址；修改后需要重新登录 |
+| `network` | `default` | 加入的虚拟网络 ID |
+| `device-name` | `linux-server` | 控制台和诊断里显示的设备名 |
+| `interface` | `p2pnet0` | Linux TUN 网卡名 |
+| `mtu` | `1420` | 虚拟网卡 MTU |
+| `udp-bind` | `0.0.0.0:60207` | 本机直连 UDP 监听地址；云服务器建议固定端口 |
+| `udp-advertise` | `203.0.113.10:60207` | 发布给其他节点的公网 UDP 地址；用 `off` 清空 |
+| `stun` | `1.1.1.1:3478,8.8.8.8:3478` | STUN 服务器列表；用 `off` 清空 |
+| `diagnostics` | `127.0.0.1:39277` | 本机诊断端点，只允许回环地址 |
+| `relay` | `default@control.example.com:18081` | Relay 候选列表 |
+| `relay-policy` | `auto` / `relay` | `auto` 优先直连，`relay` 强制中继 |
+| `direct-timeout` | `5000ms` | 直连确认超时后回退 Relay 的时间 |
+
+升级 Linux CLI：
+
+```bash
+p2wlan update
+p2wlan update --dry-run
+p2wlan update --version v0.1.22
+```
+
+`p2wlan update` 默认从 GitHub 最新 release 下载与当前 CPU 架构匹配的 Linux CLI 包，并安装到 `/usr/local/bin`。如果 daemon 正在运行，更新后执行 `p2wlan down && p2wlan up` 让新版 daemon 生效。
+
+### 直连与中继排查
+
+P2WLAN 会优先尝试 Direct UDP，失败后自动走 Relay。Relay 可用说明账号、控制面、虚拟网卡和加密数据面大概率是通的；如果 Windows 云电脑和 Linux 云服务器只能中继，通常是云安全组、系统防火墙或 NAT 类型导致对端打不到你的 UDP 端口。
+
+Linux 云服务器建议固定端口并发布公网地址：
+
+```bash
+p2wlan down
+p2wlan config set udp-bind 0.0.0.0:60207
+p2wlan config set udp-advertise 203.0.113.10:60207
+p2wlan config set relay-policy auto
+p2wlan up
+p2wlan doctor
+```
+
+同时在云厂商安全组和 Linux 防火墙中放行 UDP `60207` 入站。Windows 云电脑也需要在云安全组和 Windows Defender 防火墙中放行对应 UDP 入站；如果 Windows 端没有可被公网访问的 UDP 入口，双方仍可能只能由 Linux 侧被动接收或回退 Relay。
+
+常见现象：
+
+| 现象 | 处理方式 |
+| --- | --- |
+| `endpoint not advertised because bind address is unspecified` | 设置 `udp-bind 0.0.0.0:<固定端口>` 和 `udp-advertise <公网IP>:<同一端口>` |
+| `p2wlan doctor` 显示 `path=relay` | 检查两端 UDP 入站规则，确认公网 IP 和端口没有写错 |
+| `ping 10.20.x.x` 不通但 Peer 在线 | 检查系统 ICMP 防火墙；也可以先用 SSH/RDP/HTTP 端口验证虚拟 IP |
+| 频繁弹 UAC 或启动后退出 | 在 Windows 授权窗口确认管理员权限，保持 `p2wlan-desktop.exe`、`p2pnet-daemon.exe`、`wintun.dll` 同目录 |
+| 本地诊断端点无法访问 | 运行 `p2wlan logs -n 100`，确认 daemon 没有提前退出，必要时 `p2wlan down && p2wlan up` |
 
 ## 平台状态
 
@@ -168,7 +235,7 @@ RELAY_SERVERS="default@relay.example.com:18081" \
 | Control | HTTP / WebSocket | `18080` | 登录、设备注册、信令和 IP 分配 |
 | Relay | TCP | `18081` | 加密数据包中继 |
 | Diagnostics | Loopback HTTP | `39277` 起 | 本机状态，仅允许回环地址 |
-| Direct transport | UDP | 系统动态分配 | P2P 数据与 NAT 探测 |
+| Direct transport | UDP | 动态分配或手动固定 | P2P 数据与 NAT 探测；云服务器建议固定端口 |
 
 公网部署建议在 Control 前配置 HTTPS/WSS 反向代理，并限制数据库和诊断端口只能从可信网络访问。完整部署与协议说明见 [docs/PROTOCOL.md](docs/PROTOCOL.md) 和 [P2PNet-Design.md](P2PNet-Design.md)。
 
