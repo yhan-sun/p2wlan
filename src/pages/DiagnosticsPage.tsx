@@ -83,6 +83,9 @@ export default function DiagnosticsPage() {
 
 检查详情:
 ${report.checks.map(c => ` - [${c.status.toUpperCase()}] ${c.name}: ${c.detail}`).join("\n")}
+
+最近日志:
+${report.logs.slice(-80).join("\n") || "无"}
 ================================================
     `.trim();
 

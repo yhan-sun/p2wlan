@@ -118,6 +118,11 @@ fn open_logs() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn daemon_log_tail(max_lines: Option<usize>) -> Vec<String> {
+    DaemonManager::recent_daemon_log_lines(max_lines.unwrap_or(120).min(300))
+}
+
+#[tauri::command]
 async fn app_quit(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -172,6 +177,7 @@ fn main() {
             daemon_stop,
             control_authenticate,
             open_logs,
+            daemon_log_tail,
             permission_status,
             app_quit,
             window_chrome_ready
