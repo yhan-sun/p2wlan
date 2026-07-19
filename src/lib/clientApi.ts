@@ -363,6 +363,15 @@ async function fetchDiagnosticsSnapshot(url: string): Promise<DiagnosticsSnapsho
   }
 }
 
+async function invokeDaemonStatusSnapshot(url: string): Promise<DiagnosticsSnapshot | null> {
+  if (!isTauri()) return null;
+  try {
+    return await tryInvoke<DiagnosticsSnapshot>("daemon_status", { diagnosticsUrl: url });
+  } catch {
+    return null;
+  }
+}
+
 function inferNatType(peers: PeerDiagnostics[]): string {
   const types = peers.map((p) => p.nat_type).filter((t) => t && t !== "Unknown");
   if (types.length === 0) return "unknown";
@@ -612,6 +621,29 @@ export async function getClientStatusSnapshot(): Promise<ClientStatusSnapshot> {
         },
         diagnostics: null,
       };
+    }
+
+    if (!desktop.diagnostics) {
+      const diagnostics = await invokeDaemonStatusSnapshot(
+        desktop.diagnosticsUrl ?? settings.diagnosticsUrl
+      );
+      if (diagnostics) {
+        appendLog("daemon direct status recovered running state");
+        desktop = {
+          ...desktop,
+          operation: {
+            phase: "running",
+            message: "TUN 已连接",
+            startedAtMs: desktop.operation.startedAtMs || Date.now(),
+            lastError: null,
+          },
+          diagnostics,
+          diagnosticsUrl: desktop.diagnosticsUrl ?? settings.diagnosticsUrl,
+          diagnosticsAlive: true,
+          diagnosticsStale: false,
+          diagnosticsError: null,
+        };
+      }
     }
   } else {
     const diagnostics = await fetchDiagnosticsSnapshot(settings.diagnosticsUrl);
