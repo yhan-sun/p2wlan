@@ -422,6 +422,7 @@ mod tests {
         phase: DaemonOperationPhase,
         diagnostics: Option<serde_json::Value>,
     ) -> DesktopStatus {
+        let diagnostics_alive = diagnostics.is_some();
         DesktopStatus {
             operation: DaemonOperationStatus {
                 phase,
@@ -431,6 +432,9 @@ mod tests {
             },
             diagnostics,
             diagnostics_url: "http://127.0.0.1:39277/status".to_string(),
+            diagnostics_alive,
+            diagnostics_stale: false,
+            diagnostics_error: None,
         }
     }
 

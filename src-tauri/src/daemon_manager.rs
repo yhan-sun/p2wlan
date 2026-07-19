@@ -67,6 +67,9 @@ pub struct DesktopStatus {
     pub operation: DaemonOperationStatus,
     pub diagnostics: Option<serde_json::Value>,
     pub diagnostics_url: String,
+    pub diagnostics_alive: bool,
+    pub diagnostics_stale: bool,
+    pub diagnostics_error: Option<String>,
 }
 
 pub struct ManagedDaemonState {
@@ -78,6 +81,7 @@ pub struct ManagedDaemonState {
     pub operation: DaemonOperationStatus,
     pub last_start_options: Option<DaemonStartOptions>,
     pub consecutive_status_failures: u8,
+    pub last_diagnostics: Option<serde_json::Value>,
 }
 
 impl ManagedDaemonState {
@@ -91,6 +95,7 @@ impl ManagedDaemonState {
             operation: DaemonOperationStatus::stopped(),
             last_start_options: None,
             consecutive_status_failures: 0,
+            last_diagnostics: None,
         }
     }
 }
@@ -162,6 +167,9 @@ impl DaemonManager {
         ) {
             state.consecutive_status_failures = 0;
         }
+        if phase == DaemonOperationPhase::Stopped {
+            state.last_diagnostics = None;
+        }
         state.operation.clone()
     }
 
@@ -195,9 +203,29 @@ impl DaemonManager {
                 diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
             }
         };
-        let diagnostics = self.status(Some(target_url.clone())).await.ok();
+        let diagnostics_alive = Self::check_endpoint(&target_url).await;
+        let mut diagnostics_error = None;
+        let mut diagnostics_stale = false;
+        let diagnostics = if diagnostics_alive {
+            match self.status(Some(target_url.clone())).await {
+                Ok(value) => {
+                    let mut state = self.state.lock().await;
+                    state.last_diagnostics = Some(value.clone());
+                    Some(value)
+                }
+                Err(error) => {
+                    diagnostics_error = Some(error);
+                    let cached = self.state.lock().await.last_diagnostics.clone();
+                    diagnostics_stale = cached.is_some();
+                    cached
+                }
+            }
+        } else {
+            diagnostics_error = Some("本地健康检查端点不可访问".to_string());
+            None
+        };
 
-        if diagnostics.is_some() {
+        if diagnostics_alive {
             let mut state = self.state.lock().await;
             state.consecutive_status_failures = 0;
             if !state.operation.phase.is_busy()
@@ -216,11 +244,12 @@ impl DaemonManager {
                 state.consecutive_status_failures =
                     state.consecutive_status_failures.saturating_add(1);
                 if state.consecutive_status_failures >= 3 {
+                    state.last_diagnostics = None;
                     state.operation = DaemonOperationStatus {
                         phase: DaemonOperationPhase::Error,
                         message: "守护进程未响应".to_string(),
                         started_at_ms: now_ms(),
-                        last_error: Some("连续 3 次无法访问本地诊断端点".to_string()),
+                        last_error: Some("连续 3 次无法访问本地健康检查端点".to_string()),
                     };
                 }
             }
@@ -230,6 +259,9 @@ impl DaemonManager {
             operation: self.operation_status().await,
             diagnostics,
             diagnostics_url: target_url,
+            diagnostics_alive,
+            diagnostics_stale,
+            diagnostics_error,
         }
     }
 
@@ -374,13 +406,14 @@ impl DaemonManager {
     }
 
     pub async fn check_endpoint(url: &str) -> bool {
-        // Simple client request to the health/status endpoint.
-        // We use reqwest client with 500ms timeout
+        // Simple client request to the lightweight health endpoint.
+        // Full `/status` snapshots can be briefly slow while peer/relay state is changing.
+        let health_url = Self::health_url_from_status_url(url).unwrap_or_else(|| url.to_string());
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
             .build();
         if let Ok(client) = client {
-            if let Ok(res) = client.get(url).send().await {
+            if let Ok(res) = client.get(health_url).send().await {
                 return res.status().is_success();
             }
         }
@@ -400,7 +433,7 @@ impl DaemonManager {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(800))
+            .timeout(Duration::from_millis(2500))
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -442,6 +475,13 @@ impl DaemonManager {
     fn shutdown_url_from_status_url(url: &str) -> Option<String> {
         let mut parsed = url::Url::parse(url).ok()?;
         parsed.set_path("/shutdown");
+        parsed.set_query(None);
+        Some(parsed.to_string())
+    }
+
+    fn health_url_from_status_url(url: &str) -> Option<String> {
+        let mut parsed = url::Url::parse(url).ok()?;
+        parsed.set_path("/health");
         parsed.set_query(None);
         Some(parsed.to_string())
     }
@@ -1798,6 +1838,7 @@ impl DaemonManager {
                 Self::remove_pid_file(&Self::default_pid_path());
                 state.operation = DaemonOperationStatus::stopped();
                 state.consecutive_status_failures = 0;
+                state.last_diagnostics = None;
                 Self::remove_persisted_diagnostics_url();
                 return Ok("守护进程已停止。".to_string());
             }
@@ -1812,6 +1853,7 @@ impl DaemonManager {
             Self::remove_pid_file(&Self::default_pid_path());
             state.operation = DaemonOperationStatus::stopped();
             state.consecutive_status_failures = 0;
+            state.last_diagnostics = None;
             Self::remove_persisted_diagnostics_url();
             return Ok("已停止 TUN 守护进程。".to_string());
         }
@@ -1857,6 +1899,7 @@ impl DaemonManager {
             if stopped {
                 state.operation = DaemonOperationStatus::stopped();
                 state.consecutive_status_failures = 0;
+                state.last_diagnostics = None;
                 Self::remove_persisted_diagnostics_url();
             }
         }
@@ -1880,6 +1923,7 @@ impl DaemonManager {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
+                state.last_diagnostics = None;
                 Self::remove_persisted_diagnostics_url();
             } else if state.elevated_started_by_app {
                 let pid_path = Self::default_pid_path();
@@ -1889,6 +1933,7 @@ impl DaemonManager {
                         let _ = Self::terminate_pid_with_system_authorization(pid);
                     }
                 }
+                state.last_diagnostics = None;
                 Self::remove_persisted_diagnostics_url();
             }
         }
@@ -1926,15 +1971,51 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 1024];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                if request.starts_with("GET /health ") {
+                    let response =
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        format!("http://{address}/status")
+    }
+
+    async fn health_ok_status_hangs_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let n = stream.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    if request.starts_with("GET /health ") {
+                        let response =
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            }
         });
         format!("http://{address}/status")
     }
@@ -2019,6 +2100,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_status_keeps_running_when_health_is_alive_but_status_is_slow() {
+        let manager = DaemonManager::new();
+        manager
+            .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+            .await;
+        let url = health_ok_status_hangs_server().await;
+        manager.state.lock().await.diagnostics_url = url.clone();
+
+        let status = manager.desktop_status(Some(url)).await;
+
+        assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+        assert!(status.diagnostics_alive);
+        assert!(status.diagnostics.is_none());
+        assert_eq!(manager.state.lock().await.consecutive_status_failures, 0);
+    }
+
+    #[tokio::test]
     async fn desktop_status_requires_three_failures_before_marking_running_daemon_error() {
         let manager = DaemonManager::new();
         manager
@@ -2040,7 +2138,7 @@ mod tests {
         assert_eq!(status.operation.phase, DaemonOperationPhase::Error);
         assert_eq!(
             status.operation.last_error.as_deref(),
-            Some("连续 3 次无法访问本地诊断端点")
+            Some("连续 3 次无法访问本地健康检查端点")
         );
     }
 

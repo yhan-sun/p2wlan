@@ -347,7 +347,7 @@ export async function getDaemonLogTail(limit = 120): Promise<string[]> {
 
 async function fetchDiagnosticsSnapshot(url: string): Promise<DiagnosticsSnapshot | null> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 1500);
+  const timer = window.setTimeout(() => controller.abort(), 3500);
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -524,12 +524,28 @@ function daemonFromDesktopStatus(
   if (desktop.diagnostics) {
     const daemon = mapSnapshotToDaemonStatus(desktop.diagnostics, settings);
     daemon.diagnosticsUrl = desktop.diagnosticsUrl ?? settings.diagnosticsUrl;
+    if (desktop.diagnosticsStale) {
+      daemon.source = "cached";
+      daemon.healthStatus = "degraded";
+      daemon.healthReason =
+        desktop.diagnosticsError ?? "本地健康检查可访问，完整诊断详情暂时刷新中";
+      daemon.lastError = null;
+    }
     return daemon;
   }
 
   const error = desktop.operation.phase === "error" ? desktop.operation.lastError ?? desktop.operation.message : undefined;
   const daemon = stoppedDaemonStatus(settings, error);
   daemon.diagnosticsUrl = desktop.diagnosticsUrl ?? settings.diagnosticsUrl;
+  if (desktop.diagnosticsAlive) {
+    daemon.lifecycle = "running";
+    daemon.reachable = true;
+    daemon.source = "cached";
+    daemon.healthStatus = "degraded";
+    daemon.healthReason =
+      desktop.diagnosticsError ?? "本地健康检查可访问，完整诊断详情暂时刷新中";
+    daemon.lastError = null;
+  }
   if (
     desktop.operation.phase === "authorizing" ||
     desktop.operation.phase === "launching" ||
@@ -547,7 +563,13 @@ function daemonFromDesktopStatus(
 export function clientStatusFromDesktopStatus(desktop: DesktopStatus): ClientStatusSnapshot {
   const settings = getSettings();
   const daemon = daemonFromDesktopStatus(desktop, settings);
-  const source = desktop.diagnostics ? "live" : isTauri() ? "cached" : "fallback";
+  const source = desktop.diagnostics
+    ? desktop.diagnosticsStale
+      ? "cached"
+      : "live"
+    : desktop.diagnosticsAlive || isTauri()
+      ? "cached"
+      : "fallback";
   const error =
     desktop.operation.phase === "error"
       ? desktop.operation.lastError ?? desktop.operation.message
