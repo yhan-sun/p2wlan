@@ -35,6 +35,7 @@ The release workflow uploads:
 - `p2wlan-macos-universal.dmg`
 - `p2wlan-macos-universal.app.zip`
 - `p2wlan-windows-x64.zip`
+- `p2wlan-linux-x64-cli.tar.gz`
 
 The app is ad-hoc signed but not notarized yet. If macOS Gatekeeper blocks a
 downloaded build, use right-click > Open for internal testing. Public notarized
@@ -51,6 +52,24 @@ The release workflow builds a portable zip containing:
 
 Keep these files in the same folder. The desktop app uses Windows UAC to launch
 the daemon with administrator privileges when TUN mode starts.
+
+## Linux CLI
+
+The release workflow builds a headless Linux x64 CLI tarball containing:
+
+- `p2pnet-daemon`
+- `LICENSE`
+- `README-LINUX-CLI.txt`
+
+The CLI package is intended for servers, headless Linux hosts, and real TUN
+smoke testing. Running real TUN mode requires root privileges or equivalent
+`CAP_NET_ADMIN` capability:
+
+```bash
+sudo ./p2pnet-daemon --init --control http://CONTROL_HOST:18080 --network default
+sudo ./p2pnet-daemon --control http://CONTROL_HOST:18080 --network default
+./p2pnet-daemon --status
+```
 
 ## Icon Generation
 
