@@ -177,6 +177,40 @@ impl DaemonManager {
         self.state.lock().await.operation.clone()
     }
 
+    async fn tracked_daemon_process_alive(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.started_by_app {
+            if let Some(child) = state.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        state.child = None;
+                        state.started_by_app = false;
+                        return false;
+                    }
+                    Ok(None) => return true,
+                    Err(_) => return true,
+                }
+            }
+        }
+
+        if state.elevated_started_by_app {
+            let pid_path = Self::default_pid_path();
+            if let Some(pid) = Self::read_pid_file(&pid_path) {
+                let is_daemon = Self::process_exists(pid)
+                    && Self::process_command_line(pid)
+                        .map(|command_line| command_line.contains("p2pnet-daemon"))
+                        .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
+                if is_daemon {
+                    return true;
+                }
+                Self::remove_pid_file(&pid_path);
+            }
+            state.elevated_started_by_app = false;
+        }
+
+        false
+    }
+
     pub async fn configure(&self, options: DaemonStartOptions) -> DaemonOperationStatus {
         let mut state = self.state.lock().await;
         let tracks_daemon = state.started_by_app
@@ -204,6 +238,11 @@ impl DaemonManager {
             }
         };
         let diagnostics_alive = Self::check_endpoint(&target_url).await;
+        let tracked_process_alive = if diagnostics_alive {
+            false
+        } else {
+            self.tracked_daemon_process_alive().await
+        };
         let mut diagnostics_error = None;
         let mut diagnostics_stale = false;
         let diagnostics = if diagnostics_alive {
@@ -221,7 +260,11 @@ impl DaemonManager {
                 }
             }
         } else {
-            diagnostics_error = Some("本地健康检查端点不可访问".to_string());
+            diagnostics_error = Some(if tracked_process_alive {
+                "本地健康检查端点暂不可访问，但守护进程仍在运行".to_string()
+            } else {
+                "本地健康检查端点不可访问".to_string()
+            });
             None
         };
 
@@ -244,13 +287,22 @@ impl DaemonManager {
                 state.consecutive_status_failures =
                     state.consecutive_status_failures.saturating_add(1);
                 if state.consecutive_status_failures >= 3 {
-                    state.last_diagnostics = None;
-                    state.operation = DaemonOperationStatus {
-                        phase: DaemonOperationPhase::Error,
-                        message: "守护进程未响应".to_string(),
-                        started_at_ms: now_ms(),
-                        last_error: Some("连续 3 次无法访问本地健康检查端点".to_string()),
-                    };
+                    if tracked_process_alive {
+                        state.operation = DaemonOperationStatus {
+                            phase: DaemonOperationPhase::Running,
+                            message: "TUN 已连接".to_string(),
+                            started_at_ms: state.operation.started_at_ms,
+                            last_error: None,
+                        };
+                    } else {
+                        state.last_diagnostics = None;
+                        state.operation = DaemonOperationStatus {
+                            phase: DaemonOperationPhase::Error,
+                            message: "守护进程未响应".to_string(),
+                            started_at_ms: now_ms(),
+                            last_error: Some("连续 3 次无法访问本地健康检查端点".to_string()),
+                        };
+                    }
                 }
             }
         }
@@ -2031,6 +2083,21 @@ mod tests {
         format!("http://{address}/status")
     }
 
+    fn spawn_sleep_child() -> Child {
+        #[cfg(windows)]
+        {
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .unwrap()
+        }
+
+        #[cfg(not(windows))]
+        {
+            Command::new("sleep").arg("30").spawn().unwrap()
+        }
+    }
+
     #[test]
     fn operation_phase_busy_states_are_explicit() {
         assert!(!DaemonOperationPhase::Stopped.is_busy());
@@ -2144,6 +2211,39 @@ mod tests {
             status.operation.last_error.as_deref(),
             Some("连续 3 次无法访问本地健康检查端点")
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_status_keeps_running_when_tracked_process_is_alive() {
+        let manager = DaemonManager::new();
+        let child = spawn_sleep_child();
+        manager
+            .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+            .await;
+        let url = unused_local_status_url();
+        {
+            let mut state = manager.state.lock().await;
+            state.diagnostics_url = url.clone();
+            state.started_by_app = true;
+            state.child = Some(child);
+        }
+
+        for _ in 0..3 {
+            let status = manager.desktop_status(Some(url.clone())).await;
+            assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+            assert!(!status.diagnostics_alive);
+            assert!(status
+                .diagnostics_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("进程仍在运行"));
+        }
+
+        let mut state = manager.state.lock().await;
+        if let Some(mut child) = state.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]

@@ -7,6 +7,9 @@ use tracing::info;
 #[cfg(target_os = "windows")]
 use tracing::warn;
 
+#[cfg(target_os = "windows")]
+const WINDOWS_ROUTE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Platform-abstracted command runner for route operations.
 ///
 /// Production uses the real `Command` to invoke `ip`.
@@ -296,9 +299,19 @@ impl RouteManager {
         let destination_prefix = format!("{network}/{prefix}");
         let interface = self.interface();
 
-        let mut existing = windows_get_route_aliases(&destination_prefix)?;
+        let mut existing = windows_get_route_aliases(&destination_prefix).unwrap_or_else(|err| {
+            warn!(
+                "Windows route pre-check for {destination_prefix} failed: {err}; continuing with route install"
+            );
+            Vec::new()
+        });
         if windows_remove_stale_managed_routes(&destination_prefix, &interface, &existing) {
-            existing = windows_get_route_aliases(&destination_prefix)?;
+            existing = windows_get_route_aliases(&destination_prefix).unwrap_or_else(|err| {
+                warn!(
+                    "Windows route query after stale cleanup for {destination_prefix} failed: {err}; continuing with route install"
+                );
+                Vec::new()
+            });
         }
 
         if !existing.is_empty() {
@@ -426,7 +439,7 @@ impl RouteManager {
                 "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
                 ps_quote(&destination_prefix),
                 ps_quote(&interface)
-            ), std::time::Duration::from_secs(5));
+            ), WINDOWS_ROUTE_QUERY_TIMEOUT);
         }
     }
 }
@@ -436,7 +449,7 @@ fn windows_get_route_aliases(destination_prefix: &str) -> crate::Result<Vec<Stri
     let output = windows_powershell_output(&format!(
         "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -ErrorAction SilentlyContinue 2>$null | ForEach-Object {{ $_.InterfaceAlias }}; exit 0",
         ps_quote(destination_prefix)
-    ), std::time::Duration::from_secs(5))?;
+    ), WINDOWS_ROUTE_QUERY_TIMEOUT)?;
 
     if !output.status.success() {
         return Err(crate::DaemonError::Network(format!(
@@ -474,7 +487,7 @@ fn windows_remove_stale_managed_routes(
             "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceAlias '{}' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
             ps_quote(destination_prefix),
             ps_quote(alias)
-        ), std::time::Duration::from_secs(5));
+        ), WINDOWS_ROUTE_QUERY_TIMEOUT);
 
         match output {
             Ok(output) if output.status.success() => {}
