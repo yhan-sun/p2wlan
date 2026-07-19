@@ -620,6 +620,13 @@ impl DaemonManager {
         Some(lines[start..].join("\n"))
     }
 
+    pub fn recent_daemon_log_lines(max_lines: usize) -> Vec<String> {
+        let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
+        Self::log_tail(&log_path, max_lines)
+            .map(|tail| tail.lines().map(ToString::to_string).collect())
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     fn timeout_message_with_log(prefix: &str, log_path: &Path) -> String {
         match Self::log_tail(log_path, 30) {

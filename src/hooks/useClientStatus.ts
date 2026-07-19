@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import {
+  appendLog,
   clientStatusFromDesktopStatus,
   configureDaemon,
   getClientStatusSnapshot,
@@ -70,8 +71,21 @@ function useClientStatusController(): ClientStatusState {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastFetchedAt, setLastFetchedAt] = useState<number | null>(null);
   const inFlight = useRef(false);
+  const lastOperationLogKey = useRef<string | null>(null);
 
   const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof getClientStatusSnapshot>>) => {
+    const { operation } = snapshot;
+    const operationLogKey = `${operation.phase}|${operation.message}|${operation.lastError ?? ""}`;
+    if (lastOperationLogKey.current !== operationLogKey) {
+      lastOperationLogKey.current = operationLogKey;
+      if (operation.phase !== "stopped") {
+        appendLog(
+          `daemon operation ${operation.phase}: ${operation.message}${
+            operation.lastError ? `; ${operation.lastError}` : ""
+          }`
+        );
+      }
+    }
     setSettings(getSettings());
     setDaemon(snapshot.daemon);
     setPeers(snapshot.peers);
@@ -183,14 +197,40 @@ function useClientStatusController(): ClientStatusState {
     return result.data.message;
   }, [refresh]);
 
+  const waitForElevatedOutcome = useCallback(async () => {
+    const deadline = Date.now() + 60_000;
+    let lastSnapshot: Awaited<ReturnType<typeof getClientStatusSnapshot>> | null = null;
+
+    while (Date.now() < deadline) {
+      const snapshot = await getClientStatusSnapshot();
+      lastSnapshot = snapshot;
+      applySnapshot(snapshot);
+
+      if (snapshot.daemon.reachable || snapshot.operation.phase === "running") {
+        return snapshot.operation.message || "TUN 已连接";
+      }
+
+      if (snapshot.operation.phase === "error") {
+        throw new Error(snapshot.operation.lastError ?? snapshot.operation.message ?? "TUN 启动失败");
+      }
+
+      await new Promise(resolve => window.setTimeout(resolve, 1_000));
+    }
+
+    const lastOperation = lastSnapshot?.operation;
+    throw new Error(
+      lastOperation?.lastError ??
+        `${lastOperation?.message ?? "TUN 启动"}超时，诊断端点仍不可访问。请打开诊断页复制最近日志。`
+    );
+  }, [applySnapshot]);
+
   const connectElevated = useCallback(async () => {
     const result = await startDaemonElevated();
-    await refresh();
     if (result.error || !result.data.started) {
       throw new Error(result.data.message || result.error || "提权启动 TUN 失败");
     }
-    return result.data.message;
-  }, [refresh]);
+    return waitForElevatedOutcome();
+  }, [waitForElevatedOutcome]);
 
   const disconnect = useCallback(async () => {
     const result = await stopDaemon();

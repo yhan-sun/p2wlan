@@ -310,7 +310,7 @@ export function validateSettings(settings: ClientSettings): string[] {
   return errors;
 }
 
-function appendLog(line: string): void {
+export function appendLog(line: string): void {
   const stamp = new Date().toISOString().replace("T", " ").replace("Z", "");
   const entry = `${stamp}  ${line}`;
   try {
@@ -331,6 +331,16 @@ export function getRecentLogs(limit = 300): string[] {
     const lines = existing.split("\n").filter(Boolean);
     return lines.slice(-Math.min(limit, MAX_LOG_LINES));
   } catch {
+    return [];
+  }
+}
+
+export async function getDaemonLogTail(limit = 120): Promise<string[]> {
+  if (!isTauri()) return [];
+  try {
+    return (await tryInvoke<string[]>("daemon_log_tail", { maxLines: limit })) ?? [];
+  } catch (err) {
+    appendLog(`daemon log tail unavailable: ${err}`);
     return [];
   }
 }
@@ -808,11 +818,14 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
   if (statusResult.error) {
     appendLog(`diagnostics: ${statusResult.error}`);
   }
+  const appLogs = getRecentLogs(300).length ? getRecentLogs(300) : logs;
+  const daemonLogs = (await getDaemonLogTail(120)).map(line => `daemon-log: ${line}`);
+  const combinedLogs = [...appLogs, ...daemonLogs].slice(-MAX_LOG_LINES);
 
   return {
     data: {
       checks,
-      logs: getRecentLogs(300).length ? getRecentLogs(300) : logs,
+      logs: combinedLogs,
       source: statusResult.source,
       generatedAt: Date.now(),
     },
