@@ -2675,7 +2675,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "p2pnet-crypto"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-daemon"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bytes",
  "clap",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-nat"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-relay"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-tun"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-wireguard"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "hex",
  "p2pnet-crypto",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-desktop"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "arboard",
  "dirs 5.0.1",

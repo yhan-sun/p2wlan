@@ -537,13 +537,15 @@ function daemonFromDesktopStatus(
   const error = desktop.operation.phase === "error" ? desktop.operation.lastError ?? desktop.operation.message : undefined;
   const daemon = stoppedDaemonStatus(settings, error);
   daemon.diagnosticsUrl = desktop.diagnosticsUrl ?? settings.diagnosticsUrl;
-  if (desktop.diagnosticsAlive) {
+  if (desktop.diagnosticsAlive || desktop.operation.phase === "running") {
     daemon.lifecycle = "running";
     daemon.reachable = true;
     daemon.source = "cached";
     daemon.healthStatus = "degraded";
     daemon.healthReason =
-      desktop.diagnosticsError ?? "本地健康检查可访问，完整诊断详情暂时刷新中";
+      desktop.diagnosticsAlive
+        ? desktop.diagnosticsError ?? "本地健康检查可访问，完整诊断详情暂时刷新中"
+        : desktop.diagnosticsError ?? "TUN 已连接，完整诊断详情暂时刷新中";
     daemon.lastError = null;
   }
   if (
