@@ -243,6 +243,31 @@ export default function SettingsPage() {
                 </div>
               </div>
 
+              <div className="form-group-row">
+                <div className="form-group flex-1">
+                  <label className="form-label">UDP 监听地址</label>
+                  <input
+                    className="form-input text-mono"
+                    type="text"
+                    value={settings.udpBind}
+                    onChange={(e) => handleFieldChange("udpBind", e.target.value)}
+                    placeholder="0.0.0.0:60207"
+                  />
+                  <span className="form-hint">直连传输使用的本机 UDP 端口；云主机建议固定端口。</span>
+                </div>
+                <div className="form-group flex-1">
+                  <label className="form-label">公网 UDP 地址</label>
+                  <input
+                    className="form-input text-mono"
+                    type="text"
+                    value={settings.udpAdvertise}
+                    onChange={(e) => handleFieldChange("udpAdvertise", e.target.value)}
+                    placeholder="203.0.113.10:60207"
+                  />
+                  <span className="form-hint">发布给其他节点的可达公网地址；没有公网入口时留空。</span>
+                </div>
+              </div>
+
               <div className="form-group">
                 <label className="form-label">本地守护进程诊断端口 (URL)</label>
                 <input

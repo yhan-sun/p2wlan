@@ -77,14 +77,43 @@ wintun.dll
 
 ### Linux
 
-下载对应架构的 `p2wlan-linux-x64-cli.tar.gz` 或 `p2wlan-linux-arm64-cli.tar.gz`，安装无桌面的 Linux 命令行客户端：
+当前 release 提供无桌面的 Linux CLI，适合云服务器、NAS、开发机和 headless TUN 场景。
+
+推荐用在线安装脚本安装最新版：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh
+
+p2wlan --version
+p2wlan help
+```
+
+安装指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo env P2WLAN_VERSION=v0.1.23 sh /tmp/p2wlan-install.sh
+```
+
+自定义仓库或安装目录：
+
+```bash
+sudo env P2WLAN_REPO=yhan-sun/p2wlan P2WLAN_INSTALL_DIR=/usr/local/bin sh /tmp/p2wlan-install.sh
+```
+
+也可以从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载对应架构的 `p2wlan-linux-x64-cli.tar.gz` 或 `p2wlan-linux-arm64-cli.tar.gz` 后手动安装：
 
 ```bash
 tar -xzf p2wlan-linux-x64-cli.tar.gz
 cd p2wlan-linux-x64-cli
 sudo ./install.sh
+```
 
-p2wlan login -u pyu@qq.com
+登录并启动 TUN：
+
+```bash
+p2wlan login -u you@example.com
 p2wlan up
 p2wlan status
 ```
@@ -92,7 +121,7 @@ p2wlan status
 自动化环境也可以直接传入密码：
 
 ```bash
-p2wlan login -u pyu@qq.com -p 'your-password'
+p2wlan login -u you@example.com -p 'your-password'
 ```
 
 直接传入的密码可能被 shell history 或本机进程列表记录，日常使用建议省略 `-p`，在隐藏输入提示中填写。`p2wlan up` 会在创建 TUN 和系统路由时自动请求 `sudo`，其余命令不要使用 `sudo`。
@@ -143,7 +172,7 @@ Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/serv
 ```bash
 p2wlan update
 p2wlan update --dry-run
-p2wlan update --version v0.1.22
+p2wlan update --version v0.1.23
 ```
 
 `p2wlan update` 默认从 GitHub 最新 release 下载与当前 CPU 架构匹配的 Linux CLI 包，并安装到 `/usr/local/bin`。如果 daemon 正在运行，更新后执行 `p2wlan down && p2wlan up` 让新版 daemon 生效。
@@ -164,6 +193,8 @@ p2wlan doctor
 ```
 
 同时在云厂商安全组和 Linux 防火墙中放行 UDP `60207` 入站。Windows 云电脑也需要在云安全组和 Windows Defender 防火墙中放行对应 UDP 入站；如果 Windows 端没有可被公网访问的 UDP 入口，双方仍可能只能由 Linux 侧被动接收或回退 Relay。
+
+Windows 桌面端从 `v0.1.23` 开始可在“设置 > 高级配置项”里填写同样的直连参数：`UDP 监听地址` 填 `0.0.0.0:60207`，`公网 UDP 地址` 填云电脑的公网 `IP:端口`。保存后需要停止并重新启动 TUN，让 daemon 重新注册候选端点。
 
 常见现象：
 

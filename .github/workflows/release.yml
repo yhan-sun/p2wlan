@@ -184,14 +184,28 @@ jobs:
           Contents:
           - p2wlan: user-facing command-line client
           - p2pnet-daemon: background daemon with real Linux TUN support
-          - install.sh: system-wide installer
+          - install.sh: system-wide installer; also works as an online GitHub release installer
           - LICENSE
 
-          Quick start:
+          Install from this tarball:
           1. sudo ./install.sh
-          2. p2wlan login -u you@example.com
-          3. p2wlan up
-          4. p2wlan status
+
+          Online install latest:
+          1. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+          2. sudo sh /tmp/p2wlan-install.sh
+
+          Online install a specific tag:
+          1. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+          2. sudo env P2WLAN_VERSION=${{ github.ref_name }} sh /tmp/p2wlan-install.sh
+
+          Verify:
+          - p2wlan --version
+          - p2wlan help
+
+          Quick start:
+          - p2wlan login -u you@example.com
+          - p2wlan up
+          - p2wlan status
 
           Common commands:
           - p2wlan config show

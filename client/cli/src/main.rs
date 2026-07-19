@@ -1399,12 +1399,19 @@ mod tests {
 
     #[test]
     fn parses_login_short_options() {
-        let cli = Cli::try_parse_from(["p2wlan", "login", "-u", "pyu@qq.com", "-p", "password123"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "p2wlan",
+            "login",
+            "-u",
+            "you@example.com",
+            "-p",
+            "password123",
+        ])
+        .unwrap();
         let Commands::Login(args) = cli.command else {
             panic!("expected login command");
         };
-        assert_eq!(args.username, "pyu@qq.com");
+        assert_eq!(args.username, "you@example.com");
         assert_eq!(args.password.as_deref(), Some("password123"));
     }
 
@@ -1421,7 +1428,7 @@ mod tests {
             "update",
             "--dry-run",
             "--version",
-            "v0.1.22",
+            "v0.1.23",
             "--install-dir",
             "/tmp/bin",
         ])
@@ -1430,7 +1437,7 @@ mod tests {
             panic!("expected update command");
         };
         assert!(args.dry_run);
-        assert_eq!(args.version.as_deref(), Some("v0.1.22"));
+        assert_eq!(args.version.as_deref(), Some("v0.1.23"));
         assert_eq!(args.install_dir.as_deref(), Some(Path::new("/tmp/bin")));
     }
 
