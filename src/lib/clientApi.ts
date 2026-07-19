@@ -66,6 +66,8 @@ function daemonStartOptions(settings: ClientSettings) {
     networkId: settings.networkId,
     deviceName: settings.deviceName,
     tunInterface: settings.tunInterface,
+    udpBind: settings.udpBind,
+    udpAdvertise: settings.udpAdvertise,
     mtu: settings.mtu,
   };
 }
@@ -132,6 +134,8 @@ export function saveSettings(settings: ClientSettings): ApiResult<ClientSettings
     ...settings,
     closeBehavior: normalizeCloseBehavior(settings),
     minimizeToTray: normalizeCloseBehavior(settings) === "keep-running",
+    udpBind: settings.udpBind.trim(),
+    udpAdvertise: settings.udpAdvertise.trim(),
   };
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalizedSettings));
   appendLog(`settings saved (control=${settings.controlServer}, mtu=${settings.mtu})`);
@@ -292,6 +296,18 @@ export function validateSettings(settings: ClientSettings): string[] {
   if (!settings.networkId.trim()) {
     errors.push("网络 ID 不能为空");
   }
+  if (!settings.udpBind.trim()) {
+    errors.push("UDP 监听地址不能为空");
+  } else if (!isSocketAddress(settings.udpBind, true)) {
+    errors.push("UDP 监听地址格式应类似 0.0.0.0:60207");
+  }
+  if (settings.udpAdvertise.trim()) {
+    if (!isSocketAddress(settings.udpAdvertise, false)) {
+      errors.push("公网 UDP 地址格式应类似 203.0.113.10:60207");
+    } else if (isUnspecifiedAddress(settings.udpAdvertise)) {
+      errors.push("公网 UDP 地址不能使用 0.0.0.0 或 ::");
+    }
+  }
   if (!settings.diagnosticsUrl.trim()) {
     errors.push("诊断地址不能为空");
   } else {
@@ -309,6 +325,26 @@ export function validateSettings(settings: ClientSettings): string[] {
     errors.push("关闭窗口行为配置无效");
   }
   return errors;
+}
+
+function isSocketAddress(value: string, allowPortZero: boolean): boolean {
+  const trimmed = value.trim();
+  const ipv4 = trimmed.match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/);
+  const ipv6 = trimmed.match(/^\[[0-9a-fA-F:.]+\]:(\d{1,5})$/);
+  const portText = ipv4?.[2] ?? ipv6?.[1];
+  if (!portText) return false;
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < (allowPortZero ? 0 : 1) || port > 65535) return false;
+  if (!ipv4) return true;
+  return ipv4[1].split(".").every(part => {
+    const octet = Number(part);
+    return Number.isInteger(octet) && octet >= 0 && octet <= 255;
+  });
+}
+
+function isUnspecifiedAddress(value: string): boolean {
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.startsWith("0.0.0.0:") || trimmed.startsWith("[::]:");
 }
 
 export function appendLog(line: string): void {

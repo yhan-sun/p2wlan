@@ -68,8 +68,32 @@ The CLI package is intended for servers, headless Linux hosts, and real TUN
 smoke testing. Running real TUN mode requires root privileges or equivalent
 `CAP_NET_ADMIN` capability:
 
+Install the latest published Linux CLI directly from GitHub:
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh
+p2wlan --version
+p2wlan help
+```
+
+Install a specific release tag:
+
+```bash
+sudo env P2WLAN_VERSION=v0.1.23 sh /tmp/p2wlan-install.sh
+```
+
+Or install from an already downloaded release tarball:
+
+```bash
+tar -xzf p2wlan-linux-x64-cli.tar.gz
+cd p2wlan-linux-x64-cli
 sudo ./install.sh
+```
+
+After installation:
+
+```bash
 p2wlan login -u you@example.com
 p2wlan up
 p2wlan status
@@ -97,7 +121,7 @@ Published Linux CLI builds can update themselves:
 
 ```bash
 p2wlan update
-p2wlan update --version v0.1.22
+p2wlan update --version v0.1.23
 ```
 
 ## Icon Generation

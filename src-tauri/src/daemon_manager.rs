@@ -17,6 +17,8 @@ pub struct DaemonStartOptions {
     pub network_id: Option<String>,
     pub device_name: Option<String>,
     pub tun_interface: Option<String>,
+    pub udp_bind: Option<String>,
+    pub udp_advertise: Option<String>,
     pub mtu: Option<u32>,
 }
 
@@ -1259,6 +1261,8 @@ impl DaemonManager {
         push_pair("--network", options.network_id.as_deref());
         push_pair("--device-name", options.device_name.as_deref());
         push_pair("--interface", options.tun_interface.as_deref());
+        push_pair("--udp-bind", options.udp_bind.as_deref());
+        push_pair("--udp-advertise", options.udp_advertise.as_deref());
         if let Some(mtu) = options.mtu {
             args.push("--mtu".to_string());
             args.push(mtu.to_string());
@@ -1548,6 +1552,8 @@ impl DaemonManager {
             network_id: None,
             device_name: None,
             tun_interface: None,
+            udp_bind: None,
+            udp_advertise: None,
             mtu: None,
         });
         let preferred_url = {
@@ -1668,6 +1674,8 @@ impl DaemonManager {
             network_id: None,
             device_name: None,
             tun_interface: None,
+            udp_bind: None,
+            udp_advertise: None,
             mtu: None,
         });
         let preferred_url = {
@@ -2038,6 +2046,8 @@ mod tests {
             network_id: Some("test-network".to_string()),
             device_name: Some("test-device".to_string()),
             tun_interface: Some("p2wlan-test".to_string()),
+            udp_bind: Some("0.0.0.0:60207".to_string()),
+            udp_advertise: Some("203.0.113.10:60207".to_string()),
             mtu: Some(1420),
         }
     }
@@ -2416,6 +2426,8 @@ mod tests {
             "networkId": "default",
             "deviceName": "mac",
             "tunInterface": "p2pnet0",
+            "udpBind": "0.0.0.0:60207",
+            "udpAdvertise": "203.0.113.10:60207",
             "mtu": 1420
         });
         let options: DaemonStartOptions = serde_json::from_value(json).unwrap();
@@ -2431,7 +2443,25 @@ mod tests {
         assert_eq!(options.network_id.as_deref(), Some("default"));
         assert_eq!(options.device_name.as_deref(), Some("mac"));
         assert_eq!(options.tun_interface.as_deref(), Some("p2pnet0"));
+        assert_eq!(options.udp_bind.as_deref(), Some("0.0.0.0:60207"));
+        assert_eq!(options.udp_advertise.as_deref(), Some("203.0.113.10:60207"));
         assert_eq!(options.mtu, Some(1420));
+    }
+
+    #[test]
+    fn test_daemon_start_args_include_udp_direct_options() {
+        let options = test_options("http://127.0.0.1:39277/status".to_string());
+        let args = DaemonManager::build_args(
+            &options,
+            "127.0.0.1:39277",
+            Path::new("/tmp/p2pnet-config.json"),
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--udp-bind", "0.0.0.0:60207"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--udp-advertise", "203.0.113.10:60207"]));
     }
 
     #[test]

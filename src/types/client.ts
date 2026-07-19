@@ -245,6 +245,8 @@ export interface ClientSettings {
   mtu: number;
   overlayCidr: string;
   tunInterface: string;
+  udpBind: string;
+  udpAdvertise: string;
   diagnosticsUrl: string;
   authToken: string;
   relayPolicy: RelayPolicy;
@@ -286,6 +288,8 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   mtu: 1420,
   overlayCidr: "10.20.0.0/16",
   tunInterface: DEFAULT_TUN_INTERFACE,
+  udpBind: "0.0.0.0:0",
+  udpAdvertise: "",
   diagnosticsUrl: "http://127.0.0.1:39277/status",
   authToken: "",
   relayPolicy: "auto",
