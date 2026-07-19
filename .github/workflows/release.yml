@@ -196,7 +196,11 @@ jobs:
 
           Online install a specific tag:
           1. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-          2. sudo env P2WLAN_VERSION=${{ github.ref_name }} sh /tmp/p2wlan-install.sh
+          2. sudo sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }}
+
+          Preview or install to a user directory:
+          - sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }} --dry-run
+          - sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
 
           Verify:
           - p2wlan --version
@@ -223,6 +227,7 @@ jobs:
           - Login and configuration commands must be run without sudo.
           - Supplying `-p` is supported for automation, but interactive password input is safer.
           - Cloud direct UDP needs an open fixed UDP port in the provider security group and OS firewall.
+          - `p2wlan doctor` shows peer UDP candidate previews and warns when peers only advertise private endpoints.
           - For self-hosting, run the Go control and relay services separately.
           EOF
           chmod +x "$pkg/p2wlan" "$pkg/p2pnet-daemon" "$pkg/install.sh"
