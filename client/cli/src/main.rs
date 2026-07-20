@@ -1033,6 +1033,12 @@ fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(stage) = direct_failure_stage(peer) {
             println!("  direct-stage={stage}");
         }
+        if let Some(selection) = path_selection_summary(peer, "current_path_selection") {
+            println!("  path-selection={selection}");
+        }
+        if let Some(selection) = path_selection_summary(peer, "last_path_selection") {
+            println!("  last-path-selection={selection}");
+        }
         if let Some(reason) = relay_path_reason(snapshot, peer) {
             println!("  relay-reason={reason}");
         }
@@ -1159,6 +1165,10 @@ fn relay_path_reason(snapshot: &Value, peer: &Value) -> Option<String> {
         return None;
     }
 
+    if let Some(reason) = path_selection_reason(peer) {
+        return Some(reason);
+    }
+
     if let Some(stage) = direct_failure_stage(peer) {
         return Some(format!("Direct 不可用：{stage}"));
     }
@@ -1202,6 +1212,57 @@ fn relay_path_reason(snapshot: &Value, peer: &Value) -> Option<String> {
     Some("Relay fallback 已生效，Direct 尚未确认".to_string())
 }
 
+fn path_selection_summary(peer: &Value, field: &str) -> Option<String> {
+    let selection = peer.get(field)?.as_object()?;
+    let path = selection
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let endpoint = selection
+        .get("direct_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let reason_code = selection.get("reason_code").and_then(Value::as_str)?;
+    let reason = selection
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let confirmed = selection
+        .get("direct_confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Some(format!(
+        "path={path} endpoint={endpoint} confirmed={confirmed} code={reason_code} reason={reason}"
+    ))
+}
+
+fn path_selection_reason(peer: &Value) -> Option<String> {
+    let selection = peer
+        .get("current_path_selection")
+        .or_else(|| peer.get("last_path_selection"))?
+        .as_object()?;
+    let path = selection
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let reason_code = selection.get("reason_code").and_then(Value::as_str)?;
+    let reason = selection
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let path_label = match path {
+        "direct" => "Direct",
+        "relay" => "Relay",
+        _ => "无可用路径",
+    };
+    Some(format!(
+        "Path selector 选择 {path_label}：{}（{reason_code}）：{reason}",
+        path_reason_label(reason_code)
+    ))
+}
+
 fn direct_failure_stage(peer: &Value) -> Option<String> {
     let direct = peer.get("direct")?;
     let error = direct.get("last_error").and_then(Value::as_str);
@@ -1227,6 +1288,19 @@ fn reason_label(code: &str) -> &'static str {
         "direct_send_failed" => "Direct UDP 发送失败",
         "handshake_timeout" => "WireGuard 握手超时",
         _ => "Direct 失败",
+    }
+}
+
+fn path_reason_label(code: &str) -> &'static str {
+    match code {
+        "path_direct_confirmed" => "Direct UDP pair 已确认",
+        "path_direct_trial" => "Direct 最近成功，处于试探窗口",
+        "path_relay_unavailable" => "Relay 不可用，尝试 Direct",
+        "path_direct_disabled" => "策略禁用 Direct",
+        "path_direct_no_endpoint" => "没有 Direct UDP endpoint",
+        "path_direct_not_confirmed" => "Direct UDP 尚未确认",
+        "path_unavailable" => "没有可用数据路径",
+        _ => "路径选择原因",
     }
 }
 
@@ -1933,6 +2007,47 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|item| item.contains("WireGuard 握手超时")));
+    }
+
+    #[test]
+    fn doctor_prefers_explicit_path_selection_reason() {
+        let snapshot = serde_json::json!({
+            "network_generation": 3,
+            "relay_selection": {
+                "selected_region": "cn-east",
+                "selected_endpoint": "relay.example.com:443"
+            },
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "laptop",
+                "virtual_ip": "10.20.0.5",
+                "state": "relay",
+                "active_path": "relay",
+                "direct_generation": 3,
+                "candidates": [],
+                "current_path_selection": {
+                    "path": "relay",
+                    "direct_endpoint": null,
+                    "reason_code": "path_direct_no_endpoint",
+                    "reason": "direct UDP has no candidate endpoint",
+                    "direct_confirmed": false
+                },
+                "direct": {
+                    "last_error_code": "handshake_timeout",
+                    "last_error": "old direct failure"
+                }
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+
+        assert_eq!(
+            path_selection_summary(peer, "current_path_selection").as_deref(),
+            Some("path=relay endpoint=(none) confirmed=false code=path_direct_no_endpoint reason=direct UDP has no candidate endpoint")
+        );
+        assert_eq!(
+            relay_path_reason(&snapshot, peer).as_deref(),
+            Some("Path selector 选择 Relay：没有 Direct UDP endpoint（path_direct_no_endpoint）：direct UDP has no candidate endpoint")
+        );
     }
 
     #[test]

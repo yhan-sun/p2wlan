@@ -155,6 +155,30 @@ impl PathSelection {
     }
 }
 
+/// Serializable path selector diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathSelectionDiagnostics {
+    pub path: Option<NetworkPath>,
+    pub direct_endpoint: Option<String>,
+    pub reason_code: String,
+    pub reason: String,
+    pub direct_confirmed: bool,
+}
+
+impl From<&PathSelection> for PathSelectionDiagnostics {
+    fn from(selection: &PathSelection) -> Self {
+        Self {
+            path: selection.path,
+            direct_endpoint: selection
+                .direct_endpoint
+                .map(|endpoint| endpoint.to_string()),
+            reason_code: selection.reason_code.to_string(),
+            reason: selection.reason.clone(),
+            direct_confirmed: selection.direct_confirmed,
+        }
+    }
+}
+
 /// Reachability state for one direct candidate pair.
 ///
 /// The daemon currently has a single local UDP socket per network generation,
@@ -375,6 +399,8 @@ pub struct PeerConnection {
     pub direct_generation: u64,
     /// Direct candidate-pair reachability table.
     pub candidate_pairs: Vec<CandidatePair>,
+    /// Last selector decision made for outbound peer traffic.
+    pub last_path_selection: Option<PathSelection>,
 }
 
 impl PeerConnection {
@@ -396,6 +422,7 @@ impl PeerConnection {
             relay_health: PathHealth::default(),
             direct_generation: 0,
             candidate_pairs: Vec::new(),
+            last_path_selection: None,
         }
     }
 
@@ -896,12 +923,15 @@ impl PeerManager {
         relay_available: bool,
     ) -> PathSelection {
         let generation = self.current_network_generation().await;
-        self.connections
-            .read()
-            .await
-            .get(node_id)
-            .map(|conn| conn.select_path_for_data(generation, prefer_direct, relay_available))
-            .unwrap_or_else(|| {
+        let mut conns = self.connections.write().await;
+        match conns.get_mut(node_id) {
+            Some(conn) => {
+                let selection =
+                    conn.select_path_for_data(generation, prefer_direct, relay_available);
+                conn.last_path_selection = Some(selection.clone());
+                selection
+            }
+            None => {
                 if relay_available {
                     PathSelection::relay(
                         REASON_PATH_DIRECT_NO_ENDPOINT,
@@ -913,7 +943,8 @@ impl PeerManager {
                         "peer has no direct state and relay is unavailable",
                     )
                 }
-            })
+            }
+        }
     }
 
     /// Whether encrypted data should use direct UDP for this peer right now.
@@ -1159,6 +1190,32 @@ impl PeerManager {
         peers
     }
 
+    /// Get diagnostics with the live path-selector decision for every peer.
+    ///
+    /// This does not update `last_path_selection`; it is a read-only snapshot
+    /// used by CLI/UI diagnostics to explain why data would use Direct or Relay
+    /// right now.
+    pub async fn diagnostics_with_path_selection(
+        &self,
+        prefer_direct: bool,
+        relay_available: bool,
+    ) -> Vec<PeerDiagnostics> {
+        let generation = self.current_network_generation().await;
+        let mut peers: Vec<_> = self
+            .connections
+            .read()
+            .await
+            .values()
+            .map(|conn| {
+                let current_selection =
+                    conn.select_path_for_data(generation, prefer_direct, relay_available);
+                PeerDiagnostics::from_connection_with_path_selection(conn, Some(&current_selection))
+            })
+            .collect();
+        peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        peers
+    }
+
     /// Get connection statistics.
     pub async fn stats(&self) -> PeerManagerStats {
         let conns = self.connections.read().await;
@@ -1213,10 +1270,17 @@ pub struct PeerDiagnostics {
     pub relay: PathHealthDiagnostics,
     pub direct_generation: u64,
     pub candidate_pairs: Vec<CandidatePairDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_path_selection: Option<PathSelectionDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_path_selection: Option<PathSelectionDiagnostics>,
 }
 
-impl From<&PeerConnection> for PeerDiagnostics {
-    fn from(conn: &PeerConnection) -> Self {
+impl PeerDiagnostics {
+    fn from_connection_with_path_selection(
+        conn: &PeerConnection,
+        current_selection: Option<&PathSelection>,
+    ) -> Self {
         let mut candidate_pairs = conn
             .candidate_pairs
             .iter()
@@ -1247,7 +1311,18 @@ impl From<&PeerConnection> for PeerDiagnostics {
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
             candidate_pairs,
+            current_path_selection: current_selection.map(PathSelectionDiagnostics::from),
+            last_path_selection: conn
+                .last_path_selection
+                .as_ref()
+                .map(PathSelectionDiagnostics::from),
         }
+    }
+}
+
+impl From<&PeerConnection> for PeerDiagnostics {
+    fn from(conn: &PeerConnection) -> Self {
+        Self::from_connection_with_path_selection(conn, None)
     }
 }
 
@@ -1740,6 +1815,42 @@ mod tests {
         let no_state = manager.select_path_for_data("missing", true, false).await;
         assert_eq!(no_state.path, None);
         assert_eq!(no_state.reason_code, REASON_PATH_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn path_selection_diagnostics_exposes_current_and_last_selection() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51833".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+        let diagnostics = manager.diagnostics_with_path_selection(true, true).await;
+        assert_eq!(diagnostics.len(), 1);
+        let current = diagnostics[0].current_path_selection.as_ref().unwrap();
+        assert_eq!(current.path, Some(NetworkPath::Relay));
+        assert_eq!(current.direct_endpoint, None);
+        assert_eq!(current.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert_eq!(diagnostics[0].last_path_selection, None);
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+
+        let diagnostics = manager.diagnostics_with_path_selection(true, true).await;
+        let current = diagnostics[0].current_path_selection.as_ref().unwrap();
+        let last = diagnostics[0].last_path_selection.as_ref().unwrap();
+        assert_eq!(current.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert_eq!(last.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+
+        let json = serde_json::to_value(&diagnostics[0]).unwrap();
+        assert_eq!(
+            json["current_path_selection"]["reason_code"],
+            REASON_PATH_DIRECT_NOT_CONFIRMED
+        );
+        assert_eq!(
+            json["last_path_selection"]["reason_code"],
+            REASON_PATH_DIRECT_NOT_CONFIRMED
+        );
     }
 
     #[tokio::test]

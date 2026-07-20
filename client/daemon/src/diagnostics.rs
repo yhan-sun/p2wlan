@@ -214,7 +214,10 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection: context.relay_selection.read().await.clone(),
-        peers: context.peers.diagnostics().await,
+        peers: context
+            .peers
+            .diagnostics_with_path_selection(context.config.relay.prefer_direct, relay_connected)
+            .await,
         stats: context.peers.stats().await,
         health: health_snap,
     }
@@ -252,7 +255,7 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
-    use crate::peer::REASON_DIRECT_PROBE_FAILED;
+    use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_RELAY_UNAVAILABLE};
 
     #[test]
     fn cors_origin_is_restricted_to_local_dev_server() {
@@ -344,6 +347,12 @@ mod tests {
             snapshot.peers[0].direct.last_error_code.as_deref(),
             Some(REASON_DIRECT_PROBE_FAILED)
         );
+        assert_eq!(snapshot.peers[0].last_path_selection, None);
+        let current_path = snapshot.peers[0]
+            .current_path_selection
+            .as_ref()
+            .expect("current path selection should be included in /status");
+        assert_eq!(current_path.reason_code, REASON_PATH_RELAY_UNAVAILABLE);
 
         let mut shutdown_stream = TcpStream::connect(addr).await.unwrap();
         shutdown_stream
