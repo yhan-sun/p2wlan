@@ -9,6 +9,20 @@ description = "DERP-like relay server and client for P2PNet"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"

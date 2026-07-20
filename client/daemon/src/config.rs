@@ -206,6 +206,12 @@ pub struct RelayConfig {
     /// Timeout for direct connection attempt before falling back to relay (ms).
     #[serde(default = "default_relay_timeout")]
     pub fallback_timeout_ms: u64,
+    /// Whether to allow insecure plaintext TCP to relay (default: false, development only).
+    #[serde(default)]
+    pub allow_insecure_plaintext: bool,
+    /// Path to additional CA certificate bundle for self-hosted relays.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -457,6 +463,8 @@ impl Config {
                 selection_timeout_ms: default_relay_selection_timeout(),
                 prefer_direct: true,
                 fallback_timeout_ms: default_relay_timeout(),
+                allow_insecure_plaintext: false,
+                ca_cert_path: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             port_mappings: Vec::new(),

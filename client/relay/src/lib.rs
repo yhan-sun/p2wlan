@@ -47,17 +47,24 @@
 //! # }
 //! ```
 
+pub mod auth;
 pub mod client;
 pub mod error;
 pub mod protocol;
 pub mod server;
+pub mod tls;
 
 // Re-export key types for convenience
+pub use auth::{
+    decode_auth_register, encode_auth_register, AuthenticatedPeer, NetworkNodeKey, TicketVerifier,
+    VerifiedTicket, MAX_TICKET_LEN, MSG_AUTH_REGISTER, RELAY_PROTOCOL_VERSION,
+};
 pub use client::{RelayClient, RelayMessage};
 pub use error::{RelayError, RelayErrorCode, Result as RelayResult};
 pub use protocol::{Frame, MAX_PAYLOAD, VERSION as PROTOCOL_VERSION};
 pub use server::RelayServer;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Relay server limits configuration.
@@ -68,6 +75,22 @@ pub struct RelayServerConfig {
     pub idle_timeout: Duration,
     pub max_connections: usize,
     pub max_frame_payload: usize,
+    /// Whether to require authenticated registration (default: true for security mode).
+    pub require_authentication: bool,
+    /// Whether to allow legacy unauthenticated MSG_REGISTER (default: false).
+    pub allow_legacy_unauthenticated: bool,
+    /// Path to TLS certificate chain PEM file (empty = no TLS).
+    pub tls_cert_chain_path: Option<PathBuf>,
+    /// Path to TLS private key PEM file (empty = no TLS).
+    pub tls_private_key_path: Option<PathBuf>,
+    /// Whether to allow plaintext TCP (default: false).
+    pub allow_insecure_plaintext: bool,
+    /// JSON map of kid -> hex Ed25519 public key for ticket verification.
+    pub ticket_keyring_json: Option<String>,
+    /// Expected audience in relay tickets (required when auth is enabled).
+    pub ticket_audience: Option<String>,
+    /// Expected region in relay tickets (required when auth is enabled).
+    pub ticket_region: Option<String>,
 }
 
 impl Default for RelayServerConfig {
@@ -78,11 +101,48 @@ impl Default for RelayServerConfig {
             idle_timeout: Duration::from_secs(30),
             max_connections: 1000,
             max_frame_payload: 65535,
+            require_authentication: true,
+            allow_legacy_unauthenticated: false,
+            tls_cert_chain_path: None,
+            tls_private_key_path: None,
+            allow_insecure_plaintext: false,
+            ticket_keyring_json: None,
+            ticket_audience: None,
+            ticket_region: None,
         }
     }
 }
 
 impl RelayServerConfig {
+    /// Build a TicketVerifier from config fields.
+    pub fn build_verifier(&self) -> std::result::Result<TicketVerifier, String> {
+        let keys: std::collections::HashMap<String, String> = match &self.ticket_keyring_json {
+            Some(json) => {
+                serde_json::from_str(json).map_err(|e| format!("ticket_keyring_json: {e}"))?
+            }
+            None => {
+                // Try env var as fallback
+                let env_raw = std::env::var("RELAY_TICKET_KEYRING_JSON").unwrap_or_default();
+                if env_raw.is_empty() {
+                    return Err(
+                        "ticket_keyring_json is required when authentication is enabled".into(),
+                    );
+                }
+                serde_json::from_str(&env_raw)
+                    .map_err(|e| format!("RELAY_TICKET_KEYRING_JSON env: {e}"))?
+            }
+        };
+        let audience = self.ticket_audience.as_deref().unwrap_or("").to_string();
+        let region = self.ticket_region.as_deref().unwrap_or("").to_string();
+        if audience.is_empty() {
+            return Err("ticket_audience is required when authentication is enabled".into());
+        }
+        if region.is_empty() {
+            return Err("ticket_region is required when authentication is enabled".into());
+        }
+        crate::auth::TicketVerifier::new(keys, crate::auth::DEFAULT_CLOCK_SKEW, audience, region)
+    }
+
     pub fn validate(&self) -> std::result::Result<(), error::RelayError> {
         if self.outbound_queue_capacity == 0 {
             return Err(error::RelayError::Protocol(
@@ -109,6 +169,26 @@ impl RelayServerConfig {
                 "max_frame_payload must be between 1 and 65535".into(),
             ));
         }
+        // TLS checks
+        let has_tls = self.tls_cert_chain_path.is_some() || self.tls_private_key_path.is_some();
+        if has_tls {
+            if self.tls_cert_chain_path.is_none() {
+                return Err(error::RelayError::Protocol(
+                    "tls_cert_chain_path is required when TLS is configured".into(),
+                ));
+            }
+            if self.tls_private_key_path.is_none() {
+                return Err(error::RelayError::Protocol(
+                    "tls_private_key_path is required when TLS is configured".into(),
+                ));
+            }
+        }
+        if !has_tls && !self.allow_insecure_plaintext {
+            return Err(error::RelayError::Protocol(
+                "TLS must be configured or allow_insecure_plaintext must be set (development only)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -122,6 +202,14 @@ pub struct RelayClientConfig {
     pub idle_timeout: Duration,
     pub keepalive_interval: Duration,
     pub max_frame_payload: usize,
+    /// TLS server name for certificate verification (required for tls:// endpoints).
+    pub tls_server_name: Option<String>,
+    /// Path to additional CA certificate bundle for self-hosted relays.
+    pub tls_ca_cert_path: Option<PathBuf>,
+    /// Whether to allow plaintext TCP (default: false).
+    pub allow_insecure_plaintext: bool,
+    /// Relay ticket JWT for authenticated registration.
+    pub relay_ticket: Option<String>,
 }
 
 impl Default for RelayClientConfig {
@@ -133,6 +221,10 @@ impl Default for RelayClientConfig {
             idle_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(10),
             max_frame_payload: 65535,
+            tls_server_name: None,
+            tls_ca_cert_path: None,
+            allow_insecure_plaintext: false,
+            relay_ticket: None,
         }
     }
 }

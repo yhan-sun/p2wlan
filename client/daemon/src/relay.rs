@@ -5,16 +5,15 @@
 //! server only sees source/destination node IDs and opaque bytes.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use p2pnet_relay::{RelayClient, RelayMessage};
+use p2pnet_relay::{RelayClient, RelayClientConfig, RelayMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
@@ -82,9 +81,11 @@ fn parse_candidate(
         None => ("default".to_string(), spec),
     };
 
-    endpoint
-        .parse::<SocketAddr>()
-        .map_err(|err| format!("invalid relay endpoint '{endpoint}': {err}"))?;
+    // Endpoints now support tls://host:port, tcp://host:port, or bare host:port.
+    // Validation is done by the relay client's endpoint parser.
+    if endpoint.is_empty() {
+        return Err(format!("relay candidate '{spec}' has an empty endpoint"));
+    }
 
     let preference_rank = preferred_regions
         .iter()
@@ -105,12 +106,18 @@ fn duration_millis(duration: Duration) -> u64 {
 
 /// Connect to all valid relay candidates concurrently and select the best one.
 /// Preferred regions win first; connection latency and config order break ties.
+///
+/// A2 parameters (ticket, TLS config) are passed through to the relay client.
+#[allow(clippy::too_many_arguments)]
 pub async fn select_relay(
     specs: &[String],
     preferred_regions: &[String],
     selection_timeout: Duration,
     node_id: &str,
     peers: Arc<PeerManager>,
+    relay_ticket: Option<String>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
 ) -> RelaySelectionOutcome {
     let mut diagnostics = RelaySelectionDiagnostics::default();
     let mut candidates = Vec::new();
@@ -149,6 +156,8 @@ pub async fn select_relay(
     for candidate in candidates {
         let node_id = node_id.to_string();
         let peers = peers.clone();
+        let ticket = relay_ticket.clone();
+        let ca_path = ca_cert_path.clone();
         tasks.spawn(async move {
             let started = Instant::now();
             let result = timeout(
@@ -158,6 +167,9 @@ pub async fn select_relay(
                     &candidate.region,
                     &node_id,
                     peers,
+                    ticket,
+                    allow_insecure_plaintext,
+                    ca_path,
                 ),
             )
             .await;
@@ -246,33 +258,89 @@ pub struct RelayTransport {
 }
 
 impl RelayTransport {
-    /// Connect to a relay server and register this node ID.
+    /// Connect to a relay server and register this node ID (legacy, no TLS/ticket).
+    /// Prefers tcp:// prefix if not already present for bare host:port.
     pub async fn connect(
         relay_endpoint: &str,
         node_id: &str,
         peers: Arc<PeerManager>,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
-        Self::connect_in_region(relay_endpoint, "default", node_id, peers)
-            .await
-            .map_err(|e| {
-                DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
-            })
+        // For backward compat, prefix bare host:port with tcp://
+        let wire_endpoint = if !relay_endpoint.contains("://") {
+            format!("tcp://{relay_endpoint}")
+        } else {
+            relay_endpoint.to_string()
+        };
+        let (mut transport, rx) =
+            Self::connect_in_region(&wire_endpoint, "default", node_id, peers, None, true, None)
+                .await
+                .map_err(|e| {
+                    DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
+                })?;
+        // Store the original endpoint for diagnostics consistency
+        transport.relay_endpoint = relay_endpoint.to_string();
+        Ok((transport, rx))
     }
 
+    /// Connect with full A2 support: TLS endpoint, ticket, and CA cert.
+    pub async fn connect_secure(
+        relay_endpoint: &str,
+        relay_region: &str,
+        node_id: &str,
+        peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        Self::connect_in_region(
+            relay_endpoint,
+            relay_region,
+            node_id,
+            peers,
+            relay_ticket,
+            allow_insecure_plaintext,
+            ca_cert_path,
+        )
+        .await
+        .map_err(|e| {
+            DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn connect_in_region(
         relay_endpoint: &str,
         relay_region: &str,
         node_id: &str,
         peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
     ) -> std::result::Result<(Self, mpsc::Receiver<RelayMessage>), p2pnet_relay::RelayError> {
         let started = Instant::now();
-        let config = p2pnet_relay::RelayClientConfig {
+        let mut config = RelayClientConfig {
             idle_timeout: RELAY_INBOUND_IDLE_TIMEOUT,
             keepalive_interval: RELAY_INBOUND_IDLE_TIMEOUT / 2,
+            allow_insecure_plaintext,
+            relay_ticket,
             ..Default::default()
         };
+
+        // Set CA cert path if provided
+        if let Some(ca_path) = &ca_cert_path {
+            config.tls_ca_cert_path = Some(std::path::PathBuf::from(ca_path));
+        }
+
+        // Use the new A2 endpoint-based connection which supports tls:// and tcp://
         let (client, relay_rx) =
-            RelayClient::connect_verified_with_config(relay_endpoint, node_id, config).await?;
+            RelayClient::connect_with_endpoint(relay_endpoint, node_id, config).await?;
+
+        info!(
+            "Connected to relay {} (region={}, {}ms)",
+            relay_endpoint,
+            relay_region,
+            duration_millis(started.elapsed())
+        );
 
         Ok((
             Self {
@@ -501,6 +569,9 @@ mod tests {
             Duration::from_secs(1),
             "node-a",
             peer_manager(),
+            None,
+            true,
+            None,
         )
         .await;
 
@@ -537,6 +608,9 @@ mod tests {
             Duration::from_secs(1),
             "node-a",
             peer_manager(),
+            None,
+            true,
+            None,
         )
         .await;
 

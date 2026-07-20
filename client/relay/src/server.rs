@@ -3,12 +3,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::error::{RelayError, Result};
+use crate::auth::{decode_auth_register, NetworkNodeKey, TicketVerifier, MSG_AUTH_REGISTER};
+use crate::error::{RelayError, RelayErrorCode, Result};
 use crate::protocol::*;
 use crate::RelayServerConfig;
 
@@ -23,7 +25,7 @@ struct PeerConnection {
     conn_id: u64,
 }
 
-type PeerTable = Arc<Mutex<HashMap<String, PeerConnection>>>;
+type PeerTable = Arc<Mutex<HashMap<NetworkNodeKey, PeerConnection>>>;
 
 /// A DERP-like relay server.
 pub struct RelayServer {
@@ -44,18 +46,56 @@ impl RelayServer {
     /// Start a relay server on the given address with custom config.
     pub async fn start_with_config(addr: &str, config: RelayServerConfig) -> Result<Self> {
         config.validate()?;
-        let listener = TcpListener::bind(addr).await?;
-        let actual_addr = listener.local_addr()?;
+
+        // Build ticket verifier if authentication is required
+        let verifier: Option<Arc<TicketVerifier>> = if config.require_authentication {
+            let v = config
+                .build_verifier()
+                .map_err(|e| RelayError::Protocol(format!("ticket verifier: {e}")))?;
+            Some(Arc::new(v))
+        } else {
+            None
+        };
+
+        // Determine listener: TLS or plaintext
+        let has_tls = config.tls_cert_chain_path.is_some() && config.tls_private_key_path.is_some();
+
+        let (listener, actual_addr) = if has_tls {
+            let tls_config = crate::tls::load_tls_server_config(
+                config.tls_cert_chain_path.as_ref().unwrap(),
+                config.tls_private_key_path.as_ref().unwrap(),
+            )
+            .map_err(|e| RelayError::Protocol(format!("failed to load TLS server config: {e}")))?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+            let tcp_listener = TcpListener::bind(addr).await?;
+            let addr = tcp_listener.local_addr()?;
+            info!("Relay server listening on {} with TLS 1.3", addr);
+            (
+                AcceptStream::Tls {
+                    listener: tcp_listener,
+                    acceptor,
+                },
+                addr,
+            )
+        } else {
+            let listener = TcpListener::bind(addr).await?;
+            let addr = listener.local_addr()?;
+            if config.allow_insecure_plaintext {
+                warn!(
+                    "Relay server listening on {} in PLAINTEXT mode (development only)",
+                    addr
+                );
+            }
+            info!("Relay server listening on {}", addr);
+            (AcceptStream::Tcp(listener), addr)
+        };
+
         let peer_table: PeerTable = Arc::new(Mutex::new(HashMap::new()));
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-        info!(
-            "Relay server listening on {} with config: {:?}",
-            actual_addr, config
-        );
-
         let c_config = config.clone();
+        let c_verifier = verifier.clone();
         let s_tx = shutdown_tx.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
@@ -70,27 +110,50 @@ impl RelayServer {
                     }
                     accept_res = listener.accept() => {
                         match accept_res {
-                            Ok((stream, client_addr)) => {
-                                debug!("New connection from {}", client_addr);
+                            Ok(accepted) => {
+                                // Connection limit check BEFORE TLS handshake
                                 match semaphore.clone().try_acquire_owned() {
                                     Ok(permit) => {
                                         let table = peer_table.clone();
                                         let client_cfg = c_config.clone();
+                                        let verifier = c_verifier.clone();
                                         next_conn_id += 1;
                                         let conn_id = next_conn_id;
                                         let conn_shutdown_rx = s_tx.subscribe();
+                                        let handshake_timeout = client_cfg.register_timeout;
                                         join_set.spawn(async move {
                                             let _permit = permit;
-                                            if let Err(e) = handle_client(stream, table, conn_id, client_cfg, conn_shutdown_rx).await {
+
+                                            // TLS handshake (if configured) happens in task, with timeout
+                                            let stream: Box<dyn AsyncReadWrite> = if let Some(acceptor) = accepted.tls_acceptor {
+                                                match tokio::time::timeout(
+                                                    handshake_timeout,
+                                                    acceptor.accept(accepted.stream),
+                                                ).await {
+                                                    Ok(Ok(tls_stream)) => Box::new(tls_stream),
+                                                    Ok(Err(e)) => {
+                                                        warn!("TLS handshake failed: {}", e);
+                                                        return;
+                                                    }
+                                                    Err(_) => {
+                                                        warn!("TLS handshake timed out");
+                                                        return;
+                                                    }
+                                                }
+                                            } else {
+                                                Box::new(accepted.stream)
+                                            };
+
+                                            if let Err(e) = handle_client(stream, table, conn_id, client_cfg, verifier, conn_shutdown_rx).await {
                                                 warn!("Client connection error: {}", e);
                                             }
                                         });
                                     }
                                     Err(_) => {
-                                        let mut stream = stream;
+                                        let mut stream = accepted.stream;
                                         let _ = tokio::time::timeout(Duration::from_millis(50), async {
                                             let _ = stream.write_all(&Frame::error(ERR_CONNECTION_LIMIT, "connection limit exceeded").encode()).await;
-                                            let _ = stream.shutdown().await;
+                                            let _ = AsyncWriteExt::shutdown(&mut stream).await;
                                         }).await;
                                     }
                                 }
@@ -115,9 +178,15 @@ impl RelayServer {
         })
     }
 
-    /// Start a relay server on a random port (for testing).
+    /// Start a relay server on a random port (for testing) — uses dev mode.
     pub async fn start_random() -> Result<Self> {
-        Self::start("127.0.0.1:0").await
+        let config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
+            allow_legacy_unauthenticated: true,
+            ..Default::default()
+        };
+        Self::start_with_config("127.0.0.1:0", config).await
     }
 
     /// Shut down the relay server.
@@ -128,41 +197,91 @@ impl RelayServer {
     }
 }
 
+/// Enum abstracting over plaintext and TLS acceptors.
+/// TCP accept is fast (just accept the socket); TLS handshake is deferred
+/// to the per-connection task so it cannot block the accept loop.
+enum AcceptStream {
+    Tcp(TcpListener),
+    Tls {
+        listener: TcpListener,
+        acceptor: TlsAcceptor,
+    },
+}
+
+struct AcceptedConn {
+    stream: TcpStream,
+    tls_acceptor: Option<TlsAcceptor>,
+}
+
+impl AcceptStream {
+    async fn accept(&self) -> std::io::Result<AcceptedConn> {
+        match self {
+            AcceptStream::Tcp(listener) => {
+                let (stream, _addr) = listener.accept().await?;
+                stream.set_nodelay(true).ok();
+                Ok(AcceptedConn {
+                    stream,
+                    tls_acceptor: None,
+                })
+            }
+            AcceptStream::Tls { listener, acceptor } => {
+                let (tcp_stream, _addr) = listener.accept().await?;
+                tcp_stream.set_nodelay(true).ok();
+                Ok(AcceptedConn {
+                    stream: tcp_stream,
+                    tls_acceptor: Some(acceptor.clone()),
+                })
+            }
+        }
+    }
+}
+
+/// Trait for types that are both AsyncRead and AsyncWrite.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
 /// Handle a single client connection.
 async fn handle_client(
-    stream: TcpStream,
+    stream: Box<dyn AsyncReadWrite>,
     peer_table: PeerTable,
     conn_id: u64,
     config: RelayServerConfig,
+    verifier: Option<Arc<TicketVerifier>>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(config.outbound_queue_capacity);
-    let client_addr = stream.peer_addr().ok();
-    let (reader, writer) = stream.into_split();
+    let (reader, writer) = tokio::io::split(stream);
 
     let write_task = tokio::spawn(async move {
         let mut writer = writer;
         let mut rx = rx;
         while let Some(frame_bytes) = rx.recv().await {
             if let Err(e) = writer.write_all(&frame_bytes).await {
-                warn!("Write error to client {:?}: {}", client_addr, e);
+                warn!("Write error to client: {}", e);
                 break;
             }
         }
-        let _ = writer.shutdown().await;
-        debug!("Write task ended for client {:?}", client_addr);
+        let _ = AsyncWriteExt::shutdown(&mut writer).await;
+        debug!("Write task ended");
     });
 
-    let (res, registered_id) =
-        handle_client_inner(reader, tx, conn_id, config, shutdown_rx, peer_table.clone()).await;
+    let (res, registered_key) = handle_client_inner(
+        reader,
+        tx,
+        conn_id,
+        config,
+        verifier,
+        shutdown_rx,
+        peer_table.clone(),
+    )
+    .await;
 
-    // Guaranteed unregistration Cleanup
-    if let Some(ref id) = registered_id {
+    if let Some(ref key) = registered_key {
         let mut table = peer_table.lock().await;
-        if let Some(active) = table.get(id) {
+        if let Some(active) = table.get(key) {
             if active.conn_id == conn_id {
-                table.remove(id);
-                debug!("Removed '{}' (conn_id={}) from peer table", id, conn_id);
+                table.remove(key);
+                debug!("Removed '{}' (conn_id={}) from peer table", key, conn_id);
             }
         }
     }
@@ -174,16 +293,281 @@ async fn handle_client(
 }
 
 async fn handle_client_inner(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut reader: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,
     tx: mpsc::Sender<Vec<u8>>,
     conn_id: u64,
     config: RelayServerConfig,
+    verifier: Option<Arc<TicketVerifier>>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     peer_table: PeerTable,
-) -> (Result<()>, Option<String>) {
+) -> (Result<()>, Option<NetworkNodeKey>) {
     let (dup_shutdown_tx, mut dup_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Registration phase with register_timeout
+    let first_frame =
+        read_first_frame(&mut reader, &config, &mut shutdown_rx, &mut dup_shutdown_rx).await;
+
+    let first_frame = match first_frame {
+        Ok(frame) => frame,
+        Err((e, _)) => {
+            // Send appropriate error frame before closing
+            let err_code = match &e {
+                RelayError::FrameTooLarge(_, _) => ERR_FRAME_TOO_LARGE,
+                RelayError::Timeout(_) => ERR_REGISTRATION_TIMEOUT,
+                RelayError::UnsupportedVersion(_) => ERR_UNSUPPORTED_VERSION,
+                RelayError::InvalidMagic => ERR_INVALID_FRAME,
+                _ => ERR_INVALID_FRAME,
+            };
+            let _ = tx.try_send(Frame::error(err_code, &e.to_string()).encode());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return (Err(e), None);
+        }
+    };
+
+    // ---- Handle legacy MSG_REGISTER (0x01) ----
+    if first_frame.msg_type == MSG_REGISTER {
+        if config.require_authentication && !config.allow_legacy_unauthenticated {
+            let _ = tx.try_send(
+                Frame::error(RelayErrorCode::AUTH_REQUIRED, "authentication required").encode(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return (
+                Err(RelayError::AuthError(
+                    RelayErrorCode::AUTH_REQUIRED,
+                    "legacy register rejected in secure mode".into(),
+                )),
+                None,
+            );
+        }
+
+        let node_id = match std::str::from_utf8(&first_frame.payload) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                let _ =
+                    tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID UTF-8").encode());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return (
+                    Err(RelayError::Protocol("invalid node ID UTF-8".into())),
+                    None,
+                );
+            }
+        };
+
+        if node_id.is_empty() || node_id.len() > MAX_NODE_ID_LEN {
+            let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID length").encode());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return (
+                Err(RelayError::Protocol("invalid node ID length".into())),
+                None,
+            );
+        }
+
+        // Legacy: register with empty network_id
+        let network_key = NetworkNodeKey::new(String::new(), node_id.clone());
+
+        let my_connection = PeerConnection {
+            tx: tx.clone(),
+            shutdown_tx: Arc::new(Mutex::new(Some(dup_shutdown_tx))),
+            conn_id,
+        };
+
+        {
+            let mut table = peer_table.lock().await;
+            if let Some(old_conn) = table.get(&network_key) {
+                warn!("Disconnecting duplicate connection for '{}'", network_key);
+                if let Some(old_s_tx) = old_conn.shutdown_tx.lock().await.take() {
+                    let _ = old_s_tx.send(());
+                }
+            }
+            table.insert(network_key.clone(), my_connection);
+        }
+
+        let registered_key = Some(network_key);
+
+        if tx.try_send(Frame::registered(&node_id).encode()).is_err() {
+            return (
+                Err(RelayError::Closed(
+                    "write channel closed on registered reply".into(),
+                )),
+                registered_key,
+            );
+        }
+
+        return run_read_loop(
+            reader,
+            tx,
+            conn_id,
+            &config,
+            shutdown_rx,
+            dup_shutdown_rx,
+            peer_table,
+            &node_id,
+            String::new(),
+            registered_key,
+            None,
+        )
+        .await;
+    }
+
+    // ---- Handle MSG_AUTH_REGISTER (0x09) ----
+    if first_frame.msg_type == MSG_AUTH_REGISTER {
+        if !config.require_authentication {
+            // In dev mode with auth disabled, reject auth register
+            let _ = tx.try_send(
+                Frame::error(ERR_INVALID_FRAME, "auth register not supported in dev mode").encode(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return (
+                Err(RelayError::Protocol(
+                    "auth register not supported in dev mode".into(),
+                )),
+                None,
+            );
+        }
+
+        // Parse auth register payload
+        let (frame_node_id, ticket) = match decode_auth_register(&first_frame.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.try_send(Frame::error(RelayErrorCode::INVALID_TICKET, &e).encode());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return (
+                    Err(RelayError::AuthError(RelayErrorCode::INVALID_TICKET, e)),
+                    None,
+                );
+            }
+        };
+
+        // Verify JWT ticket with the configured verifier
+        let verifier = match &verifier {
+            Some(v) => v,
+            None => {
+                let _ = tx.try_send(
+                    Frame::error(
+                        RelayErrorCode::INVALID_TICKET,
+                        "ticket verification not configured",
+                    )
+                    .encode(),
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return (
+                    Err(RelayError::AuthError(
+                        RelayErrorCode::INVALID_TICKET,
+                        "ticket verification not configured".into(),
+                    )),
+                    None,
+                );
+            }
+        };
+
+        let verified = match verifier.verify(&ticket) {
+            Ok(v) => v,
+            Err(e) => {
+                let code = e
+                    .error_code()
+                    .map(|c| c.to_u16())
+                    .unwrap_or(RelayErrorCode::INVALID_TICKET);
+                let _ = tx.try_send(Frame::error(code, &e.to_string()).encode());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return (Err(e), None);
+            }
+        };
+
+        // Validate identity: frame node_id must match ticket node_id
+        if frame_node_id != verified.claims.node_id {
+            let _ = tx.try_send(
+                Frame::error(
+                    RelayErrorCode::IDENTITY_MISMATCH,
+                    "node_id does not match ticket",
+                )
+                .encode(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return (
+                Err(RelayError::AuthError(
+                    RelayErrorCode::IDENTITY_MISMATCH,
+                    "node_id mismatch".into(),
+                )),
+                None,
+            );
+        }
+
+        let network_id = verified.claims.network_id.clone();
+        let node_id = verified.claims.node_id.clone();
+        let ticket_expiry = verified.claims.exp;
+
+        // Register in peer table with network binding
+        let network_key = NetworkNodeKey::new(network_id.clone(), node_id.clone());
+
+        let my_connection = PeerConnection {
+            tx: tx.clone(),
+            shutdown_tx: Arc::new(Mutex::new(Some(dup_shutdown_tx))),
+            conn_id,
+        };
+
+        {
+            let mut table = peer_table.lock().await;
+            if let Some(old_conn) = table.get(&network_key) {
+                warn!("Disconnecting duplicate connection for '{}'", network_key);
+                if let Some(old_s_tx) = old_conn.shutdown_tx.lock().await.take() {
+                    let _ = old_s_tx.send(());
+                }
+            }
+            table.insert(network_key.clone(), my_connection);
+        }
+
+        let registered_key = Some(network_key.clone());
+
+        if tx.try_send(Frame::registered(&node_id).encode()).is_err() {
+            return (
+                Err(RelayError::Closed(
+                    "write channel closed on registered reply".into(),
+                )),
+                registered_key,
+            );
+        }
+
+        return run_read_loop(
+            reader,
+            tx,
+            conn_id,
+            &config,
+            shutdown_rx,
+            dup_shutdown_rx,
+            peer_table,
+            &node_id,
+            network_id,
+            registered_key,
+            ticket_expiry,
+        )
+        .await;
+    }
+
+    // Unknown first frame type
+    if config.require_authentication {
+        let _ = tx.try_send(
+            Frame::error(RelayErrorCode::AUTH_REQUIRED, "authentication required").encode(),
+        );
+    } else {
+        let _ =
+            tx.try_send(Frame::error(ERR_REGISTRATION_REQUIRED, "registration required").encode());
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (
+        Err(RelayError::Protocol(
+            "first frame must be register or auth register".into(),
+        )),
+        None,
+    )
+}
+
+/// Read and validate the first frame from a new connection.
+async fn read_first_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    config: &RelayServerConfig,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    dup_shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) -> std::result::Result<Frame, (RelayError, Option<NetworkNodeKey>)> {
     let first_frame_fut = async {
         let mut buf = [0u8; FRAME_HEADER_SIZE + MAX_NODE_ID_LEN];
         reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]).await?;
@@ -204,6 +588,7 @@ async fn handle_client_inner(
             ));
         }
 
+        // For MSG_AUTH_REGISTER, payload could be larger; use a dynamic buffer
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             reader.read_exact(&mut payload).await?;
@@ -211,94 +596,55 @@ async fn handle_client_inner(
         Ok(Frame::new(msg_type, payload))
     };
 
-    let first_frame = match tokio::select! {
+    match tokio::select! {
         _ = shutdown_rx.recv() => {
-            return (Ok(()), None);
+            Err((RelayError::Closed("shutdown".into()), None))
         }
-        _ = &mut dup_shutdown_rx => {
-            return (Ok(()), None);
+        _ = dup_shutdown_rx => {
+            Err((RelayError::Closed("duplicate".into()), None))
         }
         res = tokio::time::timeout(config.register_timeout, first_frame_fut) => match res {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(RelayError::Timeout("registration timed out".into())),
+            Ok(Err(e)) => Err((e, None)),
+            Err(_) => Err((RelayError::Timeout("registration timed out".into()), None)),
         }
     } {
-        Ok(frame) => frame,
-        Err(e) => {
-            let err_code = match &e {
-                RelayError::FrameTooLarge(_, _) => ERR_FRAME_TOO_LARGE,
-                RelayError::Timeout(_) => ERR_REGISTRATION_TIMEOUT,
-                RelayError::UnsupportedVersion(_) => ERR_UNSUPPORTED_VERSION,
-                RelayError::InvalidMagic => ERR_INVALID_FRAME,
-                _ => ERR_INVALID_FRAME,
-            };
-            let _ = tx.try_send(Frame::error(err_code, &e.to_string()).encode());
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            return (Err(e), None);
+        Ok(frame) => Ok(frame),
+        Err((e, key)) => Err((e, key)),
+    }
+}
+
+/// Read loop after successful registration. Forwards data between peers
+/// scoped to the source's network.
+#[allow(clippy::too_many_arguments)]
+async fn run_read_loop<R: AsyncRead + Unpin>(
+    mut reader: R,
+    tx: mpsc::Sender<Vec<u8>>,
+    _conn_id: u64,
+    config: &RelayServerConfig,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut dup_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    peer_table: PeerTable,
+    node_id: &str,
+    network_id: String,
+    registered_key: Option<NetworkNodeKey>,
+    ticket_expiry: Option<i64>,
+) -> (Result<()>, Option<NetworkNodeKey>) {
+    let node_id = node_id.to_string();
+
+    // Build optional ticket expiry deadline
+    let expiry_deadline = ticket_expiry.and_then(|exp| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if exp > now {
+            let remaining = Duration::from_secs((exp - now) as u64);
+            Some(tokio::time::Instant::now() + remaining)
+        } else {
+            None
         }
-    };
-
-    if first_frame.msg_type != MSG_REGISTER {
-        let _ =
-            tx.try_send(Frame::error(ERR_REGISTRATION_REQUIRED, "registration required").encode());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        return (
-            Err(RelayError::Protocol("first frame must be register".into())),
-            None,
-        );
-    }
-
-    let node_id = match std::str::from_utf8(&first_frame.payload) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID UTF-8").encode());
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            return (
-                Err(RelayError::Protocol("invalid node ID UTF-8".into())),
-                None,
-            );
-        }
-    };
-
-    if node_id.is_empty() || node_id.len() > MAX_NODE_ID_LEN {
-        let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID length").encode());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        return (
-            Err(RelayError::Protocol("invalid node ID length".into())),
-            None,
-        );
-    }
-
-    // Register in peer table, close duplicate connection if exists
-    let my_connection = PeerConnection {
-        tx: tx.clone(),
-        shutdown_tx: Arc::new(Mutex::new(Some(dup_shutdown_tx))),
-        conn_id,
-    };
-
-    {
-        let mut table = peer_table.lock().await;
-        if let Some(old_conn) = table.get(&node_id) {
-            warn!("Disconnecting duplicate connection for node '{}'", node_id);
-            if let Some(old_s_tx) = old_conn.shutdown_tx.lock().await.take() {
-                let _ = old_s_tx.send(());
-            }
-        }
-        table.insert(node_id.clone(), my_connection);
-    }
-
-    let registered_id = Some(node_id.clone());
-
-    // Send confirmation
-    if tx.try_send(Frame::registered(&node_id).encode()).is_err() {
-        return (
-            Err(RelayError::Closed(
-                "write channel closed on registered reply".into(),
-            )),
-            registered_id,
-        );
-    }
+    });
 
     macro_rules! try_queue {
         ($tx:expr, $frame:expr) => {
@@ -316,11 +662,10 @@ async fn handle_client_inner(
         };
     }
 
-    // Read loop with idle_timeout
     let mut buf = vec![0u8; config.max_frame_payload + FRAME_HEADER_SIZE];
 
     loop {
-        // Read header with idle timeout
+        // ---- Read header with timeout, shutdown, duplicate, ticket expiry ----
         let read_header_fut = reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]);
         let read_res = tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -329,6 +674,19 @@ async fn handle_client_inner(
             }
             _ = &mut dup_shutdown_rx => {
                 debug!("Client '{}' connection closed by duplicate registration", node_id);
+                break;
+            }
+            _ = async {
+                if let Some(deadline) = expiry_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                    true
+                } else {
+                    std::future::pending::<bool>().await
+                }
+            }, if expiry_deadline.is_some() => {
+                debug!("Client '{}' ticket expired", node_id);
+                try_queue!(tx, Frame::error(RelayErrorCode::TICKET_EXPIRED, "ticket expired").encode());
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 break;
             }
             res = tokio::time::timeout(config.idle_timeout, read_header_fut) => match res {
@@ -352,7 +710,6 @@ async fn handle_client_inner(
             break;
         }
 
-        // Parse header
         if buf[..4] != MAGIC {
             warn!("Invalid magic from '{}'", node_id);
             try_queue!(
@@ -388,7 +745,7 @@ async fn handle_client_inner(
             break;
         }
 
-        // Read payload
+        // ---- Read payload with same timeout/shutdown/duplicate/expiry as header ----
         if payload_len > 0 {
             if buf.len() < FRAME_HEADER_SIZE + payload_len {
                 buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
@@ -396,16 +753,36 @@ async fn handle_client_inner(
             let read_payload_fut =
                 reader.read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len]);
             let read_payload_res = tokio::select! {
-                _ = shutdown_rx.recv() => {
+                _ = shutdown_rx.recv() => { break; }
+                _ = &mut dup_shutdown_rx => { break; }
+                _ = async {
+                    if let Some(deadline) = expiry_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                        true
+                    } else {
+                        std::future::pending::<bool>().await
+                    }
+                }, if expiry_deadline.is_some() => {
+                    try_queue!(tx, Frame::error(RelayErrorCode::TICKET_EXPIRED, "ticket expired").encode());
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     break;
                 }
-                _ = &mut dup_shutdown_rx => {
-                    break;
-                }
-                res = read_payload_fut => res,
+                res = tokio::time::timeout(config.idle_timeout, read_payload_fut) => match res {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => {
+                        warn!("Client '{}' idle timeout during payload", node_id);
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))
+                    }
+                },
             };
             if let Err(e) = read_payload_res {
-                warn!("Payload read error from '{}': {}", node_id, e);
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    try_queue!(tx, Frame::error(ERR_IDLE_TIMEOUT, "idle timeout").encode());
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    warn!("Payload read error from '{}': {}", node_id, e);
+                }
                 break;
             }
         }
@@ -471,7 +848,6 @@ async fn handle_client_inner(
 
                 let data = &payload[1 + dst_len..];
 
-                // Check if outbound frame payload exceeds the configured maximum frame payload
                 let total_received_len = 1 + node_id.len() + data.len();
                 if total_received_len > config.max_frame_payload {
                     try_queue!(
@@ -481,51 +857,49 @@ async fn handle_client_inner(
                     continue;
                 }
 
-                // Look up destination peer
+                // Network-scoped lookup: only find destination in the same network
+                let dst_key = NetworkNodeKey::new(network_id.clone(), dst_id.to_string());
                 let dst_conn = {
                     let table = peer_table.lock().await;
-                    table.get(dst_id).cloned()
+                    table.get(&dst_key).cloned()
                 };
 
                 match dst_conn {
-                    Some(dst) => {
-                        // Build a Received frame and forward it
-                        match Frame::received(&node_id, data) {
-                            Ok(frame) => match dst.tx.try_send(frame.encode()) {
-                                Ok(_) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("Target '{}' is slow consumer, closing it", dst_id);
-                                    if let Some(s_tx) = dst.shutdown_tx.lock().await.take() {
-                                        let _ = s_tx.send(());
-                                    }
-                                    try_queue!(
-                                        tx,
-                                        Frame::error(
-                                            ERR_PEER_BACKPRESSURE,
-                                            "target peer outbound queue full"
-                                        )
-                                        .encode()
-                                    );
+                    Some(dst) => match Frame::received(&node_id, data) {
+                        Ok(frame) => match dst.tx.try_send(frame.encode()) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("Target '{}' is slow consumer, closing it", dst_id);
+                                if let Some(s_tx) = dst.shutdown_tx.lock().await.take() {
+                                    let _ = s_tx.send(());
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    try_queue!(
-                                        tx,
-                                        Frame::error(
-                                            ERR_PEER_NOT_FOUND,
-                                            "target peer write channel closed"
-                                        )
-                                        .encode()
-                                    );
-                                }
-                            },
-                            Err(e) => {
                                 try_queue!(
                                     tx,
-                                    Frame::error(ERR_INVALID_FRAME, &e.to_string()).encode()
+                                    Frame::error(
+                                        ERR_PEER_BACKPRESSURE,
+                                        "target peer outbound queue full"
+                                    )
+                                    .encode()
                                 );
                             }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                try_queue!(
+                                    tx,
+                                    Frame::error(
+                                        ERR_PEER_NOT_FOUND,
+                                        "target peer write channel closed"
+                                    )
+                                    .encode()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            try_queue!(
+                                tx,
+                                Frame::error(ERR_INVALID_FRAME, &e.to_string()).encode()
+                            );
                         }
-                    }
+                    },
                     None => {
                         try_queue!(
                             tx,
@@ -537,7 +911,7 @@ async fn handle_client_inner(
             }
 
             MSG_PING => {
-                let timestamp = if payload.len() >= 8 {
+                let ts = if payload.len() >= 8 {
                     u64::from_be_bytes([
                         payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
                         payload[6], payload[7],
@@ -545,7 +919,7 @@ async fn handle_client_inner(
                 } else {
                     0
                 };
-                try_queue!(tx, Frame::pong(timestamp).encode());
+                try_queue!(tx, Frame::pong(ts).encode());
             }
 
             MSG_CLOSE => {
@@ -566,7 +940,7 @@ async fn handle_client_inner(
         }
     }
 
-    (Ok(()), registered_id)
+    (Ok(()), registered_key)
 }
 
 #[cfg(test)]
@@ -575,6 +949,16 @@ mod tests {
     use crate::client::RelayClient;
     use crate::{RelayClientConfig, RelayErrorCode, RelayMessage};
     use std::time::Duration;
+
+    /// Create a dev-mode config for localhost testing.
+    fn dev_config() -> RelayServerConfig {
+        RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
+            allow_legacy_unauthenticated: true,
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn test_server_start_and_shutdown() {
@@ -757,6 +1141,8 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_limits() {
         let config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             max_connections: 0,
             ..Default::default()
         };
@@ -793,8 +1179,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_outbound_queue_full_policy() {
         let server_config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             outbound_queue_capacity: 1,
-            ..Default::default()
+            ..dev_config()
         };
         let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
             .await
@@ -833,6 +1221,8 @@ mod tests {
     #[tokio::test]
     async fn test_register_timeout() {
         let server_config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             register_timeout: Duration::from_millis(100),
             ..Default::default()
         };
@@ -858,6 +1248,8 @@ mod tests {
     #[tokio::test]
     async fn test_idle_timeout() {
         let server_config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             idle_timeout: Duration::from_millis(100),
             ..Default::default()
         };
@@ -881,6 +1273,8 @@ mod tests {
     #[tokio::test]
     async fn test_max_connections() {
         let server_config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             max_connections: 1,
             ..Default::default()
         };
@@ -906,6 +1300,8 @@ mod tests {
     #[tokio::test]
     async fn test_oversized_frame_rejected_before_payload() {
         let server_config = RelayServerConfig {
+            allow_insecure_plaintext: true,
+            require_authentication: false,
             max_frame_payload: 10,
             ..Default::default()
         };
@@ -1015,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_real_shutdown_lifecycle() {
-        let server_config = RelayServerConfig::default();
+        let server_config = dev_config();
         let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
             .await
             .unwrap();
@@ -1059,8 +1455,8 @@ mod tests {
         let handler_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let shutdown_rx = s_tx.subscribe();
-            let config = RelayServerConfig::default();
-            handle_client(stream, table_clone, 1, config, shutdown_rx).await
+            let config = dev_config();
+            handle_client(Box::new(stream), table_clone, 1, config, None, shutdown_rx).await
         });
 
         // --- Client side ---
@@ -1078,8 +1474,9 @@ mod tests {
         // Verify the mapping is present right after registration.
         {
             let table = peer_table.lock().await;
+            let key = NetworkNodeKey::new(String::new(), "errnode".to_string());
             assert!(
-                table.contains_key("errnode"),
+                table.contains_key(&key),
                 "peer table must contain errnode after registration"
             );
         }
@@ -1117,8 +1514,9 @@ mod tests {
         // The mapping must now be gone.
         {
             let table = peer_table.lock().await;
+            let key = NetworkNodeKey::new(String::new(), "errnode".to_string());
             assert!(
-                !table.contains_key("errnode"),
+                !table.contains_key(&key),
                 "peer table must NOT contain errnode after handler exit"
             );
         }
