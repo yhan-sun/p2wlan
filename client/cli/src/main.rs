@@ -1017,8 +1017,9 @@ fn print_peer_diagnostics(snapshot: &Value) {
             .get("direct_generation")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let pair_summary = candidate_pair_summary(peer);
         println!(
-            "- {} ({}) state={} path={} endpoint={} candidates={}{} direct_gen={}",
+            "- {} ({}) state={} path={} endpoint={} candidates={}{} direct_gen={}{}",
             short_text(name, 24),
             virtual_ip,
             state,
@@ -1026,7 +1027,8 @@ fn print_peer_diagnostics(snapshot: &Value) {
             endpoint,
             candidate_count,
             candidate_preview,
-            direct_generation
+            direct_generation,
+            pair_summary
         );
         if let Some(stage) = direct_failure_stage(peer) {
             println!("  direct-stage={stage}");
@@ -1225,6 +1227,57 @@ fn reason_label(code: &str) -> &'static str {
         "direct_send_failed" => "Direct UDP 发送失败",
         "handshake_timeout" => "WireGuard 握手超时",
         _ => "Direct 失败",
+    }
+}
+
+fn candidate_pair_summary(peer: &Value) -> String {
+    let Some(pairs) = peer.get("candidate_pairs").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if pairs.is_empty() {
+        return String::new();
+    }
+
+    let mut selected = 0;
+    let mut succeeded = 0;
+    let mut probing = 0;
+    let mut failed = 0;
+    let mut degraded = 0;
+    for pair in pairs {
+        match pair
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+        {
+            "selected" => selected += 1,
+            "succeeded" => succeeded += 1,
+            "probing" => probing += 1,
+            "failed" => failed += 1,
+            "degraded" => degraded += 1,
+            _ => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    if selected > 0 {
+        parts.push(format!("selected={selected}"));
+    }
+    if succeeded > 0 {
+        parts.push(format!("succeeded={succeeded}"));
+    }
+    if probing > 0 {
+        parts.push(format!("probing={probing}"));
+    }
+    if failed > 0 {
+        parts.push(format!("failed={failed}"));
+    }
+    if degraded > 0 {
+        parts.push(format!("degraded={degraded}"));
+    }
+    if parts.is_empty() {
+        format!(" pairs={}", pairs.len())
+    } else {
+        format!(" pairs={}({})", pairs.len(), parts.join(","))
     }
 }
 
