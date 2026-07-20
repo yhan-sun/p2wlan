@@ -26,14 +26,14 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::error::{RelayError, Result};
 use crate::protocol::*;
 
-const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A message received from the relay (data from a peer or a control message).
 #[derive(Debug, Clone)]
@@ -147,8 +147,11 @@ impl RelayClient {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ClientCommand>();
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<RelayMessage>();
         let (reg_tx, reg_rx) = oneshot::channel::<Result<()>>();
+        let (close_tx, close_rx) = watch::channel(false);
 
         // Write task: processes commands and writes to the TCP stream
+        let write_close_tx = close_tx.clone();
+        let mut write_close_rx = close_rx.clone();
         let _write_task = tokio::spawn(async move {
             let mut writer = writer;
             let mut keepalive = tokio::time::interval(keepalive_interval);
@@ -163,13 +166,15 @@ impl RelayClient {
                         };
                         match cmd {
                             ClientCommand::SendFrame(frame) => {
-                                if writer.write_all(&frame.encode()).await.is_err() {
+                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                    warn!("Relay write error: {}", err);
                                     break;
                                 }
                             }
                             ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
                                 Ok(frame) => {
-                                    if writer.write_all(&frame.encode()).await.is_err() {
+                                    if let Err(err) = writer.write_all(&frame.encode()).await {
+                                        warn!("Relay write error: {}", err);
                                         break;
                                     }
                                 }
@@ -179,7 +184,8 @@ impl RelayClient {
                             },
                             ClientCommand::Ping => {
                                 let frame = Frame::ping();
-                                if writer.write_all(&frame.encode()).await.is_err() {
+                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                    warn!("Relay ping write error: {}", err);
                                     break;
                                 }
                             }
@@ -192,25 +198,41 @@ impl RelayClient {
                     }
                     _ = keepalive.tick() => {
                         let frame = Frame::ping();
-                        if writer.write_all(&frame.encode()).await.is_err() {
+                        if let Err(err) = writer.write_all(&frame.encode()).await {
+                            warn!("Relay keepalive write error: {}", err);
+                            break;
+                        }
+                    }
+                    changed = write_close_rx.changed() => {
+                        if changed.is_ok() && *write_close_rx.borrow() {
                             break;
                         }
                     }
                 }
             }
+            let _ = write_close_tx.send(true);
             debug!("Relay write task ended");
         });
 
         // Read task: reads frames and dispatches messages
         let msg_tx_clone = msg_tx.clone();
         let mut reg_tx = Some(reg_tx);
+        let read_close_tx = close_tx.clone();
+        let mut read_close_rx = close_rx.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PAYLOAD + FRAME_HEADER_SIZE];
 
             loop {
                 // Read header
-                match reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]).await {
-                    Ok(_) => {}
+                match tokio::select! {
+                    result = reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]) => result.map(|_| true),
+                    changed = read_close_rx.changed() => {
+                        let _ = changed;
+                        Ok(false)
+                    }
+                } {
+                    Ok(true) => {}
+                    Ok(false) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         debug!("Relay server disconnected");
                         break;
@@ -234,12 +256,19 @@ impl RelayClient {
                     if buf.len() < FRAME_HEADER_SIZE + payload_len {
                         buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
                     }
-                    if let Err(e) = reader
-                        .read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len])
-                        .await
-                    {
-                        warn!("Relay payload read error: {}", e);
-                        break;
+                    match tokio::select! {
+                        result = reader.read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len]) => result.map(|_| true),
+                        changed = read_close_rx.changed() => {
+                            let _ = changed;
+                            Ok(false)
+                        }
+                    } {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            warn!("Relay payload read error: {}", e);
+                            break;
+                        }
                     }
                 }
 
@@ -324,6 +353,7 @@ impl RelayClient {
                 from_node: String::new(),
                 data: b"closed".to_vec(),
             });
+            let _ = read_close_tx.send(true);
             debug!("Relay read task ended");
         });
 

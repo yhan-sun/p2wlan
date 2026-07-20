@@ -20,6 +20,8 @@ use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
+const RELAY_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Diagnostics for one configured relay candidate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayCandidateDiagnostics {
@@ -309,8 +311,23 @@ impl RelayTransport {
         mut relay_rx: mpsc::UnboundedReceiver<RelayMessage>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) -> Result<()> {
-        while let Some(message) = relay_rx.recv().await {
+        while let Some(message) = timeout(RELAY_INBOUND_IDLE_TIMEOUT, relay_rx.recv())
+            .await
+            .map_err(|_| {
+                DaemonError::Relay(format!(
+                    "relay {} heartbeat timed out after {} seconds",
+                    self.relay_endpoint,
+                    RELAY_INBOUND_IDLE_TIMEOUT.as_secs()
+                ))
+            })?
+        {
             if message.from_node.is_empty() {
+                if message.data.as_slice() == b"closed" {
+                    return Err(DaemonError::Relay(format!(
+                        "relay {} connection closed",
+                        self.relay_endpoint
+                    )));
+                }
                 debug!(
                     "Ignoring relay control message from {}: {} bytes",
                     self.relay_endpoint,
