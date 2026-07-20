@@ -153,11 +153,11 @@ async fn handle_client(
         debug!("Write task ended for client {:?}", client_addr);
     });
 
-    let res =
+    let (res, registered_id) =
         handle_client_inner(reader, tx, conn_id, config, shutdown_rx, peer_table.clone()).await;
 
     // Guaranteed unregistration Cleanup
-    if let Ok(Some(ref id)) = res {
+    if let Some(ref id) = registered_id {
         let mut table = peer_table.lock().await;
         if let Some(active) = table.get(id) {
             if active.conn_id == conn_id {
@@ -170,10 +170,7 @@ async fn handle_client(
     write_task.abort();
     let _ = write_task.await;
 
-    match res {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
+    res
 }
 
 async fn handle_client_inner(
@@ -183,7 +180,7 @@ async fn handle_client_inner(
     config: RelayServerConfig,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     peer_table: PeerTable,
-) -> Result<Option<String>> {
+) -> (Result<()>, Option<String>) {
     let (dup_shutdown_tx, mut dup_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Registration phase with register_timeout
@@ -216,10 +213,10 @@ async fn handle_client_inner(
 
     let first_frame = match tokio::select! {
         _ = shutdown_rx.recv() => {
-            return Ok(None);
+            return (Ok(()), None);
         }
         _ = &mut dup_shutdown_rx => {
-            return Ok(None);
+            return (Ok(()), None);
         }
         res = tokio::time::timeout(config.register_timeout, first_frame_fut) => match res {
             Ok(Ok(frame)) => Ok(frame),
@@ -238,7 +235,7 @@ async fn handle_client_inner(
             };
             let _ = tx.try_send(Frame::error(err_code, &e.to_string()).encode());
             tokio::time::sleep(Duration::from_millis(50)).await;
-            return Err(e);
+            return (Err(e), None);
         }
     };
 
@@ -246,7 +243,10 @@ async fn handle_client_inner(
         let _ =
             tx.try_send(Frame::error(ERR_REGISTRATION_REQUIRED, "registration required").encode());
         tokio::time::sleep(Duration::from_millis(50)).await;
-        return Err(RelayError::Protocol("first frame must be register".into()));
+        return (
+            Err(RelayError::Protocol("first frame must be register".into())),
+            None,
+        );
     }
 
     let node_id = match std::str::from_utf8(&first_frame.payload) {
@@ -254,14 +254,20 @@ async fn handle_client_inner(
         Err(_) => {
             let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID UTF-8").encode());
             tokio::time::sleep(Duration::from_millis(50)).await;
-            return Err(RelayError::Protocol("invalid node ID UTF-8".into()));
+            return (
+                Err(RelayError::Protocol("invalid node ID UTF-8".into())),
+                None,
+            );
         }
     };
 
     if node_id.is_empty() || node_id.len() > MAX_NODE_ID_LEN {
         let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID length").encode());
         tokio::time::sleep(Duration::from_millis(50)).await;
-        return Err(RelayError::Protocol("invalid node ID length".into()));
+        return (
+            Err(RelayError::Protocol("invalid node ID length".into())),
+            None,
+        );
     }
 
     // Register in peer table, close duplicate connection if exists
@@ -282,11 +288,16 @@ async fn handle_client_inner(
         table.insert(node_id.clone(), my_connection);
     }
 
+    let registered_id = Some(node_id.clone());
+
     // Send confirmation
     if tx.try_send(Frame::registered(&node_id).encode()).is_err() {
-        return Err(RelayError::Closed(
-            "write channel closed on registered reply".into(),
-        ));
+        return (
+            Err(RelayError::Closed(
+                "write channel closed on registered reply".into(),
+            )),
+            registered_id,
+        );
     }
 
     macro_rules! try_queue {
@@ -555,7 +566,7 @@ async fn handle_client_inner(
         }
     }
 
-    Ok(Some(node_id))
+    (Ok(()), registered_id)
 }
 
 #[cfg(test)]
@@ -1029,5 +1040,106 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(closed_msg, RelayMessage::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_error_after_registration_cleanup() {
+        let server = RelayServer::start_random().await.unwrap();
+        let addr = server.addr;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let reg = Frame::register("errnode").encode();
+        stream.write_all(&reg).await.unwrap();
+
+        let mut buf = [0u8; 100];
+        let n = stream.read(&mut buf).await.unwrap();
+        let (f, _) = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(f.msg_type, MSG_REGISTERED);
+
+        let mut invalid_frame = Vec::new();
+        invalid_frame.extend_from_slice(&MAGIC);
+        invalid_frame.push(99);
+        invalid_frame.push(MSG_PING);
+        invalid_frame.extend_from_slice(&0u16.to_be_bytes());
+        stream.write_all(&invalid_frame).await.unwrap();
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        let (f, _) = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(f.msg_type, MSG_ERROR);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let res = RelayClient::connect(&addr.to_string(), "errnode").await;
+        assert!(
+            res.is_ok(),
+            "Failed to register duplicate node after cleanup: {:?}",
+            res.err()
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_client_config_invalid() {
+        let config = RelayClientConfig {
+            idle_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(10),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config2 = RelayClientConfig {
+            keepalive_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(config2.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_client_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = RelayClientConfig {
+            idle_timeout: Duration::from_millis(100),
+            keepalive_interval: Duration::from_millis(40),
+            ..Default::default()
+        };
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let (f, _) = Frame::decode(&buf[..n]).unwrap();
+            assert_eq!(f.msg_type, MSG_REGISTER);
+
+            let reg_ok = Frame::registered("client-idle").encode();
+            stream.write_all(&reg_ok).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let (_client, mut rx) =
+            RelayClient::connect_verified_with_config(&addr.to_string(), "client-idle", config)
+                .await
+                .unwrap();
+
+        let msg1 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            msg1,
+            RelayMessage::Error {
+                code: 4009,
+                message: "idle timeout".to_string()
+            }
+        );
+
+        let msg2 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg2, RelayMessage::Closed);
     }
 }

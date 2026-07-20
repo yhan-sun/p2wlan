@@ -249,22 +249,38 @@ impl RelayClient {
         let mut reg_tx = Some(reg_tx);
         let read_close_tx = close_tx.clone();
         let mut read_close_rx = close_rx.clone();
+        let idle_timeout = config.idle_timeout;
         tokio::spawn(async move {
             let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
 
             loop {
                 // Read header
-                match tokio::select! {
-                    result = reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]) => result.map(|_| true),
+                let read_header_fut = reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]);
+                let read_res = tokio::select! {
+                    res = tokio::time::timeout(idle_timeout, read_header_fut) => match res {
+                        Ok(Ok(_)) => Ok(true),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
+                    },
                     changed = read_close_rx.changed() => {
                         let _ = changed;
                         Ok(false)
                     }
-                } {
+                };
+
+                match read_res {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         debug!("Relay server disconnected");
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        warn!("Relay client idle timeout");
+                        let _ = msg_tx_clone.try_send(RelayMessage::Error {
+                            code: ERR_IDLE_TIMEOUT,
+                            message: "idle timeout".to_string(),
+                        });
                         break;
                     }
                     Err(e) => {
@@ -308,15 +324,30 @@ impl RelayClient {
                     if buf.len() < FRAME_HEADER_SIZE + payload_len {
                         buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
                     }
-                    match tokio::select! {
-                        result = reader.read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len]) => result.map(|_| true),
+                    let read_payload_fut = reader
+                        .read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len]);
+                    let read_payload_res = tokio::select! {
+                        res = tokio::time::timeout(idle_timeout, read_payload_fut) => match res {
+                            Ok(Ok(_)) => Ok(true),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
+                        },
                         changed = read_close_rx.changed() => {
                             let _ = changed;
                             Ok(false)
                         }
-                    } {
+                    };
+                    match read_payload_res {
                         Ok(true) => {}
                         Ok(false) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            warn!("Relay client idle timeout during payload");
+                            let _ = msg_tx_clone.try_send(RelayMessage::Error {
+                                code: ERR_IDLE_TIMEOUT,
+                                message: "idle timeout during payload".to_string(),
+                            });
+                            break;
+                        }
                         Err(e) => {
                             warn!("Relay payload read error: {}", e);
                             break;

@@ -119,6 +119,7 @@ pub struct RelayClientConfig {
     pub cmd_queue_capacity: usize,
     pub inbound_queue_capacity: usize,
     pub register_timeout: Duration,
+    pub idle_timeout: Duration,
     pub keepalive_interval: Duration,
     pub max_frame_payload: usize,
 }
@@ -129,7 +130,8 @@ impl Default for RelayClientConfig {
             cmd_queue_capacity: 128,
             inbound_queue_capacity: 128,
             register_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(10),
             max_frame_payload: 65535,
         }
     }
@@ -152,9 +154,19 @@ impl RelayClientConfig {
                 "register_timeout must be > 0".into(),
             ));
         }
+        if self.idle_timeout.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "idle_timeout must be > 0".into(),
+            ));
+        }
         if self.keepalive_interval.is_zero() {
             return Err(error::RelayError::Protocol(
                 "keepalive_interval must be > 0".into(),
+            ));
+        }
+        if self.keepalive_interval >= self.idle_timeout {
+            return Err(error::RelayError::Protocol(
+                "keepalive_interval must be strictly less than idle_timeout".into(),
             ));
         }
         if self.max_frame_payload == 0 || self.max_frame_payload > 65535 {
