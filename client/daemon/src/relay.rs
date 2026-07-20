@@ -40,9 +40,25 @@ pub struct RelaySelectionDiagnostics {
     pub selected_region: Option<String>,
     pub selected_endpoint: Option<String>,
     pub selected_connect_latency_ms: Option<u64>,
+    pub selected_last_pong_at_unix_ms: Option<u64>,
+    pub selected_last_pong_age_ms: Option<u64>,
+    pub selected_last_pong_rtt_ms: Option<u64>,
+    pub selected_rtt_ewma_ms: Option<u64>,
+    pub selected_jitter_ms: Option<u64>,
+    pub selected_pong_count: u64,
+    pub selected_error_count: u64,
     pub candidates: Vec<RelayCandidateDiagnostics>,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+}
+
+impl RelaySelectionDiagnostics {
+    pub fn refresh_runtime_ages(&mut self) {
+        let now_ms = now_unix_millis();
+        if let Some(last_pong_at) = self.selected_last_pong_at_unix_ms {
+            self.selected_last_pong_age_ms = Some(now_ms.saturating_sub(last_pong_at));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +211,52 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn update_latency_ewma(ewma_ms: &mut Option<u64>, jitter_ms: &mut Option<u64>, sample_ms: u64) {
+    match *ewma_ms {
+        Some(previous) => {
+            let delta = sample_ms.abs_diff(previous);
+            let next_ewma = ((previous as u128 * 7) + sample_ms as u128).div_ceil(8) as u64;
+            let next_jitter = match *jitter_ms {
+                Some(previous_jitter) => {
+                    ((previous_jitter as u128 * 3) + delta as u128).div_ceil(4) as u64
+                }
+                None => delta,
+            };
+            *ewma_ms = Some(next_ewma);
+            *jitter_ms = Some(next_jitter);
+        }
+        None => {
+            *ewma_ms = Some(sample_ms);
+            *jitter_ms = Some(0);
+        }
+    }
+}
+
+fn record_relay_pong(
+    diagnostics: &mut RelaySelectionDiagnostics,
+    ping_timestamp_ms: u64,
+    received_at_ms: u64,
+) {
+    let rtt_ms = received_at_ms.saturating_sub(ping_timestamp_ms);
+    diagnostics.selected_last_pong_at_unix_ms = Some(received_at_ms);
+    diagnostics.selected_last_pong_age_ms = Some(0);
+    diagnostics.selected_last_pong_rtt_ms = Some(rtt_ms);
+    diagnostics.selected_pong_count = diagnostics.selected_pong_count.saturating_add(1);
+    update_latency_ewma(
+        &mut diagnostics.selected_rtt_ewma_ms,
+        &mut diagnostics.selected_jitter_ms,
+        rtt_ms,
+    );
 }
 
 #[derive(Debug)]
@@ -622,6 +684,7 @@ impl RelayTransport {
                 RelayMessage::Closed => {
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
+                        d.selected_error_count = d.selected_error_count.saturating_add(1);
                         d.last_error = Some("relay connection closed by remote".to_string());
                         d.last_error_code = Some("transport_closed".to_string());
                     }
@@ -637,6 +700,7 @@ impl RelayTransport {
                     );
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
+                        d.selected_error_count = d.selected_error_count.saturating_add(1);
                         d.last_error = Some(message.clone());
                         if let Some(ec) = p2pnet_relay::RelayErrorCode::from_u16(code) {
                             d.last_error_code = Some(ec.to_snake_case().to_string());
@@ -646,9 +710,16 @@ impl RelayTransport {
                     }
                 }
                 RelayMessage::Pong { timestamp } => {
+                    let received_at_ms = now_unix_millis();
+                    if let Some(ref diags) = relay_selection {
+                        let mut d = diags.write().await;
+                        record_relay_pong(&mut d, timestamp, received_at_ms);
+                    }
                     debug!(
-                        "Received ping-pong keepalive response from relay {} with timestamp {}",
-                        self.relay_endpoint, timestamp
+                        "Received ping-pong keepalive response from relay {} with timestamp {} rtt={}ms",
+                        self.relay_endpoint,
+                        timestamp,
+                        received_at_ms.saturating_sub(timestamp)
                     );
                 }
                 RelayMessage::Data { from_node, data } => {
@@ -704,6 +775,28 @@ mod tests {
         Arc::new(PeerManager::new(
             Config::generate_default("http://ctrl.test", "default").unwrap(),
         ))
+    }
+
+    #[test]
+    fn relay_pong_updates_runtime_health() {
+        let mut diagnostics = RelaySelectionDiagnostics::default();
+
+        record_relay_pong(&mut diagnostics, 900, 1_000);
+        assert_eq!(diagnostics.selected_last_pong_at_unix_ms, Some(1_000));
+        assert_eq!(diagnostics.selected_last_pong_age_ms, Some(0));
+        assert_eq!(diagnostics.selected_last_pong_rtt_ms, Some(100));
+        assert_eq!(diagnostics.selected_rtt_ewma_ms, Some(100));
+        assert_eq!(diagnostics.selected_jitter_ms, Some(0));
+        assert_eq!(diagnostics.selected_pong_count, 1);
+
+        record_relay_pong(&mut diagnostics, 1_000, 1_120);
+        assert_eq!(diagnostics.selected_last_pong_rtt_ms, Some(120));
+        assert_eq!(diagnostics.selected_rtt_ewma_ms, Some(103));
+        assert_eq!(diagnostics.selected_jitter_ms, Some(5));
+        assert_eq!(diagnostics.selected_pong_count, 2);
+
+        diagnostics.refresh_runtime_ages();
+        assert!(diagnostics.selected_last_pong_age_ms.unwrap() > 0);
     }
 
     #[tokio::test]
