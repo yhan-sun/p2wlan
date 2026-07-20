@@ -565,6 +565,8 @@ function activePathSummary(snapshot: DiagnosticsSnapshot): string {
 
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
   const directPathAvailable = snapshot.stats.direct_connections > 0;
+  const relayPathAvailable = snapshot.relay_connected || snapshot.stats.relay_connections > 0;
+  const anyPathAvailable = directPathAvailable || relayPathAvailable;
   const isOptionalRelayIssue = (message: string) => {
     const normalized = message.toLowerCase();
     return normalized.includes("relay-inbound") || normalized.startsWith("relay ");
@@ -572,15 +574,15 @@ function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
 
   if (
     snapshot.health.reason &&
-    !(directPathAvailable && isOptionalRelayIssue(snapshot.health.reason))
+    !(anyPathAvailable && isOptionalRelayIssue(snapshot.health.reason))
   ) {
     return snapshot.health.reason;
   }
-  if (snapshot.relay_selection.last_error && !directPathAvailable) {
+  if (snapshot.relay_selection.last_error && !anyPathAvailable) {
     return snapshot.relay_selection.last_error;
   }
   const failedTask = snapshot.health.critical_tasks.find((t) => t.error);
-  if (failedTask?.error && !(directPathAvailable && failedTask.name === "relay-inbound")) {
+  if (failedTask?.error && !(anyPathAvailable && failedTask.name === "relay-inbound")) {
     return `${failedTask.name}: ${failedTask.error}`;
   }
   return null;
