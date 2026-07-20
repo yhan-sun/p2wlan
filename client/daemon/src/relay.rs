@@ -266,7 +266,13 @@ impl RelayTransport {
         peers: Arc<PeerManager>,
     ) -> std::result::Result<(Self, mpsc::Receiver<RelayMessage>), p2pnet_relay::RelayError> {
         let started = Instant::now();
-        let (client, relay_rx) = RelayClient::connect(relay_endpoint, node_id).await?;
+        let config = p2pnet_relay::RelayClientConfig {
+            idle_timeout: RELAY_INBOUND_IDLE_TIMEOUT,
+            keepalive_interval: RELAY_INBOUND_IDLE_TIMEOUT / 2,
+            ..Default::default()
+        };
+        let (client, relay_rx) =
+            RelayClient::connect_verified_with_config(relay_endpoint, node_id, config).await?;
 
         Ok((
             Self {
@@ -331,16 +337,7 @@ impl RelayTransport {
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
         relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
     ) -> Result<()> {
-        while let Some(message) = timeout(RELAY_INBOUND_IDLE_TIMEOUT, relay_rx.recv())
-            .await
-            .map_err(|_| {
-                DaemonError::Relay(format!(
-                    "relay {} heartbeat timed out after {} seconds",
-                    self.relay_endpoint,
-                    RELAY_INBOUND_IDLE_TIMEOUT.as_secs()
-                ))
-            })?
-        {
+        while let Some(message) = relay_rx.recv().await {
             match message {
                 RelayMessage::Closed => {
                     if let Some(ref diags) = relay_selection {
