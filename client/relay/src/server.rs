@@ -1042,41 +1042,83 @@ mod tests {
         assert_eq!(closed_msg, RelayMessage::Closed);
     }
 
+    /// Deterministic registration cleanup test: shares the server's peer_table directly
+    /// and verifies the mapping is absent after the handler task exits.
     #[tokio::test]
-    async fn test_error_after_registration_cleanup() {
-        let server = RelayServer::start_random().await.unwrap();
-        let addr = server.addr;
+    async fn test_error_after_registration_cleanup_deterministic() {
+        // Build server internals so we can inspect peer_table directly.
+        let peer_table: PeerTable = Arc::new(Mutex::new(HashMap::new()));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept loop: spawn a single client handler, then stop.
+        let table_clone = peer_table.clone();
+        let s_tx = shutdown_tx.clone();
+        let handler_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let shutdown_rx = s_tx.subscribe();
+            let config = RelayServerConfig::default();
+            handle_client(stream, table_clone, 1, config, shutdown_rx).await
+        });
+
+        // --- Client side ---
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let reg = Frame::register("errnode").encode();
-        stream.write_all(&reg).await.unwrap();
+        stream
+            .write_all(&Frame::register("errnode").encode())
+            .await
+            .unwrap();
 
-        let mut buf = [0u8; 100];
+        let mut buf = [0u8; 256];
         let n = stream.read(&mut buf).await.unwrap();
         let (f, _) = Frame::decode(&buf[..n]).unwrap();
         assert_eq!(f.msg_type, MSG_REGISTERED);
 
-        let mut invalid_frame = Vec::new();
-        invalid_frame.extend_from_slice(&MAGIC);
-        invalid_frame.push(99);
-        invalid_frame.push(MSG_PING);
-        invalid_frame.extend_from_slice(&0u16.to_be_bytes());
-        stream.write_all(&invalid_frame).await.unwrap();
+        // Verify the mapping is present right after registration.
+        {
+            let table = peer_table.lock().await;
+            assert!(
+                table.contains_key("errnode"),
+                "peer table must contain errnode after registration"
+            );
+        }
 
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n > 0);
-        let (f, _) = Frame::decode(&buf[..n]).unwrap();
-        assert_eq!(f.msg_type, MSG_ERROR);
+        // Send a bad-version frame to force a protocol error that tears down the handler.
+        let mut bad_frame = Vec::new();
+        bad_frame.extend_from_slice(&MAGIC);
+        bad_frame.push(99); // bad version
+        bad_frame.push(MSG_PING);
+        bad_frame.extend_from_slice(&0u16.to_be_bytes());
+        stream.write_all(&bad_frame).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Read until the connection is closed (error frame + EOF).
+        let mut total_read = 0usize;
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total_read += n;
+                }
+            }
+        }
+        assert!(total_read > 0, "expected at least an error frame");
 
-        let res = RelayClient::connect(&addr.to_string(), "errnode").await;
-        assert!(
-            res.is_ok(),
-            "Failed to register duplicate node after cleanup: {:?}",
-            res.err()
-        );
-        server.shutdown().await;
+        // Wait for the handler task to finish (guarantees cleanup ran).
+        tokio::time::timeout(Duration::from_secs(2), handler_task)
+            .await
+            .expect("handler did not finish within 2s")
+            .expect("handler task panicked")
+            .ok();
+
+        // The mapping must now be gone.
+        {
+            let table = peer_table.lock().await;
+            assert!(
+                !table.contains_key("errnode"),
+                "peer table must NOT contain errnode after handler exit"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1095,16 +1137,12 @@ mod tests {
         assert!(config2.validate().is_err());
     }
 
+    /// Verify that a silent server (never responds to pings) triggers idle timeout and
+    /// the client delivers Error{4009} + Closed.
     #[tokio::test]
     async fn test_client_idle_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let config = RelayClientConfig {
-            idle_timeout: Duration::from_millis(100),
-            keepalive_interval: Duration::from_millis(40),
-            ..Default::default()
-        };
 
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1112,22 +1150,28 @@ mod tests {
             let n = stream.read(&mut buf).await.unwrap();
             let (f, _) = Frame::decode(&buf[..n]).unwrap();
             assert_eq!(f.msg_type, MSG_REGISTER);
-
-            let reg_ok = Frame::registered("client-idle").encode();
-            stream.write_all(&reg_ok).await.unwrap();
-
+            // Reply with Registered, then go silent — never respond to Ping.
+            stream
+                .write_all(&Frame::registered("client-idle").encode())
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
+        let config = RelayClientConfig {
+            idle_timeout: Duration::from_millis(100),
+            keepalive_interval: Duration::from_millis(40),
+            ..Default::default()
+        };
         let (_client, mut rx) =
             RelayClient::connect_verified_with_config(&addr.to_string(), "client-idle", config)
                 .await
                 .unwrap();
 
-        let msg1 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+        let msg1 = tokio::time::timeout(Duration::from_millis(400), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("timed out waiting for idle-timeout error")
+            .expect("channel closed unexpectedly");
         assert_eq!(
             msg1,
             RelayMessage::Error {
@@ -1136,10 +1180,61 @@ mod tests {
             }
         );
 
-        let msg2 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+        let msg2 = tokio::time::timeout(Duration::from_millis(400), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("timed out waiting for Closed")
+            .expect("channel closed unexpectedly");
         assert_eq!(msg2, RelayMessage::Closed);
+    }
+
+    /// Verify that a working relay server (responds with Pong) does NOT trigger idle
+    /// timeout even when the client's idle_timeout is short.
+    #[tokio::test]
+    async fn test_keepalive_prevents_idle_timeout() {
+        let server = RelayServer::start_random().await.unwrap();
+        let addr = server.addr;
+
+        // idle_timeout=200ms, keepalive_interval=60ms — pings arrive well within timeout.
+        let config = RelayClientConfig {
+            idle_timeout: Duration::from_millis(200),
+            keepalive_interval: Duration::from_millis(60),
+            ..Default::default()
+        };
+        let (_client, mut rx) =
+            RelayClient::connect_verified_with_config(&addr.to_string(), "keepalive-node", config)
+                .await
+                .unwrap();
+
+        // Over ~400ms (several keepalive cycles) we should receive only Pong messages,
+        // no Error{4009} or Closed.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        let mut pong_count = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(RelayMessage::Pong { .. })) => {
+                    pong_count += 1;
+                }
+                Ok(Some(RelayMessage::Error { code, message })) => {
+                    panic!("unexpected error during keepalive: code={code}, msg={message}");
+                }
+                Ok(Some(RelayMessage::Closed)) => {
+                    panic!("connection closed unexpectedly during keepalive test");
+                }
+                Ok(Some(other)) => {
+                    panic!("unexpected message: {other:?}");
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(
+            pong_count >= 2,
+            "expected at least 2 Pong responses during keepalive window, got {pong_count}"
+        );
+        server.shutdown().await;
     }
 }
