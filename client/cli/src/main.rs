@@ -1033,6 +1033,12 @@ fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(stage) = direct_failure_stage(peer) {
             println!("  direct-stage={stage}");
         }
+        if let Some(summary) = direct_health_summary(peer) {
+            println!("  direct-health={summary}");
+        }
+        if let Some(retry) = direct_retry_summary(peer) {
+            println!("  direct-retry={retry}");
+        }
         if let Some(selection) = path_selection_summary(peer, "current_path_selection") {
             println!("  path-selection={selection}");
         }
@@ -1234,6 +1240,49 @@ fn path_selection_summary(peer: &Value, field: &str) -> Option<String> {
 
     Some(format!(
         "path={path} endpoint={endpoint} confirmed={confirmed} code={reason_code} reason={reason}"
+    ))
+}
+
+fn direct_health_summary(peer: &Value) -> Option<String> {
+    let direct = peer.get("direct")?.as_object()?;
+    let success_count = direct
+        .get("success_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let failure_count = direct
+        .get("failure_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ewma = direct.get("rtt_ewma_ms").and_then(Value::as_u64);
+    let jitter = direct.get("jitter_ms").and_then(Value::as_u64);
+    if success_count == 0 && failure_count == 0 && ewma.is_none() && jitter.is_none() {
+        return None;
+    }
+
+    Some(format!(
+        "success={} failure={} rtt_ewma={} jitter={}",
+        success_count,
+        failure_count,
+        ewma.map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        jitter
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "unknown".to_string())
+    ))
+}
+
+fn direct_retry_summary(peer: &Value) -> Option<String> {
+    let retry_after = peer.get("direct_retry_after_ms").and_then(Value::as_u64)?;
+    let remaining = peer
+        .get("direct_retry_remaining_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if retry_after == 0 || remaining == 0 {
+        return None;
+    }
+    Some(format!(
+        "next_probe_in={}ms backoff={}ms",
+        remaining, retry_after
     ))
 }
 
@@ -2047,6 +2096,35 @@ mod tests {
         assert_eq!(
             relay_path_reason(&snapshot, peer).as_deref(),
             Some("Path selector 选择 Relay：没有 Direct UDP endpoint（path_direct_no_endpoint）：direct UDP has no candidate endpoint")
+        );
+    }
+
+    #[test]
+    fn doctor_formats_direct_health_and_retry_backoff() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "laptop",
+                "virtual_ip": "10.20.0.5",
+                "direct_retry_after_ms": 10000,
+                "direct_retry_remaining_ms": 4200,
+                "direct": {
+                    "success_count": 3,
+                    "failure_count": 2,
+                    "rtt_ewma_ms": 18,
+                    "jitter_ms": 5
+                }
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+
+        assert_eq!(
+            direct_health_summary(peer).as_deref(),
+            Some("success=3 failure=2 rtt_ewma=18ms jitter=5ms")
+        );
+        assert_eq!(
+            direct_retry_summary(peer).as_deref(),
+            Some("next_probe_in=4200ms backoff=10000ms")
         );
     }
 
