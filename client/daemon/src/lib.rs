@@ -55,7 +55,7 @@ pub use error::{DaemonError, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p2pnet_crypto::NodeIdentity;
 use tokio::net::lookup_host;
@@ -78,8 +78,8 @@ use peer::{
 };
 use port_mapping::PortMappingManager;
 use relay::{
-    select_relay, RelayCandidateConfig, RelaySelectionDiagnostics, RelaySelectionOutcome,
-    RelayTicketCache, RelayTransport,
+    select_relay_with_cooldowns, RelayCandidateConfig, RelaySelectionDiagnostics,
+    RelaySelectionOutcome, RelayTicketCache, RelayTransport,
 };
 use transport::{EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
@@ -102,6 +102,8 @@ const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 /// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+/// Short cooldown after a selected Relay fails at runtime before trying it again.
+const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// The main daemon orchestrator.
 ///
@@ -1509,13 +1511,17 @@ impl RelaySupervisor {
     async fn run(self) {
         let mut retry_delay = Duration::from_secs(1);
         let max_retry_delay = Duration::from_secs(30);
+        let mut cooldowns: HashMap<String, Instant> = HashMap::new();
 
         loop {
+            let now = Instant::now();
+            cooldowns.retain(|_, until| *until > now);
+
             let RelaySelectionOutcome {
                 transport,
                 relay_rx,
                 diagnostics,
-            } = select_relay(
+            } = select_relay_with_cooldowns(
                 &self.relay_candidates,
                 &self.preferred_regions,
                 self.selection_timeout,
@@ -1525,6 +1531,7 @@ impl RelaySupervisor {
                 self.relay_ticket.clone(),
                 self.allow_insecure_plaintext,
                 self.ca_cert_path.clone(),
+                &cooldowns,
             )
             .await;
             let permanent_auth = diagnostics
@@ -1553,11 +1560,59 @@ impl RelaySupervisor {
                     .await;
                 *self.relay_transport.write().await = None;
 
-                let reason = match ended {
-                    Ok(()) => format!("relay {endpoint} disconnected; reconnecting"),
-                    Err(error) => format!("relay {endpoint} failed: {error}; reconnecting"),
+                let should_cooldown = self.relay_candidates.len() > 1;
+                let cooldown_ms = duration_millis(RELAY_RUNTIME_FAILURE_COOLDOWN);
+                if should_cooldown {
+                    cooldowns.insert(
+                        endpoint.clone(),
+                        Instant::now() + RELAY_RUNTIME_FAILURE_COOLDOWN,
+                    );
+                }
+
+                let (reason, fallback_code) = match (ended, should_cooldown) {
+                    (Ok(()), true) => (
+                        format!(
+                            "relay {endpoint} disconnected; cooling down for {cooldown_ms} ms before reselection"
+                        ),
+                        "runtime_disconnected",
+                    ),
+                    (Ok(()), false) => (
+                        format!("relay {endpoint} disconnected; reconnecting"),
+                        "runtime_disconnected",
+                    ),
+                    (Err(error), true) => (
+                        format!(
+                            "relay {endpoint} failed: {error}; cooling down for {cooldown_ms} ms before reselection"
+                        ),
+                        "runtime_failed",
+                    ),
+                    (Err(error), false) => (
+                        format!("relay {endpoint} failed: {error}; reconnecting"),
+                        "runtime_failed",
+                    ),
                 };
-                self.relay_selection.write().await.last_error = Some(reason.clone());
+
+                let mut diagnostics = self.relay_selection.write().await;
+                diagnostics.last_error = Some(reason.clone());
+                if diagnostics.last_error_code.is_none() {
+                    diagnostics.last_error_code = Some(fallback_code.to_string());
+                }
+                if let Some(candidate) = diagnostics
+                    .candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.endpoint == endpoint)
+                {
+                    if should_cooldown {
+                        candidate.cooldown_remaining_ms = Some(cooldown_ms);
+                        candidate.error = Some(format!(
+                            "relay runtime failure; cooling down for {cooldown_ms} ms"
+                        ));
+                    } else {
+                        candidate.error = Some("relay runtime failure; reconnecting".to_string());
+                    }
+                    candidate.error_code = Some(fallback_code.to_string());
+                }
+                drop(diagnostics);
                 warn!("{reason}");
             } else {
                 *self.relay_transport.write().await = None;
@@ -1574,6 +1629,10 @@ impl RelaySupervisor {
             retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 async fn run_network_outbound(
@@ -1882,7 +1941,7 @@ fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2pnet_relay::{Frame, RelayMessage};
+    use p2pnet_relay::{Frame, RelayMessage, RelayServer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1979,6 +2038,27 @@ mod tests {
         assert_eq!(candidates[0].endpoint, "west@127.0.0.1:18081");
     }
 
+    async fn wait_for_relay_endpoint(
+        relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+        expected_endpoint: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let matches = relay_transport
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|relay| relay.endpoint() == expected_endpoint);
+                if matches {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected relay endpoint was not published");
+    }
+
     async fn accept_relay_registration(listener: &TcpListener, node_id: &str) -> TcpStream {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut header = [0u8; 8];
@@ -2048,6 +2128,63 @@ mod tests {
 
         supervisor.abort();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_fails_over_to_standby_after_runtime_disconnect() {
+        let primary = RelayServer::start_random().await.unwrap();
+        let standby = RelayServer::start_random().await.unwrap();
+        let primary_endpoint = primary.addr.to_string();
+        let standby_endpoint = standby.addr.to_string();
+
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let peers = Arc::new(PeerManager::new(config));
+        let relay_transport = Arc::new(RwLock::new(None));
+        let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let supervisor = tokio::spawn(
+            RelaySupervisor {
+                relay_candidates: vec![
+                    RelayCandidateConfig::legacy(format!("primary@{primary_endpoint}")),
+                    RelayCandidateConfig::legacy(format!("standby@{standby_endpoint}")),
+                ],
+                preferred_regions: vec!["primary".to_string()],
+                selection_timeout: Duration::from_millis(500),
+                node_id: "node-a".to_string(),
+                peers,
+                relay_transport: relay_transport.clone(),
+                relay_selection: relay_selection.clone(),
+                inbound_tx,
+                ticket_cache: None,
+                relay_ticket: None,
+                allow_insecure_plaintext: true,
+                ca_cert_path: None,
+            }
+            .run(),
+        );
+
+        wait_for_relay_endpoint(relay_transport.clone(), &primary_endpoint).await;
+        primary.shutdown().await;
+        wait_for_relay_endpoint(relay_transport, &standby_endpoint).await;
+
+        let diagnostics = relay_selection.read().await.clone();
+        assert_eq!(
+            diagnostics.selected_endpoint.as_deref(),
+            Some(standby_endpoint.as_str())
+        );
+        let primary_candidate = diagnostics
+            .candidates
+            .iter()
+            .find(|candidate| candidate.endpoint == primary_endpoint)
+            .expect("primary relay candidate should remain in diagnostics");
+        assert_eq!(
+            primary_candidate.error_code.as_deref(),
+            Some("cooling_down")
+        );
+        assert!(primary_candidate.cooldown_remaining_ms.is_some());
+
+        supervisor.abort();
+        standby.shutdown().await;
     }
 
     #[test]

@@ -1087,6 +1087,9 @@ fn print_relay_diagnostics(snapshot: &Value) {
     if let Some(health) = relay_health_summary(relay) {
         println!("Relay health：{health}");
     }
+    for cooldown in relay_cooldown_summaries(relay).into_iter().take(3) {
+        println!("Relay cooldown：{cooldown}");
+    }
 
     if let Some(error) = relay.get("last_error").and_then(Value::as_str) {
         let code = relay
@@ -1131,6 +1134,38 @@ fn relay_ms_text(relay: &Value, field: &str) -> String {
         .and_then(Value::as_u64)
         .map(|ms| format!("{ms}ms"))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn relay_cooldown_summaries(relay: &Value) -> Vec<String> {
+    let Some(candidates) = relay.get("candidates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .get("error_code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "cooling_down" || code.starts_with("runtime_"))
+        })
+        .map(|candidate| {
+            let region = candidate
+                .get("region")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let endpoint = candidate
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let remaining = candidate
+                .get("cooldown_remaining_ms")
+                .and_then(Value::as_u64)
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("region={region} endpoint={endpoint} remaining={remaining}")
+        })
+        .collect()
 }
 
 fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
@@ -2064,6 +2099,27 @@ mod tests {
         assert_eq!(
             relay_health_summary(&relay).as_deref(),
             Some("pong=3 errors=1 last_rtt=42ms rtt_ewma=39ms jitter=5ms last_pong=250ms_ago")
+        );
+    }
+
+    #[test]
+    fn relay_cooldown_summary_reports_skipped_candidates() {
+        let relay = serde_json::json!({
+            "candidates": [{
+                "region": "cn-east",
+                "endpoint": "relay-a.example.com:443",
+                "cooldown_remaining_ms": 8_500,
+                "error_code": "cooling_down"
+            }, {
+                "region": "cn-south",
+                "endpoint": "relay-b.example.com:443",
+                "error_code": null
+            }]
+        });
+
+        assert_eq!(
+            relay_cooldown_summaries(&relay),
+            vec!["region=cn-east endpoint=relay-a.example.com:443 remaining=8500ms".to_string()]
         );
     }
 
