@@ -5,54 +5,32 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	server, err := NewRelayServer(config)
 	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+		t.Fatalf("failed to start relay server: %v", err)
 	}
-	addr := listener.Addr().String()
 
-	h := newHub()
-	stop := make(chan struct{})
-
-	atomic.StoreInt64(&activeConnections, 0)
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-stop:
-					return
-				default:
-					continue
-				}
-			}
-
-			if atomic.AddInt64(&activeConnections, 1) > int64(config.MaxConnections) {
-				atomic.AddInt64(&activeConnections, -1)
-				_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-				_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
-				_ = conn.Close()
-				continue
-			}
-
-			go handleConn(h, conn, config)
-		}
-	}()
+	go server.Serve()
 
 	cleanup := func() {
-		close(stop)
-		_ = listener.Close()
+		_ = server.Close()
 	}
 
-	return addr, cleanup
+	return server.Addr().String(), cleanup
+}
+
+func TestEnvValidation(t *testing.T) {
+	t.Setenv("RELAY_MAX_CONNECTIONS", "abc")
+	_, err := parseConfig(nil)
+	if err == nil {
+		t.Error("expected error for invalid RELAY_MAX_CONNECTIONS env value, got nil")
+	}
 }
 
 func TestConfigValidation(t *testing.T) {

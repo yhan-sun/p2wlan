@@ -111,7 +111,70 @@ func (h *hub) forward(srcID, dstID string, data []byte, maxFramePayload int) uin
 	}
 }
 
-var activeConnections int64
+type RelayServer struct {
+	config            *RelayConfig
+	listener          net.Listener
+	hub               *hub
+	activeConnections int64
+	wg                sync.WaitGroup
+	shutdownChan      chan struct{}
+}
+
+func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
+	listener, err := net.Listen("tcp", config.Bind)
+	if err != nil {
+		return nil, err
+	}
+	return &RelayServer{
+		config:       config,
+		listener:     listener,
+		hub:          newHub(),
+		shutdownChan: make(chan struct{}),
+	}, nil
+}
+
+func (s *RelayServer) Addr() net.Addr {
+	return s.listener.Addr()
+}
+
+func (s *RelayServer) Serve() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.shutdownChan:
+				return
+			default:
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				return
+			}
+		}
+
+		// Atomic connection limit check
+		if atomic.AddInt64(&s.activeConnections, 1) > int64(s.config.MaxConnections) {
+			atomic.AddInt64(&s.activeConnections, -1)
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
+			_ = conn.Close()
+			continue
+		}
+
+		s.wg.Add(1)
+		go func(c net.Conn) {
+			defer s.wg.Done()
+			s.handleConn(c)
+		}(conn)
+	}
+}
+
+func (s *RelayServer) Close() error {
+	close(s.shutdownChan)
+	err := s.listener.Close()
+	s.wg.Wait()
+	return err
+}
 
 func main() {
 	config, err := parseConfig(os.Args[1:])
@@ -119,42 +182,21 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", config.Bind)
+	server, err := NewRelayServer(config)
 	if err != nil {
-		log.Fatalf("listen %s: %v", config.Bind, err)
+		log.Fatalf("listen error: %v", err)
 	}
-	defer listener.Close()
 
-	h := newHub()
-	log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", listener.Addr(), config.MaxConnections, config.MaxFramePayload)
+	log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", server.Addr(), config.MaxConnections, config.MaxFramePayload)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-stop
-		_ = listener.Close()
+		_ = server.Close()
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			return
-		}
-
-		// Atomic connection limit check using atomic addition
-		if atomic.AddInt64(&activeConnections, 1) > int64(config.MaxConnections) {
-			atomic.AddInt64(&activeConnections, -1)
-			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-			_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
-			_ = conn.Close()
-			continue
-		}
-
-		go handleConn(h, conn, config)
-	}
+	server.Serve()
 }
 
 func getenv(key, fallback string) string {
@@ -164,38 +206,60 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getIntEnv(key string, fallback int) int {
+func getIntEnv(key string, fallback int) (int, error) {
 	val := os.Getenv(key)
 	if val == "" {
-		return fallback
+		return fallback, nil
 	}
 	i, err := strconv.Atoi(val)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("invalid env value for %s: %w", key, err)
 	}
-	return i
+	return i, nil
 }
 
-func getDurationEnv(key string, fallback time.Duration) time.Duration {
+func getDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
 	val := os.Getenv(key)
 	if val == "" {
-		return fallback
+		return fallback, nil
 	}
 	d, err := time.ParseDuration(val)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("invalid env value for %s: %w", key, err)
 	}
-	return d
+	return d, nil
 }
 
 func parseConfig(args []string) (*RelayConfig, error) {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
+
+	envSendQueue, err := getIntEnv("RELAY_SEND_QUEUE", 128)
+	if err != nil {
+		return nil, err
+	}
+	envRegisterTimeout, err := getDurationEnv("RELAY_REGISTER_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	envIdleTimeout, err := getDurationEnv("RELAY_IDLE_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	envMaxConnections, err := getIntEnv("RELAY_MAX_CONNECTIONS", 1000)
+	if err != nil {
+		return nil, err
+	}
+	envMaxFramePayload, err := getIntEnv("RELAY_MAX_FRAME_PAYLOAD", 65535)
+	if err != nil {
+		return nil, err
+	}
+
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
-	sendQueue := fs.Int("send-queue", getIntEnv("RELAY_SEND_QUEUE", 128), "Send queue capacity")
-	registerTimeout := fs.Duration("register-timeout", getDurationEnv("RELAY_REGISTER_TIMEOUT", 5*time.Second), "Register timeout")
-	idleTimeout := fs.Duration("idle-timeout", getDurationEnv("RELAY_IDLE_TIMEOUT", 30*time.Second), "Idle timeout")
-	maxConnections := fs.Int("max-connections", getIntEnv("RELAY_MAX_CONNECTIONS", 1000), "Maximum connections")
-	maxFramePayload := fs.Int("max-frame-payload", getIntEnv("RELAY_MAX_FRAME_PAYLOAD", 65535), "Maximum frame payload")
+	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
+	registerTimeout := fs.Duration("register-timeout", envRegisterTimeout, "Register timeout")
+	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
+	maxConnections := fs.Int("max-connections", envMaxConnections, "Maximum connections")
+	maxFramePayload := fs.Int("max-frame-payload", envMaxFramePayload, "Maximum frame payload")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -228,17 +292,17 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	return config, nil
 }
 
-func handleConn(h *hub, conn net.Conn, config *RelayConfig) {
+func (s *RelayServer) handleConn(conn net.Conn) {
 	p := &peer{
 		conn: conn,
-		send: make(chan []byte, config.SendQueueCapacity),
+		send: make(chan []byte, s.config.SendQueueCapacity),
 		done: make(chan struct{}),
 	}
 	defer func() {
-		h.unregister(p)
+		s.hub.unregister(p)
 		close(p.done)
 		_ = conn.Close()
-		atomic.AddInt64(&activeConnections, -1)
+		atomic.AddInt64(&s.activeConnections, -1)
 	}()
 
 	go func() {
@@ -259,8 +323,8 @@ func handleConn(h *hub, conn net.Conn, config *RelayConfig) {
 	}()
 
 	// Registration timeout
-	_ = conn.SetReadDeadline(time.Now().Add(config.RegisterTimeout))
-	typ, payload, err := readFrame(conn, config.MaxFramePayload)
+	_ = conn.SetReadDeadline(time.Now().Add(s.config.RegisterTimeout))
+	typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
 	if err != nil {
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -288,12 +352,12 @@ func handleConn(h *hub, conn net.Conn, config *RelayConfig) {
 		return
 	}
 
-	h.register(p, nodeID)
+	s.hub.register(p, nodeID)
 	queue(p, makeFrame(msgRegistered, []byte(nodeID)))
 
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(config.IdleTimeout))
-		typ, payload, err := readFrame(conn, config.MaxFramePayload)
+		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
+		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
 		if err != nil {
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -324,7 +388,7 @@ func handleConn(h *hub, conn net.Conn, config *RelayConfig) {
 				queue(p, errorFrame(4000, "malformed forward payload"))
 				continue
 			}
-			status := h.forward(p.id, dstID, data, config.MaxFramePayload)
+			status := s.hub.forward(p.id, dstID, data, s.config.MaxFramePayload)
 			if status != 0 {
 				queue(p, errorFrame(status, "forward failed"))
 			}
