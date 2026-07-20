@@ -187,9 +187,9 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
     }
     if let Some(ref stun) = cli.stun {
         for s in stun.split(',').map(str::trim).filter(|x| !x.is_empty()) {
-            if s.parse::<std::net::SocketAddr>().is_err() {
+            if !is_valid_stun_server_spec(s) {
                 return Err(format!(
-                    "Invalid SocketAddr in --stun (expected IP:port): {}",
+                    "Invalid STUN server in --stun (expected host:port or IP:port): {}",
                     s
                 ));
             }
@@ -227,6 +227,27 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn is_valid_stun_server_spec(value: &str) -> bool {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "none" | "off" | "false" | "clear" | "unset" | "disable" | "disabled"
+    ) {
+        return true;
+    }
+    if value.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.contains(char::is_whitespace)
+        && !host.contains('/')
+        && !host.contains('@')
+        && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 #[tokio::main]
@@ -683,8 +704,12 @@ mod tests {
         cli.mtu = Some(1420);
         cli.udp_bind = Some("0.0.0.0:51820".to_string());
         cli.udp_advertise = Some("203.0.113.10:51820".to_string());
+        cli.stun = Some("stun.l.google.com:19302,74.125.250.129:19302".to_string());
         cli.relay = Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string());
         assert!(validate_cli(&cli).is_ok());
+
+        cli.stun = Some("not-a-stun-server".to_string());
+        assert!(validate_cli(&cli).is_err());
     }
 
     #[test]

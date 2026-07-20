@@ -168,7 +168,7 @@ Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/serv
 | `mtu` | `1420` | 虚拟网卡 MTU |
 | `udp-bind` | `0.0.0.0:60207` | 本机直连 UDP 监听地址；云服务器建议固定端口 |
 | `udp-advertise` | `203.0.113.10:60207` | 发布给其他节点的公网 UDP 地址；用 `off` 清空 |
-| `stun` | `1.1.1.1:3478,8.8.8.8:3478` | STUN 服务器列表；用 `off` 清空 |
+| `stun` | `stun.l.google.com:19302,stun1.l.google.com:19302` | STUN 服务器列表，支持域名或 IP；用 `off` 禁用 |
 | `diagnostics` | `127.0.0.1:39277` | 本机诊断端点，只允许回环地址 |
 | `relay` | `default@47.109.40.237:18081` | Relay 候选列表 |
 | `relay-policy` | `auto` / `relay` | `auto` 优先直连，`relay` 强制中继 |

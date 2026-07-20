@@ -1375,9 +1375,7 @@ async fn poll_peers(
 
             seen.insert(peer.node_id.clone(), peer.clone());
             match state.peers.get(&peer.node_id) {
-                Some(known) if known.device_name != peer.device_name => {
-                    updated.push(peer.clone());
-                }
+                Some(known) if peer_metadata_changed(known, &peer) => updated.push(peer.clone()),
                 None => joined.push(peer.clone()),
                 _ => {}
             }
@@ -1405,6 +1403,15 @@ async fn poll_peers(
     }
 
     Ok(())
+}
+
+fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
+    known.device_name != peer.device_name
+        || known.public_key != peer.public_key
+        || known.endpoint != peer.endpoint
+        || known.nat_type != peer.nat_type
+        || known.virtual_ip != peer.virtual_ip
+        || known.online != peer.online
 }
 
 async fn create_tunnel(
@@ -1468,6 +1475,28 @@ mod tests {
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
+    }
+
+    #[test]
+    fn peer_endpoint_change_is_reported_as_metadata_update() {
+        let known = PeerInfo {
+            node_id: "peer-a".to_string(),
+            device_name: "peer".to_string(),
+            public_key: "key".to_string(),
+            endpoint: "192.168.1.10:5000".to_string(),
+            nat_type: "unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 1,
+        };
+        let mut updated = known.clone();
+        updated.endpoint = "203.0.113.10:62000".to_string();
+        updated.last_seen = 2;
+
+        assert!(peer_metadata_changed(&known, &updated));
+
+        updated.endpoint = known.endpoint.clone();
+        assert!(!peer_metadata_changed(&known, &updated));
     }
 
     #[test]

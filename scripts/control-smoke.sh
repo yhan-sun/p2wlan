@@ -107,6 +107,7 @@ for _ in {1..80}; do
        printf '%s' "$STATUS_B" | grep -q '"stats"' && \
        printf '%s' "$STATUS_B" | grep -q '"relay_selection"'; then
       "$ROOT_DIR/target/debug/p2pnet-daemon" \
+        --config "$TMP_DIR/node-a.json" \
         --status \
         --diagnostics-url "http://127.0.0.1:$DIAG_A_PORT/status" \
         >"$TMP_DIR/status-cli.json" 2>"$TMP_DIR/status-cli.log" || true

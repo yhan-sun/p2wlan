@@ -710,7 +710,14 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             println!(
                 "stun = {}",
                 if config.network.stun_servers.is_empty() {
-                    "(none)".to_string()
+                    "(default)".to_string()
+                } else if config
+                    .network
+                    .stun_servers
+                    .iter()
+                    .all(|value| is_clear_value(value))
+                {
+                    "(disabled)".to_string()
                 } else {
                     config.network.stun_servers.join(",")
                 }
@@ -801,13 +808,13 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
         }
         "stun" => {
             if is_clear_value(value) {
-                config.network.stun_servers.clear();
+                config.network.stun_servers = vec!["off".to_string()];
             } else {
                 let servers = value
                     .split(',')
                     .map(str::trim)
                     .filter(|item| !item.is_empty())
-                    .map(|item| parse_socket_addr(item, "stun").map(|addr| addr.to_string()))
+                    .map(|item| parse_stun_server_spec(item).map(ToString::to_string))
                     .collect::<Result<Vec<_>, _>>()?;
                 config.network.stun_servers = servers;
             }
@@ -854,6 +861,30 @@ fn parse_socket_addr(value: &str, label: &str) -> Result<SocketAddr, String> {
         .trim()
         .parse::<SocketAddr>()
         .map_err(|error| format!("{label} 必须是有效 ip:port：{error}"))
+}
+
+fn parse_stun_server_spec(value: &str) -> Result<&str, String> {
+    let spec = value.trim();
+    if spec.parse::<SocketAddr>().is_ok() {
+        return Ok(spec);
+    }
+    let Some((host, port)) = spec.rsplit_once(':') else {
+        return Err("stun 必须是有效 host:port 或 ip:port".to_string());
+    };
+    if host.is_empty()
+        || host.contains(char::is_whitespace)
+        || host.contains('/')
+        || host.contains('@')
+    {
+        return Err("stun host 不能为空，且不能包含空白、/ 或 @".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "stun 端口必须是 1 到 65535 的整数".to_string())?;
+    if port == 0 {
+        return Err("stun 端口必须是 1 到 65535 的整数".to_string());
+    }
+    Ok(spec)
 }
 
 fn parse_millis(value: &str, label: &str) -> Result<u64, String> {
@@ -1589,7 +1620,12 @@ mod tests {
         set_config_value(&mut config, "device-name", "linux-server").unwrap();
         set_config_value(&mut config, "udp-bind", "0.0.0.0:60207").unwrap();
         set_config_value(&mut config, "udp-advertise", "203.0.113.10:60207").unwrap();
-        set_config_value(&mut config, "stun", "1.1.1.1:3478,8.8.8.8:3478").unwrap();
+        set_config_value(
+            &mut config,
+            "stun",
+            "stun.l.google.com:19302,74.125.250.129:19302",
+        )
+        .unwrap();
         set_config_value(&mut config, "direct-timeout", "7000ms").unwrap();
         assert_eq!(config.network.mtu, 1380);
         assert!(!config.relay.prefer_direct);
@@ -1600,9 +1636,12 @@ mod tests {
             Some("203.0.113.10:60207")
         );
         assert_eq!(config.network.stun_servers.len(), 2);
+        assert_eq!(config.network.stun_servers[0], "stun.l.google.com:19302");
         assert_eq!(config.relay.fallback_timeout_ms, 7000);
         set_config_value(&mut config, "udp-advertise", "off").unwrap();
         assert!(config.network.udp_advertise.is_none());
+        set_config_value(&mut config, "stun", "off").unwrap();
+        assert_eq!(config.network.stun_servers, vec!["off".to_string()]);
         assert!(set_config_value(&mut config, "mtu", "10").is_err());
         assert!(set_config_value(&mut config, "udp-advertise", "0.0.0.0:60207").is_err());
         assert!(set_config_value(&mut config, "diagnostics", "0.0.0.0:39277").is_err());

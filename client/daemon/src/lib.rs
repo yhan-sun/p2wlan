@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p2pnet_crypto::NodeIdentity;
+use tokio::net::lookup_host;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
@@ -91,6 +92,10 @@ const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
 /// Short grace period for UDP/STUN candidate gathering before signaling a WireGuard offer.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
+/// Public STUN fallbacks used when older configs do not specify STUN servers.
+const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
+/// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
+const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The main daemon orchestrator.
 ///
@@ -303,8 +308,14 @@ impl Daemon {
             ))
         })?;
         let udp_advertise = self.config.network.udp_advertise.clone();
-        let stun_servers = parse_stun_servers(&self.config.network.stun_servers)?;
         let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
+        let stun_servers =
+            parse_stun_servers(&self.config.network.stun_servers, stun_timeout).await?;
+        if stun_servers.is_empty() {
+            info!("STUN candidate gathering is disabled");
+        } else {
+            info!("Using STUN endpoints: {stun_servers:?}");
+        }
         let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
@@ -417,7 +428,7 @@ impl Daemon {
                     *udp_transport.write().await = Some(udp.clone());
 
                     let mut candidate_endpoints =
-                        match udp.gather_candidates(stun_servers, stun_timeout).await {
+                        match udp.gather_candidates(stun_servers.clone(), stun_timeout).await {
                             Ok(candidates) => candidates,
                             Err(err) => {
                                 warn!("Failed to gather UDP candidates: {err}");
@@ -427,8 +438,11 @@ impl Daemon {
 
                     match udp.local_addr() {
                         Ok(addr) => {
-                            if let Some(endpoint) =
-                                advertised_udp_endpoint(addr, udp_advertise.as_deref())
+                            if let Some(endpoint) = advertised_udp_endpoint(
+                                addr,
+                                udp_advertise.as_deref(),
+                                &candidate_endpoints,
+                            )
                             {
                                 if !candidate_endpoints.contains(&endpoint) {
                                     candidate_endpoints.insert(0, endpoint.clone());
@@ -441,7 +455,7 @@ impl Daemon {
                                 }
                             } else {
                                 warn!(
-                                    "UDP transport listening on {addr}; endpoint not advertised because bind address is unspecified. Set --udp-advertise to publish a reachable endpoint."
+                                    "UDP transport listening on {addr}; no reachable endpoint was discovered or configured."
                                 );
                             }
                         }
@@ -455,12 +469,32 @@ impl Daemon {
                     *local_candidates.write().await = candidate_endpoints;
 
                     if keepalive_interval.is_zero() {
-                        udp.run_inbound(udp_inbound_tx).await
+                        let refresh_udp = udp.clone();
+                        tokio::select! {
+                            result = udp.run_inbound(udp_inbound_tx) => result,
+                            _ = run_udp_candidate_refresh(
+                                refresh_udp,
+                                stun_servers,
+                                stun_timeout,
+                                udp_advertise,
+                                local_candidates,
+                                control,
+                            ) => Ok(()),
+                        }
                     } else {
                         let keepalive_udp = udp.clone();
+                        let refresh_udp = udp.clone();
                         tokio::select! {
                             result = udp.run_inbound(udp_inbound_tx) => result,
                             _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
+                            _ = run_udp_candidate_refresh(
+                                refresh_udp,
+                                stun_servers,
+                                stun_timeout,
+                                udp_advertise,
+                                local_candidates,
+                                control,
+                            ) => Ok(()),
                         }
                     }
                 }
@@ -784,6 +818,13 @@ impl Daemon {
 
                 ControlEvent::PeerUpdated(peer_info) => {
                     self.peers.add_peer(&peer_info).await;
+                    if let Err(err) = self.maybe_initiate_handshake(&peer_info).await {
+                        warn!(
+                            "Failed to refresh WireGuard handshake with {} after peer update: {err}",
+                            peer_info.node_id
+                        );
+                    }
+                    self.start_hole_punch(&peer_info.node_id).await;
                 }
 
                 ControlEvent::PeerLeft(node_id) => {
@@ -1203,7 +1244,11 @@ impl Daemon {
     }
 }
 
-fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> Option<String> {
+fn advertised_udp_endpoint(
+    local_addr: SocketAddr,
+    configured: Option<&str>,
+    candidates: &[String],
+) -> Option<String> {
     if let Some(endpoint) = configured
         .map(str::trim)
         .filter(|endpoint| !endpoint.is_empty())
@@ -1211,11 +1256,101 @@ fn advertised_udp_endpoint(local_addr: SocketAddr, configured: Option<&str>) -> 
         return Some(endpoint.to_string());
     }
 
-    if local_addr.ip().is_unspecified() {
-        return None;
+    if !local_addr.ip().is_unspecified() {
+        return Some(local_addr.to_string());
     }
 
-    Some(local_addr.to_string())
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+        .find(|candidate| is_public_udp_candidate(*candidate))
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+                .find(|candidate| !candidate.ip().is_unspecified() && !candidate.ip().is_loopback())
+        })
+        .map(|candidate| candidate.to_string())
+}
+
+fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
+    match candidate.ip() {
+        std::net::IpAddr::V4(ip) => {
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+        }
+        std::net::IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unique_local()
+                && (ip.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+async fn run_udp_candidate_refresh(
+    udp: UdpTransport,
+    stun_servers: Vec<SocketAddr>,
+    stun_timeout: Duration,
+    udp_advertise: Option<String>,
+    local_candidates: Arc<RwLock<Vec<String>>>,
+    control: ControlClient,
+) {
+    let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+
+        let mut candidates = match udp
+            .gather_candidates(stun_servers.clone(), stun_timeout)
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                warn!("Periodic UDP candidate refresh failed: {err}");
+                continue;
+            }
+        };
+
+        let advertised_endpoint = udp.local_addr().ok().and_then(|local_addr| {
+            advertised_udp_endpoint(local_addr, udp_advertise.as_deref(), &candidates)
+        });
+        if let Some(endpoint) = advertised_endpoint.as_ref() {
+            if !candidates.contains(endpoint) {
+                candidates.insert(0, endpoint.clone());
+            }
+        }
+
+        let changed = {
+            let mut current = local_candidates.write().await;
+            if *current == candidates {
+                false
+            } else {
+                *current = candidates.clone();
+                true
+            }
+        };
+        if !changed {
+            continue;
+        }
+
+        info!(
+            "UDP candidates changed after network update; refreshed {} candidates",
+            candidates.len()
+        );
+        if let Some(endpoint) = advertised_endpoint {
+            if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+                warn!("Failed to publish refreshed UDP endpoint {endpoint}: {err}");
+            }
+        }
+    }
 }
 
 fn infer_default_relay_servers(control_server_url: &str) -> Vec<String> {
@@ -1506,15 +1641,84 @@ fn decode_x25519_key(hex_value: &str, label: &str) -> Result<[u8; 32]> {
     })
 }
 
-fn parse_stun_servers(values: &[String]) -> Result<Vec<SocketAddr>> {
-    values
+async fn parse_stun_servers(
+    values: &[String],
+    resolve_timeout: Duration,
+) -> Result<Vec<SocketAddr>> {
+    let using_defaults = values.is_empty();
+    let specs: Vec<String> = if using_defaults {
+        DEFAULT_STUN_SERVERS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    } else {
+        values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    if specs
         .iter()
-        .map(|value| {
-            value.trim().parse::<SocketAddr>().map_err(|e| {
-                DaemonError::Config(format!("invalid STUN server '{}': {e}", value.trim()))
-            })
-        })
-        .collect()
+        .all(|value| is_stun_clear_value(value.as_str()))
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut resolved = Vec::new();
+    for spec in specs {
+        if is_stun_clear_value(&spec) {
+            continue;
+        }
+        if let Ok(addr) = spec.parse::<SocketAddr>() {
+            if !resolved.contains(&addr) {
+                resolved.push(addr);
+            }
+            continue;
+        }
+
+        let addrs = match tokio::time::timeout(resolve_timeout, lookup_host(&spec)).await {
+            Ok(Ok(addrs)) => addrs,
+            Err(_) if using_defaults => {
+                warn!(
+                    "Default STUN server {spec} resolution timed out after {} ms",
+                    resolve_timeout.as_millis()
+                );
+                continue;
+            }
+            Err(_) => {
+                return Err(DaemonError::Config(format!(
+                    "STUN server '{spec}' resolution timed out after {} ms",
+                    resolve_timeout.as_millis()
+                )));
+            }
+            Ok(Err(err)) if using_defaults => {
+                warn!("Default STUN server {spec} could not be resolved: {err}");
+                continue;
+            }
+            Ok(Err(err)) => {
+                return Err(DaemonError::Config(format!(
+                    "invalid or unresolved STUN server '{spec}': {err}"
+                )));
+            }
+        };
+        for addr in addrs {
+            if !resolved.contains(&addr) {
+                resolved.push(addr);
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn is_stun_clear_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "false" | "clear" | "unset" | "disable" | "disabled"
+    )
 }
 
 // ============================================================
@@ -1598,22 +1802,32 @@ mod tests {
     fn test_advertised_udp_endpoint_uses_configured_value() {
         let local = "0.0.0.0:51820".parse().unwrap();
         assert_eq!(
-            advertised_udp_endpoint(local, Some("203.0.113.10:51820")),
+            advertised_udp_endpoint(local, Some("203.0.113.10:51820"), &[]),
             Some("203.0.113.10:51820".to_string())
         );
     }
 
     #[test]
-    fn test_advertised_udp_endpoint_skips_unspecified_address() {
+    fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
         let local = "0.0.0.0:51820".parse().unwrap();
-        assert_eq!(advertised_udp_endpoint(local, None), None);
+        assert_eq!(
+            advertised_udp_endpoint(
+                local,
+                None,
+                &[
+                    "192.168.1.10:51820".to_string(),
+                    "74.125.250.129:43000".to_string()
+                ]
+            ),
+            Some("74.125.250.129:43000".to_string())
+        );
     }
 
     #[test]
     fn test_advertised_udp_endpoint_uses_specific_bind_address() {
         let local = "127.0.0.1:51820".parse().unwrap();
         assert_eq!(
-            advertised_udp_endpoint(local, None),
+            advertised_udp_endpoint(local, None, &[]),
             Some("127.0.0.1:51820".to_string())
         );
     }
@@ -1708,20 +1922,47 @@ mod tests {
         assert!(infer_default_relay_servers("https://ctrl.test").is_empty());
     }
 
-    #[test]
-    fn test_parse_stun_servers() {
-        let servers =
-            parse_stun_servers(&["127.0.0.1:3478".to_string(), " 10.0.0.1:3478 ".to_string()])
-                .unwrap();
+    #[tokio::test]
+    async fn test_parse_stun_servers() {
+        let servers = parse_stun_servers(
+            &["127.0.0.1:3478".to_string(), " 10.0.0.1:3478 ".to_string()],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0], "127.0.0.1:3478".parse().unwrap());
         assert_eq!(servers[1], "10.0.0.1:3478".parse().unwrap());
     }
 
-    #[test]
-    fn test_parse_stun_servers_rejects_invalid_endpoint() {
-        let err = parse_stun_servers(&["not-a-socket".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("invalid STUN server"));
+    #[tokio::test]
+    async fn test_parse_stun_servers_resolves_hostname() {
+        let servers = parse_stun_servers(&["localhost:3478".to_string()], Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(servers
+            .iter()
+            .any(|server| server.ip().is_loopback() && server.port() == 3478));
+    }
+
+    #[tokio::test]
+    async fn test_parse_stun_servers_can_be_disabled() {
+        assert!(
+            parse_stun_servers(&["off".to_string()], Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_stun_servers_rejects_invalid_endpoint() {
+        let err = parse_stun_servers(&["not-a-socket".to_string()], Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid or unresolved STUN server"));
     }
 
     #[tokio::test]

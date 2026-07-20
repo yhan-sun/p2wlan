@@ -449,9 +449,8 @@ impl PeerManager {
         }
     }
 
-    /// Record that a UDP punch endpoint is reachable without fully promoting it
-    /// to Direct. Direct is only confirmed after a WireGuard packet decrypts
-    /// successfully from the endpoint.
+    /// Record that a UDP punch endpoint is reachable. A matched ACK confirms
+    /// bidirectional UDP reachability; an inbound punch alone remains provisional.
     pub async fn record_direct_probe_success(&self, node_id: &str, endpoint: SocketAddr) {
         self.record_direct_probe_success_with_latency(node_id, endpoint, None)
             .await;
@@ -466,9 +465,14 @@ impl PeerManager {
     ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.endpoint = Some(endpoint);
+            let ack_confirmed = latency.is_some();
             match latency {
                 Some(latency) => conn.direct_health.record_success_with_latency(latency),
                 None => conn.direct_health.record_success(),
+            }
+            if ack_confirmed {
+                conn.transition(ConnectionState::Direct);
+                return;
             }
             if matches!(
                 conn.state,
@@ -897,7 +901,13 @@ mod tests {
                 .await
         );
 
-        manager.record_direct_success("peer1", Some(endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(12)),
+            )
+            .await;
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.state, ConnectionState::Direct);
         assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
