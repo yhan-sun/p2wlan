@@ -158,6 +158,15 @@ impl UdpTransport {
             return Ok(None);
         };
 
+        self.send_packet_to(packet, endpoint).await.map(Some)
+    }
+
+    /// Send a single encrypted packet to a selector-provided direct endpoint.
+    pub async fn send_packet_to(
+        &self,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+    ) -> Result<usize> {
         let sent = self
             .socket
             .send_to(&packet.wire_bytes, endpoint)
@@ -184,7 +193,7 @@ impl UdpTransport {
             sent, packet.peer_id, endpoint, packet.dst_ip
         );
         self.peers.record_sent(&packet.peer_id, sent as u64).await;
-        Ok(Some(sent))
+        Ok(sent)
     }
 
     /// Consume encrypted packets until the channel closes.

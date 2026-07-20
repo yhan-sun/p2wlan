@@ -28,6 +28,20 @@ pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
 pub const REASON_DIRECT_SEND_FAILED: &str = "direct_send_failed";
 /// Stable reason code for WireGuard handshake timeout.
 pub const REASON_HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
+/// Path selector chose a confirmed Direct UDP pair.
+pub const REASON_PATH_DIRECT_CONFIRMED: &str = "path_direct_confirmed";
+/// Path selector chose a recent Direct trial while Relay stays available.
+pub const REASON_PATH_DIRECT_TRIAL: &str = "path_direct_trial";
+/// Path selector chose Direct because Relay is unavailable.
+pub const REASON_PATH_RELAY_UNAVAILABLE: &str = "path_relay_unavailable";
+/// Path selector chose Relay because Direct is disabled by policy.
+pub const REASON_PATH_DIRECT_DISABLED: &str = "path_direct_disabled";
+/// Path selector chose Relay because Direct has no candidate endpoint.
+pub const REASON_PATH_DIRECT_NO_ENDPOINT: &str = "path_direct_no_endpoint";
+/// Path selector chose Relay because Direct has not been confirmed.
+pub const REASON_PATH_DIRECT_NOT_CONFIRMED: &str = "path_direct_not_confirmed";
+/// Path selector found no usable Direct or Relay path.
+pub const REASON_PATH_UNAVAILABLE: &str = "path_unavailable";
 
 // ============================================================
 // Connection State
@@ -85,6 +99,58 @@ impl std::fmt::Display for NetworkPath {
         match self {
             Self::Direct => write!(f, "direct"),
             Self::Relay => write!(f, "relay"),
+        }
+    }
+}
+
+/// Explicit result from the data path selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSelection {
+    /// Selected path, if any path can be attempted.
+    pub path: Option<NetworkPath>,
+    /// Direct UDP endpoint to use when `path == Direct`.
+    pub direct_endpoint: Option<SocketAddr>,
+    /// Stable machine-readable reason code.
+    pub reason_code: &'static str,
+    /// Human-readable reason for diagnostics and logs.
+    pub reason: String,
+    /// Whether the chosen Direct path is fully confirmed.
+    pub direct_confirmed: bool,
+}
+
+impl PathSelection {
+    fn direct(
+        endpoint: SocketAddr,
+        reason_code: &'static str,
+        reason: impl Into<String>,
+        direct_confirmed: bool,
+    ) -> Self {
+        Self {
+            path: Some(NetworkPath::Direct),
+            direct_endpoint: Some(endpoint),
+            reason_code,
+            reason: reason.into(),
+            direct_confirmed,
+        }
+    }
+
+    fn relay(reason_code: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            path: Some(NetworkPath::Relay),
+            direct_endpoint: None,
+            reason_code,
+            reason: reason.into(),
+            direct_confirmed: false,
+        }
+    }
+
+    fn unavailable(reason_code: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            path: None,
+            direct_endpoint: None,
+            reason_code,
+            reason: reason.into(),
+            direct_confirmed: false,
         }
     }
 }
@@ -486,6 +552,89 @@ impl PeerConnection {
         })
     }
 
+    fn select_path_for_data(
+        &self,
+        local_generation: u64,
+        prefer_direct: bool,
+        relay_available: bool,
+    ) -> PathSelection {
+        let direct_endpoint = self.direct_endpoint_for_send(local_generation);
+
+        if !prefer_direct {
+            return if relay_available {
+                PathSelection::relay(
+                    REASON_PATH_DIRECT_DISABLED,
+                    "relay policy disables direct UDP",
+                )
+            } else if let Some(endpoint) = direct_endpoint {
+                PathSelection::direct(
+                    endpoint,
+                    REASON_PATH_RELAY_UNAVAILABLE,
+                    "relay unavailable; attempting best-effort direct UDP",
+                    false,
+                )
+            } else {
+                PathSelection::unavailable(
+                    REASON_PATH_UNAVAILABLE,
+                    "relay unavailable and no direct UDP endpoint exists",
+                )
+            };
+        }
+
+        let Some(endpoint) = direct_endpoint else {
+            return if relay_available {
+                PathSelection::relay(
+                    REASON_PATH_DIRECT_NO_ENDPOINT,
+                    "direct UDP has no candidate endpoint",
+                )
+            } else {
+                PathSelection::unavailable(
+                    REASON_PATH_UNAVAILABLE,
+                    "no relay and no direct UDP endpoint exists",
+                )
+            };
+        };
+
+        let direct_pair_ready = self.has_current_direct_pair_for_data(local_generation);
+        if self.state == ConnectionState::Direct && direct_pair_ready {
+            return PathSelection::direct(
+                endpoint,
+                REASON_PATH_DIRECT_CONFIRMED,
+                "direct UDP pair is confirmed",
+                true,
+            );
+        }
+
+        if !relay_available {
+            return PathSelection::direct(
+                endpoint,
+                REASON_PATH_RELAY_UNAVAILABLE,
+                "relay unavailable; attempting best-effort direct UDP",
+                false,
+            );
+        }
+
+        if direct_pair_ready
+            && self
+                .direct_health
+                .success_age()
+                .map(|age| age <= DIRECT_TRIAL_WINDOW)
+                .unwrap_or(false)
+        {
+            return PathSelection::direct(
+                endpoint,
+                REASON_PATH_DIRECT_TRIAL,
+                "recent direct UDP success is in trial window",
+                false,
+            );
+        }
+
+        PathSelection::relay(
+            REASON_PATH_DIRECT_NOT_CONFIRMED,
+            "direct UDP pair is not confirmed; using relay",
+        )
+    }
+
     fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
         self.ensure_candidate_pair(endpoint, local_generation)
             .record_probing();
@@ -739,6 +888,34 @@ impl PeerManager {
             .collect()
     }
 
+    /// Select the data path for one outbound encrypted packet.
+    pub async fn select_path_for_data(
+        &self,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+    ) -> PathSelection {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(|conn| conn.select_path_for_data(generation, prefer_direct, relay_available))
+            .unwrap_or_else(|| {
+                if relay_available {
+                    PathSelection::relay(
+                        REASON_PATH_DIRECT_NO_ENDPOINT,
+                        "peer has no direct state; using relay",
+                    )
+                } else {
+                    PathSelection::unavailable(
+                        REASON_PATH_UNAVAILABLE,
+                        "peer has no direct state and relay is unavailable",
+                    )
+                }
+            })
+    }
+
     /// Whether encrypted data should use direct UDP for this peer right now.
     pub async fn should_use_direct_for_data(
         &self,
@@ -746,29 +923,10 @@ impl PeerManager {
         prefer_direct: bool,
         relay_available: bool,
     ) -> bool {
-        let generation = self.current_network_generation().await;
-        let Some(conn) = self.connections.read().await.get(node_id).cloned() else {
-            return false;
-        };
-
-        if !prefer_direct || conn.direct_endpoint_for_send(generation).is_none() {
-            return false;
-        }
-
-        if conn.state == ConnectionState::Direct {
-            return conn.has_current_direct_pair_for_data(generation);
-        }
-
-        if !relay_available {
-            return true;
-        }
-
-        conn.direct_health
-            .success_age()
-            .map(|age| {
-                age <= DIRECT_TRIAL_WINDOW && conn.has_current_direct_pair_for_data(generation)
-            })
-            .unwrap_or(false)
+        self.select_path_for_data(node_id, prefer_direct, relay_available)
+            .await
+            .path
+            == Some(NetworkPath::Direct)
     }
 
     /// Whether direct retry suppression has expired for diagnostics/probing.
@@ -1189,6 +1347,19 @@ mod tests {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
     }
 
+    fn test_peer(node_id: &str, endpoint: SocketAddr) -> PeerInfo {
+        PeerInfo {
+            node_id: node_id.to_string(),
+            device_name: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+        }
+    }
+
     #[test]
     fn test_connection_state_display() {
         assert_eq!(ConnectionState::Idle.to_string(), "idle");
@@ -1520,6 +1691,55 @@ mod tests {
         assert_eq!(conn.endpoint, Some(selected_endpoint));
         assert_eq!(conn.state, ConnectionState::Idle);
         assert!(manager.direct_endpoints().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn path_selector_prefers_relay_until_direct_is_confirmed() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51831".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+        let waiting = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(waiting.path, Some(NetworkPath::Relay));
+        assert_eq!(waiting.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert_eq!(waiting.direct_endpoint, None);
+
+        let no_relay = manager.select_path_for_data("peer1", true, false).await;
+        assert_eq!(no_relay.path, Some(NetworkPath::Direct));
+        assert_eq!(no_relay.reason_code, REASON_PATH_RELAY_UNAVAILABLE);
+        assert_eq!(no_relay.direct_endpoint, Some(endpoint));
+        assert!(!no_relay.direct_confirmed);
+
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(6)),
+            )
+            .await;
+        let confirmed = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(confirmed.path, Some(NetworkPath::Direct));
+        assert_eq!(confirmed.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+        assert_eq!(confirmed.direct_endpoint, Some(endpoint));
+        assert!(confirmed.direct_confirmed);
+    }
+
+    #[tokio::test]
+    async fn path_selector_honors_relay_policy_and_reports_no_path() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51832".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        let relay_policy = manager.select_path_for_data("peer1", false, true).await;
+        assert_eq!(relay_policy.path, Some(NetworkPath::Relay));
+        assert_eq!(relay_policy.reason_code, REASON_PATH_DIRECT_DISABLED);
+
+        let no_state = manager.select_path_for_data("missing", true, false).await;
+        assert_eq!(no_state.path, None);
+        assert_eq!(no_state.reason_code, REASON_PATH_UNAVAILABLE);
     }
 
     #[tokio::test]
