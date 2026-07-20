@@ -30,6 +30,8 @@ pub struct RelayCandidateDiagnostics {
     pub region: String,
     pub endpoint: String,
     pub connect_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_ms: Option<u64>,
     pub error: Option<String>,
     pub error_code: Option<String>,
 }
@@ -369,33 +371,87 @@ pub async fn select_relay(
     allow_insecure_plaintext: bool,
     ca_cert_path: Option<String>,
 ) -> RelaySelectionOutcome {
+    let cooldowns = HashMap::new();
+    select_relay_with_cooldowns(
+        specs,
+        preferred_regions,
+        selection_timeout,
+        node_id,
+        peers,
+        ticket_cache,
+        static_relay_ticket,
+        allow_insecure_plaintext,
+        ca_cert_path,
+        &cooldowns,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn select_relay_with_cooldowns(
+    specs: &[RelayCandidateConfig],
+    preferred_regions: &[String],
+    selection_timeout: Duration,
+    node_id: &str,
+    peers: Arc<PeerManager>,
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    static_relay_ticket: Option<String>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
+    cooldowns: &HashMap<String, Instant>,
+) -> RelaySelectionOutcome {
     let mut diagnostics = RelaySelectionDiagnostics::default();
     let mut candidates = Vec::new();
     let mut seen_endpoints = HashSet::new();
+    let now = Instant::now();
 
     for (index, spec) in specs.iter().enumerate() {
         match parse_candidate(index, spec, preferred_regions) {
-            Ok(candidate) if seen_endpoints.insert(candidate.endpoint.clone()) => {
-                diagnostics.candidates.push(RelayCandidateDiagnostics {
-                    region: candidate.region.clone(),
-                    endpoint: candidate.endpoint.clone(),
-                    connect_latency_ms: None,
-                    error: None,
-                    error_code: None,
-                });
-                candidates.push(candidate);
+            Ok(candidate) => {
+                if let Some(remaining) = cooldowns
+                    .get(&candidate.endpoint)
+                    .and_then(|until| until.checked_duration_since(now))
+                {
+                    let remaining_ms = duration_millis(remaining);
+                    diagnostics.candidates.push(RelayCandidateDiagnostics {
+                        region: candidate.region,
+                        endpoint: candidate.endpoint,
+                        connect_latency_ms: None,
+                        cooldown_remaining_ms: Some(remaining_ms),
+                        error: Some(format!(
+                            "relay candidate cooling down for {remaining_ms} ms"
+                        )),
+                        error_code: Some("cooling_down".to_string()),
+                    });
+                    continue;
+                }
+
+                if seen_endpoints.insert(candidate.endpoint.clone()) {
+                    diagnostics.candidates.push(RelayCandidateDiagnostics {
+                        region: candidate.region.clone(),
+                        endpoint: candidate.endpoint.clone(),
+                        connect_latency_ms: None,
+                        cooldown_remaining_ms: None,
+                        error: None,
+                        error_code: None,
+                    });
+                    candidates.push(candidate);
+                } else {
+                    diagnostics.candidates.push(RelayCandidateDiagnostics {
+                        region: candidate.region,
+                        endpoint: candidate.endpoint,
+                        connect_latency_ms: None,
+                        cooldown_remaining_ms: None,
+                        error: Some("duplicate relay endpoint".to_string()),
+                        error_code: Some("duplicate_endpoint".to_string()),
+                    });
+                }
             }
-            Ok(candidate) => diagnostics.candidates.push(RelayCandidateDiagnostics {
-                region: candidate.region,
-                endpoint: candidate.endpoint,
-                connect_latency_ms: None,
-                error: Some("duplicate relay endpoint".to_string()),
-                error_code: Some("duplicate_endpoint".to_string()),
-            }),
             Err(error) => diagnostics.candidates.push(RelayCandidateDiagnostics {
                 region: "unknown".to_string(),
                 endpoint: spec.endpoint.trim().to_string(),
                 connect_latency_ms: None,
+                cooldown_remaining_ms: None,
                 error: Some(error),
                 error_code: Some("invalid_spec".to_string()),
             }),
@@ -746,8 +802,9 @@ impl RelayTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use p2pnet_relay::RelayServer;
     use tokio::sync::mpsc;
@@ -939,6 +996,51 @@ mod tests {
         drop(outcome);
         east.shutdown().await;
         west.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_selector_skips_cooled_down_candidate() {
+        let primary = RelayServer::start_random().await.unwrap();
+        let standby = RelayServer::start_random().await.unwrap();
+        let specs = vec![
+            RelayCandidateConfig::legacy(format!("primary@{}", primary.addr)),
+            RelayCandidateConfig::legacy(format!("standby@{}", standby.addr)),
+        ];
+        let mut cooldowns = HashMap::new();
+        cooldowns.insert(
+            primary.addr.to_string(),
+            Instant::now() + Duration::from_secs(30),
+        );
+
+        let outcome = select_relay_with_cooldowns(
+            &specs,
+            &["primary".to_string()],
+            Duration::from_secs(1),
+            "node-a",
+            peer_manager(),
+            None,
+            None,
+            true,
+            None,
+            &cooldowns,
+        )
+        .await;
+
+        let transport = outcome.transport.as_ref().unwrap();
+        assert_eq!(transport.region(), "standby");
+        assert_eq!(transport.endpoint(), standby.addr.to_string());
+        assert_eq!(
+            outcome.diagnostics.candidates[0].error_code.as_deref(),
+            Some("cooling_down")
+        );
+        assert!(outcome.diagnostics.candidates[0]
+            .cooldown_remaining_ms
+            .is_some());
+        assert!(outcome.diagnostics.candidates[1].error.is_none());
+
+        drop(outcome);
+        primary.shutdown().await;
+        standby.shutdown().await;
     }
 
     #[tokio::test]
