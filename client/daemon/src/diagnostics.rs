@@ -353,6 +353,7 @@ mod tests {
             Some(REASON_DIRECT_PROBE_FAILED)
         );
         assert_eq!(snapshot.peers[0].last_path_selection, None);
+        assert!(snapshot.peers[0].path_events.is_empty());
         let current_path = snapshot.peers[0]
             .current_path_selection
             .as_ref()

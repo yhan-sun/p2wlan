@@ -22,6 +22,7 @@ const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
+const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
@@ -256,6 +257,21 @@ impl From<&PathScore> for PathScoreDiagnostics {
             reason: score.reason.clone(),
         }
     }
+}
+
+/// One recorded path-selector transition for a peer.
+#[derive(Debug, Clone)]
+pub struct PathSelectionEvent {
+    pub selected_at: Instant,
+    pub network_generation: u64,
+    pub previous_path: Option<NetworkPath>,
+    pub selected_path: Option<NetworkPath>,
+    pub direct_endpoint: Option<SocketAddr>,
+    pub reason_code: String,
+    pub reason: String,
+    pub direct_confirmed: bool,
+    pub direct_score: Option<PathScore>,
+    pub relay_score: Option<PathScore>,
 }
 
 /// Reachability state for one direct candidate pair.
@@ -533,6 +549,8 @@ pub struct PeerConnection {
     pub candidate_pairs: Vec<CandidatePair>,
     /// Last selector decision made for outbound peer traffic.
     pub last_path_selection: Option<PathSelection>,
+    /// Recent real outbound path-selector transitions.
+    pub path_events: Vec<PathSelectionEvent>,
 }
 
 impl PeerConnection {
@@ -555,6 +573,7 @@ impl PeerConnection {
             direct_generation: 0,
             candidate_pairs: Vec::new(),
             last_path_selection: None,
+            path_events: Vec::new(),
         }
     }
 
@@ -1019,6 +1038,38 @@ impl PeerConnection {
     fn direct_retry_due(&self, base: Duration) -> bool {
         self.direct_health.retry_due(base)
     }
+
+    fn record_path_selection_event(&mut self, local_generation: u64, selection: &PathSelection) {
+        let previous = self.last_path_selection.as_ref();
+        let changed = previous
+            .map(|previous| {
+                previous.path != selection.path
+                    || previous.reason_code != selection.reason_code
+                    || previous.direct_endpoint != selection.direct_endpoint
+            })
+            .unwrap_or(true);
+        if !changed {
+            return;
+        }
+
+        self.path_events.push(PathSelectionEvent {
+            selected_at: Instant::now(),
+            network_generation: local_generation,
+            previous_path: previous.and_then(|selection| selection.path),
+            selected_path: selection.path,
+            direct_endpoint: selection.direct_endpoint,
+            reason_code: selection.reason_code.to_string(),
+            reason: selection.reason.clone(),
+            direct_confirmed: selection.direct_confirmed,
+            direct_score: selection.direct_score.clone(),
+            relay_score: selection.relay_score.clone(),
+        });
+
+        if self.path_events.len() > PATH_SELECTION_EVENT_LIMIT {
+            let excess = self.path_events.len() - PATH_SELECTION_EVENT_LIMIT;
+            self.path_events.drain(0..excess);
+        }
+    }
 }
 
 // ============================================================
@@ -1271,6 +1322,7 @@ impl PeerManager {
             Some(conn) => {
                 let selection =
                     conn.select_path_for_data(generation, prefer_direct, relay_available);
+                conn.record_path_selection_event(generation, &selection);
                 conn.last_path_selection = Some(selection.clone());
                 selection
             }
@@ -1623,6 +1675,7 @@ pub struct PeerDiagnostics {
     pub current_path_selection: Option<PathSelectionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_path_selection: Option<PathSelectionDiagnostics>,
+    pub path_events: Vec<PathSelectionEventDiagnostics>,
 }
 
 impl PeerDiagnostics {
@@ -1670,6 +1723,11 @@ impl PeerDiagnostics {
                 .last_path_selection
                 .as_ref()
                 .map(PathSelectionDiagnostics::from),
+            path_events: conn
+                .path_events
+                .iter()
+                .map(PathSelectionEventDiagnostics::from)
+                .collect(),
         }
     }
 }
@@ -1677,6 +1735,38 @@ impl PeerDiagnostics {
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
         Self::from_connection_with_path_selection(conn, None, None)
+    }
+}
+
+/// Serializable path-selector transition diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathSelectionEventDiagnostics {
+    pub selected_age_ms: u64,
+    pub network_generation: u64,
+    pub previous_path: Option<NetworkPath>,
+    pub selected_path: Option<NetworkPath>,
+    pub direct_endpoint: Option<String>,
+    pub reason_code: String,
+    pub reason: String,
+    pub direct_confirmed: bool,
+    pub direct_score: Option<PathScoreDiagnostics>,
+    pub relay_score: Option<PathScoreDiagnostics>,
+}
+
+impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
+    fn from(event: &PathSelectionEvent) -> Self {
+        Self {
+            selected_age_ms: duration_millis(event.selected_at.elapsed()),
+            network_generation: event.network_generation,
+            previous_path: event.previous_path,
+            selected_path: event.selected_path,
+            direct_endpoint: event.direct_endpoint.map(|endpoint| endpoint.to_string()),
+            reason_code: event.reason_code.clone(),
+            reason: event.reason.clone(),
+            direct_confirmed: event.direct_confirmed,
+            direct_score: event.direct_score.as_ref().map(PathScoreDiagnostics::from),
+            relay_score: event.relay_score.as_ref().map(PathScoreDiagnostics::from),
+        }
     }
 }
 
@@ -2267,6 +2357,61 @@ mod tests {
             degraded.direct_score.as_ref().unwrap().score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN
                 < degraded.relay_score.as_ref().unwrap().score
         );
+    }
+
+    #[tokio::test]
+    async fn path_selection_timeline_records_only_real_changes() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51837".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+        let first = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(first.path, Some(NetworkPath::Relay));
+        let repeated = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(repeated.path, Some(NetworkPath::Relay));
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics[0].path_events.len(), 1);
+        assert_eq!(diagnostics[0].path_events[0].previous_path, None);
+        assert_eq!(
+            diagnostics[0].path_events[0].selected_path,
+            Some(NetworkPath::Relay)
+        );
+        assert_eq!(
+            diagnostics[0].path_events[0].reason_code,
+            REASON_PATH_DIRECT_NOT_CONFIRMED
+        );
+
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(9)),
+            )
+            .await;
+        let direct = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(direct.path, Some(NetworkPath::Direct));
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics[0].path_events.len(), 2);
+        assert_eq!(
+            diagnostics[0].path_events[1].previous_path,
+            Some(NetworkPath::Relay)
+        );
+        assert_eq!(
+            diagnostics[0].path_events[1].selected_path,
+            Some(NetworkPath::Direct)
+        );
+        assert_eq!(
+            diagnostics[0].path_events[1].reason_code,
+            REASON_PATH_DIRECT_CONFIRMED
+        );
+
+        let json = serde_json::to_value(&diagnostics[0]).unwrap();
+        assert_eq!(json["path_events"].as_array().unwrap().len(), 2);
+        assert!(json["path_events"][1]["direct_score"]["score"].is_i64());
     }
 
     #[tokio::test]
