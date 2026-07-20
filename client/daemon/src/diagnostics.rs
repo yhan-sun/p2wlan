@@ -200,6 +200,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         .and_then(|udp| udp.local_addr().ok())
         .map(|addr| addr.to_string());
     let relay_connected = context.relay_transport.read().await.is_some();
+    let direct_retry_after = Duration::from_millis(context.config.relay.fallback_timeout_ms);
 
     let tasks = context.task_manager.task_statuses().await;
     let health_snap = context.health.snapshot(&tasks).await;
@@ -216,7 +217,11 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         relay_selection: context.relay_selection.read().await.clone(),
         peers: context
             .peers
-            .diagnostics_with_path_selection(context.config.relay.prefer_direct, relay_connected)
+            .diagnostics_with_path_selection(
+                context.config.relay.prefer_direct,
+                relay_connected,
+                direct_retry_after,
+            )
             .await,
         stats: context.peers.stats().await,
         health: health_snap,

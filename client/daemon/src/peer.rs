@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::control::PeerInfo;
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
+const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
@@ -225,6 +226,14 @@ pub struct CandidatePair {
     pub last_error: Option<String>,
     /// Most recent RTT measurement for this pair.
     pub rtt_ms: Option<u64>,
+    /// Smoothed RTT estimate for this pair.
+    pub rtt_ewma_ms: Option<u64>,
+    /// Smoothed absolute RTT variation for this pair.
+    pub jitter_ms: Option<u64>,
+    /// Successful reachability samples observed for this pair.
+    pub success_count: u64,
+    /// Failed reachability samples observed for this pair.
+    pub failure_count: u64,
 }
 
 impl CandidatePair {
@@ -240,6 +249,10 @@ impl CandidatePair {
             last_error_code: None,
             last_error: None,
             rtt_ms: None,
+            rtt_ewma_ms: None,
+            jitter_ms: None,
+            success_count: 0,
+            failure_count: 0,
         }
     }
 
@@ -259,10 +272,13 @@ impl CandidatePair {
         }
         self.last_success_at = Some(now);
         self.consecutive_failures = 0;
+        self.success_count = self.success_count.saturating_add(1);
         self.last_error_code = None;
         self.last_error = None;
         if let Some(latency) = latency {
-            self.rtt_ms = Some(duration_millis(latency));
+            let latency_ms = duration_millis(latency);
+            self.rtt_ms = Some(latency_ms);
+            update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
         }
         self.state = if selected {
             CandidatePairState::Selected
@@ -274,6 +290,7 @@ impl CandidatePair {
     fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
         self.last_failure_at = Some(Instant::now());
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.failure_count = self.failure_count.saturating_add(1);
         self.last_error_code = Some(code.into());
         self.last_error = Some(reason.into());
         self.state = if matches!(
@@ -322,24 +339,36 @@ pub struct PathHealth {
     pub last_error_code: Option<String>,
     /// Most recent measured round-trip time for this path.
     pub latency_ms: Option<u64>,
+    /// Smoothed RTT estimate for this path.
+    pub rtt_ewma_ms: Option<u64>,
+    /// Smoothed absolute RTT variation for this path.
+    pub jitter_ms: Option<u64>,
+    /// Successful path samples observed.
+    pub success_count: u64,
+    /// Failed path samples observed.
+    pub failure_count: u64,
 }
 
 impl PathHealth {
     fn record_success(&mut self) {
         self.last_success_at = Some(Instant::now());
         self.consecutive_failures = 0;
+        self.success_count = self.success_count.saturating_add(1);
         self.last_error = None;
         self.last_error_code = None;
     }
 
     fn record_success_with_latency(&mut self, latency: Duration) {
         self.record_success();
-        self.latency_ms = Some(duration_millis(latency));
+        let latency_ms = duration_millis(latency);
+        self.latency_ms = Some(latency_ms);
+        update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
     }
 
     fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
         self.last_failure_at = Some(Instant::now());
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.failure_count = self.failure_count.saturating_add(1);
         self.last_error_code = Some(code.into());
         self.last_error = Some(reason.into());
     }
@@ -347,6 +376,8 @@ impl PathHealth {
     fn record_generation_change(&mut self, reason: impl Into<String>) {
         self.last_success_at = None;
         self.latency_ms = None;
+        self.rtt_ewma_ms = None;
+        self.jitter_ms = None;
         self.consecutive_failures = 0;
         self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason);
     }
@@ -359,6 +390,29 @@ impl PathHealth {
     fn success_age(&self) -> Option<Duration> {
         self.last_success_at
             .map(|last_success| last_success.elapsed())
+    }
+
+    fn retry_after(&self, base: Duration) -> Duration {
+        if base.is_zero() || self.consecutive_failures <= 1 {
+            return base;
+        }
+        let exponent = self
+            .consecutive_failures
+            .saturating_sub(1)
+            .min(DIRECT_RETRY_BACKOFF_MAX_EXPONENT);
+        base.checked_mul(1_u32 << exponent).unwrap_or(Duration::MAX)
+    }
+
+    fn retry_remaining(&self, base: Duration) -> Duration {
+        let retry_after = self.retry_after(base);
+        match self.failure_age() {
+            Some(age) if age < retry_after => retry_after - age,
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn retry_due(&self, base: Duration) -> bool {
+        self.retry_remaining(base).is_zero()
     }
 }
 
@@ -642,6 +696,7 @@ impl PeerConnection {
         }
 
         if direct_pair_ready
+            && self.direct_health.consecutive_failures == 0
             && self
                 .direct_health
                 .success_age()
@@ -706,6 +761,18 @@ impl PeerConnection {
             }
         }
         self.ensure_current_candidate_pairs(local_generation);
+    }
+
+    fn direct_retry_after(&self, base: Duration) -> Duration {
+        self.direct_health.retry_after(base)
+    }
+
+    fn direct_retry_remaining(&self, base: Duration) -> Duration {
+        self.direct_health.retry_remaining(base)
+    }
+
+    fn direct_retry_due(&self, base: Duration) -> bool {
+        self.direct_health.retry_due(base)
     }
 }
 
@@ -915,6 +982,37 @@ impl PeerManager {
             .collect()
     }
 
+    /// Return candidate endpoints that are due for direct-path reprobe.
+    ///
+    /// Unlike `direct_probe_targets`, this only transitions pairs to Probing
+    /// after the peer-level retry cooldown has elapsed, so diagnostics do not
+    /// report a probe that was intentionally suppressed by backoff.
+    pub async fn direct_probe_targets_due(
+        &self,
+        base_retry_after: Duration,
+    ) -> Vec<(String, Vec<SocketAddr>)> {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .write()
+            .await
+            .values_mut()
+            .filter(|conn| conn.state != ConnectionState::Direct)
+            .filter(|conn| conn.direct_retry_due(base_retry_after))
+            .filter_map(|conn| {
+                let endpoints = conn.candidate_probe_endpoints(generation);
+
+                if endpoints.is_empty() {
+                    None
+                } else {
+                    for endpoint in &endpoints {
+                        conn.mark_candidate_pair_probing(*endpoint, generation);
+                    }
+                    Some((conn.node_id.clone(), endpoints))
+                }
+            })
+            .collect()
+    }
+
     /// Select the data path for one outbound encrypted packet.
     pub async fn select_path_for_data(
         &self,
@@ -966,10 +1064,7 @@ impl PeerManager {
             return false;
         };
 
-        conn.direct_health
-            .failure_age()
-            .map(|age| age >= retry_after)
-            .unwrap_or(true)
+        conn.direct_retry_due(retry_after)
     }
 
     /// Whether the peer currently has a verified direct path.
@@ -1199,6 +1294,7 @@ impl PeerManager {
         &self,
         prefer_direct: bool,
         relay_available: bool,
+        direct_retry_after: Duration,
     ) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
         let mut peers: Vec<_> = self
@@ -1209,7 +1305,11 @@ impl PeerManager {
             .map(|conn| {
                 let current_selection =
                     conn.select_path_for_data(generation, prefer_direct, relay_available);
-                PeerDiagnostics::from_connection_with_path_selection(conn, Some(&current_selection))
+                PeerDiagnostics::from_connection_with_path_selection(
+                    conn,
+                    Some(&current_selection),
+                    Some(direct_retry_after),
+                )
             })
             .collect();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1271,6 +1371,10 @@ pub struct PeerDiagnostics {
     pub direct_generation: u64,
     pub candidate_pairs: Vec<CandidatePairDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_retry_remaining_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub current_path_selection: Option<PathSelectionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_path_selection: Option<PathSelectionDiagnostics>,
@@ -1280,6 +1384,7 @@ impl PeerDiagnostics {
     fn from_connection_with_path_selection(
         conn: &PeerConnection,
         current_selection: Option<&PathSelection>,
+        direct_retry_after: Option<Duration>,
     ) -> Self {
         let mut candidate_pairs = conn
             .candidate_pairs
@@ -1311,6 +1416,10 @@ impl PeerDiagnostics {
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
             candidate_pairs,
+            direct_retry_after_ms: direct_retry_after
+                .map(|base| duration_millis(conn.direct_retry_after(base))),
+            direct_retry_remaining_ms: direct_retry_after
+                .map(|base| duration_millis(conn.direct_retry_remaining(base))),
             current_path_selection: current_selection.map(PathSelectionDiagnostics::from),
             last_path_selection: conn
                 .last_path_selection
@@ -1322,7 +1431,7 @@ impl PeerDiagnostics {
 
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
-        Self::from_connection_with_path_selection(conn, None)
+        Self::from_connection_with_path_selection(conn, None, None)
     }
 }
 
@@ -1339,6 +1448,10 @@ pub struct CandidatePairDiagnostics {
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
     pub rtt_ms: Option<u64>,
+    pub rtt_ewma_ms: Option<u64>,
+    pub jitter_ms: Option<u64>,
+    pub success_count: u64,
+    pub failure_count: u64,
 }
 
 impl From<&CandidatePair> for CandidatePairDiagnostics {
@@ -1354,6 +1467,10 @@ impl From<&CandidatePair> for CandidatePairDiagnostics {
             last_error: pair.last_error.clone(),
             last_error_code: pair.last_error_code.clone(),
             rtt_ms: pair.rtt_ms,
+            rtt_ewma_ms: pair.rtt_ewma_ms,
+            jitter_ms: pair.jitter_ms,
+            success_count: pair.success_count,
+            failure_count: pair.failure_count,
         }
     }
 }
@@ -1367,6 +1484,10 @@ pub struct PathHealthDiagnostics {
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
     pub latency_ms: Option<u64>,
+    pub rtt_ewma_ms: Option<u64>,
+    pub jitter_ms: Option<u64>,
+    pub success_count: u64,
+    pub failure_count: u64,
 }
 
 impl From<&PathHealth> for PathHealthDiagnostics {
@@ -1378,6 +1499,10 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             last_error: health.last_error.clone(),
             last_error_code: health.last_error_code.clone(),
             latency_ms: health.latency_ms,
+            rtt_ewma_ms: health.rtt_ewma_ms,
+            jitter_ms: health.jitter_ms,
+            success_count: health.success_count,
+            failure_count: health.failure_count,
         }
     }
 }
@@ -1408,6 +1533,27 @@ fn candidate_pair_send_rank(state: CandidatePairState) -> u8 {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn update_latency_ewma(ewma_ms: &mut Option<u64>, jitter_ms: &mut Option<u64>, sample_ms: u64) {
+    match *ewma_ms {
+        Some(previous) => {
+            let delta = sample_ms.abs_diff(previous);
+            let next_ewma = ((previous as u128 * 7) + sample_ms as u128).div_ceil(8) as u64;
+            let next_jitter = match *jitter_ms {
+                Some(previous_jitter) => {
+                    ((previous_jitter as u128 * 3) + delta as u128).div_ceil(4) as u64
+                }
+                None => delta,
+            };
+            *ewma_ms = Some(next_ewma);
+            *jitter_ms = Some(next_jitter);
+        }
+        None => {
+            *ewma_ms = Some(sample_ms);
+            *jitter_ms = Some(0);
+        }
+    }
 }
 
 // ============================================================
@@ -1825,7 +1971,9 @@ mod tests {
 
         manager.add_peer(&test_peer("peer1", endpoint)).await;
 
-        let diagnostics = manager.diagnostics_with_path_selection(true, true).await;
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
         assert_eq!(diagnostics.len(), 1);
         let current = diagnostics[0].current_path_selection.as_ref().unwrap();
         assert_eq!(current.path, Some(NetworkPath::Relay));
@@ -1836,7 +1984,9 @@ mod tests {
         let selected = manager.select_path_for_data("peer1", true, true).await;
         assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
 
-        let diagnostics = manager.diagnostics_with_path_selection(true, true).await;
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
         let current = diagnostics[0].current_path_selection.as_ref().unwrap();
         let last = diagnostics[0].last_path_selection.as_ref().unwrap();
         assert_eq!(current.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
@@ -1851,6 +2001,76 @@ mod tests {
             json["last_path_selection"]["reason_code"],
             REASON_PATH_DIRECT_NOT_CONFIRMED
         );
+    }
+
+    #[tokio::test]
+    async fn direct_probe_targets_due_respects_backoff_without_false_probing() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51834".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+        let first_targets = manager
+            .direct_probe_targets_due(Duration::from_secs(5))
+            .await;
+        assert_eq!(first_targets, vec![("peer1".to_string(), vec![endpoint])]);
+
+        manager
+            .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "no ACK")
+            .await;
+        manager
+            .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "still no ACK")
+            .await;
+
+        let suppressed = manager
+            .direct_probe_targets_due(Duration::from_secs(5))
+            .await;
+        assert!(suppressed.is_empty());
+
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(diagnostics[0].direct_retry_after_ms, Some(10_000));
+        assert!(diagnostics[0].direct_retry_remaining_ms.unwrap() > 0);
+        assert_eq!(diagnostics[0].direct.failure_count, 2);
+        assert!(diagnostics[0].candidate_pairs.iter().all(|pair| {
+            pair.state != CandidatePairState::Probing
+                && pair.failure_count == 2
+                && pair.last_error_code.as_deref() == Some(REASON_DIRECT_PROBE_FAILED)
+        }));
+    }
+
+    #[tokio::test]
+    async fn direct_path_latency_tracks_ewma_and_jitter() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51835".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(8)),
+            )
+            .await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(24)),
+            )
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics[0].direct.success_count, 2);
+        assert_eq!(diagnostics[0].direct.latency_ms, Some(24));
+        assert_eq!(diagnostics[0].direct.rtt_ewma_ms, Some(10));
+        assert_eq!(diagnostics[0].direct.jitter_ms, Some(4));
+        assert_eq!(diagnostics[0].candidate_pairs[0].success_count, 2);
+        assert_eq!(diagnostics[0].candidate_pairs[0].rtt_ewma_ms, Some(10));
+        assert_eq!(diagnostics[0].candidate_pairs[0].jitter_ms, Some(4));
     }
 
     #[tokio::test]

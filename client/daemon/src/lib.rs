@@ -1680,11 +1680,7 @@ async fn run_direct_probe_loop(
             continue;
         };
 
-        for (peer_id, candidates) in peers.direct_probe_targets().await {
-            if !peers.direct_retry_due(&peer_id, retry_after).await {
-                continue;
-            }
-
+        for (peer_id, candidates) in peers.direct_probe_targets_due(retry_after).await {
             let udp = udp.clone();
             let peers = peers.clone();
             let generation = peers.current_network_generation().await;
