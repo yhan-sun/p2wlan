@@ -184,7 +184,6 @@ func GenerateNodeToken() string {
 	return hex.EncodeToString(b)
 }
 
-
 // RequireAnyAuth is middleware that accepts either a user JWT or a device credential.
 func RequireAnyAuth(authService *Service, db interface {
 	ValidateDeviceCredential(token string) (*database.DeviceCredential, *database.Device, error)
