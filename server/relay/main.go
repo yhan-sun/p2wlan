@@ -13,8 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"unicode/utf8"
 	"time"
+	"unicode/utf8"
 )
 
 var magic = []byte{'D', 'E', 'R', 'P'}
@@ -39,12 +39,12 @@ var (
 )
 
 type RelayConfig struct {
-	Bind               string
-	SendQueueCapacity  int
-	RegisterTimeout    time.Duration
-	IdleTimeout        time.Duration
-	MaxConnections     int
-	MaxFramePayload    int
+	Bind              string
+	SendQueueCapacity int
+	RegisterTimeout   time.Duration
+	IdleTimeout       time.Duration
+	MaxConnections    int
+	MaxFramePayload   int
 }
 
 type peer struct {
@@ -122,6 +122,7 @@ type RelayServer struct {
 	closeOnce         sync.Once
 
 	mu          sync.Mutex
+	closing     bool
 	connections map[net.Conn]struct{}
 }
 
@@ -158,20 +159,27 @@ func (s *RelayServer) Serve() {
 			}
 		}
 
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+
 		// Atomic connection limit check
 		if atomic.AddInt64(&s.activeConnections, 1) > int64(s.config.MaxConnections) {
 			atomic.AddInt64(&s.activeConnections, -1)
+			s.mu.Unlock()
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
 			_ = conn.Close()
 			continue
 		}
 
-		s.mu.Lock()
 		s.connections[conn] = struct{}{}
+		s.wg.Add(1)
 		s.mu.Unlock()
 
-		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer func() {
 				s.mu.Lock()
@@ -187,10 +195,11 @@ func (s *RelayServer) Serve() {
 func (s *RelayServer) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
 		close(s.shutdownChan)
 		err = s.listener.Close()
 
-		s.mu.Lock()
 		for c := range s.connections {
 			_ = c.Close()
 		}
@@ -290,12 +299,12 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	}
 
 	config := &RelayConfig{
-		Bind:               *bind,
-		SendQueueCapacity:  *sendQueue,
-		RegisterTimeout:    *registerTimeout,
-		IdleTimeout:        *idleTimeout,
-		MaxConnections:     *maxConnections,
-		MaxFramePayload:    *maxFramePayload,
+		Bind:              *bind,
+		SendQueueCapacity: *sendQueue,
+		RegisterTimeout:   *registerTimeout,
+		IdleTimeout:       *idleTimeout,
+		MaxConnections:    *maxConnections,
+		MaxFramePayload:   *maxFramePayload,
 	}
 
 	if config.SendQueueCapacity <= 0 {
@@ -323,14 +332,20 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		send: make(chan []byte, s.config.SendQueueCapacity),
 		done: make(chan struct{}),
 	}
+
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
+
 	defer func() {
 		s.hub.unregister(p)
 		close(p.done)
 		_ = conn.Close()
+		writerWg.Wait()
 		atomic.AddInt64(&s.activeConnections, -1)
 	}()
 
 	go func() {
+		defer writerWg.Done()
 		for {
 			select {
 			case frame, ok := <-p.send:
