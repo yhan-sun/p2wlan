@@ -89,6 +89,134 @@ impl std::fmt::Display for NetworkPath {
     }
 }
 
+/// Reachability state for one direct candidate pair.
+///
+/// The daemon currently has a single local UDP socket per network generation,
+/// so the pair key is represented as `(local network generation, remote endpoint)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidatePairState {
+    /// Candidate is known but not scheduled yet.
+    Frozen,
+    /// Candidate is ready for probing.
+    Waiting,
+    /// Probe traffic has been sent or an inbound punch was observed.
+    Probing,
+    /// Bidirectional probe succeeded but the pair is not selected.
+    Succeeded,
+    /// Selected direct traffic path.
+    Selected,
+    /// Probe failed before selection.
+    Failed,
+    /// Previously usable pair became stale or unhealthy.
+    Degraded,
+}
+
+/// State and health for one direct candidate pair.
+#[derive(Debug, Clone)]
+pub struct CandidatePair {
+    /// Remote UDP candidate endpoint.
+    pub remote_endpoint: SocketAddr,
+    /// Local network generation this pair belongs to.
+    pub local_generation: u64,
+    /// Current reachability state.
+    pub state: CandidatePairState,
+    /// First successful bidirectional probe or encrypted packet.
+    pub first_success_at: Option<Instant>,
+    /// Most recent successful bidirectional probe or encrypted packet.
+    pub last_success_at: Option<Instant>,
+    /// Most recent failed probe/path event.
+    pub last_failure_at: Option<Instant>,
+    /// Consecutive pair-level failures since the last success.
+    pub consecutive_failures: u32,
+    /// Stable machine-readable reason for the last failure.
+    pub last_error_code: Option<String>,
+    /// Human-readable last failure detail.
+    pub last_error: Option<String>,
+    /// Most recent RTT measurement for this pair.
+    pub rtt_ms: Option<u64>,
+}
+
+impl CandidatePair {
+    fn new(remote_endpoint: SocketAddr, local_generation: u64) -> Self {
+        Self {
+            remote_endpoint,
+            local_generation,
+            state: CandidatePairState::Waiting,
+            first_success_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            consecutive_failures: 0,
+            last_error_code: None,
+            last_error: None,
+            rtt_ms: None,
+        }
+    }
+
+    fn record_probing(&mut self) {
+        if !matches!(
+            self.state,
+            CandidatePairState::Succeeded | CandidatePairState::Selected
+        ) {
+            self.state = CandidatePairState::Probing;
+        }
+    }
+
+    fn record_success(&mut self, latency: Option<Duration>, selected: bool) {
+        let now = Instant::now();
+        if self.first_success_at.is_none() {
+            self.first_success_at = Some(now);
+        }
+        self.last_success_at = Some(now);
+        self.consecutive_failures = 0;
+        self.last_error_code = None;
+        self.last_error = None;
+        if let Some(latency) = latency {
+            self.rtt_ms = Some(duration_millis(latency));
+        }
+        self.state = if selected {
+            CandidatePairState::Selected
+        } else {
+            CandidatePairState::Succeeded
+        };
+    }
+
+    fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
+        self.last_failure_at = Some(Instant::now());
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error_code = Some(code.into());
+        self.last_error = Some(reason.into());
+        self.state = if matches!(
+            self.state,
+            CandidatePairState::Succeeded | CandidatePairState::Selected
+        ) {
+            CandidatePairState::Degraded
+        } else {
+            CandidatePairState::Failed
+        };
+    }
+
+    fn record_generation_change(&mut self, reason: impl Into<String>) {
+        self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason);
+        self.state = CandidatePairState::Degraded;
+    }
+
+    fn failure_age(&self) -> Option<Duration> {
+        self.last_failure_at
+            .map(|last_failure| last_failure.elapsed())
+    }
+
+    fn first_success_age(&self) -> Option<Duration> {
+        self.first_success_at
+            .map(|first_success| first_success.elapsed())
+    }
+
+    fn success_age(&self) -> Option<Duration> {
+        self.last_success_at
+            .map(|last_success| last_success.elapsed())
+    }
+}
+
 /// Health counters for one transport path.
 #[derive(Debug, Clone, Default)]
 pub struct PathHealth {
@@ -179,6 +307,8 @@ pub struct PeerConnection {
     pub relay_health: PathHealth,
     /// Local network generation in which the direct path was last confirmed.
     pub direct_generation: u64,
+    /// Direct candidate-pair reachability table.
+    pub candidate_pairs: Vec<CandidatePair>,
 }
 
 impl PeerConnection {
@@ -199,6 +329,7 @@ impl PeerConnection {
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
             direct_generation: 0,
+            candidate_pairs: Vec::new(),
         }
     }
 
@@ -245,6 +376,92 @@ impl PeerConnection {
     /// Record bytes received.
     pub fn record_received(&mut self, n: u64) {
         self.bytes_received += n;
+    }
+
+    fn candidate_endpoints(&self) -> Vec<SocketAddr> {
+        let mut endpoints = Vec::new();
+        for candidate in &self.candidates {
+            if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+        if let Some(endpoint) = self.endpoint {
+            if !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
+        }
+        endpoints
+    }
+
+    fn ensure_candidate_pair(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+    ) -> &mut CandidatePair {
+        if let Some(index) = self.candidate_pairs.iter().position(|pair| {
+            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+        }) {
+            return &mut self.candidate_pairs[index];
+        }
+        self.candidate_pairs
+            .push(CandidatePair::new(endpoint, local_generation));
+        self.candidate_pairs
+            .last_mut()
+            .expect("candidate pair inserted")
+    }
+
+    fn ensure_current_candidate_pairs(&mut self, local_generation: u64) {
+        for endpoint in self.candidate_endpoints() {
+            self.ensure_candidate_pair(endpoint, local_generation);
+        }
+    }
+
+    fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
+        self.ensure_candidate_pair(endpoint, local_generation)
+            .record_probing();
+    }
+
+    fn mark_candidate_pair_success(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        latency: Option<Duration>,
+        selected: bool,
+    ) {
+        self.ensure_candidate_pair(endpoint, local_generation)
+            .record_success(latency, selected);
+    }
+
+    fn mark_current_candidate_pairs_failed(
+        &mut self,
+        local_generation: u64,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let code = code.into();
+        let reason = reason.into();
+        for endpoint in self.candidate_endpoints() {
+            self.ensure_candidate_pair(endpoint, local_generation)
+                .record_failure(code.clone(), reason.clone());
+        }
+    }
+
+    fn mark_network_generation_changed(
+        &mut self,
+        local_generation: u64,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        self.candidate_pairs
+            .retain(|pair| pair.local_generation.saturating_add(1) >= local_generation);
+        for pair in &mut self.candidate_pairs {
+            if pair.local_generation < local_generation {
+                pair.record_generation_change(reason.clone());
+            }
+        }
+        self.ensure_current_candidate_pairs(local_generation);
     }
 }
 
@@ -295,6 +512,7 @@ impl PeerManager {
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
             conn.direct_health.record_generation_change(reason.clone());
+            conn.mark_network_generation_changed(generation, reason.clone());
             if conn.state == ConnectionState::Direct {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
@@ -306,6 +524,7 @@ impl PeerManager {
 
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) {
+        let generation = self.current_network_generation().await;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -318,6 +537,7 @@ impl PeerManager {
         conn.nat_type = info.nat_type.clone();
         if let Ok(addr) = info.endpoint.parse::<SocketAddr>() {
             conn.endpoint = Some(addr);
+            conn.ensure_candidate_pair(addr, generation);
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
@@ -351,10 +571,14 @@ impl PeerManager {
 
     /// Add ICE candidates for a peer.
     pub async fn add_candidates(&self, node_id: &str, candidates: &[String]) {
+        let generation = self.current_network_generation().await;
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             for c in candidates {
                 if !conn.candidates.contains(c) {
                     conn.candidates.push(c.clone());
+                }
+                if let Ok(endpoint) = c.parse::<SocketAddr>() {
+                    conn.ensure_candidate_pair(endpoint, generation);
                 }
             }
 
@@ -373,6 +597,7 @@ impl PeerManager {
     /// prove that a candidate address is visible; the direct path is confirmed
     /// only after an encrypted WireGuard packet decrypts successfully.
     pub async fn learn_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
+        let generation = self.current_network_generation().await;
         let mut conns = self.connections.write().await;
 
         for (node_id, conn) in conns.iter_mut() {
@@ -385,6 +610,7 @@ impl PeerManager {
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);
+                conn.mark_candidate_pair_probing(endpoint, generation);
                 return Some(node_id.clone());
             }
         }
@@ -413,29 +639,21 @@ impl PeerManager {
 
     /// Return candidate endpoints that should continue receiving direct-path probes.
     pub async fn direct_probe_targets(&self) -> Vec<(String, Vec<SocketAddr>)> {
+        let generation = self.current_network_generation().await;
         self.connections
-            .read()
+            .write()
             .await
-            .values()
+            .values_mut()
             .filter(|conn| conn.state != ConnectionState::Direct)
             .filter_map(|conn| {
-                let mut endpoints = Vec::new();
-                for candidate in &conn.candidates {
-                    if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
-                        if !endpoints.contains(&endpoint) {
-                            endpoints.push(endpoint);
-                        }
-                    }
-                }
-                if let Some(endpoint) = conn.endpoint {
-                    if !endpoints.contains(&endpoint) {
-                        endpoints.push(endpoint);
-                    }
-                }
+                let endpoints = conn.candidate_endpoints();
 
                 if endpoints.is_empty() {
                     None
                 } else {
+                    for endpoint in &endpoints {
+                        conn.mark_candidate_pair_probing(*endpoint, generation);
+                    }
                     Some((conn.node_id.clone(), endpoints))
                 }
             })
@@ -512,8 +730,10 @@ impl PeerManager {
             return false;
         }
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            if let Some(endpoint) = endpoint {
+            let selected_endpoint = endpoint.or(conn.endpoint);
+            if let Some(endpoint) = selected_endpoint {
                 conn.endpoint = Some(endpoint);
+                conn.mark_candidate_pair_success(endpoint, generation, None, true);
             }
             conn.direct_generation = generation;
             conn.direct_health.record_success();
@@ -560,6 +780,11 @@ impl PeerManager {
             conn.endpoint = Some(endpoint);
             conn.direct_generation = generation;
             let ack_confirmed = latency.is_some();
+            if ack_confirmed {
+                conn.mark_candidate_pair_success(endpoint, generation, latency, true);
+            } else {
+                conn.mark_candidate_pair_probing(endpoint, generation);
+            }
             match latency {
                 Some(latency) => conn.direct_health.record_success_with_latency(latency),
                 None => conn.direct_health.record_success(),
@@ -612,7 +837,11 @@ impl PeerManager {
             return false;
         }
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.direct_health.record_failure(code, reason);
+            let code = code.into();
+            let reason = reason.into();
+            conn.direct_health
+                .record_failure(code.clone(), reason.clone());
+            conn.mark_current_candidate_pairs_failed(generation, code, reason);
             if conn.state != ConnectionState::Relay {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
@@ -743,10 +972,22 @@ pub struct PeerDiagnostics {
     pub direct: PathHealthDiagnostics,
     pub relay: PathHealthDiagnostics,
     pub direct_generation: u64,
+    pub candidate_pairs: Vec<CandidatePairDiagnostics>,
 }
 
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
+        let mut candidate_pairs = conn
+            .candidate_pairs
+            .iter()
+            .map(CandidatePairDiagnostics::from)
+            .collect::<Vec<_>>();
+        candidate_pairs.sort_by(|a, b| {
+            a.local_generation
+                .cmp(&b.local_generation)
+                .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
+        });
+
         Self {
             node_id: conn.node_id.clone(),
             device_name: conn.device_name.clone(),
@@ -765,6 +1006,39 @@ impl From<&PeerConnection> for PeerDiagnostics {
             direct: PathHealthDiagnostics::from(&conn.direct_health),
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
+            candidate_pairs,
+        }
+    }
+}
+
+/// Serializable candidate-pair diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidatePairDiagnostics {
+    pub remote_endpoint: String,
+    pub local_generation: u64,
+    pub state: CandidatePairState,
+    pub first_success_age_ms: Option<u64>,
+    pub last_success_age_ms: Option<u64>,
+    pub last_failure_age_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
+    pub rtt_ms: Option<u64>,
+}
+
+impl From<&CandidatePair> for CandidatePairDiagnostics {
+    fn from(pair: &CandidatePair) -> Self {
+        Self {
+            remote_endpoint: pair.remote_endpoint.to_string(),
+            local_generation: pair.local_generation,
+            state: pair.state,
+            first_success_age_ms: pair.first_success_age().map(duration_millis),
+            last_success_age_ms: pair.success_age().map(duration_millis),
+            last_failure_age_ms: pair.failure_age().map(duration_millis),
+            consecutive_failures: pair.consecutive_failures,
+            last_error: pair.last_error.clone(),
+            last_error_code: pair.last_error_code.clone(),
+            rtt_ms: pair.rtt_ms,
         }
     }
 }
@@ -913,6 +1187,85 @@ mod tests {
 
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.candidates.len(), 2);
+        assert_eq!(conn.candidate_pairs.len(), 3);
+        assert!(conn
+            .candidate_pairs
+            .iter()
+            .all(|pair| pair.local_generation == 0 && pair.state == CandidatePairState::Waiting));
+    }
+
+    #[tokio::test]
+    async fn candidate_pairs_track_probe_success_failure_and_generation() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51826".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        let targets = manager.direct_probe_targets().await;
+        assert_eq!(targets, vec![("peer1".to_string(), vec![endpoint])]);
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.candidate_pairs.len(), 1);
+        assert_eq!(conn.candidate_pairs[0].state, CandidatePairState::Probing);
+
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    endpoint,
+                    Some(Duration::from_millis(9)),
+                    0,
+                )
+                .await
+        );
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.candidate_pairs[0].state, CandidatePairState::Selected);
+        assert_eq!(conn.candidate_pairs[0].rtt_ms, Some(9));
+
+        let generation = manager.advance_network_generation("wifi_to_hotspot").await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(conn.candidate_pairs.len(), 2);
+        assert!(conn.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == 0
+                && pair.remote_endpoint == endpoint
+                && pair.state == CandidatePairState::Degraded
+                && pair.last_error_code.as_deref() == Some(REASON_NETWORK_GENERATION_CHANGED)
+        }));
+        assert!(conn.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == 1
+                && pair.remote_endpoint == endpoint
+                && pair.state == CandidatePairState::Waiting
+        }));
+
+        assert!(
+            manager
+                .record_direct_failure_for_generation(
+                    "peer1",
+                    generation,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no ACK",
+                )
+                .await
+        );
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert!(conn.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == generation
+                && pair.remote_endpoint == endpoint
+                && pair.state == CandidatePairState::Failed
+                && pair.last_error.as_deref() == Some("no ACK")
+        }));
     }
 
     #[tokio::test]
