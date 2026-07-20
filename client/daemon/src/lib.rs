@@ -73,8 +73,8 @@ use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
 };
 use peer::{
-    ConnectionState, PeerManager, REASON_DIRECT_PROBE_FAILED, REASON_DIRECT_SEND_FAILED,
-    REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
+    ConnectionState, NetworkPath, PeerManager, REASON_DIRECT_PROBE_FAILED,
+    REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
 };
 use port_mapping::PortMappingManager;
 use relay::{
@@ -1586,25 +1586,21 @@ async fn run_network_outbound(
     while let Some(packet) = encrypted_rx.recv().await {
         let relay = relay_transport.read().await.clone();
         let relay_available = relay.is_some();
-        let direct_confirmed = peers.is_direct(&packet.peer_id).await;
-        let use_direct = peers
-            .should_use_direct_for_data(&packet.peer_id, prefer_direct, relay_available)
+        let selection = peers
+            .select_path_for_data(&packet.peer_id, prefer_direct, relay_available)
             .await;
+        debug!(
+            "Path selection for peer {}: path={:?} reason_code={} reason={}",
+            packet.peer_id, selection.path, selection.reason_code, selection.reason
+        );
 
-        let sent_direct = if use_direct {
-            if let Some(udp) = udp_transport.read().await.clone() {
-                match udp.send_packet(&packet).await {
-                    Ok(Some(_)) => true,
-                    Ok(None) => {
-                        peers
-                            .record_direct_failure_with_code(
-                                &packet.peer_id,
-                                REASON_DIRECT_SEND_FAILED,
-                                "no direct UDP endpoint for encrypted packet",
-                            )
-                            .await;
-                        false
-                    }
+        let sent_direct = if selection.path == Some(NetworkPath::Direct) {
+            match (
+                udp_transport.read().await.clone(),
+                selection.direct_endpoint,
+            ) {
+                (Some(udp), Some(endpoint)) => match udp.send_packet_to(&packet, endpoint).await {
+                    Ok(_) => true,
                     Err(err) => {
                         warn!(
                             "Direct UDP send failed for peer {}; trying relay fallback: {err}",
@@ -1619,22 +1615,33 @@ async fn run_network_outbound(
                             .await;
                         false
                     }
+                },
+                (None, _) => {
+                    peers
+                        .record_direct_failure_with_code(
+                            &packet.peer_id,
+                            REASON_DIRECT_SEND_FAILED,
+                            "UDP transport unavailable for encrypted packet",
+                        )
+                        .await;
+                    false
                 }
-            } else {
-                peers
-                    .record_direct_failure_with_code(
-                        &packet.peer_id,
-                        REASON_DIRECT_SEND_FAILED,
-                        "UDP transport unavailable for encrypted packet",
-                    )
-                    .await;
-                false
+                (_, None) => {
+                    peers
+                        .record_direct_failure_with_code(
+                            &packet.peer_id,
+                            REASON_DIRECT_SEND_FAILED,
+                            "path selector chose direct without an endpoint",
+                        )
+                        .await;
+                    false
+                }
             }
         } else {
             false
         };
 
-        if sent_direct && direct_confirmed {
+        if sent_direct && selection.direct_confirmed {
             continue;
         }
 
@@ -1645,26 +1652,10 @@ async fn run_network_outbound(
                     packet.peer_id
                 );
             }
-        } else if !use_direct {
-            if let Some(udp) = udp_transport.read().await.clone() {
-                match udp.send_packet(&packet).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => debug!(
-                        "Encrypted packet for peer {} has no direct UDP endpoint and no relay fallback",
-                        packet.peer_id
-                    ),
-                    Err(err) => warn!("Best-effort direct UDP send failed: {err}"),
-                }
-            } else {
-                debug!(
-                    "Encrypted packet for peer {} has no direct UDP path and no relay fallback",
-                    packet.peer_id
-                );
-            }
-        } else {
+        } else if !sent_direct {
             debug!(
-                "Encrypted packet for peer {} has no direct UDP path and no relay fallback",
-                packet.peer_id
+                "Encrypted packet for peer {} has no selected path: {} ({})",
+                packet.peer_id, selection.reason, selection.reason_code
             );
         }
     }
