@@ -418,6 +418,74 @@ impl PeerConnection {
         }
     }
 
+    fn candidate_probe_endpoints(&mut self, local_generation: u64) -> Vec<SocketAddr> {
+        self.ensure_current_candidate_pairs(local_generation);
+        let endpoints = self.candidate_endpoints();
+        let mut pairs = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| {
+                pair.local_generation == local_generation
+                    && endpoints.contains(&pair.remote_endpoint)
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_by(|a, b| {
+            candidate_pair_probe_rank(a.state)
+                .cmp(&candidate_pair_probe_rank(b.state))
+                .then_with(|| {
+                    a.rtt_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.rtt_ms.unwrap_or(u64::MAX))
+                })
+                .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
+        });
+        pairs.into_iter().map(|pair| pair.remote_endpoint).collect()
+    }
+
+    fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
+        let mut pairs = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| {
+                pair.local_generation == local_generation
+                    && matches!(
+                        pair.state,
+                        CandidatePairState::Selected
+                            | CandidatePairState::Succeeded
+                            | CandidatePairState::Probing
+                            | CandidatePairState::Waiting
+                    )
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_by(|a, b| {
+            candidate_pair_send_rank(a.state)
+                .cmp(&candidate_pair_send_rank(b.state))
+                .then_with(|| {
+                    a.rtt_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.rtt_ms.unwrap_or(u64::MAX))
+                })
+                .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
+        });
+
+        pairs
+            .first()
+            .map(|pair| pair.remote_endpoint)
+            .or(self.endpoint)
+    }
+
+    fn has_current_direct_pair_for_data(&self, local_generation: u64) -> bool {
+        self.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == local_generation
+                && matches!(
+                    pair.state,
+                    CandidatePairState::Selected
+                        | CandidatePairState::Succeeded
+                        | CandidatePairState::Probing
+                )
+        })
+    }
+
     fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
         self.ensure_candidate_pair(endpoint, local_generation)
             .record_probing();
@@ -623,15 +691,26 @@ impl PeerManager {
         self.learn_endpoint_from_addr(endpoint).await
     }
 
+    /// Return the best current direct endpoint for encrypted UDP data.
+    pub async fn direct_endpoint_for_send(&self, node_id: &str) -> Option<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| conn.direct_endpoint_for_send(generation))
+    }
+
     /// Return direct UDP endpoints for NAT keepalive probes.
     pub async fn direct_endpoints(&self) -> Vec<(String, SocketAddr)> {
+        let generation = self.current_network_generation().await;
         self.connections
             .read()
             .await
             .values()
             .filter(|conn| conn.state == ConnectionState::Direct)
             .filter_map(|conn| {
-                conn.endpoint
+                conn.direct_endpoint_for_send(generation)
                     .map(|endpoint| (conn.node_id.clone(), endpoint))
             })
             .collect()
@@ -646,7 +725,7 @@ impl PeerManager {
             .values_mut()
             .filter(|conn| conn.state != ConnectionState::Direct)
             .filter_map(|conn| {
-                let endpoints = conn.candidate_endpoints();
+                let endpoints = conn.candidate_probe_endpoints(generation);
 
                 if endpoints.is_empty() {
                     None
@@ -667,16 +746,17 @@ impl PeerManager {
         prefer_direct: bool,
         relay_available: bool,
     ) -> bool {
+        let generation = self.current_network_generation().await;
         let Some(conn) = self.connections.read().await.get(node_id).cloned() else {
             return false;
         };
 
-        if !prefer_direct || conn.endpoint.is_none() {
+        if !prefer_direct || conn.direct_endpoint_for_send(generation).is_none() {
             return false;
         }
 
         if conn.state == ConnectionState::Direct {
-            return true;
+            return conn.has_current_direct_pair_for_data(generation);
         }
 
         if !relay_available {
@@ -685,7 +765,9 @@ impl PeerManager {
 
         conn.direct_health
             .success_age()
-            .map(|age| age <= DIRECT_TRIAL_WINDOW)
+            .map(|age| {
+                age <= DIRECT_TRIAL_WINDOW && conn.has_current_direct_pair_for_data(generation)
+            })
             .unwrap_or(false)
     }
 
@@ -1067,6 +1149,30 @@ impl From<&PathHealth> for PathHealthDiagnostics {
     }
 }
 
+fn candidate_pair_probe_rank(state: CandidatePairState) -> u8 {
+    match state {
+        CandidatePairState::Waiting => 0,
+        CandidatePairState::Probing => 1,
+        CandidatePairState::Succeeded => 2,
+        CandidatePairState::Selected => 3,
+        CandidatePairState::Failed => 4,
+        CandidatePairState::Degraded => 5,
+        CandidatePairState::Frozen => 6,
+    }
+}
+
+fn candidate_pair_send_rank(state: CandidatePairState) -> u8 {
+    match state {
+        CandidatePairState::Selected => 0,
+        CandidatePairState::Succeeded => 1,
+        CandidatePairState::Probing => 2,
+        CandidatePairState::Waiting => 3,
+        CandidatePairState::Failed => 4,
+        CandidatePairState::Degraded => 5,
+        CandidatePairState::Frozen => 6,
+    }
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -1266,6 +1372,91 @@ mod tests {
                 && pair.state == CandidatePairState::Failed
                 && pair.last_error.as_deref() == Some("no ACK")
         }));
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_selection_prefers_selected_endpoint_for_send() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let old_endpoint: SocketAddr = "127.0.0.1:51827".parse().unwrap();
+        let new_endpoint: SocketAddr = "127.0.0.1:51828".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: old_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+        manager
+            .add_candidates("peer1", &[new_endpoint.to_string()])
+            .await;
+
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(old_endpoint)
+        );
+
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    new_endpoint,
+                    Some(Duration::from_millis(4)),
+                    0,
+                )
+                .await
+        );
+
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(new_endpoint)
+        );
+        assert_eq!(
+            manager.direct_endpoints().await,
+            vec![("peer1".to_string(), new_endpoint)]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_probe_targets_prioritize_non_failed_pairs() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let failed_endpoint: SocketAddr = "127.0.0.1:51829".parse().unwrap();
+        let waiting_endpoint: SocketAddr = "127.0.0.1:51830".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: failed_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+        manager
+            .add_candidates("peer1", &[waiting_endpoint.to_string()])
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.ensure_candidate_pair(failed_endpoint, 0)
+                .record_failure(REASON_DIRECT_PROBE_FAILED, "no ACK");
+        }
+
+        let targets = manager.direct_probe_targets().await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "peer1");
+        assert_eq!(targets[0].1, vec![waiting_endpoint, failed_endpoint]);
     }
 
     #[tokio::test]

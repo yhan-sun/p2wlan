@@ -149,16 +149,7 @@ impl UdpTransport {
     /// Returns `Ok(Some(bytes))` when sent, `Ok(None)` when no endpoint is known
     /// for the destination peer, and `Err` for socket-level failures.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<Option<usize>> {
-        let Some(conn) = self.peers.get_connection(&packet.peer_id).await else {
-            trace!(
-                "No peer connection for {}; dropping {} byte encrypted packet",
-                packet.peer_id,
-                packet.wire_bytes.len()
-            );
-            return Ok(None);
-        };
-
-        let Some(endpoint) = conn.endpoint else {
+        let Some(endpoint) = self.peers.direct_endpoint_for_send(&packet.peer_id).await else {
             trace!(
                 "No UDP endpoint for {}; dropping {} byte encrypted packet",
                 packet.peer_id,
