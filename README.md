@@ -15,6 +15,7 @@
   <p>
     <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>下载客户端</strong></a>
     · <a href="P2PNet-Design.md">设计文档</a>
+    · <a href="docs/ENGINE_OPTIMIZATION_PLAN.md">架构优化方案</a>
     · <a href="docs/ROADMAP.md">路线图</a>
     · <a href="https://github.com/yhan-sun/p2wlan/issues">反馈问题</a>
   </p>

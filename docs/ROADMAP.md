@@ -3,6 +3,8 @@
 Version: 0.1  
 Date: 2026-07-16
 
+> 本文描述产品交付阶段。网络引擎边界、安全基线、自适应穿透、路径迁移和分阶段实施任务见 [ENGINE_OPTIMIZATION_PLAN.md](ENGINE_OPTIMIZATION_PLAN.md)。
+
 ## 路线原则
 
 - 先打通数据面，再完善控制面。
