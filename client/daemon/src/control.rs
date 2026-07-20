@@ -397,7 +397,7 @@ impl ControlClient {
             state: state.clone(),
         };
 
-        if enabled && !config.control.auth_token.trim().is_empty() {
+        if enabled && has_control_credential(config) {
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
@@ -631,6 +631,11 @@ impl ControlClient {
             }
         }
     }
+}
+
+fn has_control_credential(config: &Config) -> bool {
+    !config.control.auth_token.trim().is_empty()
+        || !config.control.device_credential.trim().is_empty()
 }
 
 /// Maximum exponential-backoff delay before giving up.
@@ -1655,6 +1660,17 @@ mod tests {
         // When disabled, no background control loop is spawned
         let (client, _rx) = ControlClient::new(&config, false, None);
         drop(client);
+    }
+
+    #[test]
+    fn control_credential_accepts_device_credential_only() {
+        let mut config = test_config();
+        config.control.auth_token.clear();
+        config.control.device_credential = "device-token".to_string();
+        assert!(has_control_credential(&config));
+
+        config.control.device_credential.clear();
+        assert!(!has_control_credential(&config));
     }
 
     /// Regression: with token + unreachable control, disabled mode must not
