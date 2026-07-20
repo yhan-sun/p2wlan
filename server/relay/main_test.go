@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -494,5 +495,53 @@ func TestIllegalUTF8NodeID(t *testing.T) {
 	code := binary.BigEndian.Uint16(buf[8:10])
 	if code != 4000 {
 		t.Errorf("expected 4000 (invalid node ID), got %d", code)
+	}
+}
+
+func TestServerCloseConcurrentAccept(t *testing.T) {
+	config := &RelayConfig{
+		SendQueueCapacity: 10,
+		RegisterTimeout:   1 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		MaxConnections:    10,
+		MaxFramePayload:   65535,
+	}
+	server, err := NewRelayServer(config)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	go server.Serve()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					conn, err := net.Dial("tcp", server.Addr().String())
+					if err == nil {
+						_ = conn.Close()
+					}
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	_ = server.Close()
+	duration := time.Since(start)
+
+	close(stop)
+	wg.Wait()
+
+	if duration > 200*time.Millisecond {
+		t.Errorf("Close took too long to complete during concurrent accepts: %v", duration)
 	}
 }
