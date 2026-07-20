@@ -1093,15 +1093,18 @@ mod tests {
         stream.write_all(&bad_frame).await.unwrap();
 
         // Read until the connection is closed (error frame + EOF).
-        let mut total_read = 0usize;
-        loop {
-            match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    total_read += n;
+        let total_read = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut total_read = 0usize;
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total_read += n,
                 }
             }
-        }
+            total_read
+        })
+        .await
+        .expect("connection did not close within 2s");
         assert!(total_read > 0, "expected at least an error frame");
 
         // Wait for the handler task to finish (guarantees cleanup ran).
