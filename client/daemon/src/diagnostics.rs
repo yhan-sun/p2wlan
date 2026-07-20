@@ -204,6 +204,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
 
     let tasks = context.task_manager.task_statuses().await;
     let health_snap = context.health.snapshot(&tasks).await;
+    let mut relay_selection = context.relay_selection.read().await.clone();
+    relay_selection.refresh_runtime_ages();
 
     DiagnosticsSnapshot {
         process_id: std::process::id(),
@@ -214,7 +216,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         udp_local_addr,
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
-        relay_selection: context.relay_selection.read().await.clone(),
+        relay_selection,
         peers: context
             .peers
             .diagnostics_with_path_selection(

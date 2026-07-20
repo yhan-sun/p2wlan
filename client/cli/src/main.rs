@@ -1084,6 +1084,9 @@ fn print_relay_diagnostics(snapshot: &Value) {
         "Relay selection：region={} endpoint={} latency={} candidates={}",
         selected_region, selected_endpoint, latency, candidate_count
     );
+    if let Some(health) = relay_health_summary(relay) {
+        println!("Relay health：{health}");
+    }
 
     if let Some(error) = relay.get("last_error").and_then(Value::as_str) {
         let code = relay
@@ -1092,6 +1095,42 @@ fn print_relay_diagnostics(snapshot: &Value) {
             .unwrap_or("unknown");
         println!("Relay error：code={code} message={error}");
     }
+}
+
+fn relay_health_summary(relay: &Value) -> Option<String> {
+    let pong_count = relay
+        .get("selected_pong_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let error_count = relay
+        .get("selected_error_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if pong_count == 0 && error_count == 0 {
+        return None;
+    }
+
+    let last_rtt = relay_ms_text(relay, "selected_last_pong_rtt_ms");
+    let rtt_ewma = relay_ms_text(relay, "selected_rtt_ewma_ms");
+    let jitter = relay_ms_text(relay, "selected_jitter_ms");
+    let last_pong = relay
+        .get("selected_last_pong_age_ms")
+        .and_then(Value::as_u64)
+        .map(|ms| format!("{ms}ms_ago"))
+        .unwrap_or_else(|| "never".to_string());
+
+    Some(format!(
+        "pong={} errors={} last_rtt={} rtt_ewma={} jitter={} last_pong={}",
+        pong_count, error_count, last_rtt, rtt_ewma, jitter, last_pong
+    ))
+}
+
+fn relay_ms_text(relay: &Value, field: &str) -> String {
+    relay
+        .get(field)
+        .and_then(Value::as_u64)
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
@@ -2009,6 +2048,23 @@ mod tests {
         assert!(args.dry_run);
         assert_eq!(args.version.as_deref(), Some("v0.1.24"));
         assert_eq!(args.install_dir.as_deref(), Some(Path::new("/tmp/bin")));
+    }
+
+    #[test]
+    fn relay_health_summary_reports_runtime_measurements() {
+        let relay = serde_json::json!({
+            "selected_pong_count": 3,
+            "selected_error_count": 1,
+            "selected_last_pong_age_ms": 250,
+            "selected_last_pong_rtt_ms": 42,
+            "selected_rtt_ewma_ms": 39,
+            "selected_jitter_ms": 5
+        });
+
+        assert_eq!(
+            relay_health_summary(&relay).as_deref(),
+            Some("pong=3 errors=1 last_rtt=42ms rtt_ewma=39ms jitter=5ms last_pong=250ms_ago")
+        );
     }
 
     #[test]
