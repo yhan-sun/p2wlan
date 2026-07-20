@@ -426,3 +426,73 @@ func TestRustGoErrorCodesCompatibility(t *testing.T) {
 		t.Errorf("errorFrame 9999 mismatch\ngot:  %v\nwant: %v", err9999, expected9999)
 	}
 }
+
+func TestServerCloseReclaimsImmediately(t *testing.T) {
+	config := &RelayConfig{
+		SendQueueCapacity: 10,
+		RegisterTimeout:   10 * time.Second,
+		IdleTimeout:       1 * time.Hour,
+		MaxConnections:    10,
+		MaxFramePayload:   65535,
+	}
+	server, err := NewRelayServer(config)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	go server.Serve()
+
+	conn, err := net.Dial("tcp", server.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write(makeFrame(msgRegister, []byte("nodeA")))
+
+	buf := make([]byte, 100)
+	_, _ = io.ReadAtLeast(conn, buf, frameHeader)
+
+	start := time.Now()
+	err = server.Close()
+	if err != nil {
+		t.Errorf("Close returned error: %v", err)
+	}
+	duration := time.Since(start)
+
+	if duration > 200*time.Millisecond {
+		t.Errorf("Close took too long to reclaim connection: %v (expected < 200ms)", duration)
+	}
+}
+
+func TestIllegalUTF8NodeID(t *testing.T) {
+	config := &RelayConfig{
+		SendQueueCapacity: 10,
+		RegisterTimeout:   1 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		MaxConnections:    10,
+		MaxFramePayload:   65535,
+	}
+	addr, cleanup := startTestServer(t, config)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	illegalBytes := []byte{0xff, 0xfe, 0xfd}
+	_, _ = conn.Write(makeFrame(msgRegister, illegalBytes))
+
+	buf := make([]byte, 100)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	if n < frameHeader {
+		t.Fatalf("expected error frame, got %d bytes", n)
+	}
+	code := binary.BigEndian.Uint16(buf[8:10])
+	if code != 4000 {
+		t.Errorf("expected 4000 (invalid node ID), got %d", code)
+	}
+}
