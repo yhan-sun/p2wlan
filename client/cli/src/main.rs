@@ -547,6 +547,13 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             println!("Daemon：运行中");
             println!("虚拟 IP：{}", value_text(&snapshot, "virtual_ip", "未知"));
             println!(
+                "网络代际：{}",
+                snapshot
+                    .get("network_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            );
+            println!(
                 "UDP local：{}",
                 value_text(&snapshot, "udp_local_addr", "未知")
             );
@@ -569,6 +576,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "direct_connections"),
                 value_u64(stats, "relay_connections")
             );
+            print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
             suggestions.extend(peer_direct_suggestions(&snapshot));
             if value_u64(stats, "relay_connections") > 0
@@ -1005,23 +1013,67 @@ fn print_peer_diagnostics(snapshot: &Value) {
             .unwrap_or(0);
         let candidates = peer_candidate_strings(peer);
         let candidate_preview = endpoint_preview(&candidates, 3);
+        let direct_generation = peer
+            .get("direct_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         println!(
-            "- {} ({}) state={} path={} endpoint={} candidates={}{}",
+            "- {} ({}) state={} path={} endpoint={} candidates={}{} direct_gen={}",
             short_text(name, 24),
             virtual_ip,
             state,
             active_path,
             endpoint,
             candidate_count,
-            candidate_preview
+            candidate_preview,
+            direct_generation
         );
-        if let Some(error) = peer
-            .get("direct")
-            .and_then(|direct| direct.get("last_error"))
-            .and_then(Value::as_str)
-        {
-            println!("  direct-error={error}");
+        if let Some(stage) = direct_failure_stage(peer) {
+            println!("  direct-stage={stage}");
         }
+        if let Some(reason) = relay_path_reason(snapshot, peer) {
+            println!("  relay-reason={reason}");
+        }
+    }
+}
+
+fn print_relay_diagnostics(snapshot: &Value) {
+    let Some(relay) = snapshot
+        .get("relay_selection")
+        .filter(|value| value.is_object())
+    else {
+        return;
+    };
+
+    let selected_region = relay
+        .get("selected_region")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let selected_endpoint = relay
+        .get("selected_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let latency = relay
+        .get("selected_connect_latency_ms")
+        .and_then(Value::as_u64)
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let candidate_count = relay
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    println!(
+        "Relay selection：region={} endpoint={} latency={} candidates={}",
+        selected_region, selected_endpoint, latency, candidate_count
+    );
+
+    if let Some(error) = relay.get("last_error").and_then(Value::as_str) {
+        let code = relay
+            .get("last_error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        println!("Relay error：code={code} message={error}");
     }
 }
 
@@ -1031,15 +1083,23 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
     };
 
     let mut private_only_peers = Vec::new();
-    let mut direct_failures = 0_u64;
+    let mut generation_changed_peers = Vec::new();
+    let mut handshake_timeout_peers = Vec::new();
+    let mut direct_send_failed_peers = Vec::new();
+    let mut generic_direct_failures = 0_u64;
     for peer in peers {
-        let has_direct_error = peer
-            .get("direct")
-            .and_then(|direct| direct.get("last_error"))
-            .and_then(Value::as_str)
-            .is_some();
-        if has_direct_error {
-            direct_failures += 1;
+        let direct_error_code = direct_error_code(peer);
+        let has_direct_error = direct_failure_stage(peer).is_some();
+        if has_direct_error && matches!(direct_error_code, Some("direct_probe_failed") | None) {
+            generic_direct_failures += 1;
+        }
+        match direct_error_code {
+            Some("network_generation_changed") => {
+                generation_changed_peers.push(peer_display_name(peer))
+            }
+            Some("handshake_timeout") => handshake_timeout_peers.push(peer_display_name(peer)),
+            Some("direct_send_failed") => direct_send_failed_peers.push(peer_display_name(peer)),
+            _ => {}
         }
 
         let endpoints = peer_diagnostic_endpoints(peer);
@@ -1056,18 +1116,116 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
     }
 
     let mut suggestions = Vec::new();
+    if !generation_changed_peers.is_empty() {
+        suggestions.push(format!(
+            "对端 {} 的 Direct 状态来自旧网络代际，已切回 Relay；等待新的 UDP candidate/ACK 后会自动重新选择直连。",
+            generation_changed_peers.join("、")
+        ));
+    }
+    if !handshake_timeout_peers.is_empty() {
+        suggestions.push(format!(
+            "对端 {} UDP 探测后 WireGuard 握手超时；通常是单向 UDP、防火墙状态表或对端会话未及时刷新。",
+            handshake_timeout_peers.join("、")
+        ));
+    }
+    if !direct_send_failed_peers.is_empty() {
+        suggestions.push(format!(
+            "对端 {} 的 Direct 发送失败，daemon 已降级 Relay；请重点查看网络切换、防火墙和 UDP endpoint 是否漂移。",
+            direct_send_failed_peers.join("、")
+        ));
+    }
     if !private_only_peers.is_empty() {
         suggestions.push(format!(
             "对端 {} 只上报了私网/回环 UDP 候选；请在对应设备配置 udp-advertise <公网IP>:<端口>，并放行同一个 UDP 入站端口。",
             private_only_peers.join("、")
         ));
-    } else if direct_failures > 0 {
+    } else if generic_direct_failures > 0 {
         suggestions.push(
             "检测到 Direct UDP 探测失败；请确认两端 udp-bind/udp-advertise、云安全组和系统防火墙使用同一个 UDP 端口。"
                 .to_string(),
         );
     }
     suggestions
+}
+
+fn relay_path_reason(snapshot: &Value, peer: &Value) -> Option<String> {
+    let active_path = peer.get("active_path").and_then(Value::as_str);
+    let state = peer.get("state").and_then(Value::as_str);
+    let relayish = matches!(active_path, Some("relay"))
+        || matches!(state, Some("relay" | "fallback_to_relay"));
+    if !relayish {
+        return None;
+    }
+
+    if let Some(stage) = direct_failure_stage(peer) {
+        return Some(format!("Direct 不可用：{stage}"));
+    }
+
+    let snapshot_generation = snapshot
+        .get("network_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let direct_generation = peer
+        .get("direct_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if direct_generation < snapshot_generation {
+        return Some(format!(
+            "Direct 成功属于旧网络代际 {direct_generation}，当前代际 {snapshot_generation} 正在重新探测"
+        ));
+    }
+
+    let candidates = peer_candidate_strings(peer);
+    if candidates.is_empty() {
+        return Some("对端暂无 UDP candidate".to_string());
+    }
+
+    if let Some(relay) = snapshot
+        .get("relay_selection")
+        .filter(|value| value.is_object())
+    {
+        let region = relay
+            .get("selected_region")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let endpoint = relay
+            .get("selected_endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Some(format!(
+            "Relay 已选中 {region} / {endpoint}，Direct 尚未确认"
+        ));
+    }
+
+    Some("Relay fallback 已生效，Direct 尚未确认".to_string())
+}
+
+fn direct_failure_stage(peer: &Value) -> Option<String> {
+    let direct = peer.get("direct")?;
+    let error = direct.get("last_error").and_then(Value::as_str);
+    let code = direct.get("last_error_code").and_then(Value::as_str);
+    match (code, error) {
+        (Some(code), Some(error)) => Some(format!("{}：{}", reason_label(code), error)),
+        (Some(code), None) => Some(reason_label(code).to_string()),
+        (None, Some(error)) => Some(error.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn direct_error_code(peer: &Value) -> Option<&str> {
+    peer.get("direct")
+        .and_then(|direct| direct.get("last_error_code"))
+        .and_then(Value::as_str)
+}
+
+fn reason_label(code: &str) -> &'static str {
+    match code {
+        "network_generation_changed" => "网络切换后 Direct 状态失效",
+        "direct_probe_failed" => "UDP 探测未确认",
+        "direct_send_failed" => "Direct UDP 发送失败",
+        "handshake_timeout" => "WireGuard 握手超时",
+        _ => "Direct 失败",
+    }
 }
 
 fn peer_diagnostic_endpoints(peer: &Value) -> Vec<SocketAddr> {
@@ -1682,6 +1840,78 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert!(suggestions[0].contains("Direct UDP 探测失败"));
         assert!(!suggestions[0].contains("只上报了私网/回环"));
+    }
+
+    #[test]
+    fn doctor_explains_relay_reason_with_stable_reason_code() {
+        let snapshot = serde_json::json!({
+            "network_generation": 3,
+            "relay_selection": {
+                "selected_region": "cn-east",
+                "selected_endpoint": "relay.example.com:443",
+                "selected_connect_latency_ms": 42,
+                "candidates": []
+            },
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "laptop",
+                "virtual_ip": "10.20.0.5",
+                "state": "fallback_to_relay",
+                "active_path": "relay",
+                "direct_generation": 3,
+                "candidates": ["203.0.113.10:60207"],
+                "direct": {
+                    "last_error_code": "handshake_timeout",
+                    "last_error": "handshake timed out"
+                }
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+
+        assert_eq!(
+            direct_failure_stage(peer).as_deref(),
+            Some("WireGuard 握手超时：handshake timed out")
+        );
+        assert_eq!(
+            relay_path_reason(&snapshot, peer).as_deref(),
+            Some("Direct 不可用：WireGuard 握手超时：handshake timed out")
+        );
+        let suggestions = peer_direct_suggestions(&snapshot);
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("WireGuard 握手超时")));
+    }
+
+    #[test]
+    fn doctor_reports_generation_reprobe_reason() {
+        let snapshot = serde_json::json!({
+            "network_generation": 4,
+            "relay_selection": {
+                "selected_region": "cn-east",
+                "selected_endpoint": "relay.example.com:443"
+            },
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "phone-hotspot",
+                "virtual_ip": "10.20.0.9",
+                "state": "relay",
+                "active_path": "relay",
+                "direct_generation": 3,
+                "candidates": ["198.51.100.20:45000"],
+                "direct": {
+                    "last_error_code": "network_generation_changed",
+                    "last_error": "network_generation_changed: refreshed UDP candidates"
+                }
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+
+        assert_eq!(
+            relay_path_reason(&snapshot, peer).as_deref(),
+            Some("Direct 不可用：网络切换后 Direct 状态失效：network_generation_changed: refreshed UDP candidates")
+        );
+        let suggestions = peer_direct_suggestions(&snapshot);
+        assert!(suggestions.iter().any(|item| item.contains("旧网络代际")));
     }
 
     #[test]

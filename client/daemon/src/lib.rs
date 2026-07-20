@@ -72,7 +72,10 @@ use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
 };
-use peer::{ConnectionState, PeerManager};
+use peer::{
+    ConnectionState, PeerManager, REASON_DIRECT_PROBE_FAILED, REASON_DIRECT_SEND_FAILED,
+    REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
+};
 use port_mapping::PortMappingManager;
 use relay::{
     select_relay, RelayCandidateConfig, RelaySelectionDiagnostics, RelaySelectionOutcome,
@@ -432,7 +435,7 @@ impl Daemon {
         let udp_inbound_tx = network_inbound_tx.clone();
         self.task_manager
             .spawn_result("udp-direct", false, async move {
-            match UdpTransport::bind(udp_bind, peers).await {
+            match UdpTransport::bind(udp_bind, peers.clone()).await {
                 Ok(udp) => {
                     *udp_transport.write().await = Some(udp.clone());
 
@@ -488,6 +491,7 @@ impl Daemon {
                                 udp_advertise,
                                 local_candidates,
                                 control,
+                                peers.clone(),
                             ) => Ok(()),
                         }
                     } else {
@@ -503,6 +507,7 @@ impl Daemon {
                                 udp_advertise,
                                 local_candidates,
                                 control,
+                                peers.clone(),
                             ) => Ok(()),
                         }
                     }
@@ -708,14 +713,17 @@ impl Daemon {
                                 let timeout_peer = conn.node_id.clone();
                                 let transport2 = transport.clone();
                                 let peers2 = peers.clone();
+                                let generation = peers.current_network_generation().await;
                                 tokio::spawn(async move {
                                     tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS))
                                         .await;
                                     if !transport2.has_session(&timeout_peer).await {
                                         warn!("Handshake timeout for peer {timeout_peer}");
                                         peers2
-                                            .record_direct_failure(
+                                            .record_direct_failure_for_generation(
                                                 &timeout_peer,
+                                                generation,
+                                                REASON_HANDSHAKE_TIMEOUT,
                                                 "handshake timed out",
                                             )
                                             .await;
@@ -1040,12 +1048,18 @@ impl Daemon {
         let timeout_peer = peer_id_clone;
         let transport = self.transport.clone();
         let peers = self.peers.clone();
+        let generation = self.peers.current_network_generation().await;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
             if !transport.has_session(&timeout_peer).await {
                 warn!("Handshake timeout for peer {timeout_peer}");
                 peers
-                    .record_direct_failure(&timeout_peer, "handshake timed out")
+                    .record_direct_failure_for_generation(
+                        &timeout_peer,
+                        generation,
+                        REASON_HANDSHAKE_TIMEOUT,
+                        "handshake timed out",
+                    )
                     .await;
             }
             // Remove from pending so retry is possible.
@@ -1111,7 +1125,11 @@ impl Daemon {
         if candidates.is_empty() {
             debug!("No UDP candidates for {node_id}; skipping hole punch");
             self.peers
-                .record_direct_failure(node_id, "no UDP candidates for hole punching")
+                .record_direct_failure_with_code(
+                    node_id,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no UDP candidates for hole punching",
+                )
                 .await;
             return;
         }
@@ -1124,6 +1142,7 @@ impl Daemon {
 
         let peer_id = node_id.to_string();
         let peers = self.peers.clone();
+        let generation = self.peers.current_network_generation().await;
         let probe_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let attempts = self.config.network.punch_attempts;
         tokio::spawn(async move {
@@ -1134,10 +1153,12 @@ impl Daemon {
                 Ok(sent) => {
                     info!("Sent {sent} UDP punch probes to peer {peer_id}");
                     sleep(probe_interval).await;
-                    if sent > 0 && !peers.is_direct(&peer_id).await {
+                    if sent > 0 && !peers.is_direct_for_generation(&peer_id, generation).await {
                         peers
-                            .record_direct_failure(
+                            .record_direct_failure_for_generation(
                                 &peer_id,
+                                generation,
+                                REASON_DIRECT_PROBE_FAILED,
                                 format!("no UDP punch ACK after {sent} probes"),
                             )
                             .await;
@@ -1145,7 +1166,12 @@ impl Daemon {
                 }
                 Err(err) => {
                     peers
-                        .record_direct_failure(&peer_id, format!("hole punch failed: {err}"))
+                        .record_direct_failure_for_generation(
+                            &peer_id,
+                            generation,
+                            REASON_DIRECT_PROBE_FAILED,
+                            format!("hole punch failed: {err}"),
+                        )
                         .await;
                     warn!("Failed to punch peer {peer_id}: {err}");
                 }
@@ -1325,6 +1351,7 @@ async fn run_udp_candidate_refresh(
     udp_advertise: Option<String>,
     local_candidates: Arc<RwLock<Vec<String>>>,
     control: ControlClient,
+    peers: Arc<PeerManager>,
 ) {
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
     ticker.tick().await;
@@ -1369,6 +1396,11 @@ async fn run_udp_candidate_refresh(
             "UDP candidates changed after network update; refreshed {} candidates",
             candidates.len()
         );
+        peers
+            .advance_network_generation(format!(
+                "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
+            ))
+            .await;
         if let Some(endpoint) = advertised_endpoint {
             if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
                 warn!("Failed to publish refreshed UDP endpoint {endpoint}: {err}");
@@ -1565,8 +1597,9 @@ async fn run_network_outbound(
                     Ok(Some(_)) => true,
                     Ok(None) => {
                         peers
-                            .record_direct_failure(
+                            .record_direct_failure_with_code(
                                 &packet.peer_id,
+                                REASON_DIRECT_SEND_FAILED,
                                 "no direct UDP endpoint for encrypted packet",
                             )
                             .await;
@@ -1578,15 +1611,20 @@ async fn run_network_outbound(
                             packet.peer_id
                         );
                         peers
-                            .record_direct_failure(&packet.peer_id, err.to_string())
+                            .record_direct_failure_with_code(
+                                &packet.peer_id,
+                                REASON_DIRECT_SEND_FAILED,
+                                err.to_string(),
+                            )
                             .await;
                         false
                     }
                 }
             } else {
                 peers
-                    .record_direct_failure(
+                    .record_direct_failure_with_code(
                         &packet.peer_id,
+                        REASON_DIRECT_SEND_FAILED,
                         "UDP transport unavailable for encrypted packet",
                     )
                     .await;
@@ -1658,6 +1696,7 @@ async fn run_direct_probe_loop(
 
             let udp = udp.clone();
             let peers = peers.clone();
+            let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
                 match udp
                     .punch_candidates(&peer_id, candidates, probe_interval, attempts)
@@ -1666,10 +1705,12 @@ async fn run_direct_probe_loop(
                     Ok(0) => {}
                     Ok(sent) => {
                         sleep(probe_interval).await;
-                        if !peers.is_direct(&peer_id).await {
+                        if !peers.is_direct_for_generation(&peer_id, generation).await {
                             peers
-                                .record_direct_failure(
+                                .record_direct_failure_for_generation(
                                     &peer_id,
+                                    generation,
+                                    REASON_DIRECT_PROBE_FAILED,
                                     format!("no direct probe ACK after {sent} retry probes"),
                                 )
                                 .await;
@@ -1680,7 +1721,12 @@ async fn run_direct_probe_loop(
                     }
                     Err(err) => {
                         peers
-                            .record_direct_failure(&peer_id, format!("direct retry failed: {err}"))
+                            .record_direct_failure_for_generation(
+                                &peer_id,
+                                generation,
+                                REASON_DIRECT_PROBE_FAILED,
+                                format!("direct retry failed: {err}"),
+                            )
                             .await;
                         warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");
                     }

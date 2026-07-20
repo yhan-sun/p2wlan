@@ -20,6 +20,15 @@ use crate::control::PeerInfo;
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 
+/// Stable reason code emitted when a local network generation changes.
+pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
+/// Stable reason code for direct path probe timeout/failure.
+pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
+/// Stable reason code for direct path send failure.
+pub const REASON_DIRECT_SEND_FAILED: &str = "direct_send_failed";
+/// Stable reason code for WireGuard handshake timeout.
+pub const REASON_HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
+
 // ============================================================
 // Connection State
 // ============================================================
@@ -91,6 +100,8 @@ pub struct PathHealth {
     pub consecutive_failures: u32,
     /// Last diagnostic error for this path.
     pub last_error: Option<String>,
+    /// Stable machine-readable reason for the last failure.
+    pub last_error_code: Option<String>,
     /// Most recent measured round-trip time for this path.
     pub latency_ms: Option<u64>,
 }
@@ -100,6 +111,7 @@ impl PathHealth {
         self.last_success_at = Some(Instant::now());
         self.consecutive_failures = 0;
         self.last_error = None;
+        self.last_error_code = None;
     }
 
     fn record_success_with_latency(&mut self, latency: Duration) {
@@ -107,10 +119,18 @@ impl PathHealth {
         self.latency_ms = Some(duration_millis(latency));
     }
 
-    fn record_failure(&mut self, reason: impl Into<String>) {
+    fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
         self.last_failure_at = Some(Instant::now());
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error_code = Some(code.into());
         self.last_error = Some(reason.into());
+    }
+
+    fn record_generation_change(&mut self, reason: impl Into<String>) {
+        self.last_success_at = None;
+        self.latency_ms = None;
+        self.consecutive_failures = 0;
+        self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason);
     }
 
     fn failure_age(&self) -> Option<Duration> {
@@ -157,6 +177,8 @@ pub struct PeerConnection {
     pub direct_health: PathHealth,
     /// Relay path health.
     pub relay_health: PathHealth,
+    /// Local network generation in which the direct path was last confirmed.
+    pub direct_generation: u64,
 }
 
 impl PeerConnection {
@@ -176,6 +198,7 @@ impl PeerConnection {
             candidates: Vec::new(),
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
+            direct_generation: 0,
         }
     }
 
@@ -235,6 +258,8 @@ pub struct PeerManager {
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
     /// Virtual IP → node ID mapping for routing.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
+    /// Monotonic local network generation. Incremented when local UDP candidates change.
+    network_generation: Arc<RwLock<u64>>,
     /// Configuration.
     _config: Config,
 }
@@ -245,8 +270,38 @@ impl PeerManager {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
+            network_generation: Arc::new(RwLock::new(0)),
             _config: config,
         }
+    }
+
+    /// Current local network generation.
+    pub async fn current_network_generation(&self) -> u64 {
+        *self.network_generation.read().await
+    }
+
+    /// Advance local network generation and invalidate confirmed direct paths.
+    ///
+    /// Existing remote candidates are kept so they can be reprobed, but prior
+    /// direct success is no longer trusted for active-path selection.
+    pub async fn advance_network_generation(&self, reason: impl Into<String>) -> u64 {
+        let reason = reason.into();
+        let generation = {
+            let mut generation = self.network_generation.write().await;
+            *generation = generation.saturating_add(1);
+            *generation
+        };
+
+        let mut conns = self.connections.write().await;
+        for conn in conns.values_mut() {
+            conn.direct_health.record_generation_change(reason.clone());
+            if conn.state == ConnectionState::Direct {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+
+        info!("Local network generation advanced to {generation}: {reason}");
+        generation
     }
 
     /// Add or update a peer from control plane info.
@@ -440,13 +495,32 @@ impl PeerManager {
 
     /// Record a successful direct-path event.
     pub async fn record_direct_success(&self, node_id: &str, endpoint: Option<SocketAddr>) {
+        let generation = self.current_network_generation().await;
+        self.record_direct_success_for_generation(node_id, endpoint, generation)
+            .await;
+    }
+
+    /// Record a successful direct-path event for a specific local network generation.
+    /// Returns false when the result belongs to an old generation and was ignored.
+    pub async fn record_direct_success_for_generation(
+        &self,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+    ) -> bool {
+        if generation != self.current_network_generation().await {
+            return false;
+        }
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             if let Some(endpoint) = endpoint {
                 conn.endpoint = Some(endpoint);
             }
+            conn.direct_generation = generation;
             conn.direct_health.record_success();
             conn.transition(ConnectionState::Direct);
+            return true;
         }
+        false
     }
 
     /// Record that a UDP punch endpoint is reachable. A matched ACK confirms
@@ -463,8 +537,28 @@ impl PeerManager {
         endpoint: SocketAddr,
         latency: Option<Duration>,
     ) {
+        let generation = self.current_network_generation().await;
+        self.record_direct_probe_success_with_latency_for_generation(
+            node_id, endpoint, latency, generation,
+        )
+        .await;
+    }
+
+    /// Record a direct-path probe result for a specific local network generation.
+    /// Returns false when the result belongs to an old generation and was ignored.
+    pub async fn record_direct_probe_success_with_latency_for_generation(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        latency: Option<Duration>,
+        generation: u64,
+    ) -> bool {
+        if generation != self.current_network_generation().await {
+            return false;
+        }
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.endpoint = Some(endpoint);
+            conn.direct_generation = generation;
             let ack_confirmed = latency.is_some();
             match latency {
                 Some(latency) => conn.direct_health.record_success_with_latency(latency),
@@ -472,7 +566,7 @@ impl PeerManager {
             }
             if ack_confirmed {
                 conn.transition(ConnectionState::Direct);
-                return;
+                return true;
             }
             if matches!(
                 conn.state,
@@ -482,17 +576,54 @@ impl PeerManager {
             ) {
                 conn.transition(ConnectionState::HolePunching);
             }
+            return true;
         }
+        false
     }
 
     /// Record a failed direct-path event and enter relay fallback state.
     pub async fn record_direct_failure(&self, node_id: &str, reason: impl Into<String>) {
+        self.record_direct_failure_with_code(node_id, REASON_DIRECT_PROBE_FAILED, reason)
+            .await;
+    }
+
+    /// Record a failed direct-path event with a stable reason code.
+    pub async fn record_direct_failure_with_code(
+        &self,
+        node_id: &str,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let generation = self.current_network_generation().await;
+        self.record_direct_failure_for_generation(node_id, generation, code, reason)
+            .await;
+    }
+
+    /// Record a failed direct-path event for a specific local network generation.
+    /// Returns false when the result belongs to an old generation and was ignored.
+    pub async fn record_direct_failure_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> bool {
+        if generation != self.current_network_generation().await {
+            return false;
+        }
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.direct_health.record_failure(reason);
+            conn.direct_health.record_failure(code, reason);
             if conn.state != ConnectionState::Relay {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
+            return true;
         }
+        false
+    }
+
+    /// Whether the peer is direct in a specific generation.
+    pub async fn is_direct_for_generation(&self, node_id: &str, generation: u64) -> bool {
+        generation == self.current_network_generation().await && self.is_direct(node_id).await
     }
 
     /// Set the relay server for a peer.
@@ -611,6 +742,7 @@ pub struct PeerDiagnostics {
     pub candidates: Vec<String>,
     pub direct: PathHealthDiagnostics,
     pub relay: PathHealthDiagnostics,
+    pub direct_generation: u64,
 }
 
 impl From<&PeerConnection> for PeerDiagnostics {
@@ -632,6 +764,7 @@ impl From<&PeerConnection> for PeerDiagnostics {
             candidates: conn.candidates.clone(),
             direct: PathHealthDiagnostics::from(&conn.direct_health),
             relay: PathHealthDiagnostics::from(&conn.relay_health),
+            direct_generation: conn.direct_generation,
         }
     }
 }
@@ -643,6 +776,7 @@ pub struct PathHealthDiagnostics {
     pub last_failure_age_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
     pub latency_ms: Option<u64>,
 }
 
@@ -653,6 +787,7 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             last_failure_age_ms: health.failure_age().map(duration_millis),
             consecutive_failures: health.consecutive_failures,
             last_error: health.last_error.clone(),
+            last_error_code: health.last_error_code.clone(),
             latency_ms: health.latency_ms,
         }
     }
@@ -883,6 +1018,10 @@ mod tests {
             conn.direct_health.last_error.as_deref(),
             Some("probe timeout")
         );
+        assert_eq!(
+            conn.direct_health.last_error_code.as_deref(),
+            Some(REASON_DIRECT_PROBE_FAILED)
+        );
 
         manager.set_relay("peer1", "127.0.0.1:9000").await;
         let conn = manager.get_connection("peer1").await.unwrap();
@@ -917,6 +1056,84 @@ mod tests {
                 .should_use_direct_for_data("peer1", true, true)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn network_generation_invalidates_direct_and_ignores_stale_results() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let old_endpoint: SocketAddr = "127.0.0.1:51824".parse().unwrap();
+        let new_endpoint: SocketAddr = "127.0.0.1:51825".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: old_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        assert_eq!(manager.current_network_generation().await, 0);
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    old_endpoint,
+                    Some(Duration::from_millis(8)),
+                    0,
+                )
+                .await
+        );
+        assert!(manager.is_direct_for_generation("peer1", 0).await);
+
+        let generation = manager.advance_network_generation("wifi_to_hotspot").await;
+        assert_eq!(generation, 1);
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        assert_eq!(
+            conn.direct_health.last_error_code.as_deref(),
+            Some(REASON_NETWORK_GENERATION_CHANGED)
+        );
+        assert!(
+            !manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
+
+        assert!(
+            !manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    old_endpoint,
+                    Some(Duration::from_millis(5)),
+                    0,
+                )
+                .await
+        );
+        assert_eq!(
+            manager.get_connection("peer1").await.unwrap().state,
+            ConnectionState::FallbackToRelay
+        );
+
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    new_endpoint,
+                    Some(Duration::from_millis(7)),
+                    generation,
+                )
+                .await
+        );
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(conn.endpoint, Some(new_endpoint));
+        assert_eq!(conn.direct_generation, generation);
     }
 
     #[test]
