@@ -20,6 +20,8 @@ use crate::control::PeerInfo;
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
+const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
+const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
@@ -41,6 +43,8 @@ pub const REASON_PATH_DIRECT_DISABLED: &str = "path_direct_disabled";
 pub const REASON_PATH_DIRECT_NO_ENDPOINT: &str = "path_direct_no_endpoint";
 /// Path selector chose Relay because Direct has not been confirmed.
 pub const REASON_PATH_DIRECT_NOT_CONFIRMED: &str = "path_direct_not_confirmed";
+/// Path selector chose Relay because Direct quality is worse than Relay.
+pub const REASON_PATH_DIRECT_DEGRADED: &str = "path_direct_degraded";
 /// Path selector found no usable Direct or Relay path.
 pub const REASON_PATH_UNAVAILABLE: &str = "path_unavailable";
 
@@ -117,6 +121,10 @@ pub struct PathSelection {
     pub reason: String,
     /// Whether the chosen Direct path is fully confirmed.
     pub direct_confirmed: bool,
+    /// Explainable Direct path score, when a Direct endpoint exists.
+    pub direct_score: Option<PathScore>,
+    /// Explainable Relay path score, when Relay is available.
+    pub relay_score: Option<PathScore>,
 }
 
 impl PathSelection {
@@ -132,6 +140,8 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed,
+            direct_score: None,
+            relay_score: None,
         }
     }
 
@@ -142,6 +152,8 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
+            direct_score: None,
+            relay_score: None,
         }
     }
 
@@ -152,8 +164,34 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
+            direct_score: None,
+            relay_score: None,
         }
     }
+
+    fn with_scores(
+        mut self,
+        direct_score: Option<PathScore>,
+        relay_score: Option<PathScore>,
+    ) -> Self {
+        self.direct_score = direct_score;
+        self.relay_score = relay_score;
+        self
+    }
+}
+
+/// Explainable score used by the path selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathScore {
+    pub path: NetworkPath,
+    pub score: i32,
+    pub reachable: bool,
+    pub reachability_score: i32,
+    pub preference_score: i32,
+    pub latency_score: i32,
+    pub stability_score: i32,
+    pub penalty_score: i32,
+    pub reason: String,
 }
 
 /// Serializable path selector diagnostics.
@@ -164,6 +202,8 @@ pub struct PathSelectionDiagnostics {
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
+    pub direct_score: Option<PathScoreDiagnostics>,
+    pub relay_score: Option<PathScoreDiagnostics>,
 }
 
 impl From<&PathSelection> for PathSelectionDiagnostics {
@@ -176,6 +216,44 @@ impl From<&PathSelection> for PathSelectionDiagnostics {
             reason_code: selection.reason_code.to_string(),
             reason: selection.reason.clone(),
             direct_confirmed: selection.direct_confirmed,
+            direct_score: selection
+                .direct_score
+                .as_ref()
+                .map(PathScoreDiagnostics::from),
+            relay_score: selection
+                .relay_score
+                .as_ref()
+                .map(PathScoreDiagnostics::from),
+        }
+    }
+}
+
+/// Serializable path score diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathScoreDiagnostics {
+    pub path: NetworkPath,
+    pub score: i32,
+    pub reachable: bool,
+    pub reachability_score: i32,
+    pub preference_score: i32,
+    pub latency_score: i32,
+    pub stability_score: i32,
+    pub penalty_score: i32,
+    pub reason: String,
+}
+
+impl From<&PathScore> for PathScoreDiagnostics {
+    fn from(score: &PathScore) -> Self {
+        Self {
+            path: score.path,
+            score: score.score,
+            reachable: score.reachable,
+            reachability_score: score.reachability_score,
+            preference_score: score.preference_score,
+            latency_score: score.latency_score,
+            stability_score: score.stability_score,
+            penalty_score: score.penalty_score,
+            reason: score.reason.clone(),
         }
     }
 }
@@ -580,9 +658,15 @@ impl PeerConnection {
             candidate_pair_probe_rank(a.state)
                 .cmp(&candidate_pair_probe_rank(b.state))
                 .then_with(|| {
-                    a.rtt_ms
+                    a.rtt_ewma_ms
+                        .or(a.rtt_ms)
                         .unwrap_or(u64::MAX)
-                        .cmp(&b.rtt_ms.unwrap_or(u64::MAX))
+                        .cmp(&b.rtt_ewma_ms.or(b.rtt_ms).unwrap_or(u64::MAX))
+                })
+                .then_with(|| {
+                    a.jitter_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.jitter_ms.unwrap_or(u64::MAX))
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
@@ -608,9 +692,15 @@ impl PeerConnection {
             candidate_pair_send_rank(a.state)
                 .cmp(&candidate_pair_send_rank(b.state))
                 .then_with(|| {
-                    a.rtt_ms
+                    a.rtt_ewma_ms
+                        .or(a.rtt_ms)
                         .unwrap_or(u64::MAX)
-                        .cmp(&b.rtt_ms.unwrap_or(u64::MAX))
+                        .cmp(&b.rtt_ewma_ms.or(b.rtt_ms).unwrap_or(u64::MAX))
+                })
+                .then_with(|| {
+                    a.jitter_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.jitter_ms.unwrap_or(u64::MAX))
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
@@ -633,6 +723,107 @@ impl PeerConnection {
         })
     }
 
+    fn direct_path_score(
+        &self,
+        local_generation: u64,
+        direct_endpoint: Option<SocketAddr>,
+        confirmed: bool,
+        trial: bool,
+    ) -> Option<PathScore> {
+        let direct_endpoint = direct_endpoint?;
+        let pair = self.candidate_pairs.iter().find(|pair| {
+            pair.local_generation == local_generation && pair.remote_endpoint == direct_endpoint
+        });
+
+        let reachable = confirmed || trial;
+        let reachability_score = if confirmed {
+            80
+        } else if trial {
+            50
+        } else {
+            0
+        };
+        let preference_score = 10;
+        let latency_ms = pair
+            .and_then(|pair| pair.rtt_ewma_ms.or(pair.rtt_ms))
+            .or(self
+                .direct_health
+                .rtt_ewma_ms
+                .or(self.direct_health.latency_ms));
+        let jitter_ms = pair
+            .and_then(|pair| pair.jitter_ms)
+            .or(self.direct_health.jitter_ms);
+        let latency_score = latency_score(latency_ms);
+        let jitter_penalty = jitter_penalty(jitter_ms);
+        let stability_score = stability_score(
+            self.direct_health.success_count,
+            self.direct_health.consecutive_failures,
+            self.direct_health.failure_count,
+        );
+        let migration_penalty = if trial && !confirmed { -5 } else { 0 };
+        let penalty_score = jitter_penalty + migration_penalty;
+        let score =
+            reachability_score + preference_score + latency_score + stability_score + penalty_score;
+        Some(PathScore {
+            path: NetworkPath::Direct,
+            score,
+            reachable,
+            reachability_score,
+            preference_score,
+            latency_score,
+            stability_score,
+            penalty_score,
+            reason: format!(
+                "reachable={reachable} confirmed={confirmed} trial={trial} rtt={} jitter={} failures={}",
+                format_optional_ms(latency_ms),
+                format_optional_ms(jitter_ms),
+                self.direct_health.consecutive_failures,
+            ),
+        })
+    }
+
+    fn relay_path_score(&self, relay_available: bool) -> Option<PathScore> {
+        if !relay_available {
+            return None;
+        }
+        let reachability_score = 55;
+        let preference_score = 0;
+        let latency_score = latency_score(
+            self.relay_health
+                .rtt_ewma_ms
+                .or(self.relay_health.latency_ms),
+        );
+        let jitter_penalty = jitter_penalty(self.relay_health.jitter_ms);
+        let stability_score = stability_score(
+            self.relay_health.success_count,
+            self.relay_health.consecutive_failures,
+            self.relay_health.failure_count,
+        );
+        let penalty_score = jitter_penalty;
+        let score =
+            reachability_score + preference_score + latency_score + stability_score + penalty_score;
+        Some(PathScore {
+            path: NetworkPath::Relay,
+            score,
+            reachable: true,
+            reachability_score,
+            preference_score,
+            latency_score,
+            stability_score,
+            penalty_score,
+            reason: format!(
+                "relay_available=true rtt={} jitter={} failures={}",
+                format_optional_ms(
+                    self.relay_health
+                        .rtt_ewma_ms
+                        .or(self.relay_health.latency_ms)
+                ),
+                format_optional_ms(self.relay_health.jitter_ms),
+                self.relay_health.consecutive_failures,
+            ),
+        })
+    }
+
     fn select_path_for_data(
         &self,
         local_generation: u64,
@@ -640,6 +831,7 @@ impl PeerConnection {
         relay_available: bool,
     ) -> PathSelection {
         let direct_endpoint = self.direct_endpoint_for_send(local_generation);
+        let relay_score = self.relay_path_score(relay_available);
 
         if !prefer_direct {
             return if relay_available {
@@ -647,18 +839,23 @@ impl PeerConnection {
                     REASON_PATH_DIRECT_DISABLED,
                     "relay policy disables direct UDP",
                 )
+                .with_scores(None, relay_score)
             } else if let Some(endpoint) = direct_endpoint {
+                let direct_score =
+                    self.direct_path_score(local_generation, Some(endpoint), false, false);
                 PathSelection::direct(
                     endpoint,
                     REASON_PATH_RELAY_UNAVAILABLE,
                     "relay unavailable; attempting best-effort direct UDP",
                     false,
                 )
+                .with_scores(direct_score, None)
             } else {
                 PathSelection::unavailable(
                     REASON_PATH_UNAVAILABLE,
                     "relay unavailable and no direct UDP endpoint exists",
                 )
+                .with_scores(None, None)
             };
         }
 
@@ -668,22 +865,55 @@ impl PeerConnection {
                     REASON_PATH_DIRECT_NO_ENDPOINT,
                     "direct UDP has no candidate endpoint",
                 )
+                .with_scores(None, relay_score)
             } else {
                 PathSelection::unavailable(
                     REASON_PATH_UNAVAILABLE,
                     "no relay and no direct UDP endpoint exists",
                 )
+                .with_scores(None, None)
             };
         };
 
         let direct_pair_ready = self.has_current_direct_pair_for_data(local_generation);
+        let confirmed_direct = self.state == ConnectionState::Direct && direct_pair_ready;
+        let trial_direct = direct_pair_ready
+            && self.direct_health.consecutive_failures == 0
+            && self
+                .direct_health
+                .success_age()
+                .map(|age| age <= DIRECT_TRIAL_WINDOW)
+                .unwrap_or(false);
+        let direct_score = self.direct_path_score(
+            local_generation,
+            Some(endpoint),
+            confirmed_direct,
+            trial_direct,
+        );
+
         if self.state == ConnectionState::Direct && direct_pair_ready {
+            if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
+                if direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score {
+                    return PathSelection::relay(
+                        REASON_PATH_DIRECT_DEGRADED,
+                        format!(
+                            "direct score {} is below relay score {} after hysteresis",
+                            direct_score.score, relay_score.score
+                        ),
+                    )
+                    .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
+                }
+            }
             return PathSelection::direct(
                 endpoint,
                 REASON_PATH_DIRECT_CONFIRMED,
-                "direct UDP pair is confirmed",
+                direct_score
+                    .as_ref()
+                    .map(|score| format!("direct UDP pair is confirmed; score={}", score.score))
+                    .unwrap_or_else(|| "direct UDP pair is confirmed".to_string()),
                 true,
-            );
+            )
+            .with_scores(direct_score, relay_score);
         }
 
         if !relay_available {
@@ -692,29 +922,44 @@ impl PeerConnection {
                 REASON_PATH_RELAY_UNAVAILABLE,
                 "relay unavailable; attempting best-effort direct UDP",
                 false,
-            );
+            )
+            .with_scores(direct_score, None);
         }
 
-        if direct_pair_ready
-            && self.direct_health.consecutive_failures == 0
-            && self
-                .direct_health
-                .success_age()
-                .map(|age| age <= DIRECT_TRIAL_WINDOW)
-                .unwrap_or(false)
+        if trial_direct
+            && direct_score
+                .as_ref()
+                .map(|score| score.score >= DIRECT_TRIAL_MIN_SCORE)
+                .unwrap_or(true)
         {
             return PathSelection::direct(
                 endpoint,
                 REASON_PATH_DIRECT_TRIAL,
-                "recent direct UDP success is in trial window",
+                direct_score
+                    .as_ref()
+                    .map(|score| {
+                        format!(
+                            "recent direct UDP success is in trial window; score={}",
+                            score.score
+                        )
+                    })
+                    .unwrap_or_else(|| "recent direct UDP success is in trial window".to_string()),
                 false,
-            );
+            )
+            .with_scores(direct_score, relay_score);
         }
 
         PathSelection::relay(
             REASON_PATH_DIRECT_NOT_CONFIRMED,
-            "direct UDP pair is not confirmed; using relay",
+            match (&direct_score, &relay_score) {
+                (Some(direct_score), Some(relay_score)) => format!(
+                    "direct UDP pair is not confirmed enough; direct_score={} relay_score={}",
+                    direct_score.score, relay_score.score
+                ),
+                _ => "direct UDP pair is not confirmed; using relay".to_string(),
+            },
         )
+        .with_scores(direct_score, relay_score)
     }
 
     fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
@@ -1556,6 +1801,39 @@ fn update_latency_ewma(ewma_ms: &mut Option<u64>, jitter_ms: &mut Option<u64>, s
     }
 }
 
+fn latency_score(latency_ms: Option<u64>) -> i32 {
+    match latency_ms {
+        Some(ms) if ms <= 30 => 10,
+        Some(ms) if ms <= 80 => 6,
+        Some(ms) if ms <= 150 => 2,
+        Some(ms) if ms <= 300 => -5,
+        Some(_) => -15,
+        None => 0,
+    }
+}
+
+fn jitter_penalty(jitter_ms: Option<u64>) -> i32 {
+    match jitter_ms {
+        Some(ms) if ms <= 10 => 0,
+        Some(ms) if ms <= 40 => -5,
+        Some(_) => -15,
+        None => 0,
+    }
+}
+
+fn stability_score(success_count: u64, consecutive_failures: u32, failure_count: u64) -> i32 {
+    let success_bonus = success_count.min(5) as i32 * 2;
+    let consecutive_penalty = consecutive_failures.min(4) as i32 * -20;
+    let history_penalty = failure_count.min(5) as i32 * -3;
+    success_bonus + consecutive_penalty + history_penalty
+}
+
+fn format_optional_ms(value: Option<u64>) -> String {
+    value
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -1945,6 +2223,50 @@ mod tests {
         assert_eq!(confirmed.reason_code, REASON_PATH_DIRECT_CONFIRMED);
         assert_eq!(confirmed.direct_endpoint, Some(endpoint));
         assert!(confirmed.direct_confirmed);
+        assert!(
+            confirmed.direct_score.as_ref().unwrap().score
+                > confirmed.relay_score.as_ref().unwrap().score
+        );
+    }
+
+    #[tokio::test]
+    async fn path_selector_uses_scores_and_hysteresis_for_degraded_direct() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51836".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(18)),
+            )
+            .await;
+        manager
+            .record_relay_success("peer1", "relay.test:443", false)
+            .await;
+
+        let healthy = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(healthy.path, Some(NetworkPath::Direct));
+        assert_eq!(healthy.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.consecutive_failures = 3;
+            conn.direct_health.failure_count = 3;
+            conn.direct_health.rtt_ewma_ms = Some(650);
+            conn.direct_health.jitter_ms = Some(120);
+        }
+
+        let degraded = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(degraded.path, Some(NetworkPath::Relay));
+        assert_eq!(degraded.reason_code, REASON_PATH_DIRECT_DEGRADED);
+        assert!(
+            degraded.direct_score.as_ref().unwrap().score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN
+                < degraded.relay_score.as_ref().unwrap().score
+        );
     }
 
     #[tokio::test]
@@ -1979,6 +2301,10 @@ mod tests {
         assert_eq!(current.path, Some(NetworkPath::Relay));
         assert_eq!(current.direct_endpoint, None);
         assert_eq!(current.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert!(
+            current.direct_score.as_ref().unwrap().score
+                < current.relay_score.as_ref().unwrap().score
+        );
         assert_eq!(diagnostics[0].last_path_selection, None);
 
         let selected = manager.select_path_for_data("peer1", true, true).await;
@@ -2001,6 +2327,8 @@ mod tests {
             json["last_path_selection"]["reason_code"],
             REASON_PATH_DIRECT_NOT_CONFIRMED
         );
+        assert!(json["current_path_selection"]["direct_score"]["score"].is_i64());
+        assert!(json["current_path_selection"]["relay_score"]["score"].is_i64());
     }
 
     #[tokio::test]

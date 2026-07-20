@@ -1237,10 +1237,29 @@ fn path_selection_summary(peer: &Value, field: &str) -> Option<String> {
         .get("direct_confirmed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let direct_score = selection_score_text(selection.get("direct_score"));
+    let relay_score = selection_score_text(selection.get("relay_score"));
 
     Some(format!(
-        "path={path} endpoint={endpoint} confirmed={confirmed} code={reason_code} reason={reason}"
+        "path={path} endpoint={endpoint} confirmed={confirmed} direct_score={direct_score} relay_score={relay_score} code={reason_code} reason={reason}"
     ))
+}
+
+fn selection_score_text(score: Option<&Value>) -> String {
+    let Some(score) = score.and_then(Value::as_object) else {
+        return "n/a".to_string();
+    };
+    let value = score
+        .get("score")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let reason = score.get("reason").and_then(Value::as_str).unwrap_or("");
+    if reason.is_empty() {
+        value
+    } else {
+        format!("{value}({reason})")
+    }
 }
 
 fn direct_health_summary(peer: &Value) -> Option<String> {
@@ -1348,6 +1367,7 @@ fn path_reason_label(code: &str) -> &'static str {
         "path_direct_disabled" => "策略禁用 Direct",
         "path_direct_no_endpoint" => "没有 Direct UDP endpoint",
         "path_direct_not_confirmed" => "Direct UDP 尚未确认",
+        "path_direct_degraded" => "Direct 质量低于 Relay",
         "path_unavailable" => "没有可用数据路径",
         _ => "路径选择原因",
     }
@@ -2079,7 +2099,19 @@ mod tests {
                     "direct_endpoint": null,
                     "reason_code": "path_direct_no_endpoint",
                     "reason": "direct UDP has no candidate endpoint",
-                    "direct_confirmed": false
+                    "direct_confirmed": false,
+                    "direct_score": null,
+                    "relay_score": {
+                        "path": "relay",
+                        "score": 55,
+                        "reachable": true,
+                        "reachability_score": 55,
+                        "preference_score": 0,
+                        "latency_score": 0,
+                        "stability_score": 0,
+                        "penalty_score": 0,
+                        "reason": "relay_available=true rtt=unknown jitter=unknown failures=0"
+                    }
                 },
                 "direct": {
                     "last_error_code": "handshake_timeout",
@@ -2091,7 +2123,7 @@ mod tests {
 
         assert_eq!(
             path_selection_summary(peer, "current_path_selection").as_deref(),
-            Some("path=relay endpoint=(none) confirmed=false code=path_direct_no_endpoint reason=direct UDP has no candidate endpoint")
+            Some("path=relay endpoint=(none) confirmed=false direct_score=n/a relay_score=55(relay_available=true rtt=unknown jitter=unknown failures=0) code=path_direct_no_endpoint reason=direct UDP has no candidate endpoint")
         );
         assert_eq!(
             relay_path_reason(&snapshot, peer).as_deref(),
