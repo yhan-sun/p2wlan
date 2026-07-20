@@ -52,13 +52,117 @@ pub mod server;
 
 // Re-export key types for convenience
 pub use client::{RelayClient, RelayMessage};
-pub use error::{RelayError, Result as RelayResult};
+pub use error::{RelayError, RelayErrorCode, Result as RelayResult};
 pub use protocol::{Frame, MAX_PAYLOAD, VERSION as PROTOCOL_VERSION};
 pub use server::RelayServer;
 
-// ============================================================
-// Legacy types (kept for backward compatibility with Phase 1-3 code)
-// ============================================================
+use std::time::Duration;
+
+/// Relay server limits configuration.
+#[derive(Debug, Clone)]
+pub struct RelayServerConfig {
+    pub outbound_queue_capacity: usize,
+    pub register_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_connections: usize,
+    pub max_frame_payload: usize,
+}
+
+impl Default for RelayServerConfig {
+    fn default() -> Self {
+        Self {
+            outbound_queue_capacity: 128,
+            register_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(30),
+            max_connections: 1000,
+            max_frame_payload: 65535,
+        }
+    }
+}
+
+impl RelayServerConfig {
+    pub fn validate(&self) -> std::result::Result<(), error::RelayError> {
+        if self.outbound_queue_capacity == 0 {
+            return Err(error::RelayError::Protocol(
+                "outbound_queue_capacity must be > 0".into(),
+            ));
+        }
+        if self.register_timeout.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "register_timeout must be > 0".into(),
+            ));
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "idle_timeout must be > 0".into(),
+            ));
+        }
+        if self.max_connections == 0 {
+            return Err(error::RelayError::Protocol(
+                "max_connections must be > 0".into(),
+            ));
+        }
+        if self.max_frame_payload == 0 || self.max_frame_payload > 65535 {
+            return Err(error::RelayError::Protocol(
+                "max_frame_payload must be between 1 and 65535".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Relay client limits configuration.
+#[derive(Debug, Clone)]
+pub struct RelayClientConfig {
+    pub cmd_queue_capacity: usize,
+    pub inbound_queue_capacity: usize,
+    pub register_timeout: Duration,
+    pub keepalive_interval: Duration,
+    pub max_frame_payload: usize,
+}
+
+impl Default for RelayClientConfig {
+    fn default() -> Self {
+        Self {
+            cmd_queue_capacity: 128,
+            inbound_queue_capacity: 128,
+            register_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            max_frame_payload: 65535,
+        }
+    }
+}
+
+impl RelayClientConfig {
+    pub fn validate(&self) -> std::result::Result<(), error::RelayError> {
+        if self.cmd_queue_capacity == 0 {
+            return Err(error::RelayError::Protocol(
+                "cmd_queue_capacity must be > 0".into(),
+            ));
+        }
+        if self.inbound_queue_capacity == 0 {
+            return Err(error::RelayError::Protocol(
+                "inbound_queue_capacity must be > 0".into(),
+            ));
+        }
+        if self.register_timeout.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "register_timeout must be > 0".into(),
+            ));
+        }
+        if self.keepalive_interval.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "keepalive_interval must be > 0".into(),
+            ));
+        }
+        if self.max_frame_payload == 0 || self.max_frame_payload > 65535 {
+            return Err(error::RelayError::Protocol(
+                "max_frame_payload must be between 1 and 65535".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Relay server configuration.
 #[derive(Debug, Clone)]

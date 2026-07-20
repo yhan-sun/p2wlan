@@ -1451,7 +1451,13 @@ impl RelaySupervisor {
                 retry_delay = Duration::from_secs(1);
 
                 let endpoint = relay.endpoint().to_string();
-                let ended = relay.run_inbound(relay_rx, self.inbound_tx.clone()).await;
+                let ended = relay
+                    .run_inbound(
+                        relay_rx,
+                        self.inbound_tx.clone(),
+                        Some(self.relay_selection.clone()),
+                    )
+                    .await;
                 *self.relay_transport.write().await = None;
 
                 let reason = match ended {

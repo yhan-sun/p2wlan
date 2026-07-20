@@ -385,3 +385,35 @@ Internet client
 | 3000 | TUN_CREATE_FAILED | 虚拟网卡创建失败 |
 | 3100 | ROUTE_APPLY_FAILED | 路由应用失败 |
 | 4000 | ACL_DENIED | ACL 拒绝访问 |
+
+## 11. Relay Protocol V1 协议与资源限制
+
+### 11.1 资源限制配置
+Relay 服务端和客户端均支持严格的资源边界参数配置：
+- `outbound_queue_capacity` (服务端) / `cmd_queue_capacity` / `inbound_queue_capacity` (客户端): 限制队列深度，防止内存无上限增长。
+- `register_timeout` (服务端 5s) / `idle_timeout` (服务端 30s): 连接建立后未按时注册或注册后长期无流量的连接将自动被断开。
+- `max_connections` (服务端): 限制服务端最大并发 TCP 连接数。
+- `max_frame_payload` (65535 字节): 单个帧的最大 Payload 长度。
+
+### 11.2 二进制帧结构设计
+所有帧均以 8 字节 header 开始，以避免在大帧分配内存前导致 OOM：
+- `Magic` (4 字节): 统一为 `DERP` ('D', 'E', 'R', 'P')。
+- `Version` (1 字节): 版本号，为 1。
+- `Type` (1 字节): 帧类型 (Register=0x01, Registered=0x02, Forward=0x03, Received=0x04, Ping=0x05, Pong=0x06, Error=0x07, Close=0x08)。
+- `Length` (2 字节): 网络字节序表示的 Payload 长度，若超出配置的最大值，服务器会直接拒绝且不为 Payload 分配内存。
+
+### 11.3 协议错误码 (Wire Error Codes)
+
+当 Relay 协议层发生错误时，将返回带有以下标准 2 字节代码的 `msgError` (0x07) 帧：
+
+| 代码 (u16) | Snake Case 诊断码 | 触发场景与策略描述 |
+| --- | --- | --- |
+| `4000` | `invalid_frame` | 帧格式非法、未知帧类型或畸形 payload。 |
+| `4001` | `unsupported_version` | 协议版本不匹配（当前版本为 1）。 |
+| `4002` | `registration_required` | 建立连接后在发送注册帧前试图发送其他控制或数据帧。 |
+| `4003` | `registration_timeout` | 建立连接后未在超时时间内完成注册，直接断开。 |
+| `4004` | `duplicate_registration` | 同一 TCP 连接尝试对多个 Node ID 进行重复注册。 |
+| `4005` | `connection_limit` | 服务端连接数达到上限，新连接将被立即拒绝。 |
+| `4006` | `frame_too_large` | 帧的声明 Payload 长度超出 configured maximum frame payload。 |
+| `4008` | `peer_backpressure` | 目标 peer 消费过慢，导致服务端 outbound 队列溢出，目标 peer 将被主动断开，并向发送端返回此错误。 |
+| `4009` | `idle_timeout` | 客户端连接静默（无读写流量）时间超出最大闲置超时，连接被回收。 |
