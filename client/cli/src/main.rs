@@ -1045,6 +1045,9 @@ fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(selection) = path_selection_summary(peer, "last_path_selection") {
             println!("  last-path-selection={selection}");
         }
+        for event in path_event_summaries(peer, 3) {
+            println!("  path-event={event}");
+        }
         if let Some(reason) = relay_path_reason(snapshot, peer) {
             println!("  relay-reason={reason}");
         }
@@ -1260,6 +1263,48 @@ fn selection_score_text(score: Option<&Value>) -> String {
     } else {
         format!("{value}({reason})")
     }
+}
+
+fn path_event_summaries(peer: &Value, limit: usize) -> Vec<String> {
+    let Some(events) = peer.get("path_events").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let start = events.len().saturating_sub(limit);
+    events[start..]
+        .iter()
+        .filter_map(path_event_summary)
+        .collect()
+}
+
+fn path_event_summary(event: &Value) -> Option<String> {
+    let age = event
+        .get("selected_age_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let generation = event
+        .get("network_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let previous = event
+        .get("previous_path")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let selected = event
+        .get("selected_path")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let endpoint = event
+        .get("direct_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let reason_code = event.get("reason_code").and_then(Value::as_str)?;
+    let direct_score = selection_score_text(event.get("direct_score"));
+    let relay_score = selection_score_text(event.get("relay_score"));
+
+    Some(format!(
+        "age={}ms gen={} {}->{} endpoint={} direct_score={} relay_score={} code={}",
+        age, generation, previous, selected, endpoint, direct_score, relay_score, reason_code
+    ))
 }
 
 fn direct_health_summary(peer: &Value) -> Option<String> {
@@ -2157,6 +2202,45 @@ mod tests {
         assert_eq!(
             direct_retry_summary(peer).as_deref(),
             Some("next_probe_in=4200ms backoff=10000ms")
+        );
+    }
+
+    #[test]
+    fn doctor_formats_recent_path_events() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "laptop",
+                "virtual_ip": "10.20.0.5",
+                "path_events": [{
+                    "selected_age_ms": 250,
+                    "network_generation": 2,
+                    "previous_path": "relay",
+                    "selected_path": "direct",
+                    "direct_endpoint": "203.0.113.10:60207",
+                    "reason_code": "path_direct_confirmed",
+                    "reason": "direct UDP pair is confirmed; score=102",
+                    "direct_confirmed": true,
+                    "direct_score": {
+                        "path": "direct",
+                        "score": 102,
+                        "reachable": true,
+                        "reachability_score": 80,
+                        "preference_score": 10,
+                        "latency_score": 10,
+                        "stability_score": 2,
+                        "penalty_score": 0,
+                        "reason": "reachable=true confirmed=true trial=true rtt=9ms jitter=0ms failures=0"
+                    },
+                    "relay_score": null
+                }]
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+
+        assert_eq!(
+            path_event_summaries(peer, 3),
+            vec!["age=250ms gen=2 relay->direct endpoint=203.0.113.10:60207 direct_score=102(reachable=true confirmed=true trial=true rtt=9ms jitter=0ms failures=0) relay_score=n/a code=path_direct_confirmed".to_string()]
         );
     }
 
