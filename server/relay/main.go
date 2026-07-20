@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -10,26 +14,42 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var magic = []byte{'D', 'E', 'R', 'P'}
 
 const (
-	version       = byte(1)
-	frameHeader   = 8
-	msgRegister   = byte(0x01)
-	msgRegistered = byte(0x02)
-	msgForward    = byte(0x03)
-	msgReceived   = byte(0x04)
-	msgPing       = byte(0x05)
-	msgPong       = byte(0x06)
-	msgError      = byte(0x07)
-	msgClose      = byte(0x08)
+	version          = byte(1)
+	frameHeader      = 8
+	msgRegister      = byte(0x01)
+	msgRegistered    = byte(0x02)
+	msgForward       = byte(0x03)
+	msgReceived      = byte(0x04)
+	msgPing          = byte(0x05)
+	msgPong          = byte(0x06)
+	msgError         = byte(0x07)
+	msgClose         = byte(0x08)
+	msgAuthRegister  = byte(0x09)
+)
+
+// A2 error codes (extending A1 codes)
+const (
+	errAuthRequired     = uint16(4011)
+	errInvalidTicket    = uint16(4012)
+	errTicketExpired    = uint16(4013)
+	errAudienceMismatch = uint16(4014)
+	errIdentityMismatch = uint16(4015)
+	errNetworkMismatch  = uint16(4016)
+	errTicketNotYetVal  = uint16(4017)
+	errUnknownTicketKey = uint16(4018)
 )
 
 var (
@@ -39,54 +59,86 @@ var (
 )
 
 type RelayConfig struct {
-	Bind              string
-	SendQueueCapacity int
-	RegisterTimeout   time.Duration
-	IdleTimeout       time.Duration
-	MaxConnections    int
-	MaxFramePayload   int
+	Bind                       string
+	SendQueueCapacity          int
+	RegisterTimeout            time.Duration
+	IdleTimeout                time.Duration
+	MaxConnections             int
+	MaxFramePayload            int
+	// A2: security settings
+	RequireAuthentication      bool
+	AllowLegacyUnauthenticated bool
+	TLSCertChainPath           string
+	TLSPrivateKeyPath          string
+	AllowInsecurePlaintext     bool
+	// A2: ticket verification
+	TicketKeyringJSON          string
+	RelayAudience              string
+	RelayRegion                string
+	TicketMaxClockSkew         time.Duration
+}
+
+// networkNodeKey is the composite key for the peer table: (network_id, node_id).
+type networkNodeKey struct {
+	networkID string
+	nodeID    string
 }
 
 type peer struct {
-	id   string
-	conn net.Conn
-	send chan []byte
-	done chan struct{}
+	id        string // node_id (for logging)
+	networkID string
+	deviceID  string
+	conn      net.Conn
+	send      chan []byte
+	done      chan struct{}
 }
 
 type hub struct {
 	mu    sync.RWMutex
-	peers map[string]*peer
+	peers map[networkNodeKey]*peer
 }
 
 func newHub() *hub {
-	return &hub{peers: map[string]*peer{}}
+	return &hub{peers: map[networkNodeKey]*peer{}}
 }
 
-func (h *hub) register(p *peer, id string) {
+func (h *hub) register(p *peer, networkID, nodeID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if old := h.peers[id]; old != nil && old != p {
+	key := networkNodeKey{networkID: networkID, nodeID: nodeID}
+	if old := h.peers[key]; old != nil && old != p {
 		_ = old.conn.Close()
 	}
-	p.id = id
-	h.peers[id] = p
+	p.id = nodeID
+	p.networkID = networkID
+	h.peers[key] = p
 }
 
 func (h *hub) unregister(p *peer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if p.id != "" && h.peers[p.id] == p {
-		delete(h.peers, p.id)
+	if p.id != "" && p.networkID != "" {
+		key := networkNodeKey{networkID: p.networkID, nodeID: p.id}
+		if h.peers[key] == p {
+			delete(h.peers, key)
+		}
 	}
 }
 
-// forward forwards payload and returns error code (0 for success).
-func (h *hub) forward(srcID, dstID string, data []byte, maxFramePayload int) uint16 {
+// lookup returns the peer for a given network+node, or nil.
+func (h *hub) lookup(networkID, nodeID string) *peer {
 	h.mu.RLock()
-	dst := h.peers[dstID]
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
+	return h.peers[networkNodeKey{networkID: networkID, nodeID: nodeID}]
+}
+
+// forward forwards payload and returns error code (0 for success).
+// Uses network-scoped lookup: source and destination must be in the same network.
+func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayload int) uint16 {
+	dst := h.lookup(srcNetwork, dstID)
 	if dst == nil {
+		// Return 404 even if peer exists in a different network — do not leak
+		// that information to the sender.
 		return 404
 	}
 
@@ -124,20 +176,212 @@ type RelayServer struct {
 	mu          sync.Mutex
 	closing     bool
 	connections map[net.Conn]struct{}
+
+	// A2: ticket verification
+	ticketKeyring map[string]ed25519.PublicKey
+}
+
+// RelayTicketClaims are the JWT claims for relay registration.
+type relayTicketClaims struct {
+	DeviceID      string `json:"device_id"`
+	NetworkID     string `json:"network_id"`
+	NodeID        string `json:"node_id"`
+	RelayRegion   string `json:"relay_region"`
+	RelayProtocol int    `json:"relay_protocol"`
+	jwt.RegisteredClaims
 }
 
 func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
-	listener, err := net.Listen("tcp", config.Bind)
+	// Validate keyring BEFORE opening listener to avoid leaking listener on failure
+	keyring, err := loadTicketKeyring(config)
 	if err != nil {
-		return nil, err
+		if config.RequireAuthentication {
+			return nil, fmt.Errorf("ticket keyring required when authentication is enabled: %w", err)
+		}
+		log.Printf("WARNING: no ticket keyring configured; authentication disabled")
 	}
+
+	// Determine TLS or plaintext
+	var listener net.Listener
+	hasTLS := config.TLSCertChainPath != "" && config.TLSPrivateKeyPath != ""
+	if hasTLS {
+		cert, err := tls.LoadX509KeyPair(config.TLSCertChainPath, config.TLSPrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+		}
+		listener, err = tls.Listen("tcp", config.Bind, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to listen with TLS on %s: %w", config.Bind, err)
+		}
+		log.Printf("TLS enabled on %s", config.Bind)
+	} else {
+		if !config.AllowInsecurePlaintext {
+			return nil, fmt.Errorf("TLS must be configured or allow_insecure_plaintext must be set (development only)")
+		}
+		listener, err = net.Listen("tcp", config.Bind)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("WARNING: plaintext mode enabled on %s (development only)", config.Bind)
+	}
+
 	return &RelayServer{
-		config:       config,
-		listener:     listener,
-		hub:          newHub(),
-		shutdownChan: make(chan struct{}),
-		connections:  make(map[net.Conn]struct{}),
+		config:        config,
+		listener:      listener,
+		hub:           newHub(),
+		shutdownChan:  make(chan struct{}),
+		connections:   make(map[net.Conn]struct{}),
+		ticketKeyring: keyring,
 	}, nil
+}
+
+// loadTicketKeyring parses RELAY_TICKET_KEYRING_JSON or config field.
+// Expected format: {"kid-1": "<hex-encoded 32-byte Ed25519 public key>", ...}
+func loadTicketKeyring(config *RelayConfig) (map[string]ed25519.PublicKey, error) {
+	raw := strings.TrimSpace(config.TicketKeyringJSON)
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("RELAY_TICKET_KEYRING_JSON"))
+	}
+	if raw == "" {
+		return nil, fmt.Errorf("no ticket keyring configured")
+	}
+
+	var rawKeys map[string]string
+	if err := json.Unmarshal([]byte(raw), &rawKeys); err != nil {
+		return nil, fmt.Errorf("invalid ticket keyring JSON: %w", err)
+	}
+
+	keyring := make(map[string]ed25519.PublicKey)
+	for kid, hexKey := range rawKeys {
+		bytes, err := hex.DecodeString(strings.TrimSpace(hexKey))
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex key for kid '%s': %w", kid, err)
+		}
+		if len(bytes) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("public key for kid '%s' is %d bytes (expected %d)", kid, len(bytes), ed25519.PublicKeySize)
+		}
+		keyring[kid] = ed25519.PublicKey(bytes)
+	}
+
+	if len(keyring) == 0 {
+		return nil, fmt.Errorf("ticket keyring is empty")
+	}
+
+	return keyring, nil
+}
+
+// verifyTicket parses and validates a relay ticket JWT.
+func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) {
+	if s.ticketKeyring == nil {
+		return nil, fmt.Errorf("ticket verification not configured")
+	}
+
+	clockSkew := s.config.TicketMaxClockSkew
+	if clockSkew <= 0 {
+		clockSkew = 30 * time.Second
+	}
+
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{"EdDSA"}),
+		jwt.WithIssuer("p2wlan-control"),
+		jwt.WithLeeway(clockSkew),
+	)
+
+	token, err := parser.ParseWithClaims(tokenStr, &relayTicketClaims{},
+		func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != "EdDSA" {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			typ, _ := t.Header["typ"].(string)
+			if typ != "p2wlan-relay+jwt" {
+				return nil, fmt.Errorf("invalid token type")
+			}
+			kid, ok := t.Header["kid"].(string)
+			if !ok || kid == "" {
+				return nil, fmt.Errorf("missing kid")
+			}
+			pub, ok := s.ticketKeyring[kid]
+			if !ok {
+				return nil, fmt.Errorf("unknown kid: %s", kid)
+			}
+			return ed25519.PublicKey(pub), nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("ticket verification failed: %w", err)
+	}
+
+	claims, ok := token.Claims.(*relayTicketClaims)
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("invalid ticket claims")
+	}
+
+	// Validate required claims
+	if claims.DeviceID == "" {
+		return nil, fmt.Errorf("missing device_id")
+	}
+	if claims.NetworkID == "" {
+		return nil, fmt.Errorf("missing network_id")
+	}
+	if claims.NodeID == "" {
+		return nil, fmt.Errorf("missing node_id")
+	}
+	if claims.RelayProtocol != 1 {
+		return nil, fmt.Errorf("unsupported relay protocol: %d", claims.RelayProtocol)
+	}
+
+	// Strict claim validation
+	if claims.Subject != claims.DeviceID {
+		return nil, fmt.Errorf("identity mismatch: sub '%s' != device_id '%s'",
+			claims.Subject, claims.DeviceID)
+	}
+	if claims.ID == "" {
+		return nil, fmt.Errorf("missing jti")
+	}
+	if claims.IssuedAt == nil {
+		return nil, fmt.Errorf("missing iat")
+	}
+	if claims.ExpiresAt == nil {
+		return nil, fmt.Errorf("missing exp")
+	}
+	if claims.NotBefore == nil {
+		return nil, fmt.Errorf("missing nbf")
+	}
+	// Audience must be single value, not array
+	if len(claims.Audience) != 1 {
+		return nil, fmt.Errorf("audience must be a single value, got %d", len(claims.Audience))
+	}
+
+	// Validate audience matches this relay (mandatory when auth is enabled)
+	if s.config.RelayAudience == "" {
+		return nil, fmt.Errorf("relay audience not configured; required for ticket verification")
+	}
+	audMatch := false
+	for _, aud := range claims.Audience {
+		if aud == s.config.RelayAudience {
+			audMatch = true
+			break
+		}
+	}
+	if !audMatch {
+		return nil, fmt.Errorf("audience mismatch: ticket is for %v, relay expects %s",
+			claims.Audience, s.config.RelayAudience)
+	}
+
+	// Validate region matches (mandatory when auth is enabled)
+	if s.config.RelayRegion == "" {
+		return nil, fmt.Errorf("relay region not configured; required for ticket verification")
+	}
+	if claims.RelayRegion != s.config.RelayRegion {
+		return nil, fmt.Errorf("region mismatch: ticket is for '%s', relay serves '%s'",
+			claims.RelayRegion, s.config.RelayRegion)
+	}
+
+	return claims, nil
 }
 
 func (s *RelayServer) Addr() net.Addr {
@@ -294,17 +538,35 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
 	maxConnections := fs.Int("max-connections", envMaxConnections, "Maximum connections")
 	maxFramePayload := fs.Int("max-frame-payload", envMaxFramePayload, "Maximum frame payload")
+	// A2 flags
+	requireAuth := fs.Bool("require-auth", getenv("RELAY_REQUIRE_AUTH", "true") == "true", "Require authenticated registration")
+	allowLegacy := fs.Bool("allow-legacy-unauthenticated", getenv("RELAY_ALLOW_LEGACY_UNAUTH", "false") == "true", "Allow legacy unauthenticated registration")
+	tlsCert := fs.String("tls-cert", getenv("RELAY_TLS_CERT", ""), "TLS certificate chain PEM file")
+	tlsKey := fs.String("tls-key", getenv("RELAY_TLS_KEY", ""), "TLS private key PEM file")
+	allowPlaintext := fs.Bool("allow-insecure-plaintext", getenv("RELAY_ALLOW_INSECURE_PLAINTEXT", "false") == "true", "Allow plaintext TCP (development only)")
+	ticketKeyring := fs.String("ticket-keyring", getenv("RELAY_TICKET_KEYRING_JSON", ""), "Ticket verification keyring JSON")
+	relayAudience := fs.String("relay-audience", getenv("RELAY_AUDIENCE", ""), "This relay's audience ID")
+	relayRegion := fs.String("relay-region", getenv("RELAY_REGION", ""), "This relay's region label")
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 
 	config := &RelayConfig{
-		Bind:              *bind,
-		SendQueueCapacity: *sendQueue,
-		RegisterTimeout:   *registerTimeout,
-		IdleTimeout:       *idleTimeout,
-		MaxConnections:    *maxConnections,
-		MaxFramePayload:   *maxFramePayload,
+		Bind:                       *bind,
+		SendQueueCapacity:          *sendQueue,
+		RegisterTimeout:            *registerTimeout,
+		IdleTimeout:                *idleTimeout,
+		MaxConnections:             *maxConnections,
+		MaxFramePayload:            *maxFramePayload,
+		RequireAuthentication:      *requireAuth,
+		AllowLegacyUnauthenticated: *allowLegacy,
+		TLSCertChainPath:           *tlsCert,
+		TLSPrivateKeyPath:          *tlsKey,
+		AllowInsecurePlaintext:     *allowPlaintext,
+		TicketKeyringJSON:          *ticketKeyring,
+		RelayAudience:              *relayAudience,
+		RelayRegion:                *relayRegion,
 	}
 
 	if config.SendQueueCapacity <= 0 {
@@ -321,6 +583,19 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	}
 	if config.MaxFramePayload <= 0 || config.MaxFramePayload > 65535 {
 		return nil, fmt.Errorf("max-frame-payload must be between 1 and 65535")
+	}
+
+	// A2: validate security config at startup
+	if config.RequireAuthentication {
+		if config.TicketKeyringJSON == "" && os.Getenv("RELAY_TICKET_KEYRING_JSON") == "" {
+			return nil, fmt.Errorf("require-auth is enabled but no ticket keyring configured (set -ticket-keyring or RELAY_TICKET_KEYRING_JSON)")
+		}
+		if config.RelayAudience == "" {
+			return nil, fmt.Errorf("require-auth is enabled but relay-audience is not set")
+		}
+		if config.RelayRegion == "" {
+			return nil, fmt.Errorf("require-auth is enabled but relay-region is not set")
+		}
 	}
 
 	return config, nil
@@ -379,22 +654,111 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		return
 	}
 
-	if typ != msgRegister {
-		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	// ---- Handle legacy MSG_REGISTER (0x01) ----
+	if typ == msgRegister {
+		if s.config.RequireAuthentication && !s.config.AllowLegacyUnauthenticated {
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
+			return
+		}
+
+		nodeID := string(payload)
+		if nodeID == "" || len(nodeID) > 255 || !utf8.Valid(payload) {
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = conn.Write(errorFrame(4000, "invalid node ID"))
+			return
+		}
+
+		// Legacy: network_id defaults to "" (empty string)
+		s.hub.register(p, "", nodeID)
+		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
+		s.handlePostRegister(conn, p, nodeID, "")
+		return
+	}
+
+	// ---- Handle MSG_AUTH_REGISTER (0x09) ----
+	if typ == msgAuthRegister {
+		nodeID, ticket, err := parseAuthRegister(payload)
+		if err != nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = conn.Write(errorFrame(errInvalidTicket, err.Error()))
+			return
+		}
+
+		// Verify the ticket
+		claims, err := s.verifyTicket(ticket)
+		if err != nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			code := errInvalidTicket
+			msg := err.Error()
+			// Map specific error types to proper wire codes
+			switch {
+			case strings.Contains(msg, "expired"):
+				code = errTicketExpired
+			case strings.Contains(msg, "not yet valid"):
+				code = errTicketNotYetVal
+			case strings.Contains(msg, "audience"):
+				code = errAudienceMismatch
+			case strings.Contains(msg, "unknown kid"):
+				code = errUnknownTicketKey
+			case strings.Contains(msg, "identity"):
+				code = errIdentityMismatch
+			case strings.Contains(msg, "network"):
+				code = errNetworkMismatch
+			}
+			_, _ = conn.Write(errorFrame(code, msg))
+			return
+		}
+
+		// Verify node_id from frame matches ticket
+		if nodeID != claims.NodeID {
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = conn.Write(errorFrame(errIdentityMismatch, "node_id does not match ticket"))
+			return
+		}
+
+		// Register with network binding
+		p.deviceID = claims.DeviceID
+		s.hub.register(p, claims.NetworkID, nodeID)
+		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
+
+		// Store ticket expiry for connection lifecycle management
+		ticketExpiry := claims.ExpiresAt
+		var expiryTimer *time.Timer
+		if ticketExpiry != nil && ticketExpiry.Unix() > 0 {
+			remaining := time.Until(ticketExpiry.Time)
+			if remaining > 0 {
+				expiryTimer = time.AfterFunc(remaining, func() {
+					_ = conn.Close()
+				})
+			} else {
+				// Ticket already expired
+				_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+				_, _ = conn.Write(errorFrame(errTicketExpired, "ticket expired"))
+				return
+			}
+		}
+
+		// If we have a timer, stop it on connection close
+		if expiryTimer != nil {
+			defer expiryTimer.Stop()
+		}
+
+		s.handlePostRegister(conn, p, nodeID, claims.NetworkID)
+		return
+	}
+
+	// Unknown first frame type
+	_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	if s.config.RequireAuthentication {
+		_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
+	} else {
 		_, _ = conn.Write(errorFrame(4002, "registration required"))
-		return
 	}
+}
 
-	nodeID := string(payload)
-	if nodeID == "" || len(nodeID) > 255 || !utf8.Valid(payload) {
-		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-		_, _ = conn.Write(errorFrame(4000, "invalid node ID"))
-		return
-	}
-
-	s.hub.register(p, nodeID)
-	queue(p, makeFrame(msgRegistered, []byte(nodeID)))
-
+// handlePostRegister handles the read loop after registration completes.
+func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, networkID string) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
@@ -428,7 +792,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				queue(p, errorFrame(4000, "malformed forward payload"))
 				continue
 			}
-			status := s.hub.forward(p.id, dstID, data, s.config.MaxFramePayload)
+			status := s.hub.forward(networkID, p.id, dstID, data, s.config.MaxFramePayload)
 			if status != 0 {
 				queue(p, errorFrame(status, "forward failed"))
 			}
@@ -443,6 +807,38 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 			queue(p, errorFrame(4000, "unsupported frame type"))
 		}
 	}
+}
+
+// parseAuthRegister parses the MSG_AUTH_REGISTER binary payload.
+// Format: u8 node_id_len | node_id | u16 ticket_len (BE) | ticket
+func parseAuthRegister(payload []byte) (nodeID, ticket string, err error) {
+	if len(payload) < 1 {
+		return "", "", fmt.Errorf("auth register payload empty")
+	}
+	nodeIDLen := int(payload[0])
+	if nodeIDLen == 0 || nodeIDLen > 255 {
+		return "", "", fmt.Errorf("invalid node_id_len: %d", nodeIDLen)
+	}
+	if len(payload) < 1+nodeIDLen+2 {
+		return "", "", fmt.Errorf("auth register payload truncated")
+	}
+	nodeIDBytes := payload[1 : 1+nodeIDLen]
+	if !utf8.Valid(nodeIDBytes) {
+		return "", "", fmt.Errorf("node_id is not valid UTF-8")
+	}
+	nodeID = string(nodeIDBytes)
+
+	ticketStart := 1 + nodeIDLen
+	ticketLen := int(binary.BigEndian.Uint16(payload[ticketStart : ticketStart+2]))
+	if ticketLen == 0 || ticketLen > 8192 {
+		return "", "", fmt.Errorf("invalid ticket_len: %d", ticketLen)
+	}
+	ticketDataStart := ticketStart + 2
+	if len(payload) != ticketDataStart+ticketLen {
+		return "", "", fmt.Errorf("auth register payload has trailing bytes or is truncated")
+	}
+	ticket = string(payload[ticketDataStart : ticketDataStart+ticketLen])
+	return nodeID, ticket, nil
 }
 
 func queue(p *peer, frame []byte) {

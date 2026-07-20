@@ -59,11 +59,18 @@ pub enum RelayError {
     /// Invalid magic header.
     #[error("invalid magic header")]
     InvalidMagic,
+
+    /// Authentication / authorization error (A2).
+    #[error("auth error (code {0}): {1}")]
+    AuthError(u16, String),
+
+    /// TLS error.
+    #[error("TLS error: {0}")]
+    TlsError(String),
 }
 
 /// Stable error codes matching Go relay implementation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
 pub enum RelayErrorCode {
     InvalidFrame = 4000,
     UnsupportedVersion = 4001,
@@ -76,6 +83,15 @@ pub enum RelayErrorCode {
     PeerBackpressure = 4008,
     IdleTimeout = 4009,
     TransportClosed = 4010,
+    // A2 auth error codes
+    AuthRequired = 4011,
+    InvalidTicket = 4012,
+    TicketExpired = 4013,
+    AudienceMismatch = 4014,
+    IdentityMismatch = 4015,
+    NetworkMismatch = 4016,
+    TicketNotYetValid = 4017,
+    UnknownTicketKey = 4018,
 }
 
 impl RelayErrorCode {
@@ -92,6 +108,14 @@ impl RelayErrorCode {
             4008 => Some(Self::PeerBackpressure),
             4009 => Some(Self::IdleTimeout),
             4010 => Some(Self::TransportClosed),
+            4011 => Some(Self::AuthRequired),
+            4012 => Some(Self::InvalidTicket),
+            4013 => Some(Self::TicketExpired),
+            4014 => Some(Self::AudienceMismatch),
+            4015 => Some(Self::IdentityMismatch),
+            4016 => Some(Self::NetworkMismatch),
+            4017 => Some(Self::TicketNotYetValid),
+            4018 => Some(Self::UnknownTicketKey),
             _ => None,
         }
     }
@@ -113,6 +137,14 @@ impl RelayErrorCode {
             Self::PeerBackpressure => "peer_backpressure",
             Self::IdleTimeout => "idle_timeout",
             Self::TransportClosed => "transport_closed",
+            Self::AuthRequired => "auth_required",
+            Self::InvalidTicket => "invalid_ticket",
+            Self::TicketExpired => "ticket_expired",
+            Self::AudienceMismatch => "audience_mismatch",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::NetworkMismatch => "network_mismatch",
+            Self::TicketNotYetValid => "ticket_not_yet_valid",
+            Self::UnknownTicketKey => "unknown_ticket_key",
         }
     }
 }
@@ -121,6 +153,9 @@ impl RelayError {
     pub fn error_code(&self) -> Option<RelayErrorCode> {
         match self {
             RelayError::ServerError(code, _) => RelayErrorCode::from_u16(*code),
+            RelayError::AuthError(code, _) => {
+                Some(RelayErrorCode::from_u16(*code).unwrap_or(RelayErrorCode::AuthRequired))
+            }
             RelayError::UnsupportedVersion(_) => Some(RelayErrorCode::UnsupportedVersion),
             RelayError::InvalidMagic => Some(RelayErrorCode::InvalidFrame),
             RelayError::FrameTooLarge(_, _) => Some(RelayErrorCode::FrameTooLarge),
@@ -137,6 +172,13 @@ impl RelayError {
                     "unknown_server_error"
                 }
             }
+            RelayError::AuthError(code, _) => {
+                if let Some(ec) = RelayErrorCode::from_u16(*code) {
+                    ec.to_snake_case()
+                } else {
+                    "auth_error"
+                }
+            }
             RelayError::Protocol(_) => "protocol_error",
             RelayError::Timeout(_) => "timeout",
             RelayError::ConnectFailed(_) => "connect_failed",
@@ -149,6 +191,7 @@ impl RelayError {
             RelayError::UnexpectedMessageType(_) => "unexpected_message_type",
             RelayError::UnsupportedVersion(_) => "unsupported_version",
             RelayError::InvalidMagic => "invalid_magic",
+            RelayError::TlsError(_) => "tls_error",
         }
     }
 }

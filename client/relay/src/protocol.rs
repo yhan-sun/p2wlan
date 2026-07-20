@@ -63,6 +63,7 @@ pub const MSG_PING: u8 = 0x05;
 pub const MSG_PONG: u8 = 0x06;
 pub const MSG_ERROR: u8 = 0x07;
 pub const MSG_CLOSE: u8 = 0x08;
+pub const MSG_AUTH_REGISTER: u8 = 0x09;
 
 // Close reason codes
 pub const CLOSE_NORMAL: u8 = 0x00;

@@ -172,6 +172,8 @@ pub enum ControlEvent {
         virtual_ip: String,
         cidr: Option<String>,
         relay_servers: Vec<String>,
+        /// A2: structured relay catalog from control plane.
+        relay_catalog: Vec<RelayCatalogEntry>,
     },
     /// A new peer has joined.
     PeerJoined(PeerInfo),
@@ -228,6 +230,14 @@ struct ClientState {
     _relay_servers: Vec<String>,
 }
 
+/// Relay catalog entry from control plane.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RelayCatalogEntry {
+    pub region: String,
+    pub audience: String,
+    pub endpoint: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterDeviceResponse {
     success: bool,
@@ -236,6 +246,8 @@ struct RegisterDeviceResponse {
     cidr: Option<String>,
     #[serde(default)]
     relay_servers: Vec<String>,
+    #[serde(default)]
+    relay_catalog: Vec<RelayCatalogEntry>,
     error: Option<String>,
 }
 
@@ -313,6 +325,12 @@ pub struct ControlClient {
     state: Arc<RwLock<ClientState>>,
 }
 
+/// Response for a relay ticket fetch.
+struct FetchRelayTicketResponse {
+    ticket: String,
+    expires_at: i64,
+}
+
 /// Commands sent to the control client background task.
 enum ControlCommand {
     /// Update our endpoint (after NAT detection).
@@ -337,6 +355,12 @@ enum ControlCommand {
     },
     /// Delete a tunnel.
     DeleteTunnel { tunnel_id: String },
+    /// Fetch a relay ticket.
+    FetchRelayTicket {
+        audience: String,
+        region: String,
+        response_tx: tokio::sync::oneshot::Sender<Result<FetchRelayTicketResponse>>,
+    },
     /// Shutdown.
     Shutdown,
 }
@@ -468,6 +492,23 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Fetch a relay ticket from the control plane.
+    /// Returns (ticket_jwt, expires_at_unix).
+    pub async fn fetch_relay_ticket(&self, audience: &str, region: &str) -> Result<(String, i64)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::FetchRelayTicket {
+                audience: audience.to_string(),
+                region: region.to_string(),
+                response_tx: tx,
+            })
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        let resp = rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("ticket fetch cancelled".into()))??;
+        Ok((resp.ticket, resp.expires_at))
+    }
+
     /// Process a received control message (internal).
     #[cfg(test)]
     async fn handle_message(&self, msg: ControlMessage) {
@@ -487,6 +528,7 @@ impl ControlClient {
                     virtual_ip,
                     cidr: Some("10.20.0.0/16".to_string()),
                     relay_servers,
+                    relay_catalog: Vec::new(),
                 });
             }
 
@@ -654,7 +696,7 @@ async fn run_control_loop(
             let mut attempt: u32 = 0;
             loop {
                 match register_device(&http, &base_url, &token, &config).await {
-                    Ok((node_id, virtual_ip, cidr, server_relay_servers)) => {
+                    Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
                         {
                             let mut s = state.write().await;
                             s.registered = true;
@@ -674,6 +716,7 @@ async fn run_control_loop(
                             virtual_ip: virtual_ip.clone(),
                             cidr: Some(cidr),
                             relay_servers,
+                            relay_catalog,
                         });
 
                         // Attempt Ed25519 challenge for device credential
@@ -977,6 +1020,10 @@ async fn run_control_loop(
                         ControlCommand::DeleteTunnel { tunnel_id } => {
                             debug!("Tunnel deletion queued locally for {tunnel_id}");
                         }
+                        ControlCommand::FetchRelayTicket { audience, region, response_tx } => {
+                            let result = fetch_relay_ticket_http(&http, &base_url, &token, &audience, &region).await;
+                            let _ = response_tx.send(result);
+                        }
                         ControlCommand::Shutdown => {
                             let _ = event_tx.send(ControlEvent::Disconnected);
                             return;
@@ -1109,6 +1156,60 @@ async fn obtain_device_credential(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct RelayTicketResponse {
+    ticket: Option<String>,
+    expires_at: Option<i64>,
+    error: Option<String>,
+}
+
+async fn fetch_relay_ticket_http(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    audience: &str,
+    region: &str,
+) -> Result<FetchRelayTicketResponse> {
+    let resp = http
+        .post(format!("{base_url}/api/v1/relay/tickets"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "audience": audience,
+            "region": region,
+        }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("relay ticket request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: RelayTicketResponse = resp.json().await.unwrap_or(RelayTicketResponse {
+            ticket: None,
+            expires_at: None,
+            error: Some(format!("HTTP {status}")),
+        });
+        let msg = body.error.unwrap_or_else(|| format!("HTTP {status}"));
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(DaemonError::ControlPlane(format!("permanent auth: {msg}")));
+        }
+        return Err(DaemonError::ControlPlane(format!(
+            "relay ticket request: {msg}"
+        )));
+    }
+
+    let body: RelayTicketResponse = resp
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("relay ticket decode: {e}")))?;
+
+    let ticket = body
+        .ticket
+        .ok_or_else(|| DaemonError::ControlPlane("relay ticket response missing ticket".into()))?;
+    let expires_at = body.expires_at.unwrap_or(0);
+
+    Ok(FetchRelayTicketResponse { ticket, expires_at })
+}
+
 fn normalize_http_base_url(server_url: &str) -> String {
     let trimmed = server_url.trim().trim_end_matches('/');
     if trimmed.starts_with("ws://") {
@@ -1125,7 +1226,7 @@ async fn register_device(
     base_url: &str,
     token: &str,
     config: &Config,
-) -> Result<(String, String, String, Vec<String>)> {
+) -> Result<(String, String, String, Vec<String>, Vec<RelayCatalogEntry>)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .bearer_auth(token)
@@ -1166,7 +1267,13 @@ async fn register_device(
         .ok_or_else(|| DaemonError::ControlPlane("register response missing virtual_ip".into()))?;
     let cidr = body.cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
 
-    Ok((node_id, virtual_ip, cidr, body.relay_servers))
+    Ok((
+        node_id,
+        virtual_ip,
+        cidr,
+        body.relay_servers,
+        body.relay_catalog,
+    ))
 }
 
 async fn update_endpoint(
@@ -1589,6 +1696,7 @@ mod tests {
             virtual_ip,
             cidr: _,
             relay_servers,
+            relay_catalog: _,
         } = event
         {
             assert_eq!(node_id, None);

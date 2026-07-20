@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -20,15 +21,51 @@ import (
 
 // Server handles API requests.
 type Server struct {
-	auth         *auth.Service
-	hub          *signaling.Hub
-	db           *database.DB
-	relayServers []string
+	auth              *auth.Service
+	hub               *signaling.Hub
+	db                *database.DB
+	relayServers      []string
+	relayCatalog      *RelayCatalog
+	relayTicketSigner *auth.RelayTicketSigner
 }
 
 // NewServer creates a new API server.
-func NewServer(auth *auth.Service, hub *signaling.Hub, db *database.DB) *Server {
-	return &Server{auth: auth, hub: hub, db: db, relayServers: parseRelayServers()}
+// Catalog and signer configuration errors are fatal in production mode
+// (when RELAY_TICKET_SIGNER_KEY_FILE is set), but warnings in dev mode.
+func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *Server {
+	catalog, catalogErr := LoadRelayCatalog()
+	if catalogErr != nil {
+		log.Printf("WARNING: failed to load relay catalog: %v", catalogErr)
+		catalog = nil
+	}
+
+	signer, signerErr := auth.LoadSignerFromEnv()
+	if signerErr != nil {
+		// If a signer key file was explicitly configured, errors are fatal
+		if os.Getenv("RELAY_TICKET_SIGNER_KEY_FILE") != "" || os.Getenv("RELAY_TICKET_SIGNER_JSON") != "" {
+			log.Fatalf("FATAL: relay ticket signer configuration error: %v", signerErr)
+		}
+		log.Printf("WARNING: relay ticket signer not configured: %v", signerErr)
+		signer = nil
+	}
+
+	// Fail fast: signer configured but no catalog
+	if signer != nil && catalog == nil {
+		log.Fatalf("FATAL: relay ticket signer is configured but no relay catalog is available. Set RELAY_CATALOG_JSON or RELAY_SERVERS.")
+	}
+
+	if signer != nil {
+		log.Printf("Relay ticket signer active: kid=%s fingerprint=%s", signer.ActiveKid(), signer.Fingerprint())
+	}
+
+	return &Server{
+		auth:              authService,
+		hub:               hub,
+		db:                db,
+		relayServers:      parseRelayServers(),
+		relayCatalog:      catalog,
+		relayTicketSigner: signer,
+	}
 }
 
 func parseRelayServers() []string {
@@ -230,6 +267,11 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		"virtual_ip":    device.VirtualIP,
 		"cidr":          cidr,
 		"relay_servers": s.relayServers,
+	}
+
+	// Include relay catalog for new clients that support it
+	if s.relayCatalog != nil {
+		response["relay_catalog"] = s.relayCatalog.Entries()
 	}
 
 	// Issue device credential if Ed25519 identity was verified

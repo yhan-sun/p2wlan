@@ -418,3 +418,153 @@ Relay 服务端和客户端均支持严格的资源边界参数配置：
 | `4008` | `peer_backpressure` | 目标 peer 消费过慢，导致服务端 outbound 队列溢出，目标 peer 将被主动断开，并向发送端返回此错误。 |
 | `4009` | `idle_timeout` | 客户端连接静默（无读写流量）时间超出最大闲置超时，连接被回收。 |
 | `4010` | `transport_closed` | 传输层连接被远端关闭或丢失。 |
+| `4011` | `auth_required` | 安全模式下，连接必须使用带 ticket 的 Auth Register 帧，不允许匿名注册。 |
+| `4012` | `invalid_ticket` | ticket 格式无效、签名错误、算法不匹配或 kid 缺失。 |
+| `4013` | `ticket_expired` | ticket 已过期（含时钟偏差 leeway 后仍超出 exp）。 |
+| `4014` | `audience_mismatch` | ticket audience 与当前 Relay 实例不匹配。 |
+| `4015` | `identity_mismatch` | ticket 中的 node_id/device_id 与 Auth Register frame 中声明的 node_id 不一致，或 sub 与 device_id 不匹配。 |
+| `4016` | `network_mismatch` | ticket 中的 network_id 与当前 Relay 预期不符（跨网络转发被拒绝）。 |
+| `4017` | `ticket_not_yet_valid` | ticket nbf 尚未到达（含时钟偏差 leeway）。 |
+| `4018` | `unknown_ticket_key` | ticket 的 kid 不在当前 Relay 的公钥 keyring 中。 |
+
+## 12. Phase A2 安全协议扩展
+
+### 12.1 Relay Ticket JWT
+
+控制面签发 EdDSA (Ed25519) JWT，Relay 验证后才接受注册。
+
+**JWT Header:**
+```json
+{
+  "alg": "EdDSA",
+  "typ": "p2wlan-relay+jwt",
+  "kid": "<key identifier>"
+}
+```
+
+**JWT Claims (RelayTicketClaims):**
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `iss` | string | 固定 `p2wlan-control` |
+| `sub` | string | device ID（必须等于 `device_id`）|
+| `aud` | string | Relay audience（与 Relay 实例配置精确匹配）|
+| `iat` | int64 | 签发时间 (Unix seconds) |
+| `nbf` | int64 | 不早于时间 |
+| `exp` | int64 | 过期时间 |
+| `jti` | string | 128-bit CSPRNG 随机值（hex 编码）|
+| `device_id` | string | 设备 ID |
+| `network_id` | string | 网络 ID（由控制面从数据库读取，不接受客户端填写）|
+| `node_id` | string | 节点 ID（通常等于 device_id）|
+| `relay_region` | string | 目标 Relay region |
+| `relay_protocol` | int | 固定为 1 |
+
+- 签名算法：`EdDSA`（严格锁定，不接受 `none`、`HS256` 或自动选择）。
+- 默认 TTL：5 分钟，可配置 30 秒到 15 分钟。
+- 允许的时钟偏差：默认 30 秒。
+- ticket 绝不落盘、不进入日志、不进入 diagnostics。
+
+### 12.2 Auth Register Frame (MSG_AUTH_REGISTER = 0x09)
+
+替代旧 `MSG_REGISTER (0x01)` 的认证注册帧。
+
+**Payload 布局 (strict binary):**
+```text
+u8   node_id_len         (1..255)
+byte node_id[node_id_len] (valid UTF-8)
+u16  ticket_len          (big-endian, 1..8192)
+byte ticket[ticket_len]  (compact JWT)
+```
+
+约束：
+- `node_id_len` 必须为 1..255。
+- `node_id` 必须是合法 UTF-8。
+- `ticket_len` 必须 > 0 且 ≤ 8192 (8 KiB)。
+- 总 payload 仍受 A1 `max_frame_payload` 限制。
+- payload 必须精确消费，禁止 trailing bytes。
+
+### 12.3 注册状态机
+
+```
+安全模式（默认）:
+  - MSG_AUTH_REGISTER (0x09): 验证 ticket → 成功则 Registered (0x02)
+  - MSG_REGISTER (0x01): 返回 ERR_AUTH_REQUIRED (4011) 并关闭连接
+
+开发模式 (allow_legacy_unauthenticated=true):
+  - MSG_REGISTER (0x01): 匿名注册（仅开发/测试）
+  - MSG_AUTH_REGISTER (0x09): 认证注册
+
+客户端不允许在认证注册失败后自动回退匿名注册。
+```
+
+### 12.4 Network Binding
+
+Relay peer table 以 `(network_id, node_id)` 为身份键：
+- 不同 network 的相同 node_id 可以独立注册，互不替换。
+- 转发（Forward）只在 source 的 network 内查找 target。
+- 跨 network 目标对发送方表现为普通 `peer-not-found (404)`，不泄漏另一网络是否存在该 ID。
+- 重复注册（同 network + 同 node_id）按 A1 规则处理：旧连接被关闭，旧连接退出不删除新连接。
+
+### 12.5 TLS Transport
+
+- 默认 TLS 1.3。
+- 端点格式：`tls://host:port`（安全模式）；`tcp://host:port` 仅在 `allow_insecure_plaintext=true` 时可用。
+- 客户端：使用系统可信根 + 可选 CA bundle；验证证书链、有效期和服务端名称。
+- 服务端：加载证书链 + 私钥文件；缺少 TLS 配置且未显式开启明文模式时启动失败。
+- 禁止：跳过证书验证、自动降级明文、dangerous accept-any-certificate。
+- TLS handshake 受 register timeout 约束并计入连接限制。
+
+### 12.6 密钥轮换
+
+1. 将新 public key 部署到所有 Relay 的 keyring 中。
+2. 切换 control 的 active signer 为新 kid。
+3. 等待 `max_ticket_ttl + clock_skew`。此期间 current 和 previous key 均有效。
+4. 从 keyring 删除旧 public key。旧 kid ticket 在此后被拒绝。
+
+### 12.7 撤销边界
+
+- 撤销 device credential 或删除 device 后，控制面停止签发新 ticket。
+- 已签发的 ticket 最迟在短 TTL（默认 5 分钟）到期后失效。
+- A2 不包含全局即时 jti 撤销列表。
+
+### 12.8 Rust/Go 跨语言 Golden Vectors
+
+Auth Register 测试向量（共享 fixtures）：
+
+**Auth Register payload:**
+```
+node_id = "node-golden" (11 bytes)
+ticket  = "test-jwt-token-value" (20 bytes)
+
+Encoded bytes (hex):
+0b 6e 6f 64 65 2d 67 6f 6c 64 65 6e 00 14 74 65 73 74 2d 6a 77 74 2d 74 6f 6b 65 6e 2d 76 61 6c 75 65
+```
+
+错误码对照表（Rust `RelayErrorCode` ↔ Go 常量）：
+| Code | Rust | Go |
+| --- | --- | --- |
+| 4000 | `InvalidFrame` | `4000` |
+| 4001 | `UnsupportedVersion` | `4001` |
+| 4002 | `RegistrationRequired` | `4002` |
+| 4003 | `RegistrationTimeout` | `4003` |
+| 4004 | `DuplicateRegistration` | `4004` |
+| 4005 | `ConnectionLimit` | `4005` |
+| 4006 | `FrameTooLarge` | `4006` |
+| 404 | `PeerNotFound` | `404` |
+| 4008 | `PeerBackpressure` | `4008` |
+| 4009 | `IdleTimeout` | `4009` |
+| 4010 | `TransportClosed` | `4010` |
+| 4011 | `AuthRequired` | `errAuthRequired` |
+| 4012 | `InvalidTicket` | `errInvalidTicket` |
+| 4013 | `TicketExpired` | `errTicketExpired` |
+| 4014 | `AudienceMismatch` | `errAudienceMismatch` |
+| 4015 | `IdentityMismatch` | `errIdentityMismatch` |
+| 4016 | `NetworkMismatch` | `errNetworkMismatch` |
+| 4017 | `TicketNotYetValid` | `errTicketNotYetVal` |
+| 4018 | `UnknownTicketKey` | `errUnknownTicketKey` |
+
+### 12.9 安全状态声明
+
+A2 完成后：
+- Relay 注册和传输已达到 Phase A2 安全基线。
+- 认证 Probe v2、session-bound MAC、nonce replay window 和即时全局撤销仍属于 Phase A3。
+- A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。

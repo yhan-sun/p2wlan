@@ -217,6 +217,7 @@ impl Daemon {
                         virtual_ip: vip,
                         cidr: dyn_cidr,
                         relay_servers: rs,
+                        relay_catalog: _,
                     } => {
                         info!("Control plane registration confirmed. Assigned IP: {}", vip);
                         self.health.mark_control_success().await;
@@ -259,6 +260,7 @@ impl Daemon {
                             virtual_ip: virtual_ip.clone(),
                             cidr: Some(cidr.clone()),
                             relay_servers: relay_servers.clone(),
+                            relay_catalog: Vec::new(),
                         });
                         break;
                     }
@@ -551,6 +553,10 @@ impl Daemon {
                             relay_transport,
                             relay_selection,
                             inbound_tx: relay_inbound_tx,
+                            control_client: Some(self.control.clone()),
+                            relay_ticket: None,
+                            allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
+                            ca_cert_path: self.config.relay.ca_cert_path.clone(),
                         }
                         .run(),
                     )
@@ -748,6 +754,7 @@ impl Daemon {
                     virtual_ip: _,
                     cidr: _,
                     relay_servers,
+                    relay_catalog: _,
                 } => {
                     self.health.mark_control_success().await;
                     if !relay_started {
@@ -784,6 +791,10 @@ impl Daemon {
                                     relay_transport,
                                     relay_selection,
                                     inbound_tx: relay_inbound_tx,
+                                    control_client: Some(self.control.clone()),
+                                    relay_ticket: None,
+                                    allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
+                                    ca_cert_path: self.config.relay.ca_cert_path.clone(),
                                 }
                                 .run(),
                             )
@@ -1418,6 +1429,11 @@ struct RelaySupervisor {
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     inbound_tx: mpsc::Sender<transport::ReceivedEncryptedPacket>,
+    // A2 fields
+    control_client: Option<ControlClient>,
+    relay_ticket: Option<String>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
 }
 
 impl RelaySupervisor {
@@ -1426,6 +1442,33 @@ impl RelaySupervisor {
         let max_retry_delay = Duration::from_secs(30);
 
         loop {
+            // Fetch relay ticket if we have a control client and TLS is needed
+            let ticket = if let Some(ref cc) = self.control_client {
+                if !self.relay_servers.is_empty() {
+                    let first_server = &self.relay_servers[0];
+                    // Only fetch ticket if using tls:// endpoints
+                    if first_server.starts_with("tls://") {
+                        // Extract audience/region from the endpoint or use defaults
+                        match cc.fetch_relay_ticket("relay-default", "default").await {
+                            Ok((t, _exp)) => {
+                                info!("Relay ticket obtained");
+                                Some(t)
+                            }
+                            Err(e) => {
+                                warn!("Failed to fetch relay ticket: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                self.relay_ticket.clone()
+            };
+
             let RelaySelectionOutcome {
                 transport,
                 relay_rx,
@@ -1436,6 +1479,9 @@ impl RelaySupervisor {
                 self.selection_timeout,
                 &self.node_id,
                 self.peers.clone(),
+                ticket,
+                self.allow_insecure_plaintext,
+                self.ca_cert_path.clone(),
             )
             .await;
             *self.relay_selection.write().await = diagnostics;
@@ -1900,6 +1946,10 @@ mod tests {
                 relay_transport: relay_transport.clone(),
                 relay_selection: relay_selection.clone(),
                 inbound_tx,
+                control_client: None,
+                relay_ticket: None,
+                allow_insecure_plaintext: true, // test
+                ca_cert_path: None,
             }
             .run(),
         );

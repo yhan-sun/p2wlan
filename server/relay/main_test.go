@@ -10,6 +10,19 @@ import (
 	"time"
 )
 
+// testConfig returns a RelayConfig suitable for local testing (plaintext enabled).
+func testConfig() *RelayConfig {
+	return &RelayConfig{
+		SendQueueCapacity:      10,
+		RegisterTimeout:        1 * time.Second,
+		IdleTimeout:            5 * time.Second,
+		MaxConnections:         10,
+		MaxFramePayload:        65535,
+		AllowInsecurePlaintext: true,
+		RequireAuthentication:  false,
+	}
+}
+
 func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 	t.Helper()
 	server, err := NewRelayServer(config)
@@ -41,8 +54,8 @@ func TestConfigValidation(t *testing.T) {
 		t.Error("expected error for 0 send queue capacity")
 	}
 
-	// Test valid configuration parsing
-	cfg, err := parseConfig([]string{"-send-queue=64", "-register-timeout=10s"})
+	// Test valid configuration parsing (with auth disabled for test)
+	cfg, err := parseConfig([]string{"-send-queue=64", "-register-timeout=10s", "-require-auth=false"})
 	if err != nil {
 		t.Fatalf("unexpected parsing error: %v", err)
 	}
@@ -55,13 +68,8 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestSendQueueFullBackpressure(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 1,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
+	config.SendQueueCapacity = 1
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -115,13 +123,8 @@ func TestSendQueueFullBackpressure(t *testing.T) {
 }
 
 func TestRegisterTimeout(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   100 * time.Millisecond,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
+	config.RegisterTimeout = 100 * time.Millisecond
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -151,13 +154,8 @@ func TestRegisterTimeout(t *testing.T) {
 }
 
 func TestIdleTimeout(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       100 * time.Millisecond,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
+	config.IdleTimeout = 100 * time.Millisecond
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -191,13 +189,8 @@ func TestIdleTimeout(t *testing.T) {
 }
 
 func TestMaxConnections(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    1,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
+	config.MaxConnections = 1
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -228,13 +221,8 @@ func TestMaxConnections(t *testing.T) {
 }
 
 func TestFrameSizeBoundary(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   10,
-	}
+	config := testConfig()
+	config.MaxFramePayload = 10
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -262,13 +250,8 @@ func TestFrameSizeBoundary(t *testing.T) {
 }
 
 func TestOutboundFrameSizeBoundary(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   30, // Limit is 30 bytes
-	}
+	config := testConfig()
+	config.MaxFramePayload = 30
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -310,13 +293,7 @@ func TestOutboundFrameSizeBoundary(t *testing.T) {
 }
 
 func TestDuplicateRegistration(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -429,13 +406,9 @@ func TestRustGoErrorCodesCompatibility(t *testing.T) {
 }
 
 func TestServerCloseReclaimsImmediately(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   10 * time.Second,
-		IdleTimeout:       1 * time.Hour,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
+	config.RegisterTimeout = 10 * time.Second
+	config.IdleTimeout = 1 * time.Hour
 	server, err := NewRelayServer(config)
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)
@@ -465,13 +438,7 @@ func TestServerCloseReclaimsImmediately(t *testing.T) {
 }
 
 func TestIllegalUTF8NodeID(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
 	addr, cleanup := startTestServer(t, config)
 	defer cleanup()
 
@@ -499,13 +466,7 @@ func TestIllegalUTF8NodeID(t *testing.T) {
 }
 
 func TestServerCloseConcurrentAccept(t *testing.T) {
-	config := &RelayConfig{
-		SendQueueCapacity: 10,
-		RegisterTimeout:   1 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		MaxConnections:    10,
-		MaxFramePayload:   65535,
-	}
+	config := testConfig()
 	server, err := NewRelayServer(config)
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)

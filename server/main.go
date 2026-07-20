@@ -90,6 +90,9 @@ func main() {
 	deviceAuth := auth.RequireDeviceAuth(db)
 	mux.HandleFunc("DELETE /api/v1/devices/{id}", deviceAuth(apiServer.DeleteDevice))
 
+	// Relay ticket endpoint (device-credential-only, rate limited)
+	mux.HandleFunc("POST /api/v1/relay/tickets", deviceAuth(rateLimit(apiServer.CreateRelayTicket, 5, time.Minute)))
+
 	// Backward-compat: endpoint update accepts user JWT (anyAuth)
 	mux.HandleFunc("PATCH /api/v1/devices/{id}/endpoint", anyAuth(apiServer.UpdateDeviceEndpoint))
 
