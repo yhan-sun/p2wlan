@@ -64,7 +64,7 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
-use control::{ControlClient, ControlEvent};
+use control::{ControlClient, ControlEvent, RelayCatalogEntry};
 use dataplane::{DataPlane, InboundPacket};
 use diagnostics::{run_diagnostics_server, DiagnosticsContext};
 use dns::DnsResolver;
@@ -74,7 +74,10 @@ use p2pnet_wireguard::{
 };
 use peer::{ConnectionState, PeerManager};
 use port_mapping::PortMappingManager;
-use relay::{select_relay, RelaySelectionDiagnostics, RelaySelectionOutcome, RelayTransport};
+use relay::{
+    select_relay, RelayCandidateConfig, RelaySelectionDiagnostics, RelaySelectionOutcome,
+    RelayTicketCache, RelayTransport,
+};
 use transport::{EncryptedPeerPacket, WireGuardTransport};
 use udp::UdpTransport;
 
@@ -204,6 +207,7 @@ impl Daemon {
         let mut cidr = self.config.network.cidr.clone();
         let mut assigned_node_id = self.config.node.node_id.clone();
         let mut relay_servers = self.config.relay.servers.clone();
+        let mut relay_catalog = Vec::new();
 
         let mut control_event_registered = None;
 
@@ -217,7 +221,7 @@ impl Daemon {
                         virtual_ip: vip,
                         cidr: dyn_cidr,
                         relay_servers: rs,
-                        relay_catalog: _,
+                        relay_catalog: catalog,
                     } => {
                         info!("Control plane registration confirmed. Assigned IP: {}", vip);
                         self.health.mark_control_success().await;
@@ -250,7 +254,10 @@ impl Daemon {
                         if !rs.is_empty() {
                             relay_servers = rs;
                         }
-                        if relay_servers.is_empty() {
+                        if !catalog.is_empty() {
+                            relay_catalog = catalog;
+                        }
+                        if relay_servers.is_empty() && relay_catalog.is_empty() {
                             relay_servers =
                                 infer_default_relay_servers(&self.config.control.server_url);
                         }
@@ -260,7 +267,7 @@ impl Daemon {
                             virtual_ip: virtual_ip.clone(),
                             cidr: Some(cidr.clone()),
                             relay_servers: relay_servers.clone(),
-                            relay_catalog: Vec::new(),
+                            relay_catalog: relay_catalog.clone(),
                         });
                         break;
                     }
@@ -515,6 +522,7 @@ impl Daemon {
         if let Some(ControlEvent::Registered {
             ref node_id,
             ref relay_servers,
+            ref relay_catalog,
             ..
         }) = control_event_registered
         {
@@ -526,7 +534,8 @@ impl Daemon {
             } else {
                 relay_servers.clone()
             };
-            if relay_servers.is_empty() {
+            let relay_candidates = relay_candidates_from_sources(relay_catalog, &relay_servers);
+            if relay_candidates.is_empty() {
                 debug!(
                     "No relay servers configured; direct UDP only unless peers provide relay later"
                 );
@@ -545,7 +554,7 @@ impl Daemon {
                         "relay-inbound",
                         false,
                         RelaySupervisor {
-                            relay_servers,
+                            relay_candidates,
                             preferred_regions,
                             selection_timeout,
                             node_id: relay_node_id,
@@ -553,7 +562,9 @@ impl Daemon {
                             relay_transport,
                             relay_selection,
                             inbound_tx: relay_inbound_tx,
-                            control_client: Some(self.control.clone()),
+                            ticket_cache: Some(Arc::new(RelayTicketCache::new(
+                                self.control.clone(),
+                            ))),
                             relay_ticket: None,
                             allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
                             ca_cert_path: self.config.relay.ca_cert_path.clone(),
@@ -754,7 +765,7 @@ impl Daemon {
                     virtual_ip: _,
                     cidr: _,
                     relay_servers,
-                    relay_catalog: _,
+                    relay_catalog,
                 } => {
                     self.health.mark_control_success().await;
                     if !relay_started {
@@ -765,7 +776,9 @@ impl Daemon {
                         } else {
                             relay_servers
                         };
-                        if relay_servers.is_empty() {
+                        let relay_candidates =
+                            relay_candidates_from_sources(&relay_catalog, &relay_servers);
+                        if relay_candidates.is_empty() {
                             debug!("No relay servers advertised by control plane");
                             continue;
                         }
@@ -783,7 +796,7 @@ impl Daemon {
                                 "relay-inbound",
                                 false,
                                 RelaySupervisor {
-                                    relay_servers,
+                                    relay_candidates,
                                     preferred_regions,
                                     selection_timeout,
                                     node_id: relay_node_id,
@@ -791,7 +804,7 @@ impl Daemon {
                                     relay_transport,
                                     relay_selection,
                                     inbound_tx: relay_inbound_tx,
-                                    control_client: Some(self.control.clone()),
+                                    ticket_cache: Some(Arc::new(RelayTicketCache::new(self.control.clone()))),
                                     relay_ticket: None,
                                     allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
                                     ca_cert_path: self.config.relay.ca_cert_path.clone(),
@@ -1420,8 +1433,32 @@ fn control_server_host(control_server_url: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn relay_candidates_from_sources(
+    relay_catalog: &[RelayCatalogEntry],
+    relay_servers: &[String],
+) -> Vec<RelayCandidateConfig> {
+    if !relay_catalog.is_empty() {
+        return relay_catalog
+            .iter()
+            .map(|entry| {
+                RelayCandidateConfig::catalog(
+                    entry.region.clone(),
+                    entry.audience.clone(),
+                    entry.endpoint.clone(),
+                )
+            })
+            .collect();
+    }
+
+    relay_servers
+        .iter()
+        .cloned()
+        .map(RelayCandidateConfig::legacy)
+        .collect()
+}
+
 struct RelaySupervisor {
-    relay_servers: Vec<String>,
+    relay_candidates: Vec<RelayCandidateConfig>,
     preferred_regions: Vec<String>,
     selection_timeout: Duration,
     node_id: String,
@@ -1430,7 +1467,7 @@ struct RelaySupervisor {
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     inbound_tx: mpsc::Sender<transport::ReceivedEncryptedPacket>,
     // A2 fields
-    control_client: Option<ControlClient>,
+    ticket_cache: Option<Arc<RelayTicketCache>>,
     relay_ticket: Option<String>,
     allow_insecure_plaintext: bool,
     ca_cert_path: Option<String>,
@@ -1442,48 +1479,26 @@ impl RelaySupervisor {
         let max_retry_delay = Duration::from_secs(30);
 
         loop {
-            // Fetch relay ticket if we have a control client and TLS is needed
-            let ticket = if let Some(ref cc) = self.control_client {
-                if !self.relay_servers.is_empty() {
-                    let first_server = &self.relay_servers[0];
-                    // Only fetch ticket if using tls:// endpoints
-                    if first_server.starts_with("tls://") {
-                        // Extract audience/region from the endpoint or use defaults
-                        match cc.fetch_relay_ticket("relay-default", "default").await {
-                            Ok((t, _exp)) => {
-                                info!("Relay ticket obtained");
-                                Some(t)
-                            }
-                            Err(e) => {
-                                warn!("Failed to fetch relay ticket: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                self.relay_ticket.clone()
-            };
-
             let RelaySelectionOutcome {
                 transport,
                 relay_rx,
                 diagnostics,
             } = select_relay(
-                &self.relay_servers,
+                &self.relay_candidates,
                 &self.preferred_regions,
                 self.selection_timeout,
                 &self.node_id,
                 self.peers.clone(),
-                ticket,
+                self.ticket_cache.clone(),
+                self.relay_ticket.clone(),
                 self.allow_insecure_plaintext,
                 self.ca_cert_path.clone(),
             )
             .await;
+            let permanent_auth = diagnostics
+                .candidates
+                .iter()
+                .any(|candidate| candidate.error_code.as_deref() == Some("permanent_auth"));
             *self.relay_selection.write().await = diagnostics;
 
             if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
@@ -1514,6 +1529,9 @@ impl RelaySupervisor {
                 warn!("{reason}");
             } else {
                 *self.relay_transport.write().await = None;
+                if permanent_auth {
+                    retry_delay = max_retry_delay;
+                }
                 warn!(
                     "No configured relay candidate was reachable; retrying in {} seconds",
                     retry_delay.as_secs()
@@ -1900,6 +1918,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relay_catalog_takes_precedence_over_legacy_servers() {
+        let catalog = vec![RelayCatalogEntry {
+            region: "sg".to_string(),
+            audience: "relay-sg-1".to_string(),
+            endpoint: "tls://relay.example.com:18081".to_string(),
+        }];
+        let legacy = vec!["default@127.0.0.1:18081".to_string()];
+
+        let candidates = relay_candidates_from_sources(&catalog, &legacy);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].region, "sg");
+        assert_eq!(candidates[0].audience.as_deref(), Some("relay-sg-1"));
+        assert_eq!(candidates[0].endpoint, "tls://relay.example.com:18081");
+    }
+
+    #[test]
+    fn legacy_relay_servers_are_used_without_catalog() {
+        let legacy = vec!["west@127.0.0.1:18081".to_string()];
+
+        let candidates = relay_candidates_from_sources(&[], &legacy);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].audience.is_none());
+        assert_eq!(candidates[0].endpoint, "west@127.0.0.1:18081");
+    }
+
     async fn accept_relay_registration(listener: &TcpListener, node_id: &str) -> TcpStream {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut header = [0u8; 8];
@@ -1938,7 +1984,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(4);
         let supervisor = tokio::spawn(
             RelaySupervisor {
-                relay_servers: vec![endpoint],
+                relay_candidates: vec![RelayCandidateConfig::legacy(endpoint)],
                 preferred_regions: Vec::new(),
                 selection_timeout: Duration::from_millis(500),
                 node_id: "node-a".to_string(),
@@ -1946,7 +1992,7 @@ mod tests {
                 relay_transport: relay_transport.clone(),
                 relay_selection: relay_selection.clone(),
                 inbound_tx,
-                control_client: None,
+                ticket_cache: None,
                 relay_ticket: None,
                 allow_insecure_plaintext: true, // test
                 ca_cert_path: None,

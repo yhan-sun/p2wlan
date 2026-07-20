@@ -170,13 +170,12 @@ pub fn build_tls_connector(ca_cert_path: Option<&PathBuf>) -> Result<TlsConnecto
         );
     }
 
-    // Configure TLS 1.3 only
-    let config = rustls::ClientConfig::builder()
+    // Configure TLS 1.3 only. Do not rely on rustls defaults here: dev/test
+    // feature unification can make TLS 1.2 available, but relay A2 requires
+    // TLS 1.3-only transport semantics.
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(root_store)
         .with_no_client_auth();
-
-    // Set TLS 1.3 as minimum and maximum version
-    // (rustls 0.23 default already enforces TLS 1.2+, but we restrict further)
 
     Ok(TlsConnector::from(Arc::new(config)))
 }
@@ -236,7 +235,7 @@ pub fn load_tls_server_config(
         .map_err(|e| RelayError::TlsError(format!("failed to read private key: {e}")))?
         .ok_or_else(|| RelayError::TlsError("no private key found in private key file".into()))?;
 
-    let config = rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, private_key)
         .map_err(|e| RelayError::TlsError(format!("failed to configure TLS server: {e}")))?;
@@ -270,6 +269,15 @@ mod tests {
         assert_eq!(ep.scheme, "tls");
         assert_eq!(ep.host, "[::1]");
         assert_eq!(ep.port, 18081);
+    }
+
+    #[test]
+    fn test_manifest_does_not_enable_tls12() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            !manifest.contains("tls12"),
+            "relay crate must not enable rustls tls12; A2 requires TLS 1.3-only transport"
+        );
     }
 
     #[test]

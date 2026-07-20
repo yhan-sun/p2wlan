@@ -4,9 +4,10 @@
 //! relay client. Relay payloads remain encrypted WireGuard datagrams; the relay
 //! server only sees source/destination node IDs and opaque bytes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_relay::{RelayClient, RelayClientConfig, RelayMessage};
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,13 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::control::ControlClient;
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 const RELAY_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
 
 /// Diagnostics for one configured relay candidate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +49,7 @@ pub struct RelaySelectionDiagnostics {
 struct RelayCandidate {
     index: usize,
     region: String,
+    audience: Option<String>,
     endpoint: String,
     preference_rank: usize,
 }
@@ -63,29 +67,211 @@ pub struct RelaySelectionOutcome {
     pub diagnostics: RelaySelectionDiagnostics,
 }
 
+/// A relay candidate after control-plane/catalog normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCandidateConfig {
+    pub region: String,
+    pub audience: Option<String>,
+    pub endpoint: String,
+}
+
+impl RelayCandidateConfig {
+    pub fn catalog(
+        region: impl Into<String>,
+        audience: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            region: region.into(),
+            audience: Some(audience.into()),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    pub fn legacy(spec: impl Into<String>) -> Self {
+        Self {
+            region: String::new(),
+            audience: None,
+            endpoint: spec.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RelayTicketKey {
+    audience: String,
+    region: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRelayTicket {
+    ticket: String,
+    expires_at: i64,
+}
+
+/// In-memory relay ticket cache keyed by (audience, region).
+///
+/// Tokens are never persisted or placed in diagnostics. A per-key async lock
+/// merges concurrent refreshes for the same relay audience.
+pub struct RelayTicketCache {
+    control_client: ControlClient,
+    entries: Mutex<HashMap<RelayTicketKey, CachedRelayTicket>>,
+    refresh_locks: Mutex<HashMap<RelayTicketKey, Arc<Mutex<()>>>>,
+}
+
+impl RelayTicketCache {
+    pub fn new(control_client: ControlClient) -> Self {
+        Self {
+            control_client,
+            entries: Mutex::new(HashMap::new()),
+            refresh_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn ticket_for(&self, audience: &str, region: &str) -> Result<String> {
+        let key = RelayTicketKey {
+            audience: audience.to_string(),
+            region: region.to_string(),
+        };
+
+        if let Some(ticket) = self.cached_ticket(&key).await {
+            return Ok(ticket);
+        }
+
+        let refresh_lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = refresh_lock.lock().await;
+
+        if let Some(ticket) = self.cached_ticket(&key).await {
+            return Ok(ticket);
+        }
+
+        let (ticket, expires_at) = self
+            .control_client
+            .fetch_relay_ticket(&key.audience, &key.region)
+            .await?;
+
+        if ticket.trim().is_empty() {
+            return Err(DaemonError::ControlPlane(
+                "relay ticket response contained an empty ticket".into(),
+            ));
+        }
+        if expires_at <= now_unix() + RELAY_TICKET_REFRESH_MARGIN_SECS {
+            return Err(DaemonError::ControlPlane(
+                "relay ticket expires too soon".into(),
+            ));
+        }
+
+        self.entries.lock().await.insert(
+            key.clone(),
+            CachedRelayTicket {
+                ticket: ticket.clone(),
+                expires_at,
+            },
+        );
+
+        Ok(ticket)
+    }
+
+    async fn cached_ticket(&self, key: &RelayTicketKey) -> Option<String> {
+        self.entries.lock().await.get(key).and_then(|entry| {
+            if entry.expires_at > now_unix() + RELAY_TICKET_REFRESH_MARGIN_SECS {
+                Some(entry.ticket.clone())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+#[derive(Debug)]
+enum RelayAttemptError {
+    Relay(p2pnet_relay::RelayError),
+    Daemon(DaemonError),
+}
+
+impl RelayAttemptError {
+    fn error_code(&self) -> String {
+        match self {
+            RelayAttemptError::Relay(error) => error
+                .error_code()
+                .map(|code| code.to_snake_case().to_string())
+                .unwrap_or_else(|| error.to_snake_case().to_string()),
+            RelayAttemptError::Daemon(error) => match error {
+                DaemonError::Auth(_) => "permanent_auth".to_string(),
+                DaemonError::ControlPlane(message) if message.contains("permanent auth") => {
+                    "permanent_auth".to_string()
+                }
+                DaemonError::ControlPlane(_) => "ticket_fetch_failed".to_string(),
+                _ => "connect_failed".to_string(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for RelayAttemptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelayAttemptError::Relay(error) => write!(f, "{error}"),
+            RelayAttemptError::Daemon(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 fn parse_candidate(
     index: usize,
-    spec: &str,
+    spec: &RelayCandidateConfig,
     preferred_regions: &[String],
 ) -> std::result::Result<RelayCandidate, String> {
-    let spec = spec.trim();
-    if spec.is_empty() {
+    let raw_endpoint = spec.endpoint.trim();
+    if raw_endpoint.is_empty() {
         return Err("empty relay candidate".to_string());
     }
 
-    let (region, endpoint) = match spec.split_once('@') {
-        Some((region, endpoint)) if !region.trim().is_empty() => {
-            (region.trim().to_string(), endpoint.trim())
+    let (region, endpoint) = if spec.region.trim().is_empty() {
+        match raw_endpoint.split_once('@') {
+            Some((region, endpoint)) if !region.trim().is_empty() => {
+                (region.trim().to_string(), endpoint.trim())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "relay candidate '{}' has an empty region",
+                    spec.endpoint
+                ))
+            }
+            None => ("default".to_string(), raw_endpoint),
         }
-        Some(_) => return Err(format!("relay candidate '{spec}' has an empty region")),
-        None => ("default".to_string(), spec),
+    } else {
+        (spec.region.trim().to_string(), raw_endpoint)
     };
 
     // Endpoints now support tls://host:port, tcp://host:port, or bare host:port.
     // Validation is done by the relay client's endpoint parser.
     if endpoint.is_empty() {
-        return Err(format!("relay candidate '{spec}' has an empty endpoint"));
+        return Err(format!(
+            "relay candidate '{}' has an empty endpoint",
+            spec.endpoint
+        ));
     }
+
+    let audience = spec
+        .audience
+        .as_ref()
+        .map(|audience| audience.trim().to_string())
+        .filter(|audience| !audience.is_empty());
 
     let preference_rank = preferred_regions
         .iter()
@@ -95,6 +281,7 @@ fn parse_candidate(
     Ok(RelayCandidate {
         index,
         region,
+        audience,
         endpoint: endpoint.to_string(),
         preference_rank,
     })
@@ -110,12 +297,13 @@ fn duration_millis(duration: Duration) -> u64 {
 /// A2 parameters (ticket, TLS config) are passed through to the relay client.
 #[allow(clippy::too_many_arguments)]
 pub async fn select_relay(
-    specs: &[String],
+    specs: &[RelayCandidateConfig],
     preferred_regions: &[String],
     selection_timeout: Duration,
     node_id: &str,
     peers: Arc<PeerManager>,
-    relay_ticket: Option<String>,
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    static_relay_ticket: Option<String>,
     allow_insecure_plaintext: bool,
     ca_cert_path: Option<String>,
 ) -> RelaySelectionOutcome {
@@ -144,7 +332,7 @@ pub async fn select_relay(
             }),
             Err(error) => diagnostics.candidates.push(RelayCandidateDiagnostics {
                 region: "unknown".to_string(),
-                endpoint: spec.trim().to_string(),
+                endpoint: spec.endpoint.trim().to_string(),
                 connect_latency_ms: None,
                 error: Some(error),
                 error_code: Some("invalid_spec".to_string()),
@@ -156,12 +344,14 @@ pub async fn select_relay(
     for candidate in candidates {
         let node_id = node_id.to_string();
         let peers = peers.clone();
-        let ticket = relay_ticket.clone();
+        let ticket_cache = ticket_cache.clone();
+        let static_ticket = static_relay_ticket.clone();
         let ca_path = ca_cert_path.clone();
         tasks.spawn(async move {
             let started = Instant::now();
-            let result = timeout(
-                selection_timeout,
+            let result = timeout(selection_timeout, async {
+                let ticket =
+                    relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket).await?;
                 RelayTransport::connect_in_region(
                     &candidate.endpoint,
                     &candidate.region,
@@ -170,8 +360,10 @@ pub async fn select_relay(
                     ticket,
                     allow_insecure_plaintext,
                     ca_path,
-                ),
-            )
+                )
+                .await
+                .map_err(RelayAttemptError::Relay)
+            })
             .await;
             let latency_ms = duration_millis(started.elapsed());
             (candidate, latency_ms, result)
@@ -194,12 +386,7 @@ pub async fn select_relay(
             }),
             Ok(Err(error)) => {
                 candidate_diagnostics.error = Some(error.to_string());
-                candidate_diagnostics.error_code = Some(
-                    error
-                        .error_code()
-                        .map(|c| c.to_snake_case().to_string())
-                        .unwrap_or_else(|| "connect_failed".to_string()),
-                );
+                candidate_diagnostics.error_code = Some(error.error_code());
             }
             Err(_) => {
                 candidate_diagnostics.error = Some(format!(
@@ -245,6 +432,31 @@ pub async fn select_relay(
             diagnostics,
         }
     }
+}
+
+async fn relay_ticket_for_candidate(
+    candidate: &RelayCandidate,
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    static_relay_ticket: Option<String>,
+) -> std::result::Result<Option<String>, RelayAttemptError> {
+    if let (Some(cache), Some((audience, region))) =
+        (ticket_cache, relay_ticket_lookup_key(candidate))
+    {
+        return cache
+            .ticket_for(audience, region)
+            .await
+            .map(Some)
+            .map_err(RelayAttemptError::Daemon);
+    }
+
+    Ok(static_relay_ticket)
+}
+
+fn relay_ticket_lookup_key(candidate: &RelayCandidate) -> Option<(&str, &str)> {
+    candidate
+        .audience
+        .as_deref()
+        .map(|audience| (audience, candidate.region.as_str()))
 }
 
 /// Sends and receives encrypted WireGuard datagrams through a relay server.
@@ -546,22 +758,66 @@ mod tests {
     #[test]
     fn relay_candidate_parses_region_and_legacy_endpoint() {
         let preferred = vec!["cn-east".to_string()];
-        let regional = parse_candidate(0, "cn-east@127.0.0.1:8080", &preferred).unwrap();
+        let regional = parse_candidate(
+            0,
+            &RelayCandidateConfig::legacy("cn-east@127.0.0.1:8080"),
+            &preferred,
+        )
+        .unwrap();
         assert_eq!(regional.region, "cn-east");
         assert_eq!(regional.endpoint, "127.0.0.1:8080");
+        assert_eq!(regional.audience, None);
         assert_eq!(regional.preference_rank, 0);
 
-        let legacy = parse_candidate(1, "127.0.0.1:8081", &preferred).unwrap();
+        let legacy = parse_candidate(
+            1,
+            &RelayCandidateConfig::legacy("127.0.0.1:8081"),
+            &preferred,
+        )
+        .unwrap();
         assert_eq!(legacy.region, "default");
         assert_eq!(legacy.endpoint, "127.0.0.1:8081");
         assert_eq!(legacy.preference_rank, 1);
+    }
+
+    #[test]
+    fn relay_candidate_preserves_catalog_audience() {
+        let candidate = parse_candidate(
+            0,
+            &RelayCandidateConfig::catalog("sg", "relay-sg-1", "tls://relay.example.com:18081"),
+            &["sg".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(candidate.region, "sg");
+        assert_eq!(candidate.audience.as_deref(), Some("relay-sg-1"));
+        assert_eq!(candidate.endpoint, "tls://relay.example.com:18081");
+        assert_eq!(candidate.preference_rank, 0);
+    }
+
+    #[test]
+    fn relay_ticket_lookup_uses_catalog_audience_for_tcp_too() {
+        let candidate = parse_candidate(
+            0,
+            &RelayCandidateConfig::catalog("dev", "relay-dev-1", "tcp://127.0.0.1:18081"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            relay_ticket_lookup_key(&candidate),
+            Some(("relay-dev-1", "dev"))
+        );
     }
 
     #[tokio::test]
     async fn relay_selector_prefers_configured_region() {
         let east = RelayServer::start_random().await.unwrap();
         let west = RelayServer::start_random().await.unwrap();
-        let specs = vec![format!("east@{}", east.addr), format!("west@{}", west.addr)];
+        let specs = vec![
+            RelayCandidateConfig::legacy(format!("east@{}", east.addr)),
+            RelayCandidateConfig::legacy(format!("west@{}", west.addr)),
+        ];
 
         let outcome = select_relay(
             &specs,
@@ -569,6 +825,7 @@ mod tests {
             Duration::from_secs(1),
             "node-a",
             peer_manager(),
+            None,
             None,
             true,
             None,
@@ -598,8 +855,8 @@ mod tests {
         drop(dead_listener);
         let fallback = RelayServer::start_random().await.unwrap();
         let specs = vec![
-            format!("preferred@{dead_addr}"),
-            format!("fallback@{}", fallback.addr),
+            RelayCandidateConfig::legacy(format!("preferred@{dead_addr}")),
+            RelayCandidateConfig::legacy(format!("fallback@{}", fallback.addr)),
         ];
 
         let outcome = select_relay(
@@ -608,6 +865,7 @@ mod tests {
             Duration::from_secs(1),
             "node-a",
             peer_manager(),
+            None,
             None,
             true,
             None,
