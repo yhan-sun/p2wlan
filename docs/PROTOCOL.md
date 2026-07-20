@@ -417,3 +417,4 @@ Relay 服务端和客户端均支持严格的资源边界参数配置：
 | `4006` | `frame_too_large` | 帧的声明 Payload 长度超出 configured maximum frame payload。 |
 | `4008` | `peer_backpressure` | 目标 peer 消费过慢，导致服务端 outbound 队列溢出，目标 peer 将被主动断开，并向发送端返回此错误。 |
 | `4009` | `idle_timeout` | 客户端连接静默（无读写流量）时间超出最大闲置超时，连接被回收。 |
+| `4010` | `transport_closed` | 传输层连接被远端关闭或丢失。 |

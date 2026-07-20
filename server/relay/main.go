@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"unicode/utf8"
 	"time"
 )
 
@@ -118,6 +119,10 @@ type RelayServer struct {
 	activeConnections int64
 	wg                sync.WaitGroup
 	shutdownChan      chan struct{}
+	closeOnce         sync.Once
+
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
 }
 
 func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
@@ -130,6 +135,7 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		listener:     listener,
 		hub:          newHub(),
 		shutdownChan: make(chan struct{}),
+		connections:  make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -161,18 +167,37 @@ func (s *RelayServer) Serve() {
 			continue
 		}
 
+		s.mu.Lock()
+		s.connections[conn] = struct{}{}
+		s.mu.Unlock()
+
 		s.wg.Add(1)
 		go func(c net.Conn) {
-			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.connections, c)
+				s.mu.Unlock()
+				s.wg.Done()
+			}()
 			s.handleConn(c)
 		}(conn)
 	}
 }
 
 func (s *RelayServer) Close() error {
-	close(s.shutdownChan)
-	err := s.listener.Close()
-	s.wg.Wait()
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.shutdownChan)
+		err = s.listener.Close()
+
+		s.mu.Lock()
+		for c := range s.connections {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
+
+		s.wg.Wait()
+	})
 	return err
 }
 
@@ -346,7 +371,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	}
 
 	nodeID := string(payload)
-	if nodeID == "" || len(nodeID) > 255 {
+	if nodeID == "" || len(nodeID) > 255 || !utf8.Valid(payload) {
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		_, _ = conn.Write(errorFrame(4000, "invalid node ID"))
 		return
@@ -375,7 +400,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		switch typ {
 		case msgRegister:
 			newID := string(payload)
-			if newID != p.id {
+			if newID != p.id || !utf8.Valid(payload) {
 				queue(p, errorFrame(4004, "already registered with a different node ID"))
 				time.Sleep(50 * time.Millisecond)
 				return
