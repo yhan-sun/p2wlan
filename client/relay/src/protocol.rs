@@ -69,6 +69,19 @@ pub const CLOSE_NORMAL: u8 = 0x00;
 pub const CLOSE_ERROR: u8 = 0x01;
 pub const CLOSE_TIMEOUT: u8 = 0x02;
 
+// Error codes (stable wire codes)
+pub const ERR_INVALID_FRAME: u16 = 4000;
+pub const ERR_UNSUPPORTED_VERSION: u16 = 4001;
+pub const ERR_REGISTRATION_REQUIRED: u16 = 4002;
+pub const ERR_REGISTRATION_TIMEOUT: u16 = 4003;
+pub const ERR_DUPLICATE_REGISTRATION: u16 = 4004;
+pub const ERR_CONNECTION_LIMIT: u16 = 4005;
+pub const ERR_FRAME_TOO_LARGE: u16 = 4006;
+pub const ERR_PEER_NOT_FOUND: u16 = 404;
+pub const ERR_PEER_BACKPRESSURE: u16 = 4008;
+pub const ERR_IDLE_TIMEOUT: u16 = 4009;
+pub const ERR_TRANSPORT_CLOSED: u16 = 4010;
+
 // ============================================================
 // Frame
 // ============================================================

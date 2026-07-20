@@ -32,7 +32,9 @@ use tracing::{debug, info, warn};
 
 use crate::error::{RelayError, Result};
 use crate::protocol::*;
+use crate::RelayClientConfig;
 
+#[allow(dead_code)]
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A message received from the relay (data from a peer or a control message).
@@ -45,6 +47,7 @@ pub struct RelayMessage {
 }
 
 /// Commands sent from the client handle to the background write task.
+#[derive(Debug)]
 enum ClientCommand {
     /// Send a raw frame (currently unused by public API but available for extensions).
     #[allow(dead_code)]
@@ -62,9 +65,10 @@ enum ClientCommand {
 /// The client maintains a background task that handles reading from and
 /// writing to the relay server. Data received from peers is delivered via
 /// the `mpsc::Receiver<RelayMessage>` returned by [`connect`].
+#[derive(Debug)]
 pub struct RelayClient {
     /// Command channel to the background task.
-    cmd_tx: mpsc::UnboundedSender<ClientCommand>,
+    cmd_tx: mpsc::Sender<ClientCommand>,
 }
 
 impl RelayClient {
@@ -74,59 +78,70 @@ impl RelayClient {
     pub async fn connect(
         addr: &str,
         node_id: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        Self::connect_with_config(addr, node_id, RelayClientConfig::default()).await
+    }
+
+    /// Connect with config.
+    pub async fn connect_with_config(
+        addr: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        config.validate()?;
         let socket_addr: SocketAddr = addr
             .parse()
             .map_err(|e| RelayError::ConnectFailed(format!("invalid address '{addr}': {e}")))?;
 
-        Self::connect_to_addr(socket_addr, node_id).await
+        Self::connect_to_addr_with_config(socket_addr, node_id, config).await
     }
 
     /// Connect, register, and wait for the server's confirmation.
     pub async fn connect_verified(
         addr: &str,
         node_id: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
-        let (client, mut rx) = Self::connect(addr, node_id).await?;
-
-        // Wait for the Registered confirmation
-        let timeout = Duration::from_secs(5);
-        loop {
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    if msg.from_node.is_empty() && msg.data.starts_with(b"registered:") {
-                        return Ok((client, rx));
-                    }
-                    // Re-queue? For simplicity, just ignore and keep waiting.
-                    // In practice the first message should be the confirmation.
-                }
-                Ok(None) => {
-                    return Err(RelayError::Closed(
-                        "connection closed during registration".into(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(RelayError::Timeout("registration timed out".into()));
-                }
-            }
-        }
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        Self::connect(addr, node_id).await
     }
 
+    /// Connect verified with config.
+    pub async fn connect_verified_with_config(
+        addr: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        Self::connect_with_config(addr, node_id, config).await
+    }
+
+    #[allow(dead_code)]
     async fn connect_to_addr(
         addr: SocketAddr,
         node_id: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
         Self::connect_to_addr_with_keepalive(addr, node_id, RELAY_KEEPALIVE_INTERVAL).await
     }
 
+    #[allow(dead_code)]
     async fn connect_to_addr_with_keepalive(
         addr: SocketAddr,
         node_id: &str,
         keepalive_interval: Duration,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        let config = RelayClientConfig {
+            keepalive_interval,
+            ..Default::default()
+        };
+        Self::connect_to_addr_with_config(addr, node_id, config).await
+    }
+
+    async fn connect_to_addr_with_config(
+        addr: SocketAddr,
+        node_id: &str,
+        config: RelayClientConfig,
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
         debug!("Connecting to relay server at {}", addr);
 
-        let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        let stream = tokio::time::timeout(config.register_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| RelayError::Timeout("connect timed out".into()))?
             .map_err(|e| RelayError::ConnectFailed(e.to_string()))?;
@@ -144,17 +159,18 @@ impl RelayClient {
         );
 
         // Channels
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ClientCommand>();
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<RelayMessage>();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
+        let (msg_tx, msg_rx) = mpsc::channel::<RelayMessage>(config.inbound_queue_capacity);
         let (reg_tx, reg_rx) = oneshot::channel::<Result<()>>();
         let (close_tx, close_rx) = watch::channel(false);
 
         // Write task: processes commands and writes to the TCP stream
         let write_close_tx = close_tx.clone();
         let mut write_close_rx = close_rx.clone();
+        let max_payload = config.max_frame_payload;
         let _write_task = tokio::spawn(async move {
             let mut writer = writer;
-            let mut keepalive = tokio::time::interval(keepalive_interval);
+            let mut keepalive = tokio::time::interval(config.keepalive_interval);
             keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
             keepalive.tick().await;
 
@@ -166,6 +182,10 @@ impl RelayClient {
                         };
                         match cmd {
                             ClientCommand::SendFrame(frame) => {
+                                if frame.payload.len() > max_payload {
+                                    warn!("Frame payload exceeds max limit");
+                                    continue;
+                                }
                                 if let Err(err) = writer.write_all(&frame.encode()).await {
                                     warn!("Relay write error: {}", err);
                                     break;
@@ -173,6 +193,10 @@ impl RelayClient {
                             }
                             ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
                                 Ok(frame) => {
+                                    if frame.payload.len() > max_payload {
+                                        warn!("Frame payload exceeds max limit");
+                                        continue;
+                                    }
                                     if let Err(err) = writer.write_all(&frame.encode()).await {
                                         warn!("Relay write error: {}", err);
                                         break;
@@ -220,7 +244,7 @@ impl RelayClient {
         let read_close_tx = close_tx.clone();
         let mut read_close_rx = close_rx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_PAYLOAD + FRAME_HEADER_SIZE];
+            let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
 
             loop {
                 // Read header
@@ -248,8 +272,30 @@ impl RelayClient {
                     warn!("Invalid magic from relay server");
                     break;
                 }
+                let version = buf[4];
+                if version != VERSION {
+                    warn!("Unsupported version {} from relay server", version);
+                    if let Some(tx) = reg_tx.take() {
+                        let _ = tx.send(Err(RelayError::Protocol(format!(
+                            "unsupported version: {}",
+                            version
+                        ))));
+                    }
+                    break;
+                }
                 let msg_type = buf[5];
                 let payload_len = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+
+                if payload_len > max_payload {
+                    warn!(
+                        "Payload length {} exceeds configured maximum {}",
+                        payload_len, max_payload
+                    );
+                    if let Some(tx) = reg_tx.take() {
+                        let _ = tx.send(Err(RelayError::FrameTooLarge(payload_len, max_payload)));
+                    }
+                    break;
+                }
 
                 // Read payload
                 if payload_len > 0 {
@@ -280,10 +326,16 @@ impl RelayClient {
                         let frame = Frame::new(MSG_RECEIVED, payload.to_vec());
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
-                                let _ = msg_tx_clone.send(RelayMessage {
-                                    from_node: src.to_string(),
-                                    data: data.to_vec(),
-                                });
+                                if msg_tx_clone
+                                    .try_send(RelayMessage {
+                                        from_node: src.to_string(),
+                                        data: data.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    warn!("msg_tx full or closed, closing connection");
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 warn!("Failed to parse received frame: {}", e);
@@ -308,19 +360,32 @@ impl RelayClient {
                         } else {
                             0
                         };
-                        let _ = msg_tx_clone.send(RelayMessage {
-                            from_node: String::new(),
-                            data: format!("pong:{}", ts).into_bytes(),
-                        });
+                        if msg_tx_clone
+                            .try_send(RelayMessage {
+                                from_node: String::new(),
+                                data: format!("pong:{}", ts).into_bytes(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
 
                     MSG_ERROR => {
                         let frame = Frame::new(MSG_ERROR, payload.to_vec());
                         let (code, message) = frame.parse_error().unwrap_or((0, "unknown".into()));
-                        let _ = msg_tx_clone.send(RelayMessage {
-                            from_node: String::new(),
-                            data: format!("error:{}:{}", code, message).into_bytes(),
-                        });
+                        if let Some(tx) = reg_tx.take() {
+                            let _ = tx.send(Err(RelayError::ServerError(code, message.clone())));
+                        }
+                        if msg_tx_clone
+                            .try_send(RelayMessage {
+                                from_node: String::new(),
+                                data: format!("error:{}:{}", code, message).into_bytes(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
 
                     MSG_CLOSE => {
@@ -328,28 +393,14 @@ impl RelayClient {
                         break;
                     }
 
-                    MSG_PING => {
-                        // Server pinging us — shouldn't happen in normal protocol
-                        debug!("Unexpected ping from relay server");
-                    }
-
-                    MSG_FORWARD => {
-                        // We shouldn't receive forward frames (only the server does)
-                        debug!("Unexpected forward frame from relay server");
-                    }
-
-                    MSG_REGISTER => {
-                        debug!("Unexpected register frame from relay server");
-                    }
-
                     _ => {
-                        warn!("Unknown message type {:#04X} from relay server", msg_type);
+                        warn!("Unexpected or unknown message type {:#04X}", msg_type);
                     }
                 }
             }
 
             // Signal end of stream
-            let _ = msg_tx_clone.send(RelayMessage {
+            let _ = msg_tx_clone.try_send(RelayMessage {
                 from_node: String::new(),
                 data: b"closed".to_vec(),
             });
@@ -358,7 +409,7 @@ impl RelayClient {
         });
 
         // Wait for registration confirmation before returning
-        match tokio::time::timeout(Duration::from_secs(5), reg_rx).await {
+        match tokio::time::timeout(config.register_timeout, reg_rx).await {
             Ok(Ok(Ok(()))) => {
                 debug!("Registration confirmed by relay server");
             }
@@ -379,31 +430,44 @@ impl RelayClient {
     /// Send data to a peer via the relay.
     pub async fn send_data(&mut self, dst: &str, data: &[u8]) -> Result<()> {
         self.cmd_tx
-            .send(ClientCommand::SendData {
+            .try_send(ClientCommand::SendData {
                 dst: dst.to_string(),
                 data: data.to_vec(),
             })
-            .map_err(|_| RelayError::Closed("relay write task stopped".into()))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    RelayError::Channel("command queue full".into())
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    RelayError::Closed("relay write task stopped".into())
+                }
+            })
     }
 
     /// Send a ping to the relay server (to measure latency / keep alive).
     pub async fn ping(&mut self) -> Result<()> {
         self.cmd_tx
-            .send(ClientCommand::Ping)
-            .map_err(|_| RelayError::Closed("relay write task stopped".into()))
+            .try_send(ClientCommand::Ping)
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    RelayError::Channel("command queue full".into())
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    RelayError::Closed("relay write task stopped".into())
+                }
+            })
     }
 
     /// Close the connection gracefully.
     pub async fn close(&mut self) -> Result<()> {
-        let _ = self.cmd_tx.send(ClientCommand::Close);
+        let _ = self.cmd_tx.try_send(ClientCommand::Close);
         Ok(())
     }
 }
 
 impl Drop for RelayClient {
     fn drop(&mut self) {
-        // Try to signal close (best-effort, ignore errors)
-        let _ = self.cmd_tx.send(ClientCommand::Close);
+        let _ = self.cmd_tx.try_send(ClientCommand::Close);
     }
 }
 

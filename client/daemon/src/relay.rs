@@ -29,6 +29,7 @@ pub struct RelayCandidateDiagnostics {
     pub endpoint: String,
     pub connect_latency_ms: Option<u64>,
     pub error: Option<String>,
+    pub error_code: Option<String>,
 }
 
 /// Result of the most recent relay selection pass.
@@ -39,6 +40,7 @@ pub struct RelaySelectionDiagnostics {
     pub selected_connect_latency_ms: Option<u64>,
     pub candidates: Vec<RelayCandidateDiagnostics>,
     pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,13 +54,13 @@ struct RelayCandidate {
 struct ConnectedCandidate {
     candidate: RelayCandidate,
     transport: RelayTransport,
-    relay_rx: mpsc::UnboundedReceiver<RelayMessage>,
+    relay_rx: mpsc::Receiver<RelayMessage>,
 }
 
 /// Relay selector output. A failed pass still returns diagnostics.
 pub struct RelaySelectionOutcome {
     pub transport: Option<RelayTransport>,
-    pub relay_rx: Option<mpsc::UnboundedReceiver<RelayMessage>>,
+    pub relay_rx: Option<mpsc::Receiver<RelayMessage>>,
     pub diagnostics: RelaySelectionDiagnostics,
 }
 
@@ -122,6 +124,7 @@ pub async fn select_relay(
                     endpoint: candidate.endpoint.clone(),
                     connect_latency_ms: None,
                     error: None,
+                    error_code: None,
                 });
                 candidates.push(candidate);
             }
@@ -130,12 +133,14 @@ pub async fn select_relay(
                 endpoint: candidate.endpoint,
                 connect_latency_ms: None,
                 error: Some("duplicate relay endpoint".to_string()),
+                error_code: Some("duplicate_endpoint".to_string()),
             }),
             Err(error) => diagnostics.candidates.push(RelayCandidateDiagnostics {
                 region: "unknown".to_string(),
                 endpoint: spec.trim().to_string(),
                 connect_latency_ms: None,
                 error: Some(error),
+                error_code: Some("invalid_spec".to_string()),
             }),
         }
     }
@@ -175,12 +180,21 @@ pub async fn select_relay(
                 transport,
                 relay_rx,
             }),
-            Ok(Err(error)) => candidate_diagnostics.error = Some(error.to_string()),
+            Ok(Err(error)) => {
+                candidate_diagnostics.error = Some(error.to_string());
+                candidate_diagnostics.error_code = Some(
+                    error
+                        .error_code()
+                        .map(|c| c.to_snake_case().to_string())
+                        .unwrap_or_else(|| "connect_failed".to_string()),
+                );
+            }
             Err(_) => {
                 candidate_diagnostics.error = Some(format!(
                     "relay selection timed out after {} ms",
                     duration_millis(selection_timeout)
                 ));
+                candidate_diagnostics.error_code = Some("timeout".to_string());
             }
         }
     }
@@ -208,6 +222,11 @@ pub async fn select_relay(
         } else {
             "all relay candidates failed".to_string()
         });
+        if let Some(first_failed) = diagnostics.candidates.iter().find(|c| c.error.is_some()) {
+            diagnostics.last_error_code = first_failed.error_code.clone();
+        } else {
+            diagnostics.last_error_code = Some("no_candidates".to_string());
+        }
         RelaySelectionOutcome {
             transport: None,
             relay_rx: None,
@@ -232,8 +251,12 @@ impl RelayTransport {
         relay_endpoint: &str,
         node_id: &str,
         peers: Arc<PeerManager>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
-        Self::connect_in_region(relay_endpoint, "default", node_id, peers).await
+    ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        Self::connect_in_region(relay_endpoint, "default", node_id, peers)
+            .await
+            .map_err(|e| {
+                DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
+            })
     }
 
     async fn connect_in_region(
@@ -241,13 +264,9 @@ impl RelayTransport {
         relay_region: &str,
         node_id: &str,
         peers: Arc<PeerManager>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RelayMessage>)> {
+    ) -> std::result::Result<(Self, mpsc::Receiver<RelayMessage>), p2pnet_relay::RelayError> {
         let started = Instant::now();
-        let (client, relay_rx) = RelayClient::connect(relay_endpoint, node_id)
-            .await
-            .map_err(|e| {
-                DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
-            })?;
+        let (client, relay_rx) = RelayClient::connect(relay_endpoint, node_id).await?;
 
         Ok((
             Self {
@@ -308,8 +327,9 @@ impl RelayTransport {
     /// Convert relay messages into inbound encrypted datagrams for WireGuard.
     pub async fn run_inbound(
         self,
-        mut relay_rx: mpsc::UnboundedReceiver<RelayMessage>,
+        mut relay_rx: mpsc::Receiver<RelayMessage>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
     ) -> Result<()> {
         while let Some(message) = timeout(RELAY_INBOUND_IDLE_TIMEOUT, relay_rx.recv())
             .await
@@ -323,10 +343,37 @@ impl RelayTransport {
         {
             if message.from_node.is_empty() {
                 if message.data.as_slice() == b"closed" {
+                    if let Some(ref diags) = relay_selection {
+                        let mut d = diags.write().await;
+                        d.last_error = Some("relay connection closed by remote".to_string());
+                        d.last_error_code = Some("transport_closed".to_string());
+                    }
                     return Err(DaemonError::Relay(format!(
                         "relay {} connection closed",
                         self.relay_endpoint
                     )));
+                }
+                if message.data.starts_with(b"error:") {
+                    let err_str = String::from_utf8_lossy(&message.data);
+                    warn!("Received relay runtime error: {}", err_str);
+                    if let Some(ref diags) = relay_selection {
+                        let mut d = diags.write().await;
+                        d.last_error = Some(err_str.to_string());
+                        let parts: Vec<&str> = err_str.splitn(3, ':').collect();
+                        if parts.len() >= 2 {
+                            if let Ok(code) = parts[1].parse::<u16>() {
+                                if let Some(ec) = p2pnet_relay::RelayErrorCode::from_u16(code) {
+                                    d.last_error_code = Some(ec.to_snake_case().to_string());
+                                } else {
+                                    d.last_error_code = Some(format!("error_{}", code));
+                                }
+                            } else {
+                                d.last_error_code = Some("unknown_error".to_string());
+                            }
+                        } else {
+                            d.last_error_code = Some("unknown_error".to_string());
+                        }
+                    }
                 }
                 debug!(
                     "Ignoring relay control message from {}: {} bytes",
@@ -406,7 +453,7 @@ mod tests {
             .unwrap();
 
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let inbound_worker = tokio::spawn(relay_b.run_inbound(rx_b, inbound_tx));
+        let inbound_worker = tokio::spawn(relay_b.run_inbound(rx_b, inbound_tx, None));
 
         let payload = vec![4, 1, 2, 3, 4, 5];
         relay_a
