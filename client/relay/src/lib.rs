@@ -40,7 +40,9 @@
 //!
 //! // Bob receives it
 //! let msg = rx_b.recv().await.unwrap();
-//! assert_eq!(msg.from_node, "alice");
+//! if let p2pnet_relay::RelayMessage::Data { from_node, .. } = msg {
+//!     assert_eq!(from_node, "alice");
+//! }
 //! # Ok(())
 //! # }
 //! ```

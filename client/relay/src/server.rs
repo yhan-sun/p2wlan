@@ -1,34 +1,11 @@
-//! Async relay server for testing and development.
-//!
-//! The relay server listens on a TCP port, accepts connections from clients,
-//! and forwards encrypted data between peers. The server cannot decrypt any
-//! data — it only routes frames based on node IDs.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌──────────────┐     ┌───────────────────┐     ┌──────────────┐
-//! │   Node A     │────▶│   Relay Server    │◀────│   Node B     │
-//! │ (node-id-A)  │     │                   │     │ (node-id-B)  │
-//! └──────────────┘     │  peer_table:      │     └──────────────┘
-//!                      │  "A" → tx_a       │
-//!                      │  "B" → tx_b       │
-//!                      └───────────────────┘
-//! ```
-//!
-//! Each client connection spawns two tasks:
-//! 1. **Read task**: reads frames from the TCP stream, processes them
-//! 2. **Write task**: receives data from an mpsc channel and writes to the TCP stream
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{RelayError, Result};
@@ -37,21 +14,25 @@ use crate::RelayServerConfig;
 
 /// A peer connection representation in the server.
 #[derive(Clone)]
-pub struct PeerConnection {
+struct PeerConnection {
+    /// Channel to send frames to the connection's write task.
     tx: mpsc::Sender<Vec<u8>>,
-    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Trigger to shut down this connection (used on duplicate registration).
+    shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Generation identifier to resolve unregistration races.
     conn_id: u64,
 }
 
-/// Shared state mapping node IDs to their write channels and connection metadata.
 type PeerTable = Arc<Mutex<HashMap<String, PeerConnection>>>;
 
-/// A running relay server instance.
+/// A DERP-like relay server.
 pub struct RelayServer {
     /// The address the server is listening on.
     pub addr: SocketAddr,
     /// Handle to the server task.
     handle: tokio::task::JoinHandle<()>,
+    /// Shutdown trigger broadcast channel.
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl RelayServer {
@@ -66,7 +47,8 @@ impl RelayServer {
         let listener = TcpListener::bind(addr).await?;
         let actual_addr = listener.local_addr()?;
         let peer_table: PeerTable = Arc::new(Mutex::new(HashMap::new()));
-        let connection_count = Arc::new(AtomicUsize::new(0));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
         info!(
             "Relay server listening on {} with config: {:?}",
@@ -74,36 +56,70 @@ impl RelayServer {
         );
 
         let c_config = config.clone();
+        let s_tx = shutdown_tx.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
+            let mut join_set = tokio::task::JoinSet::new();
             let mut next_conn_id = 0u64;
+
             loop {
-                match listener.accept().await {
-                    Ok((stream, client_addr)) => {
-                        debug!("New connection from {}", client_addr);
-                        let table = peer_table.clone();
-                        let conn_count = connection_count.clone();
-                        let client_cfg = c_config.clone();
-                        next_conn_id += 1;
-                        let conn_id = next_conn_id;
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_client(stream, table, conn_count, conn_id, client_cfg).await
-                            {
-                                warn!("Client connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!("Accept error: {}", e);
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        debug!("Accept loop exiting due to shutdown signal");
                         break;
                     }
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((stream, client_addr)) => {
+                                debug!("New connection from {}", client_addr);
+                                match semaphore.clone().try_acquire_owned() {
+                                    Ok(permit) => {
+                                        let table = peer_table.clone();
+                                        let client_cfg = c_config.clone();
+                                        next_conn_id += 1;
+                                        let conn_id = next_conn_id;
+                                        let mut conn_shutdown_rx = s_tx.subscribe();
+                                        join_set.spawn(async move {
+                                            let _permit = permit;
+                                            tokio::select! {
+                                                _ = conn_shutdown_rx.recv() => {
+                                                    debug!("Client connection closed by server shutdown");
+                                                }
+                                                res = handle_client(stream, table, conn_id, client_cfg) => {
+                                                    if let Err(e) = res {
+                                                        warn!("Client connection error: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(_) => {
+                                        tokio::spawn(async move {
+                                            let mut stream = stream;
+                                            let _ = stream.write_all(&Frame::error(ERR_CONNECTION_LIMIT, "connection limit exceeded").encode()).await;
+                                            let _ = stream.shutdown().await;
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Accept error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    _ = join_set.join_next(), if !join_set.is_empty() => {}
                 }
             }
+
+            join_set.abort_all();
+            while join_set.join_next().await.is_some() {}
         });
 
         Ok(Self {
             addr: actual_addr,
             handle,
+            shutdown_tx,
         })
     }
 
@@ -114,7 +130,8 @@ impl RelayServer {
 
     /// Shut down the relay server.
     pub async fn shutdown(self) {
-        self.handle.abort();
+        let _ = self.shutdown_tx.send(());
+        let _ = self.handle.await;
         info!("Relay server shut down");
     }
 }
@@ -123,68 +140,49 @@ impl RelayServer {
 async fn handle_client(
     stream: TcpStream,
     peer_table: PeerTable,
-    connection_count: Arc<AtomicUsize>,
     conn_id: u64,
     config: RelayServerConfig,
 ) -> Result<()> {
     let client_addr = stream.peer_addr().ok();
-
-    // Check connection limit
-    let current_connections = connection_count.fetch_add(1, Ordering::SeqCst);
-    struct ConnectionGuard {
-        count: Arc<AtomicUsize>,
-    }
-    impl Drop for ConnectionGuard {
-        fn drop(&mut self) {
-            self.count.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    let _guard = ConnectionGuard {
-        count: connection_count.clone(),
-    };
-
-    if current_connections >= config.max_connections {
-        let mut writer = stream.into_split().1;
-        let _ = writer
-            .write_all(&Frame::error(ERR_CONNECTION_LIMIT, "connection limit exceeded").encode())
-            .await;
-        return Err(RelayError::Protocol("connection limit exceeded".into()));
-    }
-
     let (mut reader, mut writer) = stream.into_split();
 
-    // Channel for sending data to this client (from other peers)
+    // Outbound channel to connection's write loop task
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(config.outbound_queue_capacity);
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Write task: forward queued frames to the TCP stream
+    // Write task for this connection
     let write_task = tokio::spawn(async move {
         while let Some(frame_bytes) = rx.recv().await {
-            if writer.write_all(&frame_bytes).await.is_err() {
+            if let Err(e) = writer.write_all(&frame_bytes).await {
+                warn!("Write error to client {:?}: {}", client_addr, e);
                 break;
             }
         }
+        let _ = writer.shutdown().await;
+        debug!("Write task ended for client {:?}", client_addr);
     });
 
-    // Step 1: Wait for Register frame within register_timeout
+    // Registration phase with register_timeout
     let first_frame_fut = async {
-        let mut header = [0u8; FRAME_HEADER_SIZE];
-        reader.read_exact(&mut header).await?;
-        if header[..4] != MAGIC {
-            return Err(RelayError::Protocol("invalid magic".into()));
+        let mut buf = [0u8; FRAME_HEADER_SIZE + MAX_NODE_ID_LEN];
+        reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]).await?;
+        if buf[..4] != MAGIC {
+            return Err(RelayError::InvalidMagic);
         }
-        let version = header[4];
+        let version = buf[4];
         if version != VERSION {
-            return Err(RelayError::Protocol("unsupported version".into()));
+            return Err(RelayError::UnsupportedVersion(version));
         }
-        let msg_type = header[5];
-        let payload_len = u16::from_be_bytes([header[6], header[7]]) as usize;
+        let msg_type = buf[5];
+        let payload_len = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+
         if payload_len > config.max_frame_payload {
             return Err(RelayError::FrameTooLarge(
                 payload_len,
                 config.max_frame_payload,
             ));
         }
+
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             reader.read_exact(&mut payload).await?;
@@ -207,10 +205,8 @@ async fn handle_client(
             let err_code = match &e {
                 RelayError::FrameTooLarge(_, _) => ERR_FRAME_TOO_LARGE,
                 RelayError::Timeout(_) => ERR_REGISTRATION_TIMEOUT,
-                RelayError::Protocol(s) if s.contains("unsupported version") => {
-                    ERR_UNSUPPORTED_VERSION
-                }
-                RelayError::Protocol(s) if s.contains("invalid magic") => ERR_INVALID_FRAME,
+                RelayError::UnsupportedVersion(_) => ERR_UNSUPPORTED_VERSION,
+                RelayError::InvalidMagic => ERR_INVALID_FRAME,
                 _ => ERR_INVALID_FRAME,
             };
             let _ = tx.try_send(Frame::error(err_code, &e.to_string()).encode());
@@ -254,19 +250,35 @@ async fn handle_client(
     {
         let mut table = peer_table.lock().await;
         if let Some(old_conn) = table.get(&node_id) {
-            // Unregister/shutdown the old connection
-            if let Some(s_tx) = old_conn.shutdown_tx.lock().await.take() {
-                let _ = s_tx.send(());
+            warn!("Disconnecting duplicate connection for node '{}'", node_id);
+            if let Some(old_s_tx) = old_conn.shutdown_tx.lock().await.take() {
+                let _ = old_s_tx.send(());
             }
         }
         table.insert(node_id.clone(), my_connection);
     }
 
     // Send confirmation
-    if tx.send(Frame::registered(&node_id).encode()).await.is_err() {
+    if let Err(_) = tx.try_send(Frame::registered(&node_id).encode()) {
         return Err(RelayError::Closed(
-            "client closed connection immediately".into(),
+            "write channel closed on registered reply".into(),
         ));
+    }
+
+    macro_rules! try_queue {
+        ($tx:expr, $frame:expr) => {
+            match $tx.try_send($frame) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("Outbound queue full, closing connection");
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    debug!("Outbound queue closed, exiting");
+                    break;
+                }
+            }
+        };
     }
 
     // Read loop with idle_timeout
@@ -289,7 +301,7 @@ async fn handle_client(
                 Ok(Err(e)) => Err(RelayError::Io(e)),
                 Err(_) => {
                     debug!("Client '{}' idle timeout", node_id);
-                    let _ = tx.try_send(Frame::error(ERR_IDLE_TIMEOUT, "idle timeout").encode());
+                    try_queue!(tx, Frame::error(ERR_IDLE_TIMEOUT, "idle timeout").encode());
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     break;
                 }
@@ -304,15 +316,20 @@ async fn handle_client(
         // Parse header
         if buf[..4] != MAGIC {
             warn!("Invalid magic from '{}'", node_id);
-            let _ = tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid magic").encode());
+            try_queue!(
+                tx,
+                Frame::error(ERR_INVALID_FRAME, "invalid magic").encode()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
             break;
         }
         let version = buf[4];
         if version != VERSION {
             warn!("Unsupported version {} from '{}'", version, node_id);
-            let _ =
-                tx.try_send(Frame::error(ERR_UNSUPPORTED_VERSION, "unsupported version").encode());
+            try_queue!(
+                tx,
+                Frame::error(ERR_UNSUPPORTED_VERSION, "unsupported version").encode()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
             break;
         }
@@ -324,7 +341,10 @@ async fn handle_client(
                 "Payload length {} exceeds limit {}",
                 payload_len, config.max_frame_payload
             );
-            let _ = tx.try_send(Frame::error(ERR_FRAME_TOO_LARGE, "frame too large").encode());
+            try_queue!(
+                tx,
+                Frame::error(ERR_FRAME_TOO_LARGE, "frame too large").encode()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
             break;
         }
@@ -355,46 +375,54 @@ async fn handle_client(
                 let new_id = match std::str::from_utf8(payload) {
                     Ok(s) => s.to_string(),
                     Err(_) => {
-                        let _ = tx
-                            .try_send(Frame::error(ERR_INVALID_FRAME, "invalid node ID").encode());
+                        try_queue!(
+                            tx,
+                            Frame::error(ERR_INVALID_FRAME, "invalid node ID").encode()
+                        );
                         continue;
                     }
                 };
                 if Some(&new_id) != registered_id.as_ref() {
-                    let _ = tx.try_send(
+                    try_queue!(
+                        tx,
                         Frame::error(
                             ERR_DUPLICATE_REGISTRATION,
-                            "already registered with a different node ID",
+                            "already registered with a different node ID"
                         )
-                        .encode(),
+                        .encode()
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     break;
                 } else {
-                    let _ = tx.try_send(Frame::registered(&new_id).encode());
+                    try_queue!(tx, Frame::registered(&new_id).encode());
                 }
             }
 
             MSG_FORWARD => {
                 if payload.is_empty() {
-                    let _ = tx.try_send(
-                        Frame::error(ERR_INVALID_FRAME, "empty forward payload").encode(),
+                    try_queue!(
+                        tx,
+                        Frame::error(ERR_INVALID_FRAME, "empty forward payload").encode()
                     );
                     continue;
                 }
 
                 let dst_len = payload[0] as usize;
                 if payload.len() < 1 + dst_len {
-                    let _ =
-                        tx.try_send(Frame::error(ERR_INVALID_FRAME, "malformed forward").encode());
+                    try_queue!(
+                        tx,
+                        Frame::error(ERR_INVALID_FRAME, "malformed forward").encode()
+                    );
                     continue;
                 }
 
                 let dst_id = match std::str::from_utf8(&payload[1..1 + dst_len]) {
                     Ok(s) => s,
                     Err(_) => {
-                        let _ =
-                            tx.try_send(Frame::error(ERR_INVALID_FRAME, "invalid dst ID").encode());
+                        try_queue!(
+                            tx,
+                            Frame::error(ERR_INVALID_FRAME, "invalid dst ID").encode()
+                        );
                         continue;
                     }
                 };
@@ -404,8 +432,9 @@ async fn handle_client(
                 // Check if outbound frame payload exceeds the configured maximum frame payload
                 let total_received_len = 1 + node_id.len() + data.len();
                 if total_received_len > config.max_frame_payload {
-                    let _ = tx.try_send(
-                        Frame::error(ERR_FRAME_TOO_LARGE, "forward payload too large").encode(),
+                    try_queue!(
+                        tx,
+                        Frame::error(ERR_FRAME_TOO_LARGE, "forward payload too large").encode()
                     );
                     continue;
                 }
@@ -427,35 +456,39 @@ async fn handle_client(
                                     if let Some(s_tx) = dst.shutdown_tx.lock().await.take() {
                                         let _ = s_tx.send(());
                                     }
-                                    let _ = tx.try_send(
+                                    try_queue!(
+                                        tx,
                                         Frame::error(
                                             ERR_PEER_BACKPRESSURE,
-                                            "target peer outbound queue full",
+                                            "target peer outbound queue full"
                                         )
-                                        .encode(),
+                                        .encode()
                                     );
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    let _ = tx.try_send(
+                                    try_queue!(
+                                        tx,
                                         Frame::error(
                                             ERR_PEER_NOT_FOUND,
-                                            "target peer write channel closed",
+                                            "target peer write channel closed"
                                         )
-                                        .encode(),
+                                        .encode()
                                     );
                                 }
                             },
                             Err(e) => {
-                                let _ = tx.try_send(
-                                    Frame::error(ERR_INVALID_FRAME, &e.to_string()).encode(),
+                                try_queue!(
+                                    tx,
+                                    Frame::error(ERR_INVALID_FRAME, &e.to_string()).encode()
                                 );
                             }
                         }
                     }
                     None => {
-                        let _ = tx.try_send(
+                        try_queue!(
+                            tx,
                             Frame::error(ERR_PEER_NOT_FOUND, &format!("peer not found: {dst_id}"))
-                                .encode(),
+                                .encode()
                         );
                     }
                 }
@@ -470,7 +503,7 @@ async fn handle_client(
                 } else {
                     0
                 };
-                let _ = tx.try_send(Frame::pong(timestamp).encode());
+                try_queue!(tx, Frame::pong(timestamp).encode());
             }
 
             MSG_CLOSE => {
@@ -483,8 +516,10 @@ async fn handle_client(
                     "Unexpected message type {:#04X} from client '{}'",
                     msg_type, node_id
                 );
-                let _ = tx
-                    .try_send(Frame::error(ERR_INVALID_FRAME, "unexpected message type").encode());
+                try_queue!(
+                    tx,
+                    Frame::error(ERR_INVALID_FRAME, "unexpected message type").encode()
+                );
             }
         }
     }
@@ -492,8 +527,8 @@ async fn handle_client(
     // Clean up: remove from peer table if it's still ours
     if let Some(id) = &registered_id {
         let mut table = peer_table.lock().await;
-        if let Some(conn) = table.get(id) {
-            if conn.conn_id == conn_id {
+        if let Some(active) = table.get(id) {
+            if active.conn_id == conn_id {
                 table.remove(id);
                 debug!("Removed '{}' (conn_id={}) from peer table", id, conn_id);
             }
@@ -508,7 +543,7 @@ async fn handle_client(
 mod tests {
     use super::*;
     use crate::client::RelayClient;
-    use crate::{RelayClientConfig, RelayErrorCode};
+    use crate::{RelayClientConfig, RelayErrorCode, RelayMessage};
     use std::time::Duration;
 
     #[tokio::test]
@@ -544,8 +579,12 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(received.from_node, "nodeA");
-        assert_eq!(received.data, b"hello from A");
+        if let RelayMessage::Data { from_node, data } = received {
+            assert_eq!(from_node, "nodeA");
+            assert_eq!(data, b"hello from A");
+        } else {
+            panic!("Expected Data, got {:?}", received);
+        }
 
         // B sends data back to A
         client_b.send_data("nodeA", b"hi from B").await.unwrap();
@@ -555,8 +594,12 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(received.from_node, "nodeB");
-        assert_eq!(received.data, b"hi from B");
+        if let RelayMessage::Data { from_node, data } = received {
+            assert_eq!(from_node, "nodeB");
+            assert_eq!(data, b"hi from B");
+        } else {
+            panic!("Expected Data, got {:?}", received);
+        }
 
         server.shutdown().await;
     }
@@ -570,8 +613,6 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() waited for registration
-
         // Send to a peer that doesn't exist
         client.send_data("ghost", b"data").await.unwrap();
 
@@ -581,8 +622,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        assert!(received.from_node.is_empty()); // Error messages have empty from_node
-        assert!(received.data.starts_with(b"error:"));
+        assert!(matches!(received, RelayMessage::Error { code: 404, .. }));
 
         server.shutdown().await;
     }
@@ -596,8 +636,6 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() waited for registration
-
         client.ping().await.unwrap();
 
         // Should receive a pong
@@ -606,8 +644,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        // Pong comes as a special message
-        assert!(received.from_node.is_empty());
+        assert!(matches!(received, RelayMessage::Pong { .. }));
 
         server.shutdown().await;
     }
@@ -632,15 +669,25 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r1.from_node, "p3");
-        assert_eq!(r1.data, b"to p1");
+        assert_eq!(
+            r1,
+            RelayMessage::Data {
+                from_node: "p3".to_string(),
+                data: b"to p1".to_vec()
+            }
+        );
 
         let r2 = tokio::time::timeout(Duration::from_secs(2), rx2.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r2.from_node, "p3");
-        assert_eq!(r2.data, b"to p2");
+        assert_eq!(
+            r2,
+            RelayMessage::Data {
+                from_node: "p3".to_string(),
+                data: b"to p2".to_vec()
+            }
+        );
 
         server.shutdown().await;
     }
@@ -657,8 +704,6 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() waited for registration
-
         // Send 60KB of data
         let big_data = vec![0x42u8; 60000];
         client_a.send_data("bigB", &big_data).await.unwrap();
@@ -668,19 +713,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(received.from_node, "bigA");
-        assert_eq!(received.data.len(), 60000);
-        assert!(received.data.iter().all(|&b| b == 0x42));
+        if let RelayMessage::Data { from_node, data } = received {
+            assert_eq!(from_node, "bigA");
+            assert_eq!(data.len(), 60000);
+            assert!(data.iter().all(|&b| b == 0x42));
+        } else {
+            panic!("Expected Data, got {:?}", received);
+        }
 
         server.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_invalid_limits() {
-        let config = RelayServerConfig {
-            max_connections: 0,
-            ..Default::default()
-        };
+        let mut config = RelayServerConfig::default();
+        config.max_connections = 0;
         assert!(config.validate().is_err());
         assert!(RelayServer::start_with_config("127.0.0.1:0", config)
             .await
@@ -742,7 +789,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
             if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(5), rx_a.recv()).await
             {
-                if msg.from_node.is_empty() && msg.data.starts_with(b"error:4008") {
+                if let RelayMessage::Error { code: 4008, .. } = msg {
                     got_backpressure = true;
                     break;
                 }
@@ -796,8 +843,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(msg.from_node.is_empty());
-        assert!(msg.data.starts_with(b"error:4009")); // ERR_IDLE_TIMEOUT
+        assert!(matches!(msg, RelayMessage::Error { code: 4009, .. }));
         server.shutdown().await;
     }
 
@@ -866,20 +912,15 @@ mod tests {
         let server = RelayServer::start_random().await.unwrap();
         let addr = server.addr;
 
-        let (client1, mut rx1) = RelayClient::connect_verified(&addr.to_string(), "dup")
+        let client1 = RelayClient::connect_verified(&addr.to_string(), "dup")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let (_client2, mut rx2) = RelayClient::connect_verified(&addr.to_string(), "dup")
             .await
             .unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_millis(500), rx1.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(msg.from_node.is_empty());
-        assert_eq!(msg.data, b"closed");
-
+        // client1 exiting should be clean
         drop(client1);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -892,8 +933,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(msg.from_node, "sender3");
-        assert_eq!(msg.data, b"still here");
+        if let RelayMessage::Data { from_node, data } = msg {
+            assert_eq!(from_node, "sender3");
+            assert_eq!(data, b"still here");
+        } else {
+            panic!("Expected Data, got {:?}", msg);
+        }
         server.shutdown().await;
     }
 

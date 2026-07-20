@@ -16,7 +16,9 @@
 //!
 //! // Receive data from peers
 //! while let Some(msg) = rx.recv().await {
-//!     println!("From {}: {:?}", msg.from_node, msg.data);
+//!     if let p2pnet_relay::RelayMessage::Data { from_node, data } = msg {
+//!         println!("From {}: {:?}", from_node, data);
+//!     }
 //! }
 //! # }
 //! ```
@@ -37,13 +39,17 @@ use crate::RelayClientConfig;
 #[allow(dead_code)]
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A message received from the relay (data from a peer or a control message).
-#[derive(Debug, Clone)]
-pub struct RelayMessage {
-    /// The source node ID (empty for control messages like pong/error).
-    pub from_node: String,
-    /// The data payload (for control messages, prefixed with "error:" or "pong:").
-    pub data: Vec<u8>,
+/// A message received from the relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayMessage {
+    /// Data from a peer.
+    Data { from_node: String, data: Vec<u8> },
+    /// Pong response with timestamp.
+    Pong { timestamp: u64 },
+    /// Relay protocol or operational error.
+    Error { code: u16, message: String },
+    /// Remote closed connection.
+    Closed,
 }
 
 /// Commands sent from the client handle to the background write task.
@@ -327,7 +333,7 @@ impl RelayClient {
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
                                 if msg_tx_clone
-                                    .try_send(RelayMessage {
+                                    .try_send(RelayMessage::Data {
                                         from_node: src.to_string(),
                                         data: data.to_vec(),
                                     })
@@ -361,10 +367,7 @@ impl RelayClient {
                             0
                         };
                         if msg_tx_clone
-                            .try_send(RelayMessage {
-                                from_node: String::new(),
-                                data: format!("pong:{}", ts).into_bytes(),
-                            })
+                            .try_send(RelayMessage::Pong { timestamp: ts })
                             .is_err()
                         {
                             break;
@@ -378,10 +381,7 @@ impl RelayClient {
                             let _ = tx.send(Err(RelayError::ServerError(code, message.clone())));
                         }
                         if msg_tx_clone
-                            .try_send(RelayMessage {
-                                from_node: String::new(),
-                                data: format!("error:{}:{}", code, message).into_bytes(),
-                            })
+                            .try_send(RelayMessage::Error { code, message })
                             .is_err()
                         {
                             break;
@@ -400,10 +400,7 @@ impl RelayClient {
             }
 
             // Signal end of stream
-            let _ = msg_tx_clone.try_send(RelayMessage {
-                from_node: String::new(),
-                data: b"closed".to_vec(),
-            });
+            let _ = msg_tx_clone.try_send(RelayMessage::Closed);
             let _ = read_close_tx.send(true);
             debug!("Relay read task ended");
         });
@@ -506,7 +503,7 @@ mod tests {
         let pong = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 let message = rx.recv().await.expect("relay stream closed");
-                if message.from_node.is_empty() && message.data.starts_with(b"pong:") {
+                if let RelayMessage::Pong { .. } = message {
                     return message;
                 }
             }
@@ -514,7 +511,7 @@ mod tests {
         .await
         .expect("relay keepalive pong timed out");
 
-        assert!(pong.data.starts_with(b"pong:"));
+        assert!(matches!(pong, RelayMessage::Pong { .. }));
         server.shutdown().await;
     }
 
@@ -530,8 +527,6 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() already waited for registration
-
         // Alice → Bob
         alice.send_data("bob", b"hello bob").await.unwrap();
 
@@ -540,8 +535,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(msg.from_node, "alice");
-        assert_eq!(msg.data, b"hello bob");
+        assert_eq!(
+            msg,
+            RelayMessage::Data {
+                from_node: "alice".to_string(),
+                data: b"hello bob".to_vec()
+            }
+        );
 
         // Bob → Alice
         bob.send_data("alice", b"hi alice").await.unwrap();
@@ -551,8 +551,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(msg.from_node, "bob");
-        assert_eq!(msg.data, b"hi alice");
+        assert_eq!(
+            msg,
+            RelayMessage::Data {
+                from_node: "bob".to_string(),
+                data: b"hi alice".to_vec()
+            }
+        );
 
         server.shutdown().await;
     }
@@ -566,7 +571,7 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() waited for registration, now send to nonexistent peer
+        // Send to nonexistent peer
         client.send_data("nonexistent", b"data").await.unwrap();
 
         // Should get an error response (code 404)
@@ -575,7 +580,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(msg.data.starts_with(b"error:404"), "got: {:?}", msg.data);
+        assert!(
+            matches!(msg, RelayMessage::Error { code: 404, .. }),
+            "got: {:?}",
+            msg
+        );
     }
 
     #[tokio::test]
@@ -587,7 +596,6 @@ mod tests {
             .await
             .unwrap();
 
-        // connect() already waited for registration, so just ping
         client.ping().await.unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -595,7 +603,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(msg.data.starts_with(b"pong:"));
+        assert!(matches!(msg, RelayMessage::Pong { .. }));
 
         server.shutdown().await;
     }
@@ -614,7 +622,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send 60KB (under the 65535 max payload)
+        // Send 60KB
         let data = vec![0xAB; 60_000];
         sender.send_data("receiver", &data).await.unwrap();
 
@@ -623,16 +631,19 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(msg.from_node, "sender");
-        assert_eq!(msg.data.len(), 60_000);
-        assert!(msg.data.iter().all(|&b| b == 0xAB));
+        if let RelayMessage::Data { from_node, data } = msg {
+            assert_eq!(from_node, "sender");
+            assert_eq!(data.len(), 60_000);
+            assert!(data.iter().all(|&b| b == 0xAB));
+        } else {
+            panic!("expected Data, got {:?}", msg);
+        }
 
         server.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_connect_to_invalid_address() {
-        // Port 1 is reserved and almost certainly not listening
         let result = RelayClient::connect("127.0.0.1:1", "test").await;
         assert!(result.is_err());
     }
@@ -648,7 +659,6 @@ mod tests {
 
         client.close().await.unwrap();
 
-        // Give it time for the close frame to be processed
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         server.shutdown().await;
@@ -668,41 +678,46 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // Multiple messages both ways
         for i in 0..5 {
             let msg = format!("message-{}", i);
             a.send_data("streamB", msg.as_bytes()).await.unwrap();
             b.send_data("streamA", msg.as_bytes()).await.unwrap();
         }
 
-        // Collect A → B messages
         let mut a_to_b = Vec::new();
         for _ in 0..5 {
             let msg = tokio::time::timeout(Duration::from_secs(2), rxb.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            if !msg.from_node.is_empty() {
-                a_to_b.push(msg);
+            if let RelayMessage::Data { ref from_node, .. } = msg {
+                if !from_node.is_empty() {
+                    a_to_b.push(msg);
+                }
             }
         }
 
-        // Collect B → A messages
         let mut b_to_a = Vec::new();
         for _ in 0..5 {
             let msg = tokio::time::timeout(Duration::from_secs(2), rxa.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            if !msg.from_node.is_empty() {
-                b_to_a.push(msg);
+            if let RelayMessage::Data { ref from_node, .. } = msg {
+                if !from_node.is_empty() {
+                    b_to_a.push(msg);
+                }
             }
         }
 
         assert_eq!(a_to_b.len(), 5);
         assert_eq!(b_to_a.len(), 5);
-        assert!(a_to_b.iter().all(|m| m.from_node == "streamA"));
-        assert!(b_to_a.iter().all(|m| m.from_node == "streamB"));
+        assert!(a_to_b
+            .iter()
+            .all(|m| matches!(m, RelayMessage::Data { from_node, .. } if from_node == "streamA")));
+        assert!(b_to_a
+            .iter()
+            .all(|m| matches!(m, RelayMessage::Data { from_node, .. } if from_node == "streamB")));
 
         server.shutdown().await;
     }

@@ -1785,7 +1785,7 @@ fn is_ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2pnet_relay::Frame;
+    use p2pnet_relay::{Frame, RelayMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2060,8 +2060,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.from_node, "node-a");
-        assert_eq!(received.data, payload);
+        if let RelayMessage::Data { from_node, data } = received {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(data, payload);
+        } else {
+            panic!("Expected Data message, got {:?}", received);
+        }
 
         worker.abort();
         server.shutdown().await;
@@ -2125,8 +2129,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.from_node, "node-a");
-        assert_eq!(received.data, payload);
+        if let RelayMessage::Data { from_node, data } = received {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(data, payload);
+        } else {
+            panic!("Expected Data message, got {:?}", received);
+        }
 
         let mut buf = [0u8; 64];
         assert!(

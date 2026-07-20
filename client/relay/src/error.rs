@@ -51,6 +51,14 @@ pub enum RelayError {
     /// Channel communication error.
     #[error("channel error: {0}")]
     Channel(String),
+
+    /// Unsupported protocol version.
+    #[error("unsupported protocol version: {0}")]
+    UnsupportedVersion(u8),
+
+    /// Invalid magic header.
+    #[error("invalid magic header")]
+    InvalidMagic,
 }
 
 /// Stable error codes matching Go relay implementation
@@ -113,6 +121,9 @@ impl RelayError {
     pub fn error_code(&self) -> Option<RelayErrorCode> {
         match self {
             RelayError::ServerError(code, _) => RelayErrorCode::from_u16(*code),
+            RelayError::UnsupportedVersion(_) => Some(RelayErrorCode::UnsupportedVersion),
+            RelayError::InvalidMagic => Some(RelayErrorCode::InvalidFrame),
+            RelayError::FrameTooLarge(_, _) => Some(RelayErrorCode::FrameTooLarge),
             _ => None,
         }
     }
@@ -136,6 +147,8 @@ impl RelayError {
             RelayError::Closed(_) => "connection_closed",
             RelayError::Io(_) => "io_error",
             RelayError::UnexpectedMessageType(_) => "unexpected_message_type",
+            RelayError::UnsupportedVersion(_) => "unsupported_version",
+            RelayError::InvalidMagic => "invalid_magic",
         }
     }
 }

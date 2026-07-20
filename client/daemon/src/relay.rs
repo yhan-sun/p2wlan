@@ -341,8 +341,8 @@ impl RelayTransport {
                 ))
             })?
         {
-            if message.from_node.is_empty() {
-                if message.data.as_slice() == b"closed" {
+            match message {
+                RelayMessage::Closed => {
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
                         d.last_error = Some("relay connection closed by remote".to_string());
@@ -353,48 +353,42 @@ impl RelayTransport {
                         self.relay_endpoint
                     )));
                 }
-                if message.data.starts_with(b"error:") {
-                    let err_str = String::from_utf8_lossy(&message.data);
-                    warn!("Received relay runtime error: {}", err_str);
+                RelayMessage::Error { code, message } => {
+                    warn!(
+                        "Received relay runtime error: code={}, message={}",
+                        code, message
+                    );
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
-                        d.last_error = Some(err_str.to_string());
-                        let parts: Vec<&str> = err_str.splitn(3, ':').collect();
-                        if parts.len() >= 2 {
-                            if let Ok(code) = parts[1].parse::<u16>() {
-                                if let Some(ec) = p2pnet_relay::RelayErrorCode::from_u16(code) {
-                                    d.last_error_code = Some(ec.to_snake_case().to_string());
-                                } else {
-                                    d.last_error_code = Some(format!("error_{}", code));
-                                }
-                            } else {
-                                d.last_error_code = Some("unknown_error".to_string());
-                            }
+                        d.last_error = Some(message.clone());
+                        if let Some(ec) = p2pnet_relay::RelayErrorCode::from_u16(code) {
+                            d.last_error_code = Some(ec.to_snake_case().to_string());
                         } else {
-                            d.last_error_code = Some("unknown_error".to_string());
+                            d.last_error_code = Some(format!("error_{}", code));
                         }
                     }
                 }
-                debug!(
-                    "Ignoring relay control message from {}: {} bytes",
-                    self.relay_endpoint,
-                    message.data.len()
-                );
-                continue;
+                RelayMessage::Pong { timestamp } => {
+                    debug!(
+                        "Received ping-pong keepalive response from relay {} with timestamp {}",
+                        self.relay_endpoint, timestamp
+                    );
+                }
+                RelayMessage::Data { from_node, data } => {
+                    self.peers
+                        .record_relay_success(&from_node, &self.relay_endpoint, false)
+                        .await;
+                    inbound_tx
+                        .send(ReceivedEncryptedPacket {
+                            source: None,
+                            wire_bytes: data,
+                        })
+                        .await
+                        .map_err(|_| {
+                            DaemonError::Network("relay inbound packet channel closed".to_string())
+                        })?;
+                }
             }
-
-            self.peers
-                .record_relay_success(&message.from_node, &self.relay_endpoint, false)
-                .await;
-            inbound_tx
-                .send(ReceivedEncryptedPacket {
-                    source: None,
-                    wire_bytes: message.data,
-                })
-                .await
-                .map_err(|_| {
-                    DaemonError::Network("relay inbound packet channel closed".to_string())
-                })?;
         }
 
         warn!("Relay inbound stream from {} ended", self.relay_endpoint);
