@@ -19,9 +19,10 @@
 //! | Relay | 0 |
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use if_addrs::IfAddr;
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
@@ -63,6 +64,89 @@ impl Default for IceConfig {
             gather_srflx: true,
         }
     }
+}
+
+/// One STUN observation collected from a single external observer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StunObservation {
+    /// STUN server queried.
+    pub server: String,
+    /// Public mapped address seen by the server.
+    pub mapped_address: Option<String>,
+    /// Query round-trip time in milliseconds.
+    pub rtt_ms: Option<u64>,
+    /// Error, if the query failed.
+    pub error: Option<String>,
+}
+
+/// Behavioral NAT mapping classification based on multiple STUN observers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingBehavior {
+    /// No STUN data was collected.
+    Unknown,
+    /// STUN was configured but no server replied.
+    UdpBlocked,
+    /// Mapped address matches the local socket address.
+    OpenInternet,
+    /// Multiple observers saw the same public address and port.
+    EndpointIndependent,
+    /// Observers returned different public addresses or ports.
+    AddressOrPortDependent,
+}
+
+/// Local NAT profile inferred from candidate gathering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NatProfile {
+    /// Local UDP socket address used for STUN and direct traffic.
+    pub local_addr: String,
+    /// STUN observations used to infer this profile.
+    pub observations: Vec<StunObservation>,
+    /// True when STUN was configured but every request failed.
+    pub udp_blocked: bool,
+    /// Best public endpoint discovered from STUN, if any.
+    pub public_endpoint: Option<String>,
+    /// Whether all successful observations shared the same public IP.
+    pub public_ip_stable: Option<bool>,
+    /// Whether all successful observations shared the same public port.
+    pub public_port_stable: Option<bool>,
+    /// Whether the NAT preserved the local UDP port in the first observation.
+    pub port_preserved: Option<bool>,
+    /// Stable consecutive port delta, when observable.
+    pub port_delta: Option<i32>,
+    /// Conservative symmetric/address-dependent indicator.
+    pub likely_symmetric: Option<bool>,
+    /// Behavioral mapping summary.
+    pub mapping_behavior: MappingBehavior,
+    /// Confidence score from 0-100.
+    pub confidence: u8,
+}
+
+impl NatProfile {
+    fn unknown(local_addr: SocketAddr) -> Self {
+        Self {
+            local_addr: local_addr.to_string(),
+            observations: Vec::new(),
+            udp_blocked: false,
+            public_endpoint: None,
+            public_ip_stable: None,
+            public_port_stable: None,
+            port_preserved: None,
+            port_delta: None,
+            likely_symmetric: None,
+            mapping_behavior: MappingBehavior::Unknown,
+            confidence: 0,
+        }
+    }
+}
+
+/// Candidate gathering output with STUN observations and inferred NAT behavior.
+#[derive(Debug, Clone)]
+pub struct CandidateGatherReport {
+    /// Gathered ICE candidates.
+    pub candidates: Vec<IceCandidate>,
+    /// Inferred NAT profile.
+    pub nat_profile: NatProfile,
 }
 
 /// Compute the ICE priority for a candidate.
@@ -192,8 +276,17 @@ pub async fn gather_candidates(
     socket: &UdpSocket,
     config: &IceConfig,
 ) -> Result<Vec<IceCandidate>> {
+    Ok(gather_candidate_report(socket, config).await?.candidates)
+}
+
+/// Gather ICE candidates and a behavioral NAT profile for the given socket.
+pub async fn gather_candidate_report(
+    socket: &UdpSocket,
+    config: &IceConfig,
+) -> Result<CandidateGatherReport> {
     let local_addr = socket.local_addr()?;
     let mut candidates = Vec::new();
+    let mut observations = Vec::new();
 
     // 1. Host candidates
     if config.gather_host {
@@ -214,25 +307,45 @@ pub async fn gather_candidates(
         let stun_client = StunClient::with_timeout(config.stun_timeout);
 
         for &server in &config.stun_servers {
-            match stun_client.get_reflexive_address(socket, server).await {
-                Ok(reflexive) => {
-                    let candidate = IceCandidate {
-                        candidate_type: CandidateType::ServerReflexive,
-                        endpoint: crate::Endpoint::new(
-                            &reflexive.ip().to_string(),
-                            reflexive.port(),
-                        ),
-                        priority: compute_priority(CandidateType::ServerReflexive),
-                    };
-                    debug!(
-                        "Server-reflexive candidate: {} (via {})",
-                        candidate.endpoint.to_string(),
-                        server
-                    );
-                    candidates.push(candidate);
-                    break; // One srflx candidate is enough
+            let started = Instant::now();
+            match stun_client.binding_request(socket, server).await {
+                Ok(response) => {
+                    let rtt_ms = duration_millis(started.elapsed());
+                    let reflexive = response.reflexive_address;
+                    observations.push(StunObservation {
+                        server: server.to_string(),
+                        mapped_address: reflexive.map(|addr| addr.to_string()),
+                        rtt_ms: Some(rtt_ms),
+                        error: None,
+                    });
+
+                    if let Some(reflexive) = reflexive {
+                        let candidate = IceCandidate {
+                            candidate_type: CandidateType::ServerReflexive,
+                            endpoint: crate::Endpoint::new(
+                                &reflexive.ip().to_string(),
+                                reflexive.port(),
+                            ),
+                            priority: compute_priority(CandidateType::ServerReflexive),
+                        };
+                        debug!(
+                            "Server-reflexive candidate: {} (via {}, rtt={}ms)",
+                            candidate.endpoint.to_string(),
+                            server,
+                            rtt_ms
+                        );
+                        candidates.push(candidate);
+                    } else {
+                        debug!("STUN query to {} returned no reflexive address", server);
+                    }
                 }
                 Err(e) => {
+                    observations.push(StunObservation {
+                        server: server.to_string(),
+                        mapped_address: None,
+                        rtt_ms: None,
+                        error: Some(e.to_string()),
+                    });
                     debug!("STUN query to {} failed: {}", server, e);
                 }
             }
@@ -246,8 +359,118 @@ pub async fn gather_candidates(
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|c| seen.insert((c.candidate_type, c.endpoint.to_string())));
 
-    info!("Gathered {} ICE candidates", candidates.len());
-    Ok(candidates)
+    let nat_profile = build_nat_profile(local_addr, observations);
+    info!(
+        "Gathered {} ICE candidates (STUN success {}/{}, mapping={:?})",
+        candidates.len(),
+        nat_profile
+            .observations
+            .iter()
+            .filter(|observation| observation.mapped_address.is_some())
+            .count(),
+        nat_profile.observations.len(),
+        nat_profile.mapping_behavior
+    );
+    Ok(CandidateGatherReport {
+        candidates,
+        nat_profile,
+    })
+}
+
+fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>) -> NatProfile {
+    if observations.is_empty() {
+        return NatProfile::unknown(local_addr);
+    }
+
+    let mapped = observations
+        .iter()
+        .filter_map(|observation| {
+            observation
+                .mapped_address
+                .as_deref()
+                .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        })
+        .collect::<Vec<_>>();
+
+    if mapped.is_empty() {
+        let udp_blocked = observations
+            .iter()
+            .all(|observation| observation.error.is_some());
+        return NatProfile {
+            local_addr: local_addr.to_string(),
+            observations,
+            udp_blocked,
+            public_endpoint: None,
+            public_ip_stable: None,
+            public_port_stable: None,
+            port_preserved: None,
+            port_delta: None,
+            likely_symmetric: None,
+            mapping_behavior: if udp_blocked {
+                MappingBehavior::UdpBlocked
+            } else {
+                MappingBehavior::Unknown
+            },
+            confidence: if udp_blocked { 60 } else { 20 },
+        };
+    }
+
+    let first = mapped[0];
+    let public_ip_stable =
+        (mapped.len() >= 2).then(|| mapped.iter().all(|addr| addr.ip() == first.ip()));
+    let public_port_stable =
+        (mapped.len() >= 2).then(|| mapped.iter().all(|addr| addr.port() == first.port()));
+    let likely_symmetric = match (public_ip_stable, public_port_stable) {
+        (Some(ip_stable), Some(port_stable)) => Some(!ip_stable || !port_stable),
+        _ => None,
+    };
+
+    let mapping_behavior = if first.ip() == local_addr.ip() && first.port() == local_addr.port() {
+        MappingBehavior::OpenInternet
+    } else if public_ip_stable == Some(true) && public_port_stable == Some(true) {
+        MappingBehavior::EndpointIndependent
+    } else if mapped.len() >= 2 {
+        MappingBehavior::AddressOrPortDependent
+    } else {
+        MappingBehavior::Unknown
+    };
+
+    let confidence = match mapped.len() {
+        0 => 0,
+        1 => 40,
+        2 => 70,
+        _ => 90,
+    };
+
+    NatProfile {
+        local_addr: local_addr.to_string(),
+        observations,
+        udp_blocked: false,
+        public_endpoint: Some(first.to_string()),
+        public_ip_stable,
+        public_port_stable,
+        port_preserved: Some(first.port() == local_addr.port()),
+        port_delta: stable_port_delta(&mapped),
+        likely_symmetric,
+        mapping_behavior,
+        confidence,
+    }
+}
+
+fn stable_port_delta(mapped: &[SocketAddr]) -> Option<i32> {
+    if mapped.len() < 2 {
+        return None;
+    }
+    let deltas = mapped
+        .windows(2)
+        .map(|pair| pair[1].port() as i32 - pair[0].port() as i32)
+        .collect::<Vec<_>>();
+    let first = deltas[0];
+    deltas.iter().all(|delta| *delta == first).then_some(first)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Convert ICE candidates to a list of SocketAddr for hole punching.
@@ -343,6 +566,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_nat_profile_unknown_without_observations() {
+        let profile = build_nat_profile("192.168.1.2:5000".parse().unwrap(), Vec::new());
+        assert_eq!(profile.mapping_behavior, MappingBehavior::Unknown);
+        assert!(!profile.udp_blocked);
+        assert_eq!(profile.public_endpoint, None);
+        assert_eq!(profile.confidence, 0);
+    }
+
+    #[test]
+    fn test_build_nat_profile_udp_blocked_when_all_stun_failed() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: None,
+                rtt_ms: None,
+                error: Some("timeout".to_string()),
+            }],
+        );
+        assert_eq!(profile.mapping_behavior, MappingBehavior::UdpBlocked);
+        assert!(profile.udp_blocked);
+        assert_eq!(profile.likely_symmetric, None);
+        assert_eq!(profile.confidence, 60);
+    }
+
+    #[test]
+    fn test_build_nat_profile_unknown_when_stun_replies_without_mapping() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: None,
+                rtt_ms: Some(10),
+                error: None,
+            }],
+        );
+        assert_eq!(profile.mapping_behavior, MappingBehavior::Unknown);
+        assert!(!profile.udp_blocked);
+        assert_eq!(profile.confidence, 20);
+    }
+
+    #[test]
+    fn test_build_nat_profile_endpoint_independent_mapping() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:62000".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:62000".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+            ],
+        );
+        assert_eq!(
+            profile.mapping_behavior,
+            MappingBehavior::EndpointIndependent
+        );
+        assert_eq!(
+            profile.public_endpoint.as_deref(),
+            Some("203.0.113.10:62000")
+        );
+        assert_eq!(profile.public_ip_stable, Some(true));
+        assert_eq!(profile.public_port_stable, Some(true));
+        assert_eq!(profile.port_preserved, Some(false));
+        assert_eq!(profile.likely_symmetric, Some(false));
+        assert_eq!(profile.port_delta, Some(0));
+        assert_eq!(profile.confidence, 70);
+    }
+
+    #[test]
+    fn test_build_nat_profile_detects_port_dependent_mapping() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40001".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40003".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40005".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+            ],
+        );
+        assert_eq!(
+            profile.mapping_behavior,
+            MappingBehavior::AddressOrPortDependent
+        );
+        assert_eq!(profile.public_ip_stable, Some(true));
+        assert_eq!(profile.public_port_stable, Some(false));
+        assert_eq!(profile.likely_symmetric, Some(true));
+        assert_eq!(profile.port_delta, Some(2));
+        assert_eq!(profile.confidence, 90);
+    }
+
     #[tokio::test]
     async fn test_gather_candidates_host_only() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -354,7 +690,8 @@ mod tests {
             stun_timeout: Duration::from_secs(1),
         };
 
-        let candidates = gather_candidates(&socket, &config).await.unwrap();
+        let report = gather_candidate_report(&socket, &config).await.unwrap();
+        let candidates = report.candidates;
         assert!(!candidates.is_empty());
 
         // All should be host candidates
@@ -382,7 +719,8 @@ mod tests {
             stun_timeout: Duration::from_secs(2),
         };
 
-        let candidates = gather_candidates(&socket, &config).await.unwrap();
+        let report = gather_candidate_report(&socket, &config).await.unwrap();
+        let candidates = report.candidates;
 
         // Should have at least one host and one srflx candidate
         let has_host = candidates
@@ -401,6 +739,16 @@ mod tests {
             .unwrap();
         let srflx_addr = srflx.endpoint.to_socket_addr().unwrap();
         assert_eq!(srflx_addr, local);
+        assert_eq!(report.nat_profile.observations.len(), 1);
+        assert_eq!(
+            report.nat_profile.mapping_behavior,
+            MappingBehavior::OpenInternet
+        );
+        let local_text = local.to_string();
+        assert_eq!(
+            report.nat_profile.public_endpoint.as_deref(),
+            Some(local_text.as_str())
+        );
     }
 
     #[test]

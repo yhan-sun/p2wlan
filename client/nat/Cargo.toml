@@ -6,6 +6,7 @@ license.workspace = true
 description = "NAT traversal (STUN/ICE/UDP Hole Punching) for P2PNet"
 
 [dependencies]
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -557,6 +557,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 "UDP local：{}",
                 value_text(&snapshot, "udp_local_addr", "未知")
             );
+            print_nat_diagnostics(&snapshot);
             println!(
                 "Relay：{}",
                 if snapshot
@@ -578,6 +579,14 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             );
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
+            suggestions.extend(nat_profile_suggestions(
+                &snapshot,
+                config
+                    .network
+                    .udp_advertise
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            ));
             suggestions.extend(peer_direct_suggestions(&snapshot));
             if value_u64(stats, "relay_connections") > 0
                 && value_u64(stats, "direct_connections") == 0
@@ -969,6 +978,191 @@ fn auth_error(message: &str, status: u16) -> String {
 fn clear_device_credential(config: &mut Config) {
     config.control.device_credential.clear();
     config.control.credential_issued = false;
+}
+
+fn print_nat_diagnostics(snapshot: &Value) {
+    let candidates = local_candidate_strings(snapshot);
+    if !candidates.is_empty() {
+        println!(
+            "UDP candidates：{}{}",
+            candidates.len(),
+            endpoint_preview(&candidates, 4)
+        );
+    }
+
+    if let Some(summary) = nat_profile_summary(snapshot) {
+        println!("NAT：{summary}");
+        for observation in stun_observation_summaries(snapshot, 3) {
+            println!("STUN：{observation}");
+        }
+    } else {
+        println!("NAT：未采集");
+    }
+}
+
+fn nat_profile_summary(snapshot: &Value) -> Option<String> {
+    let profile = snapshot.get("nat_profile")?.as_object()?;
+    let mapping = profile
+        .get("mapping_behavior")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let public_endpoint = profile
+        .get("public_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let (stun_success, stun_total) = stun_observation_counts(snapshot);
+    let confidence = profile
+        .get("confidence")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(format!(
+        "mapping={mapping} public={public_endpoint} stun={stun_success}/{stun_total} confidence={confidence} symmetric={} port_preserved={}",
+        nat_bool_text(profile.get("likely_symmetric")),
+        nat_bool_text(profile.get("port_preserved"))
+    ))
+}
+
+fn stun_observation_summaries(snapshot: &Value, limit: usize) -> Vec<String> {
+    let Some(observations) = snapshot
+        .get("nat_profile")
+        .and_then(|profile| profile.get("observations"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    observations
+        .iter()
+        .take(limit)
+        .map(|observation| {
+            let server = observation
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if let Some(mapped) = observation.get("mapped_address").and_then(Value::as_str) {
+                let rtt = observation
+                    .get("rtt_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| format!("{ms}ms"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("server={server} mapped={mapped} rtt={rtt}")
+            } else {
+                let error = observation
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                format!("server={server} error={error}")
+            }
+        })
+        .collect()
+}
+
+fn nat_profile_suggestions(snapshot: &Value, udp_advertise_configured: bool) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let candidates = local_candidate_strings(snapshot);
+    let has_public_candidate = candidates
+        .iter()
+        .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+        .any(|endpoint| is_public_udp_endpoint(&endpoint));
+
+    let Some(profile) = snapshot.get("nat_profile").and_then(Value::as_object) else {
+        if candidates.is_empty() {
+            suggestions.push(
+                "daemon 尚未采集到 UDP candidate/NAT profile；如果刚启动，请等待几秒或检查 STUN 配置。"
+                    .to_string(),
+            );
+        }
+        return suggestions;
+    };
+
+    if profile
+        .get("udp_blocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        suggestions.push(
+            "本机 STUN 全失败，可能 UDP 被防火墙、安全组、运营商或公司网络阻断；直连会高度依赖 Relay。"
+                .to_string(),
+        );
+    }
+
+    let mapping = profile
+        .get("mapping_behavior")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let likely_symmetric = profile
+        .get("likely_symmetric")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if likely_symmetric || mapping == "address_or_port_dependent" {
+        suggestions.push(
+            "本机疑似对称/地址端口相关 NAT；当前基础打洞成功率有限，后续应启用 peer-reflexive、端口预测和 birthday probing。"
+                .to_string(),
+        );
+    }
+
+    if !udp_advertise_configured
+        && profile
+            .get("public_endpoint")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        suggestions.push(
+            "未发现本机公网 UDP endpoint；云服务器或固定公网主机建议配置 udp-advertise <公网IP>:<端口>。"
+                .to_string(),
+        );
+    }
+
+    if !udp_advertise_configured && !candidates.is_empty() && !has_public_candidate {
+        suggestions.push(
+            "本机当前只上报私网/回环 UDP candidate；跨公网直连通常需要 STUN 成功或显式 udp-advertise。"
+                .to_string(),
+        );
+    }
+
+    suggestions
+}
+
+fn local_candidate_strings(snapshot: &Value) -> Vec<String> {
+    snapshot
+        .get("local_candidates")
+        .and_then(Value::as_array)
+        .map(|candidates| {
+            candidates
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn stun_observation_counts(snapshot: &Value) -> (usize, usize) {
+    let Some(observations) = snapshot
+        .get("nat_profile")
+        .and_then(|profile| profile.get("observations"))
+        .and_then(Value::as_array)
+    else {
+        return (0, 0);
+    };
+    let success = observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .get("mapped_address")
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        .count();
+    (success, observations.len())
+}
+
+fn nat_bool_text(value: Option<&Value>) -> &'static str {
+    match value.and_then(Value::as_bool) {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
 }
 
 fn print_peer_diagnostics(snapshot: &Value) {
@@ -2121,6 +2315,94 @@ mod tests {
             relay_cooldown_summaries(&relay),
             vec!["region=cn-east endpoint=relay-a.example.com:443 remaining=8500ms".to_string()]
         );
+    }
+
+    #[test]
+    fn nat_profile_summary_formats_stable_mapping() {
+        let snapshot = serde_json::json!({
+            "local_candidates": ["192.168.2.4:60207", "203.0.113.10:62000"],
+            "nat_profile": {
+                "mapping_behavior": "endpoint_independent",
+                "udp_blocked": false,
+                "public_endpoint": "203.0.113.10:62000",
+                "likely_symmetric": false,
+                "port_preserved": false,
+                "confidence": 70,
+                "observations": [{
+                    "server": "stun-a.example:3478",
+                    "mapped_address": "203.0.113.10:62000",
+                    "rtt_ms": 12,
+                    "error": null
+                }, {
+                    "server": "stun-b.example:3478",
+                    "mapped_address": "203.0.113.10:62000",
+                    "rtt_ms": 18,
+                    "error": null
+                }, {
+                    "server": "stun-c.example:3478",
+                    "mapped_address": null,
+                    "rtt_ms": null,
+                    "error": "timeout"
+                }]
+            }
+        });
+
+        assert_eq!(
+            nat_profile_summary(&snapshot).as_deref(),
+            Some("mapping=endpoint_independent public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false")
+        );
+        assert_eq!(
+            stun_observation_summaries(&snapshot, 2),
+            vec![
+                "server=stun-a.example:3478 mapped=203.0.113.10:62000 rtt=12ms".to_string(),
+                "server=stun-b.example:3478 mapped=203.0.113.10:62000 rtt=18ms".to_string(),
+            ]
+        );
+        assert!(nat_profile_suggestions(&snapshot, false).is_empty());
+    }
+
+    #[test]
+    fn nat_profile_suggestions_explain_udp_blocked_and_symmetric() {
+        let blocked = serde_json::json!({
+            "local_candidates": ["192.168.2.4:60207"],
+            "nat_profile": {
+                "mapping_behavior": "udp_blocked",
+                "udp_blocked": true,
+                "public_endpoint": null,
+                "likely_symmetric": null,
+                "port_preserved": null,
+                "confidence": 60,
+                "observations": [{
+                    "server": "stun-a.example:3478",
+                    "mapped_address": null,
+                    "rtt_ms": null,
+                    "error": "timeout"
+                }]
+            }
+        });
+        let suggestions = nat_profile_suggestions(&blocked, false);
+        assert!(suggestions.iter().any(|item| item.contains("STUN 全失败")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("udp-advertise")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("只上报私网/回环")));
+
+        let symmetric = serde_json::json!({
+            "local_candidates": ["198.51.100.10:62000", "198.51.100.10:62008"],
+            "nat_profile": {
+                "mapping_behavior": "address_or_port_dependent",
+                "udp_blocked": false,
+                "public_endpoint": "198.51.100.10:62000",
+                "likely_symmetric": true,
+                "port_preserved": false,
+                "confidence": 70,
+                "observations": []
+            }
+        });
+        let suggestions = nat_profile_suggestions(&symmetric, false);
+        assert!(suggestions.iter().any(|item| item.contains("端口预测")));
     }
 
     #[test]

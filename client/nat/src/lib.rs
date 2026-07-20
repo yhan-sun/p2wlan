@@ -24,7 +24,9 @@ pub use client::{BindingResponse, StunClient, DEFAULT_TIMEOUT};
 pub use detection::{DetectionConfig, NatDetector};
 pub use error::{NatError, Result};
 pub use ice::{
-    candidates_to_addrs, compute_priority, gather_candidates, gather_local_addresses, IceConfig,
+    candidates_to_addrs, compute_priority, gather_candidate_report, gather_candidates,
+    gather_local_addresses, CandidateGatherReport, IceConfig, MappingBehavior, NatProfile,
+    StunObservation,
 };
 pub use punch::{
     build_punch_ack, build_punch_packet, decode_punch_packet, hole_punch, send_keepalive,
