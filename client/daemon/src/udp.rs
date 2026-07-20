@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
-    build_punch_ack, build_punch_packet, decode_punch_packet, gather_candidates, IceConfig,
-    PunchPacketKind,
+    build_punch_ack, build_punch_packet, decode_punch_packet, gather_candidate_report,
+    CandidateGatherReport, IceConfig, PunchPacketKind,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
@@ -85,6 +85,23 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<Vec<String>> {
+        let report = self
+            .gather_candidate_report(stun_servers, stun_timeout)
+            .await?;
+
+        Ok(report
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.endpoint.to_string())
+            .collect())
+    }
+
+    /// Gather ICE-style candidates plus STUN/NAT behavior diagnostics.
+    pub async fn gather_candidate_report(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
         let config = IceConfig {
             stun_servers,
             stun_timeout,
@@ -92,14 +109,9 @@ impl UdpTransport {
             gather_srflx: true,
         };
 
-        let candidates = gather_candidates(&self.socket, &config)
+        gather_candidate_report(&self.socket, &config)
             .await
-            .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))?;
-
-        Ok(candidates
-            .into_iter()
-            .map(|candidate| candidate.endpoint.to_string())
-            .collect())
+            .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))
     }
 
     /// Send active UDP probes to every candidate for a peer.

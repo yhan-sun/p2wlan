@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use p2pnet_nat::NatProfile;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,6 +29,8 @@ pub struct DiagnosticsSnapshot {
     pub network_id: String,
     pub network_generation: u64,
     pub udp_local_addr: Option<String>,
+    pub local_candidates: Vec<String>,
+    pub nat_profile: Option<NatProfile>,
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
     pub relay_selection: RelaySelectionDiagnostics,
@@ -42,6 +45,8 @@ pub struct DiagnosticsContext {
     config: Arc<Config>,
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    local_candidates: Arc<RwLock<Vec<String>>>,
+    nat_profile: Arc<RwLock<Option<NatProfile>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     health: Arc<HealthState>,
@@ -55,6 +60,8 @@ impl DiagnosticsContext {
         config: Arc<Config>,
         peers: Arc<PeerManager>,
         udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+        local_candidates: Arc<RwLock<Vec<String>>>,
+        nat_profile: Arc<RwLock<Option<NatProfile>>>,
         relay_transport: Arc<RwLock<Option<RelayTransport>>>,
         relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
         health: Arc<HealthState>,
@@ -65,6 +72,8 @@ impl DiagnosticsContext {
             config,
             peers,
             udp_transport,
+            local_candidates,
+            nat_profile,
             relay_transport,
             relay_selection,
             health,
@@ -214,6 +223,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation().await,
         udp_local_addr,
+        local_candidates: context.local_candidates.read().await.clone(),
+        nat_profile: context.nat_profile.read().await.clone(),
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection,
@@ -314,6 +325,8 @@ mod tests {
             config,
             peers,
             Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
             health,
@@ -339,6 +352,8 @@ mod tests {
         assert_eq!(snapshot.process_id, std::process::id());
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.network_generation, 0);
+        assert!(snapshot.local_candidates.is_empty());
+        assert_eq!(snapshot.nat_profile, None);
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.peers[0].node_id, "node-b");
         assert_eq!(snapshot.peers[0].device_name, "Office Mac");

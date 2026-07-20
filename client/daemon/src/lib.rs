@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use p2pnet_crypto::NodeIdentity;
+use p2pnet_nat::{CandidateGatherReport, NatProfile};
 use tokio::net::lookup_host;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, sleep};
@@ -125,6 +126,8 @@ pub struct Daemon {
     pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
+    /// Latest local NAT behavior profile inferred from STUN observations.
+    nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Bound UDP transport shared with control-plane-triggered punching.
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     /// Relay transport used when direct UDP is unavailable.
@@ -172,6 +175,7 @@ impl Daemon {
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
+            nat_profile: Arc::new(RwLock::new(None)),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
             relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
@@ -367,6 +371,8 @@ impl Daemon {
                 self.config.clone(),
                 self.peers.clone(),
                 self.udp_transport.clone(),
+                self.local_candidates.clone(),
+                self.nat_profile.clone(),
                 self.relay_transport.clone(),
                 self.relay_selection.clone(),
                 self.health.clone(),
@@ -433,94 +439,118 @@ impl Daemon {
         let peers = self.peers.clone();
         let control = self.control.clone();
         let local_candidates = self.local_candidates.clone();
+        let nat_profile = self.nat_profile.clone();
         let udp_transport = self.udp_transport.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
         self.task_manager
             .spawn_result("udp-direct", false, async move {
-            match UdpTransport::bind(udp_bind, peers.clone()).await {
-                Ok(udp) => {
-                    *udp_transport.write().await = Some(udp.clone());
+                match UdpTransport::bind(udp_bind, peers.clone()).await {
+                    Ok(udp) => {
+                        *udp_transport.write().await = Some(udp.clone());
 
-                    let mut candidate_endpoints =
-                        match udp.gather_candidates(stun_servers.clone(), stun_timeout).await {
-                            Ok(candidates) => candidates,
-                            Err(err) => {
-                                warn!("Failed to gather UDP candidates: {err}");
-                                Vec::new()
-                            }
-                        };
-
-                    match udp.local_addr() {
-                        Ok(addr) => {
-                            if let Some(endpoint) = advertised_udp_endpoint(
-                                addr,
-                                udp_advertise.as_deref(),
-                                &candidate_endpoints,
-                            )
+                        let mut candidate_endpoints =
+                            match udp.gather_candidate_report(stun_servers.clone(), stun_timeout).await
                             {
-                                if !candidate_endpoints.contains(&endpoint) {
-                                    candidate_endpoints.insert(0, endpoint.clone());
+                                Ok(report) => {
+                                    let endpoints = candidate_endpoints_from_report(&report);
+                                    info!(
+                                        "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={}",
+                                        report.nat_profile.mapping_behavior,
+                                        report.nat_profile.public_endpoint,
+                                        report
+                                            .nat_profile
+                                            .observations
+                                            .iter()
+                                            .filter(|observation| observation.mapped_address.is_some())
+                                            .count(),
+                                        report.nat_profile.observations.len(),
+                                        report.nat_profile.confidence
+                                    );
+                                    *nat_profile.write().await = Some(report.nat_profile);
+                                    endpoints
                                 }
-                                info!("UDP transport listening on {addr}; advertising {endpoint}");
-                                if let Err(err) =
-                                    control.update_endpoint(&endpoint, "unknown").await
-                                {
-                                    warn!("Failed to queue UDP endpoint update: {err}");
+                                Err(err) => {
+                                    warn!("Failed to gather UDP candidates: {err}");
+                                    Vec::new()
                                 }
-                            } else {
-                                warn!(
-                                    "UDP transport listening on {addr}; no reachable endpoint was discovered or configured."
-                                );
+                            };
+
+                        match udp.local_addr() {
+                            Ok(addr) => {
+                                if let Some(endpoint) = advertised_udp_endpoint(
+                                    addr,
+                                    udp_advertise.as_deref(),
+                                    &candidate_endpoints,
+                                ) {
+                                    if !candidate_endpoints.contains(&endpoint) {
+                                        candidate_endpoints.insert(0, endpoint.clone());
+                                    }
+                                    info!(
+                                        "UDP transport listening on {addr}; advertising {endpoint}"
+                                    );
+                                    if let Err(err) =
+                                        control.update_endpoint(&endpoint, "unknown").await
+                                    {
+                                        warn!("Failed to queue UDP endpoint update: {err}");
+                                    }
+                                } else {
+                                    warn!(
+                                        "UDP transport listening on {addr}; no reachable endpoint was discovered or configured."
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                warn!("UDP transport bound but local addr unavailable: {err}")
                             }
                         }
-                        Err(err) => warn!("UDP transport bound but local addr unavailable: {err}"),
+
+                        info!(
+                            "Prepared {} UDP candidate endpoints for signaling",
+                            candidate_endpoints.len()
+                        );
+                        *local_candidates.write().await = candidate_endpoints;
+
+                        if keepalive_interval.is_zero() {
+                            let refresh_udp = udp.clone();
+                            tokio::select! {
+                                result = udp.run_inbound(udp_inbound_tx) => result,
+                                _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
+                                    udp: refresh_udp,
+                                    stun_servers,
+                                    stun_timeout,
+                                    udp_advertise,
+                                    local_candidates,
+                                    nat_profile,
+                                    control,
+                                    peers: peers.clone(),
+                                }) => Ok(()),
+                            }
+                        } else {
+                            let keepalive_udp = udp.clone();
+                            let refresh_udp = udp.clone();
+                            tokio::select! {
+                                result = udp.run_inbound(udp_inbound_tx) => result,
+                                _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
+                                _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
+                                    udp: refresh_udp,
+                                    stun_servers,
+                                    stun_timeout,
+                                    udp_advertise,
+                                    local_candidates,
+                                    nat_profile,
+                                    control,
+                                    peers: peers.clone(),
+                                }) => Ok(()),
+                            }
+                        }
                     }
-
-                    info!(
-                        "Prepared {} UDP candidate endpoints for signaling",
-                        candidate_endpoints.len()
-                    );
-                    *local_candidates.write().await = candidate_endpoints;
-
-                    if keepalive_interval.is_zero() {
-                        let refresh_udp = udp.clone();
-                        tokio::select! {
-                            result = udp.run_inbound(udp_inbound_tx) => result,
-                            _ = run_udp_candidate_refresh(
-                                refresh_udp,
-                                stun_servers,
-                                stun_timeout,
-                                udp_advertise,
-                                local_candidates,
-                                control,
-                                peers.clone(),
-                            ) => Ok(()),
-                        }
-                    } else {
-                        let keepalive_udp = udp.clone();
-                        let refresh_udp = udp.clone();
-                        tokio::select! {
-                            result = udp.run_inbound(udp_inbound_tx) => result,
-                            _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
-                            _ = run_udp_candidate_refresh(
-                                refresh_udp,
-                                stun_servers,
-                                stun_timeout,
-                                udp_advertise,
-                                local_candidates,
-                                control,
-                                peers.clone(),
-                            ) => Ok(()),
-                        }
+                    Err(err) => {
+                        warn!("UDP transport unavailable ({err}); direct UDP disabled");
+                        Ok(())
                     }
                 }
-                Err(err) => {
-                    warn!("UDP transport unavailable ({err}); direct UDP disabled");
-                    Ok(())
-                }
-            }
-        })
-        .await;
+            })
+            .await;
 
         // Relay registration must use the node ID assigned by the control plane.
         let mut relay_started = false;
@@ -1325,6 +1355,14 @@ fn advertised_udp_endpoint(
         .map(|candidate| candidate.to_string())
 }
 
+fn candidate_endpoints_from_report(report: &CandidateGatherReport) -> Vec<String> {
+    report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.endpoint.to_string())
+        .collect()
+}
+
 fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
     match candidate.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -1346,29 +1384,52 @@ fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
     }
 }
 
-async fn run_udp_candidate_refresh(
+struct UdpCandidateRefreshContext {
     udp: UdpTransport,
     stun_servers: Vec<SocketAddr>,
     stun_timeout: Duration,
     udp_advertise: Option<String>,
     local_candidates: Arc<RwLock<Vec<String>>>,
+    nat_profile: Arc<RwLock<Option<NatProfile>>>,
     control: ControlClient,
     peers: Arc<PeerManager>,
-) {
+}
+
+async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
+    let UdpCandidateRefreshContext {
+        udp,
+        stun_servers,
+        stun_timeout,
+        udp_advertise,
+        local_candidates,
+        nat_profile,
+        control,
+        peers,
+    } = context;
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
     ticker.tick().await;
 
     loop {
         ticker.tick().await;
 
-        let mut candidates = match udp
-            .gather_candidates(stun_servers.clone(), stun_timeout)
+        let report = match udp
+            .gather_candidate_report(stun_servers.clone(), stun_timeout)
             .await
         {
-            Ok(candidates) => candidates,
+            Ok(report) => report,
             Err(err) => {
                 warn!("Periodic UDP candidate refresh failed: {err}");
                 continue;
+            }
+        };
+        let mut candidates = candidate_endpoints_from_report(&report);
+        let profile_changed = {
+            let mut current_profile = nat_profile.write().await;
+            if current_profile.as_ref() == Some(&report.nat_profile) {
+                false
+            } else {
+                *current_profile = Some(report.nat_profile.clone());
+                true
             }
         };
 
@@ -1391,12 +1452,21 @@ async fn run_udp_candidate_refresh(
             }
         };
         if !changed {
+            if profile_changed {
+                debug!(
+                    "UDP NAT profile changed without advertised candidate endpoint changes: mapping={:?} public={:?}",
+                    report.nat_profile.mapping_behavior,
+                    report.nat_profile.public_endpoint
+                );
+            }
             continue;
         }
 
         info!(
-            "UDP candidates changed after network update; refreshed {} candidates",
-            candidates.len()
+            "UDP candidates changed after network update; refreshed {} candidates (mapping={:?}, public={:?})",
+            candidates.len(),
+            report.nat_profile.mapping_behavior,
+            report.nat_profile.public_endpoint
         );
         peers
             .advance_network_generation(format!(
