@@ -19,11 +19,11 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, trace, warn};
 
 use crate::error::{DaemonError, Result};
-use crate::peer::PeerManager;
+use crate::peer::{PeerManager, REASON_DIRECT_SEND_FAILED};
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 type ProbeNonce = [u8; 8];
-type PendingProbe = (Instant, SocketAddr);
+type PendingProbe = (Instant, SocketAddr, u64);
 type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
 
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
@@ -53,11 +53,14 @@ impl UdpTransport {
         let nonce = decode_punch_packet(&bytes)
             .map(|packet| packet.nonce)
             .ok_or_else(|| DaemonError::Network("failed to create UDP probe".to_string()))?;
+        let generation = self.peers.current_network_generation().await;
 
         {
             let mut pending = self.pending_probes.lock().await;
-            pending.retain(|_, (sent_at, _)| sent_at.elapsed() < Duration::from_secs(60));
-            pending.insert(nonce, (Instant::now(), peer_addr));
+            pending.retain(|_, (sent_at, _, probe_generation)| {
+                sent_at.elapsed() < Duration::from_secs(60) && *probe_generation == generation
+            });
+            pending.insert(nonce, (Instant::now(), peer_addr, generation));
         }
 
         if let Err(error) = self.socket.send_to(&bytes, peer_addr).await {
@@ -228,8 +231,9 @@ impl UdpTransport {
                     }
                     Err(err) => {
                         self.peers
-                            .record_direct_failure(
+                            .record_direct_failure_with_code(
                                 &peer_id,
+                                REASON_DIRECT_SEND_FAILED,
                                 format!("direct keepalive to {endpoint} failed: {err}"),
                             )
                             .await;
@@ -289,20 +293,41 @@ impl UdpTransport {
                         }
                     }
                     PunchPacketKind::Ack => {
-                        let latency = {
+                        let ack_match = {
+                            let generation = self.peers.current_network_generation().await;
                             let mut pending = self.pending_probes.lock().await;
                             pending
                                 .remove(&packet.nonce)
-                                .filter(|(_, endpoint)| *endpoint == source)
-                                .map(|(sent_at, _)| sent_at.elapsed())
+                                .filter(|(_, endpoint, probe_generation)| {
+                                    *endpoint == source && *probe_generation == generation
+                                })
+                                .map(|(sent_at, _, probe_generation)| {
+                                    (sent_at.elapsed(), probe_generation)
+                                })
                         };
                         if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
-                            self.peers
-                                .record_direct_probe_success_with_latency(&peer_id, source, latency)
-                                .await;
-                            debug!(
-                                "Received UDP punch ACK from peer {peer_id} at {source} (rtt={latency:?})"
-                            );
+                            if let Some((latency, generation)) = ack_match {
+                                let accepted = self
+                                    .peers
+                                    .record_direct_probe_success_with_latency_for_generation(
+                                        &peer_id,
+                                        source,
+                                        Some(latency),
+                                        generation,
+                                    )
+                                    .await;
+                                if accepted {
+                                    debug!(
+                                        "Received UDP punch ACK from peer {peer_id} at {source} (rtt={latency:?})"
+                                    );
+                                } else {
+                                    trace!(
+                                        "Ignored stale UDP punch ACK from peer {peer_id} at {source}"
+                                    );
+                                }
+                            } else {
+                                trace!("Ignored stale or unmatched UDP punch ACK from {source}");
+                            }
                         } else {
                             trace!("Received UDP punch ACK from unknown candidate {source}");
                         }

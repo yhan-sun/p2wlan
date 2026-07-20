@@ -26,6 +26,7 @@ pub struct DiagnosticsSnapshot {
     pub node_id: String,
     pub virtual_ip: String,
     pub network_id: String,
+    pub network_generation: u64,
     pub udp_local_addr: Option<String>,
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
@@ -208,6 +209,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
+        network_generation: context.peers.current_network_generation().await,
         udp_local_addr,
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
@@ -250,6 +252,7 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
+    use crate::peer::REASON_DIRECT_PROBE_FAILED;
 
     #[test]
     fn cors_origin_is_restricted_to_local_dev_server() {
@@ -325,6 +328,7 @@ mod tests {
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
         assert_eq!(snapshot.process_id, std::process::id());
         assert_eq!(snapshot.node_id, "node-a");
+        assert_eq!(snapshot.network_generation, 0);
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.peers[0].node_id, "node-b");
         assert_eq!(snapshot.peers[0].device_name, "Office Mac");
@@ -335,6 +339,10 @@ mod tests {
         assert_eq!(
             snapshot.peers[0].direct.last_error.as_deref(),
             Some("probe timeout")
+        );
+        assert_eq!(
+            snapshot.peers[0].direct.last_error_code.as_deref(),
+            Some(REASON_DIRECT_PROBE_FAILED)
         );
 
         let mut shutdown_stream = TcpStream::connect(addr).await.unwrap();
