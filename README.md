@@ -94,13 +94,13 @@ p2wlan help
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh --version v0.1.24
+sudo sh /tmp/p2wlan-install.sh --version v0.1.25
 ```
 
 先预览将要下载的包，或安装到用户目录：
 
 ```bash
-sh /tmp/p2wlan-install.sh --version v0.1.24 --dry-run
+sh /tmp/p2wlan-install.sh --version v0.1.25 --dry-run
 sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -180,7 +180,7 @@ Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/serv
 ```bash
 p2wlan update
 p2wlan update --dry-run
-p2wlan update --version v0.1.24
+p2wlan update --version v0.1.25
 ```
 
 `p2wlan update` 默认从 GitHub 最新 release 下载与当前 CPU 架构匹配的 Linux CLI 包，并安装到 `/usr/local/bin`。如果 daemon 正在运行，更新后执行 `p2wlan down && p2wlan up` 让新版 daemon 生效。`p2wlan doctor` 会列出 peer 上报的 UDP 候选；如果只看到 `192.168.x.x`、`10.x.x.x` 或 `127.0.0.1`，说明对端还没有正确配置公网 `udp-advertise`。
