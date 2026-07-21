@@ -29,8 +29,10 @@ pub use ice::{
     StunObservation,
 };
 pub use punch::{
-    build_punch_ack, build_punch_packet, decode_punch_packet, hole_punch, send_keepalive,
-    send_punch, DecodedPunchPacket, PunchConfig, PunchPacketKind, PunchResult,
+    build_authenticated_punch_ack, build_authenticated_punch_packet, build_punch_ack,
+    build_punch_packet, decode_authenticated_punch_packet, decode_punch_packet, hole_punch,
+    peek_authenticated_punch_identity, send_keepalive, send_punch, AuthenticatedPunchIdentity,
+    DecodedPunchPacket, ProbeMacKey, PunchConfig, PunchPacketKind, PunchResult,
 };
 pub use stun::{
     compute_fingerprint, crc32, StunAttribute, StunMessage, BINDING_ERROR_RESPONSE,

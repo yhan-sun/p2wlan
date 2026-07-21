@@ -11,9 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use p2pnet_crypto::{hmac, NodeIdentity};
+use p2pnet_nat::ProbeMacKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::control::PeerInfo;
@@ -23,6 +25,7 @@ const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
+const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
 
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
@@ -521,6 +524,10 @@ pub struct PeerConnection {
     pub node_id: String,
     /// Human-readable peer device name.
     pub device_name: String,
+    /// Peer's static WireGuard/X25519 public key as hex.
+    pub public_key: String,
+    /// Symmetric MAC key for authenticated UDP Probe v2.
+    pub probe_mac_key: Option<ProbeMacKey>,
     /// Peer's virtual IP.
     pub virtual_ip: String,
     /// Peer's public endpoint (ip:port) if known.
@@ -559,6 +566,8 @@ impl PeerConnection {
         Self {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            public_key: String::new(),
+            probe_mac_key: None,
             virtual_ip: virtual_ip.to_string(),
             endpoint: None,
             nat_type: String::new(),
@@ -1085,7 +1094,20 @@ pub struct PeerManager {
     /// Monotonic local network generation. Incremented when local UDP candidates change.
     network_generation: Arc<RwLock<u64>>,
     /// Configuration.
-    _config: Config,
+    config: Config,
+}
+
+fn derive_probe_mac_key(config: &Config, peer_public_key: &str) -> Option<ProbeMacKey> {
+    let local_private = decode_x25519_key_bytes(&config.node.private_key).ok()?;
+    let peer_public = decode_x25519_key_bytes(peer_public_key).ok()?;
+    let identity = NodeIdentity::from_private_key(local_private);
+    let shared = identity.diffie_hellman(&peer_public).ok()?;
+    Some(hmac(&shared, PROBE_MAC_KEY_DOMAIN))
+}
+
+fn decode_x25519_key_bytes(hex_value: &str) -> std::result::Result<[u8; 32], ()> {
+    let bytes = hex::decode(hex_value.trim()).map_err(|_| ())?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| ())
 }
 
 impl PeerManager {
@@ -1095,7 +1117,7 @@ impl PeerManager {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
-            _config: config,
+            config,
         }
     }
 
@@ -1141,6 +1163,16 @@ impl PeerManager {
 
         conn.virtual_ip = info.virtual_ip.clone();
         conn.device_name = info.device_name.clone();
+        if conn.public_key != info.public_key {
+            conn.public_key = info.public_key.clone();
+            conn.probe_mac_key = derive_probe_mac_key(&self.config, &info.public_key);
+            if conn.probe_mac_key.is_none() {
+                debug!(
+                    "Peer {} has no usable Probe v2 MAC key; falling back to legacy UDP probes",
+                    info.node_id
+                );
+            }
+        }
         conn.nat_type = info.nat_type.clone();
         if let Ok(addr) = info.endpoint.parse::<SocketAddr>() {
             conn.endpoint = Some(addr);
@@ -1176,6 +1208,15 @@ impl PeerManager {
         }
     }
 
+    /// Return the Probe v2 MAC key for a known peer, if both public keys are valid.
+    pub async fn probe_key_for_peer(&self, node_id: &str) -> Option<ProbeMacKey> {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| conn.probe_mac_key)
+    }
+
     /// Add ICE candidates for a peer.
     pub async fn add_candidates(&self, node_id: &str, candidates: &[String]) {
         let generation = self.current_network_generation().await;
@@ -1196,6 +1237,27 @@ impl PeerManager {
                     .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
             }
         }
+    }
+
+    /// Learn an endpoint from an authenticated Probe v2 packet.
+    ///
+    /// Unlike legacy endpoint learning, this may accept a peer-reflexive source
+    /// address that was not present in the control-plane candidate set because
+    /// the probe MAC proves the sender controls the peer identity.
+    pub async fn learn_authenticated_endpoint(&self, node_id: &str, endpoint: SocketAddr) -> bool {
+        let generation = self.current_network_generation().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+
+        conn.endpoint = Some(endpoint);
+        let endpoint_text = endpoint.to_string();
+        if !conn.candidates.contains(&endpoint_text) {
+            conn.candidates.push(endpoint_text);
+        }
+        conn.mark_candidate_pair_probing(endpoint, generation);
+        true
     }
 
     /// Learn a candidate endpoint after receiving a probe or packet from that address.

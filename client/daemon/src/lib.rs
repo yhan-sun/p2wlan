@@ -442,10 +442,12 @@ impl Daemon {
         let nat_profile = self.nat_profile.clone();
         let udp_transport = self.udp_transport.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
+        let local_node_id = self.config.node.node_id.clone();
         self.task_manager
             .spawn_result("udp-direct", false, async move {
                 match UdpTransport::bind(udp_bind, peers.clone()).await {
                     Ok(udp) => {
+                        let udp = udp.with_local_node_id(local_node_id.clone());
                         *udp_transport.write().await = Some(udp.clone());
 
                         let mut candidate_endpoints =
