@@ -17,7 +17,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、diagnostics、relay、relay-policy、direct-timeout";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、diagnostics、relay、relay-policy、direct-timeout";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -94,7 +94,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, diagnostics, relay, relay-policy, or direct-timeout
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, diagnostics, relay, relay-policy, or direct-timeout
         key: String,
         value: String,
     },
@@ -558,6 +558,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_text(&snapshot, "udp_local_addr", "未知")
             );
             print_nat_diagnostics(&snapshot);
+            print_traversal_history(&snapshot);
             println!(
                 "Relay：{}",
                 if snapshot
@@ -739,6 +740,22 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                     config.network.stun_servers.join(",")
                 }
             );
+            println!(
+                "port-mapping = {}",
+                if config.network.upnp_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            println!(
+                "birthday-probing = {}",
+                if config.network.birthday_probing_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
             println!("relay = {}", config.relay.servers.join(","));
             println!(
                 "relay-policy = {}",
@@ -836,6 +853,12 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 config.network.stun_servers = servers;
             }
         }
+        "port-mapping" | "upnp" => {
+            config.network.upnp_enabled = parse_bool_config(value, "port-mapping")?;
+        }
+        "birthday-probing" => {
+            config.network.birthday_probing_enabled = parse_bool_config(value, "birthday-probing")?;
+        }
         "diagnostics" => {
             let endpoint = parse_socket_addr(value, "diagnostics")?;
             if !endpoint.ip().is_loopback() {
@@ -909,6 +932,14 @@ fn parse_millis(value: &str, label: &str) -> Result<u64, String> {
     trimmed
         .parse::<u64>()
         .map_err(|_| format!("{label} 必须是毫秒整数，例如 5000 或 5000ms"))
+}
+
+fn parse_bool_config(value: &str, label: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enable" | "enabled" => Ok(true),
+        "0" | "false" | "no" | "off" | "disable" | "disabled" => Ok(false),
+        _ => Err(format!("{label} 只支持 on/off、true/false 或 yes/no")),
+    }
 }
 
 fn is_clear_value(value: &str) -> bool {
@@ -1840,6 +1871,52 @@ fn candidate_pair_stats_summary(peer: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+fn print_traversal_history(snapshot: &Value) {
+    if let Some(summary) = traversal_history_summary(snapshot) {
+        println!("Traversal history：{summary}");
+    }
+}
+
+fn traversal_history_summary(snapshot: &Value) -> Option<String> {
+    let sources = snapshot
+        .get("traversal_history")?
+        .get("sources")?
+        .as_array()?;
+    if sources.is_empty() {
+        return None;
+    }
+
+    let parts = sources
+        .iter()
+        .filter_map(|item| {
+            let source = item.get("source").and_then(Value::as_str)?;
+            let success = item
+                .get("success_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let failure = item
+                .get("failure_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total = success.saturating_add(failure);
+            let rate = item
+                .get("success_rate_per_mille")
+                .and_then(Value::as_u64)
+                .map(|value| format!("{value}‰"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let cooldown = item
+                .get("cooldown_remaining_ms")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .map(|value| format!(",cooldown={}ms", value))
+                .unwrap_or_default();
+            Some(format!("{source}={success}/{total}:{rate}{cooldown}"))
+        })
+        .collect::<Vec<_>>();
+
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn peer_diagnostic_endpoints(peer: &Value) -> Vec<SocketAddr> {
     let mut endpoints = Vec::new();
     if let Some(endpoint) = peer.get("endpoint").and_then(Value::as_str) {
@@ -2563,6 +2640,32 @@ mod tests {
     }
 
     #[test]
+    fn traversal_history_summary_formats_source_rates_and_cooldown() {
+        let snapshot = serde_json::json!({
+            "traversal_history": {
+                "sources": [{
+                    "source": "predicted",
+                    "success_count": 2,
+                    "failure_count": 2,
+                    "success_rate_per_mille": 500,
+                    "cooldown_remaining_ms": null
+                }, {
+                    "source": "birthday",
+                    "success_count": 0,
+                    "failure_count": 3,
+                    "success_rate_per_mille": 0,
+                    "cooldown_remaining_ms": 60000
+                }]
+            }
+        });
+
+        assert_eq!(
+            traversal_history_summary(&snapshot).as_deref(),
+            Some("predicted=2/4:500‰ birthday=0/3:0‰,cooldown=60000ms")
+        );
+    }
+
+    #[test]
     fn validates_and_sets_safe_config_values() {
         let mut config = Config::generate_default(DEFAULT_CONTROL_SERVER, DEFAULT_NETWORK).unwrap();
         set_config_value(&mut config, "mtu", "1380").unwrap();
@@ -2577,6 +2680,8 @@ mod tests {
         )
         .unwrap();
         set_config_value(&mut config, "direct-timeout", "7000ms").unwrap();
+        set_config_value(&mut config, "upnp", "off").unwrap();
+        set_config_value(&mut config, "birthday-probing", "no").unwrap();
         assert_eq!(config.network.mtu, 1380);
         assert!(!config.relay.prefer_direct);
         assert_eq!(config.node.device_name, "linux-server");
@@ -2588,6 +2693,8 @@ mod tests {
         assert_eq!(config.network.stun_servers.len(), 2);
         assert_eq!(config.network.stun_servers[0], "stun.l.google.com:19302");
         assert_eq!(config.relay.fallback_timeout_ms, 7000);
+        assert!(!config.network.upnp_enabled);
+        assert!(!config.network.birthday_probing_enabled);
         set_config_value(&mut config, "udp-advertise", "off").unwrap();
         assert!(config.network.udp_advertise.is_none());
         set_config_value(&mut config, "stun", "off").unwrap();

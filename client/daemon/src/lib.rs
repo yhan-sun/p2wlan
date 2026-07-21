@@ -42,6 +42,7 @@ pub mod relay;
 pub mod route;
 pub mod tasks;
 pub mod transport;
+pub mod traversal_history;
 pub mod udp;
 
 // Re-export key types
@@ -53,15 +54,18 @@ pub use error::{DaemonError, Result};
 // ============================================================
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 use p2pnet_crypto::NodeIdentity;
 use p2pnet_nat::{CandidateGatherReport, CandidateSource, NatProfile};
-use tokio::net::lookup_host;
+use rand::RngCore;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, sleep};
+use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
@@ -103,6 +107,15 @@ const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 /// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+/// Server-side signaling currently rejects candidate lists above this size.
+const MAX_SIGNAL_CANDIDATES: usize = 20;
+/// Keep UPnP discovery short so unsupported gateways never delay startup much.
+const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(900);
+/// Short UPnP lease; refreshed by the regular candidate refresh loop.
+const PORT_MAPPING_LEASE_SECS: u32 = 120;
+/// NAT-PMP / PCP share UDP port 5351 and should fail fast when unsupported.
+const NAT_MAPPING_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(650);
+const NAT_MAPPING_CONTROL_PORT: u16 = 5351;
 /// Short cooldown after a selected Relay fails at runtime before trying it again.
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -338,6 +351,7 @@ impl Daemon {
             info!("Using STUN endpoints: {stun_servers:?}");
         }
         let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
+        let upnp_enabled = self.config.network.upnp_enabled;
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
 
@@ -473,6 +487,7 @@ impl Daemon {
                                         report.nat_profile.observations.len(),
                                         report.nat_profile.confidence
                                     );
+                                    peers.update_nat_profile(report.nat_profile.clone()).await;
                                     *nat_profile.write().await = Some(report.nat_profile);
                                     (endpoints, sources)
                                 }
@@ -520,6 +535,15 @@ impl Daemon {
                             }
                         }
 
+                        if upnp_enabled {
+                            maybe_add_port_mapping_udp_candidate(
+                                udp.local_addr().ok(),
+                                &mut candidate_endpoints,
+                                &mut candidate_sources,
+                            )
+                            .await;
+                        }
+
                         info!(
                             "Prepared {} UDP candidate endpoints for signaling",
                             candidate_endpoints.len()
@@ -536,6 +560,7 @@ impl Daemon {
                                     stun_servers,
                                     stun_timeout,
                                     udp_advertise,
+                                    upnp_enabled,
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
@@ -554,6 +579,7 @@ impl Daemon {
                                     stun_servers,
                                     stun_timeout,
                                     udp_advertise,
+                                    upnp_enabled,
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
@@ -1416,7 +1442,7 @@ fn candidate_source_label(source: CandidateSource) -> &'static str {
 
 fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
     match candidate.ip() {
-        std::net::IpAddr::V4(ip) => {
+        IpAddr::V4(ip) => {
             !ip.is_private()
                 && !ip.is_loopback()
                 && !ip.is_link_local()
@@ -1424,8 +1450,9 @@ fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
                 && !ip.is_multicast()
                 && !ip.is_broadcast()
                 && !ip.is_documentation()
+                && !is_shared_ipv4(ip)
         }
-        std::net::IpAddr::V6(ip) => {
+        IpAddr::V6(ip) => {
             !ip.is_loopback()
                 && !ip.is_unspecified()
                 && !ip.is_multicast()
@@ -1435,11 +1462,453 @@ fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortMappingCandidate {
+    endpoint: String,
+    source: &'static str,
+}
+
+async fn maybe_add_port_mapping_udp_candidate(
+    udp_local_addr: Option<SocketAddr>,
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) {
+    if candidates.len() >= MAX_SIGNAL_CANDIDATES {
+        debug!(
+            "Skipping port-mapping UDP candidate because candidate list already has {} entries",
+            candidates.len()
+        );
+        return;
+    }
+
+    let Some(local_addr) = port_mapping_local_addr(udp_local_addr, candidates, candidate_sources)
+    else {
+        debug!("Skipping port-mapping UDP candidate because no LAN IPv4 local address was found");
+        return;
+    };
+
+    match discover_port_mapping_udp_candidate(local_addr).await {
+        Some(candidate) => {
+            if candidates.contains(&candidate.endpoint) {
+                return;
+            }
+            info!(
+                "{} mapped UDP {local_addr} as {}",
+                candidate.source, candidate.endpoint
+            );
+            candidates.push(candidate.endpoint.clone());
+            candidate_sources.insert(candidate.endpoint, candidate.source.to_string());
+        }
+        None => {
+            debug!("No UPnP/PCP/NAT-PMP UDP mapping candidate discovered for {local_addr}");
+        }
+    }
+}
+
+async fn discover_port_mapping_udp_candidate(
+    local_addr: SocketAddr,
+) -> Option<PortMappingCandidate> {
+    if let Some(candidate) = discover_upnp_udp_candidate(local_addr).await {
+        return Some(candidate);
+    }
+    discover_pcp_or_nat_pmp_udp_candidate(local_addr).await
+}
+
+async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappingCandidate> {
+    let options = SearchOptions {
+        timeout: Some(UPNP_DISCOVERY_TIMEOUT),
+        single_search_timeout: Some(UPNP_DISCOVERY_TIMEOUT),
+        ..Default::default()
+    };
+    let gateway = match search_gateway(options).await {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            debug!("UPnP IGD gateway search failed: {error}");
+            return None;
+        }
+    };
+
+    let external_ip = match gateway.get_external_ip().await {
+        Ok(ip) if is_public_udp_candidate(SocketAddr::new(ip, 1)) => ip,
+        Ok(ip) => {
+            debug!("UPnP IGD external IP {ip} is not publicly routable; skipping candidate");
+            return None;
+        }
+        Err(error) => {
+            debug!("UPnP IGD external IP lookup failed: {error}");
+            return None;
+        }
+    };
+
+    if gateway
+        .add_port(
+            PortMappingProtocol::UDP,
+            local_addr.port(),
+            local_addr,
+            PORT_MAPPING_LEASE_SECS,
+            "p2wlan direct udp",
+        )
+        .await
+        .is_ok()
+    {
+        return Some(PortMappingCandidate {
+            endpoint: SocketAddr::new(external_ip, local_addr.port()).to_string(),
+            source: "upnp",
+        });
+    }
+
+    match gateway
+        .get_any_address(
+            PortMappingProtocol::UDP,
+            local_addr,
+            PORT_MAPPING_LEASE_SECS,
+            "p2wlan direct udp",
+        )
+        .await
+    {
+        Ok(endpoint) if is_public_udp_candidate(endpoint) => Some(PortMappingCandidate {
+            endpoint: endpoint.to_string(),
+            source: "upnp",
+        }),
+        Ok(endpoint) => {
+            debug!("UPnP IGD mapped to non-public endpoint {endpoint}; skipping candidate");
+            None
+        }
+        Err(error) => {
+            debug!("UPnP IGD UDP port mapping failed: {error}");
+            None
+        }
+    }
+}
+
+async fn discover_pcp_or_nat_pmp_udp_candidate(
+    local_addr: SocketAddr,
+) -> Option<PortMappingCandidate> {
+    let gateway = match default_ipv4_gateway().await {
+        Some(gateway) => gateway,
+        None => {
+            debug!("No default IPv4 gateway found for PCP/NAT-PMP discovery");
+            return None;
+        }
+    };
+    let local_ip = local_addr_ipv4(local_addr)?;
+
+    let pcp = discover_pcp_udp_candidate(local_ip, local_addr.port(), gateway);
+    let nat_pmp = discover_nat_pmp_udp_candidate(local_ip, local_addr.port(), gateway);
+    let (pcp, nat_pmp) = tokio::join!(pcp, nat_pmp);
+    pcp.or(nat_pmp)
+}
+
+async fn discover_nat_pmp_udp_candidate(
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    gateway: Ipv4Addr,
+) -> Option<PortMappingCandidate> {
+    let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
+    let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            debug!("NAT-PMP bind failed on {bind_addr}: {error}");
+            return None;
+        }
+    };
+
+    let public_request = [0u8, 0u8];
+    if socket.send_to(&public_request, gateway_addr).await.is_err() {
+        return None;
+    }
+    let mut response = [0u8; 64];
+    let (len, from) = match timeout(
+        NAT_MAPPING_DISCOVERY_TIMEOUT,
+        socket.recv_from(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            debug!("NAT-PMP public address receive failed: {error}");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if from.ip() != IpAddr::V4(gateway) {
+        return None;
+    }
+    let external_ip = parse_nat_pmp_public_address_response(&response[..len])?;
+
+    let mut map_request = [0u8; 12];
+    map_request[1] = 1; // Map UDP.
+    map_request[4..6].copy_from_slice(&local_port.to_be_bytes());
+    map_request[6..8].copy_from_slice(&local_port.to_be_bytes());
+    map_request[8..12].copy_from_slice(&PORT_MAPPING_LEASE_SECS.to_be_bytes());
+    if socket.send_to(&map_request, gateway_addr).await.is_err() {
+        return None;
+    }
+    let (len, from) = match timeout(
+        NAT_MAPPING_DISCOVERY_TIMEOUT,
+        socket.recv_from(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            debug!("NAT-PMP UDP mapping receive failed: {error}");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if from.ip() != IpAddr::V4(gateway) {
+        return None;
+    }
+    let external_port = parse_nat_pmp_mapping_response(&response[..len], local_port)?;
+    let endpoint = SocketAddr::new(IpAddr::V4(external_ip), external_port);
+    is_public_udp_candidate(endpoint).then(|| PortMappingCandidate {
+        endpoint: endpoint.to_string(),
+        source: "nat_pmp",
+    })
+}
+
+async fn discover_pcp_udp_candidate(
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    gateway: Ipv4Addr,
+) -> Option<PortMappingCandidate> {
+    let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
+    let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            debug!("PCP bind failed on {bind_addr}: {error}");
+            return None;
+        }
+    };
+
+    let mut request = [0u8; 60];
+    request[0] = 2; // PCP version.
+    request[1] = 1; // MAP opcode.
+    request[4..8].copy_from_slice(&PORT_MAPPING_LEASE_SECS.to_be_bytes());
+    request[8..24].copy_from_slice(&ipv4_mapped_octets(local_ip));
+    rand::thread_rng().fill_bytes(&mut request[24..36]);
+    request[36] = 17; // UDP.
+    request[40..42].copy_from_slice(&local_port.to_be_bytes());
+    request[42..44].copy_from_slice(&local_port.to_be_bytes());
+
+    if socket.send_to(&request, gateway_addr).await.is_err() {
+        return None;
+    }
+    let mut response = [0u8; 128];
+    let (len, from) = match timeout(
+        NAT_MAPPING_DISCOVERY_TIMEOUT,
+        socket.recv_from(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            debug!("PCP UDP mapping receive failed: {error}");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if from.ip() != IpAddr::V4(gateway) {
+        return None;
+    }
+    let endpoint = parse_pcp_mapping_response(&response[..len], local_port)?;
+    is_public_udp_candidate(endpoint).then(|| PortMappingCandidate {
+        endpoint: endpoint.to_string(),
+        source: "pcp",
+    })
+}
+
+fn parse_nat_pmp_public_address_response(response: &[u8]) -> Option<Ipv4Addr> {
+    if response.len() < 12 || response[0] != 0 || response[1] != 128 {
+        return None;
+    }
+    let result = u16::from_be_bytes([response[2], response[3]]);
+    if result != 0 {
+        debug!("NAT-PMP public address request failed with result code {result}");
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        response[8],
+        response[9],
+        response[10],
+        response[11],
+    ))
+}
+
+fn parse_nat_pmp_mapping_response(response: &[u8], expected_internal_port: u16) -> Option<u16> {
+    if response.len() < 16 || response[0] != 0 || response[1] != 129 {
+        return None;
+    }
+    let result = u16::from_be_bytes([response[2], response[3]]);
+    if result != 0 {
+        debug!("NAT-PMP UDP mapping failed with result code {result}");
+        return None;
+    }
+    let internal_port = u16::from_be_bytes([response[8], response[9]]);
+    if internal_port != expected_internal_port {
+        return None;
+    }
+    let external_port = u16::from_be_bytes([response[10], response[11]]);
+    (external_port > 0).then_some(external_port)
+}
+
+fn parse_pcp_mapping_response(response: &[u8], expected_internal_port: u16) -> Option<SocketAddr> {
+    if response.len() < 60 || response[0] != 2 || response[1] != 0x81 {
+        return None;
+    }
+    let result = response[3];
+    if result != 0 {
+        debug!("PCP UDP mapping failed with result code {result}");
+        return None;
+    }
+    if response[36] != 17 {
+        return None;
+    }
+    let internal_port = u16::from_be_bytes([response[40], response[41]]);
+    if internal_port != expected_internal_port {
+        return None;
+    }
+    let external_port = u16::from_be_bytes([response[42], response[43]]);
+    if external_port == 0 {
+        return None;
+    }
+    let external_ip = parse_pcp_ip_address(&response[44..60])?;
+    Some(SocketAddr::new(external_ip, external_port))
+}
+
+fn parse_pcp_ip_address(bytes: &[u8]) -> Option<IpAddr> {
+    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    if bytes[..10] == [0; 10] && bytes[10] == 0xff && bytes[11] == 0xff {
+        return Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        )));
+    }
+    Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+}
+
+fn ipv4_mapped_octets(ip: Ipv4Addr) -> [u8; 16] {
+    let mut octets = [0u8; 16];
+    octets[10] = 0xff;
+    octets[11] = 0xff;
+    octets[12..16].copy_from_slice(&ip.octets());
+    octets
+}
+
+async fn default_ipv4_gateway() -> Option<Ipv4Addr> {
+    tokio::task::spawn_blocking(default_ipv4_gateway_blocking)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn default_ipv4_gateway_blocking() -> Option<Ipv4Addr> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        let output = Command::new("/sbin/route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return parse_first_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let output = Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return parse_first_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).NextHop",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return parse_first_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+fn parse_first_ipv4(text: &str) -> Option<Ipv4Addr> {
+    text.split_whitespace().find_map(parse_ipv4_token)
+}
+
+fn parse_ipv4_token(token: &str) -> Option<Ipv4Addr> {
+    token
+        .trim_matches(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .parse()
+        .ok()
+}
+
+fn port_mapping_local_addr(
+    udp_local_addr: Option<SocketAddr>,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> Option<SocketAddr> {
+    if udp_local_addr.is_some_and(is_port_mapping_local_addr) {
+        return udp_local_addr;
+    }
+
+    candidates.iter().find_map(|candidate| {
+        if candidate_sources.get(candidate).map(String::as_str) != Some("host") {
+            return None;
+        }
+        let endpoint = candidate.parse::<SocketAddr>().ok()?;
+        is_port_mapping_local_addr(endpoint).then_some(endpoint)
+    })
+}
+
+fn is_port_mapping_local_addr(endpoint: SocketAddr) -> bool {
+    endpoint.port() > 0
+        && matches!(
+            endpoint.ip(),
+            IpAddr::V4(ip)
+                if !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_link_local()
+                    && !ip.is_broadcast()
+        )
+}
+
+fn local_addr_ipv4(endpoint: SocketAddr) -> Option<Ipv4Addr> {
+    match endpoint.ip() {
+        IpAddr::V4(ip) if is_port_mapping_local_addr(endpoint) => Some(ip),
+        _ => None,
+    }
+}
+
+fn is_shared_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
 struct UdpCandidateRefreshContext {
     udp: UdpTransport,
     stun_servers: Vec<SocketAddr>,
     stun_timeout: Duration,
     udp_advertise: Option<String>,
+    upnp_enabled: bool,
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
@@ -1453,6 +1922,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         stun_servers,
         stun_timeout,
         udp_advertise,
+        upnp_enabled,
         local_candidates,
         local_candidate_sources,
         nat_profile,
@@ -1476,6 +1946,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             }
         };
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+        peers.update_nat_profile(report.nat_profile.clone()).await;
         let profile_changed = {
             let mut current_profile = nat_profile.write().await;
             if current_profile.as_ref() == Some(&report.nat_profile) {
@@ -1504,6 +1975,15 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                         "host".to_string()
                     }
                 });
+        }
+
+        if upnp_enabled {
+            maybe_add_port_mapping_udp_candidate(
+                udp.local_addr().ok(),
+                &mut candidates,
+                &mut candidate_sources,
+            )
+            .await;
         }
 
         let changed = {
@@ -2127,6 +2607,52 @@ mod tests {
         assert_eq!(
             advertised_udp_endpoint(local, None, &[]),
             Some("127.0.0.1:51820".to_string())
+        );
+    }
+
+    #[test]
+    fn nat_pmp_response_parsers_accept_valid_udp_mapping() {
+        let public = [0, 128, 0, 0, 0, 0, 0, 1, 93, 184, 216, 34];
+        assert_eq!(
+            parse_nat_pmp_public_address_response(&public),
+            Some(Ipv4Addr::new(93, 184, 216, 34))
+        );
+
+        let mut mapping = [0u8; 16];
+        mapping[0] = 0;
+        mapping[1] = 129;
+        mapping[8..10].copy_from_slice(&51820u16.to_be_bytes());
+        mapping[10..12].copy_from_slice(&42000u16.to_be_bytes());
+        mapping[12..16].copy_from_slice(&PORT_MAPPING_LEASE_SECS.to_be_bytes());
+        assert_eq!(parse_nat_pmp_mapping_response(&mapping, 51820), Some(42000));
+        assert_eq!(parse_nat_pmp_mapping_response(&mapping, 51821), None);
+    }
+
+    #[test]
+    fn pcp_response_parser_accepts_ipv4_mapped_udp_mapping() {
+        let mut response = [0u8; 60];
+        response[0] = 2;
+        response[1] = 0x81;
+        response[36] = 17;
+        response[40..42].copy_from_slice(&51820u16.to_be_bytes());
+        response[42..44].copy_from_slice(&42000u16.to_be_bytes());
+        response[44..60].copy_from_slice(&ipv4_mapped_octets(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(
+            parse_pcp_mapping_response(&response, 51820),
+            Some("93.184.216.34:42000".parse().unwrap())
+        );
+        assert_eq!(parse_pcp_mapping_response(&response, 51821), None);
+    }
+
+    #[test]
+    fn default_gateway_parsers_extract_ipv4_addresses() {
+        assert_eq!(
+            parse_first_ipv4("default via 192.168.1.1 dev en0"),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(
+            parse_first_ipv4("gateway: 10.0.0.1\ninterface: en0"),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
         );
     }
 

@@ -18,6 +18,7 @@ use crate::error::{DaemonError, Result};
 use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
 use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
 use crate::tasks::{HealthState, TaskManager};
+use crate::traversal_history::TraversalHistoryDiagnostics;
 use crate::udp::UdpTransport;
 
 /// Runtime diagnostics snapshot returned by the local endpoint.
@@ -34,6 +35,7 @@ pub struct DiagnosticsSnapshot {
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
     pub relay_selection: RelaySelectionDiagnostics,
+    pub traversal_history: TraversalHistoryDiagnostics,
     pub peers: Vec<PeerDiagnostics>,
     pub stats: PeerManagerStats,
     pub health: crate::tasks::HealthSnapshot,
@@ -228,6 +230,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection,
+        traversal_history: context.peers.traversal_history_diagnostics().await,
         peers: context
             .peers
             .diagnostics_with_path_selection(

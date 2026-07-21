@@ -8,22 +8,31 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use p2pnet_crypto::{hmac, NodeIdentity};
-use p2pnet_nat::ProbeMacKey;
+use p2pnet_nat::{NatProfile, ProbeMacKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::control::PeerInfo;
+use crate::traversal_history::{
+    traversal_history_path, TraversalHistory, TraversalHistoryDiagnostics,
+};
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 2;
+const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 4;
+const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
+const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 1;
+const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 4;
+const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 8;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
@@ -307,12 +316,45 @@ pub enum CandidatePairState {
 pub enum CandidatePairSource {
     /// Endpoint was signaled by the control plane or static peer metadata.
     Signaled,
+    /// Endpoint came from the peer's host/local-interface candidate.
+    Host,
+    /// Endpoint came from the peer's STUN-observed server-reflexive candidate.
+    StunObserved,
+    /// Endpoint was opened through local gateway port mapping such as UPnP IGD.
+    Upnp,
+    /// Endpoint was opened through PCP MAP.
+    Pcp,
+    /// Endpoint was opened through NAT-PMP UDP mapping.
+    NatPmp,
     /// Endpoint was predicted from the remote peer's NAT mapping delta.
     Predicted,
+    /// Endpoint was synthesized by bounded birthday probing around a public candidate.
+    Birthday,
     /// Endpoint was learned from legacy candidate-matched traffic.
     Learned,
     /// Endpoint was learned from an authenticated Probe v2 source address.
     PeerReflexive,
+}
+
+impl CandidatePairSource {
+    pub fn history_label(self) -> &'static str {
+        match self {
+            Self::Signaled => "signaled",
+            Self::Host => "host",
+            Self::StunObserved => "stun_observed",
+            Self::Upnp => "upnp",
+            Self::Pcp => "pcp",
+            Self::NatPmp => "nat_pmp",
+            Self::Predicted => "predicted",
+            Self::Birthday => "birthday",
+            Self::Learned => "learned",
+            Self::PeerReflexive => "peer_reflexive",
+        }
+    }
+
+    pub fn is_persisted_history_source(self) -> bool {
+        !matches!(self, Self::Signaled)
+    }
 }
 
 /// State and health for one direct candidate pair.
@@ -740,9 +782,20 @@ impl PeerConnection {
         }
     }
 
-    fn candidate_probe_endpoints(&mut self, local_generation: u64) -> Vec<SocketAddr> {
+    fn candidate_probe_endpoints(
+        &mut self,
+        local_generation: u64,
+        history: &TraversalHistory,
+        local_nat_profile: Option<&NatProfile>,
+    ) -> Vec<SocketAddr> {
         self.ensure_current_candidate_pairs(local_generation);
-        let endpoints = self.candidate_endpoints();
+        let mut endpoints = self.candidate_endpoints();
+        self.ensure_birthday_candidate_pairs(
+            local_generation,
+            history,
+            local_nat_profile,
+            &mut endpoints,
+        );
         let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
         let mut pairs = self
             .candidate_pairs
@@ -756,8 +809,9 @@ impl PeerConnection {
             candidate_pair_probe_rank(a.state)
                 .cmp(&candidate_pair_probe_rank(b.state))
                 .then_with(|| {
-                    candidate_pair_source_quality_rank(&source_stats, a.source)
-                        .cmp(&candidate_pair_source_quality_rank(&source_stats, b.source))
+                    candidate_pair_source_quality_rank(&source_stats, history, a.source).cmp(
+                        &candidate_pair_source_quality_rank(&source_stats, history, b.source),
+                    )
                 })
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
@@ -782,10 +836,60 @@ impl PeerConnection {
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
-        apply_predicted_probe_budget(pairs, &source_stats)
+        apply_adaptive_probe_budgets(pairs, &source_stats, history)
             .into_iter()
             .map(|pair| pair.remote_endpoint)
             .collect()
+    }
+
+    fn ensure_birthday_candidate_pairs(
+        &mut self,
+        local_generation: u64,
+        history: &TraversalHistory,
+        local_nat_profile: Option<&NatProfile>,
+        endpoints: &mut Vec<SocketAddr>,
+    ) {
+        if !local_nat_profile.is_some_and(|profile| profile.birthday_candidate) {
+            return;
+        }
+        let budget = birthday_probe_budget(history);
+        if budget == 0 {
+            return;
+        }
+
+        let bases = endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                !matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Host
+                        | CandidatePairSource::Upnp
+                        | CandidatePairSource::Pcp
+                        | CandidatePairSource::NatPmp
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut generated = 0usize;
+        for base in bases {
+            for endpoint in birthday_probe_endpoints(base) {
+                if generated >= budget {
+                    return;
+                }
+                if endpoints.contains(&endpoint) {
+                    continue;
+                }
+                endpoints.push(endpoint);
+                self.ensure_candidate_pair_with_source(
+                    endpoint,
+                    local_generation,
+                    CandidatePairSource::Birthday,
+                );
+                generated += 1;
+            }
+        }
     }
 
     fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
@@ -1098,9 +1202,10 @@ impl PeerConnection {
         local_generation: u64,
         latency: Option<Duration>,
         selected: bool,
-    ) {
-        self.ensure_candidate_pair(endpoint, local_generation)
-            .record_success(latency, selected);
+    ) -> CandidatePairSource {
+        let pair = self.ensure_candidate_pair(endpoint, local_generation);
+        pair.record_success(latency, selected);
+        pair.source
     }
 
     fn mark_current_candidate_pairs_failed(
@@ -1108,13 +1213,18 @@ impl PeerConnection {
         local_generation: u64,
         code: impl Into<String>,
         reason: impl Into<String>,
-    ) {
+    ) -> Vec<CandidatePairSource> {
         let code = code.into();
         let reason = reason.into();
+        let mut probed_sources = Vec::new();
         for endpoint in self.candidate_endpoints() {
-            self.ensure_candidate_pair(endpoint, local_generation)
-                .record_failure(code.clone(), reason.clone());
+            let pair = self.ensure_candidate_pair(endpoint, local_generation);
+            if pair.last_probe_at.is_some() && !probed_sources.contains(&pair.source) {
+                probed_sources.push(pair.source);
+            }
+            pair.record_failure(code.clone(), reason.clone());
         }
+        probed_sources
     }
 
     fn mark_network_generation_changed(
@@ -1190,6 +1300,12 @@ pub struct PeerManager {
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.
     network_generation: Arc<RwLock<u64>>,
+    /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
+    local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    /// Anonymous local traversal outcome history.
+    traversal_history: Arc<RwLock<TraversalHistory>>,
+    /// Optional persistent history path.
+    traversal_history_path: Option<PathBuf>,
     /// Configuration.
     config: Config,
 }
@@ -1210,12 +1326,87 @@ fn decode_x25519_key_bytes(hex_value: &str) -> std::result::Result<[u8; 32], ()>
 impl PeerManager {
     /// Create a new peer manager.
     pub fn new(config: Config) -> Self {
+        let history_path = traversal_history_path(&config);
+        let traversal_history = TraversalHistory::load(history_path.as_deref());
+        Self::new_with_history(config, history_path, traversal_history)
+    }
+
+    fn new_with_history(
+        config: Config,
+        traversal_history_path: Option<PathBuf>,
+        traversal_history: TraversalHistory,
+    ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
+            local_nat_profile: Arc::new(RwLock::new(None)),
+            traversal_history: Arc::new(RwLock::new(traversal_history)),
+            traversal_history_path,
             config,
         }
+    }
+
+    /// Update the latest local NAT profile used by adaptive probe scheduling.
+    pub async fn update_nat_profile(&self, profile: NatProfile) {
+        *self.local_nat_profile.write().await = Some(profile);
+    }
+
+    /// Serializable local traversal history diagnostics.
+    pub async fn traversal_history_diagnostics(&self) -> TraversalHistoryDiagnostics {
+        self.traversal_history.read().await.diagnostics()
+    }
+
+    async fn record_traversal_success(&self, source: CandidatePairSource) {
+        if !source.is_persisted_history_source() {
+            return;
+        }
+        let snapshot = {
+            let mut history = self.traversal_history.write().await;
+            history.record_success(source);
+            history.clone()
+        };
+        self.persist_traversal_history(&snapshot);
+    }
+
+    async fn record_traversal_failures(&self, sources: Vec<CandidatePairSource>) {
+        let mut unique_sources = Vec::new();
+        for source in sources {
+            if source.is_persisted_history_source() && !unique_sources.contains(&source) {
+                unique_sources.push(source);
+            }
+        }
+        if unique_sources.is_empty() {
+            return;
+        }
+
+        let snapshot = {
+            let mut history = self.traversal_history.write().await;
+            for source in unique_sources {
+                history.record_failure(source);
+            }
+            history.clone()
+        };
+        self.persist_traversal_history(&snapshot);
+    }
+
+    fn persist_traversal_history(&self, history: &TraversalHistory) {
+        let Some(path) = self.traversal_history_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = history.save(path) {
+            warn!(
+                "Failed to persist traversal history at {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    async fn local_nat_profile_for_probe_budget(&self) -> Option<NatProfile> {
+        if !self.config.network.birthday_probing_enabled {
+            return None;
+        }
+        self.local_nat_profile.read().await.clone()
     }
 
     /// Current local network generation.
@@ -1447,6 +1638,8 @@ impl PeerManager {
     /// Return candidate endpoints for a specific peer using the adaptive probe scheduler.
     pub async fn direct_probe_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
         let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return Vec::new();
@@ -1454,7 +1647,8 @@ impl PeerManager {
         if conn.state == ConnectionState::Direct {
             return Vec::new();
         }
-        let endpoints = conn.candidate_probe_endpoints(generation);
+        let endpoints =
+            conn.candidate_probe_endpoints(generation, &history, local_nat_profile.as_ref());
         for endpoint in &endpoints {
             conn.mark_candidate_pair_probing(*endpoint, generation);
         }
@@ -1464,13 +1658,19 @@ impl PeerManager {
     /// Return candidate endpoints that should continue receiving direct-path probes.
     pub async fn direct_probe_targets(&self) -> Vec<(String, Vec<SocketAddr>)> {
         let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
         self.connections
             .write()
             .await
             .values_mut()
             .filter(|conn| conn.state != ConnectionState::Direct)
             .filter_map(|conn| {
-                let endpoints = conn.candidate_probe_endpoints(generation);
+                let endpoints = conn.candidate_probe_endpoints(
+                    generation,
+                    &history,
+                    local_nat_profile.as_ref(),
+                );
 
                 if endpoints.is_empty() {
                     None
@@ -1494,6 +1694,8 @@ impl PeerManager {
         base_retry_after: Duration,
     ) -> Vec<(String, Vec<SocketAddr>)> {
         let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
         self.connections
             .write()
             .await
@@ -1501,7 +1703,11 @@ impl PeerManager {
             .filter(|conn| conn.state != ConnectionState::Direct)
             .filter(|conn| conn.direct_retry_due(base_retry_after))
             .filter_map(|conn| {
-                let endpoints = conn.candidate_probe_endpoints(generation);
+                let endpoints = conn.candidate_probe_endpoints(
+                    generation,
+                    &history,
+                    local_nat_profile.as_ref(),
+                );
 
                 if endpoints.is_empty() {
                     None
@@ -1598,18 +1804,25 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        let source = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
             let selected_endpoint = endpoint.or(conn.endpoint);
-            if let Some(endpoint) = selected_endpoint {
+            let source = selected_endpoint.map(|endpoint| {
                 conn.endpoint = Some(endpoint);
-                conn.mark_candidate_pair_success(endpoint, generation, None, true);
-            }
+                conn.mark_candidate_pair_success(endpoint, generation, None, true)
+            });
             conn.direct_generation = generation;
             conn.direct_health.record_success();
             conn.transition(ConnectionState::Direct);
-            return true;
+            source
+        };
+        if let Some(source) = source {
+            self.record_traversal_success(source).await;
         }
-        false
+        true
     }
 
     /// Record that a UDP punch endpoint is reachable. A matched ACK confirms
@@ -1645,24 +1858,27 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        let source = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
             conn.endpoint = Some(endpoint);
             conn.direct_generation = generation;
             let ack_confirmed = latency.is_some();
-            if ack_confirmed {
-                conn.mark_candidate_pair_success(endpoint, generation, latency, true);
+            let source = if ack_confirmed {
+                Some(conn.mark_candidate_pair_success(endpoint, generation, latency, true))
             } else {
                 conn.mark_candidate_pair_probing(endpoint, generation);
-            }
+                None
+            };
             match latency {
                 Some(latency) => conn.direct_health.record_success_with_latency(latency),
                 None => conn.direct_health.record_success(),
             }
             if ack_confirmed {
                 conn.transition(ConnectionState::Direct);
-                return true;
-            }
-            if matches!(
+            } else if matches!(
                 conn.state,
                 ConnectionState::Idle
                     | ConnectionState::Connecting
@@ -1670,9 +1886,12 @@ impl PeerManager {
             ) {
                 conn.transition(ConnectionState::HolePunching);
             }
-            return true;
+            source
+        };
+        if let Some(source) = source {
+            self.record_traversal_success(source).await;
         }
-        false
+        true
     }
 
     /// Record a failed direct-path event and enter relay fallback state.
@@ -1705,18 +1924,23 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        let probed_sources = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
             let code = code.into();
             let reason = reason.into();
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
-            conn.mark_current_candidate_pairs_failed(generation, code, reason);
+            let probed_sources = conn.mark_current_candidate_pairs_failed(generation, code, reason);
             if conn.state != ConnectionState::Relay {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
-            return true;
-        }
-        false
+            probed_sources
+        };
+        self.record_traversal_failures(probed_sources).await;
+        true
     }
 
     /// Whether the peer is direct in a specific generation.
@@ -2089,8 +2313,14 @@ fn candidate_pair_source_stats(
     [
         CandidatePairSource::PeerReflexive,
         CandidatePairSource::Learned,
+        CandidatePairSource::Host,
+        CandidatePairSource::Upnp,
+        CandidatePairSource::Pcp,
+        CandidatePairSource::NatPmp,
+        CandidatePairSource::StunObserved,
         CandidatePairSource::Signaled,
         CandidatePairSource::Predicted,
+        CandidatePairSource::Birthday,
     ]
     .into_iter()
     .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source))
@@ -2150,33 +2380,86 @@ fn candidate_pair_source_stats_for(
     })
 }
 
-fn apply_predicted_probe_budget<'a>(
+fn apply_adaptive_probe_budgets<'a>(
     pairs: Vec<&'a CandidatePair>,
     stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
 ) -> Vec<&'a CandidatePair> {
-    let predicted_has_success = stats
-        .iter()
-        .find(|stats| stats.source == CandidatePairSource::Predicted)
-        .is_some_and(|stats| stats.success_count > 0);
-    if predicted_has_success {
-        return pairs;
-    }
-
+    let predicted_budget = predicted_probe_budget(stats, history);
+    let birthday_budget = birthday_probe_budget(history);
     let mut predicted_used = 0usize;
+    let mut birthday_used = 0usize;
     pairs
         .into_iter()
-        .filter(|pair| {
-            if pair.source != CandidatePairSource::Predicted {
-                return true;
+        .filter(|pair| match pair.source {
+            CandidatePairSource::Predicted => {
+                if predicted_used < predicted_budget {
+                    predicted_used += 1;
+                    true
+                } else {
+                    false
+                }
             }
-            if predicted_used < PREDICTED_PROBE_BUDGET_PER_CYCLE {
-                predicted_used += 1;
-                true
-            } else {
-                false
+            CandidatePairSource::Birthday => {
+                if birthday_used < birthday_budget {
+                    birthday_used += 1;
+                    true
+                } else {
+                    false
+                }
             }
+            _ => true,
         })
         .collect()
+}
+
+fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &TraversalHistory) -> usize {
+    if history.source_in_cooldown(CandidatePairSource::Predicted) {
+        return PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE;
+    }
+    if history
+        .source(CandidatePairSource::Predicted)
+        .is_some_and(|entry| entry.consecutive_failures >= 3)
+    {
+        return PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE;
+    }
+    if history
+        .source(CandidatePairSource::Predicted)
+        .is_some_and(|entry| {
+            entry.success_count >= 2 && entry.success_rate_per_mille().unwrap_or(0) >= 500
+        })
+    {
+        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+    }
+    if stats
+        .iter()
+        .find(|stats| stats.source == CandidatePairSource::Predicted)
+        .is_some_and(|stats| stats.success_count > 0)
+    {
+        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+    }
+    PREDICTED_PROBE_BUDGET_PER_CYCLE
+}
+
+fn birthday_probe_budget(history: &TraversalHistory) -> usize {
+    if history.source_in_cooldown(CandidatePairSource::Birthday) {
+        return 0;
+    }
+    if history
+        .source(CandidatePairSource::Birthday)
+        .is_some_and(|entry| entry.consecutive_failures >= 3)
+    {
+        return 0;
+    }
+    if history
+        .source(CandidatePairSource::Birthday)
+        .is_some_and(|entry| {
+            entry.success_count > 0 && entry.success_rate_per_mille().unwrap_or(0) >= 500
+        })
+    {
+        return BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+    }
+    BIRTHDAY_PROBE_BUDGET_PER_CYCLE
 }
 
 fn latest_instant(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
@@ -2201,15 +2484,28 @@ fn candidate_pair_source_from_label(label: &str) -> Option<CandidatePairSource> 
         "predicted" => Some(CandidatePairSource::Predicted),
         "peer_reflexive" => Some(CandidatePairSource::PeerReflexive),
         "learned" => Some(CandidatePairSource::Learned),
-        "signaled" | "host" | "stun_observed" | "manual" => Some(CandidatePairSource::Signaled),
+        "host" => Some(CandidatePairSource::Host),
+        "stun_observed" => Some(CandidatePairSource::StunObserved),
+        "upnp" | "port_mapping" => Some(CandidatePairSource::Upnp),
+        "pcp" => Some(CandidatePairSource::Pcp),
+        "nat_pmp" | "nat-pmp" => Some(CandidatePairSource::NatPmp),
+        "birthday" => Some(CandidatePairSource::Birthday),
+        "signaled" | "manual" => Some(CandidatePairSource::Signaled),
         _ => None,
     }
 }
 
 fn candidate_pair_source_quality_rank(
     stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
     source: CandidatePairSource,
 ) -> u16 {
+    if history.source_in_cooldown(source) {
+        return 1100;
+    }
+    if let Some(rate) = history.source_success_rate_per_mille(source) {
+        return 1000u16.saturating_sub(rate);
+    }
     let Some(stats) = stats.iter().find(|stats| stats.source == source) else {
         return 500;
     };
@@ -2223,9 +2519,55 @@ fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
     match source {
         CandidatePairSource::PeerReflexive => 0,
         CandidatePairSource::Learned => 1,
-        CandidatePairSource::Signaled => 2,
-        CandidatePairSource::Predicted => 3,
+        CandidatePairSource::Host => 2,
+        CandidatePairSource::Upnp => 3,
+        CandidatePairSource::Pcp => 4,
+        CandidatePairSource::NatPmp => 5,
+        CandidatePairSource::StunObserved => 6,
+        CandidatePairSource::Signaled => 7,
+        CandidatePairSource::Predicted => 8,
+        CandidatePairSource::Birthday => 9,
     }
+}
+
+fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
+    [1, -1, 2, -2, 3, -3, 4, -4]
+        .into_iter()
+        .filter_map(|delta| {
+            let port = base.port() as i32 + delta;
+            let port = u16::try_from(port).ok()?;
+            (port > 0).then_some(SocketAddr::new(base.ip(), port))
+        })
+        .collect()
+}
+
+fn is_public_probe_endpoint(endpoint: SocketAddr) -> bool {
+    match endpoint.ip() {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !is_shared_ipv4(ip)
+        }
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            let is_unique_local = (first_segment & 0xfe00) == 0xfc00;
+            let is_link_local = (first_segment & 0xffc0) == 0xfe80;
+            !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !is_unique_local
+                && !is_link_local
+        }
+    }
+}
+
+fn is_shared_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
 fn endpoint_probe_rank(endpoint: SocketAddr) -> u8 {
