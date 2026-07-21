@@ -80,10 +80,11 @@ pub struct StunObservation {
 }
 
 /// Behavioral NAT mapping classification based on multiple STUN observers.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MappingBehavior {
     /// No STUN data was collected.
+    #[default]
     Unknown,
     /// STUN was configured but no server replied.
     UdpBlocked,
@@ -93,6 +94,45 @@ pub enum MappingBehavior {
     EndpointIndependent,
     /// Observers returned different public addresses or ports.
     AddressOrPortDependent,
+}
+
+/// Best-effort NAT filtering classification.
+///
+/// `NAT-01b-a` intentionally exposes this as a diagnostic foundation before
+/// adding active RFC 5780 / multi-socket filtering probes. Values are therefore
+/// conservative unless a future active probe can prove them directly.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilteringBehavior {
+    /// No filtering behavior could be inferred.
+    #[default]
+    Unknown,
+    /// Mapping observations suggest endpoint-independent behavior.
+    LikelyEndpointIndependent,
+    /// Mapping observations suggest address or port dependent behavior.
+    AddressOrPortDependent,
+    /// STUN was configured but no server replied.
+    UdpBlocked,
+}
+
+/// Local NAT hairpin behavior.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HairpinBehavior {
+    /// Hairpin behavior has not been probed yet.
+    #[default]
+    Unknown,
+    /// Hairpin does not matter for a public/open endpoint.
+    NotApplicable,
+}
+
+/// Observed NAT mapping lifetime.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingLifetime {
+    /// Lifetime has not been measured yet.
+    #[default]
+    Unknown,
 }
 
 /// Local NAT profile inferred from candidate gathering.
@@ -118,6 +158,21 @@ pub struct NatProfile {
     pub likely_symmetric: Option<bool>,
     /// Behavioral mapping summary.
     pub mapping_behavior: MappingBehavior,
+    /// Best-effort filtering behavior summary.
+    #[serde(default)]
+    pub filtering_behavior: FilteringBehavior,
+    /// Hairpin behavior summary.
+    #[serde(default)]
+    pub hairpin_behavior: HairpinBehavior,
+    /// NAT mapping lifetime summary.
+    #[serde(default)]
+    pub mapping_lifetime: MappingLifetime,
+    /// Whether this profile is a good candidate for bounded port prediction.
+    #[serde(default)]
+    pub prediction_candidate: bool,
+    /// Whether this profile is a good candidate for bounded birthday probing.
+    #[serde(default)]
+    pub birthday_candidate: bool,
     /// Confidence score from 0-100.
     pub confidence: u8,
 }
@@ -135,6 +190,11 @@ impl NatProfile {
             port_delta: None,
             likely_symmetric: None,
             mapping_behavior: MappingBehavior::Unknown,
+            filtering_behavior: FilteringBehavior::Unknown,
+            hairpin_behavior: HairpinBehavior::Unknown,
+            mapping_lifetime: MappingLifetime::Unknown,
+            prediction_candidate: false,
+            birthday_candidate: false,
             confidence: 0,
         }
     }
@@ -411,6 +471,15 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
             } else {
                 MappingBehavior::Unknown
             },
+            filtering_behavior: if udp_blocked {
+                FilteringBehavior::UdpBlocked
+            } else {
+                FilteringBehavior::Unknown
+            },
+            hairpin_behavior: HairpinBehavior::Unknown,
+            mapping_lifetime: MappingLifetime::Unknown,
+            prediction_candidate: false,
+            birthday_candidate: false,
             confidence: if udp_blocked { 60 } else { 20 },
         };
     }
@@ -441,6 +510,22 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         2 => 70,
         _ => 90,
     };
+    let filtering_behavior = infer_filtering_behavior(false, mapping_behavior);
+    let hairpin_behavior = infer_hairpin_behavior(mapping_behavior);
+    let port_delta = stable_port_delta(&mapped);
+    let prediction_candidate = is_prediction_candidate(
+        false,
+        public_ip_stable,
+        public_port_stable,
+        mapping_behavior,
+        port_delta,
+    );
+    let birthday_candidate = is_birthday_candidate(
+        false,
+        mapping_behavior,
+        likely_symmetric,
+        prediction_candidate,
+    );
 
     NatProfile {
         local_addr: local_addr.to_string(),
@@ -450,11 +535,68 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         public_ip_stable,
         public_port_stable,
         port_preserved: Some(first.port() == local_addr.port()),
-        port_delta: stable_port_delta(&mapped),
+        port_delta,
         likely_symmetric,
         mapping_behavior,
+        filtering_behavior,
+        hairpin_behavior,
+        mapping_lifetime: MappingLifetime::Unknown,
+        prediction_candidate,
+        birthday_candidate,
         confidence,
     }
+}
+
+fn infer_filtering_behavior(
+    udp_blocked: bool,
+    mapping_behavior: MappingBehavior,
+) -> FilteringBehavior {
+    if udp_blocked {
+        return FilteringBehavior::UdpBlocked;
+    }
+    match mapping_behavior {
+        MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent => {
+            FilteringBehavior::LikelyEndpointIndependent
+        }
+        MappingBehavior::AddressOrPortDependent => FilteringBehavior::AddressOrPortDependent,
+        MappingBehavior::Unknown | MappingBehavior::UdpBlocked => FilteringBehavior::Unknown,
+    }
+}
+
+fn infer_hairpin_behavior(mapping_behavior: MappingBehavior) -> HairpinBehavior {
+    match mapping_behavior {
+        MappingBehavior::OpenInternet => HairpinBehavior::NotApplicable,
+        MappingBehavior::Unknown
+        | MappingBehavior::UdpBlocked
+        | MappingBehavior::EndpointIndependent
+        | MappingBehavior::AddressOrPortDependent => HairpinBehavior::Unknown,
+    }
+}
+
+fn is_prediction_candidate(
+    udp_blocked: bool,
+    public_ip_stable: Option<bool>,
+    public_port_stable: Option<bool>,
+    mapping_behavior: MappingBehavior,
+    port_delta: Option<i32>,
+) -> bool {
+    !udp_blocked
+        && public_ip_stable == Some(true)
+        && public_port_stable == Some(false)
+        && mapping_behavior == MappingBehavior::AddressOrPortDependent
+        && port_delta.is_some_and(|delta| (-8..=8).contains(&delta))
+}
+
+fn is_birthday_candidate(
+    udp_blocked: bool,
+    mapping_behavior: MappingBehavior,
+    likely_symmetric: Option<bool>,
+    prediction_candidate: bool,
+) -> bool {
+    !udp_blocked
+        && (prediction_candidate
+            || likely_symmetric == Some(true)
+            || mapping_behavior == MappingBehavior::AddressOrPortDependent)
 }
 
 fn stable_port_delta(mapped: &[SocketAddr]) -> Option<i32> {
@@ -572,6 +714,11 @@ mod tests {
         assert_eq!(profile.mapping_behavior, MappingBehavior::Unknown);
         assert!(!profile.udp_blocked);
         assert_eq!(profile.public_endpoint, None);
+        assert_eq!(profile.filtering_behavior, FilteringBehavior::Unknown);
+        assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
+        assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
+        assert!(!profile.prediction_candidate);
+        assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 0);
     }
 
@@ -589,6 +736,11 @@ mod tests {
         assert_eq!(profile.mapping_behavior, MappingBehavior::UdpBlocked);
         assert!(profile.udp_blocked);
         assert_eq!(profile.likely_symmetric, None);
+        assert_eq!(profile.filtering_behavior, FilteringBehavior::UdpBlocked);
+        assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
+        assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
+        assert!(!profile.prediction_candidate);
+        assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 60);
     }
 
@@ -605,6 +757,11 @@ mod tests {
         );
         assert_eq!(profile.mapping_behavior, MappingBehavior::Unknown);
         assert!(!profile.udp_blocked);
+        assert_eq!(profile.filtering_behavior, FilteringBehavior::Unknown);
+        assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
+        assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
+        assert!(!profile.prediction_candidate);
+        assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 20);
     }
 
@@ -640,6 +797,14 @@ mod tests {
         assert_eq!(profile.port_preserved, Some(false));
         assert_eq!(profile.likely_symmetric, Some(false));
         assert_eq!(profile.port_delta, Some(0));
+        assert_eq!(
+            profile.filtering_behavior,
+            FilteringBehavior::LikelyEndpointIndependent
+        );
+        assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
+        assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
+        assert!(!profile.prediction_candidate);
+        assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 70);
     }
 
@@ -676,7 +841,49 @@ mod tests {
         assert_eq!(profile.public_port_stable, Some(false));
         assert_eq!(profile.likely_symmetric, Some(true));
         assert_eq!(profile.port_delta, Some(2));
+        assert_eq!(
+            profile.filtering_behavior,
+            FilteringBehavior::AddressOrPortDependent
+        );
+        assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
+        assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
+        assert!(profile.prediction_candidate);
+        assert!(profile.birthday_candidate);
         assert_eq!(profile.confidence, 90);
+    }
+
+    #[test]
+    fn test_build_nat_profile_rejects_wide_delta_for_prediction() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40001".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40033".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40065".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+            ],
+        );
+        assert_eq!(
+            profile.mapping_behavior,
+            MappingBehavior::AddressOrPortDependent
+        );
+        assert_eq!(profile.port_delta, Some(32));
+        assert!(!profile.prediction_candidate);
+        assert!(profile.birthday_candidate);
     }
 
     #[tokio::test]
