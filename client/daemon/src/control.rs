@@ -79,6 +79,8 @@ pub enum ControlMessage {
         to_node_id: String,
         candidates: Vec<String>,
         #[serde(default)]
+        candidate_sources: HashMap<String, String>,
+        #[serde(default)]
         handshake_init: Vec<u8>,
     },
 
@@ -88,6 +90,8 @@ pub enum ControlMessage {
         from_node_id: String,
         to_node_id: String,
         candidates: Vec<String>,
+        #[serde(default)]
+        candidate_sources: HashMap<String, String>,
         #[serde(default)]
         handshake_response: Vec<u8>,
     },
@@ -185,12 +189,14 @@ pub enum ControlEvent {
     PeerOffer {
         from_node_id: String,
         candidates: Vec<String>,
+        candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
     },
     /// Received a peer answer.
     PeerAnswer {
         from_node_id: String,
         candidates: Vec<String>,
+        candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
     },
     /// Received a peer reject.
@@ -308,6 +314,8 @@ struct SignalResponse {
     #[serde(default)]
     candidates: Vec<String>,
     #[serde(default)]
+    candidate_sources: HashMap<String, String>,
+    #[serde(default)]
     handshake: String,
 }
 
@@ -339,12 +347,14 @@ enum ControlCommand {
     SendPeerOffer {
         to_node_id: String,
         candidates: Vec<String>,
+        candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
     },
     /// Send a peer answer.
     SendPeerAnswer {
         to_node_id: String,
         candidates: Vec<String>,
+        candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
     },
     /// Create a tunnel.
@@ -436,10 +446,23 @@ impl ControlClient {
         candidates: &[String],
         handshake_init: &[u8],
     ) -> Result<()> {
+        self.send_peer_offer_with_sources(to_node_id, candidates, &HashMap::new(), handshake_init)
+            .await
+    }
+
+    /// Send a peer offer with optional candidate source metadata.
+    pub async fn send_peer_offer_with_sources(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+    ) -> Result<()> {
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
+                candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
@@ -452,10 +475,28 @@ impl ControlClient {
         candidates: &[String],
         handshake_response: &[u8],
     ) -> Result<()> {
+        self.send_peer_answer_with_sources(
+            to_node_id,
+            candidates,
+            &HashMap::new(),
+            handshake_response,
+        )
+        .await
+    }
+
+    /// Send a peer answer with optional candidate source metadata.
+    pub async fn send_peer_answer_with_sources(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_response: &[u8],
+    ) -> Result<()> {
         self.cmd_tx
             .send(ControlCommand::SendPeerAnswer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
+                candidate_sources: candidate_sources.clone(),
                 handshake_response: handshake_response.to_vec(),
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
@@ -571,12 +612,14 @@ impl ControlClient {
             ControlMessage::PeerOffer {
                 from_node_id,
                 candidates,
+                candidate_sources,
                 handshake_init,
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerOffer {
                     from_node_id,
                     candidates,
+                    candidate_sources,
                     handshake_init,
                 });
             }
@@ -584,12 +627,14 @@ impl ControlClient {
             ControlMessage::PeerAnswer {
                 from_node_id,
                 candidates,
+                candidate_sources,
                 handshake_response,
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerAnswer {
                     from_node_id,
                     candidates,
+                    candidate_sources,
                     handshake_response,
                 });
             }
@@ -996,8 +1041,8 @@ async fn run_control_loop(
                                 }
                             }
                         }
-                        ControlCommand::SendPeerOffer { to_node_id, candidates, handshake_init } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &handshake_init).await;
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
                                 Err(err) => {
@@ -1009,8 +1054,8 @@ async fn run_control_loop(
                                 }
                             }
                         }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, handshake_response } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &handshake_response).await;
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
                                 Err(err) => {
@@ -1331,6 +1376,7 @@ async fn send_signal(
     to_node_id: &str,
     signal_type: &str,
     candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
     handshake: &[u8],
 ) -> Result<()> {
     let res = http
@@ -1341,6 +1387,7 @@ async fn send_signal(
             "to_node_id": to_node_id,
             "type": signal_type,
             "candidates": candidates,
+            "candidate_sources": candidate_sources,
             "handshake": hex::encode(handshake),
         }))
         .send()
@@ -1409,6 +1456,7 @@ async fn poll_signals(
                 let _ = event_tx.send(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
+                    candidate_sources: signal.candidate_sources,
                     handshake_init: handshake,
                 });
             }
@@ -1416,6 +1464,7 @@ async fn poll_signals(
                 let _ = event_tx.send(ControlEvent::PeerAnswer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
+                    candidate_sources: signal.candidate_sources,
                     handshake_response: handshake,
                 });
             }
@@ -1637,6 +1686,7 @@ mod tests {
             from_node_id: "alice".to_string(),
             to_node_id: "bob".to_string(),
             candidates: vec!["10.0.0.1:5000".to_string()],
+            candidate_sources: HashMap::new(),
             handshake_init: vec![0x01, 0x02],
         };
 

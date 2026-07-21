@@ -623,11 +623,12 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 // CreateSignal handles POST /api/v1/signals.
 func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromNodeID string   `json:"from_node_id"`
-		ToNodeID   string   `json:"to_node_id"`
-		Type       string   `json:"type"`
-		Candidates []string `json:"candidates"`
-		Handshake  string   `json:"handshake"`
+		FromNodeID       string            `json:"from_node_id"`
+		ToNodeID         string            `json:"to_node_id"`
+		Type             string            `json:"type"`
+		Candidates       []string          `json:"candidates"`
+		CandidateSources map[string]string `json:"candidate_sources"`
+		Handshake        string            `json:"handshake"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -653,9 +654,25 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"too many candidates (max 20)"}`, http.StatusBadRequest)
 		return
 	}
+	candidateSet := make(map[string]struct{}, len(req.Candidates))
 	for i, c := range req.Candidates {
 		if len(c) > 256 {
 			http.Error(w, fmt.Sprintf(`{"error":"candidate %d too long"}`, i), http.StatusBadRequest)
+			return
+		}
+		candidateSet[c] = struct{}{}
+	}
+	if len(req.CandidateSources) > len(req.Candidates) {
+		http.Error(w, `{"error":"too many candidate sources"}`, http.StatusBadRequest)
+		return
+	}
+	for endpoint, source := range req.CandidateSources {
+		if len(endpoint) > 256 || len(source) > 64 {
+			http.Error(w, `{"error":"candidate source too long"}`, http.StatusBadRequest)
+			return
+		}
+		if _, ok := candidateSet[endpoint]; !ok {
+			http.Error(w, `{"error":"candidate source references unknown candidate"}`, http.StatusBadRequest)
 			return
 		}
 	}
@@ -711,7 +728,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignal(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.Handshake)
+	signal, err := s.db.CreateSignal(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return

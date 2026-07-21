@@ -23,6 +23,7 @@ use crate::control::PeerInfo;
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
+const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 2;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
@@ -306,6 +307,8 @@ pub enum CandidatePairState {
 pub enum CandidatePairSource {
     /// Endpoint was signaled by the control plane or static peer metadata.
     Signaled,
+    /// Endpoint was predicted from the remote peer's NAT mapping delta.
+    Predicted,
     /// Endpoint was learned from legacy candidate-matched traffic.
     Learned,
     /// Endpoint was learned from an authenticated Probe v2 source address.
@@ -579,6 +582,8 @@ pub struct PeerConnection {
     pub relay_server: Option<String>,
     /// ICE candidates for this peer.
     pub candidates: Vec<String>,
+    /// Local-only source metadata keyed by candidate endpoint string.
+    pub candidate_sources: HashMap<String, CandidatePairSource>,
     /// Direct UDP path health.
     pub direct_health: PathHealth,
     /// Relay path health.
@@ -610,6 +615,7 @@ impl PeerConnection {
             bytes_received: 0,
             relay_server: None,
             candidates: Vec::new(),
+            candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
             direct_generation: 0,
@@ -681,11 +687,23 @@ impl PeerConnection {
         endpoints
     }
 
+    fn candidate_source_for_endpoint(&self, endpoint: SocketAddr) -> CandidatePairSource {
+        self.candidate_sources
+            .get(&endpoint.to_string())
+            .copied()
+            .unwrap_or(CandidatePairSource::Signaled)
+    }
+
     fn ensure_candidate_pair(
         &mut self,
         endpoint: SocketAddr,
         local_generation: u64,
     ) -> &mut CandidatePair {
+        if let Some(index) = self.candidate_pairs.iter().position(|pair| {
+            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+        }) {
+            return &mut self.candidate_pairs[index];
+        }
         self.ensure_candidate_pair_with_source(
             endpoint,
             local_generation,
@@ -717,7 +735,8 @@ impl PeerConnection {
 
     fn ensure_current_candidate_pairs(&mut self, local_generation: u64) {
         for endpoint in self.candidate_endpoints() {
-            self.ensure_candidate_pair(endpoint, local_generation);
+            let source = self.candidate_source_for_endpoint(endpoint);
+            self.ensure_candidate_pair_with_source(endpoint, local_generation, source);
         }
     }
 
@@ -763,7 +782,10 @@ impl PeerConnection {
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
-        pairs.into_iter().map(|pair| pair.remote_endpoint).collect()
+        apply_predicted_probe_budget(pairs, &source_stats)
+            .into_iter()
+            .map(|pair| pair.remote_endpoint)
+            .collect()
     }
 
     fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
@@ -1056,11 +1078,8 @@ impl PeerConnection {
     }
 
     fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
-        self.mark_candidate_pair_probing_with_source(
-            endpoint,
-            local_generation,
-            CandidatePairSource::Signaled,
-        );
+        self.ensure_candidate_pair(endpoint, local_generation)
+            .record_probing();
     }
 
     fn mark_candidate_pair_probing_with_source(
@@ -1297,14 +1316,30 @@ impl PeerManager {
 
     /// Add ICE candidates for a peer.
     pub async fn add_candidates(&self, node_id: &str, candidates: &[String]) {
+        self.add_candidates_with_sources(node_id, candidates, &HashMap::new())
+            .await;
+    }
+
+    /// Add ICE candidates plus optional source metadata for a peer.
+    pub async fn add_candidates_with_sources(
+        &self,
+        node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+    ) {
         let generation = self.current_network_generation().await;
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             for c in candidates {
                 if !conn.candidates.contains(c) {
                     conn.candidates.push(c.clone());
                 }
+                let source = candidate_sources
+                    .get(c)
+                    .and_then(|value| candidate_pair_source_from_label(value))
+                    .unwrap_or(CandidatePairSource::Signaled);
+                conn.candidate_sources.insert(c.clone(), source);
                 if let Ok(endpoint) = c.parse::<SocketAddr>() {
-                    conn.ensure_candidate_pair(endpoint, generation);
+                    conn.ensure_candidate_pair_with_source(endpoint, generation, source);
                 }
             }
 
@@ -1407,6 +1442,23 @@ impl PeerManager {
                     .map(|endpoint| (conn.node_id.clone(), endpoint))
             })
             .collect()
+    }
+
+    /// Return candidate endpoints for a specific peer using the adaptive probe scheduler.
+    pub async fn direct_probe_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Vec::new();
+        };
+        if conn.state == ConnectionState::Direct {
+            return Vec::new();
+        }
+        let endpoints = conn.candidate_probe_endpoints(generation);
+        for endpoint in &endpoints {
+            conn.mark_candidate_pair_probing(*endpoint, generation);
+        }
+        endpoints
     }
 
     /// Return candidate endpoints that should continue receiving direct-path probes.
@@ -2038,6 +2090,7 @@ fn candidate_pair_source_stats(
         CandidatePairSource::PeerReflexive,
         CandidatePairSource::Learned,
         CandidatePairSource::Signaled,
+        CandidatePairSource::Predicted,
     ]
     .into_iter()
     .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source))
@@ -2097,6 +2150,35 @@ fn candidate_pair_source_stats_for(
     })
 }
 
+fn apply_predicted_probe_budget<'a>(
+    pairs: Vec<&'a CandidatePair>,
+    stats: &[CandidatePairSourceStats],
+) -> Vec<&'a CandidatePair> {
+    let predicted_has_success = stats
+        .iter()
+        .find(|stats| stats.source == CandidatePairSource::Predicted)
+        .is_some_and(|stats| stats.success_count > 0);
+    if predicted_has_success {
+        return pairs;
+    }
+
+    let mut predicted_used = 0usize;
+    pairs
+        .into_iter()
+        .filter(|pair| {
+            if pair.source != CandidatePairSource::Predicted {
+                return true;
+            }
+            if predicted_used < PREDICTED_PROBE_BUDGET_PER_CYCLE {
+                predicted_used += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
 fn latest_instant(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
     match (current, candidate) {
         (Some(current), Some(candidate)) => Some(current.max(candidate)),
@@ -2112,6 +2194,16 @@ fn success_rate_per_mille(success_count: u64, failure_count: u64) -> Option<u16>
         return None;
     }
     Some(((success_count.saturating_mul(1000)) / total).min(1000) as u16)
+}
+
+fn candidate_pair_source_from_label(label: &str) -> Option<CandidatePairSource> {
+    match label {
+        "predicted" => Some(CandidatePairSource::Predicted),
+        "peer_reflexive" => Some(CandidatePairSource::PeerReflexive),
+        "learned" => Some(CandidatePairSource::Learned),
+        "signaled" | "host" | "stun_observed" | "manual" => Some(CandidatePairSource::Signaled),
+        _ => None,
+    }
 }
 
 fn candidate_pair_source_quality_rank(
@@ -2132,6 +2224,7 @@ fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
         CandidatePairSource::PeerReflexive => 0,
         CandidatePairSource::Learned => 1,
         CandidatePairSource::Signaled => 2,
+        CandidatePairSource::Predicted => 3,
     }
 }
 
@@ -2550,6 +2643,63 @@ mod tests {
 
         let json = serde_json::to_value(&diagnostics[0]).unwrap();
         assert_eq!(json["candidate_pair_stats"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn candidate_pairs_record_predicted_source_from_signal_metadata() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51840".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &["203.0.113.10:40007".to_string()],
+                &HashMap::from([("203.0.113.10:40007".to_string(), "predicted".to_string())]),
+            )
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        let predicted = diagnostics[0]
+            .candidate_pair_stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::Predicted)
+            .unwrap();
+        assert_eq!(predicted.current_pair_count, 1);
+        assert!(diagnostics[0].candidate_pairs.iter().any(|pair| {
+            pair.remote_endpoint == "203.0.113.10:40007"
+                && pair.source == CandidatePairSource::Predicted
+        }));
+    }
+
+    #[tokio::test]
+    async fn predicted_candidates_have_independent_probe_budget() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        let candidates = vec![
+            "203.0.113.10:40007".to_string(),
+            "203.0.113.10:40009".to_string(),
+            "203.0.113.10:40011".to_string(),
+            "203.0.113.10:40013".to_string(),
+        ];
+        let sources = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        let predicted_count = targets
+            .iter()
+            .filter(|endpoint| endpoint.ip().to_string() == "203.0.113.10")
+            .count();
+        assert_eq!(predicted_count, PREDICTED_PROBE_BUDGET_PER_CYCLE);
     }
 
     #[tokio::test]

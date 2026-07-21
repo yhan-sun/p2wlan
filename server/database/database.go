@@ -100,6 +100,7 @@ func migrate(db *sql.DB) error {
 		to_node_id   TEXT NOT NULL,
 		type        TEXT NOT NULL,
 		candidates  TEXT NOT NULL DEFAULT '[]',
+		candidate_sources TEXT NOT NULL DEFAULT '{}',
 		handshake   TEXT NOT NULL DEFAULT '',
 		created_at  INTEGER NOT NULL
 	);
@@ -156,6 +157,7 @@ func migrate(db *sql.DB) error {
 	}
 
 	_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN ed25519_public_key TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidate_sources TEXT NOT NULL DEFAULT '{}'`)
 
 	// Insert default system user and network to satisfy foreign keys,
 	// then grant the system user membership to the default network.
@@ -701,24 +703,32 @@ func (db *DB) DeleteDevice(deviceID string) error {
 
 // Signal represents one queued control-plane signaling message.
 type Signal struct {
-	ID         string   `json:"id"`
-	FromNodeID string   `json:"from_node_id"`
-	ToNodeID   string   `json:"to_node_id"`
-	Type       string   `json:"type"`
-	Candidates []string `json:"candidates"`
-	Handshake  string   `json:"handshake"`
-	CreatedAt  int64    `json:"created_at"`
+	ID               string            `json:"id"`
+	FromNodeID       string            `json:"from_node_id"`
+	ToNodeID         string            `json:"to_node_id"`
+	Type             string            `json:"type"`
+	Candidates       []string          `json:"candidates"`
+	CandidateSources map[string]string `json:"candidate_sources,omitempty"`
+	Handshake        string            `json:"handshake"`
+	CreatedAt        int64             `json:"created_at"`
 }
 
 const signalTTLSeconds int64 = 120
 
 // CreateSignal queues a signaling message for a target node.
-func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string, handshake string) (*Signal, error) {
+func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string, candidateSources map[string]string, handshake string) (*Signal, error) {
 	if candidates == nil {
 		candidates = []string{}
 	}
+	if candidateSources == nil {
+		candidateSources = map[string]string{}
+	}
 
 	candidatesJSON, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, err
+	}
+	candidateSourcesJSON, err := json.Marshal(candidateSources)
 	if err != nil {
 		return nil, err
 	}
@@ -737,8 +747,8 @@ func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string
 	if _, err = tx.Exec(`DELETE FROM signals WHERE from_node_id = ? AND to_node_id = ? AND type = ?`, fromNodeID, toNodeID, typ); err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, handshake, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), handshake, now)
+	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, candidate_sources, handshake, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), string(candidateSourcesJSON), handshake, now)
 	if err != nil {
 		return nil, err
 	}
@@ -748,7 +758,7 @@ func (db *DB) CreateSignal(fromNodeID, toNodeID, typ string, candidates []string
 
 	return &Signal{
 		ID: id, FromNodeID: fromNodeID, ToNodeID: toNodeID, Type: typ,
-		Candidates: candidates, Handshake: handshake, CreatedAt: now,
+		Candidates: candidates, CandidateSources: candidateSources, Handshake: handshake, CreatedAt: now,
 	}, nil
 }
 
@@ -765,7 +775,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, handshake, created_at
+	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, candidate_sources, handshake, created_at
 		FROM signals WHERE to_node_id = ? AND created_at >= ? ORDER BY created_at ASC`, toNodeID, now-signalTTLSeconds)
 	if err != nil {
 		return nil, err
@@ -775,7 +785,8 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	for rows.Next() {
 		var s Signal
 		var candidatesJSON string
-		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &candidatesJSON, &s.Handshake, &s.CreatedAt); err != nil {
+		var candidateSourcesJSON string
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &candidatesJSON, &candidateSourcesJSON, &s.Handshake, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(candidatesJSON), &s.Candidates); err != nil {
@@ -783,6 +794,12 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		}
 		if s.Candidates == nil {
 			s.Candidates = []string{}
+		}
+		if err := json.Unmarshal([]byte(candidateSourcesJSON), &s.CandidateSources); err != nil {
+			return nil, err
+		}
+		if s.CandidateSources == nil {
+			s.CandidateSources = map[string]string{}
 		}
 		signals = append(signals, s)
 	}

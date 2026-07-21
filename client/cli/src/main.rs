@@ -2547,12 +2547,18 @@ mod tests {
                 "failure_count": 0,
                 "success_rate_per_mille": 1000,
                 "current_pair_count": 2
+            }, {
+                "source": "predicted",
+                "success_count": 1,
+                "failure_count": 3,
+                "success_rate_per_mille": 250,
+                "current_pair_count": 4
             }]
         });
 
         assert_eq!(
             candidate_pair_stats_summary(&peer).as_deref(),
-            Some("peer_reflexive=1/2:500‰,current=1 signaled=2/2:1000‰,current=2")
+            Some("peer_reflexive=1/2:500‰,current=1 signaled=2/2:1000‰,current=2 predicted=1/4:250‰,current=4")
         );
     }
 

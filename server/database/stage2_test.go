@@ -178,7 +178,7 @@ func TestDatabase_DeviceSignalAuth(t *testing.T) {
 	bobDev := newDevice(t, db, bob.ID, "default")
 
 	// Alice's device creates a signal TO bob
-	sig, err := db.CreateSignal(aliceDev.ID, bobDev.ID, "peer_offer", []string{"cand"}, "hs")
+	sig, err := db.CreateSignal(aliceDev.ID, bobDev.ID, "peer_offer", []string{"cand"}, map[string]string{"cand": "predicted"}, "hs")
 	if err != nil {
 		t.Fatalf("CreateSignal: %v", err)
 	}
@@ -190,6 +190,9 @@ func TestDatabase_DeviceSignalAuth(t *testing.T) {
 	}
 	if len(sigs) != 1 || sigs[0].ID != sig.ID {
 		t.Fatal("Bob should receive Alice's signal")
+	}
+	if sigs[0].CandidateSources["cand"] != "predicted" {
+		t.Fatalf("expected candidate source roundtrip, got %#v", sigs[0].CandidateSources)
 	}
 
 	// Alice's device should NOT have any signals (none addressed to Alice)
@@ -204,7 +207,7 @@ func TestDatabase_DeviceSignalAuth(t *testing.T) {
 	// A different device should not be able to consume signals addressed to someone else
 	_, _ = db.CreateDevice(alice.ID, "default", "pk-eve-"+fmt.Sprint(time.Now().UnixNano()), "eve-dev", "linux", "")
 	// Create signal for bob
-	_, err = db.CreateSignal(aliceDev.ID, bobDev.ID, "peer_offer", []string{"c2"}, "hs2")
+	_, err = db.CreateSignal(aliceDev.ID, bobDev.ID, "peer_offer", []string{"c2"}, nil, "hs2")
 	if err != nil {
 		t.Fatalf("CreateSignal: %v", err)
 	}
@@ -260,7 +263,7 @@ func TestDatabase_CrossNetworkSignalBlocked(t *testing.T) {
 	// The signal CAN be created at DB level (no FK to device network),
 	// but the API layer checks NetworkID matching before creating.
 	// This test validates the DB-level routing and consumption.
-	_, err = db.CreateSignal(devA.ID, devB.ID, "peer_offer", []string{"c"}, "hs")
+	_, err = db.CreateSignal(devA.ID, devB.ID, "peer_offer", []string{"c"}, nil, "hs")
 	if err != nil {
 		t.Fatalf("CreateSignal cross-network: %v", err)
 	}
