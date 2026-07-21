@@ -261,6 +261,21 @@ fn record_relay_pong(
     );
 }
 
+fn relay_error_code_name(code: u16) -> String {
+    p2pnet_relay::RelayErrorCode::from_u16(code)
+        .map(|ec| ec.to_snake_case().to_string())
+        .unwrap_or_else(|| format!("error_{code}"))
+}
+
+fn relay_error_peer_id(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("peer not found: ")
+        .or_else(|| message.strip_prefix("peer disconnected: "))
+        .or_else(|| message.strip_prefix("peer backpressure: "))
+        .map(str::trim)
+        .filter(|peer_id| !peer_id.is_empty())
+}
+
 #[derive(Debug)]
 enum RelayAttemptError {
     Relay(p2pnet_relay::RelayError),
@@ -714,10 +729,7 @@ impl RelayTransport {
             })?;
 
         self.peers
-            .set_relay(&packet.peer_id, &self.relay_endpoint)
-            .await;
-        self.peers
-            .record_sent(&packet.peer_id, packet.wire_bytes.len() as u64)
+            .record_relay_attempt(&packet.peer_id, &self.relay_endpoint)
             .await;
         debug!(
             "Sent {} encrypted bytes to peer {} through relay {}",
@@ -750,19 +762,21 @@ impl RelayTransport {
                     )));
                 }
                 RelayMessage::Error { code, message } => {
+                    let error_code = relay_error_code_name(code);
                     warn!(
-                        "Received relay runtime error: code={}, message={}",
-                        code, message
+                        "Received relay runtime error: code={}, error_code={}, message={}",
+                        code, error_code, message
                     );
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
                         d.selected_error_count = d.selected_error_count.saturating_add(1);
                         d.last_error = Some(message.clone());
-                        if let Some(ec) = p2pnet_relay::RelayErrorCode::from_u16(code) {
-                            d.last_error_code = Some(ec.to_snake_case().to_string());
-                        } else {
-                            d.last_error_code = Some(format!("error_{}", code));
-                        }
+                        d.last_error_code = Some(error_code.clone());
+                    }
+                    if let Some(peer_id) = relay_error_peer_id(&message).map(str::to_string) {
+                        self.peers
+                            .record_relay_failure(&peer_id, error_code, message)
+                            .await;
                     }
                 }
                 RelayMessage::Pong { timestamp } => {
@@ -779,12 +793,11 @@ impl RelayTransport {
                     );
                 }
                 RelayMessage::Data { from_node, data } => {
-                    self.peers
-                        .record_relay_success(&from_node, &self.relay_endpoint, false)
-                        .await;
                     inbound_tx
                         .send(ReceivedEncryptedPacket {
                             source: None,
+                            relay_endpoint: Some(self.relay_endpoint.clone()),
+                            relay_peer_id: Some(from_node),
                             wire_bytes: data,
                         })
                         .await
@@ -856,6 +869,25 @@ mod tests {
         assert!(diagnostics.selected_last_pong_age_ms.unwrap() > 0);
     }
 
+    #[test]
+    fn relay_runtime_error_helpers_extract_peer_context() {
+        assert_eq!(relay_error_code_name(404), "peer_not_found");
+        assert_eq!(relay_error_code_name(4999), "error_4999");
+        assert_eq!(
+            relay_error_peer_id("peer not found: node-b"),
+            Some("node-b")
+        );
+        assert_eq!(
+            relay_error_peer_id("peer disconnected: node-b "),
+            Some("node-b")
+        );
+        assert_eq!(
+            relay_error_peer_id("peer backpressure: node-b"),
+            Some("node-b")
+        );
+        assert_eq!(relay_error_peer_id("target peer not connected"), None);
+    }
+
     #[tokio::test]
     async fn relay_transport_sends_encrypted_datagrams() {
         let server = RelayServer::start_random().await.unwrap();
@@ -891,15 +923,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.source, None);
+        assert_eq!(
+            received.relay_endpoint.as_deref(),
+            Some(relay_endpoint.as_str())
+        );
+        assert_eq!(received.relay_peer_id.as_deref(), Some("node-a"));
         assert_eq!(received.wire_bytes, payload);
 
         let conn_a = peers_a.get_connection("node-b").await.unwrap();
-        assert_eq!(conn_a.state, ConnectionState::Relay);
+        assert_eq!(conn_a.state, ConnectionState::Idle);
         assert_eq!(conn_a.relay_server, Some(relay_endpoint.clone()));
+        assert_eq!(conn_a.bytes_sent, 0);
 
         let conn_b = peers_b.get_connection("node-a").await.unwrap();
-        assert_eq!(conn_b.state, ConnectionState::Relay);
-        assert_eq!(conn_b.relay_server, Some(relay_endpoint));
+        assert_eq!(conn_b.state, ConnectionState::Idle);
+        assert_eq!(conn_b.relay_server, None);
+
+        inbound_worker.abort();
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_peer_not_found_is_attributed_to_destination() {
+        let server = RelayServer::start_random().await.unwrap();
+        let relay_endpoint = server.addr.to_string();
+        let peers = peer_manager();
+        peers.add_peer(&peer("node-b", "10.20.0.2")).await;
+
+        let (relay, relay_rx) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+            .await
+            .unwrap();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let inbound_worker = tokio::spawn(relay.clone().run_inbound(relay_rx, inbound_tx, None));
+
+        relay
+            .send_packet(&EncryptedPeerPacket {
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                wire_bytes: vec![4, 1, 2, 3],
+            })
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let conn = peers.get_connection("node-b").await.unwrap();
+                if conn.relay_health.last_error_code.as_deref() == Some("peer_not_found") {
+                    assert_eq!(
+                        conn.relay_health.last_error.as_deref(),
+                        Some("peer not found: node-b")
+                    );
+                    assert_eq!(conn.state, ConnectionState::Idle);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay 404 was not attributed to node-b");
+
+        let diagnostics = peers
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(diagnostics[0].active_path, None);
 
         inbound_worker.abort();
         server.shutdown().await;

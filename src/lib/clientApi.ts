@@ -565,7 +565,9 @@ function activePathSummary(snapshot: DiagnosticsSnapshot): string {
 
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
   const directPathAvailable = snapshot.stats.direct_connections > 0;
-  const relayPathAvailable = snapshot.relay_connected || snapshot.stats.relay_connections > 0;
+  // A healthy TCP/TLS session to the relay service does not prove that any
+  // destination peer is registered and reachable through it.
+  const relayPathAvailable = snapshot.stats.relay_connections > 0;
   const anyPathAvailable = directPathAvailable || relayPathAvailable;
   const isOptionalRelayIssue = (message: string) => {
     const normalized = message.toLowerCase();
@@ -625,9 +627,14 @@ function mapSnapshotToDaemonStatus(
 }
 
 function mapPeer(peer: PeerDiagnostics): PeerStatus {
-  const path =
-    peer.active_path ??
-    (peer.state === "direct" || peer.state === "relay" ? peer.state : "offline");
+  const path = peer.active_path ?? "offline";
+  const pathErrors = [peer.direct, peer.relay]
+    .filter(health => health.last_error)
+    .sort(
+      (left, right) =>
+        (left.last_failure_age_ms ?? Number.POSITIVE_INFINITY) -
+        (right.last_failure_age_ms ?? Number.POSITIVE_INFINITY)
+    );
   const lastActiveMs =
     peer.direct.last_success_age_ms ??
     peer.relay.last_success_age_ms ??
@@ -651,7 +658,7 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     bytesSent: peer.bytes_sent,
     bytesReceived: peer.bytes_received,
     relayServer: peer.relay_server,
-    lastError: peer.direct.last_error ?? peer.relay.last_error,
+    lastError: pathErrors[0]?.last_error ?? null,
     candidates: peer.candidates,
     directHealth: peer.direct,
     relayHealth: peer.relay,

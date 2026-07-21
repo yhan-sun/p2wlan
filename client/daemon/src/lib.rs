@@ -53,7 +53,7 @@ pub use error::{DaemonError, Result};
 // Daemon
 // ============================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
@@ -93,8 +93,34 @@ use udp::UdpTransport;
 #[derive(Default)]
 struct PendingHandshakeState {
     pending: HashMap<String, HandshakeInitiator>,
+    pending_ids: HashMap<String, u64>,
+    next_id: u64,
     /// Number of initiation attempts per peer (bounded retries).
     attempts: HashMap<String, u32>,
+}
+
+impl PendingHandshakeState {
+    fn insert(&mut self, peer_id: String, initiator: HandshakeInitiator) -> u64 {
+        self.next_id = self.next_id.saturating_add(1);
+        let pending_id = self.next_id;
+        self.pending.insert(peer_id.clone(), initiator);
+        self.pending_ids.insert(peer_id, pending_id);
+        pending_id
+    }
+
+    fn remove(&mut self, peer_id: &str) -> Option<HandshakeInitiator> {
+        self.pending_ids.remove(peer_id);
+        self.pending.remove(peer_id)
+    }
+
+    fn clear_peer(&mut self, peer_id: &str) {
+        self.remove(peer_id);
+        self.attempts.remove(peer_id);
+    }
+
+    fn is_current(&self, peer_id: &str, pending_id: u64) -> bool {
+        self.pending_ids.get(peer_id).copied() == Some(pending_id)
+    }
 }
 
 /// Maximum number of handshake re-initiation attempts before giving up.
@@ -104,7 +130,11 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
 /// Short grace period for UDP/STUN candidate gathering before signaling a WireGuard offer.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
 /// Public STUN fallbacks used when older configs do not specify STUN servers.
-const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
+const DEFAULT_STUN_SERVERS: &[&str] = &[
+    "stun.cloudflare.com:3478",
+    "stun.miwifi.com:3478",
+    "stun.l.google.com:19302",
+];
 /// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Server-side signaling currently rejects candidate lists above this size.
@@ -118,6 +148,8 @@ const NAT_MAPPING_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(650);
 const NAT_MAPPING_CONTROL_PORT: u16 = 5351;
 /// Short cooldown after a selected Relay fails at runtime before trying it again.
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
+/// Active-path liveness must react much faster than a typical NAT mapping lease.
+const DIRECT_LIVENESS_INTERVAL_MAX: Duration = Duration::from_secs(8);
 
 /// The main daemon orchestrator.
 ///
@@ -363,7 +395,12 @@ impl Daemon {
         } else {
             info!("Using STUN endpoints: {stun_servers:?}");
         }
-        let keepalive_interval = Duration::from_secs(self.config.network.keepalive_interval_secs);
+        let configured_keepalive = Duration::from_secs(self.config.network.keepalive_interval_secs);
+        let keepalive_interval = if configured_keepalive.is_zero() {
+            Duration::ZERO
+        } else {
+            configured_keepalive.min(DIRECT_LIVENESS_INTERVAL_MAX)
+        };
         let upnp_enabled = self.config.network.upnp_enabled;
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
@@ -424,7 +461,9 @@ impl Daemon {
         if let Some(tun) = tun {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
-            let (mut dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
+            let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
+            let mut dataplane =
+                dataplane.with_acl(self.acl.clone(), self.config.node.node_id.clone());
 
             let outbound_transport = transport.clone();
             self.task_manager
@@ -556,6 +595,10 @@ impl Daemon {
                             )
                             .await;
                         }
+                        truncate_signal_candidates(
+                            &mut candidate_endpoints,
+                            &mut candidate_sources,
+                        );
 
                         info!(
                             "Prepared {} UDP candidate endpoints for signaling",
@@ -766,14 +809,14 @@ impl Daemon {
                             let candidates = local_candidates.read().await.clone();
                             let candidate_sources = local_candidate_sources.read().await.clone();
 
-                            let attempt_no = {
+                            let (attempt_no, pending_id) = {
                                 let mut state = pending.lock().await;
                                 let attempts =
                                     state.attempts.entry(conn.node_id.clone()).or_insert(0);
                                 *attempts = attempts.saturating_add(1);
                                 let attempt_no = *attempts;
-                                state.pending.insert(conn.node_id.clone(), initiator);
-                                attempt_no
+                                let pending_id = state.insert(conn.node_id.clone(), initiator);
+                                (attempt_no, pending_id)
                             };
 
                             if let Err(err) = control
@@ -787,7 +830,9 @@ impl Daemon {
                             {
                                 warn!("Handshake offer to {} failed: {err}", conn.node_id);
                                 let mut state = pending.lock().await;
-                                state.pending.remove(&conn.node_id);
+                                if state.is_current(&conn.node_id, pending_id) {
+                                    state.remove(&conn.node_id);
+                                }
                             } else {
                                 if is_rekey {
                                     info!(
@@ -825,10 +870,8 @@ impl Daemon {
                                             .await;
                                     }
                                     let mut state = pending2.lock().await;
-                                    if state.attempts.get(&timeout_peer).copied()
-                                        == Some(attempt_no)
-                                    {
-                                        state.pending.remove(&timeout_peer);
+                                    if state.is_current(&timeout_peer, pending_id) {
+                                        state.remove(&timeout_peer);
                                         if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
                                             state.attempts.remove(&timeout_peer);
                                         }
@@ -958,7 +1001,31 @@ impl Daemon {
                 }
 
                 ControlEvent::PeerUpdated(peer_info) => {
-                    self.peers.add_peer(&peer_info).await;
+                    let previous = self.peers.get_connection(&peer_info.node_id).await;
+                    let update = self.peers.add_peer(&peer_info).await;
+                    if update.public_key_changed {
+                        self.transport.remove_session(&peer_info.node_id).await;
+                        self.pending_handshakes
+                            .lock()
+                            .await
+                            .clear_peer(&peer_info.node_id);
+                        info!(
+                            "Peer {} public key changed; discarded the old WireGuard session",
+                            peer_info.node_id
+                        );
+                    }
+                    if update.virtual_ip_changed && self.dns.is_enabled() {
+                        if let Some(previous) = previous {
+                            self.dns.unregister(&previous.virtual_ip).await;
+                        }
+                        self.dns
+                            .register(
+                                &peer_info.node_id,
+                                &peer_info.virtual_ip,
+                                Some(&peer_info.node_id),
+                            )
+                            .await;
+                    }
                     if let Err(err) = self.maybe_initiate_handshake(&peer_info).await {
                         warn!(
                             "Failed to refresh WireGuard handshake with {} after peer update: {err}",
@@ -970,6 +1037,13 @@ impl Daemon {
 
                 ControlEvent::PeerLeft(node_id) => {
                     info!("Peer left: {}", node_id);
+                    if let Some(previous) = self.peers.get_connection(&node_id).await {
+                        if self.dns.is_enabled() {
+                            self.dns.unregister(&previous.virtual_ip).await;
+                        }
+                    }
+                    self.transport.remove_session(&node_id).await;
+                    self.pending_handshakes.lock().await.clear_peer(&node_id);
                     self.peers.remove_peer(&node_id).await;
                 }
 
@@ -1133,23 +1207,31 @@ impl Daemon {
         let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
 
         let peer_id_clone = peer_info.node_id.clone();
-        let attempt_no = {
+        let (attempt_no, pending_id) = {
             let mut state = self.pending_handshakes.lock().await;
             let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
             *attempts = attempts.saturating_add(1);
             let attempt_no = *attempts;
-            state.pending.insert(peer_id_clone.clone(), initiator);
-            attempt_no
+            let pending_id = state.insert(peer_id_clone.clone(), initiator);
+            (attempt_no, pending_id)
         };
 
-        self.control
+        if let Err(error) = self
+            .control
             .send_peer_offer_with_sources(
                 &peer_id_clone,
                 &candidates,
                 &candidate_sources,
                 &initiation_bytes,
             )
-            .await?;
+            .await
+        {
+            let mut state = self.pending_handshakes.lock().await;
+            if state.is_current(&peer_id_clone, pending_id) {
+                state.remove(&peer_id_clone);
+            }
+            return Err(error);
+        }
 
         info!(
             "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates, attempt {})",
@@ -1184,8 +1266,8 @@ impl Daemon {
             }
             // Remove from pending so retry is possible.
             let mut state = pending.lock().await;
-            if state.attempts.get(&timeout_peer).copied() == Some(attempt_no) {
-                state.pending.remove(&timeout_peer);
+            if state.is_current(&timeout_peer, pending_id) {
+                state.remove(&timeout_peer);
                 if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
                     state.attempts.remove(&timeout_peer);
                 }
@@ -1262,7 +1344,11 @@ impl Daemon {
                 Ok(sent) => {
                     info!("Sent {sent} UDP punch probes to peer {peer_id}");
                     sleep(probe_interval).await;
-                    if sent > 0 && !peers.is_direct_for_generation(&peer_id, generation).await {
+                    if sent > 0
+                        && !peers
+                            .has_direct_probe_success_for_generation(&peer_id, generation)
+                            .await
+                    {
                         peers
                             .record_direct_failure_for_generation(
                                 &peer_id,
@@ -1311,23 +1397,30 @@ impl Daemon {
             }
         }
 
-        self.transport
-            .add_session(from_node_id.to_string(), TransportSession::new(keys))
-            .await;
-        self.peers
-            .update_state(from_node_id, ConnectionState::Connecting)
-            .await;
-
         let response_bytes = response.to_bytes();
         let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
-        self.control
+        let previous_session = self
+            .transport
+            .replace_session(from_node_id.to_string(), TransportSession::new(keys))
+            .await;
+        if let Err(error) = self
+            .control
             .send_peer_answer_with_sources(
                 from_node_id,
                 &candidates,
                 &candidate_sources,
                 &response_bytes,
             )
-            .await?;
+            .await
+        {
+            self.transport
+                .restore_session(from_node_id, previous_session)
+                .await;
+            return Err(error);
+        }
+        self.peers
+            .update_state(from_node_id, ConnectionState::Connecting)
+            .await;
         info!(
             "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes, {} candidates)",
             response_bytes.len(),
@@ -1360,7 +1453,7 @@ impl Daemon {
                 }
             };
 
-            state.pending.remove(from_node_id);
+            state.remove(from_node_id);
             state.attempts.remove(from_node_id);
             keys
         };
@@ -1452,7 +1545,24 @@ fn candidate_endpoints_from_report(
             candidate_source_label(candidate.source).to_string(),
         );
     }
+    truncate_signal_candidates(&mut endpoints, &mut sources);
     (endpoints, sources)
+}
+
+fn truncate_signal_candidates(
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) {
+    if candidates.len() > MAX_SIGNAL_CANDIDATES {
+        warn!(
+            "Truncating {} gathered UDP candidates to the signaling limit of {}",
+            candidates.len(),
+            MAX_SIGNAL_CANDIDATES
+        );
+        candidates.truncate(MAX_SIGNAL_CANDIDATES);
+    }
+    let retained = candidates.iter().cloned().collect::<HashSet<_>>();
+    candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
 }
 
 fn candidate_source_label(source: CandidateSource) -> &'static str {
@@ -1499,14 +1609,6 @@ async fn maybe_add_port_mapping_udp_candidate(
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
 ) {
-    if candidates.len() >= MAX_SIGNAL_CANDIDATES {
-        debug!(
-            "Skipping port-mapping UDP candidate because candidate list already has {} entries",
-            candidates.len()
-        );
-        return;
-    }
-
     let Some(local_addr) = port_mapping_local_addr(udp_local_addr, candidates, candidate_sources)
     else {
         debug!("Skipping port-mapping UDP candidate because no LAN IPv4 local address was found");
@@ -1522,7 +1624,9 @@ async fn maybe_add_port_mapping_udp_candidate(
                 "{} mapped UDP {local_addr} as {}",
                 candidate.source, candidate.endpoint
             );
-            candidates.push(candidate.endpoint.clone());
+            // A gateway-created mapping is usually more useful than another
+            // host/predicted address and must survive the signaling cap.
+            candidates.insert(0, candidate.endpoint.clone());
             candidate_sources.insert(candidate.endpoint, candidate.source.to_string());
         }
         None => {
@@ -1962,7 +2066,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         ticker.tick().await;
 
         let report = match udp
-            .gather_candidate_report(stun_servers.clone(), stun_timeout)
+            .gather_candidate_report_live(stun_servers.clone(), stun_timeout)
             .await
         {
             Ok(report) => report,
@@ -2011,6 +2115,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             )
             .await;
         }
+        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
 
         let changed = {
             let mut current = local_candidates.write().await;
@@ -2045,9 +2150,17 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                 "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
             ))
             .await;
-        if let Some(endpoint) = advertised_endpoint {
-            if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
-                warn!("Failed to publish refreshed UDP endpoint {endpoint}: {err}");
+        let endpoint = advertised_endpoint.unwrap_or_default();
+        if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+            warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
+        }
+
+        for peer_id in control.peers().await.into_keys() {
+            if let Err(error) = control
+                .send_peer_offer_with_sources(&peer_id, &candidates, &candidate_sources, &[])
+                .await
+            {
+                warn!("Failed to publish refreshed UDP candidates to peer {peer_id}: {error}");
             }
         }
     }
@@ -2236,6 +2349,19 @@ impl RelaySupervisor {
                     )
                     .await;
                 *self.relay_transport.write().await = None;
+                let (peer_failure_code, peer_failure_reason) = match &ended {
+                    Ok(()) => (
+                        "relay_transport_closed",
+                        format!("relay {endpoint} transport closed"),
+                    ),
+                    Err(error) => (
+                        "relay_transport_failed",
+                        format!("relay {endpoint} transport failed: {error}"),
+                    ),
+                };
+                self.peers
+                    .invalidate_relay_transport(&endpoint, peer_failure_code, peer_failure_reason)
+                    .await;
 
                 let should_cooldown = self.relay_candidates.len() > 1;
                 let cooldown_ms = duration_millis(RELAY_RUNTIME_FAILURE_COOLDOWN);
@@ -2347,8 +2473,12 @@ async fn run_network_outbound(
             .select_path_for_data(&packet.peer_id, prefer_direct, relay_available)
             .await;
         debug!(
-            "Path selection for peer {}: path={:?} reason_code={} reason={}",
-            packet.peer_id, selection.path, selection.reason_code, selection.reason
+            "Path selection for peer {}: path={:?} relay_hedged={} reason_code={} reason={}",
+            packet.peer_id,
+            selection.path,
+            selection.relay_hedged,
+            selection.reason_code,
+            selection.reason
         );
 
         let sent_direct = if selection.path == Some(NetworkPath::Direct) {
@@ -2398,7 +2528,7 @@ async fn run_network_outbound(
             false
         };
 
-        if sent_direct && selection.direct_confirmed {
+        if sent_direct && selection.direct_confirmed && !selection.relay_hedged {
             continue;
         }
 
@@ -2690,6 +2820,29 @@ mod tests {
             advertised_udp_endpoint(local, None, &[]),
             Some("127.0.0.1:51820".to_string())
         );
+    }
+
+    #[test]
+    fn signal_candidate_cap_keeps_priority_prefix_and_source_map_aligned() {
+        let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 3)
+            .map(|index| format!("192.0.2.{index}:51820"))
+            .collect::<Vec<_>>();
+        let mapped = "198.51.100.10:42000".to_string();
+        candidates.insert(0, mapped.clone());
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint, "host".to_string()))
+            .collect::<HashMap<_, _>>();
+        sources.insert(mapped.clone(), "upnp".to_string());
+
+        truncate_signal_candidates(&mut candidates, &mut sources);
+
+        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert_eq!(candidates[0], mapped);
+        assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
+        assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+        assert_eq!(sources.get(&mapped).map(String::as_str), Some("upnp"));
     }
 
     #[test]
@@ -3039,7 +3192,7 @@ mod tests {
 
         {
             let mut state = daemon.pending_handshakes.lock().await;
-            state.pending.insert(peer_id.to_string(), initiator);
+            state.insert(peer_id.to_string(), initiator);
             state.attempts.insert(peer_id.to_string(), 1);
         }
 
@@ -3196,8 +3349,11 @@ mod tests {
         );
 
         let conn = peers.get_connection("node-b").await.unwrap();
-        assert_eq!(conn.state, ConnectionState::Relay);
-        assert_eq!(conn.active_path(), Some(peer::NetworkPath::Relay));
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert_eq!(conn.active_path(), None);
+        assert_eq!(conn.relay_server, Some(relay_endpoint));
+        let selection = peers.select_path_for_data("node-b", true, true).await;
+        assert_eq!(selection.path, Some(peer::NetworkPath::Relay));
 
         worker.abort();
         server.shutdown().await;

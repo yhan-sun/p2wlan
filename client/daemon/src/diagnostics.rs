@@ -218,6 +218,16 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let mut relay_selection = context.relay_selection.read().await.clone();
     relay_selection.refresh_runtime_ages();
 
+    let peers = context
+        .peers
+        .diagnostics_with_path_selection(
+            context.config.relay.prefer_direct,
+            relay_connected,
+            direct_retry_after,
+        )
+        .await;
+    let stats = PeerManagerStats::from_diagnostics(&peers);
+
     DiagnosticsSnapshot {
         process_id: std::process::id(),
         node_id: context.config.node.node_id.clone(),
@@ -231,15 +241,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         relay_connected,
         relay_selection,
         traversal_history: context.peers.traversal_history_diagnostics().await,
-        peers: context
-            .peers
-            .diagnostics_with_path_selection(
-                context.config.relay.prefer_direct,
-                relay_connected,
-                direct_retry_after,
-            )
-            .await,
-        stats: context.peers.stats().await,
+        peers,
+        stats,
         health: health_snap,
     }
 }

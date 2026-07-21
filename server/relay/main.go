@@ -27,17 +27,17 @@ import (
 var magic = []byte{'D', 'E', 'R', 'P'}
 
 const (
-	version          = byte(1)
-	frameHeader      = 8
-	msgRegister      = byte(0x01)
-	msgRegistered    = byte(0x02)
-	msgForward       = byte(0x03)
-	msgReceived      = byte(0x04)
-	msgPing          = byte(0x05)
-	msgPong          = byte(0x06)
-	msgError         = byte(0x07)
-	msgClose         = byte(0x08)
-	msgAuthRegister  = byte(0x09)
+	version         = byte(1)
+	frameHeader     = 8
+	msgRegister     = byte(0x01)
+	msgRegistered   = byte(0x02)
+	msgForward      = byte(0x03)
+	msgReceived     = byte(0x04)
+	msgPing         = byte(0x05)
+	msgPong         = byte(0x06)
+	msgError        = byte(0x07)
+	msgClose        = byte(0x08)
+	msgAuthRegister = byte(0x09)
 )
 
 // A2 error codes (extending A1 codes)
@@ -59,12 +59,12 @@ var (
 )
 
 type RelayConfig struct {
-	Bind                       string
-	SendQueueCapacity          int
-	RegisterTimeout            time.Duration
-	IdleTimeout                time.Duration
-	MaxConnections             int
-	MaxFramePayload            int
+	Bind              string
+	SendQueueCapacity int
+	RegisterTimeout   time.Duration
+	IdleTimeout       time.Duration
+	MaxConnections    int
+	MaxFramePayload   int
 	// A2: security settings
 	RequireAuthentication      bool
 	AllowLegacyUnauthenticated bool
@@ -72,10 +72,10 @@ type RelayConfig struct {
 	TLSPrivateKeyPath          string
 	AllowInsecurePlaintext     bool
 	// A2: ticket verification
-	TicketKeyringJSON          string
-	RelayAudience              string
-	RelayRegion                string
-	TicketMaxClockSkew         time.Duration
+	TicketKeyringJSON  string
+	RelayAudience      string
+	RelayRegion        string
+	TicketMaxClockSkew time.Duration
 }
 
 // networkNodeKey is the composite key for the peer table: (network_id, node_id).
@@ -132,35 +132,35 @@ func (h *hub) lookup(networkID, nodeID string) *peer {
 	return h.peers[networkNodeKey{networkID: networkID, nodeID: nodeID}]
 }
 
-// forward forwards payload and returns error code (0 for success).
+// forward forwards payload and returns error code (0 for success) and a diagnostic message.
 // Uses network-scoped lookup: source and destination must be in the same network.
-func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayload int) uint16 {
+func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayload int) (uint16, string) {
 	dst := h.lookup(srcNetwork, dstID)
 	if dst == nil {
 		// Return 404 even if peer exists in a different network — do not leak
 		// that information to the sender.
-		return 404
+		return 404, "peer not found: " + dstID
 	}
 
 	// Enforce max_frame_payload limit on outbound frames
 	totalLen := 1 + len(srcID) + len(data)
 	if totalLen > maxFramePayload {
-		return 4006 // ERR_FRAME_TOO_LARGE
+		return 4006, "forwarded frame too large" // ERR_FRAME_TOO_LARGE
 	}
 
 	frame, err := receivedFrame(srcID, data)
 	if err != nil {
-		return 4000
+		return 4000, "malformed received frame"
 	}
 	select {
 	case dst.send <- frame:
-		return 0
+		return 0, ""
 	case <-dst.done:
-		return 404
+		return 404, "peer disconnected: " + dstID
 	default:
 		// slow consumer backpressure: close target connection
 		_ = dst.conn.Close()
-		return 4008
+		return 4008, "peer backpressure: " + dstID
 	}
 }
 
@@ -792,9 +792,9 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 				queue(p, errorFrame(4000, "malformed forward payload"))
 				continue
 			}
-			status := s.hub.forward(networkID, p.id, dstID, data, s.config.MaxFramePayload)
+			status, message := s.hub.forward(networkID, p.id, dstID, data, s.config.MaxFramePayload)
 			if status != 0 {
-				queue(p, errorFrame(status, "forward failed"))
+				queue(p, errorFrame(status, message))
 			}
 
 		case msgPing:

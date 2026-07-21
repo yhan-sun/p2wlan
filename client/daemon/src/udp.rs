@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet, build_punch_ack,
-    build_punch_packet, decode_authenticated_punch_packet, decode_punch_packet,
-    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport, IceConfig,
-    PunchPacketKind,
+    build_punch_packet, candidate_report_from_observations, decode_authenticated_punch_packet,
+    decode_punch_packet, gather_candidate_report, peek_authenticated_punch_identity,
+    CandidateGatherReport, IceConfig, PunchPacketKind, StunAttribute, StunMessage, StunObservation,
+    BINDING_RESPONSE, MAGIC_COOKIE,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::{interval, sleep};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, trace, warn};
 
 use crate::error::{DaemonError, Result};
@@ -26,6 +27,10 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 type ProbeNonce = [u8; 8];
 type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
+type StunTransactionId = [u8; 12];
+type StunResponse = (Vec<u8>, SocketAddr);
+type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
+const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct PendingProbe {
@@ -100,6 +105,7 @@ pub struct UdpTransport {
     socket: Arc<UdpSocket>,
     peers: Arc<PeerManager>,
     pending_probes: PendingProbes,
+    stun_waiters: StunWaiters,
     local_node_id: Option<String>,
 }
 
@@ -114,6 +120,7 @@ impl UdpTransport {
             socket: Arc::new(socket),
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
+            stun_waiters: Arc::new(Mutex::new(HashMap::new())),
             local_node_id: None,
         })
     }
@@ -124,7 +131,7 @@ impl UdpTransport {
         self
     }
 
-    async fn send_probe(&self, peer_id: Option<&str>, peer_addr: SocketAddr) -> Result<()> {
+    async fn send_probe(&self, peer_id: Option<&str>, peer_addr: SocketAddr) -> Result<ProbeNonce> {
         let generation = self.peers.current_network_generation().await;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
             (Some(peer_id), Some(local_node_id))
@@ -173,7 +180,7 @@ impl UdpTransport {
                 "UDP probe send to {peer_addr} failed: {error}"
             )));
         }
-        Ok(())
+        Ok(nonce)
     }
 
     /// Return the local UDP socket address.
@@ -218,6 +225,93 @@ impl UdpTransport {
             .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))
     }
 
+    /// Gather candidates while `run_inbound` owns all reads from the UDP socket.
+    pub async fn gather_candidate_report_live(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
+        let local_addr = self.local_addr()?;
+        let mut observations = Vec::with_capacity(stun_servers.len());
+
+        for server in stun_servers {
+            if server.is_ipv4() != local_addr.is_ipv4() {
+                continue;
+            }
+            observations.push(self.query_stun_live(server, stun_timeout).await);
+        }
+
+        Ok(candidate_report_from_observations(
+            local_addr,
+            true,
+            observations,
+        ))
+    }
+
+    async fn query_stun_live(&self, server: SocketAddr, stun_timeout: Duration) -> StunObservation {
+        let started = Instant::now();
+        let mut request = StunMessage::binding_request();
+        request.add_attribute(StunAttribute::Software("P2WLAN/0.1".to_string()));
+        let transaction_id = request.transaction_id;
+        let encoded = request.encode();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.stun_waiters
+            .lock()
+            .await
+            .insert(transaction_id, response_tx);
+
+        let result = async {
+            self.socket
+                .send_to(&encoded, server)
+                .await
+                .map_err(|error| format!("send_to failed: {error}"))?;
+            let (data, source) = timeout(stun_timeout, response_rx)
+                .await
+                .map_err(|_| format!("no response from {server} after {stun_timeout:?}"))?
+                .map_err(|_| "STUN response dispatcher closed".to_string())?;
+            if source != server {
+                return Err(format!(
+                    "response source mismatch: expected {server}, received {source}"
+                ));
+            }
+            let response = StunMessage::decode(&data)
+                .map_err(|error| format!("invalid STUN response: {error}"))?;
+            if response.transaction_id != transaction_id {
+                return Err("STUN transaction ID mismatch".to_string());
+            }
+            if response.msg_type != BINDING_RESPONSE {
+                if let Some((code, reason)) = response.get_error_code() {
+                    return Err(format!("STUN error response: {code} {reason}"));
+                }
+                return Err(format!(
+                    "unexpected STUN message type: 0x{:04X}",
+                    response.msg_type
+                ));
+            }
+            response
+                .get_reflexive_address()
+                .ok_or_else(|| "STUN response has no mapped address".to_string())
+        }
+        .await;
+
+        self.stun_waiters.lock().await.remove(&transaction_id);
+        match result {
+            Ok(mapped_address) => StunObservation {
+                server: server.to_string(),
+                mapped_address: Some(mapped_address.to_string()),
+                rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                error: None,
+            },
+            Err(error) => StunObservation {
+                server: server.to_string(),
+                mapped_address: None,
+                rtt_ms: None,
+                error: Some(error),
+            },
+        }
+    }
+
     /// Send active UDP probes to every candidate for a peer.
     pub async fn punch_candidates(
         &self,
@@ -246,7 +340,7 @@ impl UdpTransport {
 
             for &candidate in &round.endpoints {
                 match self.send_probe(Some(peer_id), candidate).await {
-                    Ok(()) => {
+                    Ok(_) => {
                         packets_sent += 1;
                         trace!(
                             "Sent adaptive punch probe round {} to peer {} candidate {}",
@@ -316,7 +410,6 @@ impl UdpTransport {
             "Sent {} encrypted bytes to peer {} at {} (dst={})",
             sent, packet.peer_id, endpoint, packet.dst_ip
         );
-        self.peers.record_sent(&packet.peer_id, sent as u64).await;
         Ok(sent)
     }
 
@@ -348,24 +441,59 @@ impl UdpTransport {
         loop {
             ticker.tick().await;
 
-            for (peer_id, endpoint) in self.peers.direct_endpoints().await {
-                match self.send_probe(Some(&peer_id), endpoint).await {
-                    Ok(()) => {
-                        trace!("Sent direct UDP keepalive to peer {peer_id} at {endpoint}");
-                    }
-                    Err(err) => {
-                        self.peers
-                            .record_direct_failure_with_code(
-                                &peer_id,
-                                REASON_DIRECT_SEND_FAILED,
-                                format!("direct keepalive to {endpoint} failed: {err}"),
-                            )
-                            .await;
-                        debug!(
-                            "Failed to send direct UDP keepalive to peer {peer_id} at {endpoint}: {err}"
-                        );
-                    }
+            self.run_keepalive_round(DIRECT_KEEPALIVE_ACK_TIMEOUT).await;
+        }
+    }
+
+    async fn run_keepalive_round(&self, ack_timeout: Duration) {
+        let mut sent = Vec::new();
+
+        for (peer_id, endpoint) in self.peers.direct_endpoints().await {
+            match self.send_probe(Some(&peer_id), endpoint).await {
+                Ok(nonce) => {
+                    trace!("Sent direct UDP keepalive to peer {peer_id} at {endpoint}");
+                    sent.push((peer_id, endpoint, nonce));
                 }
+                Err(err) => {
+                    self.peers
+                        .record_direct_failure_with_code(
+                            &peer_id,
+                            REASON_DIRECT_SEND_FAILED,
+                            format!("direct keepalive to {endpoint} failed: {err}"),
+                        )
+                        .await;
+                    debug!(
+                        "Failed to send direct UDP keepalive to peer {peer_id} at {endpoint}: {err}"
+                    );
+                }
+            }
+        }
+
+        if sent.is_empty() {
+            return;
+        }
+
+        sleep(ack_timeout).await;
+        for (peer_id, endpoint, nonce) in sent {
+            let unanswered = self.pending_probes.lock().await.remove(&nonce);
+            let Some(pending) = unanswered else {
+                continue;
+            };
+            if pending.peer_id.as_deref() != Some(peer_id.as_str()) || pending.endpoint != endpoint
+            {
+                continue;
+            }
+
+            if self
+                .peers
+                .record_direct_keepalive_timeout_for_generation(
+                    &peer_id,
+                    endpoint,
+                    pending.generation,
+                )
+                .await
+            {
+                debug!("Direct UDP keepalive ACK timed out for peer {peer_id} at {endpoint}");
             }
         }
     }
@@ -396,6 +524,16 @@ impl UdpTransport {
             }
 
             let data = &buf[..n];
+
+            if let Some(transaction_id) = stun_transaction_id(data) {
+                let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send((data.to_vec(), source));
+                } else {
+                    trace!("Ignored unmatched STUN response from {source}");
+                }
+                continue;
+            }
 
             if is_authenticated_punch_candidate(data) {
                 let Some(identity) = peek_authenticated_punch_identity(data) else {
@@ -597,6 +735,8 @@ impl UdpTransport {
             inbound_tx
                 .send(ReceivedEncryptedPacket {
                     source: Some(source),
+                    relay_endpoint: None,
+                    relay_peer_id: None,
                     wire_bytes: data.to_vec(),
                 })
                 .await
@@ -624,6 +764,20 @@ fn is_ignorable_udp_receive_error(error: &std::io::Error) -> bool {
 
 fn is_authenticated_punch_candidate(data: &[u8]) -> bool {
     data.len() >= 5 && data.starts_with(&[0x50, 0x4e, 0x43, 0x48]) && data[4] == 2
+}
+
+fn stun_transaction_id(data: &[u8]) -> Option<StunTransactionId> {
+    if data.len() < 20 || data[0] & 0xc0 != 0 {
+        return None;
+    }
+    if u32::from_be_bytes(data[4..8].try_into().ok()?) != MAGIC_COOKIE {
+        return None;
+    }
+    let declared_len = u16::from_be_bytes(data[2..4].try_into().ok()?) as usize;
+    if data.len() < 20 + declared_len {
+        return None;
+    }
+    data[8..20].try_into().ok()
 }
 
 #[cfg(test)]
@@ -852,7 +1006,7 @@ mod tests {
             .add_peer(&peer("peer-b", "10.20.0.2", Some(receiver_addr)))
             .await;
 
-        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
             .await
             .unwrap();
         let payload = vec![4, 1, 2, 3, 4, 5, 6, 7];
@@ -873,6 +1027,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf[..n], payload.as_slice());
+        assert_eq!(peers.get_connection("peer-b").await.unwrap().bytes_sent, 0);
     }
 
     #[tokio::test]
@@ -963,6 +1118,64 @@ mod tests {
         assert_eq!(received.wire_bytes, payload);
 
         worker.abort();
+    }
+
+    #[tokio::test]
+    async fn live_stun_refresh_does_not_steal_encrypted_datagrams() {
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+        let stun_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun_server.local_addr().unwrap();
+        let stun_worker = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, client_addr) = stun_server.recv_from(&mut buf).await.unwrap();
+            let request = StunMessage::decode(&buf[..n]).unwrap();
+            let mapped: SocketAddr = "203.0.113.7:45678".parse().unwrap();
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(mapped));
+            stun_server
+                .send_to(&response.encode(), client_addr)
+                .await
+                .unwrap();
+        });
+
+        let refresh = {
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                transport
+                    .gather_candidate_report_live(vec![stun_addr], Duration::from_secs(1))
+                    .await
+            })
+        };
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let encrypted = vec![4, 0x91, 0x82, 0x73, 0x64];
+        sender.send_to(&encrypted, local_addr).await.unwrap();
+
+        let received = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.wire_bytes, encrypted);
+        assert_eq!(received.source, Some(sender.local_addr().unwrap()));
+
+        let report = refresh.await.unwrap().unwrap();
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.endpoint.to_string() == "203.0.113.7:45678"
+                && candidate.source == p2pnet_nat::CandidateSource::StunObserved
+        }));
+        assert_eq!(report.nat_profile.observations.len(), 1);
+        assert!(report.nat_profile.observations[0].error.is_none());
+
+        stun_worker.await.unwrap();
+        inbound_worker.abort();
     }
 
     #[tokio::test]
@@ -1164,7 +1377,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_probe_ack_can_confirm_peer_reflexive_source() {
+    async fn keepalive_ack_timeout_degrades_direct_after_three_misses() {
+        let peers = peer_manager();
+        let silent_remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = silent_remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer("peer-b", "10.20.0.2", Some(remote_addr)))
+            .await;
+        peers
+            .record_direct_probe_success_with_latency(
+                "peer-b",
+                remote_addr,
+                Some(Duration::from_millis(5)),
+            )
+            .await;
+        peers
+            .record_direct_success("peer-b", Some(remote_addr))
+            .await;
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+
+        transport
+            .run_keepalive_round(Duration::from_millis(10))
+            .await;
+        let after_one = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(after_one.state, ConnectionState::Direct);
+        assert_eq!(after_one.direct_health.consecutive_failures, 1);
+
+        transport
+            .run_keepalive_round(Duration::from_millis(10))
+            .await;
+        transport
+            .run_keepalive_round(Duration::from_millis(10))
+            .await;
+        let after_three = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(after_three.state, ConnectionState::FallbackToRelay);
+        assert_eq!(after_three.direct_health.consecutive_failures, 3);
+        assert_eq!(
+            after_three.direct_health.last_error_code.as_deref(),
+            Some(crate::peer::REASON_DIRECT_KEEPALIVE_TIMEOUT)
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_keepalive_ack_preserves_direct_health() {
+        let peers = peer_manager();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer("peer-b", "10.20.0.2", Some(remote_addr)))
+            .await;
+        peers
+            .record_direct_probe_success_with_latency(
+                "peer-b",
+                remote_addr,
+                Some(Duration::from_millis(5)),
+            )
+            .await;
+        peers
+            .record_direct_success("peer-b", Some(remote_addr))
+            .await;
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let (n, _) = remote.recv_from(&mut buf).await.unwrap();
+            let probe = decode_punch_packet(&buf[..n]).unwrap();
+            remote
+                .send_to(&build_punch_ack(probe.nonce), local_addr)
+                .await
+                .unwrap();
+        });
+
+        transport
+            .run_keepalive_round(Duration::from_millis(100))
+            .await;
+        responder.await.unwrap();
+
+        let conn = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(conn.direct_health.consecutive_failures, 0);
+
+        inbound_worker.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_probe_ack_learns_peer_reflexive_source_without_confirming_data() {
         let local_identity = NodeIdentity::generate();
         let peer_identity = NodeIdentity::generate();
         let remote_candidate = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1215,7 +1520,7 @@ mod tests {
             loop {
                 let conn = peers.get_connection("peer-b").await.unwrap();
                 if conn.endpoint == Some(peer_reflexive_addr)
-                    && conn.state == ConnectionState::Direct
+                    && conn.state == ConnectionState::HolePunching
                 {
                     break;
                 }
@@ -1228,7 +1533,8 @@ mod tests {
         let conn = peers.get_connection("peer-b").await.unwrap();
         assert_eq!(conn.endpoint, Some(peer_reflexive_addr));
         assert!(conn.candidates.contains(&peer_reflexive_addr.to_string()));
-        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(conn.state, ConnectionState::HolePunching);
+        assert_eq!(conn.active_path(), None);
 
         worker.abort();
     }
@@ -1284,6 +1590,11 @@ mod tests {
         assert_eq!(conn.bytes_received, written.len() as u64);
         assert_eq!(conn.state.to_string(), "direct");
         assert_eq!(conn.endpoint, Some(sender.local_addr().unwrap()));
+        assert_eq!(
+            conn.candidate_sources
+                .get(&sender.local_addr().unwrap().to_string()),
+            Some(&crate::peer::CandidatePairSource::PeerReflexive)
+        );
 
         udp_worker.abort();
         wireguard_worker.abort();
