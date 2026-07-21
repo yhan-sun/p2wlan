@@ -2446,7 +2446,7 @@ mod tests {
             "update",
             "--dry-run",
             "--version",
-            "v0.1.25",
+            "v0.1.26",
             "--install-dir",
             "/tmp/bin",
         ])
@@ -2455,7 +2455,7 @@ mod tests {
             panic!("expected update command");
         };
         assert!(args.dry_run);
-        assert_eq!(args.version.as_deref(), Some("v0.1.25"));
+        assert_eq!(args.version.as_deref(), Some("v0.1.26"));
         assert_eq!(args.install_dir.as_deref(), Some(Path::new("/tmp/bin")));
     }
 

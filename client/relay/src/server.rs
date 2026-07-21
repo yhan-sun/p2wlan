@@ -1178,44 +1178,78 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_outbound_queue_full_policy() {
-        let server_config = RelayServerConfig {
+        let config = RelayServerConfig {
             allow_insecure_plaintext: true,
             require_authentication: false,
             outbound_queue_capacity: 1,
             ..dev_config()
         };
-        let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
+
+        let peer_table: PeerTable = Arc::new(Mutex::new(HashMap::new()));
+        let (bob_tx, _bob_rx) = mpsc::channel::<Vec<u8>>(1);
+        bob_tx
+            .try_send(Frame::received("existing", b"queued").unwrap().encode())
+            .unwrap();
+        let (bob_shutdown_tx, mut bob_shutdown_rx) = tokio::sync::oneshot::channel();
+        peer_table.lock().await.insert(
+            NetworkNodeKey::new(String::new(), "bob".to_string()),
+            PeerConnection {
+                tx: bob_tx,
+                shutdown_tx: Arc::new(Mutex::new(Some(bob_shutdown_tx))),
+                conn_id: 1,
+            },
+        );
+
+        let (mut client_side, server_side) = tokio::io::duplex(4096);
+        let (alice_tx, mut alice_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (_dup_shutdown_tx, dup_shutdown_rx) = tokio::sync::oneshot::channel();
+        let registered_key = Some(NetworkNodeKey::new(String::new(), "alice".to_string()));
+        let shutdown_rx = shutdown_tx.subscribe();
+
+        let task = tokio::spawn(async move {
+            run_read_loop(
+                server_side,
+                alice_tx,
+                2,
+                &config,
+                shutdown_rx,
+                dup_shutdown_rx,
+                peer_table.clone(),
+                "alice",
+                String::new(),
+                registered_key,
+                None,
+            )
+            .await
+        });
+
+        client_side
+            .write_all(&Frame::forward("bob", b"payload").unwrap().encode())
             .await
             .unwrap();
-        let addr = server.addr;
 
-        let mut bob_stream = TcpStream::connect(addr).await.unwrap();
-        let reg = Frame::register("bob").encode();
-        bob_stream.write_all(&reg).await.unwrap();
-
-        let mut buf = [0u8; 100];
-        let n = bob_stream.read(&mut buf).await.unwrap();
-        let (f, _) = Frame::decode(&buf[..n]).unwrap();
-        assert_eq!(f.msg_type, MSG_REGISTERED);
-
-        let (mut alice, mut rx_a) = RelayClient::connect_verified(&addr.to_string(), "alice")
+        let error_bytes = tokio::time::timeout(Duration::from_secs(1), alice_rx.recv())
             .await
-            .unwrap();
+            .expect("timed out waiting for backpressure error")
+            .expect("alice outbound queue closed before error");
+        let (error_frame, consumed) = Frame::decode(&error_bytes).unwrap();
+        assert_eq!(consumed, error_bytes.len());
+        assert_eq!(error_frame.msg_type, MSG_ERROR);
+        let (code, message) = error_frame.parse_error().unwrap();
+        assert_eq!(code, ERR_PEER_BACKPRESSURE);
+        assert!(message.contains("outbound queue full"));
 
-        let mut got_backpressure = false;
-        let data = vec![0u8; 10000];
-        for _ in 0..100 {
-            let _ = alice.send_data("bob", &data).await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            if let Ok(Some(RelayMessage::Error { code: 4008, .. })) =
-                tokio::time::timeout(Duration::from_millis(5), rx_a.recv()).await
-            {
-                got_backpressure = true;
-                break;
-            }
-        }
-        assert!(got_backpressure, "Should have received backpressure error");
-        server.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(1), &mut bob_shutdown_rx)
+            .await
+            .expect("timed out waiting for slow peer shutdown")
+            .expect("slow peer shutdown sender dropped");
+
+        let _ = shutdown_tx.send(());
+        drop(client_side);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("relay read loop did not shut down");
     }
 
     #[tokio::test]
