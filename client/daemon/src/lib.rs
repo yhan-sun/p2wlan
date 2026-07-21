@@ -1344,7 +1344,7 @@ impl Daemon {
             {
                 Ok(sent) => {
                     info!("Sent {sent} UDP punch probes to peer {peer_id}");
-                    sleep(probe_interval).await;
+                    sleep(direct_probe_ack_grace(probe_interval)).await;
                     if sent > 0
                         && !peers
                             .has_direct_probe_success_for_generation(&peer_id, generation)
@@ -2553,6 +2553,12 @@ async fn run_network_outbound(
     }
 }
 
+fn direct_probe_ack_grace(probe_interval: Duration) -> Duration {
+    probe_interval
+        .saturating_mul(2)
+        .clamp(Duration::from_secs(1), Duration::from_secs(2))
+}
+
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
@@ -2583,7 +2589,7 @@ async fn run_direct_probe_loop(
                 {
                     Ok(0) => {}
                     Ok(sent) => {
-                        sleep(probe_interval).await;
+                        sleep(direct_probe_ack_grace(probe_interval)).await;
                         if !peers.is_direct_for_generation(&peer_id, generation).await {
                             peers
                                 .record_direct_failure_for_generation(
