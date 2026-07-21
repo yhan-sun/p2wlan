@@ -242,36 +242,75 @@ Idle
 
 Probe packet 不承载用户数据，只用于路径发现。
 
+### 6.1 Legacy Probe v1
+
+v1 是历史兼容格式，仍用于没有 Probe v2 MAC key 的 peer。
+
 ```text
-0                   1                   2                   3
-0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+---------------+---------------+-------------------------------+
-| magic "P2WL"  | version       | msg_type                      |
-+---------------+---------------+-------------------------------+
-| session_id (128-bit)                                           |
-+---------------------------------------------------------------+
-| src_device_id_hash (128-bit)                                   |
-+---------------------------------------------------------------+
-| dst_device_id_hash (128-bit)                                   |
-+---------------------------------------------------------------+
-| timestamp_ms (64-bit)                                          |
-+---------------------------------------------------------------+
-| nonce_len      | nonce...                                      |
-+---------------------------------------------------------------+
-| signature_len  | signature...                                  |
-+---------------------------------------------------------------+
+u8[4] magic       "PNCH"
+u8    version     1
+u8    msg_type    1=PUNCH, 2=ACK
+u8[8] nonce       random correlation nonce
 ```
+
+约束：
+
+- v1 ACK 只有在来源地址匹配已知 candidate 或已知 endpoint 时才会更新直连状态。
+- v1 包不能学习未上报的 peer-reflexive endpoint。
+- v1 不承载身份，不能作为最终安全边界。
+
+### 6.2 Authenticated Probe v2 Skeleton
+
+v2 与 v1 共存。daemon 在能通过本机 X25519 private key 与 peer X25519 public key 派生 Probe MAC key 时优先发送 v2，否则回退 v1。
+
+当前 skeleton wire layout：
+
+```text
+u8[4] magic          "PNCH"
+u8    version        2
+u8    msg_type       1=PUNCH, 2=ACK
+u8[8] nonce          random correlation nonce
+u64   generation     sender local network generation, big-endian
+u8    src_len        1..255
+u8    dst_len        1..255
+u8[]  src_node_id    UTF-8, src_len bytes
+u8[]  dst_node_id    UTF-8, dst_len bytes
+u8[16] mac           truncated HMAC-BLAKE2s
+```
+
+MAC 输入：
+
+```text
+mac = HMAC_BLAKE2s_256(
+  probe_mac_key,
+  "p2wlan-udp-probe-v2" || frame_without_mac
+)[0..16]
+```
+
+当前 daemon 派生：
+
+```text
+shared = X25519(local_node_private_key, peer_public_key)
+probe_mac_key = HMAC_BLAKE2s_256(shared, "p2wlan udp probe v2 mac key")
+```
+
+接收规则：
+
+- `dst_node_id` 必须等于本机已解析 node ID，否则丢弃。
+- peer 必须已知且存在可派生的 Probe MAC key，否则丢弃。
+- MAC 验证失败、格式错误或空 node ID 直接丢弃，不转发给 WireGuard inbound。
+- v2 PUNCH 验证通过后可以学习来源 UDP 地址，即使该地址不在控制面 candidate 列表中。
+- v2 ACK 必须匹配 pending nonce、peer ID 和本地 network generation；验证通过后可以确认来源地址为 direct endpoint。
+- legacy v1 仍保持原兼容行为；v2 不改变控制面 candidate wire format。
 
 消息类型：
 
 | msg_type | 名称 | 方向 |
 | --- | --- | --- |
-| 1 | PROBE_SYN | A -> B |
-| 2 | PROBE_ACK | B -> A |
-| 3 | PROBE_KEEPALIVE | 双向 |
-| 4 | PROBE_CLOSE | 双向 |
+| 1 | PUNCH | A -> B |
+| 2 | ACK | B -> A |
 
-签名内容包括 session_id、src、dst、timestamp、nonce，防止伪造和重放。
+后续 A3 目标：改为 session-bound 临时 X25519 key、显式 session ID、nonce replay window、限速预算和跨语言 golden vectors。当前 v2 skeleton 的目标是先阻止伪造 ACK 改写路径状态，并为 peer-reflexive endpoint 学习提供认证基础。
 
 ## 7. 路径选择
 
@@ -566,5 +605,5 @@ Encoded bytes (hex):
 
 A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
-- 认证 Probe v2、session-bound MAC、nonce replay window 和即时全局撤销仍属于 Phase A3。
+- Probe v2 skeleton 已提供 MAC 验证、目标绑定和认证 peer-reflexive endpoint 学习；session-bound 临时密钥、nonce replay window、probe 限速预算和即时全局撤销仍属于 Phase A3。
 - A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
