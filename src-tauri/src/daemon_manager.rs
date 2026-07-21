@@ -777,12 +777,35 @@ impl DaemonManager {
 
     fn persist_diagnostics_url(url: &str) -> Result<(), String> {
         let path = Self::default_endpoint_path();
+        Self::persist_diagnostics_url_to_path(&path, url)
+    }
+
+    fn persist_diagnostics_url_to_path(path: &Path, url: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("无法创建诊断端点目录 {}：{error}", parent.display()))?;
         }
-        std::fs::write(&path, url)
-            .map_err(|error| format!("无法记录诊断端点 {}：{error}", path.display()))
+        match std::fs::write(path, url) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Older elevated launches could leave this marker owned by root. The
+                // desktop app owns the parent log directory, so removing the stale marker
+                // and recreating it is safe and avoids blocking an otherwise healthy TUN.
+                std::fs::remove_file(path).map_err(|remove_error| {
+                    format!(
+                        "无法重置旧诊断端点 {}：写入失败：{error}；删除失败：{remove_error}",
+                        path.display()
+                    )
+                })?;
+                std::fs::write(path, url).map_err(|retry_error| {
+                    format!(
+                        "无法记录诊断端点 {}：已删除旧文件但重新写入失败：{retry_error}",
+                        path.display()
+                    )
+                })
+            }
+            Err(error) => Err(format!("无法记录诊断端点 {}：{error}", path.display())),
+        }
     }
 
     #[cfg(not(test))]
@@ -2419,6 +2442,34 @@ mod tests {
         let error =
             DaemonManager::available_diagnostics_url("http://0.0.0.0:39277/status").unwrap_err();
         assert!(error.contains("127.0.0.1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_diagnostics_url_recovers_from_stale_unwritable_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let endpoint_path = temp_dir.path().join("p2pnet-daemon.endpoint");
+        std::fs::write(&endpoint_path, "http://127.0.0.1:1/status").unwrap();
+        std::fs::set_permissions(&endpoint_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        DaemonManager::persist_diagnostics_url_to_path(
+            &endpoint_path,
+            "http://127.0.0.1:39277/status",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&endpoint_path).unwrap(),
+            "http://127.0.0.1:39277/status"
+        );
+        let mode = std::fs::metadata(&endpoint_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_ne!(mode, 0o444);
     }
 
     #[test]
