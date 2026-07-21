@@ -15,16 +15,16 @@ Usage:
   sudo ./install.sh
   curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
   sudo sh /tmp/p2wlan-install.sh
-  sudo sh /tmp/p2wlan-install.sh --version v0.1.25
+  sudo sh /tmp/p2wlan-install.sh --version v0.1.26
   sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
 
 Environment:
-  P2WLAN_VERSION      Release tag to install, for example v0.1.25. Default: latest
+  P2WLAN_VERSION      Release tag to install, for example v0.1.26. Default: latest
   P2WLAN_REPO         GitHub repo to download from. Default: yhan-sun/p2wlan
   P2WLAN_INSTALL_DIR  Install directory. Default: /usr/local/bin
 
 Options:
-  --version TAG       Release tag to install, for example v0.1.25
+  --version TAG       Release tag to install, for example v0.1.26
   --repo OWNER/NAME   GitHub repo to download from
   --install-dir DIR   Install directory for p2wlan and p2pnet-daemon
   --dry-run           Print the selected package without installing
