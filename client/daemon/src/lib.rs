@@ -1669,6 +1669,63 @@ fn candidate_source_label(source: CandidateSource) -> &'static str {
     }
 }
 
+fn preserve_peer_reflexive_candidates(
+    previous_candidates: &[String],
+    previous_candidate_sources: &HashMap<String, String>,
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) {
+    for endpoint in previous_candidates.iter().rev() {
+        if previous_candidate_sources.get(endpoint).map(String::as_str) != Some("peer_reflexive") {
+            continue;
+        }
+        if endpoint.parse::<SocketAddr>().is_err() || candidates.contains(endpoint) {
+            continue;
+        }
+        candidates.insert(0, endpoint.clone());
+        candidate_sources.insert(endpoint.clone(), "peer_reflexive".to_string());
+    }
+}
+
+fn candidate_refresh_requires_network_generation_advance(
+    previous_candidates: &[String],
+    previous_candidate_sources: &HashMap<String, String>,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> bool {
+    stable_network_candidate_signature(previous_candidates, previous_candidate_sources)
+        != stable_network_candidate_signature(candidates, candidate_sources)
+}
+
+fn stable_network_candidate_signature(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut signature = Vec::new();
+    for endpoint in candidates {
+        let source = candidate_sources
+            .get(endpoint)
+            .map(String::as_str)
+            .unwrap_or("signaled");
+        match source {
+            "host" | "manual" | "upnp" | "pcp" | "nat_pmp" => {
+                signature.push(format!("{source}:{endpoint}"));
+            }
+            "stun_observed" | "predicted" => match endpoint.parse::<SocketAddr>() {
+                Ok(addr) if is_public_udp_candidate(addr) => {
+                    signature.push(format!("public-ip:{}", addr.ip()));
+                }
+                Ok(_) => {}
+                Err(_) => signature.push(format!("{source}:{endpoint}")),
+            },
+            _ => {}
+        }
+    }
+    signature.sort();
+    signature.dedup();
+    signature
+}
+
 fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
     match candidate.ip() {
         IpAddr::V4(ip) => {
@@ -2210,10 +2267,26 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         }
         truncate_signal_candidates(&mut candidates, &mut candidate_sources);
 
+        let previous_candidates = local_candidates.read().await.clone();
+        let previous_candidate_sources = local_candidate_sources.read().await.clone();
+        preserve_peer_reflexive_candidates(
+            &previous_candidates,
+            &previous_candidate_sources,
+            &mut candidates,
+            &mut candidate_sources,
+        );
+        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
+        let should_advance_generation = candidate_refresh_requires_network_generation_advance(
+            &previous_candidates,
+            &previous_candidate_sources,
+            &candidates,
+            &candidate_sources,
+        );
+
         let changed = {
             let mut current = local_candidates.write().await;
-            let sources_changed = *local_candidate_sources.read().await != candidate_sources;
-            if *current == candidates && !sources_changed {
+            if previous_candidates == candidates && previous_candidate_sources == candidate_sources
+            {
                 false
             } else {
                 *current = candidates.clone();
@@ -2238,19 +2311,32 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             report.nat_profile.mapping_behavior,
             report.nat_profile.public_endpoint
         );
-        peers
-            .advance_network_generation(format!(
-                "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
-            ))
-            .await;
+        if should_advance_generation {
+            peers
+                .advance_network_generation(format!(
+                    "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
+                ))
+                .await;
+        } else {
+            debug!(
+                "UDP candidate refresh changed only volatile reflexive ports; keeping network generation stable"
+            );
+        }
         let endpoint = advertised_endpoint.unwrap_or_default();
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
             warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
         }
 
         for peer_id in control.peers().await.into_keys() {
+            let punch_at_ms = Some(relay_assisted_punch_at_ms());
             if let Err(error) = control
-                .send_peer_offer_with_sources(&peer_id, &candidates, &candidate_sources, &[])
+                .send_peer_offer_with_sources_and_punch_at(
+                    &peer_id,
+                    &candidates,
+                    &candidate_sources,
+                    &[],
+                    punch_at_ms,
+                )
                 .await
             {
                 warn!("Failed to publish refreshed UDP candidates to peer {peer_id}: {error}");
@@ -2996,6 +3082,125 @@ mod tests {
         assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
         assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
         assert_eq!(sources.get(&mapped).map(String::as_str), Some("upnp"));
+    }
+
+    #[test]
+    fn candidate_refresh_generation_ignores_stun_port_churn_on_same_public_ip() {
+        let previous = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:27106".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+        let next = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:31999".to_string(),
+        ];
+        let next_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:31999".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+
+        assert!(!candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
+        ));
+    }
+
+    #[test]
+    fn candidate_refresh_generation_advances_on_host_or_public_ip_change() {
+        let previous = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:27106".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+        let host_changed = vec![
+            "192.168.2.10:59288".to_string(),
+            "93.184.216.34:27106".to_string(),
+        ];
+        let host_changed_sources = HashMap::from([
+            ("192.168.2.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+        let public_ip_changed = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.35:27106".to_string(),
+        ];
+        let public_ip_changed_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.35:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+
+        assert!(candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &host_changed,
+            &host_changed_sources,
+        ));
+        assert!(candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &public_ip_changed,
+            &public_ip_changed_sources,
+        ));
+    }
+
+    #[test]
+    fn preserve_peer_reflexive_candidates_keeps_observed_endpoint_across_refresh() {
+        let previous = vec![
+            "93.184.216.34:27106".to_string(),
+            "93.184.216.34:45000".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            (
+                "93.184.216.34:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+            (
+                "93.184.216.34:45000".to_string(),
+                "peer_reflexive".to_string(),
+            ),
+        ]);
+        let mut next = vec!["93.184.216.34:31999".to_string()];
+        let mut next_sources = HashMap::from([(
+            "93.184.216.34:31999".to_string(),
+            "stun_observed".to_string(),
+        )]);
+
+        preserve_peer_reflexive_candidates(
+            &previous,
+            &previous_sources,
+            &mut next,
+            &mut next_sources,
+        );
+
+        assert_eq!(next[0], "93.184.216.34:45000");
+        assert_eq!(
+            next_sources.get("93.184.216.34:45000").map(String::as_str),
+            Some("peer_reflexive")
+        );
     }
 
     #[test]
