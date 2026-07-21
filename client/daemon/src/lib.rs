@@ -313,12 +313,25 @@ impl Daemon {
             info!("Running in manual/offline mode. Using local configurations.");
         }
 
+        let relay_allow_insecure_plaintext = effective_relay_allow_insecure_plaintext(
+            &self.config.control.server_url,
+            &relay_catalog,
+            &relay_servers,
+            self.config.relay.allow_insecure_plaintext,
+        );
+        if relay_allow_insecure_plaintext && !self.config.relay.allow_insecure_plaintext {
+            info!(
+                "Allowing plaintext relay because HTTP control plane supplied legacy relay candidates"
+            );
+        }
+
         let mut resolved_config = (*self.config).clone();
         resolved_config.network.virtual_ip = virtual_ip.clone();
         resolved_config.network.netmask = netmask.clone();
         resolved_config.network.cidr = cidr.clone();
         resolved_config.node.node_id = assigned_node_id.clone();
         resolved_config.relay.servers = relay_servers.clone();
+        resolved_config.relay.allow_insecure_plaintext = relay_allow_insecure_plaintext;
         self.config = Arc::new(resolved_config);
 
         // Initialize TUN using the resolved IP details
@@ -874,6 +887,19 @@ impl Daemon {
                             continue;
                         }
                         relay_started = true;
+                        let allow_insecure_plaintext = effective_relay_allow_insecure_plaintext(
+                            &self.config.control.server_url,
+                            &relay_catalog,
+                            &relay_servers,
+                            self.config.relay.allow_insecure_plaintext,
+                        );
+                        if allow_insecure_plaintext
+                            && !self.config.relay.allow_insecure_plaintext
+                        {
+                            info!(
+                                "Allowing plaintext relay because HTTP control plane supplied legacy relay candidates"
+                            );
+                        }
                         let preferred_regions = self.config.relay.preferred_regions.clone();
                         let selection_timeout =
                             Duration::from_millis(self.config.relay.selection_timeout_ms.max(1));
@@ -897,7 +923,7 @@ impl Daemon {
                                     inbound_tx: relay_inbound_tx,
                                     ticket_cache: Some(Arc::new(RelayTicketCache::new(self.control.clone()))),
                                     relay_ticket: None,
-                                    allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
+                                    allow_insecure_plaintext,
                                     ca_cert_path: self.config.relay.ca_cert_path.clone(),
                                 }
                                 .run(),
@@ -2061,7 +2087,41 @@ fn infer_default_relay_servers(control_server_url: &str) -> Vec<String> {
     } else {
         format!("{host}:18081")
     };
-    vec![format!("default@{endpoint}")]
+    vec![format!("default@tcp://{endpoint}")]
+}
+
+fn effective_relay_allow_insecure_plaintext(
+    control_server_url: &str,
+    relay_catalog: &[RelayCatalogEntry],
+    relay_servers: &[String],
+    configured: bool,
+) -> bool {
+    configured
+        || (relay_catalog.is_empty()
+            && control_server_uses_plaintext_http(control_server_url)
+            && relay_servers
+                .iter()
+                .any(|server| relay_spec_is_plaintext(server)))
+}
+
+fn control_server_uses_plaintext_http(control_server_url: &str) -> bool {
+    control_server_url
+        .trim_start()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+}
+
+fn relay_spec_is_plaintext(spec: &str) -> bool {
+    let endpoint = spec
+        .trim()
+        .split_once('@')
+        .map(|(_, endpoint)| endpoint)
+        .unwrap_or_else(|| spec.trim())
+        .trim();
+    !endpoint.is_empty()
+        && !endpoint
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tls://"))
 }
 
 fn control_server_host(control_server_url: &str) -> Option<String> {
@@ -2154,6 +2214,7 @@ impl RelaySupervisor {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.error_code.as_deref() == Some("permanent_auth"));
+            let failure_summary = relay_failure_summary(&diagnostics);
             *self.relay_selection.write().await = diagnostics;
 
             if let (Some(relay), Some(relay_rx)) = (transport, relay_rx) {
@@ -2236,7 +2297,7 @@ impl RelaySupervisor {
                     retry_delay = max_retry_delay;
                 }
                 warn!(
-                    "No configured relay candidate was reachable; retrying in {} seconds",
+                    "No configured relay candidate was reachable ({failure_summary}); retrying in {} seconds",
                     retry_delay.as_secs()
                 );
             }
@@ -2245,6 +2306,27 @@ impl RelaySupervisor {
             retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
         }
     }
+}
+
+fn relay_failure_summary(diagnostics: &RelaySelectionDiagnostics) -> String {
+    if diagnostics.candidates.is_empty() {
+        return diagnostics
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "no relay candidates configured".to_string());
+    }
+
+    diagnostics
+        .candidates
+        .iter()
+        .find(|candidate| candidate.error.is_some() || candidate.error_code.is_some())
+        .map(|candidate| {
+            let code = candidate.error_code.as_deref().unwrap_or("unknown_error");
+            let error = candidate.error.as_deref().unwrap_or("no detail");
+            format!("{}: {code}: {error}", candidate.endpoint)
+        })
+        .or_else(|| diagnostics.last_error.clone())
+        .unwrap_or_else(|| "no candidate failure detail".to_string())
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -2660,16 +2742,58 @@ mod tests {
     fn test_infer_default_relay_servers_from_public_control_host() {
         assert_eq!(
             infer_default_relay_servers("http://47.109.40.237:18080"),
-            vec!["default@47.109.40.237:18081".to_string()]
+            vec!["default@tcp://47.109.40.237:18081".to_string()]
         );
         assert_eq!(
             infer_default_relay_servers("https://relay.example.com/api"),
-            vec!["default@relay.example.com:18081".to_string()]
+            vec!["default@tcp://relay.example.com:18081".to_string()]
         );
         assert_eq!(
             infer_default_relay_servers("http://[2001:db8::1]:18080"),
-            vec!["default@[2001:db8::1]:18081".to_string()]
+            vec!["default@tcp://[2001:db8::1]:18081".to_string()]
         );
+    }
+
+    #[test]
+    fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
+        let legacy_servers = vec!["default@tcp://47.109.40.237:18081".to_string()];
+        assert!(effective_relay_allow_insecure_plaintext(
+            "http://47.109.40.237:18080",
+            &[],
+            &legacy_servers,
+            false,
+        ));
+        assert!(effective_relay_allow_insecure_plaintext(
+            "https://ctrl.example.com",
+            &[],
+            &legacy_servers,
+            true,
+        ));
+        assert!(!effective_relay_allow_insecure_plaintext(
+            "https://ctrl.example.com",
+            &[],
+            &legacy_servers,
+            false,
+        ));
+
+        let catalog = vec![RelayCatalogEntry {
+            region: "cn".to_string(),
+            audience: "relay-cn-1".to_string(),
+            endpoint: "tls://relay.example.com:18081".to_string(),
+        }];
+        assert!(!effective_relay_allow_insecure_plaintext(
+            "http://47.109.40.237:18080",
+            &catalog,
+            &legacy_servers,
+            false,
+        ));
+    }
+
+    #[test]
+    fn test_relay_spec_plaintext_detection() {
+        assert!(relay_spec_is_plaintext("default@47.109.40.237:18081"));
+        assert!(relay_spec_is_plaintext("default@tcp://47.109.40.237:18081"));
+        assert!(!relay_spec_is_plaintext("cn@tls://relay.example.com:18081"));
     }
 
     #[test]
