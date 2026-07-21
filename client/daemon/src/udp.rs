@@ -31,6 +31,7 @@ type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const PUNCH_ACK_RETRANSMIT_DELAYS_MS: [u64; 2] = [20, 80];
 
 #[derive(Debug, Clone)]
 struct PendingProbe {
@@ -68,12 +69,13 @@ fn build_probe_schedule(
             let is_final_round = round + 1 == attempts;
             let width = if attempts == 1 || is_final_round {
                 unique.len()
-            } else if round == 0 {
-                unique.len().min(2)
-            } else if round == 1 {
-                unique.len().min(4)
             } else {
-                unique.len()
+                match round {
+                    0 => unique.len().min(4),
+                    1 => unique.len().min(8),
+                    2 => unique.len().min(16),
+                    _ => unique.len(),
+                }
             };
 
             ProbeScheduleRound {
@@ -181,6 +183,39 @@ impl UdpTransport {
             )));
         }
         Ok(nonce)
+    }
+
+    async fn send_punch_ack_burst(
+        &self,
+        ack: Vec<u8>,
+        source: SocketAddr,
+        peer_label: impl Into<String>,
+    ) -> std::io::Result<()> {
+        self.socket.send_to(&ack, source).await?;
+
+        let socket = self.socket.clone();
+        let peer_label = peer_label.into();
+        tokio::spawn(async move {
+            for delay_ms in PUNCH_ACK_RETRANSMIT_DELAYS_MS {
+                sleep(Duration::from_millis(delay_ms)).await;
+                match socket.send_to(&ack, source).await {
+                    Ok(_) => trace!(
+                        "Retransmitted UDP punch ACK to peer {} at {} after {}ms",
+                        peer_label,
+                        source,
+                        delay_ms
+                    ),
+                    Err(err) => {
+                        debug!(
+                            "Failed to retransmit UDP punch ACK to peer {} at {} after {}ms: {}",
+                            peer_label, source, delay_ms, err
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Return the local UDP socket address.
@@ -598,10 +633,13 @@ impl UdpTransport {
                             generation,
                             &key,
                         );
-                        match self.socket.send_to(&ack, source).await {
-                            Ok(_) => {
+                        match self
+                            .send_punch_ack_burst(ack, source, identity.source_node_id.clone())
+                            .await
+                        {
+                            Ok(()) => {
                                 debug!(
-                                    "Received authenticated UDP punch from peer {} at {}; sent ACK",
+                                    "Received authenticated UDP punch from peer {} at {}; sent ACK burst",
                                     identity.source_node_id, source
                                 );
                             }
@@ -666,10 +704,13 @@ impl UdpTransport {
             if let Some(packet) = decode_punch_packet(data) {
                 match packet.kind {
                     PunchPacketKind::Punch => {
-                        let ack = build_punch_ack(packet.nonce);
-                        match self.socket.send_to(&ack, source).await {
-                            Ok(_) => {
-                                debug!("Received UDP punch from {source}; sent ACK");
+                        let ack = build_punch_ack(packet.nonce).to_vec();
+                        match self
+                            .send_punch_ack_burst(ack, source, source.to_string())
+                            .await
+                        {
+                            Ok(()) => {
+                                debug!("Received UDP punch from {source}; sent ACK burst");
                                 if let Some(peer_id) =
                                     self.peers.learn_endpoint_from_addr(source).await
                                 {
@@ -857,11 +898,26 @@ mod tests {
 
         assert_eq!(schedule.len(), 3);
         assert_eq!(schedule[0].delay_before, Duration::ZERO);
-        assert_eq!(schedule[0].endpoints, candidates[..2]);
+        assert_eq!(schedule[0].endpoints, candidates[..4]);
         assert_eq!(schedule[1].delay_before, Duration::from_millis(60));
-        assert_eq!(schedule[1].endpoints, candidates[..4]);
+        assert_eq!(schedule[1].endpoints, candidates);
         assert_eq!(schedule[2].delay_before, Duration::from_millis(140));
         assert_eq!(schedule[2].endpoints, candidates);
+    }
+
+    #[test]
+    fn adaptive_probe_schedule_expands_large_candidate_sets_quickly() {
+        let candidates = (0..20)
+            .map(|i| format!("127.0.0.1:{}", 12_000 + i).parse().unwrap())
+            .collect::<Vec<SocketAddr>>();
+
+        let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 4);
+
+        assert_eq!(schedule.len(), 4);
+        assert_eq!(schedule[0].endpoints.len(), 4);
+        assert_eq!(schedule[1].endpoints.len(), 8);
+        assert_eq!(schedule[2].endpoints.len(), 16);
+        assert_eq!(schedule[3].endpoints.len(), 20);
     }
 
     #[test]
@@ -945,6 +1001,35 @@ mod tests {
             .unwrap();
         let packet = decode_punch_packet(&buf[..n]).unwrap();
         assert_eq!(packet.kind, PunchPacketKind::Punch);
+    }
+
+    #[tokio::test]
+    async fn inbound_punch_sends_ack_burst() {
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.run_inbound(tx));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let punch = build_punch_packet();
+        let nonce = decode_punch_packet(&punch).unwrap().nonce;
+        sender.send_to(&punch, local_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        for _ in 0..=PUNCH_ACK_RETRANSMIT_DELAYS_MS.len() {
+            let (n, _from) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = decode_punch_packet(&buf[..n]).unwrap();
+            assert_eq!(packet.kind, PunchPacketKind::Ack);
+            assert_eq!(packet.nonce, nonce);
+        }
+
+        worker.abort();
     }
 
     #[tokio::test]

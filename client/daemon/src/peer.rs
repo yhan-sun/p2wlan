@@ -31,11 +31,11 @@ const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const DIRECT_TRIAL_RELAY_MARGIN: i32 = 5;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 2;
-const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 4;
+const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 8;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 1;
-const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 4;
-const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 8;
+const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 16;
+const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 32;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
@@ -2873,7 +2873,12 @@ fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
 }
 
 fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
-    [1, -1, 2, -2, 3, -3, 4, -4]
+    const DELTAS: [i32; 30] = [
+        1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12, 16, -16, 20, -20, 24,
+        -24, 32, -32, 48, -48, 64, -64,
+    ];
+
+    DELTAS
         .into_iter()
         .filter_map(|delta| {
             let port = base.port() as i32 + delta;
@@ -3025,6 +3030,28 @@ mod tests {
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
+    }
+
+    fn birthday_nat_profile() -> NatProfile {
+        NatProfile {
+            local_addr: "0.0.0.0:60207".to_string(),
+            observations: Vec::new(),
+            udp_blocked: false,
+            public_endpoint: Some("203.0.113.10:40007".to_string()),
+            public_ip_stable: Some(true),
+            public_port_stable: Some(false),
+            port_preserved: Some(false),
+            port_delta: None,
+            likely_symmetric: Some(true),
+            mapping_behavior: p2pnet_nat::MappingBehavior::AddressOrPortDependent,
+            filtering_behavior: p2pnet_nat::FilteringBehavior::AddressOrPortDependent,
+            hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+            mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+            prediction_candidate: false,
+            predicted_endpoints: Vec::new(),
+            birthday_candidate: true,
+            confidence: 70,
+        }
     }
 
     fn test_peer(node_id: &str, endpoint: SocketAddr) -> PeerInfo {
@@ -3465,6 +3492,42 @@ mod tests {
             .filter(|endpoint| endpoint.ip().to_string() == "203.0.113.10")
             .count();
         assert_eq!(predicted_count, PREDICTED_PROBE_BUDGET_PER_CYCLE);
+    }
+
+    #[test]
+    fn birthday_probe_endpoints_cover_layered_port_window() {
+        let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let endpoints = birthday_probe_endpoints(base);
+        let ports = endpoints
+            .iter()
+            .map(SocketAddr::port)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(endpoints.len(), 30);
+        for port in [
+            39999, 40001, 39996, 40004, 39990, 40010, 39968, 40032, 39936, 40064,
+        ] {
+            assert!(ports.contains(&port), "missing birthday port {port}");
+        }
+    }
+
+    #[tokio::test]
+    async fn birthday_candidates_use_wider_default_probe_budget() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        let birthday_count = targets
+            .iter()
+            .filter(|target| **target != endpoint && target.ip() == endpoint.ip())
+            .count();
+
+        assert!(targets.contains(&endpoint));
+        assert_eq!(birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
     }
 
     #[tokio::test]
