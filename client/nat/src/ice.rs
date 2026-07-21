@@ -56,6 +56,9 @@ const MAPPING_LIFETIME_PROBE_DELAY: Duration = Duration::from_millis(250);
 /// Prefix for self-addressed UDP hairpin probes.
 const HAIRPIN_PROBE_PREFIX: &[u8] = b"P2WLAN_HAIRPIN_V1";
 
+/// Maximum bounded predicted server-reflexive candidates to advertise.
+const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 4;
+
 /// Configuration for ICE candidate gathering.
 #[derive(Debug, Clone)]
 pub struct IceConfig {
@@ -194,6 +197,9 @@ pub struct NatProfile {
     /// Whether this profile is a good candidate for bounded port prediction.
     #[serde(default)]
     pub prediction_candidate: bool,
+    /// Bounded predicted public endpoints derived from a stable mapping delta.
+    #[serde(default)]
+    pub predicted_endpoints: Vec<String>,
     /// Whether this profile is a good candidate for bounded birthday probing.
     #[serde(default)]
     pub birthday_candidate: bool,
@@ -218,6 +224,7 @@ impl NatProfile {
             hairpin_behavior: HairpinBehavior::Unknown,
             mapping_lifetime: MappingLifetime::Unknown,
             prediction_candidate: false,
+            predicted_endpoints: Vec::new(),
             birthday_candidate: false,
             confidence: 0,
         }
@@ -436,6 +443,10 @@ pub async fn gather_candidate_report(
         }
     }
 
+    let mut nat_profile = build_nat_profile(local_addr, observations);
+    add_predicted_reflexive_candidates(&mut candidates, &nat_profile);
+    apply_active_behavior_probes(socket, config, &mut nat_profile).await;
+
     // 3. Sort by priority (highest first)
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
 
@@ -443,10 +454,8 @@ pub async fn gather_candidate_report(
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|c| seen.insert((c.candidate_type, c.endpoint.to_string())));
 
-    let mut nat_profile = build_nat_profile(local_addr, observations);
-    apply_active_behavior_probes(socket, config, &mut nat_profile).await;
     info!(
-        "Gathered {} ICE candidates (STUN success {}/{}, mapping={:?}, filtering={:?}, hairpin={:?}, lifetime={:?})",
+        "Gathered {} ICE candidates (STUN success {}/{}, mapping={:?}, filtering={:?}, hairpin={:?}, lifetime={:?}, predicted={})",
         candidates.len(),
         nat_profile
             .observations
@@ -457,7 +466,8 @@ pub async fn gather_candidate_report(
         nat_profile.mapping_behavior,
         nat_profile.filtering_behavior,
         nat_profile.hairpin_behavior,
-        nat_profile.mapping_lifetime
+        nat_profile.mapping_lifetime,
+        nat_profile.predicted_endpoints.len()
     );
     Ok(CandidateGatherReport {
         candidates,
@@ -507,6 +517,7 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
             hairpin_behavior: HairpinBehavior::Unknown,
             mapping_lifetime: MappingLifetime::Unknown,
             prediction_candidate: false,
+            predicted_endpoints: Vec::new(),
             birthday_candidate: false,
             confidence: if udp_blocked { 60 } else { 20 },
         };
@@ -548,6 +559,9 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         mapping_behavior,
         port_delta,
     );
+    let latest = mapped.last().copied().unwrap_or(first);
+    let predicted_endpoints =
+        predicted_reflexive_endpoints(latest, port_delta, prediction_candidate);
     let birthday_candidate = is_birthday_candidate(
         false,
         mapping_behavior,
@@ -570,8 +584,49 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         hairpin_behavior,
         mapping_lifetime: MappingLifetime::Unknown,
         prediction_candidate,
+        predicted_endpoints,
         birthday_candidate,
         confidence,
+    }
+}
+
+fn predicted_reflexive_endpoints(
+    base_endpoint: SocketAddr,
+    port_delta: Option<i32>,
+    prediction_candidate: bool,
+) -> Vec<String> {
+    if !prediction_candidate {
+        return Vec::new();
+    }
+    let Some(delta) = port_delta else {
+        return Vec::new();
+    };
+    if delta == 0 || !(-8..=8).contains(&delta) {
+        return Vec::new();
+    }
+
+    (1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES)
+        .filter_map(|step| {
+            let predicted = base_endpoint.port() as i32 + delta * step as i32;
+            let port = u16::try_from(predicted).ok()?;
+            if port == 0 || port == base_endpoint.port() {
+                return None;
+            }
+            Some(SocketAddr::new(base_endpoint.ip(), port).to_string())
+        })
+        .collect()
+}
+
+fn add_predicted_reflexive_candidates(candidates: &mut Vec<IceCandidate>, profile: &NatProfile) {
+    for endpoint in &profile.predicted_endpoints {
+        let Ok(addr) = endpoint.parse::<SocketAddr>() else {
+            continue;
+        };
+        candidates.push(IceCandidate {
+            candidate_type: CandidateType::ServerReflexive,
+            endpoint: crate::Endpoint::new(&addr.ip().to_string(), addr.port()),
+            priority: compute_priority(CandidateType::ServerReflexive).saturating_sub(1),
+        });
     }
 }
 
@@ -1022,6 +1077,7 @@ mod tests {
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(!profile.prediction_candidate);
+        assert!(profile.predicted_endpoints.is_empty());
         assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 0);
     }
@@ -1044,6 +1100,7 @@ mod tests {
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(!profile.prediction_candidate);
+        assert!(profile.predicted_endpoints.is_empty());
         assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 60);
     }
@@ -1065,6 +1122,7 @@ mod tests {
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(!profile.prediction_candidate);
+        assert!(profile.predicted_endpoints.is_empty());
         assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 20);
     }
@@ -1108,6 +1166,7 @@ mod tests {
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(!profile.prediction_candidate);
+        assert!(profile.predicted_endpoints.is_empty());
         assert!(!profile.birthday_candidate);
         assert_eq!(profile.confidence, 70);
     }
@@ -1152,6 +1211,15 @@ mod tests {
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(profile.prediction_candidate);
+        assert_eq!(
+            profile.predicted_endpoints,
+            vec![
+                "203.0.113.10:40007".to_string(),
+                "203.0.113.10:40009".to_string(),
+                "203.0.113.10:40011".to_string(),
+                "203.0.113.10:40013".to_string(),
+            ]
+        );
         assert!(profile.birthday_candidate);
         assert_eq!(profile.confidence, 90);
     }
@@ -1187,7 +1255,18 @@ mod tests {
         );
         assert_eq!(profile.port_delta, Some(32));
         assert!(!profile.prediction_candidate);
+        assert!(profile.predicted_endpoints.is_empty());
         assert!(profile.birthday_candidate);
+    }
+
+    #[test]
+    fn test_predicted_reflexive_endpoints_respect_port_bounds() {
+        let high =
+            predicted_reflexive_endpoints("203.0.113.10:65534".parse().unwrap(), Some(2), true);
+        assert!(high.is_empty());
+
+        let low = predicted_reflexive_endpoints("203.0.113.10:3".parse().unwrap(), Some(-2), true);
+        assert_eq!(low, vec!["203.0.113.10:1".to_string()]);
     }
 
     #[tokio::test]
@@ -1341,6 +1420,7 @@ mod tests {
             report.nat_profile.mapping_lifetime,
             MappingLifetime::LowerBoundMs(duration_millis(MAPPING_LIFETIME_PROBE_DELAY))
         );
+        assert!(report.nat_profile.predicted_endpoints.is_empty());
     }
 
     #[test]
