@@ -2709,7 +2709,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "p2pnet-crypto"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-daemon"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "bytes",
  "clap",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-nat"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "if-addrs",
  "rand 0.8.7",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-relay"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-tun"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-wireguard"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "hex",
  "p2pnet-crypto",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-cli"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "clap",
  "libc",
@@ -2824,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-desktop"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "arboard",
  "dirs 5.0.1",
