@@ -31,6 +31,7 @@ type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
 const PUNCH_ACK_RETRANSMIT_DELAYS_MS: [u64; 2] = [20, 80];
 
 #[derive(Debug, Clone)]
@@ -182,7 +183,39 @@ impl UdpTransport {
                 "UDP probe send to {peer_addr} failed: {error}"
             )));
         }
+
+        self.retransmit_probe_burst(bytes, peer_addr, peer_id.map(str::to_string));
         Ok(nonce)
+    }
+
+    fn retransmit_probe_burst(
+        &self,
+        probe: Vec<u8>,
+        peer_addr: SocketAddr,
+        peer_id: Option<String>,
+    ) {
+        let socket = self.socket.clone();
+        let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
+        tokio::spawn(async move {
+            for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
+                sleep(Duration::from_millis(delay_ms)).await;
+                match socket.send_to(&probe, peer_addr).await {
+                    Ok(_) => trace!(
+                        "Retransmitted UDP punch probe to peer {} at {} after {}ms",
+                        peer_label,
+                        peer_addr,
+                        delay_ms
+                    ),
+                    Err(err) => {
+                        debug!(
+                            "Failed to retransmit UDP punch probe to peer {} at {} after {}ms: {}",
+                            peer_label, peer_addr, delay_ms, err
+                        );
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     async fn send_punch_ack_burst(
@@ -1001,6 +1034,30 @@ mod tests {
             .unwrap();
         let packet = decode_punch_packet(&buf[..n]).unwrap();
         assert_eq!(packet.kind, PunchPacketKind::Punch);
+    }
+
+    #[tokio::test]
+    async fn send_probe_retransmits_punch_burst() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let peers = peer_manager();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+            .await
+            .unwrap();
+
+        let nonce = transport.send_probe(None, receiver_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        for _ in 0..=PUNCH_PROBE_RETRANSMIT_DELAYS_MS.len() {
+            let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = decode_punch_packet(&buf[..n]).unwrap();
+            assert_eq!(packet.kind, PunchPacketKind::Punch);
+            assert_eq!(packet.nonce, nonce);
+        }
     }
 
     #[tokio::test]
