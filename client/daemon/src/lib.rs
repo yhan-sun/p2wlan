@@ -462,8 +462,9 @@ impl Daemon {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
             let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional(tun, peers);
-            let mut dataplane =
-                dataplane.with_acl(self.acl.clone(), self.config.node.node_id.clone());
+            let mut dataplane = dataplane
+                .with_acl(self.acl.clone(), self.config.node.node_id.clone())
+                .with_overlay_cidr(&self.config.network.cidr);
 
             let outbound_transport = transport.clone();
             self.task_manager
@@ -1325,7 +1326,7 @@ impl Daemon {
             return;
         }
 
-        if conn.state != ConnectionState::Direct {
+        if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
             self.peers
                 .update_state(node_id, ConnectionState::HolePunching)
                 .await;
@@ -1418,9 +1419,11 @@ impl Daemon {
                 .await;
             return Err(error);
         }
-        self.peers
-            .update_state(from_node_id, ConnectionState::Connecting)
-            .await;
+        if !self.peers.is_relay(from_node_id).await {
+            self.peers
+                .update_state(from_node_id, ConnectionState::Connecting)
+                .await;
+        }
         info!(
             "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes, {} candidates)",
             response_bytes.len(),
@@ -1463,9 +1466,11 @@ impl Daemon {
         self.transport
             .add_session(from_node_id.to_string(), new_session)
             .await;
-        self.peers
-            .update_state(from_node_id, ConnectionState::Connecting)
-            .await;
+        if !self.peers.is_relay(from_node_id).await {
+            self.peers
+                .update_state(from_node_id, ConnectionState::Connecting)
+                .await;
+        }
         info!("Installed WireGuard initiator session for {from_node_id}");
         Ok(())
     }
