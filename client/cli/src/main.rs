@@ -1014,10 +1014,7 @@ fn nat_profile_summary(snapshot: &Value) -> Option<String> {
         .get("hairpin_behavior")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let lifetime = profile
-        .get("mapping_lifetime")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let lifetime = nat_lifetime_text(profile.get("mapping_lifetime"));
     let public_endpoint = profile
         .get("public_endpoint")
         .and_then(Value::as_str)
@@ -1199,6 +1196,20 @@ fn nat_bool_text(value: Option<&Value>) -> &'static str {
         Some(false) => "false",
         None => "unknown",
     }
+}
+
+fn nat_lifetime_text(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "unknown".to_string();
+    };
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    value
+        .get("lower_bound_ms")
+        .and_then(Value::as_u64)
+        .map(|ms| format!("lower_bound_ms={ms}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn print_peer_diagnostics(snapshot: &Value) {
@@ -2361,7 +2372,7 @@ mod tests {
                 "mapping_behavior": "endpoint_independent",
                 "filtering_behavior": "likely_endpoint_independent",
                 "hairpin_behavior": "unknown",
-                "mapping_lifetime": "unknown",
+                "mapping_lifetime": { "lower_bound_ms": 250 },
                 "udp_blocked": false,
                 "public_endpoint": "203.0.113.10:62000",
                 "likely_symmetric": false,
@@ -2390,7 +2401,7 @@ mod tests {
 
         assert_eq!(
             nat_profile_summary(&snapshot).as_deref(),
-            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=unknown public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false birthday=false")
+            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=lower_bound_ms=250 public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false birthday=false")
         );
         assert_eq!(
             stun_observation_summaries(&snapshot, 2),
