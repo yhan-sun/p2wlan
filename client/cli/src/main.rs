@@ -1277,6 +1277,9 @@ fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(summary) = direct_health_summary(peer) {
             println!("  direct-health={summary}");
         }
+        if let Some(summary) = candidate_pair_stats_summary(peer) {
+            println!("  pair-stats={summary}");
+        }
         if let Some(retry) = direct_retry_summary(peer) {
             println!("  direct-retry={retry}");
         }
@@ -1782,6 +1785,43 @@ fn candidate_pair_summary(peer: &Value) -> String {
     } else {
         format!(" pairs={}({})", pairs.len(), parts.join(","))
     }
+}
+
+fn candidate_pair_stats_summary(peer: &Value) -> Option<String> {
+    let stats = peer.get("candidate_pair_stats").and_then(Value::as_array)?;
+    if stats.is_empty() {
+        return None;
+    }
+
+    let parts = stats
+        .iter()
+        .filter_map(|item| {
+            let source = item.get("source").and_then(Value::as_str)?;
+            let success = item
+                .get("success_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let failure = item
+                .get("failure_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total = success.saturating_add(failure);
+            let rate = item
+                .get("success_rate_per_mille")
+                .and_then(Value::as_u64)
+                .map(|value| format!("{value}‰"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let current = item
+                .get("current_pair_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(format!(
+                "{source}={success}/{total}:{rate},current={current}"
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn peer_diagnostic_endpoints(peer: &Value) -> Vec<SocketAddr> {
@@ -2469,6 +2509,30 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|item| item.contains("birthday probing")));
+    }
+
+    #[test]
+    fn candidate_pair_stats_summary_formats_source_rates() {
+        let peer = serde_json::json!({
+            "candidate_pair_stats": [{
+                "source": "peer_reflexive",
+                "success_count": 1,
+                "failure_count": 1,
+                "success_rate_per_mille": 500,
+                "current_pair_count": 1
+            }, {
+                "source": "signaled",
+                "success_count": 2,
+                "failure_count": 0,
+                "success_rate_per_mille": 1000,
+                "current_pair_count": 2
+            }]
+        });
+
+        assert_eq!(
+            candidate_pair_stats_summary(&peer).as_deref(),
+            Some("peer_reflexive=1/2:500‰,current=1 signaled=2/2:1000‰,current=2")
+        );
     }
 
     #[test]

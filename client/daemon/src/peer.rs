@@ -724,6 +724,7 @@ impl PeerConnection {
     fn candidate_probe_endpoints(&mut self, local_generation: u64) -> Vec<SocketAddr> {
         self.ensure_current_candidate_pairs(local_generation);
         let endpoints = self.candidate_endpoints();
+        let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -735,6 +736,10 @@ impl PeerConnection {
         pairs.sort_by(|a, b| {
             candidate_pair_probe_rank(a.state)
                 .cmp(&candidate_pair_probe_rank(b.state))
+                .then_with(|| {
+                    candidate_pair_source_quality_rank(&source_stats, a.source)
+                        .cmp(&candidate_pair_source_quality_rank(&source_stats, b.source))
+                })
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
@@ -1720,12 +1725,15 @@ impl PeerManager {
 
     /// Get serializable diagnostics for every peer.
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
+        let generation = self.current_network_generation().await;
         let mut peers: Vec<_> = self
             .connections
             .read()
             .await
             .values()
-            .map(PeerDiagnostics::from)
+            .map(|conn| {
+                PeerDiagnostics::from_connection_with_path_selection(conn, None, None, generation)
+            })
             .collect();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         peers
@@ -1755,6 +1763,7 @@ impl PeerManager {
                     conn,
                     Some(&current_selection),
                     Some(direct_retry_after),
+                    generation,
                 )
             })
             .collect();
@@ -1797,6 +1806,24 @@ pub struct PeerManagerStats {
     pub total_bytes_received: u64,
 }
 
+/// Aggregated direct candidate-pair outcomes grouped by endpoint source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidatePairSourceStats {
+    pub source: CandidatePairSource,
+    pub pair_count: u64,
+    pub current_pair_count: u64,
+    pub selected_count: u64,
+    pub succeeded_count: u64,
+    pub probing_count: u64,
+    pub failed_count: u64,
+    pub degraded_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub success_rate_per_mille: Option<u16>,
+    pub last_success_age_ms: Option<u64>,
+    pub last_failure_age_ms: Option<u64>,
+}
+
 /// Serializable peer connection diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDiagnostics {
@@ -1815,6 +1842,7 @@ pub struct PeerDiagnostics {
     pub direct: PathHealthDiagnostics,
     pub relay: PathHealthDiagnostics,
     pub direct_generation: u64,
+    pub candidate_pair_stats: Vec<CandidatePairSourceStats>,
     pub candidate_pairs: Vec<CandidatePairDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct_retry_after_ms: Option<u64>,
@@ -1832,6 +1860,7 @@ impl PeerDiagnostics {
         conn: &PeerConnection,
         current_selection: Option<&PathSelection>,
         direct_retry_after: Option<Duration>,
+        local_generation: u64,
     ) -> Self {
         let mut candidate_pairs = conn
             .candidate_pairs
@@ -1862,6 +1891,10 @@ impl PeerDiagnostics {
             direct: PathHealthDiagnostics::from(&conn.direct_health),
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
+            candidate_pair_stats: candidate_pair_source_stats(
+                &conn.candidate_pairs,
+                local_generation,
+            ),
             candidate_pairs,
             direct_retry_after_ms: direct_retry_after
                 .map(|base| duration_millis(conn.direct_retry_after(base))),
@@ -1883,7 +1916,7 @@ impl PeerDiagnostics {
 
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
-        Self::from_connection_with_path_selection(conn, None, None)
+        Self::from_connection_with_path_selection(conn, None, None, conn.direct_generation)
     }
 }
 
@@ -1995,6 +2028,103 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             failure_count: health.failure_count,
         }
     }
+}
+
+fn candidate_pair_source_stats(
+    pairs: &[CandidatePair],
+    local_generation: u64,
+) -> Vec<CandidatePairSourceStats> {
+    [
+        CandidatePairSource::PeerReflexive,
+        CandidatePairSource::Learned,
+        CandidatePairSource::Signaled,
+    ]
+    .into_iter()
+    .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source))
+    .collect()
+}
+
+fn candidate_pair_source_stats_for(
+    pairs: &[CandidatePair],
+    local_generation: u64,
+    source: CandidatePairSource,
+) -> Option<CandidatePairSourceStats> {
+    let mut pair_count = 0u64;
+    let mut current_pair_count = 0u64;
+    let mut selected_count = 0u64;
+    let mut succeeded_count = 0u64;
+    let mut probing_count = 0u64;
+    let mut failed_count = 0u64;
+    let mut degraded_count = 0u64;
+    let mut success_count = 0u64;
+    let mut failure_count = 0u64;
+    let mut last_success_at: Option<Instant> = None;
+    let mut last_failure_at: Option<Instant> = None;
+
+    for pair in pairs.iter().filter(|pair| pair.source == source) {
+        pair_count = pair_count.saturating_add(1);
+        if pair.local_generation == local_generation {
+            current_pair_count = current_pair_count.saturating_add(1);
+        }
+        match pair.state {
+            CandidatePairState::Selected => selected_count = selected_count.saturating_add(1),
+            CandidatePairState::Succeeded => succeeded_count = succeeded_count.saturating_add(1),
+            CandidatePairState::Probing => probing_count = probing_count.saturating_add(1),
+            CandidatePairState::Failed => failed_count = failed_count.saturating_add(1),
+            CandidatePairState::Degraded => degraded_count = degraded_count.saturating_add(1),
+            CandidatePairState::Frozen | CandidatePairState::Waiting => {}
+        }
+        success_count = success_count.saturating_add(pair.success_count);
+        failure_count = failure_count.saturating_add(pair.failure_count);
+        last_success_at = latest_instant(last_success_at, pair.last_success_at);
+        last_failure_at = latest_instant(last_failure_at, pair.last_failure_at);
+    }
+
+    (pair_count > 0).then(|| CandidatePairSourceStats {
+        source,
+        pair_count,
+        current_pair_count,
+        selected_count,
+        succeeded_count,
+        probing_count,
+        failed_count,
+        degraded_count,
+        success_count,
+        failure_count,
+        success_rate_per_mille: success_rate_per_mille(success_count, failure_count),
+        last_success_age_ms: last_success_at.map(|at| duration_millis(at.elapsed())),
+        last_failure_age_ms: last_failure_at.map(|at| duration_millis(at.elapsed())),
+    })
+}
+
+fn latest_instant(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (Some(current), None) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
+fn success_rate_per_mille(success_count: u64, failure_count: u64) -> Option<u16> {
+    let total = success_count.saturating_add(failure_count);
+    if total == 0 {
+        return None;
+    }
+    Some(((success_count.saturating_mul(1000)) / total).min(1000) as u16)
+}
+
+fn candidate_pair_source_quality_rank(
+    stats: &[CandidatePairSourceStats],
+    source: CandidatePairSource,
+) -> u16 {
+    let Some(stats) = stats.iter().find(|stats| stats.source == source) else {
+        return 500;
+    };
+    let Some(rate) = stats.success_rate_per_mille else {
+        return 500;
+    };
+    1000u16.saturating_sub(rate)
 }
 
 fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
@@ -2364,6 +2494,106 @@ mod tests {
         assert_eq!(
             manager.direct_endpoints().await,
             vec![("peer1".to_string(), new_endpoint)]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_stats_aggregate_real_outcomes_by_source() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let signaled_endpoint: SocketAddr = "127.0.0.1:51836".parse().unwrap();
+        let peer_reflexive_endpoint: SocketAddr = "127.0.0.1:51837".parse().unwrap();
+
+        manager
+            .add_peer(&test_peer("peer1", signaled_endpoint))
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.ensure_candidate_pair_with_source(
+                signaled_endpoint,
+                0,
+                CandidatePairSource::Signaled,
+            )
+            .record_success(Some(Duration::from_millis(12)), false);
+            let peer_reflexive = conn.ensure_candidate_pair_with_source(
+                peer_reflexive_endpoint,
+                0,
+                CandidatePairSource::PeerReflexive,
+            );
+            peer_reflexive.record_success(Some(Duration::from_millis(9)), false);
+            peer_reflexive.record_failure(REASON_DIRECT_PROBE_FAILED, "no ACK");
+        }
+
+        let diagnostics = manager.diagnostics().await;
+        let stats = &diagnostics[0].candidate_pair_stats;
+        let signaled = stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::Signaled)
+            .unwrap();
+        assert_eq!(signaled.pair_count, 1);
+        assert_eq!(signaled.current_pair_count, 1);
+        assert_eq!(signaled.success_count, 1);
+        assert_eq!(signaled.failure_count, 0);
+        assert_eq!(signaled.success_rate_per_mille, Some(1000));
+
+        let peer_reflexive = stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::PeerReflexive)
+            .unwrap();
+        assert_eq!(peer_reflexive.pair_count, 1);
+        assert_eq!(peer_reflexive.degraded_count, 1);
+        assert_eq!(peer_reflexive.success_count, 1);
+        assert_eq!(peer_reflexive.failure_count, 1);
+        assert_eq!(peer_reflexive.success_rate_per_mille, Some(500));
+
+        let json = serde_json::to_value(&diagnostics[0]).unwrap();
+        assert_eq!(json["candidate_pair_stats"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_probe_targets_use_source_success_feedback() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let signaled_endpoint: SocketAddr = "8.8.8.8:51838".parse().unwrap();
+        let peer_reflexive_endpoint: SocketAddr = "127.0.0.1:51839".parse().unwrap();
+
+        manager
+            .add_peer(&test_peer("peer1", signaled_endpoint))
+            .await;
+        assert!(
+            manager
+                .learn_authenticated_endpoint("peer1", peer_reflexive_endpoint)
+                .await
+        );
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            let signaled = conn.ensure_candidate_pair_with_source(
+                signaled_endpoint,
+                0,
+                CandidatePairSource::Signaled,
+            );
+            signaled.success_count = 2;
+            signaled.state = CandidatePairState::Waiting;
+
+            let peer_reflexive = conn.ensure_candidate_pair_with_source(
+                peer_reflexive_endpoint,
+                0,
+                CandidatePairSource::PeerReflexive,
+            );
+            peer_reflexive.failure_count = 2;
+            peer_reflexive.state = CandidatePairState::Waiting;
+        }
+
+        let targets = manager.direct_probe_targets().await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "peer1");
+        assert_eq!(
+            targets[0].1,
+            vec![signaled_endpoint, peer_reflexive_endpoint]
         );
     }
 
