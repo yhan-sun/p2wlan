@@ -30,9 +30,20 @@ type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
 type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
+type PeerReflexiveNotificationState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
 const PUNCH_ACK_RETRANSMIT_DELAYS_MS: [u64; 2] = [20, 80];
+const PEER_REFLEXIVE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// A peer-reflexive UDP source observed on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReflexiveObservation {
+    /// Peer whose UDP source was observed.
+    pub peer_id: String,
+    /// Public/source endpoint observed by this node.
+    pub observed_endpoint: SocketAddr,
+}
 
 #[derive(Debug, Clone)]
 struct PendingProbe {
@@ -109,6 +120,8 @@ pub struct UdpTransport {
     peers: Arc<PeerManager>,
     pending_probes: PendingProbes,
     stun_waiters: StunWaiters,
+    peer_reflexive_tx: Option<mpsc::Sender<PeerReflexiveObservation>>,
+    peer_reflexive_notifications: PeerReflexiveNotificationState,
     local_node_id: Option<String>,
 }
 
@@ -124,6 +137,8 @@ impl UdpTransport {
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
             stun_waiters: Arc::new(Mutex::new(HashMap::new())),
+            peer_reflexive_tx: None,
+            peer_reflexive_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_node_id: None,
         })
     }
@@ -132,6 +147,43 @@ impl UdpTransport {
     pub fn with_local_node_id(mut self, node_id: impl Into<String>) -> Self {
         self.local_node_id = Some(node_id.into());
         self
+    }
+
+    /// Attach a best-effort channel for relay-assisted peer-reflexive observations.
+    pub fn with_peer_reflexive_observer(
+        mut self,
+        tx: mpsc::Sender<PeerReflexiveObservation>,
+    ) -> Self {
+        self.peer_reflexive_tx = Some(tx);
+        self
+    }
+
+    async fn notify_peer_reflexive_observation(
+        &self,
+        peer_id: &str,
+        observed_endpoint: SocketAddr,
+    ) {
+        let Some(tx) = self.peer_reflexive_tx.as_ref() else {
+            return;
+        };
+        let key = (peer_id.to_string(), observed_endpoint);
+        {
+            let mut notifications = self.peer_reflexive_notifications.lock().await;
+            notifications.retain(|_, sent_at| sent_at.elapsed() < PEER_REFLEXIVE_NOTIFY_COOLDOWN);
+            if notifications.contains_key(&key) {
+                return;
+            }
+            notifications.insert(key, Instant::now());
+        }
+
+        if let Err(err) = tx.try_send(PeerReflexiveObservation {
+            peer_id: peer_id.to_string(),
+            observed_endpoint,
+        }) {
+            debug!(
+                "Dropping peer-reflexive observation for {peer_id} at {observed_endpoint}: {err}"
+            );
+        }
     }
 
     async fn send_probe(&self, peer_id: Option<&str>, peer_addr: SocketAddr) -> Result<ProbeNonce> {
@@ -657,6 +709,8 @@ impl UdpTransport {
                         self.peers
                             .record_direct_probe_success(&identity.source_node_id, source)
                             .await;
+                        self.notify_peer_reflexive_observation(&identity.source_node_id, source)
+                            .await;
 
                         let generation = self.peers.current_network_generation().await;
                         let ack = build_authenticated_punch_ack(
@@ -701,6 +755,11 @@ impl UdpTransport {
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;
+                            self.notify_peer_reflexive_observation(
+                                &identity.source_node_id,
+                                source,
+                            )
+                            .await;
                             let accepted = self
                                 .peers
                                 .record_direct_probe_success_with_latency_for_generation(
@@ -750,6 +809,8 @@ impl UdpTransport {
                                     self.peers
                                         .record_direct_probe_success(&peer_id, source)
                                         .await;
+                                    self.notify_peer_reflexive_observation(&peer_id, source)
+                                        .await;
                                     debug!(
                                         "Recorded direct UDP probe success from peer {peer_id} at {source}"
                                     );
@@ -773,6 +834,8 @@ impl UdpTransport {
                         };
                         if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
                             if let Some((latency, generation)) = ack_match {
+                                self.notify_peer_reflexive_observation(&peer_id, source)
+                                    .await;
                                 let accepted = self
                                     .peers
                                     .record_direct_probe_success_with_latency_for_generation(
@@ -1381,10 +1444,12 @@ mod tests {
             .await;
 
         let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+        let (observation_tx, mut observation_rx) = mpsc::channel(4);
         let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
             .await
             .unwrap()
-            .with_local_node_id("peer-a");
+            .with_local_node_id("peer-a")
+            .with_peer_reflexive_observer(observation_tx);
         let local_addr = transport.local_addr().unwrap();
         let (tx, mut rx) = mpsc::channel(4);
         let worker = tokio::spawn(transport.run_inbound(tx));
@@ -1408,6 +1473,13 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), rx.recv())
             .await
             .is_err());
+
+        let observation = timeout(Duration::from_secs(1), observation_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.peer_id, "peer-b");
+        assert_eq!(observation.observed_endpoint, sender_addr);
 
         let conn = peers.get_connection("peer-b").await.unwrap();
         assert_eq!(conn.endpoint, Some(sender_addr));

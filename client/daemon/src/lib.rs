@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 use p2pnet_crypto::NodeIdentity;
@@ -87,7 +87,7 @@ use relay::{
     RelaySelectionOutcome, RelayTicketCache, RelayTransport,
 };
 use transport::{EncryptedPeerPacket, WireGuardTransport};
-use udp::UdpTransport;
+use udp::{PeerReflexiveObservation, UdpTransport};
 
 /// Shared pending-handshake state (timeout-safe).
 #[derive(Default)]
@@ -150,6 +150,10 @@ const NAT_MAPPING_CONTROL_PORT: u16 = 5351;
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Active-path liveness must react much faster than a typical NAT mapping lease.
 const DIRECT_LIVENESS_INTERVAL_MAX: Duration = Duration::from_secs(8);
+/// Delay advertised in signaling so both peers can align a short UDP punching burst.
+const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(1_500);
+/// Ignore very stale relay-assisted windows and punch immediately instead.
+const RELAY_ASSISTED_PUNCH_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// The main daemon orchestrator.
 ///
@@ -519,7 +523,14 @@ impl Daemon {
             .spawn_result("udp-direct", false, async move {
                 match UdpTransport::bind(udp_bind, peers.clone()).await {
                     Ok(udp) => {
-                        let udp = udp.with_local_node_id(local_node_id.clone());
+                        let (peer_reflexive_tx, peer_reflexive_rx) = mpsc::channel(128);
+                        let udp = udp
+                            .with_local_node_id(local_node_id.clone())
+                            .with_peer_reflexive_observer(peer_reflexive_tx);
+                        tokio::spawn(run_peer_reflexive_signal_loop(
+                            peer_reflexive_rx,
+                            control.clone(),
+                        ));
                         *udp_transport.write().await = Some(udp.clone());
 
                         let (mut candidate_endpoints, mut candidate_sources) =
@@ -983,11 +994,17 @@ impl Daemon {
                     );
                     self.peers.add_peer(&peer_info).await;
 
-                    if let Err(err) = self.maybe_initiate_handshake(&peer_info).await {
-                        warn!(
-                            "Failed to initiate WireGuard handshake with {}: {err}",
-                            peer_info.node_id
-                        );
+                    match self.maybe_initiate_handshake(&peer_info).await {
+                        Ok(punch_at_ms) => {
+                            self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to initiate WireGuard handshake with {}: {err}",
+                                peer_info.node_id
+                            );
+                            self.start_hole_punch(&peer_info.node_id).await;
+                        }
                     }
 
                     if self.dns.is_enabled() {
@@ -1027,13 +1044,18 @@ impl Daemon {
                             )
                             .await;
                     }
-                    if let Err(err) = self.maybe_initiate_handshake(&peer_info).await {
-                        warn!(
-                            "Failed to refresh WireGuard handshake with {} after peer update: {err}",
-                            peer_info.node_id
-                        );
+                    match self.maybe_initiate_handshake(&peer_info).await {
+                        Ok(punch_at_ms) => {
+                            self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to refresh WireGuard handshake with {} after peer update: {err}",
+                                peer_info.node_id
+                            );
+                            self.start_hole_punch(&peer_info.node_id).await;
+                        }
                     }
-                    self.start_hole_punch(&peer_info.node_id).await;
                 }
 
                 ControlEvent::PeerLeft(node_id) => {
@@ -1053,6 +1075,7 @@ impl Daemon {
                     candidates,
                     candidate_sources,
                     handshake_init,
+                    punch_at_ms,
                 } => {
                     info!(
                         "Received peer offer from {} ({} candidates)",
@@ -1070,7 +1093,7 @@ impl Daemon {
                             warn!("Failed to handle peer offer from {from_node_id}: {err}");
                         }
                     }
-                    self.start_hole_punch(&from_node_id).await;
+                    self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
                 }
 
                 ControlEvent::PeerAnswer {
@@ -1078,6 +1101,7 @@ impl Daemon {
                     candidates,
                     candidate_sources,
                     handshake_response,
+                    punch_at_ms,
                 } => {
                     info!(
                         "Received peer answer from {} ({} candidates)",
@@ -1095,7 +1119,20 @@ impl Daemon {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
                         }
                     }
-                    self.start_hole_punch(&from_node_id).await;
+                    self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
+                }
+
+                ControlEvent::PeerReflexive {
+                    from_node_id,
+                    observed_endpoint,
+                    punch_at_ms,
+                } => {
+                    self.add_local_peer_reflexive_candidate(&observed_endpoint).await;
+                    self.start_hole_punch_at(
+                        &from_node_id,
+                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
+                    )
+                    .await;
                 }
 
                 ControlEvent::PeerRejected {
@@ -1171,16 +1208,19 @@ impl Daemon {
         Ok(Some(tun))
     }
 
-    async fn maybe_initiate_handshake(&mut self, peer_info: &control::PeerInfo) -> Result<()> {
+    async fn maybe_initiate_handshake(
+        &mut self,
+        peer_info: &control::PeerInfo,
+    ) -> Result<Option<u64>> {
         if self.transport.has_session(&peer_info.node_id).await {
-            return Ok(());
+            return Ok(None);
         }
 
         {
             let state = self.pending_handshakes.lock().await;
             if state.pending.contains_key(&peer_info.node_id) {
                 // Still pending — don't duplicate.
-                return Ok(());
+                return Ok(None);
             }
             if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
                 >= MAX_HANDSHAKE_ATTEMPTS
@@ -1195,7 +1235,7 @@ impl Daemon {
         }
 
         if self.config.node.public_key >= peer_info.public_key {
-            return Ok(());
+            return Ok(None);
         }
 
         let identity = self.local_identity()?;
@@ -1217,13 +1257,15 @@ impl Daemon {
             (attempt_no, pending_id)
         };
 
+        let punch_at_ms = relay_assisted_punch_at_ms();
         if let Err(error) = self
             .control
-            .send_peer_offer_with_sources(
+            .send_peer_offer_with_sources_and_punch_at(
                 &peer_id_clone,
                 &candidates,
                 &candidate_sources,
                 &initiation_bytes,
+                Some(punch_at_ms),
             )
             .await
         {
@@ -1275,7 +1317,7 @@ impl Daemon {
             }
         });
 
-        Ok(())
+        Ok(Some(punch_at_ms))
     }
 
     async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
@@ -1301,7 +1343,40 @@ impl Daemon {
         }
     }
 
+    async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) {
+        let endpoint = match observed_endpoint.parse::<SocketAddr>() {
+            Ok(endpoint) => endpoint.to_string(),
+            Err(err) => {
+                warn!(
+                    "Ignoring invalid relay-assisted peer-reflexive endpoint '{}': {err}",
+                    observed_endpoint
+                );
+                return;
+            }
+        };
+
+        let mut candidates = self.local_candidates.write().await;
+        let mut candidate_sources = self.local_candidate_sources.write().await;
+        let already_present = candidates.contains(&endpoint);
+        if !already_present {
+            candidates.insert(0, endpoint.clone());
+        }
+        candidate_sources.insert(endpoint.clone(), "peer_reflexive".to_string());
+        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
+
+        if !already_present {
+            info!(
+                "Added relay-assisted peer-reflexive local UDP candidate {}",
+                endpoint
+            );
+        }
+    }
+
     async fn start_hole_punch(&self, node_id: &str) {
+        self.start_hole_punch_at(node_id, None).await;
+    }
+
+    async fn start_hole_punch_at(&self, node_id: &str, punch_at_ms: Option<u64>) {
         let Some(udp) = self.udp_transport.read().await.clone() else {
             debug!("UDP transport is not ready; skipping hole punch for {node_id}");
             return;
@@ -1312,20 +1387,6 @@ impl Daemon {
             return;
         };
 
-        let candidates = self.peers.direct_probe_targets_for(node_id).await;
-
-        if candidates.is_empty() {
-            debug!("No UDP candidates for {node_id}; skipping hole punch");
-            self.peers
-                .record_direct_failure_with_code(
-                    node_id,
-                    REASON_DIRECT_PROBE_FAILED,
-                    "no UDP candidates for hole punching",
-                )
-                .await;
-            return;
-        }
-
         if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
             self.peers
                 .update_state(node_id, ConnectionState::HolePunching)
@@ -1334,10 +1395,36 @@ impl Daemon {
 
         let peer_id = node_id.to_string();
         let peers = self.peers.clone();
-        let generation = self.peers.current_network_generation().await;
         let probe_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let attempts = self.config.network.punch_attempts;
+        let punch_delay = relay_assisted_punch_delay(punch_at_ms);
+        if !punch_delay.is_zero() {
+            debug!(
+                "Scheduling relay-assisted UDP punch to peer {peer_id} in {}ms",
+                punch_delay.as_millis()
+            );
+        }
+
         tokio::spawn(async move {
+            if !punch_delay.is_zero() {
+                sleep(punch_delay).await;
+            }
+
+            let generation = peers.current_network_generation().await;
+            let candidates = peers.direct_probe_targets_for(&peer_id).await;
+            if candidates.is_empty() {
+                debug!("No UDP candidates for {peer_id}; skipping hole punch");
+                peers
+                    .record_direct_failure_for_generation(
+                        &peer_id,
+                        generation,
+                        REASON_DIRECT_PROBE_FAILED,
+                        "no UDP candidates for hole punching",
+                    )
+                    .await;
+                return;
+            }
+
             match udp
                 .punch_candidates(&peer_id, candidates, probe_interval, attempts)
                 .await
@@ -1406,11 +1493,12 @@ impl Daemon {
             .await;
         if let Err(error) = self
             .control
-            .send_peer_answer_with_sources(
+            .send_peer_answer_with_sources_and_punch_at(
                 from_node_id,
                 &candidates,
                 &candidate_sources,
                 &response_bytes,
+                Some(relay_assisted_punch_at_ms()),
             )
             .await
         {
@@ -2557,6 +2645,60 @@ fn direct_probe_ack_grace(probe_interval: Duration) -> Duration {
     probe_interval
         .saturating_mul(2)
         .clamp(Duration::from_secs(1), Duration::from_secs(2))
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn relay_assisted_punch_at_ms() -> u64 {
+    unix_time_millis().saturating_add(RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64)
+}
+
+fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
+    let Some(punch_at_ms) = punch_at_ms else {
+        return Duration::ZERO;
+    };
+    let now = unix_time_millis();
+    if punch_at_ms > now {
+        return Duration::from_millis(punch_at_ms - now);
+    }
+    let stale_by = Duration::from_millis(now - punch_at_ms);
+    if stale_by > RELAY_ASSISTED_PUNCH_STALE_AFTER {
+        debug!(
+            "Relay-assisted punch window is stale by {}ms; punching immediately",
+            stale_by.as_millis()
+        );
+    }
+    Duration::ZERO
+}
+
+async fn run_peer_reflexive_signal_loop(
+    mut rx: mpsc::Receiver<PeerReflexiveObservation>,
+    control: ControlClient,
+) {
+    while let Some(observation) = rx.recv().await {
+        let observed_endpoint = observation.observed_endpoint.to_string();
+        let punch_at_ms = Some(relay_assisted_punch_at_ms());
+        match control
+            .send_peer_reflexive(&observation.peer_id, &observed_endpoint, punch_at_ms)
+            .await
+        {
+            Ok(()) => debug!(
+                "Relayed peer-reflexive observation to {}: {} punch_at_ms={punch_at_ms:?}",
+                observation.peer_id, observed_endpoint
+            ),
+            Err(err) => warn!(
+                "Failed to relay peer-reflexive observation to {} at {}: {err}",
+                observation.peer_id, observed_endpoint
+            ),
+        }
+    }
 }
 
 async fn run_direct_probe_loop(

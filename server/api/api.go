@@ -629,6 +629,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		Candidates       []string          `json:"candidates"`
 		CandidateSources map[string]string `json:"candidate_sources"`
 		Handshake        string            `json:"handshake"`
+		PunchAtMS        int64             `json:"punch_at_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -641,7 +642,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"to_node_id and type are required"}`, http.StatusBadRequest)
 		return
 	}
-	if req.Type != "peer_offer" && req.Type != "peer_answer" {
+	if req.Type != "peer_offer" && req.Type != "peer_answer" && req.Type != "peer_reflexive" {
 		http.Error(w, `{"error":"unsupported signal type"}`, http.StatusBadRequest)
 		return
 	}
@@ -652,6 +653,10 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Candidates) > 20 {
 		http.Error(w, `{"error":"too many candidates (max 20)"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Type == "peer_reflexive" && len(req.Candidates) == 0 {
+		http.Error(w, `{"error":"peer_reflexive requires an observed candidate"}`, http.StatusBadRequest)
 		return
 	}
 	candidateSet := make(map[string]struct{}, len(req.Candidates))
@@ -679,6 +684,17 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	if len(req.Handshake) > 4096 {
 		http.Error(w, `{"error":"handshake too long"}`, http.StatusBadRequest)
 		return
+	}
+	if req.PunchAtMS < 0 {
+		http.Error(w, `{"error":"punch_at_ms must be non-negative"}`, http.StatusBadRequest)
+		return
+	}
+	if req.PunchAtMS > 0 {
+		nowMS := time.Now().UnixMilli()
+		if req.PunchAtMS < nowMS-10*60*1000 || req.PunchAtMS > nowMS+10*60*1000 {
+			http.Error(w, `{"error":"punch_at_ms outside allowed clock-skew window"}`, http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Determine from_node_id and network_id from auth context
@@ -728,7 +744,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignal(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake)
+	signal, err := s.db.CreateSignalWithPunchAt(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, req.PunchAtMS)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
