@@ -145,6 +145,43 @@ func TestSignalsDeduplicateByPairAndType(t *testing.T) {
 	}
 }
 
+func TestSignalsPreservePunchAtMS(t *testing.T) {
+	db, device := createTestDevice(t, "signal-punch-window@p2wlan.local", "signal-punch-source")
+	defer db.Close()
+
+	target, err := db.CreateDevice(device.UserID, "default", "signal-punch-target-pubkey", "signal-punch-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target failed: %v", err)
+	}
+
+	const punchAtMS int64 = 1_777_000_001_234
+	if _, err := db.CreateSignalWithPunchAt(
+		device.ID,
+		target.ID,
+		"peer_reflexive",
+		[]string{"203.0.113.10:51820"},
+		map[string]string{"203.0.113.10:51820": "peer_reflexive"},
+		"",
+		punchAtMS,
+	); err != nil {
+		t.Fatalf("CreateSignalWithPunchAt failed: %v", err)
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals failed: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	if signals[0].PunchAtMS != punchAtMS {
+		t.Fatalf("expected punch_at_ms %d, got %d", punchAtMS, signals[0].PunchAtMS)
+	}
+	if got := signals[0].CandidateSources["203.0.113.10:51820"]; got != "peer_reflexive" {
+		t.Fatalf("expected peer_reflexive source, got %q", got)
+	}
+}
+
 func TestSignalsIgnoreExpiredRows(t *testing.T) {
 	db, device := createTestDevice(t, "signal-ttl@p2wlan.local", "signal-ttl-source")
 	defer db.Close()

@@ -82,6 +82,8 @@ pub enum ControlMessage {
         candidate_sources: HashMap<String, String>,
         #[serde(default)]
         handshake_init: Vec<u8>,
+        #[serde(default)]
+        punch_at_ms: Option<u64>,
     },
 
     /// Answer to a peer offer.
@@ -94,6 +96,22 @@ pub enum ControlMessage {
         candidate_sources: HashMap<String, String>,
         #[serde(default)]
         handshake_response: Vec<u8>,
+        #[serde(default)]
+        punch_at_ms: Option<u64>,
+    },
+
+    /// Relay-assisted peer-reflexive candidate observation.
+    ///
+    /// Semantics: `from_node_id` observed `to_node_id`'s UDP source as
+    /// `observed_endpoint`. The receiver must treat it as a local candidate,
+    /// not as the sender's remote endpoint.
+    #[serde(rename = "peer_reflexive")]
+    PeerReflexive {
+        from_node_id: String,
+        to_node_id: String,
+        observed_endpoint: String,
+        #[serde(default)]
+        punch_at_ms: Option<u64>,
     },
 
     /// Reject a peer connection.
@@ -191,6 +209,7 @@ pub enum ControlEvent {
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
+        punch_at_ms: Option<u64>,
     },
     /// Received a peer answer.
     PeerAnswer {
@@ -198,6 +217,13 @@ pub enum ControlEvent {
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
+        punch_at_ms: Option<u64>,
+    },
+    /// A peer relayed back the UDP source endpoint it observed for us.
+    PeerReflexive {
+        from_node_id: String,
+        observed_endpoint: String,
+        punch_at_ms: Option<u64>,
     },
     /// Received a peer reject.
     PeerRejected {
@@ -317,6 +343,8 @@ struct SignalResponse {
     candidate_sources: HashMap<String, String>,
     #[serde(default)]
     handshake: String,
+    #[serde(default)]
+    punch_at_ms: Option<u64>,
 }
 
 /// Control plane client.
@@ -353,6 +381,7 @@ enum ControlCommand {
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
+        punch_at_ms: Option<u64>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Send a peer answer.
@@ -361,6 +390,14 @@ enum ControlCommand {
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
+        punch_at_ms: Option<u64>,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
+    /// Send a relay-assisted peer-reflexive observation.
+    SendPeerReflexive {
+        to_node_id: String,
+        observed_endpoint: String,
+        punch_at_ms: Option<u64>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Create a tunnel.
@@ -457,8 +494,14 @@ impl ControlClient {
         candidates: &[String],
         handshake_init: &[u8],
     ) -> Result<()> {
-        self.send_peer_offer_with_sources(to_node_id, candidates, &HashMap::new(), handshake_init)
-            .await
+        self.send_peer_offer_with_sources_and_punch_at(
+            to_node_id,
+            candidates,
+            &HashMap::new(),
+            handshake_init,
+            None,
+        )
+        .await
     }
 
     /// Send a peer offer with optional candidate source metadata.
@@ -469,6 +512,25 @@ impl ControlClient {
         candidate_sources: &HashMap<String, String>,
         handshake_init: &[u8],
     ) -> Result<()> {
+        self.send_peer_offer_with_sources_and_punch_at(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            None,
+        )
+        .await
+    }
+
+    /// Send a peer offer with candidate sources and an optional synchronized punch window.
+    pub async fn send_peer_offer_with_sources_and_punch_at(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
@@ -476,6 +538,7 @@ impl ControlClient {
                 candidates: candidates.to_vec(),
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
+                punch_at_ms,
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
@@ -491,11 +554,12 @@ impl ControlClient {
         candidates: &[String],
         handshake_response: &[u8],
     ) -> Result<()> {
-        self.send_peer_answer_with_sources(
+        self.send_peer_answer_with_sources_and_punch_at(
             to_node_id,
             candidates,
             &HashMap::new(),
             handshake_response,
+            None,
         )
         .await
     }
@@ -508,6 +572,25 @@ impl ControlClient {
         candidate_sources: &HashMap<String, String>,
         handshake_response: &[u8],
     ) -> Result<()> {
+        self.send_peer_answer_with_sources_and_punch_at(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_response,
+            None,
+        )
+        .await
+    }
+
+    /// Send a peer answer with candidate sources and an optional synchronized punch window.
+    pub async fn send_peer_answer_with_sources_and_punch_at(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_response: &[u8],
+        punch_at_ms: Option<u64>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerAnswer {
@@ -515,12 +598,34 @@ impl ControlClient {
                 candidates: candidates.to_vec(),
                 candidate_sources: candidate_sources.clone(),
                 handshake_response: handshake_response.to_vec(),
+                punch_at_ms,
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
         response_rx
             .await
             .map_err(|_| DaemonError::ControlPlane("peer answer response channel closed".into()))?
+    }
+
+    /// Relay a peer-reflexive source address observed for the target peer.
+    pub async fn send_peer_reflexive(
+        &self,
+        to_node_id: &str,
+        observed_endpoint: &str,
+        punch_at_ms: Option<u64>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::SendPeerReflexive {
+                to_node_id: to_node_id.to_string(),
+                observed_endpoint: observed_endpoint.to_string(),
+                punch_at_ms,
+                response_tx,
+            })
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx.await.map_err(|_| {
+            DaemonError::ControlPlane("peer-reflexive response channel closed".into())
+        })?
     }
 
     /// Request a port mapping tunnel.
@@ -635,6 +740,7 @@ impl ControlClient {
                 candidates,
                 candidate_sources,
                 handshake_init,
+                punch_at_ms,
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerOffer {
@@ -642,6 +748,7 @@ impl ControlClient {
                     candidates,
                     candidate_sources,
                     handshake_init,
+                    punch_at_ms,
                 });
             }
 
@@ -650,6 +757,7 @@ impl ControlClient {
                 candidates,
                 candidate_sources,
                 handshake_response,
+                punch_at_ms,
                 ..
             } => {
                 let _ = self.event_tx.send(ControlEvent::PeerAnswer {
@@ -657,6 +765,20 @@ impl ControlClient {
                     candidates,
                     candidate_sources,
                     handshake_response,
+                    punch_at_ms,
+                });
+            }
+
+            ControlMessage::PeerReflexive {
+                from_node_id,
+                observed_endpoint,
+                punch_at_ms,
+                ..
+            } => {
+                let _ = self.event_tx.send(ControlEvent::PeerReflexive {
+                    from_node_id,
+                    observed_endpoint,
+                    punch_at_ms,
                 });
             }
 
@@ -1063,10 +1185,10 @@ async fn run_control_loop(
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init).await;
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init, punch_at_ms, response_tx } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms).await;
                             match &res {
-                                Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
+                                Ok(()) => { debug!("Sent peer offer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
                                     let err_str = err.to_string();
                                     let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err_str.clone() });
@@ -1077,13 +1199,35 @@ async fn run_control_loop(
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response).await;
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, punch_at_ms, response_tx } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms).await;
                             match &res {
-                                Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
+                                Ok(()) => { debug!("Sent peer answer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
                                     let err_str = err.to_string();
                                     let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err_str.clone() });
+                                    if is_permanent_auth_error(&err_str) {
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = response_tx.send(res);
+                        }
+                        ControlCommand::SendPeerReflexive { to_node_id, observed_endpoint, punch_at_ms, response_tx } => {
+                            let candidates = vec![observed_endpoint.clone()];
+                            let candidate_sources = HashMap::from([
+                                (observed_endpoint.clone(), "peer_reflexive".to_string())
+                            ]);
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms).await;
+                            match &res {
+                                Ok(()) => {
+                                    debug!(
+                                        "Sent peer-reflexive observation to {to_node_id}: {observed_endpoint} punch_at_ms={punch_at_ms:?}"
+                                    );
+                                }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let _ = event_tx.send(ControlEvent::ServerError { code: 4002, message: err_str.clone() });
                                     if is_permanent_auth_error(&err_str) {
                                         break;
                                     }
@@ -1402,6 +1546,7 @@ async fn send_signal(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
     handshake: &[u8],
+    punch_at_ms: Option<u64>,
 ) -> Result<()> {
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
@@ -1413,6 +1558,7 @@ async fn send_signal(
             "candidates": candidates,
             "candidate_sources": candidate_sources,
             "handshake": hex::encode(handshake),
+            "punch_at_ms": punch_at_ms,
         }))
         .send()
         .await
@@ -1482,6 +1628,7 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     handshake_init: handshake,
+                    punch_at_ms: signal.punch_at_ms,
                 });
             }
             "peer_answer" => {
@@ -1490,7 +1637,22 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     handshake_response: handshake,
+                    punch_at_ms: signal.punch_at_ms,
                 });
+            }
+            "peer_reflexive" => {
+                if let Some(observed_endpoint) = peer_reflexive_endpoint_from_signal(&signal) {
+                    let _ = event_tx.send(ControlEvent::PeerReflexive {
+                        from_node_id: signal.from_node_id,
+                        observed_endpoint,
+                        punch_at_ms: signal.punch_at_ms,
+                    });
+                } else {
+                    warn!(
+                        "Ignoring peer_reflexive signal from {}; missing observed endpoint",
+                        signal.from_node_id
+                    );
+                }
             }
             other => {
                 warn!("Ignoring unsupported signal type from control plane: {other}");
@@ -1499,6 +1661,20 @@ async fn poll_signals(
     }
 
     Ok(())
+}
+
+fn peer_reflexive_endpoint_from_signal(signal: &SignalResponse) -> Option<String> {
+    signal
+        .candidates
+        .iter()
+        .find(|candidate| {
+            signal
+                .candidate_sources
+                .get(candidate.as_str())
+                .is_some_and(|source| source == "peer_reflexive")
+        })
+        .or_else(|| signal.candidates.first())
+        .cloned()
 }
 
 async fn poll_peers(
@@ -1712,11 +1888,88 @@ mod tests {
             candidates: vec!["10.0.0.1:5000".to_string()],
             candidate_sources: HashMap::new(),
             handshake_init: vec![0x01, 0x02],
+            punch_at_ms: Some(1234),
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, ControlMessage::PeerOffer { .. }));
+    }
+
+    #[test]
+    fn test_peer_reflexive_serialization() {
+        let msg = ControlMessage::PeerReflexive {
+            from_node_id: "alice".to_string(),
+            to_node_id: "bob".to_string(),
+            observed_endpoint: "203.0.113.10:51820".to_string(),
+            punch_at_ms: Some(42_000),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"peer_reflexive\""));
+        assert!(json.contains("\"observed_endpoint\":\"203.0.113.10:51820\""));
+
+        let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ControlMessage::PeerReflexive {
+                from_node_id,
+                to_node_id,
+                observed_endpoint,
+                punch_at_ms,
+            } => {
+                assert_eq!(from_node_id, "alice");
+                assert_eq!(to_node_id, "bob");
+                assert_eq!(observed_endpoint, "203.0.113.10:51820");
+                assert_eq!(punch_at_ms, Some(42_000));
+            }
+            other => panic!("expected PeerReflexive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
+        let signal = SignalResponse {
+            from_node_id: "alice".to_string(),
+            signal_type: "peer_reflexive".to_string(),
+            candidates: vec![
+                "198.51.100.1:40000".to_string(),
+                "203.0.113.10:51820".to_string(),
+            ],
+            candidate_sources: HashMap::from([
+                (
+                    "198.51.100.1:40000".to_string(),
+                    "stun_observed".to_string(),
+                ),
+                (
+                    "203.0.113.10:51820".to_string(),
+                    "peer_reflexive".to_string(),
+                ),
+            ]),
+            handshake: String::new(),
+            punch_at_ms: Some(77),
+        };
+
+        assert_eq!(
+            peer_reflexive_endpoint_from_signal(&signal),
+            Some("203.0.113.10:51820".to_string())
+        );
+    }
+
+    #[test]
+    fn test_peer_reflexive_endpoint_falls_back_to_first_candidate() {
+        let signal = SignalResponse {
+            from_node_id: "alice".to_string(),
+            signal_type: "peer_reflexive".to_string(),
+            candidates: vec!["198.51.100.1:40000".to_string()],
+            candidate_sources: HashMap::new(),
+            handshake: String::new(),
+            punch_at_ms: None,
+        };
+
+        assert_eq!(
+            peer_reflexive_endpoint_from_signal(&signal),
+            Some("198.51.100.1:40000".to_string())
+        );
     }
 
     #[test]

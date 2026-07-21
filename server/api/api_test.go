@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
 	"github.com/yhan-sun/p2wlan/server/database"
@@ -102,4 +104,104 @@ func TestUpdateDeviceRejectsAnotherUser(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", recorder.Code, recorder.Body.String())
 	}
+}
+
+func TestCreateSignalAcceptsPeerReflexiveWithPunchWindow(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-owner@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	punchAtMS := time.Now().Add(1500 * time.Millisecond).UnixMilli()
+	body := strings.NewReader(`{
+		"to_node_id":"` + target.ID + `",
+		"type":"peer_reflexive",
+		"candidates":["203.0.113.10:51820"],
+		"candidate_sources":{"203.0.113.10:51820":"peer_reflexive"},
+		"punch_at_ms":` + fmtInt64(punchAtMS) + `
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+
+	NewServer(nil, nil, db).CreateSignal(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	if signals[0].Type != "peer_reflexive" {
+		t.Fatalf("expected peer_reflexive, got %q", signals[0].Type)
+	}
+	if signals[0].PunchAtMS != punchAtMS {
+		t.Fatalf("expected punch_at_ms %d, got %d", punchAtMS, signals[0].PunchAtMS)
+	}
+}
+
+func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, _ := db.CreateUser("signal-invalid@example.com", "hash")
+	source, _ := db.CreateDevice(user.ID, "default", "signal-invalid-source-key", "source", "macos", "")
+	target, _ := db.CreateDevice(user.ID, "default", "signal-invalid-target-key", "target", "linux", "")
+	server := NewServer(nil, nil, db)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing candidate",
+			body: `{"to_node_id":"` + target.ID + `","type":"peer_reflexive"}`,
+		},
+		{
+			name: "distant punch window",
+			body: `{"to_node_id":"` + target.ID + `","type":"peer_reflexive","candidates":["203.0.113.10:51820"],"punch_at_ms":` + fmtInt64(time.Now().Add(11*time.Minute).UnixMilli()) + `}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", strings.NewReader(tc.body))
+			req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+				DeviceID:  source.ID,
+				NetworkID: source.NetworkID,
+				UserID:    user.ID,
+			}))
+			recorder := httptest.NewRecorder()
+
+			server.CreateSignal(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func fmtInt64(value int64) string {
+	return strconv.FormatInt(value, 10)
 }

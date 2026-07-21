@@ -62,6 +62,7 @@ type PeerOfferData struct {
 	Candidates       []string          `json:"candidates"`
 	CandidateSources map[string]string `json:"candidate_sources,omitempty"`
 	HandshakeInit    []byte            `json:"handshake_init,omitempty"`
+	PunchAtMS        int64             `json:"punch_at_ms,omitempty"`
 }
 
 // PeerAnswerData is the payload for P2P connection answers.
@@ -71,6 +72,16 @@ type PeerAnswerData struct {
 	Candidates        []string          `json:"candidates"`
 	CandidateSources  map[string]string `json:"candidate_sources,omitempty"`
 	HandshakeResponse []byte            `json:"handshake_response,omitempty"`
+	PunchAtMS         int64             `json:"punch_at_ms,omitempty"`
+}
+
+// PeerReflexiveData carries a relay-assisted UDP source observation.
+type PeerReflexiveData struct {
+	FromNodeID       string            `json:"from_node_id"`
+	ToNodeID         string            `json:"to_node_id"`
+	Candidates       []string          `json:"candidates"`
+	CandidateSources map[string]string `json:"candidate_sources,omitempty"`
+	PunchAtMS        int64             `json:"punch_at_ms,omitempty"`
 }
 
 // Client represents a connected node.
@@ -269,6 +280,11 @@ func (c *Client) readPump() {
 
 		case "peer_answer":
 			var data PeerAnswerData
+			json.Unmarshal(msg.Data, &data)
+			c.hub.SendToPeer(data.FromNodeID, data.ToNodeID, msg)
+
+		case "peer_reflexive":
+			var data PeerReflexiveData
 			json.Unmarshal(msg.Data, &data)
 			c.hub.SendToPeer(data.FromNodeID, data.ToNodeID, msg)
 
