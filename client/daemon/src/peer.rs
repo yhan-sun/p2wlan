@@ -7,7 +7,7 @@
 //! - Routes packets between TUN device and peer tunnels
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -300,15 +300,33 @@ pub enum CandidatePairState {
     Degraded,
 }
 
+/// Where a candidate pair endpoint came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidatePairSource {
+    /// Endpoint was signaled by the control plane or static peer metadata.
+    Signaled,
+    /// Endpoint was learned from legacy candidate-matched traffic.
+    Learned,
+    /// Endpoint was learned from an authenticated Probe v2 source address.
+    PeerReflexive,
+}
+
 /// State and health for one direct candidate pair.
 #[derive(Debug, Clone)]
 pub struct CandidatePair {
     /// Remote UDP candidate endpoint.
     pub remote_endpoint: SocketAddr,
+    /// Endpoint source used for probe ranking and diagnostics.
+    pub source: CandidatePairSource,
     /// Local network generation this pair belongs to.
     pub local_generation: u64,
     /// Current reachability state.
     pub state: CandidatePairState,
+    /// Most recent active probe sent for this pair.
+    pub last_probe_at: Option<Instant>,
+    /// Active probe packets sent to this pair.
+    pub probe_count: u64,
     /// First successful bidirectional probe or encrypted packet.
     pub first_success_at: Option<Instant>,
     /// Most recent successful bidirectional probe or encrypted packet.
@@ -334,11 +352,18 @@ pub struct CandidatePair {
 }
 
 impl CandidatePair {
-    fn new(remote_endpoint: SocketAddr, local_generation: u64) -> Self {
+    fn new_with_source(
+        remote_endpoint: SocketAddr,
+        local_generation: u64,
+        source: CandidatePairSource,
+    ) -> Self {
         Self {
             remote_endpoint,
+            source,
             local_generation,
             state: CandidatePairState::Waiting,
+            last_probe_at: None,
+            probe_count: 0,
             first_success_at: None,
             last_success_at: None,
             last_failure_at: None,
@@ -353,7 +378,15 @@ impl CandidatePair {
         }
     }
 
+    fn promote_source(&mut self, source: CandidatePairSource) {
+        if candidate_pair_source_rank(source) < candidate_pair_source_rank(self.source) {
+            self.source = source;
+        }
+    }
+
     fn record_probing(&mut self) {
+        self.last_probe_at = Some(Instant::now());
+        self.probe_count = self.probe_count.saturating_add(1);
         if !matches!(
             self.state,
             CandidatePairState::Succeeded | CandidatePairState::Selected
@@ -653,13 +686,30 @@ impl PeerConnection {
         endpoint: SocketAddr,
         local_generation: u64,
     ) -> &mut CandidatePair {
+        self.ensure_candidate_pair_with_source(
+            endpoint,
+            local_generation,
+            CandidatePairSource::Signaled,
+        )
+    }
+
+    fn ensure_candidate_pair_with_source(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        source: CandidatePairSource,
+    ) -> &mut CandidatePair {
         if let Some(index) = self.candidate_pairs.iter().position(|pair| {
             pair.remote_endpoint == endpoint && pair.local_generation == local_generation
         }) {
+            self.candidate_pairs[index].promote_source(source);
             return &mut self.candidate_pairs[index];
         }
-        self.candidate_pairs
-            .push(CandidatePair::new(endpoint, local_generation));
+        self.candidate_pairs.push(CandidatePair::new_with_source(
+            endpoint,
+            local_generation,
+            source,
+        ));
         self.candidate_pairs
             .last_mut()
             .expect("candidate pair inserted")
@@ -685,6 +735,16 @@ impl PeerConnection {
         pairs.sort_by(|a, b| {
             candidate_pair_probe_rank(a.state)
                 .cmp(&candidate_pair_probe_rank(b.state))
+                .then_with(|| {
+                    candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
+                })
+                .then_with(|| {
+                    endpoint_probe_rank(a.remote_endpoint)
+                        .cmp(&endpoint_probe_rank(b.remote_endpoint))
+                })
+                .then_with(|| a.probe_count.cmp(&b.probe_count))
+                .then_with(|| a.consecutive_failures.cmp(&b.consecutive_failures))
+                .then_with(|| a.failure_count.cmp(&b.failure_count))
                 .then_with(|| {
                     a.rtt_ewma_ms
                         .or(a.rtt_ms)
@@ -991,7 +1051,20 @@ impl PeerConnection {
     }
 
     fn mark_candidate_pair_probing(&mut self, endpoint: SocketAddr, local_generation: u64) {
-        self.ensure_candidate_pair(endpoint, local_generation)
+        self.mark_candidate_pair_probing_with_source(
+            endpoint,
+            local_generation,
+            CandidatePairSource::Signaled,
+        );
+    }
+
+    fn mark_candidate_pair_probing_with_source(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        source: CandidatePairSource,
+    ) {
+        self.ensure_candidate_pair_with_source(endpoint, local_generation, source)
             .record_probing();
     }
 
@@ -1251,12 +1324,22 @@ impl PeerManager {
             return false;
         };
 
+        if let Some(previous_endpoint) = conn.endpoint {
+            let previous_endpoint_text = previous_endpoint.to_string();
+            if !conn.candidates.contains(&previous_endpoint_text) {
+                conn.candidates.push(previous_endpoint_text);
+            }
+        }
         conn.endpoint = Some(endpoint);
         let endpoint_text = endpoint.to_string();
         if !conn.candidates.contains(&endpoint_text) {
             conn.candidates.push(endpoint_text);
         }
-        conn.mark_candidate_pair_probing(endpoint, generation);
+        conn.mark_candidate_pair_probing_with_source(
+            endpoint,
+            generation,
+            CandidatePairSource::PeerReflexive,
+        );
         true
     }
 
@@ -1279,7 +1362,11 @@ impl PeerManager {
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);
-                conn.mark_candidate_pair_probing(endpoint, generation);
+                conn.mark_candidate_pair_probing_with_source(
+                    endpoint,
+                    generation,
+                    CandidatePairSource::Learned,
+                );
                 return Some(node_id.clone());
             }
         }
@@ -1836,8 +1923,11 @@ impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidatePairDiagnostics {
     pub remote_endpoint: String,
+    pub source: CandidatePairSource,
     pub local_generation: u64,
     pub state: CandidatePairState,
+    pub last_probe_age_ms: Option<u64>,
+    pub probe_count: u64,
     pub first_success_age_ms: Option<u64>,
     pub last_success_age_ms: Option<u64>,
     pub last_failure_age_ms: Option<u64>,
@@ -1855,8 +1945,11 @@ impl From<&CandidatePair> for CandidatePairDiagnostics {
     fn from(pair: &CandidatePair) -> Self {
         Self {
             remote_endpoint: pair.remote_endpoint.to_string(),
+            source: pair.source,
             local_generation: pair.local_generation,
             state: pair.state,
+            last_probe_age_ms: pair.last_probe_at.map(|at| duration_millis(at.elapsed())),
+            probe_count: pair.probe_count,
             first_success_age_ms: pair.first_success_age().map(duration_millis),
             last_success_age_ms: pair.success_age().map(duration_millis),
             last_failure_age_ms: pair.failure_age().map(duration_millis),
@@ -1904,12 +1997,41 @@ impl From<&PathHealth> for PathHealthDiagnostics {
     }
 }
 
+fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
+    match source {
+        CandidatePairSource::PeerReflexive => 0,
+        CandidatePairSource::Learned => 1,
+        CandidatePairSource::Signaled => 2,
+    }
+}
+
+fn endpoint_probe_rank(endpoint: SocketAddr) -> u8 {
+    match endpoint.ip() {
+        IpAddr::V4(ip) => {
+            if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+                0
+            } else {
+                2
+            }
+        }
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            let is_unique_local = (first_segment & 0xfe00) == 0xfc00;
+            let is_link_local = (first_segment & 0xffc0) == 0xfe80;
+            if ip.is_loopback() || is_unique_local || is_link_local {
+                0
+            } else {
+                1
+            }
+        }
+    }
+}
+
 fn candidate_pair_probe_rank(state: CandidatePairState) -> u8 {
     match state {
-        CandidatePairState::Waiting => 0,
-        CandidatePairState::Probing => 1,
-        CandidatePairState::Succeeded => 2,
-        CandidatePairState::Selected => 3,
+        CandidatePairState::Waiting | CandidatePairState::Probing => 0,
+        CandidatePairState::Succeeded => 1,
+        CandidatePairState::Selected => 2,
         CandidatePairState::Failed => 4,
         CandidatePairState::Degraded => 5,
         CandidatePairState::Frozen => 6,
@@ -2279,6 +2401,63 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "peer1");
         assert_eq!(targets[0].1, vec![waiting_endpoint, failed_endpoint]);
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_probe_targets_promote_authenticated_peer_reflexive() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let signaled_endpoint: SocketAddr = "8.8.8.8:51830".parse().unwrap();
+        let peer_reflexive_endpoint: SocketAddr = "127.0.0.1:51831".parse().unwrap();
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer1".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: signaled_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        assert!(
+            manager
+                .learn_authenticated_endpoint("peer1", peer_reflexive_endpoint)
+                .await
+        );
+
+        let targets = manager.direct_probe_targets().await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].1,
+            vec![peer_reflexive_endpoint, signaled_endpoint]
+        );
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        let peer_reflexive_pair = conn
+            .candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == peer_reflexive_endpoint)
+            .unwrap();
+        assert_eq!(
+            peer_reflexive_pair.source,
+            CandidatePairSource::PeerReflexive
+        );
+        assert_eq!(peer_reflexive_pair.probe_count, 2);
+        assert!(peer_reflexive_pair.last_probe_at.is_some());
+
+        let diagnostics = manager.diagnostics().await;
+        let diagnostic_pair = diagnostics[0]
+            .candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == peer_reflexive_endpoint.to_string())
+            .unwrap();
+        assert_eq!(diagnostic_pair.source, CandidatePairSource::PeerReflexive);
+        assert_eq!(diagnostic_pair.probe_count, 2);
+        assert!(diagnostic_pair.last_probe_age_ms.is_some());
     }
 
     #[tokio::test]

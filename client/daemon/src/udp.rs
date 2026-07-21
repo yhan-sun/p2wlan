@@ -36,6 +36,64 @@ struct PendingProbe {
     authenticated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeScheduleRound {
+    delay_before: Duration,
+    endpoints: Vec<SocketAddr>,
+}
+
+fn build_probe_schedule(
+    candidates: &[SocketAddr],
+    probe_interval: Duration,
+    attempts: u32,
+) -> Vec<ProbeScheduleRound> {
+    if candidates.is_empty() || attempts == 0 {
+        return Vec::new();
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.contains(candidate) {
+            unique.push(*candidate);
+        }
+    }
+
+    (0..attempts)
+        .map(|round| {
+            let is_final_round = round + 1 == attempts;
+            let width = if attempts == 1 || is_final_round {
+                unique.len()
+            } else if round == 0 {
+                unique.len().min(2)
+            } else if round == 1 {
+                unique.len().min(4)
+            } else {
+                unique.len()
+            };
+
+            ProbeScheduleRound {
+                delay_before: probe_round_delay(round, probe_interval),
+                endpoints: unique.iter().take(width).copied().collect(),
+            }
+        })
+        .filter(|round| !round.endpoints.is_empty())
+        .collect()
+}
+
+fn probe_round_delay(round: u32, probe_interval: Duration) -> Duration {
+    if round == 0 || probe_interval.is_zero() {
+        return Duration::ZERO;
+    }
+
+    let burst_delay = match round {
+        1 => Duration::from_millis(60),
+        2 => Duration::from_millis(140),
+        _ => probe_interval,
+    };
+
+    burst_delay.min(probe_interval)
+}
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
@@ -172,15 +230,27 @@ impl UdpTransport {
             return Ok(0);
         }
 
+        let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
+        trace!(
+            "Built adaptive UDP probe schedule for peer {}: {} rounds across {} candidates",
+            peer_id,
+            schedule.len(),
+            candidates.len()
+        );
+
         let mut packets_sent = 0;
-        for attempt in 0..attempts {
-            for &candidate in &candidates {
+        for (round_index, round) in schedule.iter().enumerate() {
+            if !round.delay_before.is_zero() {
+                sleep(round.delay_before).await;
+            }
+
+            for &candidate in &round.endpoints {
                 match self.send_probe(Some(peer_id), candidate).await {
                     Ok(()) => {
                         packets_sent += 1;
                         trace!(
-                            "Sent punch probe {} to peer {} candidate {}",
-                            attempt + 1,
+                            "Sent adaptive punch probe round {} to peer {} candidate {}",
+                            round_index + 1,
                             peer_id,
                             candidate
                         );
@@ -192,10 +262,6 @@ impl UdpTransport {
                         );
                     }
                 }
-            }
-
-            if attempt + 1 < attempts {
-                sleep(probe_interval).await;
             }
         }
 
@@ -621,6 +687,48 @@ mod tests {
         config.node.public_key = hex::encode(identity.public_key());
         config.node.private_key = hex::encode(identity.private_key());
         config
+    }
+
+    #[test]
+    fn adaptive_probe_schedule_covers_all_candidates_on_final_round() {
+        let candidates = vec![
+            "127.0.0.1:10001".parse().unwrap(),
+            "127.0.0.1:10002".parse().unwrap(),
+            "127.0.0.1:10003".parse().unwrap(),
+            "127.0.0.1:10004".parse().unwrap(),
+            "127.0.0.1:10005".parse().unwrap(),
+        ];
+
+        let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 3);
+
+        assert_eq!(schedule.len(), 3);
+        assert_eq!(schedule[0].delay_before, Duration::ZERO);
+        assert_eq!(schedule[0].endpoints, candidates[..2]);
+        assert_eq!(schedule[1].delay_before, Duration::from_millis(60));
+        assert_eq!(schedule[1].endpoints, candidates[..4]);
+        assert_eq!(schedule[2].delay_before, Duration::from_millis(140));
+        assert_eq!(schedule[2].endpoints, candidates);
+    }
+
+    #[test]
+    fn adaptive_probe_schedule_preserves_single_attempt_full_coverage() {
+        let candidates = vec![
+            "127.0.0.1:11001".parse().unwrap(),
+            "127.0.0.1:11002".parse().unwrap(),
+            "127.0.0.1:11001".parse().unwrap(),
+        ];
+
+        let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 1);
+
+        assert_eq!(schedule.len(), 1);
+        assert_eq!(schedule[0].delay_before, Duration::ZERO);
+        assert_eq!(
+            schedule[0].endpoints,
+            vec![
+                "127.0.0.1:11001".parse().unwrap(),
+                "127.0.0.1:11002".parse().unwrap(),
+            ]
+        );
     }
 
     fn establish_sessions() -> (TransportSession, TransportSession) {
