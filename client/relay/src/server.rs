@@ -877,7 +877,7 @@ async fn run_read_loop<R: AsyncRead + Unpin>(
                                     tx,
                                     Frame::error(
                                         ERR_PEER_BACKPRESSURE,
-                                        "target peer outbound queue full"
+                                        &format!("peer backpressure: {dst_id}")
                                     )
                                     .encode()
                                 );
@@ -887,7 +887,7 @@ async fn run_read_loop<R: AsyncRead + Unpin>(
                                     tx,
                                     Frame::error(
                                         ERR_PEER_NOT_FOUND,
-                                        "target peer write channel closed"
+                                        &format!("peer disconnected: {dst_id}")
                                     )
                                     .encode()
                                 );
@@ -1238,7 +1238,7 @@ mod tests {
         assert_eq!(error_frame.msg_type, MSG_ERROR);
         let (code, message) = error_frame.parse_error().unwrap();
         assert_eq!(code, ERR_PEER_BACKPRESSURE);
-        assert!(message.contains("outbound queue full"));
+        assert_eq!(message, "peer backpressure: bob");
 
         tokio::time::timeout(Duration::from_secs(1), &mut bob_shutdown_rx)
             .await

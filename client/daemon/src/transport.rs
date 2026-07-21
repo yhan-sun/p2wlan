@@ -33,6 +33,10 @@ pub struct EncryptedPeerPacket {
 pub struct ReceivedEncryptedPacket {
     /// Source socket address when known.
     pub source: Option<SocketAddr>,
+    /// Relay endpoint that delivered this packet, when received through Relay.
+    pub relay_endpoint: Option<String>,
+    /// Relay-authenticated source node ID, checked against the decrypted session owner.
+    pub relay_peer_id: Option<String>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
@@ -60,6 +64,25 @@ impl WireGuardTransport {
     /// Install or replace an established transport session for a peer.
     pub async fn add_session(&self, peer_id: impl Into<String>, session: TransportSession) {
         self.sessions.lock().await.insert(peer_id.into(), session);
+    }
+
+    /// Replace a session and return the previous value for transactional rollback.
+    pub async fn replace_session(
+        &self,
+        peer_id: impl Into<String>,
+        session: TransportSession,
+    ) -> Option<TransportSession> {
+        self.sessions.lock().await.insert(peer_id.into(), session)
+    }
+
+    /// Restore the session state captured before a transactional replacement.
+    pub async fn restore_session(&self, peer_id: &str, previous: Option<TransportSession>) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(previous) = previous {
+            sessions.insert(peer_id.to_string(), previous);
+        } else {
+            sessions.remove(peer_id);
+        }
     }
 
     /// Remove a peer session.
@@ -182,16 +205,41 @@ impl WireGuardTransport {
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
             let source = packet.source;
+            let relay_endpoint = packet.relay_endpoint;
+            let relay_peer_id = packet.relay_peer_id;
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
-                    if let (Some(peers), Some(source)) = (peers.as_ref(), source) {
-                        peers
-                            .record_direct_success(&inbound.peer_id, Some(source))
-                            .await;
-                        debug!(
-                            "Confirmed direct UDP data path from {source} for peer {}",
-                            inbound.peer_id
+                    if relay_peer_id
+                        .as_deref()
+                        .is_some_and(|relay_peer_id| relay_peer_id != inbound.peer_id)
+                    {
+                        warn!(
+                            "Dropping relay packet whose registered source {:?} does not match decrypted peer {}",
+                            relay_peer_id, inbound.peer_id
                         );
+                        continue;
+                    }
+                    if let Some(peers) = peers.as_ref() {
+                        if let Some(source) = source {
+                            peers
+                                .learn_authenticated_endpoint(&inbound.peer_id, source)
+                                .await;
+                            peers
+                                .record_direct_success(&inbound.peer_id, Some(source))
+                                .await;
+                            debug!(
+                                "Confirmed direct UDP data path from {source} for peer {}",
+                                inbound.peer_id
+                            );
+                        } else if let Some(relay_endpoint) = relay_endpoint {
+                            peers
+                                .record_relay_success(&inbound.peer_id, &relay_endpoint, true)
+                                .await;
+                            debug!(
+                                "Confirmed relay data path through {relay_endpoint} for peer {}",
+                                inbound.peer_id
+                            );
+                        }
                     }
                     inbound_tx.send(inbound).await.map_err(|_| {
                         DaemonError::Network("inbound packet channel closed".to_string())
@@ -225,6 +273,7 @@ pub async fn log_encrypted_packets(mut encrypted_rx: mpsc::Receiver<EncryptedPee
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::time::Duration;
 
     use p2pnet_crypto::NodeIdentity;
     use p2pnet_tun::Ipv4Packet;
@@ -234,6 +283,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::config::Config;
+    use crate::control::PeerInfo;
+    use crate::peer::{ConnectionState, NetworkPath};
 
     fn establish_sessions() -> (TransportSession, TransportSession) {
         let node_a = NodeIdentity::generate();
@@ -312,6 +364,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transactional_session_replacement_can_restore_previous_session() {
+        let (mut old_remote, old_local) = establish_sessions();
+        let (_new_remote, new_local) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", old_local).await;
+
+        let previous = transport.replace_session("peer-a", new_local).await;
+        assert!(previous.is_some());
+        transport.restore_session("peer-a", previous).await;
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"old-session",
+        );
+        let wire_bytes = old_remote.encrypt_to_bytes(&packet).unwrap();
+        let inbound = transport
+            .decrypt_inbound(&wire_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inbound.peer_id, "peer-a");
+        assert_eq!(inbound.packet, packet);
+    }
+
+    #[tokio::test]
     async fn decrypts_inbound_packet_with_matching_receiver_index() {
         let (mut node_a_session, node_b_session) = establish_sessions();
         let (transport, _encrypted_rx) = WireGuardTransport::new();
@@ -334,6 +414,126 @@ mod tests {
 
         assert_eq!(inbound.peer_id, "peer-a");
         assert_eq!(inbound.packet, packet);
+    }
+
+    #[tokio::test]
+    async fn confirms_relay_only_after_wireguard_decryption() {
+        let (mut remote_session, local_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.1".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        let wire_bytes = remote_session.encrypt_to_bytes(&packet).unwrap();
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .await
+            }
+        });
+
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: None,
+                relay_endpoint: Some("tls://relay.test:443".to_string()),
+                relay_peer_id: Some("peer-a".to_string()),
+                wire_bytes,
+            })
+            .await
+            .unwrap();
+        let inbound = inbound_rx.recv().await.unwrap();
+        assert_eq!(inbound.peer_id, "peer-a");
+
+        let conn = peers.get_connection("peer-a").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Relay);
+        assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
+        assert_eq!(conn.relay_server.as_deref(), Some("tls://relay.test:443"));
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_relay_source_that_does_not_match_decrypted_peer() {
+        let (mut remote_session, local_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.1".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            b"ping",
+        );
+        let wire_bytes = remote_session.encrypt_to_bytes(&packet).unwrap();
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .await
+            }
+        });
+
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: None,
+                relay_endpoint: Some("tls://relay.test:443".to_string()),
+                relay_peer_id: Some("different-peer".to_string()),
+                wire_bytes,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbound_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let conn = peers.get_connection("peer-a").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert_eq!(conn.relay_server, None);
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
     }
 
     #[tokio::test]

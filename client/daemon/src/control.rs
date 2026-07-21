@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -342,13 +342,18 @@ struct FetchRelayTicketResponse {
 /// Commands sent to the control client background task.
 enum ControlCommand {
     /// Update our endpoint (after NAT detection).
-    UpdateEndpoint { endpoint: String, nat_type: String },
+    UpdateEndpoint {
+        endpoint: String,
+        nat_type: String,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
     /// Send a peer offer.
     SendPeerOffer {
         to_node_id: String,
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
+        response_tx: oneshot::Sender<Result<()>>,
     },
     /// Send a peer answer.
     SendPeerAnswer {
@@ -356,6 +361,7 @@ enum ControlCommand {
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
+        response_tx: oneshot::Sender<Result<()>>,
     },
     /// Create a tunnel.
     CreateTunnel {
@@ -431,12 +437,17 @@ impl ControlClient {
 
     /// Send our updated endpoint to the control server.
     pub async fn update_endpoint(&self, endpoint: &str, nat_type: &str) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::UpdateEndpoint {
                 endpoint: endpoint.to_string(),
                 nat_type: nat_type.to_string(),
+                response_tx,
             })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx.await.map_err(|_| {
+            DaemonError::ControlPlane("endpoint update response channel closed".into())
+        })?
     }
 
     /// Send a peer offer (initiate P2P connection).
@@ -458,14 +469,19 @@ impl ControlClient {
         candidate_sources: &HashMap<String, String>,
         handshake_init: &[u8],
     ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
+                response_tx,
             })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
     }
 
     /// Send a peer answer.
@@ -492,14 +508,19 @@ impl ControlClient {
         candidate_sources: &HashMap<String, String>,
         handshake_response: &[u8],
     ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerAnswer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 candidate_sources: candidate_sources.clone(),
                 handshake_response: handshake_response.to_vec(),
+                response_tx,
             })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("peer answer response channel closed".into()))?
     }
 
     /// Request a port mapping tunnel.
@@ -1024,7 +1045,7 @@ async fn run_control_loop(
                                 }
                             }
                         }
-                        ControlCommand::UpdateEndpoint { endpoint, nat_type } => {
+                        ControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
                             let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
                             match &res {
                                 Ok(()) => {
@@ -1040,8 +1061,9 @@ async fn run_control_loop(
                                     }
                                 }
                             }
+                            let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init } => {
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init, response_tx } => {
                             let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer offer to {to_node_id}"); }
@@ -1053,8 +1075,9 @@ async fn run_control_loop(
                                     }
                                 }
                             }
+                            let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response } => {
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, response_tx } => {
                             let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer answer to {to_node_id}"); }
@@ -1066,6 +1089,7 @@ async fn run_control_loop(
                                     }
                                 }
                             }
+                            let _ = response_tx.send(res);
                         }
                         ControlCommand::DeleteTunnel { tunnel_id } => {
                             debug!("Tunnel deletion queued locally for {tunnel_id}");

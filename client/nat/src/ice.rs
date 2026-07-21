@@ -18,6 +18,7 @@
 //! | ServerReflexive | 100 |
 //! | Relay | 0 |
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -258,29 +259,41 @@ pub fn compute_priority(candidate_type: CandidateType) -> u32 {
 /// that hijack every public route probe, while the actual LAN address remains
 /// available on a physical interface.
 pub fn gather_local_addresses() -> Vec<IpAddr> {
-    let mut addresses = Vec::new();
-
-    for (name, ip) in interface_addresses() {
-        if is_candidate_interface_name(&name) && is_candidate_host_ip(ip) {
-            push_unique(&mut addresses, ip);
-        }
-    }
+    let interfaces = interface_addresses();
+    let mut route_probes = Vec::new();
 
     for probe in ["1.1.1.1:53", "8.8.8.8:53", "223.5.5.5:53"] {
         if let Some(ip) = route_probe_source_ip("0.0.0.0:0", probe) {
-            push_unique(&mut addresses, ip);
+            push_unique(&mut route_probes, ip);
         }
     }
 
     for probe in ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"] {
         if let Some(ip) = route_probe_source_ip("[::]:0", probe) {
-            push_unique(&mut addresses, ip);
+            push_unique(&mut route_probes, ip);
         }
     }
 
-    // Always include loopback
-    let loopback_v4 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-    push_unique(&mut addresses, loopback_v4);
+    select_local_addresses(&interfaces, &route_probes)
+}
+
+fn select_local_addresses(interfaces: &[(String, IpAddr)], route_probes: &[IpAddr]) -> Vec<IpAddr> {
+    let allowed = interfaces
+        .iter()
+        .filter(|(name, ip)| is_candidate_interface_name(name) && is_candidate_host_ip(*ip))
+        .map(|(_, ip)| *ip)
+        .collect::<HashSet<_>>();
+    let mut addresses = allowed.iter().copied().collect::<Vec<_>>();
+    addresses.sort();
+
+    // A route probe may select a VPN/utun source even though interface-name
+    // filtering rejected it. Trust probes only when interface enumeration
+    // failed entirely, otherwise require the source to be in the allow-list.
+    for ip in route_probes {
+        if (interfaces.is_empty() || allowed.contains(ip)) && is_candidate_host_ip(*ip) {
+            push_unique(&mut addresses, *ip);
+        }
+    }
 
     addresses
 }
@@ -399,6 +412,13 @@ pub async fn gather_candidate_report(
         let stun_client = StunClient::with_timeout(config.stun_timeout);
 
         for &server in &config.stun_servers {
+            if server.is_ipv4() != local_addr.is_ipv4() {
+                debug!(
+                    "Skipping STUN server {} because it does not match local socket family {}",
+                    server, local_addr
+                );
+                continue;
+            }
             let started = Instant::now();
             match stun_client.binding_request(socket, server).await {
                 Ok(response) => {
@@ -475,6 +495,55 @@ pub async fn gather_candidate_report(
         candidates,
         nat_profile,
     })
+}
+
+/// Build a candidate report from STUN observations already collected by an
+/// external socket dispatcher. This is used when a live UDP data socket has a
+/// single receive owner and STUN responses cannot safely call `recv_from`
+/// independently.
+pub fn candidate_report_from_observations(
+    local_addr: SocketAddr,
+    gather_host: bool,
+    observations: Vec<StunObservation>,
+) -> CandidateGatherReport {
+    let mut candidates = Vec::new();
+    if gather_host {
+        for ip in gather_local_addresses() {
+            candidates.push(IceCandidate {
+                candidate_type: CandidateType::Host,
+                endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),
+                priority: compute_priority(CandidateType::Host),
+                source: crate::CandidateSource::Host,
+            });
+        }
+    }
+    for observation in &observations {
+        let Some(reflexive) = observation
+            .mapped_address
+            .as_deref()
+            .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        else {
+            continue;
+        };
+        candidates.push(IceCandidate {
+            candidate_type: CandidateType::ServerReflexive,
+            endpoint: crate::Endpoint::new(&reflexive.ip().to_string(), reflexive.port()),
+            priority: compute_priority(CandidateType::ServerReflexive),
+            source: crate::CandidateSource::StunObserved,
+        });
+    }
+
+    let nat_profile = build_nat_profile(local_addr, observations);
+    add_predicted_reflexive_candidates(&mut candidates, &nat_profile);
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        seen.insert((candidate.candidate_type, candidate.endpoint.to_string()))
+    });
+    CandidateGatherReport {
+        candidates,
+        nat_profile,
+    }
 }
 
 fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>) -> NatProfile {
@@ -1011,13 +1080,30 @@ mod tests {
     #[test]
     fn test_gather_local_addresses() {
         let addrs = gather_local_addresses();
-        assert!(!addrs.is_empty());
-
-        // Should always include loopback
-        assert!(addrs.contains(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(!addrs.iter().any(IpAddr::is_loopback));
 
         let unique: std::collections::HashSet<_> = addrs.iter().copied().collect();
         assert_eq!(unique.len(), addrs.len());
+    }
+
+    #[test]
+    fn route_probe_cannot_reintroduce_filtered_vpn_address() {
+        let physical = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4));
+        let vpn = IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2));
+        let selected = select_local_addresses(
+            &[("en0".to_string(), physical), ("utun6".to_string(), vpn)],
+            &[vpn, physical],
+        );
+        assert_eq!(selected, vec![physical]);
+    }
+
+    #[test]
+    fn route_probe_is_used_only_when_interface_enumeration_failed() {
+        let fallback = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4));
+        assert_eq!(select_local_addresses(&[], &[fallback]), vec![fallback]);
+
+        let vpn = IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2));
+        assert!(select_local_addresses(&[("utun6".to_string(), vpn)], &[vpn]).is_empty());
     }
 
     #[test]

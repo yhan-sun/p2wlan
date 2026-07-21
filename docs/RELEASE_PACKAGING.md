@@ -80,13 +80,13 @@ p2wlan help
 Install a specific release tag:
 
 ```bash
-sudo sh /tmp/p2wlan-install.sh --version v0.1.27
+sudo sh /tmp/p2wlan-install.sh --version v0.1.28
 ```
 
 Preview or install to a user-writable directory:
 
 ```bash
-sh /tmp/p2wlan-install.sh --version v0.1.27 --dry-run
+sh /tmp/p2wlan-install.sh --version v0.1.28 --dry-run
 sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -128,7 +128,7 @@ Published Linux CLI builds can update themselves:
 
 ```bash
 p2wlan update
-p2wlan update --version v0.1.27
+p2wlan update --version v0.1.28
 ```
 
 `p2wlan doctor` prints peer UDP candidate previews and flags peers that only

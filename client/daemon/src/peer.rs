@@ -6,7 +6,7 @@
 //! - Falls back to relay when direct connection fails
 //! - Routes packets between TUN device and peer tunnels
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +27,9 @@ use crate::traversal_history::{
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
+const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
+const DIRECT_TRIAL_RELAY_MARGIN: i32 = 5;
+const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 2;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 4;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
@@ -43,6 +46,8 @@ pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed"
 pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
 /// Stable reason code for direct path send failure.
 pub const REASON_DIRECT_SEND_FAILED: &str = "direct_send_failed";
+/// Direct UDP keepalive did not receive a matching authenticated ACK.
+pub const REASON_DIRECT_KEEPALIVE_TIMEOUT: &str = "direct_keepalive_timeout";
 /// Stable reason code for WireGuard handshake timeout.
 pub const REASON_HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
 /// Path selector chose a confirmed Direct UDP pair.
@@ -135,6 +140,8 @@ pub struct PathSelection {
     pub reason: String,
     /// Whether the chosen Direct path is fully confirmed.
     pub direct_confirmed: bool,
+    /// Whether Relay should receive a hedged copy while Direct remains selected.
+    pub relay_hedged: bool,
     /// Explainable Direct path score, when a Direct endpoint exists.
     pub direct_score: Option<PathScore>,
     /// Explainable Relay path score, when Relay is available.
@@ -154,6 +161,7 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed,
+            relay_hedged: false,
             direct_score: None,
             relay_score: None,
         }
@@ -166,6 +174,7 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
+            relay_hedged: false,
             direct_score: None,
             relay_score: None,
         }
@@ -178,6 +187,7 @@ impl PathSelection {
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
+            relay_hedged: false,
             direct_score: None,
             relay_score: None,
         }
@@ -190,6 +200,11 @@ impl PathSelection {
     ) -> Self {
         self.direct_score = direct_score;
         self.relay_score = relay_score;
+        self
+    }
+
+    fn with_relay_hedge(mut self) -> Self {
+        self.relay_hedged = true;
         self
     }
 }
@@ -216,6 +231,7 @@ pub struct PathSelectionDiagnostics {
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
+    pub relay_hedged: bool,
     pub direct_score: Option<PathScoreDiagnostics>,
     pub relay_score: Option<PathScoreDiagnostics>,
 }
@@ -230,6 +246,7 @@ impl From<&PathSelection> for PathSelectionDiagnostics {
             reason_code: selection.reason_code.to_string(),
             reason: selection.reason.clone(),
             direct_confirmed: selection.direct_confirmed,
+            relay_hedged: selection.relay_hedged,
             direct_score: selection
                 .direct_score
                 .as_ref()
@@ -283,6 +300,7 @@ pub struct PathSelectionEvent {
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
+    pub relay_hedged: bool,
     pub direct_score: Option<PathScore>,
     pub relay_score: Option<PathScore>,
 }
@@ -567,6 +585,14 @@ impl PathHealth {
             .map(|last_success| last_success.elapsed())
     }
 
+    fn is_confirmed(&self) -> bool {
+        self.last_success_at.is_some_and(|success| {
+            self.last_failure_at
+                .map(|failure| success >= failure)
+                .unwrap_or(true)
+        })
+    }
+
     fn retry_after(&self, base: Duration) -> Duration {
         if base.is_zero() || self.consecutive_failures <= 1 {
             return base;
@@ -610,6 +636,9 @@ pub struct PeerConnection {
     pub virtual_ip: String,
     /// Peer's public endpoint (ip:port) if known.
     pub endpoint: Option<SocketAddr>,
+    /// Endpoint currently advertised by peer metadata. This is kept separate
+    /// from an authenticated peer-reflexive endpoint learned on the wire.
+    pub signaled_endpoint: Option<SocketAddr>,
     /// Peer's NAT type.
     pub nat_type: String,
     /// Current connection state.
@@ -624,6 +653,8 @@ pub struct PeerConnection {
     pub relay_server: Option<String>,
     /// ICE candidates for this peer.
     pub candidates: Vec<String>,
+    /// Candidate strings from the most recent peer offer/answer.
+    signaled_candidates: HashSet<String>,
     /// Local-only source metadata keyed by candidate endpoint string.
     pub candidate_sources: HashMap<String, CandidatePairSource>,
     /// Direct UDP path health.
@@ -650,6 +681,7 @@ impl PeerConnection {
             probe_mac_key: None,
             virtual_ip: virtual_ip.to_string(),
             endpoint: None,
+            signaled_endpoint: None,
             nat_type: String::new(),
             state: ConnectionState::Idle,
             connected_at: None,
@@ -657,6 +689,7 @@ impl PeerConnection {
             bytes_received: 0,
             relay_server: None,
             candidates: Vec::new(),
+            signaled_candidates: HashSet::new(),
             candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
@@ -665,6 +698,22 @@ impl PeerConnection {
             last_path_selection: None,
             path_events: Vec::new(),
         }
+    }
+
+    fn reset_for_identity_change(&mut self) {
+        self.endpoint = self.signaled_endpoint;
+        self.candidates.clear();
+        self.signaled_candidates.clear();
+        self.candidate_sources.clear();
+        self.state = ConnectionState::Idle;
+        self.connected_at = None;
+        self.relay_server = None;
+        self.direct_health = PathHealth::default();
+        self.relay_health = PathHealth::default();
+        self.direct_generation = 0;
+        self.candidate_pairs.clear();
+        self.last_path_selection = None;
+        self.path_events.clear();
     }
 
     /// Whether the connection is active (direct or relay).
@@ -1112,7 +1161,45 @@ impl PeerConnection {
 
         if self.state == ConnectionState::Direct && direct_pair_ready {
             if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
+                if direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
+                    && direct_score.score < relay_score.score
+                {
+                    if !self.relay_health.is_confirmed() {
+                        return PathSelection::direct(
+                            endpoint,
+                            REASON_PATH_DIRECT_DEGRADED,
+                            format!(
+                                "confirmed direct score {} is poor, but relay is not peer-confirmed; retaining Direct with a Relay hedge",
+                                direct_score.score
+                            ),
+                            true,
+                        )
+                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()))
+                        .with_relay_hedge();
+                    }
+                    return PathSelection::relay(
+                        REASON_PATH_DIRECT_DEGRADED,
+                        format!(
+                            "confirmed direct score {} is below quality floor {} and relay score {}",
+                            direct_score.score, DIRECT_CONFIRMED_MIN_SCORE, relay_score.score
+                        ),
+                    )
+                    .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
+                }
                 if direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score {
+                    if !self.relay_health.is_confirmed() {
+                        return PathSelection::direct(
+                            endpoint,
+                            REASON_PATH_DIRECT_DEGRADED,
+                            format!(
+                                "direct score {} is below relay score {}, but relay is not peer-confirmed; retaining Direct with a Relay hedge",
+                                direct_score.score, relay_score.score
+                            ),
+                            true,
+                        )
+                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()))
+                        .with_relay_hedge();
+                    }
                     return PathSelection::relay(
                         REASON_PATH_DIRECT_DEGRADED,
                         format!(
@@ -1146,10 +1233,14 @@ impl PeerConnection {
         }
 
         if trial_direct
-            && direct_score
-                .as_ref()
-                .map(|score| score.score >= DIRECT_TRIAL_MIN_SCORE)
-                .unwrap_or(true)
+            && match (&direct_score, &relay_score) {
+                (Some(direct_score), Some(relay_score)) => {
+                    direct_score.score >= DIRECT_TRIAL_MIN_SCORE
+                        && direct_score.score >= relay_score.score + DIRECT_TRIAL_RELAY_MARGIN
+                }
+                (Some(direct_score), None) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
+                (None, _) => true,
+            }
         {
             return PathSelection::direct(
                 endpoint,
@@ -1262,6 +1353,7 @@ impl PeerConnection {
                 previous.path != selection.path
                     || previous.reason_code != selection.reason_code
                     || previous.direct_endpoint != selection.direct_endpoint
+                    || previous.relay_hedged != selection.relay_hedged
             })
             .unwrap_or(true);
         if !changed {
@@ -1277,6 +1369,7 @@ impl PeerConnection {
             reason_code: selection.reason_code.to_string(),
             reason: selection.reason.clone(),
             direct_confirmed: selection.direct_confirmed,
+            relay_hedged: selection.relay_hedged,
             direct_score: selection.direct_score.clone(),
             relay_score: selection.relay_score.clone(),
         });
@@ -1308,6 +1401,15 @@ pub struct PeerManager {
     traversal_history_path: Option<PathBuf>,
     /// Configuration.
     config: Config,
+}
+
+/// Metadata changes observed while applying one control-plane peer snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerUpdate {
+    pub is_new: bool,
+    pub virtual_ip_changed: bool,
+    pub endpoint_changed: bool,
+    pub public_key_changed: bool,
 }
 
 fn derive_probe_mac_key(config: &Config, peer_public_key: &str) -> Option<ProbeMacKey> {
@@ -1440,15 +1542,28 @@ impl PeerManager {
     }
 
     /// Add or update a peer from control plane info.
-    pub async fn add_peer(&self, info: &PeerInfo) {
+    pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
         let generation = self.current_network_generation().await;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
+
+        let is_new = !conns.contains_key(&info.node_id);
 
         let conn = conns
             .entry(info.node_id.clone())
             .or_insert_with(|| PeerConnection::new(&info.node_id, &info.virtual_ip));
 
+        let old_virtual_ip = conn.virtual_ip.clone();
+        let old_public_key = conn.public_key.clone();
+        let old_signaled_endpoint = conn.signaled_endpoint;
+        let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
+        let public_key_changed = !is_new && old_public_key != info.public_key;
+
+        if virtual_ip_changed
+            && ip_map.get(&old_virtual_ip).map(String::as_str) == Some(info.node_id.as_str())
+        {
+            ip_map.remove(&old_virtual_ip);
+        }
         conn.virtual_ip = info.virtual_ip.clone();
         conn.device_name = info.device_name.clone();
         if conn.public_key != info.public_key {
@@ -1461,13 +1576,41 @@ impl PeerManager {
                 );
             }
         }
+        if public_key_changed {
+            conn.reset_for_identity_change();
+        }
         conn.nat_type = info.nat_type.clone();
-        if let Ok(addr) = info.endpoint.parse::<SocketAddr>() {
-            conn.endpoint = Some(addr);
+
+        let signaled_endpoint = if info.endpoint.trim().is_empty() {
+            None
+        } else {
+            match info.endpoint.parse::<SocketAddr>() {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    warn!(
+                        "Ignoring invalid endpoint '{}' for peer {}: {error}",
+                        info.endpoint, info.node_id
+                    );
+                    None
+                }
+            }
+        };
+        let endpoint_changed = !is_new && old_signaled_endpoint != signaled_endpoint;
+        if (endpoint_changed && conn.endpoint == old_signaled_endpoint) || conn.endpoint.is_none() {
+            conn.endpoint = signaled_endpoint;
+        }
+        conn.signaled_endpoint = signaled_endpoint;
+        if let Some(addr) = signaled_endpoint {
             conn.ensure_candidate_pair(addr, generation);
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
+        PeerUpdate {
+            is_new,
+            virtual_ip_changed,
+            endpoint_changed,
+            public_key_changed,
+        }
     }
 
     /// Remove a peer.
@@ -1520,10 +1663,26 @@ impl PeerManager {
     ) {
         let generation = self.current_network_generation().await;
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
+            for candidate in previous_signaled {
+                let learned = matches!(
+                    conn.candidate_sources.get(&candidate),
+                    Some(CandidatePairSource::Learned | CandidatePairSource::PeerReflexive)
+                );
+                if !learned
+                    && conn.signaled_endpoint.map(|endpoint| endpoint.to_string())
+                        != Some(candidate.clone())
+                {
+                    conn.candidates.retain(|existing| existing != &candidate);
+                    conn.candidate_sources.remove(&candidate);
+                }
+            }
+
             for c in candidates {
                 if !conn.candidates.contains(c) {
                     conn.candidates.push(c.clone());
                 }
+                conn.signaled_candidates.insert(c.clone());
                 let source = candidate_sources
                     .get(c)
                     .and_then(|value| candidate_pair_source_from_label(value))
@@ -1541,6 +1700,29 @@ impl PeerManager {
                     .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
             }
         }
+    }
+
+    /// Whether a bidirectional UDP probe succeeded in the current generation.
+    pub async fn has_direct_probe_success_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+    ) -> bool {
+        generation == self.current_network_generation().await
+            && self
+                .connections
+                .read()
+                .await
+                .get(node_id)
+                .is_some_and(|conn| {
+                    conn.candidate_pairs.iter().any(|pair| {
+                        pair.local_generation == generation
+                            && matches!(
+                                pair.state,
+                                CandidatePairState::Succeeded | CandidatePairState::Selected
+                            )
+                    })
+                })
     }
 
     /// Learn an endpoint from an authenticated Probe v2 packet.
@@ -1564,8 +1746,10 @@ impl PeerManager {
         conn.endpoint = Some(endpoint);
         let endpoint_text = endpoint.to_string();
         if !conn.candidates.contains(&endpoint_text) {
-            conn.candidates.push(endpoint_text);
+            conn.candidates.push(endpoint_text.clone());
         }
+        conn.candidate_sources
+            .insert(endpoint_text, CandidatePairSource::PeerReflexive);
         conn.mark_candidate_pair_probing_with_source(
             endpoint,
             generation,
@@ -1593,6 +1777,8 @@ impl PeerManager {
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);
+                conn.candidate_sources
+                    .insert(endpoint.to_string(), CandidatePairSource::Learned);
                 conn.mark_candidate_pair_probing_with_source(
                     endpoint,
                     generation,
@@ -1864,10 +2050,9 @@ impl PeerManager {
                 return false;
             };
             conn.endpoint = Some(endpoint);
-            conn.direct_generation = generation;
             let ack_confirmed = latency.is_some();
             let source = if ack_confirmed {
-                Some(conn.mark_candidate_pair_success(endpoint, generation, latency, true))
+                Some(conn.mark_candidate_pair_success(endpoint, generation, latency, false))
             } else {
                 conn.mark_candidate_pair_probing(endpoint, generation);
                 None
@@ -1876,14 +2061,14 @@ impl PeerManager {
                 Some(latency) => conn.direct_health.record_success_with_latency(latency),
                 None => conn.direct_health.record_success(),
             }
-            if ack_confirmed {
-                conn.transition(ConnectionState::Direct);
-            } else if matches!(
-                conn.state,
-                ConnectionState::Idle
-                    | ConnectionState::Connecting
-                    | ConnectionState::FallbackToRelay
-            ) {
+            if conn.state != ConnectionState::Direct
+                && matches!(
+                    conn.state,
+                    ConnectionState::Idle
+                        | ConnectionState::Connecting
+                        | ConnectionState::FallbackToRelay
+                )
+            {
                 conn.transition(ConnectionState::HolePunching);
             }
             source
@@ -1943,6 +2128,42 @@ impl PeerManager {
         true
     }
 
+    /// Record an unanswered direct keepalive without tearing down a path on one lost probe.
+    pub async fn record_direct_keepalive_timeout_for_generation(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+    ) -> bool {
+        if generation != self.current_network_generation().await {
+            return false;
+        }
+
+        let source = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            if conn.direct_generation != generation || conn.state != ConnectionState::Direct {
+                return false;
+            }
+
+            let reason = format!("direct keepalive ACK timeout for {endpoint}");
+            conn.direct_health
+                .record_failure(REASON_DIRECT_KEEPALIVE_TIMEOUT, reason.clone());
+            let pair = conn.ensure_candidate_pair(endpoint, generation);
+            let source = pair.source;
+            pair.record_failure(REASON_DIRECT_KEEPALIVE_TIMEOUT, reason);
+
+            if conn.direct_health.consecutive_failures >= DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+            source
+        };
+        self.record_traversal_failures(vec![source]).await;
+        true
+    }
+
     /// Whether the peer is direct in a specific generation.
     pub async fn is_direct_for_generation(&self, node_id: &str, generation: u64) -> bool {
         generation == self.current_network_generation().await && self.is_direct(node_id).await
@@ -1965,6 +2186,50 @@ impl PeerManager {
             conn.relay_health.record_success();
             if switch_to_relay || conn.state != ConnectionState::Direct {
                 conn.transition(ConnectionState::Relay);
+            }
+        }
+    }
+
+    /// Record that a relay path was attempted without treating TCP write success as delivery.
+    pub async fn record_relay_attempt(&self, node_id: &str, relay_server: &str) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.relay_server = Some(relay_server.to_string());
+        }
+    }
+
+    /// Record a relay-path failure for a specific peer.
+    pub async fn record_relay_failure(
+        &self,
+        node_id: &str,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.relay_health.record_failure(code, reason);
+            if conn.state == ConnectionState::Relay {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+    }
+
+    /// Invalidate every peer confirmation associated with a relay transport.
+    pub async fn invalidate_relay_transport(
+        &self,
+        relay_server: &str,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let code = code.into();
+        let reason = reason.into();
+        for conn in self.connections.write().await.values_mut() {
+            if conn.relay_server.as_deref() != Some(relay_server) {
+                continue;
+            }
+            conn.relay_health
+                .record_failure(code.clone(), reason.clone());
+            conn.relay_server = None;
+            if conn.state == ConnectionState::Relay {
+                conn.transition(ConnectionState::FallbackToRelay);
             }
         }
     }
@@ -2082,6 +2347,25 @@ pub struct PeerManagerStats {
     pub total_bytes_received: u64,
 }
 
+impl PeerManagerStats {
+    /// Build aggregate statistics from diagnostics using the live selected data path.
+    pub fn from_diagnostics(peers: &[PeerDiagnostics]) -> Self {
+        Self {
+            total_peers: peers.len(),
+            direct_connections: peers
+                .iter()
+                .filter(|peer| peer.active_path == Some(NetworkPath::Direct))
+                .count(),
+            relay_connections: peers
+                .iter()
+                .filter(|peer| peer.active_path == Some(NetworkPath::Relay))
+                .count(),
+            total_bytes_sent: peers.iter().map(|peer| peer.bytes_sent).sum(),
+            total_bytes_received: peers.iter().map(|peer| peer.bytes_received).sum(),
+        }
+    }
+}
+
 /// Aggregated direct candidate-pair outcomes grouped by endpoint source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidatePairSourceStats {
@@ -2156,7 +2440,24 @@ impl PeerDiagnostics {
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
             state: conn.state,
-            active_path: conn.active_path(),
+            active_path: match current_selection {
+                Some(selection) => match selection.path {
+                    Some(NetworkPath::Direct) if selection.direct_confirmed => {
+                        Some(NetworkPath::Direct)
+                    }
+                    Some(NetworkPath::Direct) if conn.relay_health.is_confirmed() => {
+                        Some(NetworkPath::Relay)
+                    }
+                    Some(NetworkPath::Relay) if conn.relay_health.is_confirmed() => {
+                        Some(NetworkPath::Relay)
+                    }
+                    _ => None,
+                },
+                None => match conn.active_path() {
+                    Some(NetworkPath::Relay) if !conn.relay_health.is_confirmed() => None,
+                    path => path,
+                },
+            },
             connected_for_ms: conn
                 .connected_at
                 .map(|connected_at| duration_millis(connected_at.elapsed())),
@@ -2207,6 +2508,7 @@ pub struct PathSelectionEventDiagnostics {
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
+    pub relay_hedged: bool,
     pub direct_score: Option<PathScoreDiagnostics>,
     pub relay_score: Option<PathScoreDiagnostics>,
 }
@@ -2222,6 +2524,7 @@ impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
             reason_code: event.reason_code.clone(),
             reason: event.reason.clone(),
             direct_confirmed: event.direct_confirmed,
+            relay_hedged: event.relay_hedged,
             direct_score: event.direct_score.as_ref().map(PathScoreDiagnostics::from),
             relay_score: event.relay_score.as_ref().map(PathScoreDiagnostics::from),
         }
@@ -2777,6 +3080,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_update_removes_old_virtual_ip_and_clears_signaled_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let mut peer = test_peer("peer1", "1.2.3.4:5000".parse().unwrap());
+        manager.add_peer(&peer).await;
+
+        peer.virtual_ip = "10.20.0.9".to_string();
+        peer.endpoint.clear();
+        let update = manager.add_peer(&peer).await;
+
+        assert!(update.virtual_ip_changed);
+        assert!(update.endpoint_changed);
+        assert_eq!(manager.resolve_virtual_ip("10.20.0.2").await, None);
+        assert_eq!(
+            manager.resolve_virtual_ip("10.20.0.9").await.as_deref(),
+            Some("peer1")
+        );
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.signaled_endpoint, None);
+        assert_eq!(conn.endpoint, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_signaled_endpoint_preserves_authenticated_peer_reflexive_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let mut peer = test_peer("peer1", "1.2.3.4:5000".parse().unwrap());
+        manager.add_peer(&peer).await;
+        let learned: SocketAddr = "5.6.7.8:6000".parse().unwrap();
+        assert!(manager.learn_authenticated_endpoint("peer1", learned).await);
+
+        peer.endpoint.clear();
+        manager.add_peer(&peer).await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.signaled_endpoint, None);
+        assert_eq!(conn.endpoint, Some(learned));
+    }
+
+    #[tokio::test]
+    async fn candidate_signal_replaces_old_signaled_set_but_preserves_learned_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let peer = test_peer("peer1", "1.2.3.4:5000".parse().unwrap());
+        manager.add_peer(&peer).await;
+        manager
+            .add_candidates("peer1", &["2.2.2.2:5000".to_string()])
+            .await;
+        let learned: SocketAddr = "3.3.3.3:5000".parse().unwrap();
+        assert!(manager.learn_authenticated_endpoint("peer1", learned).await);
+
+        manager
+            .add_candidates("peer1", &["4.4.4.4:5000".to_string()])
+            .await;
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert!(!conn.candidates.contains(&"2.2.2.2:5000".to_string()));
+        assert!(conn.candidates.contains(&"4.4.4.4:5000".to_string()));
+        assert!(conn.candidates.contains(&learned.to_string()));
+    }
+
+    #[tokio::test]
+    async fn public_key_change_resets_confirmed_paths() {
+        let manager = PeerManager::new(test_config());
+        let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let mut peer = test_peer("peer1", endpoint);
+        manager.add_peer(&peer).await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        manager.set_relay("peer1", "relay.test:443").await;
+
+        peer.public_key = "new-key".to_string();
+        let update = manager.add_peer(&peer).await;
+        assert!(update.public_key_changed);
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert_eq!(conn.active_path(), None);
+        assert_eq!(conn.relay_server, None);
+        assert!(conn.direct_health.last_success_at.is_none());
+        assert!(conn.relay_health.last_success_at.is_none());
+    }
+
+    #[tokio::test]
     async fn test_peer_manager_candidates() {
         let config = test_config();
         let manager = PeerManager::new(config);
@@ -2845,7 +3225,7 @@ mod tests {
                 .await
         );
         let conn = manager.get_connection("peer1").await.unwrap();
-        assert_eq!(conn.candidate_pairs[0].state, CandidatePairState::Selected);
+        assert_eq!(conn.candidate_pairs[0].state, CandidatePairState::Succeeded);
         assert_eq!(conn.candidate_pairs[0].rtt_ms, Some(9));
 
         let generation = manager.advance_network_generation("wifi_to_hotspot").await;
@@ -2926,6 +3306,10 @@ mod tests {
             manager.direct_endpoint_for_send("peer1").await,
             Some(new_endpoint)
         );
+        assert!(manager.direct_endpoints().await.is_empty());
+        manager
+            .record_direct_success("peer1", Some(new_endpoint))
+            .await;
         assert_eq!(
             manager.direct_endpoints().await,
             vec![("peer1".to_string(), new_endpoint)]
@@ -3271,6 +3655,14 @@ mod tests {
                 Some(Duration::from_millis(6)),
             )
             .await;
+        let provisional = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(provisional.path, Some(NetworkPath::Direct));
+        assert!(!provisional.direct_confirmed);
+        assert_eq!(
+            manager.get_connection("peer1").await.unwrap().active_path(),
+            None
+        );
+        manager.record_direct_success("peer1", Some(endpoint)).await;
         let confirmed = manager.select_path_for_data("peer1", true, true).await;
         assert_eq!(confirmed.path, Some(NetworkPath::Direct));
         assert_eq!(confirmed.reason_code, REASON_PATH_DIRECT_CONFIRMED);
@@ -3296,6 +3688,7 @@ mod tests {
                 Some(Duration::from_millis(18)),
             )
             .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
         manager
             .record_relay_success("peer1", "relay.test:443", false)
             .await;
@@ -3319,6 +3712,106 @@ mod tests {
         assert!(
             degraded.direct_score.as_ref().unwrap().score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN
                 < degraded.relay_score.as_ref().unwrap().score
+        );
+    }
+
+    #[tokio::test]
+    async fn path_selector_prefers_relay_when_confirmed_direct_quality_is_poor() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51838".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(700)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        manager
+            .record_relay_success("peer1", "relay.test:443", false)
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.consecutive_failures = 1;
+            conn.direct_health.failure_count = 1;
+            conn.direct_health.rtt_ewma_ms = Some(650);
+            conn.direct_health.jitter_ms = Some(120);
+        }
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Relay));
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
+        let direct_score = selected.direct_score.as_ref().unwrap().score;
+        let relay_score = selected.relay_score.as_ref().unwrap().score;
+        assert!(direct_score < DIRECT_CONFIRMED_MIN_SCORE);
+        assert!(direct_score < relay_score);
+        assert!(direct_score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN >= relay_score);
+    }
+
+    #[tokio::test]
+    async fn degraded_direct_is_retained_until_relay_peer_path_is_confirmed() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51842".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(700)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.consecutive_failures = 2;
+            conn.direct_health.failure_count = 2;
+            conn.direct_health.rtt_ewma_ms = Some(650);
+            conn.direct_health.jitter_ms = Some(120);
+        }
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Direct));
+        assert!(selected.direct_confirmed);
+        assert!(selected.relay_hedged);
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
+
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
+        assert!(
+            diagnostics[0]
+                .current_path_selection
+                .as_ref()
+                .unwrap()
+                .relay_hedged
+        );
+    }
+
+    #[tokio::test]
+    async fn path_selector_does_not_use_trial_direct_when_relay_scores_higher() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51839".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.set_relay("peer1", "relay.test:443").await;
+        manager.record_direct_probe_success("peer1", endpoint).await;
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Relay));
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert!(
+            selected.direct_score.as_ref().unwrap().score
+                < selected.relay_score.as_ref().unwrap().score + DIRECT_TRIAL_RELAY_MARGIN
         );
     }
 
@@ -3354,6 +3847,7 @@ mod tests {
                 Some(Duration::from_millis(9)),
             )
             .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
         let direct = manager.select_path_for_data("peer1", true, true).await;
         assert_eq!(direct.path, Some(NetworkPath::Direct));
 
@@ -3405,6 +3899,7 @@ mod tests {
             .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
             .await;
         assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].active_path, None);
         let current = diagnostics[0].current_path_selection.as_ref().unwrap();
         assert_eq!(current.path, Some(NetworkPath::Relay));
         assert_eq!(current.direct_endpoint, None);
@@ -3421,6 +3916,7 @@ mod tests {
         let diagnostics = manager
             .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
             .await;
+        assert_eq!(diagnostics[0].active_path, None);
         let current = diagnostics[0].current_path_selection.as_ref().unwrap();
         let last = diagnostics[0].last_path_selection.as_ref().unwrap();
         assert_eq!(current.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
@@ -3437,6 +3933,102 @@ mod tests {
         );
         assert!(json["current_path_selection"]["direct_score"]["score"].is_i64());
         assert!(json["current_path_selection"]["relay_score"]["score"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn relay_failure_clears_confirmed_active_path() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.set_relay("peer1", "relay.test:443").await;
+        let before = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(before[0].active_path, Some(NetworkPath::Relay));
+
+        manager
+            .record_relay_failure("peer1", "peer_not_found", "peer not found: peer1")
+            .await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        let after = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(after[0].active_path, None);
+        assert_eq!(
+            after[0].relay.last_error_code.as_deref(),
+            Some("peer_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_transport_invalidation_clears_all_matching_peer_confirmations() {
+        let manager = PeerManager::new(test_config());
+        let endpoint: SocketAddr = "127.0.0.1:51843".parse().unwrap();
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.set_relay("peer1", "relay-a.test:443").await;
+
+        manager
+            .invalidate_relay_transport(
+                "relay-a.test:443",
+                "relay_transport_closed",
+                "relay disconnected",
+            )
+            .await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        assert_eq!(conn.relay_server, None);
+        assert!(!conn.relay_health.is_confirmed());
+        assert_eq!(
+            conn.relay_health.last_error_code.as_deref(),
+            Some("relay_transport_closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_manager_stats_can_follow_selected_path_not_stale_state() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51840".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(700)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        manager
+            .record_relay_success("peer1", "relay.test:443", false)
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.consecutive_failures = 1;
+            conn.direct_health.failure_count = 1;
+            conn.direct_health.rtt_ewma_ms = Some(650);
+            conn.direct_health.jitter_ms = Some(120);
+        }
+
+        let stale_stats = manager.stats().await;
+        assert_eq!(stale_stats.direct_connections, 1);
+
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(diagnostics[0].state, ConnectionState::Direct);
+        assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Relay));
+
+        let selected_stats = PeerManagerStats::from_diagnostics(&diagnostics);
+        assert_eq!(selected_stats.direct_connections, 0);
+        assert_eq!(selected_stats.relay_connections, 1);
     }
 
     #[tokio::test]
@@ -3566,7 +4158,7 @@ mod tests {
         assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
         assert!(conn.direct_health.last_success_at.is_some());
         assert!(
-            manager
+            !manager
                 .should_use_direct_for_data("peer1", true, true)
                 .await
         );
@@ -3578,6 +4170,7 @@ mod tests {
                 Some(Duration::from_millis(12)),
             )
             .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.state, ConnectionState::Direct);
         assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
@@ -3620,6 +4213,9 @@ mod tests {
                 )
                 .await
         );
+        manager
+            .record_direct_success("peer1", Some(old_endpoint))
+            .await;
         assert!(manager.is_direct_for_generation("peer1", 0).await);
 
         let generation = manager.advance_network_generation("wifi_to_hotspot").await;
@@ -3661,6 +4257,13 @@ mod tests {
                 )
                 .await
         );
+        assert_eq!(
+            manager.get_connection("peer1").await.unwrap().state,
+            ConnectionState::HolePunching
+        );
+        manager
+            .record_direct_success_for_generation("peer1", Some(new_endpoint), generation)
+            .await;
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.state, ConnectionState::Direct);
         assert_eq!(conn.endpoint, Some(new_endpoint));

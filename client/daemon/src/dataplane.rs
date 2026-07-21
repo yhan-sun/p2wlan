@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use p2pnet_tun::{IpPacket, VirtualInterface};
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
+use crate::acl::AclEngine;
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 
@@ -41,6 +43,8 @@ pub struct DataPlane<T> {
     peers: Arc<PeerManager>,
     outbound_tx: mpsc::Sender<OutboundPacket>,
     inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
+    acl: Option<Arc<RwLock<AclEngine>>>,
+    local_node_id: Option<String>,
 }
 
 impl<T> DataPlane<T>
@@ -56,6 +60,8 @@ where
                 peers,
                 outbound_tx,
                 inbound_rx: None,
+                acl: None,
+                local_node_id: None,
             },
             outbound_rx,
         )
@@ -81,10 +87,23 @@ where
                 peers,
                 outbound_tx,
                 inbound_rx: Some(inbound_rx),
+                acl: None,
+                local_node_id: None,
             },
             outbound_rx,
             inbound_tx,
         )
+    }
+
+    /// Attach the live ACL used for both outbound and inbound overlay traffic.
+    pub fn with_acl(
+        mut self,
+        acl: Arc<RwLock<AclEngine>>,
+        local_node_id: impl Into<String>,
+    ) -> Self {
+        self.acl = Some(acl);
+        self.local_node_id = Some(local_node_id.into());
+        self
     }
 
     /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
@@ -134,13 +153,33 @@ where
         };
 
         let dst_ip = parsed.dst_addr_string();
+        let src_ip = parsed.src_addr_string();
         let total_len = parsed.total_len().min(n);
         let protocol = parsed.protocol();
+
+        if src_ip != self.tun.address() {
+            warn!(
+                "Dropping outbound packet with unexpected source IP {src_ip}; local TUN address is {}",
+                self.tun.address()
+            );
+            return Ok(());
+        }
 
         let Some(peer_id) = self.peers.resolve_virtual_ip(&dst_ip).await else {
             trace!("Dropping packet for unknown virtual IP {dst_ip} ({protocol})");
             return Ok(());
         };
+        if !self
+            .acl_allows(
+                self.local_node_id.as_deref().unwrap_or("local"),
+                &peer_id,
+                &parsed,
+            )
+            .await
+        {
+            warn!("ACL denied outbound {protocol} packet to peer {peer_id}");
+            return Ok(());
+        }
 
         let routed = OutboundPacket {
             peer_id: peer_id.clone(),
@@ -175,6 +214,44 @@ where
         let src_ip = parsed.src_addr_string();
         let dst_ip = parsed.dst_addr_string();
 
+        let Some(peer) = self.peers.get_connection(&packet.peer_id).await else {
+            warn!(
+                "Dropping inbound packet from unknown peer {}",
+                packet.peer_id
+            );
+            return Ok(());
+        };
+        if src_ip != peer.virtual_ip {
+            warn!(
+                "Dropping inbound packet from peer {} with spoofed source IP {}; expected {}",
+                packet.peer_id, src_ip, peer.virtual_ip
+            );
+            return Ok(());
+        }
+        if dst_ip != self.tun.address() {
+            warn!(
+                "Dropping inbound packet from peer {} for unexpected destination {}; local TUN address is {}",
+                packet.peer_id,
+                dst_ip,
+                self.tun.address()
+            );
+            return Ok(());
+        }
+        if !self
+            .acl_allows(
+                &packet.peer_id,
+                self.local_node_id.as_deref().unwrap_or("local"),
+                &parsed,
+            )
+            .await
+        {
+            warn!(
+                "ACL denied inbound {protocol} packet from peer {}",
+                packet.peer_id
+            );
+            return Ok(());
+        }
+
         let written = self
             .tun
             .write(&packet.packet[..total_len])
@@ -197,6 +274,20 @@ where
             packet.peer_id
         );
         Ok(())
+    }
+
+    async fn acl_allows(&self, src_node: &str, dst_node: &str, packet: &IpPacket<'_>) -> bool {
+        let Some(acl) = self.acl.as_ref() else {
+            return true;
+        };
+        let protocol = packet.protocol().to_string().to_ascii_lowercase();
+        let port = match protocol.as_str() {
+            "tcp" | "udp" if packet.payload().len() >= 4 => {
+                u16::from_be_bytes([packet.payload()[2], packet.payload()[3]])
+            }
+            _ => 0,
+        };
+        acl.read().await.check(src_node, dst_node, &protocol, port)
     }
 }
 
@@ -221,7 +312,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::config::Config;
+    use crate::config::{AclConfig, AclRule, Config};
     use crate::control::PeerInfo;
 
     fn peer(node_id: &str, virtual_ip: &str) -> PeerInfo {
@@ -334,6 +425,91 @@ mod tests {
         let conn = peers.get_connection("peer-b").await.unwrap();
         assert_eq!(conn.bytes_received, written.len() as u64);
 
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn drops_inbound_packet_with_spoofed_peer_virtual_ip() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+
+        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (mut dataplane, _outbound_rx, inbound_tx) =
+            DataPlane::new_bidirectional(tun, peers.clone());
+        let task = tokio::spawn(async move { dataplane.run().await });
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 99),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x1234,
+            1,
+            b"spoofed",
+        );
+
+        inbound_tx
+            .send(InboundPacket {
+                peer_id: "peer-b".to_string(),
+                packet,
+            })
+            .await
+            .unwrap();
+
+        assert!(timeout(Duration::from_millis(100), ctrl.recv_written())
+            .await
+            .is_err());
+        assert_eq!(
+            peers.get_connection("peer-b").await.unwrap().bytes_received,
+            0
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn live_acl_denies_matching_inbound_packet() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+        let acl = Arc::new(RwLock::new(AclEngine::from_config(&AclConfig {
+            enabled: true,
+            rules: vec![AclRule {
+                action: "deny".to_string(),
+                src: "peer-b".to_string(),
+                dst: "local-node".to_string(),
+                proto: "icmp".to_string(),
+                port: "*".to_string(),
+            }],
+        })));
+
+        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (dataplane, _outbound_rx, inbound_tx) =
+            DataPlane::new_bidirectional(tun, peers.clone());
+        let mut dataplane = dataplane.with_acl(acl, "local-node");
+        let task = tokio::spawn(async move { dataplane.run().await });
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x1234,
+            1,
+            b"denied",
+        );
+
+        inbound_tx
+            .send(InboundPacket {
+                peer_id: "peer-b".to_string(),
+                packet,
+            })
+            .await
+            .unwrap();
+
+        assert!(timeout(Duration::from_millis(100), ctrl.recv_written())
+            .await
+            .is_err());
+        assert_eq!(
+            peers.get_connection("peer-b").await.unwrap().bytes_received,
+            0
+        );
         task.abort();
     }
 }

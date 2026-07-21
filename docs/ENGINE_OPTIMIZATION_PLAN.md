@@ -1,8 +1,8 @@
 # P2WLAN 架构优化与自适应网络引擎实施方案
 
 Status: Living Plan
-Version: 1.1
-Date: 2026-07-20
+Version: 1.2
+Date: 2026-07-21
 Applies to: P2WLAN 0.1.24 and later
 
 ## 1. 文档目的
@@ -766,6 +766,16 @@ PeerSessionReady / PeerSessionFailed
 - 发生问题时可以通过 feature flag 或配置回退。
 
 ## 20. 最近三个迭代建议
+
+### 0.1.28 正确性检查点
+
+- Direct 只有在 WireGuard 数据成功解密后才成为 active path；Punch/ACK 只确认 candidate pair 可探测。
+- Relay TCP/TLS 写成功不再等同于 peer 已收到；只有来源身份匹配且 WireGuard 解密成功的数据才确认 Relay peer path。
+- peer 离线、虚拟 IP 变化、公钥轮换和 Relay 重连会清理对应 session、pending handshake 与旧路径确认。
+- 周期 STUN、Punch/ACK 和 WireGuard 数据共用一个 UDP receive owner，并按 STUN transaction ID 分发，避免互相抢包。
+- 网络候选变化会发布完整 replacement set，空集合会清除旧 endpoint；最终候选数在手工和端口映射候选合并后统一限制为 20。
+- host candidate 会过滤常见 TUN/utun/Wintun/容器接口；这不等同于外部全隧道 VPN 的物理出口绕行。跨平台 interface binding/route exclusion 仍需独立设计和实机验证。
+- 数据面校验 overlay 源/目标 IP 并执行实时 ACL；诊断和 UI 只展示经过数据面确认的 active path。
 
 ### Iteration 1：先让连接可信且可解释
 
