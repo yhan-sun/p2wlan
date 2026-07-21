@@ -38,6 +38,7 @@ const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 4;
 const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 8;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
+const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
 
 /// Stable reason code emitted when a local network generation changes.
@@ -591,6 +592,14 @@ impl PathHealth {
                 .map(|failure| success >= failure)
                 .unwrap_or(true)
         })
+    }
+
+    fn is_confirmed_recent(&self, max_age: Duration) -> bool {
+        self.is_confirmed()
+            && self
+                .success_age()
+                .map(|age| age <= max_age)
+                .unwrap_or(false)
     }
 
     fn retry_after(&self, base: Duration) -> Duration {
@@ -1164,7 +1173,10 @@ impl PeerConnection {
                 if direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
                     && direct_score.score < relay_score.score
                 {
-                    if !self.relay_health.is_confirmed() {
+                    if !self
+                        .relay_health
+                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE)
+                    {
                         return PathSelection::direct(
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,
@@ -1187,7 +1199,10 @@ impl PeerConnection {
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                 }
                 if direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score {
-                    if !self.relay_health.is_confirmed() {
+                    if !self
+                        .relay_health
+                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE)
+                    {
                         return PathSelection::direct(
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,
@@ -1972,6 +1987,16 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Whether the peer is currently in Relay state.
+    pub async fn is_relay(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(|conn| conn.state == ConnectionState::Relay)
+            .unwrap_or(false)
+    }
+
     /// Record a successful direct-path event.
     pub async fn record_direct_success(&self, node_id: &str, endpoint: Option<SocketAddr>) {
         let generation = self.current_network_generation().await;
@@ -2445,16 +2470,30 @@ impl PeerDiagnostics {
                     Some(NetworkPath::Direct) if selection.direct_confirmed => {
                         Some(NetworkPath::Direct)
                     }
-                    Some(NetworkPath::Direct) if conn.relay_health.is_confirmed() => {
+                    Some(NetworkPath::Direct)
+                        if conn
+                            .relay_health
+                            .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
+                    {
                         Some(NetworkPath::Relay)
                     }
-                    Some(NetworkPath::Relay) if conn.relay_health.is_confirmed() => {
+                    Some(NetworkPath::Relay)
+                        if conn
+                            .relay_health
+                            .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
+                    {
                         Some(NetworkPath::Relay)
                     }
                     _ => None,
                 },
                 None => match conn.active_path() {
-                    Some(NetworkPath::Relay) if !conn.relay_health.is_confirmed() => None,
+                    Some(NetworkPath::Relay)
+                        if !conn
+                            .relay_health
+                            .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
+                    {
+                        None
+                    }
                     path => path,
                 },
             },
@@ -3961,6 +4000,45 @@ mod tests {
         assert_eq!(
             after[0].relay.last_error_code.as_deref(),
             Some("peer_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_relay_confirmation_is_not_reported_active_but_remains_available() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "127.0.0.1:51844".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.set_relay("peer1", "relay.test:443").await;
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.relay_health.last_success_at =
+                Some(Instant::now() - RELAY_PEER_CONFIRMATION_MAX_AGE - Duration::from_secs(1));
+        }
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics[0].state, ConnectionState::Relay);
+        assert_eq!(diagnostics[0].active_path, None);
+        assert!(diagnostics[0]
+            .relay
+            .last_success_age_ms
+            .is_some_and(|age| age > duration_millis(RELAY_PEER_CONFIRMATION_MAX_AGE)));
+
+        let selection = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selection.path, Some(NetworkPath::Relay));
+
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .await;
+        assert_eq!(diagnostics[0].active_path, None);
+        assert_eq!(
+            diagnostics[0]
+                .current_path_selection
+                .as_ref()
+                .and_then(|selection| selection.path),
+            Some(NetworkPath::Relay)
         );
     }
 
