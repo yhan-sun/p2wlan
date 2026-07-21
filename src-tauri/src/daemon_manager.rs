@@ -1,4 +1,5 @@
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -582,6 +583,57 @@ impl DaemonManager {
             .unwrap_or(false)
     }
 
+    fn local_http_status_blocking(url: &str, method: &str, timeout: Duration) -> Option<u16> {
+        let parsed = url::Url::parse(url).ok()?;
+        let address = Self::diagnostics_socket_addr_from_url(url)?;
+        let path = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        };
+        let host = match parsed.host()? {
+            url::Host::Ipv4(ip) => format!("{ip}:{}", address.port()),
+            url::Host::Ipv6(ip) => format!("[{ip}]:{}", address.port()),
+            url::Host::Domain(host) => format!("{host}:{}", address.port()),
+        };
+        let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = [0_u8; 128];
+        let n = stream.read(&mut response).ok()?;
+        let response = std::str::from_utf8(&response[..n]).ok()?;
+        let status_line = response.lines().next()?;
+        status_line.split_whitespace().nth(1)?.parse::<u16>().ok()
+    }
+
+    fn request_daemon_shutdown_blocking(url: &str) -> bool {
+        let Some(shutdown_url) = Self::shutdown_url_from_status_url(url) else {
+            return false;
+        };
+        Self::local_http_status_blocking(&shutdown_url, "POST", Duration::from_millis(800))
+            .is_some_and(|code| (200..300).contains(&code))
+    }
+
+    fn check_endpoint_blocking(url: &str) -> bool {
+        let health_url = Self::health_url_from_status_url(url).unwrap_or_else(|| url.to_string());
+        Self::local_http_status_blocking(&health_url, "GET", Duration::from_millis(800))
+            .is_some_and(|code| (200..300).contains(&code))
+    }
+
+    fn wait_for_endpoint_down_blocking(url: &str, timeout: Duration) -> bool {
+        let start_time = Instant::now();
+        while start_time.elapsed() < timeout {
+            if !Self::check_endpoint_blocking(url) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        !Self::check_endpoint_blocking(url)
+    }
+
     pub fn diagnostics_bind_from_url(url: &str) -> String {
         Self::diagnostics_socket_addr_from_url(url)
             .map(|address| address.to_string())
@@ -907,6 +959,43 @@ impl DaemonManager {
         }
     }
 
+    fn daemon_command_line_uses_binary(command_line: &str, expected_bin: &Path) -> bool {
+        let expected = expected_bin.display().to_string();
+        if !expected.is_empty() && command_line.contains(&expected) {
+            return true;
+        }
+
+        if let Ok(canonical) = expected_bin.canonicalize() {
+            let canonical = canonical.display().to_string();
+            if !canonical.is_empty() && command_line.contains(&canonical) {
+                return true;
+            }
+        }
+
+        if expected_bin.is_relative() {
+            if let Ok(current_dir) = std::env::current_dir() {
+                let absolute = current_dir.join(expected_bin).display().to_string();
+                if !absolute.is_empty() && command_line.contains(&absolute) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn existing_daemon_binary_conflict(pid: u32, expected_bin: &Path) -> Option<String> {
+        let command_line = Self::process_command_line(pid)?;
+        if Self::daemon_command_line_uses_binary(&command_line, expected_bin) {
+            return None;
+        }
+
+        Some(format!(
+            "检测到已有 p2pnet-daemon 占用诊断端点，但它不是当前客户端要启动的守护进程。\n当前运行 PID：{pid}\n当前运行命令：{command_line}\n当前需要：{}\n请先停止 TUN，或执行：sudo kill {pid}",
+            expected_bin.display()
+        ))
+    }
+
     fn command_line_matches_daemon_bind(command_line: &str, bind_addr: &str) -> bool {
         command_line.contains("p2pnet-daemon")
             && command_line.contains("--diagnostics-bind")
@@ -1073,143 +1162,38 @@ impl DaemonManager {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
     fn terminate_pid_with_system_authorization(pid: u32) -> Result<(), String> {
         match Self::terminate_pid(pid) {
             Ok(()) => Ok(()),
             Err(err) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let shell = format!(
-                        "kill -TERM {pid} 2>/dev/null || true; sleep 2; kill -KILL {pid} 2>/dev/null || true"
-                    );
-                    let script = format!(
-                        "do shell script \"{}\" with administrator privileges with prompt \"{}\"",
-                        Self::applescript_quote(&shell),
-                        Self::applescript_quote("p2wlan 需要管理员权限以停止 TUN 守护进程。p2wlan 不会读取或保存你的密码。")
-                    );
-                    let output = Command::new("osascript")
-                        .arg("-e")
-                        .arg(script)
-                        .output()
-                        .map_err(|e| format!("无法打开系统授权停止守护进程：{e}"))?;
-                    if output.status.success() {
-                        return Ok(());
-                    }
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    if stderr.contains("-128") {
-                        return Err("已取消管理员授权，TUN 守护进程仍在运行。".to_string());
-                    }
-                    Err(if stderr.is_empty() {
-                        format!("管理员授权停止守护进程失败：{err}")
-                    } else {
-                        format!("管理员授权停止守护进程失败：{stderr}")
-                    })
+                use std::mem::size_of;
+                use windows_sys::Win32::Foundation::GetLastError;
+                use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
+                use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+                let verb = Self::windows_wide_str("runas");
+                let file = Self::windows_wide_str("taskkill.exe");
+                let parameters = Self::windows_wide_str(&format!("/PID {pid} /T /F"));
+                let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
+                info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+                info.lpVerb = verb.as_ptr();
+                info.lpFile = file.as_ptr();
+                info.lpParameters = parameters.as_ptr();
+                info.nShow = SW_HIDE;
+
+                let launched = unsafe { ShellExecuteExW(&mut info) };
+                if launched != 0 {
+                    return Ok(());
                 }
-
-                #[cfg(target_os = "windows")]
-                {
-                    use std::mem::size_of;
-                    use windows_sys::Win32::Foundation::GetLastError;
-                    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-                    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-
-                    let verb = Self::windows_wide_str("runas");
-                    let file = Self::windows_wide_str("taskkill.exe");
-                    let parameters = Self::windows_wide_str(&format!("/PID {pid} /T /F"));
-                    let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
-                    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-                    info.lpVerb = verb.as_ptr();
-                    info.lpFile = file.as_ptr();
-                    info.lpParameters = parameters.as_ptr();
-                    info.nShow = SW_HIDE;
-
-                    let launched = unsafe { ShellExecuteExW(&mut info) };
-                    if launched != 0 {
-                        return Ok(());
-                    }
-                    let code = unsafe { GetLastError() };
-                    if code == 1223 {
-                        return Err("已取消 Windows 管理员授权，TUN 守护进程仍在运行。".to_string());
-                    }
-                    return Err(format!(
-                        "无法通过 Windows UAC 停止守护进程，错误码：{code}；原始错误：{err}"
-                    ));
+                let code = unsafe { GetLastError() };
+                if code == 1223 {
+                    return Err("已取消 Windows 管理员授权，TUN 守护进程仍在运行。".to_string());
                 }
-
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                {
-                    Err(err)
-                }
+                Err(format!(
+                    "无法通过 Windows UAC 停止守护进程，错误码：{code}；原始错误：{err}"
+                ))
             }
-        }
-    }
-
-    fn terminate_daemons_by_name_with_system_authorization() -> Result<bool, String> {
-        #[cfg(target_os = "macos")]
-        {
-            let shell =
-                "pkill -TERM -x p2pnet-daemon 2>/dev/null || true; sleep 2; pkill -KILL -x p2pnet-daemon 2>/dev/null || true";
-            let script = format!(
-                "do shell script \"{}\" with administrator privileges with prompt \"{}\"",
-                Self::applescript_quote(shell),
-                Self::applescript_quote("p2wlan 需要管理员权限以停止残留的 TUN 守护进程。p2wlan 不会读取或保存你的密码。")
-            );
-            let output = Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .map_err(|e| format!("无法打开系统授权停止残留守护进程：{e}"))?;
-            if output.status.success() {
-                return Ok(true);
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.contains("-128") {
-                return Err("已取消管理员授权，TUN 守护进程仍在运行。".to_string());
-            }
-            Err(if stderr.is_empty() {
-                "管理员授权停止残留守护进程失败。".to_string()
-            } else {
-                format!("管理员授权停止残留守护进程失败：{stderr}")
-            })
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::mem::size_of;
-            use windows_sys::Win32::Foundation::GetLastError;
-            use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-            use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-
-            let script = "Get-Process -Name p2pnet-daemon -ErrorAction SilentlyContinue | Stop-Process -Force";
-            let verb = Self::windows_wide_str("runas");
-            let file = Self::windows_wide_str("powershell.exe");
-            let parameters = Self::windows_wide_str(&format!(
-                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {}",
-                Self::windows_command_line_arg_quote(script)
-            ));
-            let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
-            info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-            info.lpVerb = verb.as_ptr();
-            info.lpFile = file.as_ptr();
-            info.lpParameters = parameters.as_ptr();
-            info.nShow = SW_HIDE;
-
-            let launched = unsafe { ShellExecuteExW(&mut info) };
-            if launched != 0 {
-                return Ok(true);
-            }
-            let code = unsafe { GetLastError() };
-            if code == 1223 {
-                return Err("已取消 Windows 管理员授权，TUN 守护进程仍在运行。".to_string());
-            }
-            return Err(format!(
-                "无法通过 Windows UAC 停止残留守护进程，错误码：{code}"
-            ));
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Ok(false)
         }
     }
 
@@ -1231,7 +1215,7 @@ impl DaemonManager {
                 pid_path.display()
             ));
         }
-        Self::terminate_pid_with_system_authorization(pid)?;
+        Self::terminate_pid(pid)?;
         Self::remove_pid_file(pid_path);
         Ok(true)
     }
@@ -1564,8 +1548,18 @@ impl DaemonManager {
                 .unwrap_or_else(|| state.diagnostics_url.clone())
         };
 
+        // Resolve the daemon binary before accepting an already-running endpoint. In dev
+        // mode this prevents a stale installed app daemon from being mistaken for the
+        // freshly built target/debug daemon.
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
+            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。请确认它与桌面客户端在同一目录，或设置 P2WLAN_DAEMON_BIN。".to_string())?;
+
         // 1. Is daemon already running?
-        if Self::diagnostics_process_id(&preferred_url).await.is_some() {
+        if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
+            if let Some(error) = Self::existing_daemon_binary_conflict(pid, &bin_path) {
+                return Err(error);
+            }
             return Ok("守护进程已经运行。".to_string());
         }
 
@@ -1578,11 +1572,6 @@ impl DaemonManager {
 
         let target_url = Self::available_diagnostics_url(&preferred_url)?;
         options.diagnostics_url = Some(target_url.clone());
-
-        // 2. Resolve binary path
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。请确认它与桌面客户端在同一目录，或设置 P2WLAN_DAEMON_BIN。".to_string())?;
 
         // 3. Extract bind address from URL (default 127.0.0.1:39277)
         let bind_addr = Self::diagnostics_bind_from_url(&target_url);
@@ -1686,7 +1675,17 @@ impl DaemonManager {
                 .unwrap_or_else(|| state.diagnostics_url.clone())
         };
 
-        if Self::diagnostics_process_id(&preferred_url).await.is_some() {
+        // Resolve the daemon binary before accepting an already-running endpoint. In dev
+        // mode this prevents a stale installed app daemon from being mistaken for the
+        // freshly built target/debug daemon.
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
+            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。".to_string())?;
+
+        if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
+            if let Some(error) = Self::existing_daemon_binary_conflict(pid, &bin_path) {
+                return Err(error);
+            }
             self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
                 .await;
             return Ok("守护进程已经运行。".to_string());
@@ -1705,7 +1704,10 @@ impl DaemonManager {
         {
             let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
             Self::cleanup_stale_windows_daemon_before_start(&preferred_url, &log_path).await?;
-            if Self::diagnostics_process_id(&preferred_url).await.is_some() {
+            if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
+                if let Some(error) = Self::existing_daemon_binary_conflict(pid, &bin_path) {
+                    return Err(error);
+                }
                 self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
                     .await;
                 return Ok("守护进程已经运行。".to_string());
@@ -1728,9 +1730,6 @@ impl DaemonManager {
                 None,
             )
             .await;
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-                .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。".to_string())?;
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             let config_path = Self::default_config_path();
             let log_dir = Self::default_log_dir();
@@ -1810,9 +1809,6 @@ impl DaemonManager {
                 None,
             )
             .await;
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-                .ok_or_else(|| "找不到 p2pnet-daemon.exe 可执行文件。".to_string())?;
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             let config_path = Self::default_config_path();
             let log_dir = Self::default_log_dir();
@@ -1943,37 +1939,43 @@ impl DaemonManager {
 
         let pid_path = Self::default_pid_path();
         let mut terminated = false;
+        let mut last_termination_error = None;
         if let Some(pid) = Self::diagnostics_process_id(&target_url).await {
             let verified = Self::process_command_line(pid)
                 .map(|command_line| command_line.contains("p2pnet-daemon"))
                 .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
             if verified {
-                Self::terminate_pid_with_system_authorization(pid)?;
-                terminated = true;
+                match Self::terminate_pid(pid) {
+                    Ok(()) => terminated = true,
+                    Err(error) => last_termination_error = Some(error),
+                }
             }
         }
         if !terminated {
-            terminated = Self::terminate_recorded_daemon(&pid_path)?;
+            match Self::terminate_recorded_daemon(&pid_path) {
+                Ok(value) => terminated = value,
+                Err(error) => last_termination_error = Some(error),
+            }
         }
         if !terminated {
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
-                Self::terminate_pid_with_system_authorization(pid)?;
-                terminated = true;
+                match Self::terminate_pid(pid) {
+                    Ok(()) => terminated = true,
+                    Err(error) => last_termination_error = Some(error),
+                }
             }
         }
         if !terminated {
             if let Some(pid) = Self::find_single_daemon_pid() {
-                Self::terminate_pid_with_system_authorization(pid)?;
-                terminated = true;
+                match Self::terminate_pid(pid) {
+                    Ok(()) => terminated = true,
+                    Err(error) => last_termination_error = Some(error),
+                }
             }
         }
 
-        let mut stopped = Self::wait_for_endpoint_down(&target_url, Duration::from_secs(3)).await;
-        if !stopped {
-            terminated = Self::terminate_daemons_by_name_with_system_authorization()? || terminated;
-            stopped = Self::wait_for_endpoint_down(&target_url, Duration::from_secs(3)).await;
-        }
+        let stopped = Self::wait_for_endpoint_down(&target_url, Duration::from_secs(3)).await;
 
         {
             let mut state = self.state.lock().await;
@@ -1992,31 +1994,55 @@ impl DaemonManager {
         } else if stopped {
             Ok("守护进程已经停止。".to_string())
         } else {
+            let detail = last_termination_error
+                .map(|error| format!(" 普通关闭/结束进程失败：{error}"))
+                .unwrap_or_default();
             Err(format!(
-                "检测到守护进程仍在运行，但没有找到可安全结束的客户端记录。请手动结束 p2pnet-daemon，或重启后再启动 TUN。诊断地址：{}",
+                "已请求守护进程关闭，但它仍在运行。关闭路径不会再次请求管理员授权。{detail} 请手动执行 sudo kill <p2pnet-daemon PID>，或重启后再启动 TUN。诊断地址：{}",
                 target_url
             ))
         }
     }
 
     pub fn cleanup(&self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if state.started_by_app {
-                if let Some(mut child) = state.child.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                state.last_diagnostics = None;
-                Self::remove_persisted_diagnostics_url();
-            } else if state.elevated_started_by_app {
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        let mut child = state.child.take();
+        let elevated_started_by_app = state.elevated_started_by_app;
+        let target_url = state.diagnostics_url.clone();
+        state.started_by_app = false;
+        state.elevated_started_by_app = false;
+        state.last_diagnostics = None;
+        drop(state);
+
+        if let Some(child) = child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+            Self::remove_pid_file(&Self::default_pid_path());
+            Self::remove_persisted_diagnostics_url();
+            return;
+        }
+
+        if elevated_started_by_app {
+            let mut stopped = Self::request_daemon_shutdown_blocking(&target_url)
+                && Self::wait_for_endpoint_down_blocking(&target_url, Duration::from_secs(3));
+            if !stopped {
                 let pid_path = Self::default_pid_path();
-                if Self::terminate_recorded_daemon(&pid_path) != Ok(true) {
-                    let bind_addr = Self::diagnostics_bind_from_url(&state.diagnostics_url);
-                    if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
-                        let _ = Self::terminate_pid_with_system_authorization(pid);
-                    }
+                let _ = Self::terminate_recorded_daemon(&pid_path);
+                stopped =
+                    Self::wait_for_endpoint_down_blocking(&target_url, Duration::from_secs(2));
+            }
+            if !stopped {
+                let bind_addr = Self::diagnostics_bind_from_url(&target_url);
+                if let Some(pid) = Self::find_daemon_pid_by_diagnostics_bind(&bind_addr) {
+                    let _ = Self::terminate_pid(pid);
+                    stopped =
+                        Self::wait_for_endpoint_down_blocking(&target_url, Duration::from_secs(2));
                 }
-                state.last_diagnostics = None;
+            }
+            if stopped {
+                Self::remove_pid_file(&Self::default_pid_path());
                 Self::remove_persisted_diagnostics_url();
             }
         }
@@ -2408,6 +2434,34 @@ mod tests {
         assert!(!DaemonManager::command_line_matches_daemon_bind(
             "/tmp/other --diagnostics-bind 127.0.0.1:39277",
             "127.0.0.1:39277"
+        ));
+    }
+
+    #[test]
+    fn test_daemon_command_line_uses_expected_binary_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let expected = temp_dir
+            .path()
+            .join("target")
+            .join("debug")
+            .join(if cfg!(windows) {
+                "p2pnet-daemon.exe"
+            } else {
+                "p2pnet-daemon"
+            });
+        let installed = if cfg!(windows) {
+            "C:\\Program Files\\p2wlan\\p2pnet-daemon.exe"
+        } else {
+            "/Applications/p2wlan.app/Contents/Resources/p2pnet-daemon"
+        };
+
+        assert!(DaemonManager::daemon_command_line_uses_binary(
+            &format!("{} --diagnostics-bind 127.0.0.1:39277", expected.display()),
+            &expected
+        ));
+        assert!(!DaemonManager::daemon_command_line_uses_binary(
+            &format!("{installed} --diagnostics-bind 127.0.0.1:39277"),
+            &expected
         ));
     }
 
