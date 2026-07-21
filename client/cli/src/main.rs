@@ -1006,6 +1006,18 @@ fn nat_profile_summary(snapshot: &Value) -> Option<String> {
         .get("mapping_behavior")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let filtering = profile
+        .get("filtering_behavior")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let hairpin = profile
+        .get("hairpin_behavior")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let lifetime = profile
+        .get("mapping_lifetime")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let public_endpoint = profile
         .get("public_endpoint")
         .and_then(Value::as_str)
@@ -1016,9 +1028,11 @@ fn nat_profile_summary(snapshot: &Value) -> Option<String> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     Some(format!(
-        "mapping={mapping} public={public_endpoint} stun={stun_success}/{stun_total} confidence={confidence} symmetric={} port_preserved={}",
+        "mapping={mapping} filtering={filtering} hairpin={hairpin} lifetime={lifetime} public={public_endpoint} stun={stun_success}/{stun_total} confidence={confidence} symmetric={} port_preserved={} prediction={} birthday={}",
         nat_bool_text(profile.get("likely_symmetric")),
-        nat_bool_text(profile.get("port_preserved"))
+        nat_bool_text(profile.get("port_preserved")),
+        nat_bool_text(profile.get("prediction_candidate")),
+        nat_bool_text(profile.get("birthday_candidate"))
     ))
 }
 
@@ -1097,6 +1111,28 @@ fn nat_profile_suggestions(snapshot: &Value, udp_advertise_configured: bool) -> 
     if likely_symmetric || mapping == "address_or_port_dependent" {
         suggestions.push(
             "本机疑似对称/地址端口相关 NAT；当前基础打洞成功率有限，后续应启用 peer-reflexive、端口预测和 birthday probing。"
+                .to_string(),
+        );
+    }
+
+    if profile
+        .get("prediction_candidate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        suggestions.push(
+            "本机端口映射看起来有稳定 delta，可在后续启用受限端口预测来提高对称/地址相关 NAT 的打洞概率。"
+                .to_string(),
+        );
+    }
+
+    if profile
+        .get("birthday_candidate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        suggestions.push(
+            "本机适合作为 birthday probing 候选；应在有预算限制时启用多 socket/多端口短时探测。"
                 .to_string(),
         );
     }
@@ -2323,10 +2359,15 @@ mod tests {
             "local_candidates": ["192.168.2.4:60207", "203.0.113.10:62000"],
             "nat_profile": {
                 "mapping_behavior": "endpoint_independent",
+                "filtering_behavior": "likely_endpoint_independent",
+                "hairpin_behavior": "unknown",
+                "mapping_lifetime": "unknown",
                 "udp_blocked": false,
                 "public_endpoint": "203.0.113.10:62000",
                 "likely_symmetric": false,
                 "port_preserved": false,
+                "prediction_candidate": false,
+                "birthday_candidate": false,
                 "confidence": 70,
                 "observations": [{
                     "server": "stun-a.example:3478",
@@ -2349,7 +2390,7 @@ mod tests {
 
         assert_eq!(
             nat_profile_summary(&snapshot).as_deref(),
-            Some("mapping=endpoint_independent public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false")
+            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=unknown public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false birthday=false")
         );
         assert_eq!(
             stun_observation_summaries(&snapshot, 2),
@@ -2367,10 +2408,15 @@ mod tests {
             "local_candidates": ["192.168.2.4:60207"],
             "nat_profile": {
                 "mapping_behavior": "udp_blocked",
+                "filtering_behavior": "udp_blocked",
+                "hairpin_behavior": "unknown",
+                "mapping_lifetime": "unknown",
                 "udp_blocked": true,
                 "public_endpoint": null,
                 "likely_symmetric": null,
                 "port_preserved": null,
+                "prediction_candidate": false,
+                "birthday_candidate": false,
                 "confidence": 60,
                 "observations": [{
                     "server": "stun-a.example:3478",
@@ -2393,16 +2439,25 @@ mod tests {
             "local_candidates": ["198.51.100.10:62000", "198.51.100.10:62008"],
             "nat_profile": {
                 "mapping_behavior": "address_or_port_dependent",
+                "filtering_behavior": "address_or_port_dependent",
+                "hairpin_behavior": "unknown",
+                "mapping_lifetime": "unknown",
                 "udp_blocked": false,
                 "public_endpoint": "198.51.100.10:62000",
                 "likely_symmetric": true,
                 "port_preserved": false,
+                "prediction_candidate": true,
+                "birthday_candidate": true,
                 "confidence": 70,
                 "observations": []
             }
         });
         let suggestions = nat_profile_suggestions(&symmetric, false);
         assert!(suggestions.iter().any(|item| item.contains("端口预测")));
+        assert!(suggestions.iter().any(|item| item.contains("稳定 delta")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("birthday probing")));
     }
 
     #[test]

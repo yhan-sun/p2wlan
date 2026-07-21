@@ -25,8 +25,8 @@ pub use detection::{DetectionConfig, NatDetector};
 pub use error::{NatError, Result};
 pub use ice::{
     candidates_to_addrs, compute_priority, gather_candidate_report, gather_candidates,
-    gather_local_addresses, CandidateGatherReport, IceConfig, MappingBehavior, NatProfile,
-    StunObservation,
+    gather_local_addresses, CandidateGatherReport, FilteringBehavior, HairpinBehavior, IceConfig,
+    MappingBehavior, MappingLifetime, NatProfile, StunObservation,
 };
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet, build_punch_ack,
