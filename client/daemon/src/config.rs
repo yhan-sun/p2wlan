@@ -123,6 +123,12 @@ pub struct NetworkConfig {
     /// Periodic direct-path NAT keepalive interval in seconds.
     #[serde(default = "default_keepalive_interval_secs")]
     pub keepalive_interval_secs: u64,
+    /// Whether to try short-lived UPnP IGD / PCP / NAT-PMP UDP port mappings for direct candidates.
+    #[serde(default = "default_true")]
+    pub upnp_enabled: bool,
+    /// Whether to synthesize bounded birthday probing endpoints when NAT profile suggests it.
+    #[serde(default = "default_true")]
+    pub birthday_probing_enabled: bool,
 }
 
 fn default_cidr() -> String {
@@ -448,6 +454,8 @@ impl Config {
                 punch_interval_ms: default_punch_interval_ms(),
                 punch_attempts: default_punch_attempts(),
                 keepalive_interval_secs: default_keepalive_interval_secs(),
+                upnp_enabled: true,
+                birthday_probing_enabled: true,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -550,6 +558,11 @@ mod tests {
             decoded.network.keepalive_interval_secs,
             config.network.keepalive_interval_secs
         );
+        assert_eq!(decoded.network.upnp_enabled, config.network.upnp_enabled);
+        assert_eq!(
+            decoded.network.birthday_probing_enabled,
+            config.network.birthday_probing_enabled
+        );
         assert_eq!(decoded.diagnostics.enabled, config.diagnostics.enabled);
         assert_eq!(decoded.diagnostics.bind, config.diagnostics.bind);
         assert_eq!(
@@ -603,6 +616,8 @@ mod tests {
         assert_eq!(decoded.network.punch_interval_ms, 200);
         assert_eq!(decoded.network.punch_attempts, 10);
         assert_eq!(decoded.network.keepalive_interval_secs, 25);
+        assert!(decoded.network.upnp_enabled);
+        assert!(decoded.network.birthday_probing_enabled);
         assert!(decoded.relay.preferred_regions.is_empty());
         assert_eq!(decoded.relay.selection_timeout_ms, 3000);
         assert!(!decoded.diagnostics.enabled);
@@ -674,5 +689,7 @@ mod tests {
         assert_eq!(config.network.punch_interval_ms, 200);
         assert_eq!(config.network.punch_attempts, 10);
         assert_eq!(config.network.keepalive_interval_secs, 25);
+        assert!(config.network.upnp_enabled);
+        assert!(config.network.birthday_probing_enabled);
     }
 }

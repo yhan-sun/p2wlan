@@ -23,6 +23,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 libc = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
