@@ -1024,8 +1024,13 @@ fn nat_profile_summary(snapshot: &Value) -> Option<String> {
         .get("confidence")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let predicted = profile
+        .get("predicted_endpoints")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
     Some(format!(
-        "mapping={mapping} filtering={filtering} hairpin={hairpin} lifetime={lifetime} public={public_endpoint} stun={stun_success}/{stun_total} confidence={confidence} symmetric={} port_preserved={} prediction={} birthday={}",
+        "mapping={mapping} filtering={filtering} hairpin={hairpin} lifetime={lifetime} public={public_endpoint} stun={stun_success}/{stun_total} confidence={confidence} symmetric={} port_preserved={} prediction={} predicted={predicted} birthday={}",
         nat_bool_text(profile.get("likely_symmetric")),
         nat_bool_text(profile.get("port_preserved")),
         nat_bool_text(profile.get("prediction_candidate")),
@@ -1121,6 +1126,17 @@ fn nat_profile_suggestions(snapshot: &Value, udp_advertise_configured: bool) -> 
             "本机端口映射看起来有稳定 delta，可在后续启用受限端口预测来提高对称/地址相关 NAT 的打洞概率。"
                 .to_string(),
         );
+    }
+
+    let predicted_count = profile
+        .get("predicted_endpoints")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if predicted_count > 0 {
+        suggestions.push(format!(
+            "已生成 {predicted_count} 个受限端口预测 candidate；如果对端也有稳定 delta，可提高地址/端口相关 NAT 的命中率。"
+        ));
     }
 
     if profile
@@ -2418,6 +2434,7 @@ mod tests {
                 "likely_symmetric": false,
                 "port_preserved": false,
                 "prediction_candidate": false,
+                "predicted_endpoints": [],
                 "birthday_candidate": false,
                 "confidence": 70,
                 "observations": [{
@@ -2441,7 +2458,7 @@ mod tests {
 
         assert_eq!(
             nat_profile_summary(&snapshot).as_deref(),
-            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=lower_bound_ms=250 public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false birthday=false")
+            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=lower_bound_ms=250 public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false predicted=0 birthday=false")
         );
         assert_eq!(
             stun_observation_summaries(&snapshot, 2),
@@ -2498,6 +2515,7 @@ mod tests {
                 "likely_symmetric": true,
                 "port_preserved": false,
                 "prediction_candidate": true,
+                "predicted_endpoints": ["198.51.100.10:62002"],
                 "birthday_candidate": true,
                 "confidence": 70,
                 "observations": []
@@ -2505,6 +2523,9 @@ mod tests {
         });
         let suggestions = nat_profile_suggestions(&symmetric, false);
         assert!(suggestions.iter().any(|item| item.contains("端口预测")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("受限端口预测 candidate")));
         assert!(suggestions.iter().any(|item| item.contains("稳定 delta")));
         assert!(suggestions
             .iter()
