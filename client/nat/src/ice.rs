@@ -387,6 +387,7 @@ pub async fn gather_candidate_report(
                 candidate_type: CandidateType::Host,
                 endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),
                 priority: compute_priority(CandidateType::Host),
+                source: crate::CandidateSource::Host,
             };
             debug!("Host candidate: {}", candidate.endpoint.to_string());
             candidates.push(candidate);
@@ -418,6 +419,7 @@ pub async fn gather_candidate_report(
                                 reflexive.port(),
                             ),
                             priority: compute_priority(CandidateType::ServerReflexive),
+                            source: crate::CandidateSource::StunObserved,
                         };
                         debug!(
                             "Server-reflexive candidate: {} (via {}, rtt={}ms)",
@@ -626,6 +628,7 @@ fn add_predicted_reflexive_candidates(candidates: &mut Vec<IceCandidate>, profil
             candidate_type: CandidateType::ServerReflexive,
             endpoint: crate::Endpoint::new(&addr.ip().to_string(), addr.port()),
             priority: compute_priority(CandidateType::ServerReflexive).saturating_sub(1),
+            source: crate::CandidateSource::Predicted,
         });
     }
 }

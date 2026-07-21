@@ -141,6 +141,28 @@ pub enum CandidateType {
     Relay,
 }
 
+/// Internal provenance for an ICE candidate.
+///
+/// This is intentionally local metadata. Control-plane compatibility is kept by
+/// continuing to serialize candidates as plain endpoint strings, while newer
+/// components may carry this source alongside the endpoint for diagnostics and
+/// probe-budget decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateSource {
+    /// Candidate came from local interface enumeration.
+    Host,
+    /// Candidate came from a successful STUN observation.
+    StunObserved,
+    /// Candidate was predicted from a stable observed NAT port delta.
+    Predicted,
+    /// Candidate was discovered from authenticated peer-reflexive traffic.
+    PeerReflexive,
+    /// Candidate was manually configured or explicitly advertised.
+    Manual,
+    /// Candidate came from a relay transport.
+    Relay,
+}
+
 /// An ICE candidate address.
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
@@ -150,6 +172,8 @@ pub struct IceCandidate {
     pub endpoint: Endpoint,
     /// Priority (higher = preferred).
     pub priority: u32,
+    /// Local-only candidate source metadata.
+    pub source: CandidateSource,
 }
 
 impl IceCandidate {
@@ -159,6 +183,7 @@ impl IceCandidate {
             candidate_type: CandidateType::Host,
             endpoint: Endpoint::new(ip, port),
             priority: 100,
+            source: CandidateSource::Host,
         }
     }
 
@@ -168,6 +193,17 @@ impl IceCandidate {
             candidate_type: CandidateType::ServerReflexive,
             endpoint: Endpoint::new(ip, port),
             priority: 90,
+            source: CandidateSource::StunObserved,
+        }
+    }
+
+    /// Create a predicted server-reflexive candidate.
+    pub fn predicted_server_reflexive(ip: &str, port: u16) -> Self {
+        Self {
+            candidate_type: CandidateType::ServerReflexive,
+            endpoint: Endpoint::new(ip, port),
+            priority: 89,
+            source: CandidateSource::Predicted,
         }
     }
 
@@ -177,6 +213,7 @@ impl IceCandidate {
             candidate_type: CandidateType::Relay,
             endpoint: Endpoint::new(ip, port),
             priority: 50,
+            source: CandidateSource::Relay,
         }
     }
 }
@@ -238,10 +275,16 @@ mod tests {
     fn test_candidate_creation() {
         let host = IceCandidate::host("192.168.1.1", 5000);
         assert_eq!(host.candidate_type, CandidateType::Host);
+        assert_eq!(host.source, CandidateSource::Host);
         assert_eq!(host.priority, 100);
 
         let srflx = IceCandidate::server_reflexive("1.2.3.4", 5678);
         assert_eq!(srflx.candidate_type, CandidateType::ServerReflexive);
+        assert_eq!(srflx.source, CandidateSource::StunObserved);
+
+        let predicted = IceCandidate::predicted_server_reflexive("1.2.3.4", 5680);
+        assert_eq!(predicted.candidate_type, CandidateType::ServerReflexive);
+        assert_eq!(predicted.source, CandidateSource::Predicted);
     }
 
     #[test]

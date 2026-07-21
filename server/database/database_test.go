@@ -123,10 +123,10 @@ func TestSignalsDeduplicateByPairAndType(t *testing.T) {
 		t.Fatalf("CreateDevice target failed: %v", err)
 	}
 
-	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"old"}, "old-handshake"); err != nil {
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"old"}, nil, "old-handshake"); err != nil {
 		t.Fatalf("CreateSignal old failed: %v", err)
 	}
-	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"new"}, "new-handshake"); err != nil {
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"new"}, map[string]string{"new": "predicted"}, "new-handshake"); err != nil {
 		t.Fatalf("CreateSignal new failed: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestSignalsIgnoreExpiredRows(t *testing.T) {
 		t.Fatalf("CreateDevice target failed: %v", err)
 	}
 
-	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"stale"}, "stale-handshake"); err != nil {
+	if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"stale"}, nil, "stale-handshake"); err != nil {
 		t.Fatalf("CreateSignal stale failed: %v", err)
 	}
 	_, err = db.Exec(`UPDATE signals SET created_at = ? WHERE to_node_id = ?`, time.Now().Unix()-signalTTLSeconds-1, target.ID)

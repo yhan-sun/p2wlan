@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use p2pnet_crypto::NodeIdentity;
-use p2pnet_nat::{CandidateGatherReport, NatProfile};
+use p2pnet_nat::{CandidateGatherReport, CandidateSource, NatProfile};
 use tokio::net::lookup_host;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, sleep};
@@ -126,6 +126,8 @@ pub struct Daemon {
     pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
+    /// Local-only source metadata keyed by candidate endpoint string.
+    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     /// Latest local NAT behavior profile inferred from STUN observations.
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Bound UDP transport shared with control-plane-triggered punching.
@@ -175,6 +177,7 @@ impl Daemon {
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
+            local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             nat_profile: Arc::new(RwLock::new(None)),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
@@ -439,6 +442,8 @@ impl Daemon {
         let peers = self.peers.clone();
         let control = self.control.clone();
         let local_candidates = self.local_candidates.clone();
+        let local_candidate_sources = self.local_candidate_sources.clone();
+        let udp_local_candidate_sources = local_candidate_sources.clone();
         let nat_profile = self.nat_profile.clone();
         let udp_transport = self.udp_transport.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
@@ -450,11 +455,11 @@ impl Daemon {
                         let udp = udp.with_local_node_id(local_node_id.clone());
                         *udp_transport.write().await = Some(udp.clone());
 
-                        let mut candidate_endpoints =
+                        let (mut candidate_endpoints, mut candidate_sources) =
                             match udp.gather_candidate_report(stun_servers.clone(), stun_timeout).await
                             {
                                 Ok(report) => {
-                                    let endpoints = candidate_endpoints_from_report(&report);
+                                    let (endpoints, sources) = candidate_endpoints_from_report(&report);
                                     info!(
                                         "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={}",
                                         report.nat_profile.mapping_behavior,
@@ -469,11 +474,11 @@ impl Daemon {
                                         report.nat_profile.confidence
                                     );
                                     *nat_profile.write().await = Some(report.nat_profile);
-                                    endpoints
+                                    (endpoints, sources)
                                 }
                                 Err(err) => {
                                     warn!("Failed to gather UDP candidates: {err}");
-                                    Vec::new()
+                                    (Vec::new(), HashMap::new())
                                 }
                             };
 
@@ -487,6 +492,15 @@ impl Daemon {
                                     if !candidate_endpoints.contains(&endpoint) {
                                         candidate_endpoints.insert(0, endpoint.clone());
                                     }
+                                    candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
+                                        if udp_advertise.as_deref().is_some_and(|configured| {
+                                            !configured.trim().is_empty() && configured.trim() == endpoint
+                                        }) {
+                                            "manual".to_string()
+                                        } else {
+                                            "host".to_string()
+                                        }
+                                    });
                                     info!(
                                         "UDP transport listening on {addr}; advertising {endpoint}"
                                     );
@@ -511,6 +525,7 @@ impl Daemon {
                             candidate_endpoints.len()
                         );
                         *local_candidates.write().await = candidate_endpoints;
+                        *udp_local_candidate_sources.write().await = candidate_sources;
 
                         if keepalive_interval.is_zero() {
                             let refresh_udp = udp.clone();
@@ -522,6 +537,7 @@ impl Daemon {
                                     stun_timeout,
                                     udp_advertise,
                                     local_candidates,
+                                    local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
                                     control,
                                     peers: peers.clone(),
@@ -539,6 +555,7 @@ impl Daemon {
                                     stun_timeout,
                                     udp_advertise,
                                     local_candidates,
+                                    local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
                                     control,
                                     peers: peers.clone(),
@@ -708,6 +725,7 @@ impl Daemon {
                             };
                             let initiation_bytes = initiation.to_bytes();
                             let candidates = local_candidates.read().await.clone();
+                            let candidate_sources = local_candidate_sources.read().await.clone();
 
                             let attempt_no = {
                                 let mut state = pending.lock().await;
@@ -720,7 +738,12 @@ impl Daemon {
                             };
 
                             if let Err(err) = control
-                                .send_peer_offer(&conn.node_id, &candidates, &initiation_bytes)
+                                .send_peer_offer_with_sources(
+                                    &conn.node_id,
+                                    &candidates,
+                                    &candidate_sources,
+                                    &initiation_bytes,
+                                )
                                 .await
                             {
                                 warn!("Handshake offer to {} failed: {err}", conn.node_id);
@@ -901,6 +924,7 @@ impl Daemon {
                 ControlEvent::PeerOffer {
                     from_node_id,
                     candidates,
+                    candidate_sources,
                     handshake_init,
                 } => {
                     info!(
@@ -908,7 +932,9 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
-                    self.peers.add_candidates(&from_node_id, &candidates).await;
+                    self.peers
+                        .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
+                        .await;
                     if !handshake_init.is_empty() {
                         if let Err(err) = self
                             .handle_peer_offer(&from_node_id, &candidates, &handshake_init)
@@ -923,6 +949,7 @@ impl Daemon {
                 ControlEvent::PeerAnswer {
                     from_node_id,
                     candidates,
+                    candidate_sources,
                     handshake_response,
                 } => {
                     info!(
@@ -930,7 +957,9 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
-                    self.peers.add_candidates(&from_node_id, &candidates).await;
+                    self.peers
+                        .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
+                        .await;
                     if !handshake_response.is_empty() {
                         if let Err(err) = self
                             .handle_peer_answer(&from_node_id, &handshake_response)
@@ -1049,7 +1078,7 @@ impl Daemon {
             .create_initiation()
             .map_err(|e| DaemonError::Peer(format!("WireGuard initiation failed: {e}")))?;
         let initiation_bytes = initiation.to_bytes();
-        let candidates = self.wait_for_local_candidates().await;
+        let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
 
         let peer_id_clone = peer_info.node_id.clone();
         let attempt_no = {
@@ -1062,7 +1091,12 @@ impl Daemon {
         };
 
         self.control
-            .send_peer_offer(&peer_id_clone, &candidates, &initiation_bytes)
+            .send_peer_offer_with_sources(
+                &peer_id_clone,
+                &candidates,
+                &candidate_sources,
+                &initiation_bytes,
+            )
             .await?;
 
         info!(
@@ -1109,22 +1143,23 @@ impl Daemon {
         Ok(())
     }
 
-    async fn wait_for_local_candidates(&self) -> Vec<String> {
+    async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(50);
         let timeout = Duration::from_millis(CANDIDATE_READY_TIMEOUT_MS);
 
         loop {
             let candidates = self.local_candidates.read().await.clone();
+            let candidate_sources = self.local_candidate_sources.read().await.clone();
             if !candidates.is_empty() {
-                return candidates;
+                return (candidates, candidate_sources);
             }
             if waited >= timeout {
                 warn!(
                     "Proceeding with WireGuard signaling before UDP candidates are ready after {} ms",
                     timeout.as_millis()
                 );
-                return candidates;
+                return (candidates, candidate_sources);
             }
             sleep(step).await;
             waited += step;
@@ -1142,19 +1177,7 @@ impl Daemon {
             return;
         };
 
-        let mut candidates = Vec::new();
-        for candidate in &conn.candidates {
-            if let Ok(addr) = candidate.parse::<SocketAddr>() {
-                if !candidates.contains(&addr) {
-                    candidates.push(addr);
-                }
-            }
-        }
-        if let Some(endpoint) = conn.endpoint {
-            if !candidates.contains(&endpoint) {
-                candidates.push(endpoint);
-            }
-        }
+        let candidates = self.peers.direct_probe_targets_for(node_id).await;
 
         if candidates.is_empty() {
             debug!("No UDP candidates for {node_id}; skipping hole punch");
@@ -1244,9 +1267,14 @@ impl Daemon {
             .await;
 
         let response_bytes = response.to_bytes();
-        let candidates = self.wait_for_local_candidates().await;
+        let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
         self.control
-            .send_peer_answer(from_node_id, &candidates, &response_bytes)
+            .send_peer_answer_with_sources(
+                from_node_id,
+                &candidates,
+                &candidate_sources,
+                &response_bytes,
+            )
             .await?;
         info!(
             "Installed WireGuard responder session for {from_node_id} and sent response ({} bytes, {} candidates)",
@@ -1357,12 +1385,33 @@ fn advertised_udp_endpoint(
         .map(|candidate| candidate.to_string())
 }
 
-fn candidate_endpoints_from_report(report: &CandidateGatherReport) -> Vec<String> {
-    report
-        .candidates
-        .iter()
-        .map(|candidate| candidate.endpoint.to_string())
-        .collect()
+fn candidate_endpoints_from_report(
+    report: &CandidateGatherReport,
+) -> (Vec<String>, HashMap<String, String>) {
+    let mut endpoints = Vec::new();
+    let mut sources = HashMap::new();
+    for candidate in &report.candidates {
+        let endpoint = candidate.endpoint.to_string();
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint.clone());
+        }
+        sources.insert(
+            endpoint,
+            candidate_source_label(candidate.source).to_string(),
+        );
+    }
+    (endpoints, sources)
+}
+
+fn candidate_source_label(source: CandidateSource) -> &'static str {
+    match source {
+        CandidateSource::Host => "host",
+        CandidateSource::StunObserved => "stun_observed",
+        CandidateSource::Predicted => "predicted",
+        CandidateSource::PeerReflexive => "peer_reflexive",
+        CandidateSource::Manual => "manual",
+        CandidateSource::Relay => "relay",
+    }
 }
 
 fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
@@ -1392,6 +1441,7 @@ struct UdpCandidateRefreshContext {
     stun_timeout: Duration,
     udp_advertise: Option<String>,
     local_candidates: Arc<RwLock<Vec<String>>>,
+    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     control: ControlClient,
     peers: Arc<PeerManager>,
@@ -1404,6 +1454,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         stun_timeout,
         udp_advertise,
         local_candidates,
+        local_candidate_sources,
         nat_profile,
         control,
         peers,
@@ -1424,7 +1475,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                 continue;
             }
         };
-        let mut candidates = candidate_endpoints_from_report(&report);
+        let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         let profile_changed = {
             let mut current_profile = nat_profile.write().await;
             if current_profile.as_ref() == Some(&report.nat_profile) {
@@ -1442,14 +1493,27 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             if !candidates.contains(endpoint) {
                 candidates.insert(0, endpoint.clone());
             }
+            candidate_sources
+                .entry(endpoint.clone())
+                .or_insert_with(|| {
+                    if udp_advertise.as_deref().is_some_and(|configured| {
+                        !configured.trim().is_empty() && configured.trim() == endpoint
+                    }) {
+                        "manual".to_string()
+                    } else {
+                        "host".to_string()
+                    }
+                });
         }
 
         let changed = {
             let mut current = local_candidates.write().await;
-            if *current == candidates {
+            let sources_changed = *local_candidate_sources.read().await != candidate_sources;
+            if *current == candidates && !sources_changed {
                 false
             } else {
                 *current = candidates.clone();
+                *local_candidate_sources.write().await = candidate_sources.clone();
                 true
             }
         };

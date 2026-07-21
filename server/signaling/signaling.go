@@ -57,18 +57,20 @@ type EndpointUpdateData struct {
 
 // PeerOfferData is the payload for P2P connection offers.
 type PeerOfferData struct {
-	FromNodeID    string   `json:"from_node_id"`
-	ToNodeID      string   `json:"to_node_id"`
-	Candidates    []string `json:"candidates"`
-	HandshakeInit []byte   `json:"handshake_init,omitempty"`
+	FromNodeID       string            `json:"from_node_id"`
+	ToNodeID         string            `json:"to_node_id"`
+	Candidates       []string          `json:"candidates"`
+	CandidateSources map[string]string `json:"candidate_sources,omitempty"`
+	HandshakeInit    []byte            `json:"handshake_init,omitempty"`
 }
 
 // PeerAnswerData is the payload for P2P connection answers.
 type PeerAnswerData struct {
-	FromNodeID        string   `json:"from_node_id"`
-	ToNodeID          string   `json:"to_node_id"`
-	Candidates        []string `json:"candidates"`
-	HandshakeResponse []byte   `json:"handshake_response,omitempty"`
+	FromNodeID        string            `json:"from_node_id"`
+	ToNodeID          string            `json:"to_node_id"`
+	Candidates        []string          `json:"candidates"`
+	CandidateSources  map[string]string `json:"candidate_sources,omitempty"`
+	HandshakeResponse []byte            `json:"handshake_response,omitempty"`
 }
 
 // Client represents a connected node.
