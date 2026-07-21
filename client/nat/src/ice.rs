@@ -19,11 +19,12 @@
 //! | Relay | 0 |
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
 use crate::client::StunClient;
@@ -41,6 +42,19 @@ const LOCAL_PREF: u32 = 65535;
 
 /// Component ID (1 for the only component in our P2P tunnel).
 const COMPONENT_ID: u32 = 1;
+
+/// Short timeout for best-effort active NAT behavior probes.
+///
+/// These probes run on the same UDP socket after ordinary STUN gathering. Keep
+/// them intentionally small so diagnostics never turn startup into a long NAT
+/// lab run when public STUN servers do not support CHANGE-REQUEST.
+const ACTIVE_BEHAVIOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Short idle delay before re-checking whether the mapped endpoint is stable.
+const MAPPING_LIFETIME_PROBE_DELAY: Duration = Duration::from_millis(250);
+
+/// Prefix for self-addressed UDP hairpin probes.
+const HAIRPIN_PROBE_PREFIX: &[u8] = b"P2WLAN_HAIRPIN_V1";
 
 /// Configuration for ICE candidate gathering.
 #[derive(Debug, Clone)]
@@ -107,8 +121,12 @@ pub enum FilteringBehavior {
     /// No filtering behavior could be inferred.
     #[default]
     Unknown,
+    /// CHANGE-REQUEST proved endpoint-independent filtering.
+    EndpointIndependent,
     /// Mapping observations suggest endpoint-independent behavior.
     LikelyEndpointIndependent,
+    /// CHANGE-REQUEST proved address-dependent filtering.
+    AddressDependent,
     /// Mapping observations suggest address or port dependent behavior.
     AddressOrPortDependent,
     /// STUN was configured but no server replied.
@@ -122,6 +140,10 @@ pub enum HairpinBehavior {
     /// Hairpin behavior has not been probed yet.
     #[default]
     Unknown,
+    /// A self-addressed UDP probe returned through the mapped endpoint.
+    Supported,
+    /// A self-addressed UDP probe did not return within the bounded probe budget.
+    Unsupported,
     /// Hairpin does not matter for a public/open endpoint.
     NotApplicable,
 }
@@ -133,6 +155,8 @@ pub enum MappingLifetime {
     /// Lifetime has not been measured yet.
     #[default]
     Unknown,
+    /// The mapped endpoint stayed stable for at least this many milliseconds.
+    LowerBoundMs(u64),
 }
 
 /// Local NAT profile inferred from candidate gathering.
@@ -419,9 +443,10 @@ pub async fn gather_candidate_report(
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|c| seen.insert((c.candidate_type, c.endpoint.to_string())));
 
-    let nat_profile = build_nat_profile(local_addr, observations);
+    let mut nat_profile = build_nat_profile(local_addr, observations);
+    apply_active_behavior_probes(socket, config, &mut nat_profile).await;
     info!(
-        "Gathered {} ICE candidates (STUN success {}/{}, mapping={:?})",
+        "Gathered {} ICE candidates (STUN success {}/{}, mapping={:?}, filtering={:?}, hairpin={:?}, lifetime={:?})",
         candidates.len(),
         nat_profile
             .observations
@@ -429,7 +454,10 @@ pub async fn gather_candidate_report(
             .filter(|observation| observation.mapped_address.is_some())
             .count(),
         nat_profile.observations.len(),
-        nat_profile.mapping_behavior
+        nat_profile.mapping_behavior,
+        nat_profile.filtering_behavior,
+        nat_profile.hairpin_behavior,
+        nat_profile.mapping_lifetime
     );
     Ok(CandidateGatherReport {
         candidates,
@@ -547,6 +575,215 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
     }
 }
 
+async fn apply_active_behavior_probes(
+    socket: &UdpSocket,
+    config: &IceConfig,
+    profile: &mut NatProfile,
+) {
+    if !config.gather_srflx || profile.udp_blocked || profile.public_endpoint.is_none() {
+        return;
+    }
+
+    let Some((server, public_endpoint)) = first_successful_stun_mapping(config, profile) else {
+        return;
+    };
+    let probe_timeout = active_probe_timeout(config.stun_timeout);
+
+    if let Some(filtering_behavior) = probe_filtering_behavior(socket, server, probe_timeout).await
+    {
+        profile.filtering_behavior = filtering_behavior;
+    }
+
+    if let Some(lifetime) =
+        probe_mapping_lifetime(socket, server, public_endpoint, probe_timeout).await
+    {
+        profile.mapping_lifetime = lifetime;
+    }
+
+    if profile.mapping_behavior == MappingBehavior::OpenInternet {
+        profile.hairpin_behavior = HairpinBehavior::NotApplicable;
+    } else if let Some(hairpin_behavior) =
+        probe_hairpin_behavior(socket, public_endpoint, probe_timeout).await
+    {
+        profile.hairpin_behavior = hairpin_behavior;
+    }
+}
+
+fn first_successful_stun_mapping(
+    config: &IceConfig,
+    profile: &NatProfile,
+) -> Option<(SocketAddr, SocketAddr)> {
+    profile.observations.iter().find_map(|observation| {
+        let server = observation.server.parse::<SocketAddr>().ok()?;
+        if !config.stun_servers.contains(&server) {
+            return None;
+        }
+        let mapped = observation
+            .mapped_address
+            .as_deref()?
+            .parse::<SocketAddr>()
+            .ok()?;
+        Some((server, mapped))
+    })
+}
+
+fn active_probe_timeout(stun_timeout: Duration) -> Duration {
+    stun_timeout
+        .min(ACTIVE_BEHAVIOR_PROBE_TIMEOUT)
+        .max(Duration::from_millis(50))
+}
+
+async fn probe_filtering_behavior(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    probe_timeout: Duration,
+) -> Option<FilteringBehavior> {
+    let stun_client = StunClient::with_timeout(probe_timeout);
+
+    match stun_client
+        .binding_request_with_change(socket, server, true, true)
+        .await
+    {
+        Ok(response) => {
+            if let Some(behavior) = classify_changed_ip_port_response(server, response.from_addr) {
+                debug!(
+                    "Active NAT filtering probe: {:?} response from {} via {}",
+                    behavior, response.from_addr, server
+                );
+                return Some(behavior);
+            }
+            debug!(
+                "Active NAT filtering probe: server {} ignored change-ip+port (response from {})",
+                server, response.from_addr
+            );
+        }
+        Err(error) => {
+            debug!(
+                "Active NAT filtering probe change-ip+port via {} failed: {}",
+                server, error
+            );
+        }
+    }
+
+    match stun_client
+        .binding_request_with_change(socket, server, false, true)
+        .await
+    {
+        Ok(response) if response.from_addr.ip() == server.ip() && response.from_addr != server => {
+            debug!(
+                "Active NAT filtering probe: address-dependent response from {} via {}",
+                response.from_addr, server
+            );
+            Some(FilteringBehavior::AddressDependent)
+        }
+        Ok(response) => {
+            debug!(
+                "Active NAT filtering probe: server {} ignored change-port (response from {})",
+                server, response.from_addr
+            );
+            None
+        }
+        Err(error) => {
+            debug!(
+                "Active NAT filtering probe change-port via {} failed: {}",
+                server, error
+            );
+            None
+        }
+    }
+}
+
+fn classify_changed_ip_port_response(
+    server: SocketAddr,
+    from_addr: SocketAddr,
+) -> Option<FilteringBehavior> {
+    if from_addr.ip() != server.ip() {
+        Some(FilteringBehavior::EndpointIndependent)
+    } else if from_addr != server {
+        Some(FilteringBehavior::AddressDependent)
+    } else {
+        None
+    }
+}
+
+async fn probe_mapping_lifetime(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    expected_endpoint: SocketAddr,
+    probe_timeout: Duration,
+) -> Option<MappingLifetime> {
+    sleep(MAPPING_LIFETIME_PROBE_DELAY).await;
+
+    let stun_client = StunClient::with_timeout(probe_timeout);
+    match stun_client.binding_request(socket, server).await {
+        Ok(response) if response.reflexive_address == Some(expected_endpoint) => Some(
+            MappingLifetime::LowerBoundMs(duration_millis(MAPPING_LIFETIME_PROBE_DELAY)),
+        ),
+        Ok(response) => {
+            debug!(
+                "Active NAT lifetime probe changed mapping via {}: expected {}, got {:?}",
+                server, expected_endpoint, response.reflexive_address
+            );
+            None
+        }
+        Err(error) => {
+            debug!(
+                "Active NAT lifetime probe via {} failed after {:?}: {}",
+                server, MAPPING_LIFETIME_PROBE_DELAY, error
+            );
+            None
+        }
+    }
+}
+
+async fn probe_hairpin_behavior(
+    socket: &UdpSocket,
+    public_endpoint: SocketAddr,
+    probe_timeout: Duration,
+) -> Option<HairpinBehavior> {
+    let payload = build_hairpin_probe_payload(socket.local_addr().ok()?, public_endpoint);
+    socket.send_to(&payload, public_endpoint).await.ok()?;
+
+    match timeout(probe_timeout, recv_matching_hairpin_probe(socket, &payload)).await {
+        Ok(true) => Some(HairpinBehavior::Supported),
+        Ok(false) | Err(_) => Some(HairpinBehavior::Unsupported),
+    }
+}
+
+async fn recv_matching_hairpin_probe(socket: &UdpSocket, expected_payload: &[u8]) -> bool {
+    let mut buf = [0u8; 2048];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, _from)) if &buf[..len] == expected_payload => return true,
+            Ok((_len, from)) => {
+                debug!(
+                    "Ignoring non-hairpin UDP packet from {} during hairpin probe",
+                    from
+                );
+            }
+            Err(error) => {
+                debug!("Hairpin probe recv failed: {}", error);
+                return false;
+            }
+        }
+    }
+}
+
+fn build_hairpin_probe_payload(local_addr: SocketAddr, public_endpoint: SocketAddr) -> Vec<u8> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}/{}/{}/{}",
+        String::from_utf8_lossy(HAIRPIN_PROBE_PREFIX),
+        local_addr,
+        public_endpoint,
+        nonce
+    )
+    .into_bytes()
+}
+
 fn infer_filtering_behavior(
     udp_blocked: bool,
     mapping_behavior: MappingBehavior,
@@ -626,6 +863,73 @@ pub fn candidates_to_addrs(candidates: &[IceCandidate]) -> Vec<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stun::{StunAttribute, StunMessage, BINDING_REQUEST, BINDING_RESPONSE};
+
+    #[derive(Debug, Clone, Copy)]
+    enum ChangeResponseMode {
+        ChangedPortForIpPort,
+        ChangedPortForPortOnly,
+    }
+
+    async fn spawn_change_request_stun_server(
+        mode: ChangeResponseMode,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let alternate = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = primary.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, client_addr)) = primary.recv_from(&mut buf).await {
+                let Ok(req) = StunMessage::decode(&buf[..len]) else {
+                    continue;
+                };
+                if req.msg_type != BINDING_REQUEST {
+                    continue;
+                }
+
+                let (change_ip, change_port) = change_request_flags(&req);
+                let should_drop = matches!(
+                    (mode, change_ip, change_port),
+                    (ChangeResponseMode::ChangedPortForPortOnly, true, true)
+                );
+                if should_drop {
+                    continue;
+                }
+
+                let from_alternate = matches!(
+                    (mode, change_ip, change_port),
+                    (ChangeResponseMode::ChangedPortForIpPort, true, true)
+                        | (ChangeResponseMode::ChangedPortForPortOnly, false, true)
+                );
+                let mut resp =
+                    StunMessage::with_transaction_id(BINDING_RESPONSE, req.transaction_id);
+                resp.add_attribute(StunAttribute::XorMappedAddress(client_addr));
+                let encoded = resp.encode();
+                if from_alternate {
+                    let _ = alternate.send_to(&encoded, client_addr).await;
+                } else {
+                    let _ = primary.send_to(&encoded, client_addr).await;
+                }
+            }
+        });
+
+        (addr, handle)
+    }
+
+    fn change_request_flags(message: &StunMessage) -> (bool, bool) {
+        message
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                StunAttribute::ChangeRequest {
+                    change_ip,
+                    change_port,
+                } => Some((*change_ip, *change_port)),
+                _ => None,
+            })
+            .unwrap_or((false, false))
+    }
 
     #[test]
     fn test_priority_ordering() {
@@ -887,6 +1191,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_probe_filtering_behavior_treats_changed_port_as_address_dependent() {
+        let (server, _handle) =
+            spawn_change_request_stun_server(ChangeResponseMode::ChangedPortForIpPort).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let filtering = probe_filtering_behavior(&socket, server, Duration::from_secs(1)).await;
+
+        assert_eq!(filtering, Some(FilteringBehavior::AddressDependent));
+    }
+
+    #[tokio::test]
+    async fn test_probe_filtering_behavior_detects_address_dependent() {
+        let (server, _handle) =
+            spawn_change_request_stun_server(ChangeResponseMode::ChangedPortForPortOnly).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let filtering = probe_filtering_behavior(&socket, server, Duration::from_millis(100)).await;
+
+        assert_eq!(filtering, Some(FilteringBehavior::AddressDependent));
+    }
+
+    #[test]
+    fn test_changed_ip_port_classifier_requires_ip_change_for_endpoint_independent() {
+        let server = "192.0.2.10:3478".parse().unwrap();
+        let changed_ip = "198.51.100.10:3479".parse().unwrap();
+        let changed_port = "192.0.2.10:3479".parse().unwrap();
+        let unchanged = server;
+
+        assert_eq!(
+            classify_changed_ip_port_response(server, changed_ip),
+            Some(FilteringBehavior::EndpointIndependent)
+        );
+        assert_eq!(
+            classify_changed_ip_port_response(server, changed_port),
+            Some(FilteringBehavior::AddressDependent)
+        );
+        assert_eq!(classify_changed_ip_port_response(server, unchanged), None);
+    }
+
+    #[tokio::test]
+    async fn test_probe_mapping_lifetime_records_lower_bound() {
+        let (server, _handle) = crate::client::test_helpers::spawn_mock_stun_server().await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected_endpoint = socket.local_addr().unwrap();
+
+        let lifetime =
+            probe_mapping_lifetime(&socket, server, expected_endpoint, Duration::from_secs(1))
+                .await;
+
+        assert_eq!(
+            lifetime,
+            Some(MappingLifetime::LowerBoundMs(duration_millis(
+                MAPPING_LIFETIME_PROBE_DELAY
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_hairpin_behavior_detects_self_hairpin() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let public_endpoint = socket.local_addr().unwrap();
+
+        let hairpin =
+            probe_hairpin_behavior(&socket, public_endpoint, Duration::from_secs(1)).await;
+
+        assert_eq!(hairpin, Some(HairpinBehavior::Supported));
+    }
+
+    #[tokio::test]
     async fn test_gather_candidates_host_only() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -955,6 +1328,18 @@ mod tests {
         assert_eq!(
             report.nat_profile.public_endpoint.as_deref(),
             Some(local_text.as_str())
+        );
+        assert_eq!(
+            report.nat_profile.filtering_behavior,
+            FilteringBehavior::LikelyEndpointIndependent
+        );
+        assert_eq!(
+            report.nat_profile.hairpin_behavior,
+            HairpinBehavior::NotApplicable
+        );
+        assert_eq!(
+            report.nat_profile.mapping_lifetime,
+            MappingLifetime::LowerBoundMs(duration_millis(MAPPING_LIFETIME_PROBE_DELAY))
         );
     }
 
