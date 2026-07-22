@@ -25,7 +25,13 @@ use crate::traversal_history::{
 };
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
-const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
+/// Keep relay-backed direct probing alive.
+///
+/// Relay already provides the data-plane safety net, so direct UDP retries should stay cheap but
+/// frequent enough to catch peer-reflexive discoveries, refreshed NAT mappings, and brief symmetric
+/// NAT punch windows.  With the default 5s base interval this caps the retry cadence at 10s instead
+/// of drifting out to 40s after repeated failures.
+const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 1;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const DIRECT_TRIAL_RELAY_MARGIN: i32 = 5;
