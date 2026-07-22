@@ -235,6 +235,8 @@ Disconnected
 
 第一阶段可选 WebSocket、SSE 或 HTTP/2 streaming。只有在连接迁移、统一 UDP transport 或服务端规模数据证明有价值时，再选择 QUIC。传输协议不得泄漏到 Engine 公共事件模型。
 
+当前已落地 `CTL-02a`：设备凭证绑定的 `p2wlan.signaling.v1` WebSocket 作为实时 wake channel，signal payload 先持久化再通知；daemon 在 WS 断线时自动回退 HTTP long-poll，并在连接建立和固定周期执行持久化对账。WS 队列、消息大小、连接数、心跳、deadline、Origin、重复连接替换和协议版本均有明确边界。多实例控制面的跨实例 Pub/Sub 仍需在控制面从单机 SQLite 演进为共享存储时实现。
+
 ### 7.2 Schema 和兼容性
 
 - 所有消息有明确版本和未知字段处理策略。
@@ -658,6 +660,7 @@ PeerSessionReady / PeerSessionFailed
 
 - `CTL-01` network map snapshot + version/cursor。
 - `CTL-02` watch stream 和轮询 fallback。
+  - 已落地 `CTL-02a`：可靠 WebSocket wake stream、设备身份绑定、HTTP long-poll fallback 和持久化对账。
 - `CTL-03` 信令幂等、过期和恢复。
 - `PATH-01` 引入 network generation。
 - `PATH-02` candidate-pair 状态机。

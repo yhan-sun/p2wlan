@@ -14,15 +14,21 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
+use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tracing::{debug, error, info, warn};
 
 // ============================================================
@@ -834,9 +840,44 @@ const INITIAL_BACKOFF_SECS: u64 = 2;
 /// Signaling carries WireGuard handshake offers/answers. Keep it close to
 /// continuous long-polling so early responses do not wait almost a full second
 /// for the next tick before scheduling the synchronized UDP punch window.
-const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIGNAL_LONG_POLL_WAIT_MS: u64 = 900;
+const SIGNAL_FALLBACK_TICK: Duration = Duration::from_secs(1);
+const SIGNAL_WS_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const SIGNAL_WS_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const SIGNAL_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SIGNAL_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SIGNAL_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const SIGNAL_WS_PROTOCOL: &str = "p2wlan.signaling.v1";
+const SIGNAL_WS_PROTOCOL_VERSION: u8 = 1;
+const SIGNAL_WS_WAKE_QUEUE: usize = 32;
 const MIN_PEER_POLL_INTERVAL_SECS: u64 = 5;
+
+#[derive(Debug, Deserialize)]
+struct SignalWebSocketMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    protocol_version: u8,
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    network_id: String,
+    #[serde(default)]
+    sequence: u64,
+    #[serde(default)]
+    server_time_ms: u64,
+}
+
+struct SignalWebSocketTask {
+    handle: tokio::task::JoinHandle<()>,
+    connected: Arc<AtomicBool>,
+}
+
+impl Drop for SignalWebSocketTask {
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::Release);
+        self.handle.abort();
+    }
+}
 
 /// Compute exponential backoff with jitter, capped at MAX_BACKOFF_SECS.
 /// attempt 0 → ~2s, attempt 1 → ~4s, attempt 2 → ~8s, …
@@ -847,6 +888,243 @@ fn backoff_delay(attempt: u32) -> Duration {
         .min(MAX_BACKOFF_SECS);
     let jitter = rand::thread_rng().gen_range(0.0..=0.5) * base as f64;
     Duration::from_secs_f64(base as f64 + jitter)
+}
+
+fn spawn_signal_websocket(
+    base_url: &str,
+    token: &str,
+    node_id: &str,
+    network_id: &str,
+    wake_tx: mpsc::Sender<()>,
+    connected: Arc<AtomicBool>,
+) -> SignalWebSocketTask {
+    let task_connected = connected.clone();
+    let base_url = base_url.to_string();
+    let token = token.to_string();
+    let node_id = node_id.to_string();
+    let network_id = network_id.to_string();
+    let handle = tokio::spawn(async move {
+        run_signal_websocket(
+            &base_url,
+            &token,
+            &node_id,
+            &network_id,
+            wake_tx,
+            task_connected,
+        )
+        .await;
+    });
+    SignalWebSocketTask { handle, connected }
+}
+
+async fn run_signal_websocket(
+    base_url: &str,
+    token: &str,
+    expected_node_id: &str,
+    expected_network_id: &str,
+    wake_tx: mpsc::Sender<()>,
+    connected: Arc<AtomicBool>,
+) {
+    let ws_url = match signal_websocket_url(base_url) {
+        Ok(url) => url,
+        Err(err) => {
+            warn!("WebSocket signaling disabled: {err}");
+            return;
+        }
+    };
+    let authorization = match HeaderValue::from_str(&format!("Bearer {token}")) {
+        Ok(value) => value,
+        Err(_) => {
+            warn!("WebSocket signaling disabled: invalid credential header");
+            return;
+        }
+    };
+
+    let mut attempt = 0u32;
+    loop {
+        connected.store(false, Ordering::Release);
+        let mut request = match ws_url.as_str().into_client_request() {
+            Ok(request) => request,
+            Err(err) => {
+                warn!("WebSocket signaling request construction failed: {err}");
+                return;
+            }
+        };
+        request
+            .headers_mut()
+            .insert(AUTHORIZATION, authorization.clone());
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static(SIGNAL_WS_PROTOCOL),
+        );
+
+        match time::timeout(
+            SIGNAL_WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        {
+            Ok(Ok((mut socket, response))) => {
+                let negotiated = response
+                    .headers()
+                    .get(SEC_WEBSOCKET_PROTOCOL)
+                    .and_then(|value| value.to_str().ok());
+                if negotiated != Some(SIGNAL_WS_PROTOCOL) {
+                    warn!(
+                        "WebSocket signaling rejected required subprotocol; negotiated={negotiated:?}"
+                    );
+                    let _ = time::timeout(SIGNAL_WS_WRITE_TIMEOUT, socket.close(None)).await;
+                } else {
+                    info!("WebSocket signaling connected at {ws_url}");
+                    attempt = 0;
+                    let mut ready = false;
+                    let mut last_sequence = 0u64;
+                    loop {
+                        let message =
+                            match time::timeout(SIGNAL_WS_IDLE_TIMEOUT, socket.next()).await {
+                                Ok(Some(message)) => message,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    debug!("WebSocket signaling connection became idle");
+                                    break;
+                                }
+                            };
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(err) => {
+                                debug!("WebSocket signaling read failed: {err}");
+                                break;
+                            }
+                        };
+                        match message {
+                            WebSocketMessage::Text(text) => {
+                                if text.len() > 4096 {
+                                    warn!("WebSocket signaling message exceeded client limit");
+                                    break;
+                                }
+                                let message: SignalWebSocketMessage =
+                                    match serde_json::from_str(text.as_str()) {
+                                        Ok(message) => message,
+                                        Err(err) => {
+                                            warn!(
+                                                "Ignoring invalid WebSocket signaling JSON: {err}"
+                                            );
+                                            break;
+                                        }
+                                    };
+                                if message.protocol_version != SIGNAL_WS_PROTOCOL_VERSION {
+                                    warn!(
+                                        "WebSocket signaling protocol mismatch: server={} client={}",
+                                        message.protocol_version, SIGNAL_WS_PROTOCOL_VERSION
+                                    );
+                                    break;
+                                }
+                                match message.message_type.as_str() {
+                                    "ready" if !ready => {
+                                        if message.node_id != expected_node_id
+                                            || message.network_id != expected_network_id
+                                        {
+                                            warn!(
+                                                "WebSocket signaling identity mismatch; closing connection"
+                                            );
+                                            break;
+                                        }
+                                        ready = true;
+                                        connected.store(true, Ordering::Release);
+                                        debug!(
+                                            "WebSocket signaling ready for node {} at server_time_ms={}",
+                                            expected_node_id, message.server_time_ms
+                                        );
+                                        if wake_tx.try_send(()).is_err() && wake_tx.is_closed() {
+                                            return;
+                                        }
+                                    }
+                                    "signals_available" if ready => {
+                                        if message.sequence == 0 {
+                                            warn!("WebSocket signaling rejected zero notification sequence");
+                                            break;
+                                        }
+                                        if message.sequence <= last_sequence {
+                                            continue;
+                                        }
+                                        last_sequence = message.sequence;
+                                        if wake_tx.try_send(()).is_err() && wake_tx.is_closed() {
+                                            return;
+                                        }
+                                    }
+                                    other => {
+                                        warn!(
+                                            "Unexpected WebSocket signaling message '{other}' before/after readiness"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            WebSocketMessage::Ping(payload) => {
+                                if !matches!(
+                                    time::timeout(
+                                        SIGNAL_WS_WRITE_TIMEOUT,
+                                        socket.send(WebSocketMessage::Pong(payload)),
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    break;
+                                }
+                            }
+                            WebSocketMessage::Close(_) => break,
+                            WebSocketMessage::Binary(_) => {
+                                warn!("WebSocket signaling rejected unexpected binary message");
+                                break;
+                            }
+                            WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+                        }
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                debug!(
+                    "WebSocket signaling connection failed; HTTP fallback remains active: {err}"
+                );
+            }
+            Err(_) => {
+                debug!("WebSocket signaling connection timed out; HTTP fallback remains active");
+            }
+        }
+
+        connected.store(false, Ordering::Release);
+        attempt = attempt.saturating_add(1);
+        let exponent = attempt.saturating_sub(1).min(5);
+        let base = Duration::from_secs(1u64 << exponent).min(SIGNAL_WS_MAX_BACKOFF);
+        let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=500));
+        time::sleep(base.saturating_add(jitter)).await;
+    }
+}
+
+fn signal_websocket_url(base_url: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|err| {
+        DaemonError::ControlPlane(format!(
+            "invalid control URL for WebSocket signaling: {err}"
+        ))
+    })?;
+    let ws_scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" => "ws",
+        "wss" => "wss",
+        scheme => {
+            return Err(DaemonError::ControlPlane(format!(
+                "unsupported control URL scheme for WebSocket signaling: {scheme}"
+            )))
+        }
+    };
+    url.set_scheme(ws_scheme).map_err(|_| {
+        DaemonError::ControlPlane("failed to construct WebSocket signaling URL".to_string())
+    })?;
+    url.set_path("/api/v1/signals/ws");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn is_permanent_auth_error(err: &str) -> bool {
@@ -1033,9 +1311,23 @@ async fn run_control_loop(
         {
             warn!("Initial peer polling failed: {err}");
         }
-        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
+        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
             warn!("Initial signal polling failed: {err}");
         }
+
+        let signal_ws_connected = Arc::new(AtomicBool::new(false));
+        let (signal_wake_tx, mut signal_wake_rx) = mpsc::channel(SIGNAL_WS_WAKE_QUEUE);
+        let signal_ws_task = token.starts_with("dc-").then(|| {
+            spawn_signal_websocket(
+                &base_url,
+                &token,
+                &self_node_id,
+                &config.network.network_id,
+                signal_wake_tx.clone(),
+                signal_ws_connected.clone(),
+            )
+        });
+        drop(signal_wake_tx);
 
         let peer_interval_secs = config
             .control
@@ -1043,8 +1335,9 @@ async fn run_control_loop(
             .max(MIN_PEER_POLL_INTERVAL_SECS);
         let mut peer_tick = time::interval(Duration::from_secs(peer_interval_secs));
         peer_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut signal_tick = time::interval(SIGNAL_POLL_INTERVAL);
+        let mut signal_tick = time::interval(SIGNAL_FALLBACK_TICK);
         signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut last_signal_reconcile = Instant::now();
 
         let mut poll_failures: u32 = 0;
         let mut signal_failures: u32 = 0;
@@ -1114,10 +1407,38 @@ async fn run_control_loop(
                         }
                     }
                 }
-                _ = signal_tick.tick() => {
-                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx).await {
+                Some(()) = signal_wake_rx.recv() => {
+                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
                         Ok(()) => {
                             signal_failures = 0;
+                            last_signal_reconcile = Instant::now();
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure after WebSocket signal wake: {err_str}");
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                break;
+                            }
+                            signal_failures = signal_failures.saturating_add(1);
+                            warn!("Signal fetch after WebSocket wake failed: {err_str}");
+                        }
+                    }
+                }
+                _ = signal_tick.tick() => {
+                    let ws_connected = signal_ws_connected.load(Ordering::Acquire);
+                    if ws_connected && last_signal_reconcile.elapsed() < SIGNAL_WS_RECONCILE_INTERVAL {
+                        continue;
+                    }
+                    let wait_ms = if ws_connected { 0 } else { SIGNAL_LONG_POLL_WAIT_MS };
+                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, wait_ms).await {
+                        Ok(()) => {
+                            signal_failures = 0;
+                            if ws_connected {
+                                last_signal_reconcile = Instant::now();
+                            }
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -1259,6 +1580,8 @@ async fn run_control_loop(
                 }
             }
         }
+
+        drop(signal_ws_task);
 
         // Reached here by breaking the poll loop (auth failure or consecutive poll failures).
         // Mark unregistered so peers are refreshed on next successful register/poll.
@@ -1597,10 +1920,11 @@ async fn poll_signals(
     token: &str,
     self_node_id: &str,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
+    wait_ms: u64,
 ) -> Result<()> {
     let res = http
         .get(format!(
-            "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={SIGNAL_LONG_POLL_WAIT_MS}"
+            "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={wait_ms}"
         ))
         .bearer_auth(token)
         .send()
@@ -1869,6 +2193,115 @@ mod tests {
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
+    }
+
+    #[test]
+    fn signal_websocket_url_uses_secure_scheme_and_fixed_path() {
+        assert_eq!(
+            signal_websocket_url("https://control.example.com/base?old=1").unwrap(),
+            "wss://control.example.com/api/v1/signals/ws"
+        );
+        assert_eq!(
+            signal_websocket_url("http://127.0.0.1:18080").unwrap(),
+            "ws://127.0.0.1:18080/api/v1/signals/ws"
+        );
+        assert!(signal_websocket_url("ftp://control.example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn signal_websocket_authenticates_negotiates_and_wakes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer dc-test-token")
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(SEC_WEBSOCKET_PROTOCOL)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(SIGNAL_WS_PROTOCOL)
+                    );
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static(SIGNAL_WS_PROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            socket
+                .send(WebSocketMessage::Text(
+                    serde_json::json!({
+                        "type": "ready",
+                        "protocol_version": 1,
+                        "node_id": "node-a",
+                        "network_id": "network-a",
+                        "server_time_ms": 1000
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(WebSocketMessage::Text(
+                    serde_json::json!({
+                        "type": "signals_available",
+                        "protocol_version": 1,
+                        "sequence": 1,
+                        "server_time_ms": 1001
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = shutdown_rx.await;
+            let _ = socket.close(None).await;
+        });
+
+        let (wake_tx, mut wake_rx) = mpsc::channel(4);
+        let connected = Arc::new(AtomicBool::new(false));
+        let client_connected = connected.clone();
+        let base_url = format!("http://{address}");
+        let client = tokio::spawn(async move {
+            run_signal_websocket(
+                &base_url,
+                "dc-test-token",
+                "node-a",
+                "network-a",
+                wake_tx,
+                client_connected,
+            )
+            .await;
+        });
+
+        time::timeout(Duration::from_secs(2), wake_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        time::timeout(Duration::from_secs(2), wake_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(connected.load(Ordering::Acquire));
+
+        let _ = shutdown_tx.send(());
+        client.abort();
+        server.await.unwrap();
     }
 
     #[test]

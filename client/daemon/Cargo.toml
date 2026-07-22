@@ -24,6 +24,8 @@ rand = { workspace = true }
 libc = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

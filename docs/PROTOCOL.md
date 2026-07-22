@@ -607,3 +607,70 @@ A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
 - Probe v2 skeleton 已提供 MAC 验证、目标绑定和认证 peer-reflexive endpoint 学习；session-bound 临时密钥、nonce replay window、probe 限速预算和即时全局撤销仍属于 Phase A3。
 - A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
+
+## 13. Control Signaling WebSocket V1
+
+### 13.1 目标与交付语义
+
+WebSocket 是持久化信令队列的实时唤醒通道，不承载 offer/answer 的唯一副本：
+
+1. 发送方通过 `POST /api/v1/signals` 提交信令。
+2. 控制面在同一请求内先持久化 signal，再向目标设备发送 WS `signals_available`。
+3. 目标设备收到通知后通过 `GET /api/v1/signals?wait_ms=0` 原子领取信令。
+4. WS 断线、通知丢失、队列背压或服务端重启时，signal 仍保留在数据库中；客户端通过 HTTP long-poll fallback 或 30 秒对账恢复。
+
+因此，WS write 成功只代表“已通知”，HTTP 原子领取才代表 signal 已交付。signal 当前 TTL 为 120 秒，同一 `from/to/type` 的新 signal 会替换旧 signal，保持最新握手状态的幂等语义。
+
+### 13.2 握手
+
+- Endpoint：`GET /api/v1/signals/ws`；`GET /ws` 是同安全策略的兼容别名。
+- TLS 控制面必须使用 `wss://`；客户端禁止从 `https://` 自动降级到明文 WS。
+- `Authorization: Bearer <device credential>` 必填；禁止 query-string token。
+- `Sec-WebSocket-Protocol: p2wlan.signaling.v1` 必填，服务端必须回显相同子协议。
+- node ID、network ID 和 credential expiry 全部来自服务端验证后的 device claims。客户端不得发送 register 消息或自行声明身份。
+- 原生 daemon 不发送 `Origin`。带 `Origin` 的连接只允许同源或 `CONTROL_ALLOWED_ORIGINS` 显式白名单。
+
+### 13.3 服务端消息
+
+连接成功后的第一条消息：
+
+```json
+{
+  "type": "ready",
+  "protocol_version": 1,
+  "node_id": "device-id",
+  "network_id": "network-id",
+  "server_time_ms": 1780000000000
+}
+```
+
+信令可领取通知：
+
+```json
+{
+  "type": "signals_available",
+  "protocol_version": 1,
+  "sequence": 42,
+  "server_time_ms": 1780000000012
+}
+```
+
+`sequence` 在单次 WS 连接内严格递增，用于丢弃重复/乱序通知；重连后可从 1 重新开始。客户端收到 `ready` 时必须立即做一次 HTTP 对账，从而覆盖“初始 HTTP 查询结束、WS 注册尚未完成”之间的竞态窗口。
+
+### 13.4 生命周期与资源边界
+
+- 服务端默认最多 10,000 个实际活跃 WS（包括尚在回收的重复连接），可通过 `SIGNAL_WS_MAX_CONNECTIONS` 调整；每个 device 同时只保留最新连接，旧连接使用 policy-violation close 替换。
+- `SIGNAL_WS_MAX_CONNECTIONS` 显式配置非法时控制服务拒绝启动；关闭时 Hub 会停止注册、断开所有连接并等待连接读写任务完成。
+- 每连接通知队列容量为 64。慢消费者队列满时关闭 WS，但不删除数据库中的 signal。
+- 客户端 wake queue 容量为 32；重复 wake 可以合并，因为一次 HTTP 领取会批量返回全部待处理 signal。
+- 服务端入站消息限制为 4 KiB。V1 是 server-to-client 通知通道，客户端发送 text/binary application message 会被关闭。
+- 服务端每 20 秒发送 Ping，45 秒未收到 Pong 则回收连接；读写 deadline 均有上限。
+- device credential 到期时间是 WS read deadline 的硬上限。HTTP 领取仍会再次验证 credential，因此凭据撤销后不能消费 signal。
+- daemon 建连超时为 10 秒，已连接通道连续 60 秒没有任何入站帧会判定失活；断线重连使用带 jitter 的指数退避，最大 30 秒。断线期间使用 900ms HTTP long-poll，WS 在线时每 30 秒执行一次持久化对账。
+
+### 13.5 兼容与失败处理
+
+- 老控制面返回 404/426、TLS 失败或 WS 握手失败时，daemon 保持 HTTP long-poll，不影响注册、信令或 Relay。
+- HTTP 401/403 是永久认证失败，进入现有 re-auth 流程；普通 WS 断线不清空 peer map，也不停止数据面。
+- `protocol_version`、subprotocol、`ready.node_id` 或 `ready.network_id` 不匹配时，客户端立即关闭连接并继续 HTTP fallback。
+- 未知 WS application message 在 V1 中视为协议错误，不能静默改变连接状态。
