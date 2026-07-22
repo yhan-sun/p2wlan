@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
@@ -330,6 +330,8 @@ struct SignalCreateResponse {
 struct ListSignalsResponse {
     #[serde(default)]
     signals: Vec<SignalResponse>,
+    #[serde(default)]
+    server_time_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1561,6 +1563,7 @@ async fn send_signal(
             "candidate_sources": candidate_sources,
             "handshake": hex::encode(handshake),
             "punch_at_ms": punch_at_ms,
+            "client_time_ms": unix_time_millis(),
         }))
         .send()
         .await
@@ -1615,8 +1618,12 @@ async fn poll_signals(
         .json()
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list signals decode failed: {e}")))?;
+    let received_at_ms = unix_time_millis();
+    let server_time_ms = body.server_time_ms;
 
     for signal in body.signals {
+        let punch_at_ms =
+            normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
         let handshake = if signal.handshake.trim().is_empty() {
             Vec::new()
         } else {
@@ -1632,7 +1639,7 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     handshake_init: handshake,
-                    punch_at_ms: signal.punch_at_ms,
+                    punch_at_ms,
                 });
             }
             "peer_answer" => {
@@ -1641,7 +1648,7 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     handshake_response: handshake,
-                    punch_at_ms: signal.punch_at_ms,
+                    punch_at_ms,
                 });
             }
             "peer_reflexive" => {
@@ -1649,7 +1656,7 @@ async fn poll_signals(
                     let _ = event_tx.send(ControlEvent::PeerReflexive {
                         from_node_id: signal.from_node_id,
                         observed_endpoint,
-                        punch_at_ms: signal.punch_at_ms,
+                        punch_at_ms,
                     });
                 } else {
                     warn!(
@@ -1665,6 +1672,28 @@ async fn poll_signals(
     }
 
     Ok(())
+}
+
+fn normalize_signal_punch_at(
+    punch_at_ms: Option<u64>,
+    server_time_ms: Option<u64>,
+    received_at_ms: u64,
+) -> Option<u64> {
+    let punch_at_ms = punch_at_ms?;
+    let Some(server_time_ms) = server_time_ms else {
+        return Some(punch_at_ms);
+    };
+    if punch_at_ms <= server_time_ms {
+        return Some(received_at_ms);
+    }
+    Some(received_at_ms.saturating_add(punch_at_ms - server_time_ms))
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX)
 }
 
 fn peer_reflexive_endpoint_from_signal(signal: &SignalResponse) -> Option<String> {
@@ -1974,6 +2003,23 @@ mod tests {
             peer_reflexive_endpoint_from_signal(&signal),
             Some("198.51.100.1:40000".to_string())
         );
+    }
+
+    #[test]
+    fn signal_punch_time_uses_server_clock_offset() {
+        assert_eq!(
+            normalize_signal_punch_at(Some(11_500), Some(10_000), 50_000),
+            Some(51_500)
+        );
+        assert_eq!(
+            normalize_signal_punch_at(Some(9_000), Some(10_000), 50_000),
+            Some(50_000)
+        );
+        assert_eq!(
+            normalize_signal_punch_at(Some(11_500), None, 50_000),
+            Some(11_500)
+        );
+        assert_eq!(normalize_signal_punch_at(None, Some(10_000), 50_000), None);
     }
 
     #[test]

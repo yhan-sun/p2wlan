@@ -635,6 +635,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		CandidateSources map[string]string `json:"candidate_sources"`
 		Handshake        string            `json:"handshake"`
 		PunchAtMS        int64             `json:"punch_at_ms"`
+		ClientTimeMS     int64             `json:"client_time_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -694,8 +695,23 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"punch_at_ms must be non-negative"}`, http.StatusBadRequest)
 		return
 	}
-	if req.PunchAtMS > 0 {
-		nowMS := time.Now().UnixMilli()
+	if req.ClientTimeMS < 0 {
+		http.Error(w, `{"error":"client_time_ms must be non-negative"}`, http.StatusBadRequest)
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	normalizedPunchAtMS := req.PunchAtMS
+	if req.PunchAtMS > 0 && req.ClientTimeMS > 0 {
+		delayMS := req.PunchAtMS - req.ClientTimeMS
+		if delayMS < 0 {
+			delayMS = 0
+		}
+		if delayMS > 10*60*1000 {
+			http.Error(w, `{"error":"punch delay outside allowed window"}`, http.StatusBadRequest)
+			return
+		}
+		normalizedPunchAtMS = nowMS + delayMS
+	} else if req.PunchAtMS > 0 {
 		if req.PunchAtMS < nowMS-10*60*1000 || req.PunchAtMS > nowMS+10*60*1000 {
 			http.Error(w, `{"error":"punch_at_ms outside allowed clock-skew window"}`, http.StatusBadRequest)
 			return
@@ -749,14 +765,14 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignalWithPunchAt(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, req.PunchAtMS)
+	signal, err := s.db.CreateSignalWithPunchAt(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
 	}
 	s.signalNotifier.notify(req.ToNodeID)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal, "server_time_ms": time.Now().UnixMilli()})
 }
 
 // ListSignals handles GET /api/v1/signals.
@@ -795,7 +811,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(signals) > 0 || waitMS == 0 || !time.Now().Before(deadline) {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "server_time_ms": time.Now().UnixMilli()})
 			return
 		}
 
@@ -804,7 +820,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 			wait = signalLongPollFallbackInterval
 		}
 		if wait <= 0 {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "server_time_ms": time.Now().UnixMilli()})
 			return
 		}
 		s.signalNotifier.wait(r.Context(), nodeID, version, wait)

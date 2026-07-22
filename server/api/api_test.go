@@ -162,6 +162,59 @@ func TestCreateSignalAcceptsPeerReflexiveWithPunchWindow(t *testing.T) {
 	}
 }
 
+func TestCreateSignalNormalizesPunchWindowWithClientTime(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-normalize@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-normalize-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-normalize-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	beforeMS := time.Now().UnixMilli()
+	body := strings.NewReader(`{
+		"to_node_id":"` + target.ID + `",
+		"type":"peer_offer",
+		"candidates":["203.0.113.10:51820"],
+		"client_time_ms":1000000,
+		"punch_at_ms":1001500
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+
+	NewServer(nil, nil, db).CreateSignal(recorder, req)
+	afterMS := time.Now().UnixMilli()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	if signals[0].PunchAtMS < beforeMS+1500 || signals[0].PunchAtMS > afterMS+1500 {
+		t.Fatalf("expected server-normalized punch_at_ms around now+1500ms, got %d before=%d after=%d", signals[0].PunchAtMS, beforeMS, afterMS)
+	}
+}
+
 func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {
@@ -259,10 +312,14 @@ func TestListSignalsLongPollReturnsWhenSignalArrives(t *testing.T) {
 	}
 
 	var body struct {
-		Signals []database.Signal `json:"signals"`
+		Signals      []database.Signal `json:"signals"`
+		ServerTimeMS int64             `json:"server_time_ms"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
+	}
+	if body.ServerTimeMS <= 0 {
+		t.Fatalf("expected server_time_ms in response: %s", recorder.Body.String())
 	}
 	if len(body.Signals) != 1 {
 		t.Fatalf("expected one signal, got %d: %s", len(body.Signals), recorder.Body.String())

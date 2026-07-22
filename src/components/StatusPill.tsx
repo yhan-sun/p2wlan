@@ -54,6 +54,8 @@ export function zhLabel(value: string | null | undefined): string {
       return "正在打洞";
     case "direct":
       return "直连";
+    case "direct_trial":
+      return "直连试探";
     case "fallback_to_relay":
       return "切换到中继";
     case "relay":
@@ -105,6 +107,7 @@ export function healthTone(status: HealthStatus): Tone {
 
 export function pathTone(path: NetworkPath | "offline" | string): Tone {
   if (path === "direct") return "ok";
+  if (path === "direct_trial") return "info";
   if (path === "relay") return "warn";
   if (path === "offline") return "muted";
   return "info";
