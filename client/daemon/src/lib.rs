@@ -162,6 +162,16 @@ const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(1_500);
 const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
 /// Ignore very stale relay-assisted windows and punch immediately instead.
 const RELAY_ASSISTED_PUNCH_STALE_AFTER: Duration = Duration::from_secs(3);
+/// Re-advertise peer-reflexive observations a few times during the most useful
+/// NAT opening window. The UDP layer already rate-limits duplicate observations,
+/// so this stays bounded while giving the remote side several chances to catch
+/// the learned source port.
+const PEER_REFLEXIVE_SIGNAL_DELAYS: [Duration; 4] = [
+    Duration::ZERO,
+    Duration::from_millis(80),
+    Duration::from_millis(250),
+    Duration::from_millis(700),
+];
 
 /// The main daemon orchestrator.
 ///
@@ -3023,21 +3033,29 @@ async fn run_peer_reflexive_signal_loop(
     control: ControlClient,
 ) {
     while let Some(observation) = rx.recv().await {
-        let observed_endpoint = observation.observed_endpoint.to_string();
-        let punch_at_ms = Some(relay_assisted_punch_at_ms());
-        match control
-            .send_peer_reflexive(&observation.peer_id, &observed_endpoint, punch_at_ms)
-            .await
-        {
-            Ok(()) => debug!(
-                "Relayed peer-reflexive observation to {}: {} punch_at_ms={punch_at_ms:?}",
-                observation.peer_id, observed_endpoint
-            ),
-            Err(err) => warn!(
-                "Failed to relay peer-reflexive observation to {} at {}: {err}",
-                observation.peer_id, observed_endpoint
-            ),
-        }
+        let control = control.clone();
+        tokio::spawn(async move {
+            let observed_endpoint = observation.observed_endpoint.to_string();
+            for delay in PEER_REFLEXIVE_SIGNAL_DELAYS {
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+                let punch_at_ms = Some(relay_assisted_punch_at_ms());
+                match control
+                    .send_peer_reflexive(&observation.peer_id, &observed_endpoint, punch_at_ms)
+                    .await
+                {
+                    Ok(()) => debug!(
+                        "Relayed peer-reflexive observation to {}: {} punch_at_ms={punch_at_ms:?}",
+                        observation.peer_id, observed_endpoint
+                    ),
+                    Err(err) => warn!(
+                        "Failed to relay peer-reflexive observation to {} at {}: {err}",
+                        observation.peer_id, observed_endpoint
+                    ),
+                }
+            }
+        });
     }
 }
 

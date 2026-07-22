@@ -11,6 +11,7 @@ export type ConnectionState =
   | "closed";
 
 export type NetworkPath = "direct" | "relay";
+export type PeerPath = NetworkPath | "direct_trial" | "offline";
 
 export type HealthStatus = "healthy" | "degraded" | "unhealthy" | "shutting_down";
 
@@ -61,6 +62,31 @@ export interface PeerDiagnostics {
   candidates: string[];
   direct: PathHealthDiagnostics;
   relay: PathHealthDiagnostics;
+  current_path_selection?: PathSelectionDiagnostics | null;
+  last_path_selection?: PathSelectionDiagnostics | null;
+}
+
+export interface PathScoreDiagnostics {
+  path: NetworkPath;
+  score: number;
+  reachable: boolean;
+  reachability_score: number;
+  preference_score: number;
+  latency_score: number;
+  stability_score: number;
+  penalty_score: number;
+  reason: string;
+}
+
+export interface PathSelectionDiagnostics {
+  path: NetworkPath | null;
+  direct_endpoint: string | null;
+  reason_code: string;
+  reason: string;
+  direct_confirmed: boolean;
+  relay_hedged: boolean;
+  direct_score?: PathScoreDiagnostics | null;
+  relay_score?: PathScoreDiagnostics | null;
 }
 
 export interface PeerManagerStats {
@@ -170,7 +196,7 @@ export interface PeerStatus {
   name: string;
   virtualIp: string;
   state: ConnectionState;
-  path: NetworkPath | "offline";
+  path: PeerPath;
   latencyMs: number | null;
   endpoint: string;
   natType: string;

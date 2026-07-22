@@ -19,6 +19,7 @@ import {
   type DesktopStatus,
   type PathHealthDiagnostics,
   type PeerDiagnostics,
+  type PeerPath,
   type PeerStatus,
   type RouteStatus,
   type TunnelStatus,
@@ -627,7 +628,12 @@ function mapSnapshotToDaemonStatus(
 }
 
 function mapPeer(peer: PeerDiagnostics): PeerStatus {
-  const path = peer.active_path ?? "offline";
+  const isDirectTrial =
+    peer.active_path === "relay" &&
+    peer.current_path_selection?.path === "direct" &&
+    peer.current_path_selection?.reason_code === "path_direct_trial" &&
+    peer.current_path_selection?.relay_hedged === true;
+  const path: PeerPath = isDirectTrial ? "direct_trial" : peer.active_path ?? "offline";
   const pathErrors = [peer.direct, peer.relay]
     .filter(health => health.last_error)
     .sort(
@@ -642,15 +648,17 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
   const latencyMs =
     path === "direct"
       ? peer.direct.latency_ms
-      : path === "relay"
-        ? peer.relay.latency_ms
-        : null;
+      : path === "direct_trial"
+        ? peer.direct.latency_ms ?? peer.relay.latency_ms
+        : path === "relay"
+          ? peer.relay.latency_ms
+          : null;
   return {
     id: peer.node_id,
     name: peer.device_name?.trim() || peer.node_id.slice(0, 12),
     virtualIp: peer.virtual_ip,
     state: peer.state,
-    path: path === "direct" || path === "relay" ? path : "offline",
+    path,
     latencyMs,
     endpoint: peer.endpoint ?? "",
     natType: peer.nat_type || "unknown",
