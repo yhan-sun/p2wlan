@@ -70,10 +70,10 @@ use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent, RelayCatalogEntry};
-use dataplane::{DataPlane, InboundPacket};
+use dataplane::{DataPlane, InboundPacket, OutboundPacket};
 use diagnostics::{run_diagnostics_server, DiagnosticsContext};
 use dns::DnsResolver;
-use p2pnet_tun::{InterfaceConfig, TunDevice, VirtualInterface};
+use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
 };
@@ -172,6 +172,15 @@ const PEER_REFLEXIVE_SIGNAL_DELAYS: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_millis(700),
 ];
+/// Send a few real encrypted packets over a freshly observed UDP path. The
+/// packets are valid ICMP echo requests, so the remote TUN can answer and both
+/// sides can confirm the WireGuard data path without waiting for user traffic.
+const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_millis(80),
+    Duration::from_millis(250),
+];
+const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
 
 /// The main daemon orchestrator.
 ///
@@ -537,6 +546,8 @@ impl Daemon {
         let udp_local_candidate_sources = local_candidate_sources.clone();
         let nat_profile = self.nat_profile.clone();
         let udp_transport = self.udp_transport.clone();
+        let direct_validation_transport = self.transport.clone();
+        let direct_validation_local_ip = self.config.network.virtual_ip.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
         let local_node_id = self.config.node.node_id.clone();
         let udp_punch_interval = punch_interval;
@@ -552,6 +563,10 @@ impl Daemon {
                         tokio::spawn(run_peer_reflexive_signal_loop(
                             peer_reflexive_rx,
                             control.clone(),
+                            udp.clone(),
+                            peers.clone(),
+                            direct_validation_transport,
+                            direct_validation_local_ip,
                         ));
                         *udp_transport.write().await = Some(udp.clone());
 
@@ -2958,6 +2973,10 @@ fn spawn_hole_punch_task(
             )
             .await;
 
+        let success_count_before = peers
+            .direct_probe_success_count_for_generation(&peer_id, generation)
+            .await;
+
         match udp
             .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
             .await
@@ -2978,11 +2997,10 @@ fn spawn_hole_punch_task(
                     )
                     .await;
                 sleep(direct_probe_ack_grace(probe_interval)).await;
-                if sent > 0
-                    && !peers
-                        .has_direct_probe_success_for_generation(&peer_id, generation)
-                        .await
-                {
+                let success_count_after = peers
+                    .direct_probe_success_count_for_generation(&peer_id, generation)
+                    .await;
+                if sent > 0 && success_count_after == success_count_before {
                     peers
                         .record_direct_event(
                             &peer_id,
@@ -3031,8 +3049,28 @@ fn spawn_hole_punch_task(
 async fn run_peer_reflexive_signal_loop(
     mut rx: mpsc::Receiver<PeerReflexiveObservation>,
     control: ControlClient,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    local_virtual_ip: String,
 ) {
     while let Some(observation) = rx.recv().await {
+        let validation_observation = observation.clone();
+        let validation_udp = udp.clone();
+        let validation_peers = peers.clone();
+        let validation_transport = transport.clone();
+        let validation_local_ip = local_virtual_ip.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(
+                validation_observation,
+                validation_udp,
+                validation_peers,
+                validation_transport,
+                &validation_local_ip,
+            )
+            .await;
+        });
+
         let control = control.clone();
         tokio::spawn(async move {
             let observed_endpoint = observation.observed_endpoint.to_string();
@@ -3059,6 +3097,115 @@ async fn run_peer_reflexive_signal_loop(
     }
 }
 
+async fn run_direct_encrypted_validation(
+    observation: PeerReflexiveObservation,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    local_virtual_ip: &str,
+) {
+    let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
+        debug!(
+            "Skipping encrypted Direct validation for {}; local virtual IP '{}' is not IPv4",
+            observation.peer_id, local_virtual_ip
+        );
+        return;
+    };
+    let Some(connection) = peers.get_connection(&observation.peer_id).await else {
+        return;
+    };
+    let Ok(peer_ip) = connection.virtual_ip.parse::<Ipv4Addr>() else {
+        debug!(
+            "Skipping encrypted Direct validation for {}; peer virtual IP '{}' is not IPv4",
+            observation.peer_id, connection.virtual_ip
+        );
+        return;
+    };
+
+    let generation = peers.current_network_generation().await;
+    peers
+        .record_direct_event(
+            &observation.peer_id,
+            "encrypted_trial_started",
+            Some(observation.observed_endpoint),
+            None,
+            None,
+            "starting bounded WireGuard validation on authenticated UDP endpoint",
+        )
+        .await;
+
+    let validation_id = unix_time_millis() as u16;
+    let mut sent = 0u32;
+    for (sequence, delay) in DIRECT_ENCRYPTED_VALIDATION_DELAYS.into_iter().enumerate() {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        if peers
+            .is_direct_for_generation(&observation.peer_id, generation)
+            .await
+        {
+            break;
+        }
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            local_ip,
+            peer_ip,
+            validation_id,
+            sequence as u16,
+            DIRECT_ENCRYPTED_VALIDATION_PAYLOAD,
+        );
+        let encrypted = match transport
+            .encrypt_outbound(OutboundPacket {
+                peer_id: observation.peer_id.clone(),
+                dst_ip: connection.virtual_ip.clone(),
+                packet,
+            })
+            .await
+        {
+            Ok(Some(encrypted)) => encrypted,
+            Ok(None) => {
+                debug!(
+                    "Skipping encrypted Direct validation for {}; WireGuard session is not ready",
+                    observation.peer_id
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to encrypt Direct validation packet for {}: {err}",
+                    observation.peer_id
+                );
+                return;
+            }
+        };
+
+        match udp
+            .send_packet_to(&encrypted, observation.observed_endpoint)
+            .await
+        {
+            Ok(_) => sent = sent.saturating_add(1),
+            Err(err) => {
+                warn!(
+                    "Failed to send encrypted Direct validation to {} at {}: {err}",
+                    observation.peer_id, observation.observed_endpoint
+                );
+                break;
+            }
+        }
+    }
+
+    peers
+        .record_direct_event(
+            &observation.peer_id,
+            "encrypted_trial_sent",
+            Some(observation.observed_endpoint),
+            None,
+            Some(sent),
+            format!("sent {sent} bounded WireGuard validation packets"),
+        )
+        .await;
+}
+
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
@@ -3083,6 +3230,9 @@ async fn run_direct_probe_loop(
             let peers = peers.clone();
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
+                let success_count_before = peers
+                    .direct_probe_success_count_for_generation(&peer_id, generation)
+                    .await;
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -3113,7 +3263,10 @@ async fn run_direct_probe_loop(
                             )
                             .await;
                         sleep(direct_probe_ack_grace(probe_interval)).await;
-                        if !peers.is_direct_for_generation(&peer_id, generation).await {
+                        let success_count_after = peers
+                            .direct_probe_success_count_for_generation(&peer_id, generation)
+                            .await;
+                        if success_count_after == success_count_before {
                             peers
                                 .record_direct_event(
                                     &peer_id,
@@ -3132,9 +3285,21 @@ async fn run_direct_probe_loop(
                                     format!("no direct probe ACK after {sent} retry probes"),
                                 )
                                 .await;
-                            debug!("Direct UDP retry probes for peer {peer_id} did not confirm");
+                            debug!("Direct UDP retry probes for peer {peer_id} received no ACK");
                         } else {
-                            debug!("Direct UDP retry probes restored peer {peer_id}");
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "retry_probe_succeeded",
+                                    candidates.first().copied(),
+                                    Some(candidates.len()),
+                                    Some(sent),
+                                    "background UDP retry received an ACK; awaiting encrypted validation",
+                                )
+                                .await;
+                            debug!(
+                                "Direct UDP retry probes reached peer {peer_id}; awaiting encrypted validation"
+                            );
                         }
                     }
                     Err(err) => {
@@ -3355,6 +3520,80 @@ mod tests {
                     - RELAY_ASSISTED_PUNCH_LEAD
                     - Duration::from_millis(50)
         );
+    }
+
+    #[tokio::test]
+    async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_session() {
+        let local_identity = NodeIdentity::generate();
+        let remote_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(local_identity, remote_identity.public_key(), None);
+        let initiation = initiator.create_initiation().unwrap();
+        let mut responder = HandshakeResponder::new(remote_identity, None);
+        let (response, remote_keys) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        let local_keys = initiator.consume_response(&response).unwrap();
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observed_endpoint = remote_socket.local_addr().unwrap();
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: hex::encode(responder.initiator_public_key().unwrap()),
+                endpoint: observed_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport
+            .add_session("node-b", TransportSession::new(local_keys))
+            .await;
+
+        run_direct_encrypted_validation(
+            PeerReflexiveObservation {
+                peer_id: "node-b".to_string(),
+                observed_endpoint,
+            },
+            udp,
+            peers.clone(),
+            transport,
+            "10.20.0.1",
+        )
+        .await;
+
+        let mut datagram = vec![0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            remote_socket.recv_from(&mut datagram),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut remote_session = TransportSession::new(remote_keys);
+        let decrypted = remote_session.decrypt_from_bytes(&datagram[..len]).unwrap();
+        let packet = Ipv4Packet::new(&decrypted).unwrap();
+        assert_eq!(packet.src_addr(), Ipv4Addr::new(10, 20, 0, 1));
+        assert_eq!(packet.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
+        assert!(packet
+            .payload()
+            .ends_with(DIRECT_ENCRYPTED_VALIDATION_PAYLOAD));
+
+        let diagnostics = peers.diagnostics().await;
+        assert!(diagnostics[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(3)));
     }
 
     #[test]
