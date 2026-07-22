@@ -832,6 +832,7 @@ const INITIAL_BACKOFF_SECS: u64 = 2;
 /// Signaling carries WireGuard handshake offers/answers. Keep it independent
 /// from the slower peer/heartbeat poll so handshakes do not race their timeout.
 const SIGNAL_POLL_INTERVAL_SECS: u64 = 1;
+const SIGNAL_LONG_POLL_WAIT_MS: u64 = 900;
 const MIN_PEER_POLL_INTERVAL_SECS: u64 = 5;
 
 /// Compute exponential backoff with jitter, capped at MAX_BACKOFF_SECS.
@@ -1594,7 +1595,9 @@ async fn poll_signals(
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
 ) -> Result<()> {
     let res = http
-        .get(format!("{base_url}/api/v1/signals?node_id={self_node_id}"))
+        .get(format!(
+            "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={SIGNAL_LONG_POLL_WAIT_MS}"
+        ))
         .bearer_auth(token)
         .send()
         .await

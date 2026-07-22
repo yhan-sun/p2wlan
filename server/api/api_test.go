@@ -202,6 +202,75 @@ func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
 	}
 }
 
+func TestListSignalsLongPollReturnsWhenSignalArrives(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-long-poll@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-long-poll-source-key", "source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-long-poll-target-key", "target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+	server := NewServer(nil, nil, db)
+
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_, err := db.CreateSignalWithPunchAt(
+			source.ID,
+			target.ID,
+			"peer_offer",
+			[]string{"203.0.113.10:51820"},
+			map[string]string{"203.0.113.10:51820": "stun_observed"},
+			"",
+			time.Now().Add(1500*time.Millisecond).UnixMilli(),
+		)
+		errCh <- err
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/signals?wait_ms=500", nil)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  target.ID,
+		NetworkID: target.NetworkID,
+		UserID:    user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+
+	server.ListSignals(recorder, req)
+	if err := <-errCh; err != nil {
+		t.Fatalf("CreateSignalWithPunchAt: %v", err)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("long poll should return when the signal arrives, elapsed=%s", elapsed)
+	}
+
+	var body struct {
+		Signals []database.Signal `json:"signals"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Signals) != 1 {
+		t.Fatalf("expected one signal, got %d: %s", len(body.Signals), recorder.Body.String())
+	}
+	if body.Signals[0].FromNodeID != source.ID || body.Signals[0].ToNodeID != target.ID {
+		t.Fatalf("unexpected signal endpoints: %+v", body.Signals[0])
+	}
+}
+
 func fmtInt64(value int64) string {
 	return strconv.FormatInt(value, 10)
 }

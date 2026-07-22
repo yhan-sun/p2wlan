@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -779,13 +780,44 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signals, err := s.db.ListAndDeleteSignals(nodeID)
-	if err != nil {
-		http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
-		return
-	}
+	waitMS := boundedSignalWaitMS(r)
+	deadline := time.Now().Add(time.Duration(waitMS) * time.Millisecond)
+	for {
+		signals, err := s.db.ListAndDeleteSignals(nodeID)
+		if err != nil {
+			http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
+			return
+		}
+		if len(signals) > 0 || waitMS == 0 || !time.Now().Before(deadline) {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
+			return
+		}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
+		wait := time.Until(deadline)
+		if wait > 100*time.Millisecond {
+			wait = 100 * time.Millisecond
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+func boundedSignalWaitMS(r *http.Request) int {
+	raw := strings.TrimSpace(r.URL.Query().Get("wait_ms"))
+	if raw == "" {
+		return 0
+	}
+	waitMS, err := strconv.Atoi(raw)
+	if err != nil || waitMS <= 0 {
+		return 0
+	}
+	if waitMS > 1000 {
+		return 1000
+	}
+	return waitMS
 }
 
 // ---- Tunnel endpoints ----

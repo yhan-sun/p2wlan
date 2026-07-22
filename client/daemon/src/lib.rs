@@ -127,8 +127,12 @@ impl PendingHandshakeState {
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Handshake timeout before pending entry is cleared.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
-/// Short grace period for UDP/STUN candidate gathering before signaling a WireGuard offer.
-const CANDIDATE_READY_TIMEOUT_MS: u64 = 3_000;
+/// Grace period for UDP/STUN/port-mapping candidate gathering before signaling a WireGuard offer.
+///
+/// Real home gateways can take a little over 3s when STUN and short UPnP/PCP/NAT-PMP discovery
+/// race at startup.  Sending an offer with zero candidates is especially harmful for symmetric-like
+/// NATs because the peer starts its synchronized punch window without any usable destination for us.
+const CANDIDATE_READY_TIMEOUT_MS: u64 = 8_000;
 /// Public STUN fallbacks used when older configs do not specify STUN servers.
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
@@ -408,6 +412,8 @@ impl Daemon {
         let upnp_enabled = self.config.network.upnp_enabled;
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
+        let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
+        let punch_attempts = self.config.network.punch_attempts;
 
         let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
         self.task_manager
@@ -431,8 +437,8 @@ impl Daemon {
                     self.peers.clone(),
                     self.udp_transport.clone(),
                     fallback_timeout,
-                    Duration::from_millis(self.config.network.punch_interval_ms),
-                    self.config.network.punch_attempts.clamp(1, 3),
+                    punch_interval,
+                    punch_attempts.clamp(1, 3),
                 ),
             )
             .await;
@@ -519,6 +525,8 @@ impl Daemon {
         let udp_transport = self.udp_transport.clone();
         let udp_inbound_tx = network_inbound_tx.clone();
         let local_node_id = self.config.node.node_id.clone();
+        let udp_punch_interval = punch_interval;
+        let udp_punch_attempts = punch_attempts;
         self.task_manager
             .spawn_result("udp-direct", false, async move {
                 match UdpTransport::bind(udp_bind, peers.clone()).await {
@@ -616,8 +624,20 @@ impl Daemon {
                             "Prepared {} UDP candidate endpoints for signaling",
                             candidate_endpoints.len()
                         );
-                        *local_candidates.write().await = candidate_endpoints;
-                        *udp_local_candidate_sources.write().await = candidate_sources;
+                        *local_candidates.write().await = candidate_endpoints.clone();
+                        *udp_local_candidate_sources.write().await = candidate_sources.clone();
+
+                        publish_local_candidates_to_known_peers(
+                            &control,
+                            peers.clone(),
+                            udp.clone(),
+                            &candidate_endpoints,
+                            &candidate_sources,
+                            udp_punch_interval,
+                            udp_punch_attempts,
+                            "initial UDP candidates ready",
+                        )
+                        .await;
 
                         if keepalive_interval.is_zero() {
                             let refresh_udp = udp.clone();
@@ -634,6 +654,8 @@ impl Daemon {
                                     nat_profile,
                                     control,
                                     peers: peers.clone(),
+                                    probe_interval: udp_punch_interval,
+                                    punch_attempts: udp_punch_attempts,
                                 }) => Ok(()),
                             }
                         } else {
@@ -653,6 +675,8 @@ impl Daemon {
                                     nat_profile,
                                     control,
                                     peers: peers.clone(),
+                                    probe_interval: udp_punch_interval,
+                                    punch_attempts: udp_punch_attempts,
                                 }) => Ok(()),
                             }
                         }
@@ -831,12 +855,14 @@ impl Daemon {
                                 (attempt_no, pending_id)
                             };
 
+                            let punch_at_ms = Some(relay_assisted_punch_at_ms());
                             if let Err(err) = control
-                                .send_peer_offer_with_sources(
+                                .send_peer_offer_with_sources_and_punch_at(
                                     &conn.node_id,
                                     &candidates,
                                     &candidate_sources,
                                     &initiation_bytes,
+                                    punch_at_ms,
                                 )
                                 .await
                             {
@@ -1128,11 +1154,28 @@ impl Daemon {
                     punch_at_ms,
                 } => {
                     self.add_local_peer_reflexive_candidate(&observed_endpoint).await;
-                    self.start_hole_punch_at(
-                        &from_node_id,
-                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
-                    )
-                    .await;
+                    let punch_at_ms =
+                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
+                    let candidates = self.local_candidates.read().await.clone();
+                    let candidate_sources = self.local_candidate_sources.read().await.clone();
+                    if !candidates.is_empty() {
+                        if let Err(err) = self
+                            .control
+                            .send_peer_offer_with_sources_and_punch_at(
+                                &from_node_id,
+                                &candidates,
+                                &candidate_sources,
+                                &[],
+                                punch_at_ms,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Failed to re-advertise peer-reflexive local candidate to {from_node_id}: {err}"
+                            );
+                        }
+                    }
+                    self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
                 }
 
                 ControlEvent::PeerRejected {
@@ -1395,71 +1438,14 @@ impl Daemon {
 
         let peer_id = node_id.to_string();
         let peers = self.peers.clone();
-        let probe_interval = Duration::from_millis(self.config.network.punch_interval_ms);
-        let attempts = self.config.network.punch_attempts;
-        let punch_delay = relay_assisted_punch_delay(punch_at_ms);
-        if !punch_delay.is_zero() {
-            debug!(
-                "Scheduling relay-assisted UDP punch to peer {peer_id} in {}ms",
-                punch_delay.as_millis()
-            );
-        }
-
-        tokio::spawn(async move {
-            if !punch_delay.is_zero() {
-                sleep(punch_delay).await;
-            }
-
-            let generation = peers.current_network_generation().await;
-            let candidates = peers.direct_probe_targets_for(&peer_id).await;
-            if candidates.is_empty() {
-                debug!("No UDP candidates for {peer_id}; skipping hole punch");
-                peers
-                    .record_direct_failure_for_generation(
-                        &peer_id,
-                        generation,
-                        REASON_DIRECT_PROBE_FAILED,
-                        "no UDP candidates for hole punching",
-                    )
-                    .await;
-                return;
-            }
-
-            match udp
-                .punch_candidates(&peer_id, candidates, probe_interval, attempts)
-                .await
-            {
-                Ok(sent) => {
-                    info!("Sent {sent} UDP punch probes to peer {peer_id}");
-                    sleep(direct_probe_ack_grace(probe_interval)).await;
-                    if sent > 0
-                        && !peers
-                            .has_direct_probe_success_for_generation(&peer_id, generation)
-                            .await
-                    {
-                        peers
-                            .record_direct_failure_for_generation(
-                                &peer_id,
-                                generation,
-                                REASON_DIRECT_PROBE_FAILED,
-                                format!("no UDP punch ACK after {sent} probes"),
-                            )
-                            .await;
-                    }
-                }
-                Err(err) => {
-                    peers
-                        .record_direct_failure_for_generation(
-                            &peer_id,
-                            generation,
-                            REASON_DIRECT_PROBE_FAILED,
-                            format!("hole punch failed: {err}"),
-                        )
-                        .await;
-                    warn!("Failed to punch peer {peer_id}: {err}");
-                }
-            }
-        });
+        spawn_hole_punch_task(
+            udp,
+            peers,
+            peer_id,
+            Duration::from_millis(self.config.network.punch_interval_ms),
+            self.config.network.punch_attempts,
+            punch_at_ms,
+        );
     }
 
     async fn handle_peer_offer(
@@ -2194,6 +2180,8 @@ struct UdpCandidateRefreshContext {
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     control: ControlClient,
     peers: Arc<PeerManager>,
+    probe_interval: Duration,
+    punch_attempts: u32,
 }
 
 async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
@@ -2208,6 +2196,8 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         nat_profile,
         control,
         peers,
+        probe_interval,
+        punch_attempts,
     } = context;
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
     ticker.tick().await;
@@ -2327,21 +2317,63 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
         }
 
-        for peer_id in control.peers().await.into_keys() {
-            let punch_at_ms = Some(relay_assisted_punch_at_ms());
-            if let Err(error) = control
-                .send_peer_offer_with_sources_and_punch_at(
-                    &peer_id,
-                    &candidates,
-                    &candidate_sources,
-                    &[],
-                    punch_at_ms,
-                )
-                .await
-            {
-                warn!("Failed to publish refreshed UDP candidates to peer {peer_id}: {error}");
-            }
+        publish_local_candidates_to_known_peers(
+            &control,
+            peers.clone(),
+            udp.clone(),
+            &candidates,
+            &candidate_sources,
+            probe_interval,
+            punch_attempts,
+            "UDP candidate refresh",
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_local_candidates_to_known_peers(
+    control: &ControlClient,
+    peers: Arc<PeerManager>,
+    udp: UdpTransport,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+    probe_interval: Duration,
+    attempts: u32,
+    reason: &str,
+) {
+    if candidates.is_empty() {
+        debug!("Skipping {reason} candidate publication because local candidate set is empty");
+        return;
+    }
+
+    for peer_id in control.peers().await.into_keys() {
+        let punch_at_ms = Some(relay_assisted_punch_at_ms());
+        if let Err(error) = control
+            .send_peer_offer_with_sources_and_punch_at(
+                &peer_id,
+                candidates,
+                candidate_sources,
+                &[],
+                punch_at_ms,
+            )
+            .await
+        {
+            warn!("Failed to publish {reason} UDP candidates to peer {peer_id}: {error}");
+            continue;
         }
+
+        debug!(
+            "Published {reason} UDP candidates to peer {peer_id} with punch_at_ms={punch_at_ms:?}"
+        );
+        spawn_hole_punch_task(
+            udp.clone(),
+            peers.clone(),
+            peer_id,
+            probe_interval,
+            attempts,
+            punch_at_ms,
+        );
     }
 }
 
@@ -2762,6 +2794,79 @@ fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
         );
     }
     Duration::ZERO
+}
+
+fn spawn_hole_punch_task(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    peer_id: String,
+    probe_interval: Duration,
+    attempts: u32,
+    punch_at_ms: Option<u64>,
+) {
+    let punch_delay = relay_assisted_punch_delay(punch_at_ms);
+    if !punch_delay.is_zero() {
+        debug!(
+            "Scheduling relay-assisted UDP punch to peer {peer_id} in {}ms",
+            punch_delay.as_millis()
+        );
+    }
+
+    tokio::spawn(async move {
+        if !punch_delay.is_zero() {
+            sleep(punch_delay).await;
+        }
+
+        let generation = peers.current_network_generation().await;
+        let candidates = peers.direct_probe_targets_for(&peer_id).await;
+        if candidates.is_empty() {
+            debug!("No UDP candidates for {peer_id}; skipping hole punch");
+            peers
+                .record_direct_failure_for_generation(
+                    &peer_id,
+                    generation,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no UDP candidates for hole punching",
+                )
+                .await;
+            return;
+        }
+
+        match udp
+            .punch_candidates(&peer_id, candidates, probe_interval, attempts)
+            .await
+        {
+            Ok(sent) => {
+                info!("Sent {sent} UDP punch probes to peer {peer_id}");
+                sleep(direct_probe_ack_grace(probe_interval)).await;
+                if sent > 0
+                    && !peers
+                        .has_direct_probe_success_for_generation(&peer_id, generation)
+                        .await
+                {
+                    peers
+                        .record_direct_failure_for_generation(
+                            &peer_id,
+                            generation,
+                            REASON_DIRECT_PROBE_FAILED,
+                            format!("no UDP punch ACK after {sent} probes"),
+                        )
+                        .await;
+                }
+            }
+            Err(err) => {
+                peers
+                    .record_direct_failure_for_generation(
+                        &peer_id,
+                        generation,
+                        REASON_DIRECT_PROBE_FAILED,
+                        format!("hole punch failed: {err}"),
+                    )
+                    .await;
+                warn!("Failed to punch peer {peer_id}: {err}");
+            }
+        }
+    });
 }
 
 async fn run_peer_reflexive_signal_loop(
