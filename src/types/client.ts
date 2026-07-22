@@ -129,6 +129,28 @@ export interface RelaySelectionDiagnostics {
   last_error: string | null;
 }
 
+export interface GatewayMappingMethodDiagnostics {
+  status: "idle" | "success" | "unavailable" | "failed" | string;
+  last_error: string | null;
+  attempts: number;
+  last_attempt_age_ms: number | null;
+  last_success_age_ms: number | null;
+}
+
+/** Result of opening the daemon UDP socket on the local NAT gateway. */
+export interface GatewayMappingDiagnostics {
+  enabled: boolean;
+  local_endpoint: string | null;
+  candidate_endpoint: string | null;
+  candidate_source: "upnp" | "pcp" | "nat_pmp" | string | null;
+  lease_seconds: number;
+  renewal_remaining_ms: number | null;
+  next_discovery_remaining_ms: number | null;
+  upnp: GatewayMappingMethodDiagnostics;
+  pcp: GatewayMappingMethodDiagnostics;
+  nat_pmp: GatewayMappingMethodDiagnostics;
+}
+
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
   process_id?: number;
@@ -136,6 +158,7 @@ export interface DiagnosticsSnapshot {
   virtual_ip: string;
   network_id: string;
   udp_local_addr: string | null;
+  gateway_mapping?: GatewayMappingDiagnostics;
   relay_servers: string[];
   relay_connected: boolean;
   relay_selection: RelaySelectionDiagnostics;

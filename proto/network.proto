@@ -74,6 +74,14 @@ message PeerOffer {
   string to_node_id = 2;
   repeated string candidates = 3;  // ICE candidates
   bytes handshake_init = 4;        // WireGuard handshake initiation
+  // Candidate origin (`host`, `stun_observed`, `upnp`, `pcp`, ...).  Receivers
+  // use this only for ranking/diagnostics and still accept legacy offers.
+  map<string, string> candidate_sources = 5;
+  // Monotonic set revision; a receiver must replace, not accumulate, an older
+  // signaled set from the same peer.
+  uint64 candidate_generation = 6;
+  // Sender wall-clock deadline for this candidate set (Unix milliseconds).
+  uint64 candidates_expires_at_ms = 7;
 }
 
 /// Answer to a peer offer.
@@ -82,6 +90,9 @@ message PeerAnswer {
   string to_node_id = 2;
   repeated string candidates = 3;  // ICE candidates
   bytes handshake_response = 4;    // WireGuard handshake response
+  map<string, string> candidate_sources = 5;
+  uint64 candidate_generation = 6;
+  uint64 candidates_expires_at_ms = 7;
 }
 
 /// Reject a peer connection.

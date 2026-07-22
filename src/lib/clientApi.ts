@@ -1011,6 +1011,37 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
         : "未获取 UDP 本地地址",
   });
 
+  const gatewayMapping = snapshot?.gateway_mapping;
+  if (gatewayMapping) {
+    const methods = [
+      ["UPnP", gatewayMapping.upnp],
+      ["PCP", gatewayMapping.pcp],
+      ["NAT-PMP", gatewayMapping.nat_pmp],
+    ] as const;
+    const failed = methods.find(([, method]) => method.status === "failed");
+    checks.push({
+      id: "gateway-mapping",
+      name: "网关端口映射",
+      category: "nat",
+      status: !status.reachable
+        ? "skipped"
+        : !gatewayMapping.enabled
+          ? "skipped"
+          : gatewayMapping.candidate_endpoint
+            ? "pass"
+            : "warn",
+      detail: !status.reachable
+        ? "守护进程离线"
+        : !gatewayMapping.enabled
+          ? "已在配置中关闭"
+          : gatewayMapping.candidate_endpoint
+            ? `${gatewayMapping.candidate_source ?? "gateway"} 映射 ${gatewayMapping.candidate_endpoint}（租约 ${gatewayMapping.lease_seconds}s）`
+            : failed
+              ? `${failed[0]}：${failed[1].last_error ?? "映射失败"}`
+              : "尚未发现支持 UPnP / PCP / NAT-PMP 的网关",
+    });
+  }
+
   checks.push({
     id: "relay",
     name: "中继连通性",
