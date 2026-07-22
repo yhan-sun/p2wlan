@@ -1,6 +1,6 @@
 [package]
 name = "p2wlan-desktop"
-version = "0.1.31"
+version = "0.1.32"
 description = "p2wlan desktop client console"
 authors = ["P2PNet Team"]
 license = "MIT"
