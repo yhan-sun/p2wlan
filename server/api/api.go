@@ -706,11 +706,21 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"candidate metadata must be non-negative"}`, http.StatusBadRequest)
 		return
 	}
+	candidatesExpiresAtMS := req.CandidatesExpiresAtMS
 	if req.CandidatesExpiresAtMS > 0 {
-		if req.CandidatesExpiresAtMS <= nowMS || req.CandidatesExpiresAtMS > nowMS+10*60*1000 {
-			http.Error(w, `{"error":"candidate expiry outside allowed window"}`, http.StatusBadRequest)
+		if req.ClientTimeMS <= 0 {
+			http.Error(w, `{"error":"candidate expiry requires client_time_ms"}`, http.StatusBadRequest)
 			return
 		}
+		candidateLifetimeMS := req.CandidatesExpiresAtMS - req.ClientTimeMS
+		if candidateLifetimeMS <= 0 || candidateLifetimeMS > 2*60*1000 {
+			http.Error(w, `{"error":"candidate lifetime outside allowed window"}`, http.StatusBadRequest)
+			return
+		}
+		// Persist a server-clock deadline.  Candidate expiry must not depend on
+		// the sender's wall clock, since a skewed clock would otherwise make a
+		// newly sent candidate set look expired to a healthy peer.
+		candidatesExpiresAtMS = nowMS + candidateLifetimeMS
 	}
 	normalizedPunchAtMS := req.PunchAtMS
 	if req.PunchAtMS > 0 && req.ClientTimeMS > 0 {
@@ -777,7 +787,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignalWithTraversalMetadata(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, req.CandidatesExpiresAtMS)
+	signal, err := s.db.CreateSignalWithTraversalMetadata(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
