@@ -1109,6 +1109,19 @@ impl Daemon {
                         candidates.len()
                     );
                     self.peers
+                        .record_direct_event(
+                            &from_node_id,
+                            "peer_offer_received",
+                            None,
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "received offer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
+                                handshake_init.len()
+                            ),
+                        )
+                        .await;
+                    self.peers
                         .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
                         .await;
                     if !handshake_init.is_empty() {
@@ -1135,6 +1148,19 @@ impl Daemon {
                         candidates.len()
                     );
                     self.peers
+                        .record_direct_event(
+                            &from_node_id,
+                            "peer_answer_received",
+                            None,
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "received answer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
+                                handshake_response.len()
+                            ),
+                        )
+                        .await;
+                    self.peers
                         .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
                         .await;
                     if !handshake_response.is_empty() {
@@ -1158,6 +1184,18 @@ impl Daemon {
                         punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
                     let candidates = self.local_candidates.read().await.clone();
                     let candidate_sources = self.local_candidate_sources.read().await.clone();
+                    self.peers
+                        .record_direct_event(
+                            &from_node_id,
+                            "peer_reflexive_received",
+                            observed_endpoint.parse().ok(),
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "peer observed our UDP source as {observed_endpoint}; punch_at_ms={punch_at_ms:?}"
+                            ),
+                        )
+                        .await;
                     if !candidates.is_empty() {
                         if let Err(err) = self
                             .control
@@ -1173,6 +1211,17 @@ impl Daemon {
                             warn!(
                                 "Failed to re-advertise peer-reflexive local candidate to {from_node_id}: {err}"
                             );
+                        } else {
+                            self.peers
+                                .record_direct_event(
+                                    &from_node_id,
+                                    "peer_reflexive_offer_sent",
+                                    observed_endpoint.parse().ok(),
+                                    Some(candidates.len()),
+                                    None,
+                                    "re-advertised local candidates after peer-reflexive observation",
+                                )
+                                .await;
                         }
                     }
                     self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
@@ -1329,6 +1378,20 @@ impl Daemon {
                 state.attempts.get(&peer_id_clone).copied().unwrap_or(0)
             },
         );
+        self.peers
+            .record_direct_event(
+                &peer_id_clone,
+                "peer_offer_sent",
+                None,
+                Some(candidates.len()),
+                None,
+                format!(
+                    "sent offer handshake_bytes={} attempt={} punch_at_ms={punch_at_ms}",
+                    initiation_bytes.len(),
+                    attempt_no
+                ),
+            )
+            .await;
 
         // Spawn timeout watcher that cleans up pending entry on timeout.
         // Uses the shared Arc<Mutex<>> so the spawned task can remove the entry.
@@ -1503,6 +1566,16 @@ impl Daemon {
             response_bytes.len(),
             candidates.len()
         );
+        self.peers
+            .record_direct_event(
+                from_node_id,
+                "peer_answer_sent",
+                None,
+                Some(candidates.len()),
+                None,
+                format!("sent answer handshake_bytes={}", response_bytes.len()),
+            )
+            .await;
         Ok(())
     }
 
@@ -1546,6 +1619,19 @@ impl Daemon {
                 .await;
         }
         info!("Installed WireGuard initiator session for {from_node_id}");
+        self.peers
+            .record_direct_event(
+                from_node_id,
+                "peer_answer_applied",
+                None,
+                None,
+                None,
+                format!(
+                    "installed initiator session from {} response bytes",
+                    handshake_response.len()
+                ),
+            )
+            .await;
         Ok(())
     }
 
@@ -2813,6 +2899,19 @@ fn spawn_hole_punch_task(
     }
 
     tokio::spawn(async move {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_scheduled",
+                None,
+                None,
+                None,
+                format!(
+                    "scheduled relay-assisted UDP punch delay_ms={} punch_at_ms={punch_at_ms:?}",
+                    punch_delay.as_millis()
+                ),
+            )
+            .await;
         if !punch_delay.is_zero() {
             sleep(punch_delay).await;
         }
@@ -2831,19 +2930,55 @@ fn spawn_hole_punch_task(
                 .await;
             return;
         }
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_started",
+                candidates.first().copied(),
+                Some(candidates.len()),
+                None,
+                format!(
+                    "starting synchronized UDP punch across {} candidates",
+                    candidates.len()
+                ),
+            )
+            .await;
 
         match udp
-            .punch_candidates(&peer_id, candidates, probe_interval, attempts)
+            .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
             .await
         {
             Ok(sent) => {
                 info!("Sent {sent} UDP punch probes to peer {peer_id}");
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_probes_sent",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        Some(sent),
+                        format!(
+                            "sent {sent} UDP punch probes across {} candidates",
+                            candidates.len()
+                        ),
+                    )
+                    .await;
                 sleep(direct_probe_ack_grace(probe_interval)).await;
                 if sent > 0
                     && !peers
                         .has_direct_probe_success_for_generation(&peer_id, generation)
                         .await
                 {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_ack_timeout",
+                            candidates.first().copied(),
+                            Some(candidates.len()),
+                            Some(sent),
+                            format!("no UDP punch ACK after {sent} probes"),
+                        )
+                        .await;
                     peers
                         .record_direct_failure_for_generation(
                             &peer_id,
@@ -2855,6 +2990,16 @@ fn spawn_hole_punch_task(
                 }
             }
             Err(err) => {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_send_error",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        None,
+                        format!("hole punch failed: {err}"),
+                    )
+                    .await;
                 peers
                     .record_direct_failure_for_generation(
                         &peer_id,
@@ -2916,14 +3061,47 @@ async fn run_direct_probe_loop(
             let peers = peers.clone();
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "retry_punch_started",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        None,
+                        format!(
+                            "starting background UDP retry across {} candidates",
+                            candidates.len()
+                        ),
+                    )
+                    .await;
                 match udp
-                    .punch_candidates(&peer_id, candidates, probe_interval, attempts)
+                    .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
                     .await
                 {
                     Ok(0) => {}
                     Ok(sent) => {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "retry_probes_sent",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                Some(sent),
+                                format!("sent {sent} background retry probes"),
+                            )
+                            .await;
                         sleep(direct_probe_ack_grace(probe_interval)).await;
                         if !peers.is_direct_for_generation(&peer_id, generation).await {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "retry_ack_timeout",
+                                    candidates.first().copied(),
+                                    Some(candidates.len()),
+                                    Some(sent),
+                                    format!("no direct probe ACK after {sent} retry probes"),
+                                )
+                                .await;
                             peers
                                 .record_direct_failure_for_generation(
                                     &peer_id,
@@ -2938,6 +3116,16 @@ async fn run_direct_probe_loop(
                         }
                     }
                     Err(err) => {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "retry_send_error",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                None,
+                                format!("direct retry failed: {err}"),
+                            )
+                            .await;
                         peers
                             .record_direct_failure_for_generation(
                                 &peer_id,

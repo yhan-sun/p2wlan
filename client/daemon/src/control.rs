@@ -829,9 +829,10 @@ fn has_control_credential(config: &Config) -> bool {
 /// Maximum exponential-backoff delay before giving up.
 const MAX_BACKOFF_SECS: u64 = 300;
 const INITIAL_BACKOFF_SECS: u64 = 2;
-/// Signaling carries WireGuard handshake offers/answers. Keep it independent
-/// from the slower peer/heartbeat poll so handshakes do not race their timeout.
-const SIGNAL_POLL_INTERVAL_SECS: u64 = 1;
+/// Signaling carries WireGuard handshake offers/answers. Keep it close to
+/// continuous long-polling so early responses do not wait almost a full second
+/// for the next tick before scheduling the synchronized UDP punch window.
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIGNAL_LONG_POLL_WAIT_MS: u64 = 900;
 const MIN_PEER_POLL_INTERVAL_SECS: u64 = 5;
 
@@ -1040,7 +1041,7 @@ async fn run_control_loop(
             .max(MIN_PEER_POLL_INTERVAL_SECS);
         let mut peer_tick = time::interval(Duration::from_secs(peer_interval_secs));
         peer_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut signal_tick = time::interval(Duration::from_secs(SIGNAL_POLL_INTERVAL_SECS));
+        let mut signal_tick = time::interval(SIGNAL_POLL_INTERVAL);
         signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         let mut poll_failures: u32 = 0;
