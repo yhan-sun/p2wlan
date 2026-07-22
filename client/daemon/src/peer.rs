@@ -44,6 +44,7 @@ const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 16;
 const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 32;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
+const DIRECT_TRAVERSAL_EVENT_LIMIT: usize = 32;
 const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
 
@@ -310,6 +311,39 @@ pub struct PathSelectionEvent {
     pub relay_hedged: bool,
     pub direct_score: Option<PathScore>,
     pub relay_score: Option<PathScore>,
+}
+
+/// One recorded direct traversal event for a peer.
+#[derive(Debug, Clone)]
+pub struct DirectTraversalEvent {
+    pub recorded_at: Instant,
+    pub network_generation: u64,
+    pub stage: String,
+    pub endpoint: Option<SocketAddr>,
+    pub candidate_count: Option<usize>,
+    pub sent_probes: Option<u32>,
+    pub detail: String,
+}
+
+impl DirectTraversalEvent {
+    fn new(
+        network_generation: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            recorded_at: Instant::now(),
+            network_generation,
+            stage: stage.into(),
+            endpoint,
+            candidate_count,
+            sent_probes,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Reachability state for one direct candidate pair.
@@ -684,6 +718,8 @@ pub struct PeerConnection {
     pub last_path_selection: Option<PathSelection>,
     /// Recent real outbound path-selector transitions.
     pub path_events: Vec<PathSelectionEvent>,
+    /// Recent direct traversal timeline events.
+    pub direct_events: Vec<DirectTraversalEvent>,
 }
 
 impl PeerConnection {
@@ -712,6 +748,7 @@ impl PeerConnection {
             candidate_pairs: Vec::new(),
             last_path_selection: None,
             path_events: Vec::new(),
+            direct_events: Vec::new(),
         }
     }
 
@@ -729,6 +766,7 @@ impl PeerConnection {
         self.candidate_pairs.clear();
         self.last_path_selection = None;
         self.path_events.clear();
+        self.direct_events.clear();
     }
 
     /// Whether the connection is active (direct or relay).
@@ -1400,6 +1438,30 @@ impl PeerConnection {
             self.path_events.drain(0..excess);
         }
     }
+
+    fn record_direct_event(
+        &mut self,
+        local_generation: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        self.direct_events.push(DirectTraversalEvent::new(
+            local_generation,
+            stage,
+            endpoint,
+            candidate_count,
+            sent_probes,
+            detail,
+        ));
+
+        if self.direct_events.len() > DIRECT_TRAVERSAL_EVENT_LIMIT {
+            let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;
+            self.direct_events.drain(0..excess);
+        }
+    }
 }
 
 // ============================================================
@@ -1660,6 +1722,29 @@ impl PeerManager {
         }
     }
 
+    /// Record a direct traversal timeline event for diagnostics.
+    pub async fn record_direct_event(
+        &self,
+        node_id: &str,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        let generation = self.current_network_generation().await;
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.record_direct_event(
+                generation,
+                stage,
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+            );
+        }
+    }
+
     /// Return the Probe v2 MAC key for a known peer, if both public keys are valid.
     pub async fn probe_key_for_peer(&self, node_id: &str) -> Option<ProbeMacKey> {
         self.connections
@@ -1712,6 +1797,21 @@ impl PeerManager {
                 if let Ok(endpoint) = c.parse::<SocketAddr>() {
                     conn.ensure_candidate_pair_with_source(endpoint, generation, source);
                 }
+            }
+
+            if !candidates.is_empty() {
+                conn.record_direct_event(
+                    generation,
+                    "candidates_received",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    format!(
+                        "received {} signaled UDP candidates with {} source labels",
+                        candidates.len(),
+                        candidate_sources.len()
+                    ),
+                );
             }
 
             if conn.endpoint.is_none() {
@@ -1859,6 +1959,19 @@ impl PeerManager {
         for endpoint in &endpoints {
             conn.mark_candidate_pair_probing(*endpoint, generation);
         }
+        if !endpoints.is_empty() {
+            conn.record_direct_event(
+                generation,
+                "probe_targets_selected",
+                endpoints.first().copied(),
+                Some(endpoints.len()),
+                None,
+                format!(
+                    "selected {} UDP candidates for synchronized punching",
+                    endpoints.len()
+                ),
+            );
+        }
         endpoints
     }
 
@@ -1885,6 +1998,17 @@ impl PeerManager {
                     for endpoint in &endpoints {
                         conn.mark_candidate_pair_probing(*endpoint, generation);
                     }
+                    conn.record_direct_event(
+                        generation,
+                        "probe_targets_due",
+                        endpoints.first().copied(),
+                        Some(endpoints.len()),
+                        None,
+                        format!(
+                            "selected {} UDP candidates for background retry",
+                            endpoints.len()
+                        ),
+                    );
                     Some((conn.node_id.clone(), endpoints))
                 }
             })
@@ -2033,6 +2157,14 @@ impl PeerManager {
             });
             conn.direct_generation = generation;
             conn.direct_health.record_success();
+            conn.record_direct_event(
+                generation,
+                "direct_confirmed",
+                selected_endpoint,
+                selected_endpoint.map(|_| 1),
+                None,
+                "encrypted data path confirmed Direct UDP",
+            );
             conn.transition(ConnectionState::Direct);
             source
         };
@@ -2089,8 +2221,31 @@ impl PeerManager {
                 None
             };
             match latency {
-                Some(latency) => conn.direct_health.record_success_with_latency(latency),
+                Some(latency) => {
+                    conn.record_direct_event(
+                        generation,
+                        "probe_ack_received",
+                        Some(endpoint),
+                        Some(1),
+                        None,
+                        format!(
+                            "received UDP punch ACK from {endpoint} rtt={}ms",
+                            duration_millis(latency)
+                        ),
+                    );
+                    conn.direct_health.record_success_with_latency(latency);
+                }
                 None => conn.direct_health.record_success(),
+            }
+            if !ack_confirmed {
+                conn.record_direct_event(
+                    generation,
+                    "inbound_probe_received",
+                    Some(endpoint),
+                    Some(1),
+                    None,
+                    format!("received inbound UDP probe from {endpoint}"),
+                );
             }
             if conn.state != ConnectionState::Direct
                 && matches!(
@@ -2149,6 +2304,14 @@ impl PeerManager {
             let reason = reason.into();
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
+            conn.record_direct_event(
+                generation,
+                code.clone(),
+                conn.endpoint,
+                Some(conn.candidate_pairs.len()),
+                None,
+                reason.clone(),
+            );
             let probed_sources = conn.mark_current_candidate_pairs_failed(generation, code, reason);
             if conn.state != ConnectionState::Relay {
                 conn.transition(ConnectionState::FallbackToRelay);
@@ -2444,6 +2607,7 @@ pub struct PeerDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_path_selection: Option<PathSelectionDiagnostics>,
     pub path_events: Vec<PathSelectionEventDiagnostics>,
+    pub direct_events: Vec<DirectTraversalEventDiagnostics>,
 }
 
 impl PeerDiagnostics {
@@ -2532,6 +2696,11 @@ impl PeerDiagnostics {
                 .iter()
                 .map(PathSelectionEventDiagnostics::from)
                 .collect(),
+            direct_events: conn
+                .direct_events
+                .iter()
+                .map(DirectTraversalEventDiagnostics::from)
+                .collect(),
         }
     }
 }
@@ -2572,6 +2741,32 @@ impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
             relay_hedged: event.relay_hedged,
             direct_score: event.direct_score.as_ref().map(PathScoreDiagnostics::from),
             relay_score: event.relay_score.as_ref().map(PathScoreDiagnostics::from),
+        }
+    }
+}
+
+/// Serializable direct traversal timeline event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectTraversalEventDiagnostics {
+    pub age_ms: u64,
+    pub network_generation: u64,
+    pub stage: String,
+    pub endpoint: Option<String>,
+    pub candidate_count: Option<usize>,
+    pub sent_probes: Option<u32>,
+    pub detail: String,
+}
+
+impl From<&DirectTraversalEvent> for DirectTraversalEventDiagnostics {
+    fn from(event: &DirectTraversalEvent) -> Self {
+        Self {
+            age_ms: duration_millis(event.recorded_at.elapsed()),
+            network_generation: event.network_generation,
+            stage: event.stage.clone(),
+            endpoint: event.endpoint.map(|endpoint| endpoint.to_string()),
+            candidate_count: event.candidate_count,
+            sent_probes: event.sent_probes,
+            detail: event.detail.clone(),
         }
     }
 }
@@ -3977,6 +4172,66 @@ mod tests {
         let json = serde_json::to_value(&diagnostics[0]).unwrap();
         assert_eq!(json["path_events"].as_array().unwrap().len(), 2);
         assert!(json["path_events"][1]["direct_score"]["score"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn direct_traversal_timeline_records_probe_flow() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "203.0.113.10:60207".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        let candidates = vec![endpoint.to_string()];
+        let sources = HashMap::from([(endpoint.to_string(), "stun_observed".to_string())]);
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        assert_eq!(targets, vec![endpoint]);
+
+        manager
+            .record_direct_event(
+                "peer1",
+                "punch_probes_sent",
+                Some(endpoint),
+                Some(targets.len()),
+                Some(3),
+                "sent test probes",
+            )
+            .await;
+
+        let generation = manager.current_network_generation().await;
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    endpoint,
+                    Some(Duration::from_millis(42)),
+                    generation,
+                )
+                .await
+        );
+
+        let diagnostics = manager.diagnostics().await;
+        let stages = diagnostics[0]
+            .direct_events
+            .iter()
+            .map(|event| event.stage.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(stages.contains(&"candidates_received"));
+        assert!(stages.contains(&"probe_targets_selected"));
+        assert!(stages.contains(&"punch_probes_sent"));
+        assert!(stages.contains(&"probe_ack_received"));
+        assert_eq!(
+            diagnostics[0]
+                .direct_events
+                .iter()
+                .find(|event| event.stage == "probe_ack_received")
+                .and_then(|event| event.endpoint.as_deref()),
+            Some("203.0.113.10:60207")
+        );
     }
 
     #[tokio::test]
