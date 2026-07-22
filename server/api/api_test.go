@@ -315,6 +315,60 @@ func TestCreateSignalNormalizesPunchWindowWithClientTime(t *testing.T) {
 	}
 }
 
+func TestCreateSignalNormalizesCandidateExpiryWithClientClockSkew(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-expiry@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-expiry-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-expiry-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	// The sender is five minutes behind the control-plane clock.  Its 45 second
+	// candidate lifetime must still be accepted and stored relative to server time.
+	clientTimeMS := int64(1_000_000)
+	beforeMS := time.Now().UnixMilli()
+	body := strings.NewReader(`{
+		"to_node_id":"` + target.ID + `",
+		"type":"peer_offer",
+		"candidates":["203.0.113.10:51820"],
+		"candidate_generation":17,
+		"client_time_ms":` + fmtInt64(clientTimeMS) + `,
+		"candidates_expires_at_ms":` + fmtInt64(clientTimeMS+45_000) + `
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID: source.ID, NetworkID: source.NetworkID, UserID: user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+	NewServer(nil, nil, db).CreateSignal(recorder, req)
+	afterMS := time.Now().UnixMilli()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	if signals[0].CandidatesExpiresAtMS < beforeMS+45_000 || signals[0].CandidatesExpiresAtMS > afterMS+45_000 {
+		t.Fatalf("expected server-normalized expiry around now+45s, got %d before=%d after=%d", signals[0].CandidatesExpiresAtMS, beforeMS, afterMS)
+	}
+}
+
 func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

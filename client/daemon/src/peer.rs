@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+// WebSocket signals do not include a server-time offset.  A bounded grace
+// period prevents a peer with a modestly fast system clock from rejecting an
+// otherwise fresh server-issued candidate set.  Generation ordering still
+// prevents old sets from replacing newer ones.
+const CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS: u64 = 120_000;
+
 use crate::config::Config;
 use crate::control::PeerInfo;
 use crate::traversal_history::{
@@ -1830,7 +1836,9 @@ impl PeerManager {
                 .unwrap_or_default()
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
-            if candidates_expires_at_ms.is_some_and(|expires_at| expires_at <= now_ms) {
+            if candidates_expires_at_ms.is_some_and(|expires_at| {
+                expires_at.saturating_add(CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS) <= now_ms
+            }) {
                 conn.record_direct_event(
                     generation,
                     "candidates_expired",

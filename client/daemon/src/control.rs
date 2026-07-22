@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,11 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tracing::{debug, error, info, warn};
+
+/// Candidate-set revisions must be strictly increasing within a daemon.  Wall
+/// clock milliseconds alone collide when an offer and a candidate refresh are
+/// emitted in the same tick.
+static LAST_CANDIDATE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================
 // Control Plane Messages
@@ -1902,7 +1907,8 @@ async fn send_signal(
     // Keep the revision and expiry derived from one instant: a candidate set
     // must have a coherent lifetime even if the wall clock is adjusted while
     // this request is being assembled.
-    let candidate_generation = unix_time_millis();
+    let candidate_generation = next_candidate_generation();
+    let client_time_ms = unix_time_millis();
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
         .bearer_auth(token)
@@ -1913,10 +1919,10 @@ async fn send_signal(
             "candidates": candidates,
             "candidate_sources": candidate_sources,
             "candidate_generation": candidate_generation,
-            "candidates_expires_at_ms": candidate_generation.saturating_add(45_000),
+            "candidates_expires_at_ms": client_time_ms.saturating_add(45_000),
             "handshake": hex::encode(handshake),
             "punch_at_ms": punch_at_ms,
-            "client_time_ms": unix_time_millis(),
+            "client_time_ms": client_time_ms,
         }))
         .send()
         .await
@@ -1978,6 +1984,11 @@ async fn poll_signals(
     for signal in body.signals {
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
+        let candidates_expires_at_ms = normalize_signal_candidate_expiry(
+            signal.candidates_expires_at_ms,
+            server_time_ms,
+            received_at_ms,
+        );
         let handshake = if signal.handshake.trim().is_empty() {
             Vec::new()
         } else {
@@ -1993,7 +2004,7 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     candidate_generation: signal.candidate_generation,
-                    candidates_expires_at_ms: signal.candidates_expires_at_ms,
+                    candidates_expires_at_ms,
                     handshake_init: handshake,
                     punch_at_ms,
                 });
@@ -2004,7 +2015,7 @@ async fn poll_signals(
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
                     candidate_generation: signal.candidate_generation,
-                    candidates_expires_at_ms: signal.candidates_expires_at_ms,
+                    candidates_expires_at_ms,
                     handshake_response: handshake,
                     punch_at_ms,
                 });
@@ -2045,6 +2056,38 @@ fn normalize_signal_punch_at(
         return Some(received_at_ms);
     }
     Some(received_at_ms.saturating_add(punch_at_ms - server_time_ms))
+}
+
+/// Convert a server-clock candidate deadline into the local receiver clock.
+/// This avoids discarding a fresh candidate set merely because two devices
+/// have different wall-clock settings.
+fn normalize_signal_candidate_expiry(
+    candidates_expires_at_ms: Option<u64>,
+    server_time_ms: Option<u64>,
+    received_at_ms: u64,
+) -> Option<u64> {
+    let expires_at_ms = candidates_expires_at_ms?;
+    let Some(server_time_ms) = server_time_ms else {
+        return Some(expires_at_ms);
+    };
+    Some(if expires_at_ms <= server_time_ms {
+        received_at_ms
+    } else {
+        received_at_ms.saturating_add(expires_at_ms - server_time_ms)
+    })
+}
+
+fn next_candidate_generation() -> u64 {
+    loop {
+        let previous = LAST_CANDIDATE_GENERATION.load(Ordering::Relaxed);
+        let next = unix_time_millis().max(previous.saturating_add(1));
+        if LAST_CANDIDATE_GENERATION
+            .compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 fn unix_time_millis() -> u64 {
@@ -2493,6 +2536,29 @@ mod tests {
             Some(11_500)
         );
         assert_eq!(normalize_signal_punch_at(None, Some(10_000), 50_000), None);
+    }
+
+    #[test]
+    fn candidate_expiry_uses_the_server_clock_offset() {
+        assert_eq!(
+            normalize_signal_candidate_expiry(Some(55_000), Some(10_000), 80_000),
+            Some(125_000)
+        );
+        assert_eq!(
+            normalize_signal_candidate_expiry(Some(9_000), Some(10_000), 80_000),
+            Some(80_000)
+        );
+        assert_eq!(
+            normalize_signal_candidate_expiry(Some(55_000), None, 80_000),
+            Some(55_000)
+        );
+    }
+
+    #[test]
+    fn candidate_generations_are_strictly_monotonic() {
+        let first = next_candidate_generation();
+        let second = next_candidate_generation();
+        assert!(second > first);
     }
 
     #[test]
