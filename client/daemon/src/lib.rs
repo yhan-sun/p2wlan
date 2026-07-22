@@ -156,6 +156,10 @@ const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 const DIRECT_LIVENESS_INTERVAL_MAX: Duration = Duration::from_secs(8);
 /// Delay advertised in signaling so both peers can align a short UDP punching burst.
 const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(1_500);
+/// Start slightly before the advertised punch timestamp to absorb clock skew,
+/// HTTP wake-up jitter, and scheduler latency while still keeping the packet
+/// budget bounded by the existing probe schedule.
+const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
 /// Ignore very stale relay-assisted windows and punch immediately instead.
 const RELAY_ASSISTED_PUNCH_STALE_AFTER: Duration = Duration::from_secs(3);
 
@@ -2870,7 +2874,7 @@ fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
     };
     let now = unix_time_millis();
     if punch_at_ms > now {
-        return Duration::from_millis(punch_at_ms - now);
+        return Duration::from_millis(punch_at_ms - now).saturating_sub(RELAY_ASSISTED_PUNCH_LEAD);
     }
     let stale_by = Duration::from_millis(now - punch_at_ms);
     if stale_by > RELAY_ASSISTED_PUNCH_STALE_AFTER {
@@ -3318,6 +3322,21 @@ mod tests {
         config.control.auth_token = "present-but-ignored".to_string();
         // Must not attempt control-plane registration even with a token.
         let _daemon = Daemon::new(config);
+    }
+
+    #[test]
+    fn relay_assisted_punch_starts_slightly_before_advertised_time() {
+        let punch_at_ms = unix_time_millis() + RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64;
+
+        let delay = relay_assisted_punch_delay(Some(punch_at_ms));
+
+        assert!(delay <= RELAY_ASSISTED_PUNCH_DELAY - RELAY_ASSISTED_PUNCH_LEAD);
+        assert!(
+            delay
+                >= RELAY_ASSISTED_PUNCH_DELAY
+                    - RELAY_ASSISTED_PUNCH_LEAD
+                    - Duration::from_millis(50)
+        );
     }
 
     #[test]

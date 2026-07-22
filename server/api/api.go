@@ -20,6 +20,8 @@ import (
 	"github.com/yhan-sun/p2wlan/server/signaling"
 )
 
+var signalLongPollFallbackInterval = 100 * time.Millisecond
+
 // Server handles API requests.
 type Server struct {
 	auth              *auth.Service
@@ -28,6 +30,7 @@ type Server struct {
 	relayServers      []string
 	relayCatalog      *RelayCatalog
 	relayTicketSigner *auth.RelayTicketSigner
+	signalNotifier    *signalNotifier
 }
 
 // NewServer creates a new API server.
@@ -66,6 +69,7 @@ func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *
 		relayServers:      parseRelayServers(),
 		relayCatalog:      catalog,
 		relayTicketSigner: signer,
+		signalNotifier:    newSignalNotifier(),
 	}
 }
 
@@ -750,6 +754,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
 	}
+	s.signalNotifier.notify(req.ToNodeID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal})
 }
@@ -783,6 +788,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 	waitMS := boundedSignalWaitMS(r)
 	deadline := time.Now().Add(time.Duration(waitMS) * time.Millisecond)
 	for {
+		version := s.signalNotifier.version(nodeID)
 		signals, err := s.db.ListAndDeleteSignals(nodeID)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
@@ -794,13 +800,16 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 		}
 
 		wait := time.Until(deadline)
-		if wait > 100*time.Millisecond {
-			wait = 100 * time.Millisecond
+		if wait > signalLongPollFallbackInterval {
+			wait = signalLongPollFallbackInterval
 		}
-		select {
-		case <-r.Context().Done():
+		if wait <= 0 {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals})
 			return
-		case <-time.After(wait):
+		}
+		s.signalNotifier.wait(r.Context(), nodeID, version, wait)
+		if r.Context().Err() != nil {
+			return
 		}
 	}
 }
