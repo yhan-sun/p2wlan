@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
+use crate::gateway_mapping::GatewayMappingDiagnostics;
 use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
 use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
 use crate::tasks::{HealthState, TaskManager};
@@ -32,6 +33,7 @@ pub struct DiagnosticsSnapshot {
     pub udp_local_addr: Option<String>,
     pub local_candidates: Vec<String>,
     pub nat_profile: Option<NatProfile>,
+    pub gateway_mapping: GatewayMappingDiagnostics,
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
     pub relay_selection: RelaySelectionDiagnostics,
@@ -49,6 +51,7 @@ pub struct DiagnosticsContext {
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     local_candidates: Arc<RwLock<Vec<String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    gateway_mapping: Arc<RwLock<GatewayMappingDiagnostics>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     health: Arc<HealthState>,
@@ -64,6 +67,7 @@ impl DiagnosticsContext {
         udp_transport: Arc<RwLock<Option<UdpTransport>>>,
         local_candidates: Arc<RwLock<Vec<String>>>,
         nat_profile: Arc<RwLock<Option<NatProfile>>>,
+        gateway_mapping: Arc<RwLock<GatewayMappingDiagnostics>>,
         relay_transport: Arc<RwLock<Option<RelayTransport>>>,
         relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
         health: Arc<HealthState>,
@@ -76,6 +80,7 @@ impl DiagnosticsContext {
             udp_transport,
             local_candidates,
             nat_profile,
+            gateway_mapping,
             relay_transport,
             relay_selection,
             health,
@@ -237,6 +242,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         udp_local_addr,
         local_candidates: context.local_candidates.read().await.clone(),
         nat_profile: context.nat_profile.read().await.clone(),
+        gateway_mapping: context.gateway_mapping.read().await.clone(),
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection,
@@ -333,6 +339,7 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(GatewayMappingDiagnostics::default())),
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
             health,
@@ -352,6 +359,7 @@ mod tests {
         stream.read_to_string(&mut response).await.unwrap();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"gateway_mapping\""));
         assert!(response.contains("Access-Control-Allow-Origin: http://127.0.0.1:1420\r\n"));
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();

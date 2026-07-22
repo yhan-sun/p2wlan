@@ -36,6 +36,7 @@ pub mod dataplane;
 pub mod diagnostics;
 pub mod dns;
 pub mod error;
+pub mod gateway_mapping;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
@@ -73,6 +74,7 @@ use control::{ControlClient, ControlEvent, RelayCatalogEntry};
 use dataplane::{DataPlane, InboundPacket, OutboundPacket};
 use diagnostics::{run_diagnostics_server, DiagnosticsContext};
 use dns::DnsResolver;
+use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
@@ -144,12 +146,15 @@ const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Server-side signaling currently rejects candidate lists above this size.
 const MAX_SIGNAL_CANDIDATES: usize = 20;
 /// Keep UPnP discovery short so unsupported gateways never delay startup much.
-const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(900);
+const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Short UPnP lease; refreshed by the regular candidate refresh loop.
 const PORT_MAPPING_LEASE_SECS: u32 = 120;
 /// NAT-PMP / PCP share UDP port 5351 and should fail fast when unsupported.
-const NAT_MAPPING_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(650);
+const NAT_MAPPING_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1_500);
 const NAT_MAPPING_CONTROL_PORT: u16 = 5351;
+/// Retry unavailable gateway discovery slowly; repeated 15s multicast probes
+/// are noisy and rarely turn a disabled router into an IGD.
+const PORT_MAPPING_FAILURE_RETRY: Duration = Duration::from_secs(60);
 /// Short cooldown after a selected Relay fails at runtime before trying it again.
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Active-path liveness must react much faster than a typical NAT mapping lease.
@@ -181,6 +186,28 @@ const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
 ];
 const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
+/// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
+/// Competing bursts can create distinct NAT mappings and reduce, rather than
+/// improve, the chance that both peers hit the same opening window.
+const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Default)]
+struct PunchAttemptDeduplicator {
+    recent_starts: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+}
+
+impl PunchAttemptDeduplicator {
+    async fn claim(&self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        let mut starts = self.recent_starts.lock().await;
+        starts.retain(|_, started| now.duration_since(*started) < PUNCH_SESSION_DEDUP_WINDOW);
+        if starts.contains_key(peer_id) {
+            return false;
+        }
+        starts.insert(peer_id.to_string(), now);
+        true
+    }
+}
 
 /// The main daemon orchestrator.
 ///
@@ -206,6 +233,11 @@ pub struct Daemon {
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     /// Latest local NAT behavior profile inferred from STUN observations.
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    /// Cached gateway mapping lifecycle and structured diagnostics.
+    gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
+    gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
+    /// Coordinates UDP punch bursts across all trigger paths.
+    punch_attempts: PunchAttemptDeduplicator,
     /// Bound UDP transport shared with control-plane-triggered punching.
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     /// Relay transport used when direct UDP is unavailable.
@@ -255,6 +287,13 @@ impl Daemon {
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             nat_profile: Arc::new(RwLock::new(None)),
+            gateway_mapping_runtime: Arc::new(RwLock::new(GatewayMappingRuntime::default())),
+            gateway_mapping_diagnostics: Arc::new(RwLock::new(GatewayMappingDiagnostics {
+                enabled: config.network.upnp_enabled,
+                lease_seconds: PORT_MAPPING_LEASE_SECS,
+                ..GatewayMappingDiagnostics::default()
+            })),
+            punch_attempts: PunchAttemptDeduplicator::default(),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
             relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
@@ -459,6 +498,7 @@ impl Daemon {
                 run_direct_probe_loop(
                     self.peers.clone(),
                     self.udp_transport.clone(),
+                    self.punch_attempts.clone(),
                     fallback_timeout,
                     punch_interval,
                     punch_attempts.clamp(1, 3),
@@ -473,6 +513,7 @@ impl Daemon {
                 self.udp_transport.clone(),
                 self.local_candidates.clone(),
                 self.nat_profile.clone(),
+                self.gateway_mapping_diagnostics.clone(),
                 self.relay_transport.clone(),
                 self.relay_selection.clone(),
                 self.health.clone(),
@@ -545,6 +586,8 @@ impl Daemon {
         let local_candidate_sources = self.local_candidate_sources.clone();
         let udp_local_candidate_sources = local_candidate_sources.clone();
         let nat_profile = self.nat_profile.clone();
+        let gateway_mapping_runtime = self.gateway_mapping_runtime.clone();
+        let gateway_mapping_diagnostics = self.gateway_mapping_diagnostics.clone();
         let udp_transport = self.udp_transport.clone();
         let direct_validation_transport = self.transport.clone();
         let direct_validation_local_ip = self.config.network.virtual_ip.clone();
@@ -552,6 +595,7 @@ impl Daemon {
         let local_node_id = self.config.node.node_id.clone();
         let udp_punch_interval = punch_interval;
         let udp_punch_attempts = punch_attempts;
+        let punch_deduplicator = self.punch_attempts.clone();
         self.task_manager
             .spawn_result("udp-direct", false, async move {
                 match UdpTransport::bind(udp_bind, peers.clone()).await {
@@ -641,6 +685,8 @@ impl Daemon {
                                 udp.local_addr().ok(),
                                 &mut candidate_endpoints,
                                 &mut candidate_sources,
+                                gateway_mapping_runtime.clone(),
+                                gateway_mapping_diagnostics.clone(),
                             )
                             .await;
                         }
@@ -660,6 +706,7 @@ impl Daemon {
                             &control,
                             peers.clone(),
                             udp.clone(),
+                            punch_deduplicator.clone(),
                             &candidate_endpoints,
                             &candidate_sources,
                             udp_punch_interval,
@@ -681,6 +728,9 @@ impl Daemon {
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
+                                    gateway_mapping_runtime,
+                                    gateway_mapping_diagnostics,
+                                    punch_deduplicator,
                                     control,
                                     peers: peers.clone(),
                                     probe_interval: udp_punch_interval,
@@ -702,6 +752,9 @@ impl Daemon {
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
+                                    gateway_mapping_runtime,
+                                    gateway_mapping_diagnostics,
+                                    punch_deduplicator,
                                     control,
                                     peers: peers.clone(),
                                     probe_interval: udp_punch_interval,
@@ -1129,6 +1182,8 @@ impl Daemon {
                     from_node_id,
                     candidates,
                     candidate_sources,
+                    candidate_generation,
+                    candidates_expires_at_ms,
                     handshake_init,
                     punch_at_ms,
                 } => {
@@ -1151,7 +1206,13 @@ impl Daemon {
                         )
                         .await;
                     self.peers
-                        .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
+                        .add_candidates_with_metadata(
+                            &from_node_id,
+                            &candidates,
+                            &candidate_sources,
+                            candidate_generation,
+                            candidates_expires_at_ms,
+                        )
                         .await;
                     if !handshake_init.is_empty() {
                         if let Err(err) = self
@@ -1168,6 +1229,8 @@ impl Daemon {
                     from_node_id,
                     candidates,
                     candidate_sources,
+                    candidate_generation,
+                    candidates_expires_at_ms,
                     handshake_response,
                     punch_at_ms,
                 } => {
@@ -1190,7 +1253,13 @@ impl Daemon {
                         )
                         .await;
                     self.peers
-                        .add_candidates_with_sources(&from_node_id, &candidates, &candidate_sources)
+                        .add_candidates_with_metadata(
+                            &from_node_id,
+                            &candidates,
+                            &candidate_sources,
+                            candidate_generation,
+                            candidates_expires_at_ms,
+                        )
                         .await;
                     if !handshake_response.is_empty() {
                         if let Err(err) = self
@@ -1530,14 +1599,19 @@ impl Daemon {
 
         let peer_id = node_id.to_string();
         let peers = self.peers.clone();
+        let attempts = peers
+            .recommended_punch_attempts(self.config.network.punch_attempts)
+            .await;
         spawn_hole_punch_task(
             udp,
             peers,
+            self.punch_attempts.clone(),
             peer_id,
             Duration::from_millis(self.config.network.punch_interval_ms),
-            self.config.network.punch_attempts,
+            attempts,
             punch_at_ms,
-        );
+        )
+        .await;
     }
 
     async fn handle_peer_offer(
@@ -1859,43 +1933,156 @@ async fn maybe_add_port_mapping_udp_candidate(
     udp_local_addr: Option<SocketAddr>,
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
+    runtime: Arc<RwLock<GatewayMappingRuntime>>,
+    diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
 ) {
     let Some(local_addr) = port_mapping_local_addr(udp_local_addr, candidates, candidate_sources)
     else {
+        let mut diagnostics = diagnostics.write().await;
+        diagnostics.local_endpoint = None;
+        diagnostics.upnp.status = "unavailable".to_string();
+        diagnostics.upnp.last_error = Some("no LAN IPv4 UDP endpoint available".to_string());
         debug!("Skipping port-mapping UDP candidate because no LAN IPv4 local address was found");
         return;
     };
 
-    match discover_port_mapping_udp_candidate(local_addr).await {
-        Some(candidate) => {
-            if candidates.contains(&candidate.endpoint) {
+    let now = Instant::now();
+    {
+        let runtime = runtime.read().await;
+        if runtime.retain_candidate(local_addr, now) {
+            if let (Some(endpoint), Some(source)) = (
+                runtime.candidate_endpoint.as_ref(),
+                runtime.candidate_source,
+            ) {
+                if !candidates.contains(endpoint) {
+                    candidates.insert(0, endpoint.clone());
+                    candidate_sources.insert(endpoint.clone(), source.to_string());
+                }
+                let snapshot = runtime.snapshot(
+                    true,
+                    PORT_MAPPING_LEASE_SECS,
+                    diagnostics.read().await.clone(),
+                );
+                *diagnostics.write().await = snapshot;
                 return;
             }
-            info!(
-                "{} mapped UDP {local_addr} as {}",
-                candidate.source, candidate.endpoint
-            );
-            // A gateway-created mapping is usually more useful than another
-            // host/predicted address and must survive the signaling cap.
-            candidates.insert(0, candidate.endpoint.clone());
-            candidate_sources.insert(candidate.endpoint, candidate.source.to_string());
         }
-        None => {
+        if !runtime.needs_discovery(local_addr, now) {
+            let snapshot = runtime.snapshot(
+                true,
+                PORT_MAPPING_LEASE_SECS,
+                diagnostics.read().await.clone(),
+            );
+            *diagnostics.write().await = snapshot;
+            return;
+        }
+    }
+
+    match discover_port_mapping_udp_candidate(local_addr).await {
+        GatewayMappingDiscovery {
+            candidate: Some(candidate),
+            upnp,
+            pcp,
+            nat_pmp,
+        } => {
+            let mut diagnostics_guard = diagnostics.write().await;
+            record_method_result(&mut diagnostics_guard.upnp, upnp);
+            if let Some(result) = pcp {
+                record_method_result(&mut diagnostics_guard.pcp, result);
+            }
+            if let Some(result) = nat_pmp {
+                record_method_result(&mut diagnostics_guard.nat_pmp, result);
+            }
+            if !candidates.contains(&candidate.endpoint) {
+                info!(
+                    "{} mapped UDP {local_addr} as {}",
+                    candidate.source, candidate.endpoint
+                );
+                // A gateway-created mapping is usually more useful than another
+                // host/predicted address and must survive the signaling cap.
+                candidates.insert(0, candidate.endpoint.clone());
+            }
+            candidate_sources.insert(candidate.endpoint.clone(), candidate.source.to_string());
+            drop(diagnostics_guard);
+            {
+                let mut runtime = runtime.write().await;
+                runtime.record_success(
+                    local_addr,
+                    candidate.endpoint.clone(),
+                    candidate.source,
+                    Duration::from_secs(PORT_MAPPING_LEASE_SECS.into()),
+                );
+                let snapshot = runtime.snapshot(
+                    true,
+                    PORT_MAPPING_LEASE_SECS,
+                    diagnostics.read().await.clone(),
+                );
+                *diagnostics.write().await = snapshot;
+            }
+        }
+        GatewayMappingDiscovery {
+            candidate: None,
+            upnp,
+            pcp,
+            nat_pmp,
+        } => {
+            let mut diagnostics_guard = diagnostics.write().await;
+            record_method_result(&mut diagnostics_guard.upnp, upnp);
+            if let Some(result) = pcp {
+                record_method_result(&mut diagnostics_guard.pcp, result);
+            }
+            if let Some(result) = nat_pmp {
+                record_method_result(&mut diagnostics_guard.nat_pmp, result);
+            }
+            drop(diagnostics_guard);
+            let mut runtime = runtime.write().await;
+            runtime.record_failure(local_addr, PORT_MAPPING_FAILURE_RETRY);
+            let snapshot = runtime.snapshot(
+                true,
+                PORT_MAPPING_LEASE_SECS,
+                diagnostics.read().await.clone(),
+            );
+            *diagnostics.write().await = snapshot;
             debug!("No UPnP/PCP/NAT-PMP UDP mapping candidate discovered for {local_addr}");
         }
     }
 }
 
-async fn discover_port_mapping_udp_candidate(
-    local_addr: SocketAddr,
-) -> Option<PortMappingCandidate> {
-    if let Some(candidate) = discover_upnp_udp_candidate(local_addr).await {
-        return Some(candidate);
-    }
-    discover_pcp_or_nat_pmp_udp_candidate(local_addr).await
+struct GatewayMappingDiscovery {
+    candidate: Option<PortMappingCandidate>,
+    upnp: std::result::Result<(), String>,
+    pcp: Option<std::result::Result<(), String>>,
+    nat_pmp: Option<std::result::Result<(), String>>,
 }
 
-async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappingCandidate> {
+async fn discover_port_mapping_udp_candidate(local_addr: SocketAddr) -> GatewayMappingDiscovery {
+    match discover_upnp_udp_candidate(local_addr).await {
+        Ok(candidate) => GatewayMappingDiscovery {
+            candidate: Some(candidate),
+            upnp: Ok(()),
+            pcp: None,
+            nat_pmp: None,
+        },
+        Err(upnp) => {
+            let (pcp, nat_pmp) = discover_pcp_or_nat_pmp_udp_candidate(local_addr).await;
+            let candidate = pcp
+                .as_ref()
+                .ok()
+                .cloned()
+                .or_else(|| nat_pmp.as_ref().ok().cloned());
+            GatewayMappingDiscovery {
+                candidate,
+                upnp: Err(upnp),
+                pcp: Some(pcp.map(|_| ())),
+                nat_pmp: Some(nat_pmp.map(|_| ())),
+            }
+        }
+    }
+}
+
+async fn discover_upnp_udp_candidate(
+    local_addr: SocketAddr,
+) -> std::result::Result<PortMappingCandidate, String> {
     let options = SearchOptions {
         timeout: Some(UPNP_DISCOVERY_TIMEOUT),
         single_search_timeout: Some(UPNP_DISCOVERY_TIMEOUT),
@@ -1905,7 +2092,7 @@ async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappi
         Ok(gateway) => gateway,
         Err(error) => {
             debug!("UPnP IGD gateway search failed: {error}");
-            return None;
+            return Err(format!("gateway discovery failed: {error}"));
         }
     };
 
@@ -1913,11 +2100,11 @@ async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappi
         Ok(ip) if is_public_udp_candidate(SocketAddr::new(ip, 1)) => ip,
         Ok(ip) => {
             debug!("UPnP IGD external IP {ip} is not publicly routable; skipping candidate");
-            return None;
+            return Err(format!("gateway reported non-public external IP {ip}"));
         }
         Err(error) => {
             debug!("UPnP IGD external IP lookup failed: {error}");
-            return None;
+            return Err(format!("external IP lookup failed: {error}"));
         }
     };
 
@@ -1932,7 +2119,7 @@ async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappi
         .await
         .is_ok()
     {
-        return Some(PortMappingCandidate {
+        return Ok(PortMappingCandidate {
             endpoint: SocketAddr::new(external_ip, local_addr.port()).to_string(),
             source: "upnp",
         });
@@ -1947,57 +2134,64 @@ async fn discover_upnp_udp_candidate(local_addr: SocketAddr) -> Option<PortMappi
         )
         .await
     {
-        Ok(endpoint) if is_public_udp_candidate(endpoint) => Some(PortMappingCandidate {
+        Ok(endpoint) if is_public_udp_candidate(endpoint) => Ok(PortMappingCandidate {
             endpoint: endpoint.to_string(),
             source: "upnp",
         }),
         Ok(endpoint) => {
             debug!("UPnP IGD mapped to non-public endpoint {endpoint}; skipping candidate");
-            None
+            Err(format!("gateway assigned non-public endpoint {endpoint}"))
         }
         Err(error) => {
             debug!("UPnP IGD UDP port mapping failed: {error}");
-            None
+            Err(format!("UDP port mapping failed: {error}"))
         }
     }
 }
 
 async fn discover_pcp_or_nat_pmp_udp_candidate(
     local_addr: SocketAddr,
-) -> Option<PortMappingCandidate> {
+) -> (
+    std::result::Result<PortMappingCandidate, String>,
+    std::result::Result<PortMappingCandidate, String>,
+) {
     let gateway = match default_ipv4_gateway().await {
         Some(gateway) => gateway,
         None => {
             debug!("No default IPv4 gateway found for PCP/NAT-PMP discovery");
-            return None;
+            let error = "no default IPv4 gateway found".to_string();
+            return (Err(error.clone()), Err(error));
         }
     };
-    let local_ip = local_addr_ipv4(local_addr)?;
+    let Some(local_ip) = local_addr_ipv4(local_addr) else {
+        let error = "no usable LAN IPv4 source address".to_string();
+        return (Err(error.clone()), Err(error));
+    };
 
     let pcp = discover_pcp_udp_candidate(local_ip, local_addr.port(), gateway);
     let nat_pmp = discover_nat_pmp_udp_candidate(local_ip, local_addr.port(), gateway);
     let (pcp, nat_pmp) = tokio::join!(pcp, nat_pmp);
-    pcp.or(nat_pmp)
+    (pcp, nat_pmp)
 }
 
 async fn discover_nat_pmp_udp_candidate(
     local_ip: Ipv4Addr,
     local_port: u16,
     gateway: Ipv4Addr,
-) -> Option<PortMappingCandidate> {
+) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
     let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(socket) => socket,
         Err(error) => {
             debug!("NAT-PMP bind failed on {bind_addr}: {error}");
-            return None;
+            return Err(format!("bind {bind_addr} failed: {error}"));
         }
     };
 
     let public_request = [0u8, 0u8];
-    if socket.send_to(&public_request, gateway_addr).await.is_err() {
-        return None;
+    if let Err(error) = socket.send_to(&public_request, gateway_addr).await {
+        return Err(format!("public address request send failed: {error}"));
     }
     let mut response = [0u8; 64];
     let (len, from) = match timeout(
@@ -2009,22 +2203,25 @@ async fn discover_nat_pmp_udp_candidate(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             debug!("NAT-PMP public address receive failed: {error}");
-            return None;
+            return Err(format!("public address receive failed: {error}"));
         }
-        Err(_) => return None,
+        Err(_) => return Err("public address request timed out".to_string()),
     };
     if from.ip() != IpAddr::V4(gateway) {
-        return None;
+        return Err(format!(
+            "public address response came from unexpected {from}"
+        ));
     }
-    let external_ip = parse_nat_pmp_public_address_response(&response[..len])?;
+    let external_ip = parse_nat_pmp_public_address_response(&response[..len])
+        .ok_or_else(|| "invalid NAT-PMP public address response".to_string())?;
 
     let mut map_request = [0u8; 12];
     map_request[1] = 1; // Map UDP.
     map_request[4..6].copy_from_slice(&local_port.to_be_bytes());
     map_request[6..8].copy_from_slice(&local_port.to_be_bytes());
     map_request[8..12].copy_from_slice(&PORT_MAPPING_LEASE_SECS.to_be_bytes());
-    if socket.send_to(&map_request, gateway_addr).await.is_err() {
-        return None;
+    if let Err(error) = socket.send_to(&map_request, gateway_addr).await {
+        return Err(format!("UDP mapping request send failed: {error}"));
     }
     let (len, from) = match timeout(
         NAT_MAPPING_DISCOVERY_TIMEOUT,
@@ -2035,33 +2232,36 @@ async fn discover_nat_pmp_udp_candidate(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             debug!("NAT-PMP UDP mapping receive failed: {error}");
-            return None;
+            return Err(format!("UDP mapping receive failed: {error}"));
         }
-        Err(_) => return None,
+        Err(_) => return Err("UDP mapping request timed out".to_string()),
     };
     if from.ip() != IpAddr::V4(gateway) {
-        return None;
+        return Err(format!("UDP mapping response came from unexpected {from}"));
     }
-    let external_port = parse_nat_pmp_mapping_response(&response[..len], local_port)?;
+    let external_port = parse_nat_pmp_mapping_response(&response[..len], local_port)
+        .ok_or_else(|| "invalid NAT-PMP UDP mapping response".to_string())?;
     let endpoint = SocketAddr::new(IpAddr::V4(external_ip), external_port);
-    is_public_udp_candidate(endpoint).then(|| PortMappingCandidate {
-        endpoint: endpoint.to_string(),
-        source: "nat_pmp",
-    })
+    is_public_udp_candidate(endpoint)
+        .then_some(PortMappingCandidate {
+            endpoint: endpoint.to_string(),
+            source: "nat_pmp",
+        })
+        .ok_or_else(|| format!("gateway returned non-public endpoint {endpoint}"))
 }
 
 async fn discover_pcp_udp_candidate(
     local_ip: Ipv4Addr,
     local_port: u16,
     gateway: Ipv4Addr,
-) -> Option<PortMappingCandidate> {
+) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
     let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(socket) => socket,
         Err(error) => {
             debug!("PCP bind failed on {bind_addr}: {error}");
-            return None;
+            return Err(format!("bind {bind_addr} failed: {error}"));
         }
     };
 
@@ -2075,8 +2275,8 @@ async fn discover_pcp_udp_candidate(
     request[40..42].copy_from_slice(&local_port.to_be_bytes());
     request[42..44].copy_from_slice(&local_port.to_be_bytes());
 
-    if socket.send_to(&request, gateway_addr).await.is_err() {
-        return None;
+    if let Err(error) = socket.send_to(&request, gateway_addr).await {
+        return Err(format!("MAP request send failed: {error}"));
     }
     let mut response = [0u8; 128];
     let (len, from) = match timeout(
@@ -2088,18 +2288,21 @@ async fn discover_pcp_udp_candidate(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             debug!("PCP UDP mapping receive failed: {error}");
-            return None;
+            return Err(format!("MAP response receive failed: {error}"));
         }
-        Err(_) => return None,
+        Err(_) => return Err("MAP request timed out".to_string()),
     };
     if from.ip() != IpAddr::V4(gateway) {
-        return None;
+        return Err(format!("MAP response came from unexpected {from}"));
     }
-    let endpoint = parse_pcp_mapping_response(&response[..len], local_port)?;
-    is_public_udp_candidate(endpoint).then(|| PortMappingCandidate {
-        endpoint: endpoint.to_string(),
-        source: "pcp",
-    })
+    let endpoint = parse_pcp_mapping_response(&response[..len], local_port)
+        .ok_or_else(|| "invalid PCP MAP response".to_string())?;
+    is_public_udp_candidate(endpoint)
+        .then_some(PortMappingCandidate {
+            endpoint: endpoint.to_string(),
+            source: "pcp",
+        })
+        .ok_or_else(|| format!("gateway returned non-public endpoint {endpoint}"))
 }
 
 fn parse_nat_pmp_public_address_response(response: &[u8]) -> Option<Ipv4Addr> {
@@ -2293,6 +2496,9 @@ struct UdpCandidateRefreshContext {
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
+    gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     control: ControlClient,
     peers: Arc<PeerManager>,
     probe_interval: Duration,
@@ -2309,6 +2515,9 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         local_candidates,
         local_candidate_sources,
         nat_profile,
+        gateway_mapping_runtime,
+        gateway_mapping_diagnostics,
+        punch_deduplicator,
         control,
         peers,
         probe_interval,
@@ -2367,6 +2576,8 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                 udp.local_addr().ok(),
                 &mut candidates,
                 &mut candidate_sources,
+                gateway_mapping_runtime.clone(),
+                gateway_mapping_diagnostics.clone(),
             )
             .await;
         }
@@ -2436,6 +2647,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             &control,
             peers.clone(),
             udp.clone(),
+            punch_deduplicator.clone(),
             &candidates,
             &candidate_sources,
             probe_interval,
@@ -2451,6 +2663,7 @@ async fn publish_local_candidates_to_known_peers(
     control: &ControlClient,
     peers: Arc<PeerManager>,
     udp: UdpTransport,
+    punch_deduplicator: PunchAttemptDeduplicator,
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
     probe_interval: Duration,
@@ -2461,6 +2674,8 @@ async fn publish_local_candidates_to_known_peers(
         debug!("Skipping {reason} candidate publication because local candidate set is empty");
         return;
     }
+
+    let attempts = peers.recommended_punch_attempts(attempts).await;
 
     for peer_id in control.peers().await.into_keys() {
         let punch_at_ms = Some(relay_assisted_punch_at_ms());
@@ -2484,11 +2699,13 @@ async fn publish_local_candidates_to_known_peers(
         spawn_hole_punch_task(
             udp.clone(),
             peers.clone(),
+            punch_deduplicator.clone(),
             peer_id,
             probe_interval,
             attempts,
             punch_at_ms,
-        );
+        )
+        .await;
     }
 }
 
@@ -2911,14 +3128,29 @@ fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
     Duration::ZERO
 }
 
-fn spawn_hole_punch_task(
+async fn spawn_hole_punch_task(
     udp: UdpTransport,
     peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     peer_id: String,
     probe_interval: Duration,
     attempts: u32,
     punch_at_ms: Option<u64>,
 ) {
+    if !punch_deduplicator.claim(&peer_id).await {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_suppressed",
+                None,
+                None,
+                None,
+                "suppressed overlapping UDP punch session for this peer",
+            )
+            .await;
+        debug!("Suppressing overlapping UDP punch session for {peer_id}");
+        return;
+    }
     let punch_delay = relay_assisted_punch_delay(punch_at_ms);
     if !punch_delay.is_zero() {
         debug!(
@@ -3209,6 +3441,7 @@ async fn run_direct_encrypted_validation(
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     retry_after: Duration,
     probe_interval: Duration,
     attempts: u32,
@@ -3226,8 +3459,22 @@ async fn run_direct_probe_loop(
         };
 
         for (peer_id, candidates) in peers.direct_probe_targets_due(retry_after).await {
+            if !punch_deduplicator.claim(&peer_id).await {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "retry_punch_suppressed",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        None,
+                        "suppressed overlapping UDP retry session for this peer",
+                    )
+                    .await;
+                continue;
+            }
             let udp = udp.clone();
             let peers = peers.clone();
+            let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
                 let success_count_before = peers
@@ -3505,6 +3752,14 @@ mod tests {
         config.control.auth_token = "present-but-ignored".to_string();
         // Must not attempt control-plane registration even with a token.
         let _daemon = Daemon::new(config);
+    }
+
+    #[tokio::test]
+    async fn punch_attempt_deduplicator_allows_only_one_short_window_per_peer() {
+        let deduplicator = PunchAttemptDeduplicator::default();
+        assert!(deduplicator.claim("peer-a").await);
+        assert!(!deduplicator.claim("peer-a").await);
+        assert!(deduplicator.claim("peer-b").await);
     }
 
     #[test]

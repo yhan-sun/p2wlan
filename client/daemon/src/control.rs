@@ -87,6 +87,10 @@ pub enum ControlMessage {
         #[serde(default)]
         candidate_sources: HashMap<String, String>,
         #[serde(default)]
+        candidate_generation: u64,
+        #[serde(default)]
+        candidates_expires_at_ms: Option<u64>,
+        #[serde(default)]
         handshake_init: Vec<u8>,
         #[serde(default)]
         punch_at_ms: Option<u64>,
@@ -100,6 +104,10 @@ pub enum ControlMessage {
         candidates: Vec<String>,
         #[serde(default)]
         candidate_sources: HashMap<String, String>,
+        #[serde(default)]
+        candidate_generation: u64,
+        #[serde(default)]
+        candidates_expires_at_ms: Option<u64>,
         #[serde(default)]
         handshake_response: Vec<u8>,
         #[serde(default)]
@@ -214,6 +222,8 @@ pub enum ControlEvent {
         from_node_id: String,
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
         handshake_init: Vec<u8>,
         punch_at_ms: Option<u64>,
     },
@@ -222,6 +232,8 @@ pub enum ControlEvent {
         from_node_id: String,
         candidates: Vec<String>,
         candidate_sources: HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
         handshake_response: Vec<u8>,
         punch_at_ms: Option<u64>,
     },
@@ -349,6 +361,10 @@ struct SignalResponse {
     candidates: Vec<String>,
     #[serde(default)]
     candidate_sources: HashMap<String, String>,
+    #[serde(default)]
+    candidate_generation: u64,
+    #[serde(default)]
+    candidates_expires_at_ms: Option<u64>,
     #[serde(default)]
     handshake: String,
     #[serde(default)]
@@ -747,6 +763,8 @@ impl ControlClient {
                 from_node_id,
                 candidates,
                 candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
                 handshake_init,
                 punch_at_ms,
                 ..
@@ -755,6 +773,8 @@ impl ControlClient {
                     from_node_id,
                     candidates,
                     candidate_sources,
+                    candidate_generation,
+                    candidates_expires_at_ms,
                     handshake_init,
                     punch_at_ms,
                 });
@@ -764,6 +784,8 @@ impl ControlClient {
                 from_node_id,
                 candidates,
                 candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
                 handshake_response,
                 punch_at_ms,
                 ..
@@ -772,6 +794,8 @@ impl ControlClient {
                     from_node_id,
                     candidates,
                     candidate_sources,
+                    candidate_generation,
+                    candidates_expires_at_ms,
                     handshake_response,
                     punch_at_ms,
                 });
@@ -1875,6 +1899,10 @@ async fn send_signal(
     handshake: &[u8],
     punch_at_ms: Option<u64>,
 ) -> Result<()> {
+    // Keep the revision and expiry derived from one instant: a candidate set
+    // must have a coherent lifetime even if the wall clock is adjusted while
+    // this request is being assembled.
+    let candidate_generation = unix_time_millis();
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
         .bearer_auth(token)
@@ -1884,6 +1912,8 @@ async fn send_signal(
             "type": signal_type,
             "candidates": candidates,
             "candidate_sources": candidate_sources,
+            "candidate_generation": candidate_generation,
+            "candidates_expires_at_ms": candidate_generation.saturating_add(45_000),
             "handshake": hex::encode(handshake),
             "punch_at_ms": punch_at_ms,
             "client_time_ms": unix_time_millis(),
@@ -1962,6 +1992,8 @@ async fn poll_signals(
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
+                    candidate_generation: signal.candidate_generation,
+                    candidates_expires_at_ms: signal.candidates_expires_at_ms,
                     handshake_init: handshake,
                     punch_at_ms,
                 });
@@ -1971,6 +2003,8 @@ async fn poll_signals(
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     candidate_sources: signal.candidate_sources,
+                    candidate_generation: signal.candidate_generation,
+                    candidates_expires_at_ms: signal.candidates_expires_at_ms,
                     handshake_response: handshake,
                     punch_at_ms,
                 });
@@ -2353,6 +2387,8 @@ mod tests {
             to_node_id: "bob".to_string(),
             candidates: vec!["10.0.0.1:5000".to_string()],
             candidate_sources: HashMap::new(),
+            candidate_generation: 7,
+            candidates_expires_at_ms: Some(42_000),
             handshake_init: vec![0x01, 0x02],
             punch_at_ms: Some(1234),
         };
@@ -2411,6 +2447,8 @@ mod tests {
                     "peer_reflexive".to_string(),
                 ),
             ]),
+            candidate_generation: 0,
+            candidates_expires_at_ms: None,
             handshake: String::new(),
             punch_at_ms: Some(77),
         };
@@ -2428,6 +2466,8 @@ mod tests {
             signal_type: "peer_reflexive".to_string(),
             candidates: vec!["198.51.100.1:40000".to_string()],
             candidate_sources: HashMap::new(),
+            candidate_generation: 0,
+            candidates_expires_at_ms: None,
             handshake: String::new(),
             punch_at_ms: None,
         };

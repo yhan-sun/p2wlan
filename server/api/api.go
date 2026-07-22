@@ -628,14 +628,16 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 // CreateSignal handles POST /api/v1/signals.
 func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromNodeID       string            `json:"from_node_id"`
-		ToNodeID         string            `json:"to_node_id"`
-		Type             string            `json:"type"`
-		Candidates       []string          `json:"candidates"`
-		CandidateSources map[string]string `json:"candidate_sources"`
-		Handshake        string            `json:"handshake"`
-		PunchAtMS        int64             `json:"punch_at_ms"`
-		ClientTimeMS     int64             `json:"client_time_ms"`
+		FromNodeID            string            `json:"from_node_id"`
+		ToNodeID              string            `json:"to_node_id"`
+		Type                  string            `json:"type"`
+		Candidates            []string          `json:"candidates"`
+		CandidateSources      map[string]string `json:"candidate_sources"`
+		CandidateGeneration   int64             `json:"candidate_generation"`
+		CandidatesExpiresAtMS int64             `json:"candidates_expires_at_ms"`
+		Handshake             string            `json:"handshake"`
+		PunchAtMS             int64             `json:"punch_at_ms"`
+		ClientTimeMS          int64             `json:"client_time_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -700,6 +702,16 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nowMS := time.Now().UnixMilli()
+	if req.CandidateGeneration < 0 || req.CandidatesExpiresAtMS < 0 {
+		http.Error(w, `{"error":"candidate metadata must be non-negative"}`, http.StatusBadRequest)
+		return
+	}
+	if req.CandidatesExpiresAtMS > 0 {
+		if req.CandidatesExpiresAtMS <= nowMS || req.CandidatesExpiresAtMS > nowMS+10*60*1000 {
+			http.Error(w, `{"error":"candidate expiry outside allowed window"}`, http.StatusBadRequest)
+			return
+		}
+	}
 	normalizedPunchAtMS := req.PunchAtMS
 	if req.PunchAtMS > 0 && req.ClientTimeMS > 0 {
 		delayMS := req.PunchAtMS - req.ClientTimeMS
@@ -765,7 +777,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignalWithPunchAt(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS)
+	signal, err := s.db.CreateSignalWithTraversalMetadata(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, req.CandidatesExpiresAtMS)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return

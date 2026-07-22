@@ -10,10 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_crypto::{hmac, NodeIdentity};
-use p2pnet_nat::{NatProfile, ProbeMacKey};
+use p2pnet_nat::{MappingBehavior, NatProfile, ProbeMacKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -704,6 +704,10 @@ pub struct PeerConnection {
     pub candidates: Vec<String>,
     /// Candidate strings from the most recent peer offer/answer.
     signaled_candidates: HashSet<String>,
+    /// Newer candidate sets replace older ones; generation 0 remains valid for
+    /// legacy peers that have not yet been upgraded.
+    last_candidate_generation: u64,
+    last_candidates_expires_at_ms: Option<u64>,
     /// Local-only source metadata keyed by candidate endpoint string.
     pub candidate_sources: HashMap<String, CandidatePairSource>,
     /// Direct UDP path health.
@@ -741,6 +745,8 @@ impl PeerConnection {
             relay_server: None,
             candidates: Vec::new(),
             signaled_candidates: HashSet::new(),
+            last_candidate_generation: 0,
+            last_candidates_expires_at_ms: None,
             candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
@@ -756,6 +762,8 @@ impl PeerConnection {
         self.endpoint = self.signaled_endpoint;
         self.candidates.clear();
         self.signaled_candidates.clear();
+        self.last_candidate_generation = 0;
+        self.last_candidates_expires_at_ms = None;
         self.candidate_sources.clear();
         self.state = ConnectionState::Idle;
         self.connected_at = None;
@@ -1554,6 +1562,23 @@ impl PeerManager {
         *self.local_nat_profile.write().await = Some(profile);
     }
 
+    /// Bound probe rounds from the observed local NAT behavior.  Endpoint-
+    /// independent NATs benefit from a short synchronized burst; dependent
+    /// mappings need a wider bounded window.  UDP-blocked networks retain one
+    /// lightweight attempt so the path can recover after a transient change.
+    pub async fn recommended_punch_attempts(&self, configured: u32) -> u32 {
+        let configured = configured.clamp(1, 10);
+        let profile = self.local_nat_profile.read().await;
+        match profile.as_ref().map(|profile| profile.mapping_behavior) {
+            Some(MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent) => {
+                configured.min(4)
+            }
+            Some(MappingBehavior::AddressOrPortDependent) => configured.clamp(6, 8),
+            Some(MappingBehavior::UdpBlocked) => 1,
+            Some(MappingBehavior::Unknown) | None => configured.min(6),
+        }
+    }
+
     /// Serializable local traversal history diagnostics.
     pub async fn traversal_history_diagnostics(&self) -> TraversalHistoryDiagnostics {
         self.traversal_history.read().await.diagnostics()
@@ -1773,7 +1798,7 @@ impl PeerManager {
 
     /// Add ICE candidates for a peer.
     pub async fn add_candidates(&self, node_id: &str, candidates: &[String]) {
-        self.add_candidates_with_sources(node_id, candidates, &HashMap::new())
+        self.add_candidates_with_metadata(node_id, candidates, &HashMap::new(), 0, None)
             .await;
     }
 
@@ -1784,20 +1809,88 @@ impl PeerManager {
         candidates: &[String],
         candidate_sources: &HashMap<String, String>,
     ) {
+        self.add_candidates_with_metadata(node_id, candidates, candidate_sources, 0, None)
+            .await;
+    }
+
+    /// Install a versioned candidate set, ignoring a stale signal or an
+    /// already-expired set before it can reintroduce old NAT ports.
+    pub async fn add_candidates_with_metadata(
+        &self,
+        node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+    ) {
         let generation = self.current_network_generation().await;
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if candidates_expires_at_ms.is_some_and(|expires_at| expires_at <= now_ms) {
+                conn.record_direct_event(
+                    generation,
+                    "candidates_expired",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    "ignored expired signaled UDP candidate set",
+                );
+                return;
+            }
+            if candidate_generation != 0 && candidate_generation <= conn.last_candidate_generation {
+                conn.record_direct_event(
+                    generation,
+                    "candidates_stale",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    format!("ignored stale candidate generation {candidate_generation}"),
+                );
+                return;
+            }
+            if candidate_generation != 0 {
+                conn.last_candidate_generation = candidate_generation;
+            }
+            conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
+            let old_signaled_endpoint = conn.signaled_endpoint;
             let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
+            let had_previous_signaled = !previous_signaled.is_empty();
             for candidate in previous_signaled {
                 let learned = matches!(
                     conn.candidate_sources.get(&candidate),
                     Some(CandidatePairSource::Learned | CandidatePairSource::PeerReflexive)
                 );
-                if !learned
-                    && conn.signaled_endpoint.map(|endpoint| endpoint.to_string())
-                        != Some(candidate.clone())
-                {
+                if !learned {
                     conn.candidates.retain(|existing| existing != &candidate);
                     conn.candidate_sources.remove(&candidate);
+                }
+            }
+
+            // A current trickled signal is authoritative.  Keeping the node
+            // registry's old endpoint forever causes port churn to accumulate
+            // stale public targets and wastes each synchronized punch window.
+            if had_previous_signaled {
+                if let Some(endpoint) = old_signaled_endpoint {
+                    if !candidates
+                        .iter()
+                        .any(|candidate| candidate == &endpoint.to_string())
+                    {
+                        conn.signaled_endpoint = None;
+                        if conn.endpoint == Some(endpoint) {
+                            conn.endpoint = None;
+                        }
+                        let endpoint = endpoint.to_string();
+                        if conn.candidate_sources.get(&endpoint)
+                            == Some(&CandidatePairSource::Signaled)
+                        {
+                            conn.candidates.retain(|candidate| candidate != &endpoint);
+                            conn.candidate_sources.remove(&endpoint);
+                        }
+                    }
                 }
             }
 
@@ -3164,9 +3257,14 @@ fn endpoint_probe_rank(endpoint: SocketAddr) -> u8 {
     match endpoint.ip() {
         IpAddr::V4(ip) => {
             if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
-                0
+                // A plain signaled RFC1918 endpoint is usually from a
+                // different LAN.  It must not consume the first synchronized
+                // punch window ahead of a public srflx endpoint.  Properly
+                // labelled `host` candidates still receive their dedicated
+                // source priority above, preserving same-LAN fast paths.
+                3
             } else {
-                2
+                1
             }
         }
         IpAddr::V6(ip) => {
@@ -3174,9 +3272,9 @@ fn endpoint_probe_rank(endpoint: SocketAddr) -> u8 {
             let is_unique_local = (first_segment & 0xfe00) == 0xfc00;
             let is_link_local = (first_segment & 0xffc0) == 0xfe80;
             if ip.is_loopback() || is_unique_local || is_link_local {
-                0
+                3
             } else {
-                1
+                0
             }
         }
     }
@@ -3278,6 +3376,13 @@ fn format_optional_ms(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlabelled_private_candidates_do_not_beat_public_candidates() {
+        let private: SocketAddr = "192.168.1.188:51820".parse().unwrap();
+        let public: SocketAddr = "203.0.113.10:51820".parse().unwrap();
+        assert!(endpoint_probe_rank(public) < endpoint_probe_rank(private));
+    }
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
@@ -3714,6 +3819,90 @@ mod tests {
             pair.remote_endpoint == "203.0.113.10:40007"
                 && pair.source == CandidatePairSource::Predicted
         }));
+    }
+
+    #[tokio::test]
+    async fn fresh_candidate_signal_replaces_stale_registry_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let stale: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+        let fresh: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+        manager.add_peer(&test_peer("peer1", stale)).await;
+
+        manager
+            .add_candidates("peer1", &["203.0.113.10:41500".to_string()])
+            .await;
+        manager.add_candidates("peer1", &[fresh.to_string()]).await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.signaled_endpoint, None);
+        assert!(!conn.candidates.contains(&stale.to_string()));
+        assert!(conn.candidates.contains(&fresh.to_string()));
+        assert_eq!(conn.endpoint, Some(fresh));
+    }
+
+    #[tokio::test]
+    async fn versioned_candidates_reject_stale_and_expired_sets() {
+        let manager = PeerManager::new(test_config());
+        let initial: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+        let stale: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+        let expired: SocketAddr = "203.0.113.10:43000".parse().unwrap();
+        manager.add_peer(&test_peer("peer1", initial)).await;
+
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[initial.to_string()],
+                &HashMap::new(),
+                10,
+                Some(u64::MAX),
+            )
+            .await;
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[stale.to_string()],
+                &HashMap::new(),
+                9,
+                Some(u64::MAX),
+            )
+            .await;
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[expired.to_string()],
+                &HashMap::new(),
+                11,
+                Some(1),
+            )
+            .await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.last_candidate_generation, 10);
+        assert!(conn.candidates.contains(&initial.to_string()));
+        assert!(!conn.candidates.contains(&stale.to_string()));
+        assert!(!conn.candidates.contains(&expired.to_string()));
+        assert!(conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "candidates_stale"));
+        assert!(conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "candidates_expired"));
+    }
+
+    #[tokio::test]
+    async fn punch_rounds_follow_observed_nat_behavior() {
+        let manager = PeerManager::new(test_config());
+        assert_eq!(manager.recommended_punch_attempts(10).await, 6);
+
+        let mut endpoint_independent = birthday_nat_profile();
+        endpoint_independent.mapping_behavior = MappingBehavior::EndpointIndependent;
+        manager.update_nat_profile(endpoint_independent).await;
+        assert_eq!(manager.recommended_punch_attempts(10).await, 4);
+
+        manager.update_nat_profile(birthday_nat_profile()).await;
+        assert_eq!(manager.recommended_punch_attempts(10).await, 8);
     }
 
     #[tokio::test]

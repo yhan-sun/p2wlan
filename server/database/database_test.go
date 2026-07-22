@@ -182,6 +182,32 @@ func TestSignalsPreservePunchAtMS(t *testing.T) {
 	}
 }
 
+func TestSignalsPreserveCandidateSetMetadata(t *testing.T) {
+	db, device := createTestDevice(t, "signal-metadata@p2wlan.local", "signal-metadata-source")
+	defer db.Close()
+	target, err := db.CreateDevice(device.UserID, "default", "signal-metadata-target-pubkey", "signal-metadata-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target failed: %v", err)
+	}
+
+	const generation int64 = 42
+	const expiresAtMS int64 = 1_777_000_123_456
+	if _, err := db.CreateSignalWithTraversalMetadata(
+		device.ID, target.ID, "peer_offer", []string{"203.0.113.10:51820"},
+		map[string]string{"203.0.113.10:51820": "upnp"}, "handshake", 0, generation, expiresAtMS,
+	); err != nil {
+		t.Fatalf("CreateSignalWithTraversalMetadata failed: %v", err)
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals failed: %v", err)
+	}
+	if len(signals) != 1 || signals[0].CandidateGeneration != generation || signals[0].CandidatesExpiresAtMS != expiresAtMS {
+		t.Fatalf("candidate metadata was not preserved: %#v", signals)
+	}
+}
+
 func TestSignalsIgnoreExpiredRows(t *testing.T) {
 	db, device := createTestDevice(t, "signal-ttl@p2wlan.local", "signal-ttl-source")
 	defer db.Close()
