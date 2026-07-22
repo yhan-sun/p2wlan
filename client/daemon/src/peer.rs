@@ -34,7 +34,6 @@ const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 1;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
-const DIRECT_TRIAL_RELAY_MARGIN: i32 = 5;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 2;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 8;
@@ -1291,31 +1290,40 @@ impl PeerConnection {
             .with_scores(direct_score, None);
         }
 
-        if trial_direct
-            && match (&direct_score, &relay_score) {
-                (Some(direct_score), Some(relay_score)) => {
-                    direct_score.score >= DIRECT_TRIAL_MIN_SCORE
-                        && direct_score.score >= relay_score.score + DIRECT_TRIAL_RELAY_MARGIN
-                }
+        if trial_direct {
+            let trial_is_viable = match (&direct_score, &relay_score) {
+                (Some(direct_score), Some(_)) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
                 (Some(direct_score), None) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
                 (None, _) => true,
+            };
+
+            if trial_is_viable {
+                let should_hedge_relay =
+                    matches!((&direct_score, &relay_score), (Some(_), Some(_)));
+                let selection = PathSelection::direct(
+                    endpoint,
+                    REASON_PATH_DIRECT_TRIAL,
+                    direct_score
+                        .as_ref()
+                        .map(|score| {
+                            format!(
+                                "recent UDP reachability is in trial window; score={}; sending Direct with Relay hedge until encrypted data confirms",
+                                score.score
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "recent UDP reachability is in trial window; sending Direct with Relay hedge until encrypted data confirms".to_string()
+                        }),
+                    false,
+                )
+                .with_scores(direct_score, relay_score);
+
+                return if should_hedge_relay {
+                    selection.with_relay_hedge()
+                } else {
+                    selection
+                };
             }
-        {
-            return PathSelection::direct(
-                endpoint,
-                REASON_PATH_DIRECT_TRIAL,
-                direct_score
-                    .as_ref()
-                    .map(|score| {
-                        format!(
-                            "recent direct UDP success is in trial window; score={}",
-                            score.score
-                        )
-                    })
-                    .unwrap_or_else(|| "recent direct UDP success is in trial window".to_string()),
-                false,
-            )
-            .with_scores(direct_score, relay_score);
         }
 
         PathSelection::relay(
@@ -4100,7 +4108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_selector_does_not_use_trial_direct_when_relay_scores_higher() {
+    async fn path_selector_uses_hedged_trial_direct_when_relay_scores_higher() {
         let config = test_config();
         let manager = PeerManager::new(config);
         let endpoint: SocketAddr = "127.0.0.1:51839".parse().unwrap();
@@ -4108,13 +4116,21 @@ mod tests {
         manager.add_peer(&test_peer("peer1", endpoint)).await;
         manager.set_relay("peer1", "relay.test:443").await;
         manager.record_direct_probe_success("peer1", endpoint).await;
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.relay_health.rtt_ewma_ms = Some(10);
+            conn.relay_health.success_count = 5;
+        }
 
         let selected = manager.select_path_for_data("peer1", true, true).await;
-        assert_eq!(selected.path, Some(NetworkPath::Relay));
-        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+        assert_eq!(selected.path, Some(NetworkPath::Direct));
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_TRIAL);
+        assert!(selected.relay_hedged);
+        assert!(!selected.direct_confirmed);
         assert!(
             selected.direct_score.as_ref().unwrap().score
-                < selected.relay_score.as_ref().unwrap().score + DIRECT_TRIAL_RELAY_MARGIN
+                < selected.relay_score.as_ref().unwrap().score
         );
     }
 
@@ -4559,8 +4575,12 @@ mod tests {
         assert_eq!(conn.state, ConnectionState::Relay);
         assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
         assert!(conn.direct_health.last_success_at.is_some());
+        let trial = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(trial.path, Some(NetworkPath::Direct));
+        assert_eq!(trial.reason_code, REASON_PATH_DIRECT_TRIAL);
+        assert!(trial.relay_hedged);
         assert!(
-            !manager
+            manager
                 .should_use_direct_for_data("peer1", true, true)
                 .await
         );
