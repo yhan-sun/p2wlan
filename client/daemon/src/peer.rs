@@ -25,6 +25,7 @@ use crate::traversal_history::{
 };
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
+const PEER_REFLEXIVE_STICKY_WINDOW: Duration = Duration::from_secs(10);
 /// Keep relay-backed direct probing alive.
 ///
 /// Relay already provides the data-plane safety net, so direct UDP retries should stay cheap but
@@ -1009,8 +1010,16 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_send_rank(a.state)
-                .cmp(&candidate_pair_send_rank(b.state))
+            candidate_pair_send_rank(a)
+                .cmp(&candidate_pair_send_rank(b))
+                .then_with(|| {
+                    a.success_age()
+                        .unwrap_or(Duration::MAX)
+                        .cmp(&b.success_age().unwrap_or(Duration::MAX))
+                })
+                .then_with(|| {
+                    candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
+                })
                 .then_with(|| {
                     a.rtt_ewma_ms
                         .or(a.rtt_ms)
@@ -1852,6 +1861,31 @@ impl PeerManager {
                             )
                     })
                 })
+    }
+
+    /// Monotonic count of matched bidirectional probe ACKs for one peer and
+    /// generation. Callers can snapshot this before a probe round and require
+    /// it to increase, avoiding false success from an older Succeeded pair.
+    pub async fn direct_probe_success_count_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+    ) -> u64 {
+        if generation != self.current_network_generation().await {
+            return 0;
+        }
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(|conn| {
+                conn.candidate_pairs
+                    .iter()
+                    .filter(|pair| pair.local_generation == generation)
+                    .map(|pair| pair.success_count)
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// Learn an endpoint from an authenticated Probe v2 packet.
@@ -3159,15 +3193,23 @@ fn candidate_pair_probe_rank(state: CandidatePairState) -> u8 {
     }
 }
 
-fn candidate_pair_send_rank(state: CandidatePairState) -> u8 {
-    match state {
+fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
+    match pair.state {
         CandidatePairState::Selected => 0,
-        CandidatePairState::Succeeded => 1,
-        CandidatePairState::Probing => 2,
-        CandidatePairState::Waiting => 3,
-        CandidatePairState::Failed => 4,
-        CandidatePairState::Degraded => 5,
-        CandidatePairState::Frozen => 6,
+        CandidatePairState::Succeeded | CandidatePairState::Probing
+            if pair.source == CandidatePairSource::PeerReflexive
+                && pair.last_probe_at.is_some_and(|last_probe| {
+                    last_probe.elapsed() <= PEER_REFLEXIVE_STICKY_WINDOW
+                }) =>
+        {
+            1
+        }
+        CandidatePairState::Succeeded => 2,
+        CandidatePairState::Probing => 3,
+        CandidatePairState::Waiting => 4,
+        CandidatePairState::Failed => 5,
+        CandidatePairState::Degraded => 6,
+        CandidatePairState::Frozen => 7,
     }
 }
 
@@ -3875,6 +3917,34 @@ mod tests {
         assert_eq!(diagnostic_pair.source, CandidatePairSource::PeerReflexive);
         assert_eq!(diagnostic_pair.probe_count, 2);
         assert!(diagnostic_pair.last_probe_age_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_send_prefers_fresh_authenticated_peer_reflexive_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let signaled_endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
+        let peer_reflexive_endpoint: SocketAddr = "127.0.0.1:51842".parse().unwrap();
+        manager
+            .add_peer(&test_peer("peer1", signaled_endpoint))
+            .await;
+
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                signaled_endpoint,
+                Some(Duration::from_millis(1)),
+            )
+            .await;
+        assert!(
+            manager
+                .learn_authenticated_endpoint("peer1", peer_reflexive_endpoint)
+                .await
+        );
+
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(peer_reflexive_endpoint)
+        );
     }
 
     #[tokio::test]
