@@ -53,8 +53,11 @@ func main() {
 	authService := auth.NewService(jwtSecret, db)
 
 	// Initialize signaling hub
-	hub := signaling.NewHub(db)
-	go hub.Run()
+	hub, err := signaling.NewHubFromEnv()
+	if err != nil {
+		log.Fatalf("Invalid WebSocket signaling configuration: %v", err)
+	}
+	defer hub.Close()
 
 	// Initialize API server
 	apiServer := api.NewServer(authService, hub, db)
@@ -96,8 +99,12 @@ func main() {
 	// Backward-compat: endpoint update accepts user JWT (anyAuth)
 	mux.HandleFunc("PATCH /api/v1/devices/{id}/endpoint", anyAuth(apiServer.UpdateDeviceEndpoint))
 
-	// WebSocket signaling
-	mux.HandleFunc("/ws", signaling.ServeWS(hub, authService))
+	// Device-authenticated WebSocket wake-up channel. Signal payloads remain
+	// durable in the database and are consumed through GET /api/v1/signals.
+	signalWS := deviceAuth(signaling.ServeWS(hub))
+	mux.HandleFunc("GET /api/v1/signals/ws", signalWS)
+	// Secure compatibility alias for pre-v1 endpoint discovery.
+	mux.HandleFunc("GET /ws", signalWS)
 
 	// HTTP server
 	addr := fmt.Sprintf(":%s", port)
@@ -135,6 +142,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("Shutdown error: %v", err)
 	}
+	hub.Close()
 
 	log.Println("Server stopped")
 }

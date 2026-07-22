@@ -771,6 +771,9 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.signalNotifier.notify(req.ToNodeID)
+	if s.hub != nil {
+		s.hub.Notify(req.ToNodeID)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal, "server_time_ms": time.Now().UnixMilli()})
 }

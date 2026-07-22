@@ -12,9 +12,109 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/yhan-sun/p2wlan/server/auth"
 	"github.com/yhan-sun/p2wlan/server/database"
+	"github.com/yhan-sun/p2wlan/server/signaling"
 )
+
+func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("ws-signal@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "ws-source-key", "source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "ws-target-key", "target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+	_, targetToken, err := db.CreateDeviceCredential(target.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential: %v", err)
+	}
+
+	hub := signaling.NewHub()
+	defer hub.Close()
+	wsServer := httptest.NewServer(auth.RequireDeviceAuth(db)(signaling.ServeWS(hub)))
+	defer wsServer.Close()
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 2 * time.Second,
+		Subprotocols:     []string{signaling.ProtocolName},
+	}
+	header := http.Header{"Authorization": []string{"Bearer " + targetToken}}
+	conn, response, err := dialer.Dial("ws"+strings.TrimPrefix(wsServer.URL, "http"), header)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("websocket dial: %v (HTTP %d)", err, response.StatusCode)
+		}
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read ready: %v", err)
+	}
+
+	apiServer := NewServer(nil, hub, db)
+	body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":["203.0.113.10:51820"],"handshake":"abcd"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    source.UserID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	recorder := httptest.NewRecorder()
+	apiServer.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("CreateSignal: HTTP %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read signal notification: %v", err)
+	}
+	var notification struct {
+		Type     string `json:"type"`
+		Sequence uint64 `json:"sequence"`
+	}
+	if err := json.Unmarshal(payload, &notification); err != nil {
+		t.Fatalf("decode notification: %v", err)
+	}
+	if notification.Type != "signals_available" || notification.Sequence != 1 {
+		t.Fatalf("unexpected notification: %+v", notification)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/signals", nil)
+	listReq = listReq.WithContext(context.WithValue(listReq.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  target.ID,
+		NetworkID: target.NetworkID,
+		UserID:    target.UserID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	listRecorder := httptest.NewRecorder()
+	apiServer.ListSignals(listRecorder, listReq)
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("ListSignals: HTTP %d %s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var listed struct {
+		Signals []database.Signal `json:"signals"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode listed signals: %v", err)
+	}
+	if len(listed.Signals) != 1 || listed.Signals[0].FromNodeID != source.ID {
+		t.Fatalf("durable signal missing after WebSocket wake: %+v", listed.Signals)
+	}
+}
 
 func TestParseRelayServersReturnsEmptySliceWhenUnset(t *testing.T) {
 	t.Setenv("RELAY_SERVERS", "")
