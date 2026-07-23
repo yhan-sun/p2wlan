@@ -110,6 +110,25 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Choose the endpoint the desktop shell should poll. An elevated macOS
+/// daemon can outlive the desktop process, while its PID marker may be
+/// missing (for example after a manual restart). In that case the persisted
+/// endpoint remains the authoritative way to rediscover the live daemon.
+fn desktop_diagnostics_url(
+    state_url: String,
+    tracks_daemon: bool,
+    requested_url: Option<String>,
+    persisted_url: Option<String>,
+) -> (String, bool) {
+    if tracks_daemon {
+        return (state_url, false);
+    }
+    if let Some(url) = persisted_url {
+        return (url, true);
+    }
+    (requested_url.unwrap_or(state_url), false)
+}
+
 #[derive(Clone)]
 pub struct DaemonManager {
     state: Arc<Mutex<ManagedDaemonState>>,
@@ -123,14 +142,19 @@ impl DaemonManager {
         let managed_state = {
             let mut managed_state = ManagedDaemonState::new();
             let pid_path = Self::default_pid_path();
+            if let Some(url) = Self::read_persisted_diagnostics_url() {
+                // Do not require the PID marker here. Root-owned daemon
+                // launches can lose that marker while the health endpoint is
+                // still live on a non-default port.
+                managed_state.diagnostics_url = url;
+            }
             if let Some(pid) = Self::read_pid_file(&pid_path) {
                 let is_daemon = Self::process_exists(pid)
                     && Self::process_command_line(pid)
                         .map(|command_line| command_line.contains("p2pnet-daemon"))
                         .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
                 if is_daemon {
-                    if let Some(url) = Self::read_persisted_diagnostics_url() {
-                        managed_state.diagnostics_url = url;
+                    if Self::read_persisted_diagnostics_url().is_some() {
                         managed_state.elevated_started_by_app = true;
                         managed_state.operation = DaemonOperationStatus {
                             phase: DaemonOperationPhase::Running,
@@ -248,17 +272,21 @@ impl DaemonManager {
     }
 
     pub async fn desktop_status(&self, diagnostics_url: Option<String>) -> DesktopStatus {
-        let target_url = {
+        let (state_url, tracks_daemon) = {
             let state = self.state.lock().await;
             let tracks_daemon = state.started_by_app
                 || state.elevated_started_by_app
                 || state.operation.phase != DaemonOperationPhase::Stopped;
-            if tracks_daemon {
-                state.diagnostics_url.clone()
-            } else {
-                diagnostics_url.unwrap_or_else(|| state.diagnostics_url.clone())
-            }
+            (state.diagnostics_url.clone(), tracks_daemon)
         };
+        let (target_url, recovered_persisted_url) = desktop_diagnostics_url(
+            state_url,
+            tracks_daemon,
+            diagnostics_url,
+            (!tracks_daemon)
+                .then(Self::read_persisted_diagnostics_url)
+                .flatten(),
+        );
         let diagnostics_alive = Self::check_endpoint(&target_url).await;
         let tracked_process_alive = if diagnostics_alive {
             false
@@ -292,6 +320,10 @@ impl DaemonManager {
 
         if diagnostics_alive {
             let mut state = self.state.lock().await;
+            if recovered_persisted_url {
+                state.diagnostics_url = target_url.clone();
+                state.elevated_started_by_app = true;
+            }
             state.consecutive_status_failures = 0;
             if !state.operation.phase.is_busy()
                 && state.operation.phase != DaemonOperationPhase::Running
@@ -814,6 +846,13 @@ impl DaemonManager {
         let url = url.trim().to_string();
         Self::diagnostics_socket_addr_from_url(&url)?;
         Some(url)
+    }
+
+    #[cfg(test)]
+    fn read_persisted_diagnostics_url() -> Option<String> {
+        // Keep unit tests isolated from a real desktop daemon that may be
+        // running on the developer machine.
+        None
     }
 
     fn remove_persisted_diagnostics_url() {
@@ -2207,6 +2246,32 @@ mod tests {
         assert!(DaemonOperationPhase::Stopping.is_busy());
         assert!(!DaemonOperationPhase::Running.is_busy());
         assert!(!DaemonOperationPhase::Error.is_busy());
+    }
+
+    #[test]
+    fn persisted_endpoint_recovers_an_untracked_elevated_daemon() {
+        let (url, recovered) = desktop_diagnostics_url(
+            "http://127.0.0.1:39277/status".to_string(),
+            false,
+            Some("http://127.0.0.1:39277/status".to_string()),
+            Some("http://127.0.0.1:39278/status".to_string()),
+        );
+
+        assert_eq!(url, "http://127.0.0.1:39278/status");
+        assert!(recovered);
+    }
+
+    #[test]
+    fn tracked_daemon_keeps_its_selected_endpoint() {
+        let (url, recovered) = desktop_diagnostics_url(
+            "http://127.0.0.1:39278/status".to_string(),
+            true,
+            Some("http://127.0.0.1:39277/status".to_string()),
+            Some("http://127.0.0.1:39279/status".to_string()),
+        );
+
+        assert_eq!(url, "http://127.0.0.1:39278/status");
+        assert!(!recovered);
     }
 
     #[tokio::test]
