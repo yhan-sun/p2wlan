@@ -1237,6 +1237,7 @@ impl Daemon {
                     candidates_expires_at_ms,
                     handshake_init,
                     punch_at_ms,
+                    punch_at_server_ms,
                 } => {
                     info!(
                         "Received peer offer from {} ({} candidates)",
@@ -1267,7 +1268,13 @@ impl Daemon {
                         .await;
                     if !handshake_init.is_empty() {
                         if let Err(err) = self
-                            .handle_peer_offer(&from_node_id, &candidates, &handshake_init)
+                            .handle_peer_offer(
+                                &from_node_id,
+                                &candidates,
+                                &handshake_init,
+                                punch_at_ms,
+                                punch_at_server_ms,
+                            )
                             .await
                         {
                             warn!("Failed to handle peer offer from {from_node_id}: {err}");
@@ -1284,6 +1291,7 @@ impl Daemon {
                     candidates_expires_at_ms,
                     handshake_response,
                     punch_at_ms,
+                    punch_at_server_ms: _,
                 } => {
                     info!(
                         "Received peer answer from {} ({} candidates)",
@@ -1694,6 +1702,8 @@ impl Daemon {
         from_node_id: &str,
         _candidates: &[String],
         handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
     ) -> Result<()> {
         let initiation = MessageInitiation::from_bytes(handshake_init)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard initiation: {e}")))?;
@@ -1720,12 +1730,16 @@ impl Daemon {
             .await;
         if let Err(error) = self
             .control
-            .send_peer_answer_with_sources_and_punch_at(
+            .send_peer_answer_with_sources_and_punch_schedule(
                 from_node_id,
                 &candidates,
                 &candidate_sources,
                 &response_bytes,
-                Some(relay_assisted_punch_at_ms()),
+                // Echo the offer's server deadline so both peers use the
+                // same rendezvous window. WebSocket-only peers have no
+                // server deadline and retain the previous local fallback.
+                punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
+                punch_at_server_ms,
             )
             .await
         {
