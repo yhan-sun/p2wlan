@@ -69,6 +69,7 @@ function daemonStartOptions(settings: ClientSettings) {
     tunInterface: settings.tunInterface,
     udpBind: settings.udpBind,
     udpAdvertise: settings.udpAdvertise,
+    socketPool: settings.socketPool,
     mtu: settings.mtu,
   };
 }
@@ -137,6 +138,7 @@ export function saveSettings(settings: ClientSettings): ApiResult<ClientSettings
     minimizeToTray: normalizeCloseBehavior(settings) === "keep-running",
     udpBind: settings.udpBind.trim(),
     udpAdvertise: settings.udpAdvertise.trim(),
+    socketPool: normalizeSocketPool(settings.socketPool),
   };
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalizedSettings));
   appendLog(`settings saved (control=${settings.controlServer}, mtu=${settings.mtu})`);
@@ -309,6 +311,9 @@ export function validateSettings(settings: ClientSettings): string[] {
       errors.push("公网 UDP 地址不能使用 0.0.0.0 或 ::");
     }
   }
+  if (!isValidSocketPool(settings.socketPool)) {
+    errors.push("增强打洞 socket pool 必须为 off 或 2-4");
+  }
   if (!settings.diagnosticsUrl.trim()) {
     errors.push("诊断地址不能为空");
   } else {
@@ -346,6 +351,24 @@ function isSocketAddress(value: string, allowPortZero: boolean): boolean {
 function isUnspecifiedAddress(value: string): boolean {
   const trimmed = value.trim().toLowerCase();
   return trimmed.startsWith("0.0.0.0:") || trimmed.startsWith("[::]:");
+}
+
+function normalizeSocketPool(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "auto" || normalized === "on" || normalized === "true" || normalized === "yes") {
+    return "3";
+  }
+  if (normalized === "off" || normalized === "false" || normalized === "no" || normalized === "none") {
+    return "off";
+  }
+  return normalized;
+}
+
+function isValidSocketPool(value: string): boolean {
+  const normalized = normalizeSocketPool(value);
+  if (normalized === "off") return true;
+  const count = Number(normalized);
+  return Number.isInteger(count) && count >= 2 && count <= 4;
 }
 
 export function appendLog(line: string): void {
@@ -562,6 +585,31 @@ function activePathSummary(snapshot: DiagnosticsSnapshot): string {
     return `relay (${relay_connections})`;
   }
   return `mixed d${direct_connections}/r${relay_connections}`;
+}
+
+function udpPoolSummary(snapshot: DiagnosticsSnapshot | null): string | null {
+  const socketCount = snapshot?.udp_socket_count ?? 0;
+  if (socketCount <= 1) return null;
+  const members = snapshot?.udp_socket_pool ?? [];
+  const probes = members.reduce((sum, member) => sum + (member.probes_sent ?? 0), 0);
+  const acksReceived = members.reduce((sum, member) => sum + (member.probe_acks_received ?? 0), 0);
+  const acksSent = members.reduce((sum, member) => sum + (member.probe_acks_sent ?? 0), 0);
+  const stunMappings = members.reduce(
+    (sum, member) => sum + (member.stun_mappings_discovered ?? 0),
+    0
+  );
+  return `socket pool=${socketCount} ${snapshot?.udp_socket_pool_active ? "active" : "standby"}, STUN映射=${stunMappings}, probe=${probes}, ACK=${acksReceived}/${acksSent}`;
+}
+
+function natProfileSummary(snapshot: DiagnosticsSnapshot | null): string | null {
+  const profile = snapshot?.nat_profile;
+  if (!profile) return null;
+  const parts = [
+    profile.mapping_behavior ? `mapping=${profile.mapping_behavior}` : null,
+    profile.filtering_behavior ? `filter=${profile.filtering_behavior}` : null,
+    profile.public_endpoint ? `public=${profile.public_endpoint}` : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" ") : null;
 }
 
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
@@ -993,6 +1041,18 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
           : "未连接",
   });
 
+  const udpDetails = !status.reachable
+    ? ["守护进程离线"]
+    : status.udpLocalAddr
+      ? [
+          `已绑定 ${status.udpLocalAddr}`,
+          `直连节点=${status.peerStats.direct_connections}`,
+          snapshot?.local_candidates?.length != null ? `候选=${snapshot.local_candidates.length}` : null,
+          natProfileSummary(snapshot),
+          udpPoolSummary(snapshot),
+        ].filter(Boolean)
+      : ["未获取 UDP 本地地址"];
+
   checks.push({
     id: "udp",
     name: "UDP / 打洞",
@@ -1004,11 +1064,7 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
           ? "pass"
           : "warn"
         : "fail",
-    detail: !status.reachable
-      ? "守护进程离线"
-      : status.udpLocalAddr
-        ? `已绑定 ${status.udpLocalAddr}; 直连节点=${status.peerStats.direct_connections}`
-        : "未获取 UDP 本地地址",
+    detail: udpDetails.join("; "),
   });
 
   const gatewayMapping = snapshot?.gateway_mapping;

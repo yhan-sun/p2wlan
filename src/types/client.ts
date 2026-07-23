@@ -151,13 +151,44 @@ export interface GatewayMappingDiagnostics {
   nat_pmp: GatewayMappingMethodDiagnostics;
 }
 
+export interface NatProfileDiagnostics {
+  mapping_behavior?: string;
+  filtering_behavior?: string;
+  public_endpoint?: string | null;
+  likely_symmetric?: boolean | null;
+  prediction_candidate?: boolean;
+  birthday_candidate?: boolean;
+  observations?: Array<{
+    server: string;
+    mapped_address: string | null;
+    rtt_ms: number | null;
+    error: string | null;
+  }>;
+}
+
+export interface UdpSocketPoolMemberDiagnostics {
+  socket_index: number;
+  probes_sent: number;
+  probe_acks_sent: number;
+  probe_acks_received: number;
+  encrypted_packets_sent: number;
+  encrypted_packets_received: number;
+  stun_mappings_discovered?: number;
+}
+
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
   process_id?: number;
   node_id: string;
   virtual_ip: string;
   network_id: string;
+  network_generation?: number;
   udp_local_addr: string | null;
+  udp_socket_count?: number;
+  udp_socket_pool_active?: boolean;
+  udp_socket_pool?: UdpSocketPoolMemberDiagnostics[];
+  local_candidates?: string[];
+  nat_profile?: NatProfileDiagnostics | null;
   gateway_mapping?: GatewayMappingDiagnostics;
   relay_servers: string[];
   relay_connected: boolean;
@@ -296,6 +327,7 @@ export interface ClientSettings {
   tunInterface: string;
   udpBind: string;
   udpAdvertise: string;
+  socketPool: string;
   diagnosticsUrl: string;
   authToken: string;
   relayPolicy: RelayPolicy;
@@ -339,6 +371,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   tunInterface: DEFAULT_TUN_INTERFACE,
   udpBind: "0.0.0.0:0",
   udpAdvertise: "",
+  socketPool: "3",
   diagnosticsUrl: "http://127.0.0.1:39277/status",
   authToken: "",
   relayPolicy: "auto",

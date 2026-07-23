@@ -1080,7 +1080,7 @@ fn udp_socket_pool_summary(snapshot: &Value) -> Option<String> {
                 .iter()
                 .map(|member| {
                     format!(
-                        "#{} p={} ack={}/{} enc={}/{}",
+                        "#{} p={} ack={}/{} stun={} enc={}/{}",
                         member
                             .get("socket_index")
                             .and_then(Value::as_u64)
@@ -1095,6 +1095,10 @@ fn udp_socket_pool_summary(snapshot: &Value) -> Option<String> {
                             .unwrap_or(0),
                         member
                             .get("probe_acks_sent")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("stun_mappings_discovered")
                             .and_then(Value::as_u64)
                             .unwrap_or(0),
                         member
@@ -2700,7 +2704,7 @@ mod tests {
 
         assert_eq!(
             udp_socket_pool_summary(&snapshot).as_deref(),
-            Some("sockets=3 active #0 p=12 ack=2/3 enc=4/5 #1 p=12 ack=1/0 enc=2/1")
+            Some("sockets=3 active #0 p=12 ack=2/3 stun=0 enc=4/5 #1 p=12 ack=1/0 stun=0 enc=2/1")
         );
     }
 
