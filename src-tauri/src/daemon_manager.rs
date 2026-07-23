@@ -11,6 +11,7 @@ const DIAGNOSTICS_PORT_SCAN_LIMIT: u16 = 32;
 /// A cold elevated start may need to create the TUN device, collect STUN
 /// candidates, and reconnect the control plane before diagnostics is ready.
 /// Keep this aligned with the desktop UI's elevated-start outcome window.
+#[cfg(target_os = "macos")]
 const MACOS_ELEVATED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, serde::Deserialize)]
