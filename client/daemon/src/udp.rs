@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
@@ -18,6 +21,7 @@ use p2pnet_nat::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, trace, warn};
 
@@ -36,6 +40,25 @@ const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
 const PUNCH_ACK_RETRANSMIT_DELAYS_MS: [u64; 2] = [20, 80];
 const PEER_REFLEXIVE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(2);
 
+/// Counters for one local UDP socket in the bounded traversal experiment.
+/// They deliberately contain no endpoint or peer identity so diagnostics can
+/// expose experiment progress without disclosing local network topology.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UdpSocketPoolMemberDiagnostics {
+    /// Stable index for the lifetime of the transport; zero is the primary socket.
+    pub socket_index: usize,
+    /// Successful UDP punch probes sent from this socket.
+    pub probes_sent: u64,
+    /// Punch ACKs sent from this socket after receiving a probe.
+    pub probe_acks_sent: u64,
+    /// Matching punch ACKs received on this socket.
+    pub probe_acks_received: u64,
+    /// Encrypted direct datagrams sent from this socket.
+    pub encrypted_packets_sent: u64,
+    /// Encrypted direct datagrams received on this socket.
+    pub encrypted_packets_received: u64,
+}
+
 /// A peer-reflexive UDP source observed on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerReflexiveObservation {
@@ -49,6 +72,7 @@ pub struct PeerReflexiveObservation {
 struct PendingProbe {
     sent_at: Instant,
     endpoint: SocketAddr,
+    socket_index: usize,
     generation: u64,
     peer_id: Option<String>,
     authenticated: bool,
@@ -116,10 +140,17 @@ fn probe_round_delay(round: u32, probe_interval: Duration) -> Duration {
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
+    /// The primary socket is used for STUN and remains the single-socket
+    /// fallback. Additional sockets, when explicitly enabled, are only used
+    /// for bounded symmetric-NAT traversal experiments.
     socket: Arc<UdpSocket>,
+    sockets: Arc<Vec<Arc<UdpSocket>>>,
     peers: Arc<PeerManager>,
     pending_probes: PendingProbes,
     stun_waiters: StunWaiters,
+    peer_socket_affinity: Arc<Mutex<HashMap<String, usize>>>,
+    socket_pool_active: Arc<AtomicBool>,
+    socket_pool_diagnostics: Arc<Mutex<Vec<UdpSocketPoolMemberDiagnostics>>>,
     peer_reflexive_tx: Option<mpsc::Sender<PeerReflexiveObservation>>,
     peer_reflexive_notifications: PeerReflexiveNotificationState,
     local_node_id: Option<String>,
@@ -134,13 +165,123 @@ impl UdpTransport {
 
         Ok(Self {
             socket: Arc::new(socket),
+            sockets: Arc::new(Vec::new()),
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
             stun_waiters: Arc::new(Mutex::new(HashMap::new())),
+            peer_socket_affinity: Arc::new(Mutex::new(HashMap::new())),
+            socket_pool_active: Arc::new(AtomicBool::new(false)),
+            socket_pool_diagnostics: Arc::new(Mutex::new(vec![UdpSocketPoolMemberDiagnostics {
+                socket_index: 0,
+                ..Default::default()
+            }])),
             peer_reflexive_tx: None,
             peer_reflexive_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_node_id: None,
         })
+    }
+
+    /// Add up to `count - 1` ephemeral sockets for an explicitly enabled
+    /// traversal experiment. The primary socket is always slot zero.
+    pub async fn with_socket_pool(mut self, count: usize) -> Result<Self> {
+        const MAX_SOCKET_POOL_SIZE: usize = 4;
+        let requested = count.clamp(1, MAX_SOCKET_POOL_SIZE);
+        let bind_addr = self.local_addr()?;
+        let pool_bind_addr = SocketAddr::new(bind_addr.ip(), 0);
+        let mut sockets = vec![self.socket.clone()];
+
+        for _ in 1..requested {
+            let socket = UdpSocket::bind(pool_bind_addr).await.map_err(|e| {
+                DaemonError::Network(format!(
+                    "failed to bind UDP socket pool member at {pool_bind_addr}: {e}"
+                ))
+            })?;
+            sockets.push(Arc::new(socket));
+        }
+
+        self.sockets = Arc::new(sockets);
+        *self.socket_pool_diagnostics.lock().await = (0..requested)
+            .map(|socket_index| UdpSocketPoolMemberDiagnostics {
+                socket_index,
+                ..Default::default()
+            })
+            .collect();
+        Ok(self)
+    }
+
+    fn active_sockets(&self) -> &[Arc<UdpSocket>] {
+        if self.sockets.is_empty() {
+            std::slice::from_ref(&self.socket)
+        } else {
+            self.sockets.as_slice()
+        }
+    }
+
+    /// Number of live UDP sockets, including the primary data socket.
+    pub fn socket_count(&self) -> usize {
+        self.active_sockets().len()
+    }
+
+    /// Enable additional socket probing after the NAT profile has qualified
+    /// this network for the experiment. Receive ownership remains active for
+    /// every socket regardless, so an already-open mapping is never missed.
+    pub fn set_socket_pool_active(&self, active: bool) {
+        self.socket_pool_active.store(active, Ordering::Relaxed);
+    }
+
+    pub fn socket_pool_active(&self) -> bool {
+        self.socket_pool_active.load(Ordering::Relaxed) && self.socket_count() > 1
+    }
+
+    /// A stable, endpoint-free view of the bounded socket pool activity.
+    pub async fn socket_pool_diagnostics(&self) -> Vec<UdpSocketPoolMemberDiagnostics> {
+        self.socket_pool_diagnostics.lock().await.clone()
+    }
+
+    async fn update_socket_diagnostics(
+        &self,
+        socket_index: usize,
+        update: impl FnOnce(&mut UdpSocketPoolMemberDiagnostics),
+    ) {
+        if let Some(diagnostics) = self
+            .socket_pool_diagnostics
+            .lock()
+            .await
+            .get_mut(socket_index)
+        {
+            update(diagnostics);
+        }
+    }
+
+    fn punch_socket_count(&self) -> usize {
+        if self.socket_pool_active() {
+            self.socket_count()
+        } else {
+            1
+        }
+    }
+
+    async fn socket_index_for_peer(&self, peer_id: Option<&str>) -> usize {
+        let socket_count = self.socket_count();
+        let Some(peer_id) = peer_id else {
+            return 0;
+        };
+        self.peer_socket_affinity
+            .lock()
+            .await
+            .get(peer_id)
+            .copied()
+            .filter(|index| *index < socket_count)
+            .unwrap_or(0)
+    }
+
+    async fn remember_peer_socket(&self, peer_id: &str, socket_index: usize) {
+        if socket_index < self.socket_count() {
+            self.peer_socket_affinity
+                .lock()
+                .await
+                .insert(peer_id.to_string(), socket_index);
+        }
     }
 
     /// Attach the local control-plane node ID used by authenticated UDP Probe v2.
@@ -187,6 +328,26 @@ impl UdpTransport {
     }
 
     async fn send_probe(&self, peer_id: Option<&str>, peer_addr: SocketAddr) -> Result<ProbeNonce> {
+        let socket_index = self.socket_index_for_peer(peer_id).await;
+        self.send_probe_from_socket(socket_index, peer_id, peer_addr)
+            .await
+    }
+
+    async fn send_probe_from_socket(
+        &self,
+        socket_index: usize,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+    ) -> Result<ProbeNonce> {
+        let socket = self
+            .active_sockets()
+            .get(socket_index)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Network(format!(
+                    "UDP socket pool member {socket_index} is unavailable"
+                ))
+            })?;
         let generation = self.peers.current_network_generation().await;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
             (Some(peer_id), Some(local_node_id))
@@ -222,6 +383,7 @@ impl UdpTransport {
                 PendingProbe {
                     sent_at: Instant::now(),
                     endpoint: peer_addr,
+                    socket_index,
                     generation,
                     peer_id: peer_id.map(str::to_string),
                     authenticated,
@@ -229,24 +391,27 @@ impl UdpTransport {
             );
         }
 
-        if let Err(error) = self.socket.send_to(&bytes, peer_addr).await {
+        if let Err(error) = socket.send_to(&bytes, peer_addr).await {
             self.pending_probes.lock().await.remove(&nonce);
             return Err(DaemonError::Network(format!(
                 "UDP probe send to {peer_addr} failed: {error}"
             )));
         }
 
-        self.retransmit_probe_burst(bytes, peer_addr, peer_id.map(str::to_string));
+        self.update_socket_diagnostics(socket_index, |metrics| metrics.probes_sent += 1)
+            .await;
+
+        self.retransmit_probe_burst(socket, bytes, peer_addr, peer_id.map(str::to_string));
         Ok(nonce)
     }
 
     fn retransmit_probe_burst(
         &self,
+        socket: Arc<UdpSocket>,
         probe: Vec<u8>,
         peer_addr: SocketAddr,
         peer_id: Option<String>,
     ) {
-        let socket = self.socket.clone();
         let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
         tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
@@ -272,13 +437,16 @@ impl UdpTransport {
 
     async fn send_punch_ack_burst(
         &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
         ack: Vec<u8>,
         source: SocketAddr,
         peer_label: impl Into<String>,
     ) -> std::io::Result<()> {
-        self.socket.send_to(&ack, source).await?;
+        socket.send_to(&ack, source).await?;
+        self.update_socket_diagnostics(socket_index, |metrics| metrics.probe_acks_sent += 1)
+            .await;
 
-        let socket = self.socket.clone();
         let peer_label = peer_label.into();
         tokio::spawn(async move {
             for delay_ms in PUNCH_ACK_RETRANSMIT_DELAYS_MS {
@@ -459,21 +627,31 @@ impl UdpTransport {
             }
 
             for &candidate in &round.endpoints {
-                match self.send_probe(Some(peer_id), candidate).await {
-                    Ok(_) => {
-                        packets_sent += 1;
-                        trace!(
-                            "Sent adaptive punch probe round {} to peer {} candidate {}",
-                            round_index + 1,
-                            peer_id,
-                            candidate
-                        );
-                    }
-                    Err(err) => {
-                        debug!(
-                            "Failed to send punch probe to peer {} candidate {}: {}",
-                            peer_id, candidate, err
-                        );
+                // Before a direct path is authenticated, each bounded pool
+                // member gets one independently mapped chance at the remote
+                // candidate. Once a peer has an affinity, normal sends use
+                // that socket rather than changing its NAT mapping.
+                for socket_index in 0..self.punch_socket_count() {
+                    match self
+                        .send_probe_from_socket(socket_index, Some(peer_id), candidate)
+                        .await
+                    {
+                        Ok(_) => {
+                            packets_sent += 1;
+                            trace!(
+                                "Sent adaptive punch probe round {} from socket {} to peer {} candidate {}",
+                                round_index + 1,
+                                socket_index,
+                                peer_id,
+                                candidate
+                            );
+                        }
+                        Err(err) => {
+                            debug!(
+                                "Failed to send punch probe from socket {} to peer {} candidate {}: {}",
+                                socket_index, peer_id, candidate, err
+                            );
+                        }
                     }
                 }
             }
@@ -505,8 +683,13 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
-        let sent = self
-            .socket
+        let socket_index = self.socket_index_for_peer(Some(&packet.peer_id)).await;
+        let socket = self
+            .active_sockets()
+            .get(socket_index)
+            .cloned()
+            .unwrap_or_else(|| self.socket.clone());
+        let sent = socket
             .send_to(&packet.wire_bytes, endpoint)
             .await
             .map_err(|e| {
@@ -525,6 +708,9 @@ impl UdpTransport {
                 packet.wire_bytes.len()
             )));
         }
+
+        self.update_socket_diagnostics(socket_index, |metrics| metrics.encrypted_packets_sent += 1)
+            .await;
 
         debug!(
             "Sent {} encrypted bytes to peer {} at {} (dst={})",
@@ -623,10 +809,37 @@ impl UdpTransport {
         self,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) -> Result<()> {
+        let sockets = self.active_sockets().to_vec();
+        let mut readers = JoinSet::new();
+        for (socket_index, socket) in sockets.into_iter().enumerate() {
+            let transport = self.clone();
+            let inbound_tx = inbound_tx.clone();
+            readers.spawn(async move {
+                transport
+                    .run_inbound_socket(socket_index, socket, inbound_tx)
+                    .await
+            });
+        }
+
+        match readers.join_next().await {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(DaemonError::Network(format!(
+                "UDP socket reader task failed: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    async fn run_inbound_socket(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; 65_535];
 
         loop {
-            let (n, source) = match self.socket.recv_from(&mut buf).await {
+            let (n, source) = match socket.recv_from(&mut buf).await {
                 Ok(packet) => packet,
                 Err(err) if is_ignorable_udp_receive_error(&err) => {
                     debug!("Ignoring transient UDP receive error on direct transport: {err}");
@@ -709,6 +922,8 @@ impl UdpTransport {
                         self.peers
                             .record_direct_probe_success(&identity.source_node_id, source)
                             .await;
+                        self.remember_peer_socket(&identity.source_node_id, socket_index)
+                            .await;
                         self.notify_peer_reflexive_observation(&identity.source_node_id, source)
                             .await;
 
@@ -721,7 +936,13 @@ impl UdpTransport {
                             &key,
                         );
                         match self
-                            .send_punch_ack_burst(ack, source, identity.source_node_id.clone())
+                            .send_punch_ack_burst(
+                                socket_index,
+                                socket.clone(),
+                                ack,
+                                source,
+                                identity.source_node_id.clone(),
+                            )
                             .await
                         {
                             Ok(()) => {
@@ -744,6 +965,7 @@ impl UdpTransport {
                                 .remove(&packet.nonce)
                                 .filter(|pending| {
                                     pending.generation == generation
+                                        && pending.socket_index == socket_index
                                         && pending.peer_id.as_deref()
                                             == Some(identity.source_node_id.as_str())
                                         && pending.authenticated
@@ -752,6 +974,12 @@ impl UdpTransport {
                         };
 
                         if let Some((latency, generation)) = ack_match {
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.probe_acks_received += 1
+                            })
+                            .await;
+                            self.remember_peer_socket(&identity.source_node_id, socket_index)
+                                .await;
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;
@@ -798,7 +1026,13 @@ impl UdpTransport {
                     PunchPacketKind::Punch => {
                         let ack = build_punch_ack(packet.nonce).to_vec();
                         match self
-                            .send_punch_ack_burst(ack, source, source.to_string())
+                            .send_punch_ack_burst(
+                                socket_index,
+                                socket.clone(),
+                                ack,
+                                source,
+                                source.to_string(),
+                            )
                             .await
                         {
                             Ok(()) => {
@@ -809,6 +1043,7 @@ impl UdpTransport {
                                     self.peers
                                         .record_direct_probe_success(&peer_id, source)
                                         .await;
+                                    self.remember_peer_socket(&peer_id, socket_index).await;
                                     self.notify_peer_reflexive_observation(&peer_id, source)
                                         .await;
                                     debug!(
@@ -828,12 +1063,18 @@ impl UdpTransport {
                                 .filter(|pending| {
                                     pending.endpoint == source
                                         && pending.generation == generation
+                                        && pending.socket_index == socket_index
                                         && !pending.authenticated
                                 })
                                 .map(|pending| (pending.sent_at.elapsed(), pending.generation))
                         };
                         if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
                             if let Some((latency, generation)) = ack_match {
+                                self.update_socket_diagnostics(socket_index, |metrics| {
+                                    metrics.probe_acks_received += 1
+                                })
+                                .await;
+                                self.remember_peer_socket(&peer_id, socket_index).await;
                                 self.notify_peer_reflexive_observation(&peer_id, source)
                                     .await;
                                 let accepted = self
@@ -866,8 +1107,14 @@ impl UdpTransport {
             }
 
             if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
+                self.remember_peer_socket(&peer_id, socket_index).await;
                 trace!("Learned encrypted UDP source {source} for peer {peer_id}");
             }
+
+            self.update_socket_diagnostics(socket_index, |metrics| {
+                metrics.encrypted_packets_received += 1
+            })
+            .await;
 
             inbound_tx
                 .send(ReceivedEncryptedPacket {
@@ -1097,6 +1344,121 @@ mod tests {
             .unwrap();
         let packet = decode_punch_packet(&buf[..n]).unwrap();
         assert_eq!(packet.kind, PunchPacketKind::Punch);
+    }
+
+    #[tokio::test]
+    async fn qualified_socket_pool_probes_from_each_bound_socket() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+            .await
+            .unwrap()
+            .with_socket_pool(3)
+            .await
+            .unwrap();
+
+        assert_eq!(transport.socket_count(), 3);
+        assert!(!transport.socket_pool_active());
+        transport.set_socket_pool_active(true);
+        assert!(transport.socket_pool_active());
+
+        let sent = transport
+            .punch_candidates("peer-b", vec![receiver_addr], Duration::ZERO, 1)
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+
+        let mut sources = std::collections::HashSet::new();
+        let mut buf = [0u8; 64];
+        for _ in 0..3 {
+            let (n, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                decode_punch_packet(&buf[..n]).unwrap().kind,
+                PunchPacketKind::Punch
+            );
+            sources.insert(source);
+        }
+        assert_eq!(sources.len(), 3);
+        let diagnostics = transport.socket_pool_diagnostics().await;
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|member| member.probes_sent)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_ack_pins_peer_to_the_socket_that_received_it() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let peers = peer_manager();
+        peers
+            .add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr)))
+            .await;
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_socket_pool(2)
+            .await
+            .unwrap();
+        transport.set_socket_pool_active(true);
+        let primary_addr = transport.local_addr().unwrap();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.clone().run_inbound(inbound_tx));
+
+        assert_eq!(
+            transport
+                .punch_candidates("peer-b", vec![receiver_addr], Duration::ZERO, 1)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let mut buf = [0u8; 64];
+        let mut secondary_probe = None;
+        for _ in 0..2 {
+            let (n, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = decode_punch_packet(&buf[..n]).unwrap();
+            if source != primary_addr {
+                secondary_probe = Some((packet.nonce, source));
+            }
+        }
+        let (nonce, secondary_source) = secondary_probe.expect("expected a pool probe");
+        receiver
+            .send_to(&build_punch_ack(nonce), secondary_source)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if transport
+                    .peer_socket_affinity
+                    .lock()
+                    .await
+                    .get("peer-b")
+                    .copied()
+                    == Some(1)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("ACK should pin the peer to the secondary socket");
+
+        let diagnostics = transport.socket_pool_diagnostics().await;
+        assert_eq!(diagnostics[1].probe_acks_received, 1);
+
+        worker.abort();
     }
 
     #[tokio::test]

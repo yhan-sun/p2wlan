@@ -129,6 +129,13 @@ pub struct NetworkConfig {
     /// Whether to synthesize bounded birthday probing endpoints when NAT profile suggests it.
     #[serde(default = "default_true")]
     pub birthday_probing_enabled: bool,
+    /// Enable the experimental bounded UDP socket pool for hard NATs.
+    /// Disabled by default until a network has passed the NAT-06 A/B baseline.
+    #[serde(default)]
+    pub socket_pool_enabled: bool,
+    /// Total UDP sockets (primary plus experimental members) when the pool is enabled.
+    #[serde(default = "default_socket_pool_size")]
+    pub socket_pool_size: usize,
 }
 
 fn default_cidr() -> String {
@@ -164,6 +171,10 @@ fn default_punch_attempts() -> u32 {
 }
 fn default_keepalive_interval_secs() -> u64 {
     25
+}
+
+fn default_socket_pool_size() -> usize {
+    1
 }
 
 /// Control plane server configuration.
@@ -456,6 +467,8 @@ impl Config {
                 keepalive_interval_secs: default_keepalive_interval_secs(),
                 upnp_enabled: true,
                 birthday_probing_enabled: true,
+                socket_pool_enabled: false,
+                socket_pool_size: default_socket_pool_size(),
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -563,6 +576,14 @@ mod tests {
             decoded.network.birthday_probing_enabled,
             config.network.birthday_probing_enabled
         );
+        assert_eq!(
+            decoded.network.socket_pool_enabled,
+            config.network.socket_pool_enabled
+        );
+        assert_eq!(
+            decoded.network.socket_pool_size,
+            config.network.socket_pool_size
+        );
         assert_eq!(decoded.diagnostics.enabled, config.diagnostics.enabled);
         assert_eq!(decoded.diagnostics.bind, config.diagnostics.bind);
         assert_eq!(
@@ -618,6 +639,8 @@ mod tests {
         assert_eq!(decoded.network.keepalive_interval_secs, 25);
         assert!(decoded.network.upnp_enabled);
         assert!(decoded.network.birthday_probing_enabled);
+        assert!(!decoded.network.socket_pool_enabled);
+        assert_eq!(decoded.network.socket_pool_size, 1);
         assert!(decoded.relay.preferred_regions.is_empty());
         assert_eq!(decoded.relay.selection_timeout_ms, 3000);
         assert!(!decoded.diagnostics.enabled);
@@ -691,5 +714,7 @@ mod tests {
         assert_eq!(config.network.keepalive_interval_secs, 25);
         assert!(config.network.upnp_enabled);
         assert!(config.network.birthday_probing_enabled);
+        assert!(!config.network.socket_pool_enabled);
+        assert_eq!(config.network.socket_pool_size, 1);
     }
 }

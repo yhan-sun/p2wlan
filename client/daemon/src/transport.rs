@@ -388,12 +388,7 @@ mod tests {
         transport
             .add_session(
                 "peer-a",
-                local.with_thresholds(
-                    u64::MAX,
-                    Duration::MAX,
-                    0,
-                    Duration::MAX,
-                ),
+                local.with_thresholds(u64::MAX, Duration::MAX, 0, Duration::MAX),
             )
             .await;
 

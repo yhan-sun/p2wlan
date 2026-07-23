@@ -17,7 +17,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、diagnostics、relay、relay-policy、direct-timeout";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-policy、direct-timeout";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -94,7 +94,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, diagnostics, relay, relay-policy, or direct-timeout
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, relay, relay-policy, or direct-timeout
         key: String,
         value: String,
     },
@@ -557,6 +557,9 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 "UDP local：{}",
                 value_text(&snapshot, "udp_local_addr", "未知")
             );
+            if let Some(summary) = udp_socket_pool_summary(&snapshot) {
+                println!("UDP socket pool：{summary}");
+            }
             print_nat_diagnostics(&snapshot);
             print_traversal_history(&snapshot);
             println!(
@@ -756,6 +759,14 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                     "off"
                 }
             );
+            println!(
+                "socket-pool = {}",
+                if config.network.socket_pool_enabled {
+                    format!("{} sockets (experimental)", config.network.socket_pool_size)
+                } else {
+                    "off".to_string()
+                }
+            );
             println!("relay = {}", config.relay.servers.join(","));
             println!(
                 "relay-policy = {}",
@@ -858,6 +869,29 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
         }
         "birthday-probing" => {
             config.network.birthday_probing_enabled = parse_bool_config(value, "birthday-probing")?;
+        }
+        "socket-pool" => {
+            if is_clear_value(value)
+                || matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "no" | "false"
+                )
+            {
+                config.network.socket_pool_enabled = false;
+                config.network.socket_pool_size = 1;
+            } else {
+                let count = match value.trim().to_ascii_lowercase().as_str() {
+                    "on" | "yes" | "true" => 3,
+                    raw => raw
+                        .parse::<usize>()
+                        .map_err(|_| "socket-pool 必须是 off、on 或 2 到 4 的整数".to_string())?,
+                };
+                if !(2..=4).contains(&count) {
+                    return Err("socket-pool 必须在 2 到 4 之间".to_string());
+                }
+                config.network.socket_pool_enabled = true;
+                config.network.socket_pool_size = count;
+            }
         }
         "diagnostics" => {
             let endpoint = parse_socket_addr(value, "diagnostics")?;
@@ -1029,6 +1063,58 @@ fn print_nat_diagnostics(snapshot: &Value) {
     } else {
         println!("NAT：未采集");
     }
+}
+
+fn udp_socket_pool_summary(snapshot: &Value) -> Option<String> {
+    let socket_count = snapshot.get("udp_socket_count")?.as_u64()?;
+    let active = snapshot
+        .get("udp_socket_pool_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let state = if active { "active" } else { "standby" };
+    let members = snapshot
+        .get("udp_socket_pool")
+        .and_then(Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "#{} p={} ack={}/{} enc={}/{}",
+                        member
+                            .get("socket_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("probes_sent")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("probe_acks_received")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("probe_acks_sent")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("encrypted_packets_sent")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        member
+                            .get("encrypted_packets_received")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|members| !members.is_empty());
+    Some(match members {
+        Some(members) => format!("sockets={socket_count} {state} {members}"),
+        None => format!("sockets={socket_count} {state}"),
+    })
 }
 
 fn nat_profile_summary(snapshot: &Value) -> Option<String> {
@@ -2591,6 +2677,34 @@ mod tests {
     }
 
     #[test]
+    fn udp_socket_pool_summary_includes_activation_and_per_socket_counters() {
+        let snapshot = serde_json::json!({
+            "udp_socket_count": 3,
+            "udp_socket_pool_active": true,
+            "udp_socket_pool": [{
+                "socket_index": 0,
+                "probes_sent": 12,
+                "probe_acks_received": 2,
+                "probe_acks_sent": 3,
+                "encrypted_packets_sent": 4,
+                "encrypted_packets_received": 5
+            }, {
+                "socket_index": 1,
+                "probes_sent": 12,
+                "probe_acks_received": 1,
+                "probe_acks_sent": 0,
+                "encrypted_packets_sent": 2,
+                "encrypted_packets_received": 1
+            }]
+        });
+
+        assert_eq!(
+            udp_socket_pool_summary(&snapshot).as_deref(),
+            Some("sockets=3 active #0 p=12 ack=2/3 enc=4/5 #1 p=12 ack=1/0 enc=2/1")
+        );
+    }
+
+    #[test]
     fn nat_profile_suggestions_explain_udp_blocked_and_symmetric() {
         let blocked = serde_json::json!({
             "local_candidates": ["192.168.2.4:60207"],
@@ -2725,6 +2839,7 @@ mod tests {
         set_config_value(&mut config, "direct-timeout", "7000ms").unwrap();
         set_config_value(&mut config, "upnp", "off").unwrap();
         set_config_value(&mut config, "birthday-probing", "no").unwrap();
+        set_config_value(&mut config, "socket-pool", "3").unwrap();
         assert_eq!(config.network.mtu, 1380);
         assert!(!config.relay.prefer_direct);
         assert_eq!(config.node.device_name, "linux-server");
@@ -2738,6 +2853,11 @@ mod tests {
         assert_eq!(config.relay.fallback_timeout_ms, 7000);
         assert!(!config.network.upnp_enabled);
         assert!(!config.network.birthday_probing_enabled);
+        assert!(config.network.socket_pool_enabled);
+        assert_eq!(config.network.socket_pool_size, 3);
+        set_config_value(&mut config, "socket-pool", "off").unwrap();
+        assert!(!config.network.socket_pool_enabled);
+        assert_eq!(config.network.socket_pool_size, 1);
         set_config_value(&mut config, "udp-advertise", "off").unwrap();
         assert!(config.network.udp_advertise.is_none());
         set_config_value(&mut config, "stun", "off").unwrap();

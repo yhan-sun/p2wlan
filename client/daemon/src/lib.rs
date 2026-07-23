@@ -62,7 +62,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 use p2pnet_crypto::NodeIdentity;
-use p2pnet_nat::{CandidateGatherReport, CandidateSource, NatProfile};
+use p2pnet_nat::{
+    CandidateGatherReport, CandidateSource, FilteringBehavior, MappingBehavior, NatProfile,
+};
 use rand::RngCore;
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
@@ -501,6 +503,8 @@ impl Daemon {
             configured_keepalive.min(DIRECT_LIVENESS_INTERVAL_MAX)
         };
         let upnp_enabled = self.config.network.upnp_enabled;
+        let socket_pool_enabled = self.config.network.socket_pool_enabled;
+        let socket_pool_size = self.config.network.socket_pool_size;
         let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
@@ -629,6 +633,19 @@ impl Daemon {
             .spawn_result("udp-direct", false, async move {
                 match UdpTransport::bind(udp_bind, peers.clone()).await {
                     Ok(udp) => {
+                        let udp = if socket_pool_enabled {
+                            match udp.clone().with_socket_pool(socket_pool_size).await {
+                                Ok(udp) => udp,
+                                Err(error) => {
+                                    warn!(
+                                        "Failed to create experimental UDP socket pool; using the primary socket only: {error}"
+                                    );
+                                    udp
+                                }
+                            }
+                        } else {
+                            udp
+                        };
                         let (peer_reflexive_tx, peer_reflexive_rx) = mpsc::channel(128);
                         let udp = udp
                             .with_local_node_id(local_node_id.clone())
@@ -662,6 +679,24 @@ impl Daemon {
                                         report.nat_profile.confidence
                                     );
                                     peers.update_nat_profile(report.nat_profile.clone()).await;
+                                    let pool_eligible = socket_pool_enabled
+                                        && report.nat_profile.mapping_behavior
+                                            == MappingBehavior::AddressOrPortDependent
+                                        && report.nat_profile.filtering_behavior
+                                            == FilteringBehavior::AddressOrPortDependent;
+                                    udp.set_socket_pool_active(pool_eligible);
+                                    if udp.socket_count() > 1 {
+                                        info!(
+                                            "Experimental UDP socket pool: sockets={} active={} reason={}",
+                                            udp.socket_count(),
+                                            udp.socket_pool_active(),
+                                            if pool_eligible {
+                                                "address/port-dependent mapping and filtering"
+                                            } else {
+                                                "NAT profile did not qualify"
+                                            }
+                                        );
+                                    }
                                     *nat_profile.write().await = Some(report.nat_profile);
                                     (endpoints, sources)
                                 }
