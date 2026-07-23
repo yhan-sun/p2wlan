@@ -314,6 +314,16 @@ impl RouteManager {
             });
         }
 
+        if existing.is_empty()
+            && windows_netsh_route_exists_on_interface(&destination_prefix, &interface)
+        {
+            info!(
+                "Route for {destination_prefix} already exists on {interface} according to netsh — treating as idempotent, not owned"
+            );
+            windows_ensure_icmp_echo_firewall_rule(&destination_prefix);
+            return Ok(());
+        }
+
         if !existing.is_empty() {
             if existing
                 .iter()
@@ -527,7 +537,22 @@ fn windows_route_already_exists_message(stdout: &str, stderr: &str) -> bool {
     let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     text.contains("already exists")
         || text.contains("object already exists")
+        || text.contains("对象已存在")
+        || text.contains("物件已存在")
+        || text.contains("路由已存在")
         || (text.contains("msft_netroute") && text.contains("system error 87"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_netsh_route_output_has_interface(
+    stdout: &str,
+    destination_prefix: &str,
+    interface: &str,
+) -> bool {
+    let interface = interface.to_ascii_lowercase();
+    stdout.lines().any(|line| {
+        line.contains(destination_prefix) && line.to_ascii_lowercase().contains(&interface)
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -558,6 +583,41 @@ fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str) {
             warn!(
                 "Could not run Windows firewall ICMPv4 echo rule command for {destination_prefix}: {err}"
             );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_netsh_route_exists_on_interface(destination_prefix: &str, interface: &str) -> bool {
+    let output = windows_command_output_with_timeout(
+        {
+            let mut command = windows_hidden_command("netsh.exe");
+            command
+                .args(["interface", "ipv4", "show", "route"])
+                .arg("level=verbose")
+                .arg("store=active");
+            command
+        },
+        std::time::Duration::from_secs(8),
+    );
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            windows_netsh_route_output_has_interface(&stdout, destination_prefix, interface)
+        }
+        Ok(output) => {
+            warn!(
+                "Could not query Windows route table with netsh for {destination_prefix} via {interface}: {}",
+                command_failure_detail(&output)
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                "Could not run netsh route query for {destination_prefix} via {interface}: {err}"
+            );
+            false
         }
     }
 }
@@ -614,6 +674,16 @@ fn windows_netsh_add_route(
             "routing conflict: route to {destination_prefix} already exists on another interface: {}",
             existing_after.join(", ")
         )));
+    }
+
+    if windows_netsh_route_exists_on_interface(destination_prefix, interface) {
+        if let Ok(mut added) = manager.routes_added.lock() {
+            added.push((network, mask));
+        }
+        info!(
+            "Windows route for {destination_prefix} via {interface} exists after netsh fallback failure"
+        );
+        return Ok(());
     }
 
     Err(crate::DaemonError::Network(format!(
@@ -900,9 +970,31 @@ mod windows_helper_tests {
             "",
             "FullyQualifiedErrorId : Windows System Error 87,New-NetRoute\nMSFT_NetRoute"
         ));
+        assert!(windows_route_already_exists_message("", "对象已存在。"));
+        assert!(windows_route_already_exists_message("", "路由已存在。"));
         assert!(!windows_route_already_exists_message(
             "",
             "New-NetRoute : Access is denied"
+        ));
+    }
+
+    #[test]
+    fn detects_netsh_route_output_for_interface() {
+        let output = "\
+Publish  Type      Met  Prefix          Idx  Gateway/Interface Name
+-------  --------  ---  --------------  ---  ----------------------
+No       Manual    256  10.20.0.0/16     42  p2wlan
+No       Manual    256  10.21.0.0/16     43  Ethernet";
+
+        assert!(windows_netsh_route_output_has_interface(
+            output,
+            "10.20.0.0/16",
+            "P2WLAN"
+        ));
+        assert!(!windows_netsh_route_output_has_interface(
+            output,
+            "10.21.0.0/16",
+            "p2wlan"
         ));
     }
 }
