@@ -20,7 +20,7 @@ use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
 use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
 use crate::tasks::{HealthState, TaskManager};
 use crate::traversal_history::TraversalHistoryDiagnostics;
-use crate::udp::UdpTransport;
+use crate::udp::{UdpSocketPoolMemberDiagnostics, UdpTransport};
 
 /// Runtime diagnostics snapshot returned by the local endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +31,12 @@ pub struct DiagnosticsSnapshot {
     pub network_id: String,
     pub network_generation: u64,
     pub udp_local_addr: Option<String>,
+    /// Number of live direct UDP sockets (one unless the bounded experiment is enabled).
+    pub udp_socket_count: usize,
+    /// Whether the experimental socket pool is actively used for punch probes.
+    pub udp_socket_pool_active: bool,
+    /// Per-socket counters for the bounded UDP traversal experiment.
+    pub udp_socket_pool: Vec<UdpSocketPoolMemberDiagnostics>,
     pub local_candidates: Vec<String>,
     pub nat_profile: Option<NatProfile>,
     pub gateway_mapping: GatewayMappingDiagnostics,
@@ -208,13 +214,17 @@ fn allowed_cors_origin(request: &str) -> Option<&str> {
 }
 
 async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
-    let udp_local_addr = context
-        .udp_transport
-        .read()
-        .await
+    let udp = context.udp_transport.read().await.clone();
+    let udp_local_addr = udp
         .as_ref()
         .and_then(|udp| udp.local_addr().ok())
         .map(|addr| addr.to_string());
+    let udp_socket_count = udp.as_ref().map(UdpTransport::socket_count).unwrap_or(0);
+    let udp_socket_pool_active = udp.as_ref().is_some_and(UdpTransport::socket_pool_active);
+    let udp_socket_pool = match udp.as_ref() {
+        Some(udp) => udp.socket_pool_diagnostics().await,
+        None => Vec::new(),
+    };
     let relay_connected = context.relay_transport.read().await.is_some();
     let direct_retry_after = Duration::from_millis(context.config.relay.fallback_timeout_ms);
 
@@ -240,6 +250,9 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation().await,
         udp_local_addr,
+        udp_socket_count,
+        udp_socket_pool_active,
+        udp_socket_pool,
         local_candidates: context.local_candidates.read().await.clone(),
         nat_profile: context.nat_profile.read().await.clone(),
         gateway_mapping: context.gateway_mapping.read().await.clone(),
