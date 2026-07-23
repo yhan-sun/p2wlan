@@ -231,6 +231,9 @@ pub enum ControlEvent {
         candidates_expires_at_ms: Option<u64>,
         handshake_init: Vec<u8>,
         punch_at_ms: Option<u64>,
+        /// Server-clock deadline backing `punch_at_ms`, when supplied by the
+        /// REST signaling endpoint. This keeps offer and answer on one window.
+        punch_at_server_ms: Option<u64>,
     },
     /// Received a peer answer.
     PeerAnswer {
@@ -241,6 +244,7 @@ pub enum ControlEvent {
         candidates_expires_at_ms: Option<u64>,
         handshake_response: Vec<u8>,
         punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
     },
     /// A peer relayed back the UDP source endpoint it observed for us.
     PeerReflexive {
@@ -420,6 +424,7 @@ enum ControlCommand {
         candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
         punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Send a relay-assisted peer-reflexive observation.
@@ -620,6 +625,28 @@ impl ControlClient {
         handshake_response: &[u8],
         punch_at_ms: Option<u64>,
     ) -> Result<()> {
+        self.send_peer_answer_with_sources_and_punch_schedule(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_response,
+            punch_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Send a peer answer while preserving a server-selected rendezvous
+    /// deadline from the offer when one is available.
+    pub async fn send_peer_answer_with_sources_and_punch_schedule(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_response: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerAnswer {
@@ -628,6 +655,7 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_response: handshake_response.to_vec(),
                 punch_at_ms,
+                punch_at_server_ms,
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
@@ -782,6 +810,7 @@ impl ControlClient {
                     candidates_expires_at_ms,
                     handshake_init,
                     punch_at_ms,
+                    punch_at_server_ms: None,
                 });
             }
 
@@ -803,6 +832,7 @@ impl ControlClient {
                     candidates_expires_at_ms,
                     handshake_response,
                     punch_at_ms,
+                    punch_at_server_ms: None,
                 });
             }
 
@@ -1540,7 +1570,7 @@ async fn run_control_loop(
                             let _ = response_tx.send(res);
                         }
                         ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init, punch_at_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms).await;
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms, None).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer offer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
@@ -1553,8 +1583,8 @@ async fn run_control_loop(
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, punch_at_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms).await;
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, punch_at_ms, punch_at_server_ms, response_tx } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms, punch_at_server_ms).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer answer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
@@ -1572,7 +1602,7 @@ async fn run_control_loop(
                             let candidate_sources = HashMap::from([
                                 (observed_endpoint.clone(), "peer_reflexive".to_string())
                             ]);
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms).await;
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms, None).await;
                             match &res {
                                 Ok(()) => {
                                     debug!(
@@ -1903,6 +1933,7 @@ async fn send_signal(
     candidate_sources: &HashMap<String, String>,
     handshake: &[u8],
     punch_at_ms: Option<u64>,
+    punch_at_server_ms: Option<u64>,
 ) -> Result<()> {
     // Keep the revision and expiry derived from one instant: a candidate set
     // must have a coherent lifetime even if the wall clock is adjusted while
@@ -1922,6 +1953,7 @@ async fn send_signal(
             "candidates_expires_at_ms": client_time_ms.saturating_add(45_000),
             "handshake": hex::encode(handshake),
             "punch_at_ms": punch_at_ms,
+            "punch_at_server_ms": punch_at_server_ms,
             "client_time_ms": client_time_ms,
         }))
         .send()
@@ -1984,6 +2016,7 @@ async fn poll_signals(
     for signal in body.signals {
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
+        let punch_at_server_ms = signal.punch_at_ms.filter(|_| server_time_ms.is_some());
         let candidates_expires_at_ms = normalize_signal_candidate_expiry(
             signal.candidates_expires_at_ms,
             server_time_ms,
@@ -2007,6 +2040,7 @@ async fn poll_signals(
                     candidates_expires_at_ms,
                     handshake_init: handshake,
                     punch_at_ms,
+                    punch_at_server_ms,
                 });
             }
             "peer_answer" => {
@@ -2018,6 +2052,7 @@ async fn poll_signals(
                     candidates_expires_at_ms,
                     handshake_response: handshake,
                     punch_at_ms,
+                    punch_at_server_ms,
                 });
             }
             "peer_reflexive" => {

@@ -637,7 +637,11 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		CandidatesExpiresAtMS int64             `json:"candidates_expires_at_ms"`
 		Handshake             string            `json:"handshake"`
 		PunchAtMS             int64             `json:"punch_at_ms"`
-		ClientTimeMS          int64             `json:"client_time_ms"`
+		// PunchAtServerMS echoes an already normalized server deadline from
+		// an offer. It lets the answer join the same synchronized punch window
+		// instead of scheduling a second one after the round trip.
+		PunchAtServerMS int64 `json:"punch_at_server_ms"`
+		ClientTimeMS    int64 `json:"client_time_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -723,7 +727,13 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		candidatesExpiresAtMS = nowMS + candidateLifetimeMS
 	}
 	normalizedPunchAtMS := req.PunchAtMS
-	if req.PunchAtMS > 0 && req.ClientTimeMS > 0 {
+	if req.PunchAtServerMS > 0 {
+		if req.PunchAtServerMS < nowMS-10*60*1000 || req.PunchAtServerMS > nowMS+10*60*1000 {
+			http.Error(w, `{"error":"punch_at_server_ms outside allowed window"}`, http.StatusBadRequest)
+			return
+		}
+		normalizedPunchAtMS = req.PunchAtServerMS
+	} else if req.PunchAtMS > 0 && req.ClientTimeMS > 0 {
 		delayMS := req.PunchAtMS - req.ClientTimeMS
 		if delayMS < 0 {
 			delayMS = 0

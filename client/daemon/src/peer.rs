@@ -930,11 +930,15 @@ impl PeerConnection {
                     )
                 })
                 .then_with(|| {
-                    candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
+                    discovered_endpoint_probe_rank(a.source)
+                        .cmp(&discovered_endpoint_probe_rank(b.source))
                 })
                 .then_with(|| {
                     endpoint_probe_rank(a.remote_endpoint)
                         .cmp(&endpoint_probe_rank(b.remote_endpoint))
+                })
+                .then_with(|| {
+                    candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
                 .then_with(|| a.probe_count.cmp(&b.probe_count))
                 .then_with(|| a.consecutive_failures.cmp(&b.consecutive_failures))
@@ -1804,7 +1808,16 @@ impl PeerManager {
 
     /// Add ICE candidates for a peer.
     pub async fn add_candidates(&self, node_id: &str, candidates: &[String]) {
-        self.add_candidates_with_metadata(node_id, candidates, &HashMap::new(), 0, None)
+        // This compatibility API has always meant explicitly signaled
+        // candidates.  Preserve that behavior; wire signals which genuinely
+        // omit metadata enter through `add_candidates_with_metadata` and are
+        // classified from their address there.
+        let sources = candidates
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate, "signaled".to_string()))
+            .collect::<HashMap<_, _>>();
+        self.add_candidates_with_metadata(node_id, candidates, &sources, 0, None)
             .await;
     }
 
@@ -1907,10 +1920,13 @@ impl PeerManager {
                     conn.candidates.push(c.clone());
                 }
                 conn.signaled_candidates.insert(c.clone());
+                // Old peers did not send candidate_sources.  Classifying
+                // their literal socket address keeps a private LAN candidate
+                // from taking precedence over a public server-reflexive one.
                 let source = candidate_sources
                     .get(c)
                     .and_then(|value| candidate_pair_source_from_label(value))
-                    .unwrap_or(CandidatePairSource::Signaled);
+                    .unwrap_or_else(|| infer_unlabeled_candidate_source(c));
                 conn.candidate_sources.insert(c.clone(), source);
                 if let Ok(endpoint) = c.parse::<SocketAddr>() {
                     conn.ensure_candidate_pair_with_source(endpoint, generation, source);
@@ -3181,6 +3197,19 @@ fn candidate_pair_source_from_label(label: &str) -> Option<CandidatePairSource> 
     }
 }
 
+/// Best-effort compatibility classification for candidate sets from older
+/// clients that predate `candidate_sources` metadata.  A public socket is not
+/// proof that it was STUN-derived, but it is the safest first-round target for
+/// a cross-LAN punch; RFC1918/link-local addresses remain host candidates.
+fn infer_unlabeled_candidate_source(candidate: &str) -> CandidatePairSource {
+    candidate
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+        .map(|_| CandidatePairSource::StunObserved)
+        .unwrap_or(CandidatePairSource::Host)
+}
+
 fn candidate_pair_source_quality_rank(
     stats: &[CandidatePairSourceStats],
     history: &TraversalHistory,
@@ -3213,6 +3242,17 @@ fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
         CandidatePairSource::Signaled => 7,
         CandidatePairSource::Predicted => 8,
         CandidatePairSource::Birthday => 9,
+    }
+}
+
+/// An endpoint observed from an authenticated packet is more valuable than
+/// address-family ranking: it already proves that the peer can reach us.
+/// Everything else is ordered by public-vs-private reachability first.
+fn discovered_endpoint_probe_rank(source: CandidatePairSource) -> u8 {
+    match source {
+        CandidatePairSource::PeerReflexive => 0,
+        CandidatePairSource::Learned => 1,
+        _ => 2,
     }
 }
 
