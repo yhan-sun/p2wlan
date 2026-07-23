@@ -269,6 +269,23 @@ export default function SettingsPage() {
               </div>
 
               <div className="form-group">
+                <label className="form-label">增强打洞 socket pool</label>
+                <select
+                  className="form-input text-mono"
+                  value={settings.socketPool}
+                  onChange={(e) => handleFieldChange("socketPool", e.target.value)}
+                >
+                  <option value="off">off</option>
+                  <option value="2">2 sockets</option>
+                  <option value="3">3 sockets（推荐）</option>
+                  <option value="4">4 sockets</option>
+                </select>
+                <span className="form-hint">
+                  仅在守护进程判断本机为地址/端口依赖 NAT 时激活，用多条受控 UDP 映射增加打洞机会。
+                </span>
+              </div>
+
+              <div className="form-group">
                 <label className="form-label">本地守护进程诊断端口 (URL)</label>
                 <input
                   className="form-input text-mono"

@@ -85,6 +85,10 @@ struct Cli {
     #[arg(long, name = "punch-attempts")]
     punch_attempts: Option<u32>,
 
+    /// Enable bounded UDP socket pool for hard NATs: off, on, or 2-4
+    #[arg(long, name = "socket-pool")]
+    socket_pool: Option<String>,
+
     /// Override keepalive interval (seconds)
     #[arg(long, name = "keepalive-interval-secs")]
     keepalive_interval_secs: Option<u64>,
@@ -214,6 +218,10 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
             }
         }
     }
+    if let Some(ref socket_pool) = cli.socket_pool {
+        parse_socket_pool_override(socket_pool)
+            .map_err(|error| format!("Invalid --socket-pool: {error}"))?;
+    }
     if let Some(ref durl) = cli.diagnostics_url {
         let parsed = match reqwest::Url::parse(durl) {
             Ok(url) => url,
@@ -227,6 +235,27 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn parse_socket_pool_override(value: &str) -> std::result::Result<(bool, usize), String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "off" | "no" | "false" | "none" | "disable" | "disabled"
+    ) {
+        return Ok((false, 1));
+    }
+
+    let count = match normalized.as_str() {
+        "on" | "yes" | "true" | "auto" => 3,
+        raw => raw
+            .parse::<usize>()
+            .map_err(|_| "expected off, on/auto, or an integer from 2 to 4".to_string())?,
+    };
+    if !(2..=4).contains(&count) {
+        return Err("expected socket count from 2 to 4".to_string());
+    }
+    Ok((true, count))
 }
 
 fn is_valid_stun_server_spec(value: &str) -> bool {
@@ -514,6 +543,12 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if let Some(attempts) = cli.punch_attempts {
         config.network.punch_attempts = attempts;
     }
+    if let Some(ref socket_pool) = cli.socket_pool {
+        if let Ok((enabled, count)) = parse_socket_pool_override(socket_pool) {
+            config.network.socket_pool_enabled = enabled;
+            config.network.socket_pool_size = count;
+        }
+    }
     if let Some(interval_secs) = cli.keepalive_interval_secs {
         config.network.keepalive_interval_secs = interval_secs;
     }
@@ -583,6 +618,7 @@ mod tests {
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,
+            socket_pool: Some("3".to_string()),
             keepalive_interval_secs: None,
             relay: Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string()),
             relay_regions: Some("cn-east,us-west".to_string()),
@@ -609,6 +645,8 @@ mod tests {
         );
         assert_eq!(config.relay.preferred_regions, vec!["cn-east", "us-west"]);
         assert_eq!(config.relay.selection_timeout_ms, 750);
+        assert!(config.network.socket_pool_enabled);
+        assert_eq!(config.network.socket_pool_size, 3);
     }
 
     #[test]
@@ -633,6 +671,7 @@ mod tests {
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,
+            socket_pool: None,
             keepalive_interval_secs: None,
             relay: None,
             relay_regions: None,
@@ -709,6 +748,12 @@ mod tests {
         assert!(validate_cli(&cli).is_ok());
 
         cli.stun = Some("not-a-stun-server".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        cli.stun = None;
+        cli.socket_pool = Some("4".to_string());
+        assert!(validate_cli(&cli).is_ok());
+        cli.socket_pool = Some("5".to_string());
         assert!(validate_cli(&cli).is_err());
     }
 

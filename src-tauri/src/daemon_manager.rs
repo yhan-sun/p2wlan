@@ -25,6 +25,7 @@ pub struct DaemonStartOptions {
     pub tun_interface: Option<String>,
     pub udp_bind: Option<String>,
     pub udp_advertise: Option<String>,
+    pub socket_pool: Option<String>,
     pub mtu: Option<u32>,
 }
 
@@ -1314,6 +1315,7 @@ impl DaemonManager {
         push_pair("--interface", options.tun_interface.as_deref());
         push_pair("--udp-bind", options.udp_bind.as_deref());
         push_pair("--udp-advertise", options.udp_advertise.as_deref());
+        push_pair("--socket-pool", options.socket_pool.as_deref());
         if let Some(mtu) = options.mtu {
             args.push("--mtu".to_string());
             args.push(mtu.to_string());
@@ -1605,6 +1607,7 @@ impl DaemonManager {
             tun_interface: None,
             udp_bind: None,
             udp_advertise: None,
+            socket_pool: None,
             mtu: None,
         });
         let preferred_url = {
@@ -1732,6 +1735,7 @@ impl DaemonManager {
             tun_interface: None,
             udp_bind: None,
             udp_advertise: None,
+            socket_pool: None,
             mtu: None,
         });
         let preferred_url = {
@@ -2141,6 +2145,7 @@ mod tests {
             tun_interface: Some("p2wlan-test".to_string()),
             udp_bind: Some("0.0.0.0:60207".to_string()),
             udp_advertise: Some("203.0.113.10:60207".to_string()),
+            socket_pool: Some("3".to_string()),
             mtu: Some(1420),
         }
     }
@@ -2603,6 +2608,7 @@ mod tests {
             "tunInterface": "p2pnet0",
             "udpBind": "0.0.0.0:60207",
             "udpAdvertise": "203.0.113.10:60207",
+            "socketPool": "3",
             "mtu": 1420
         });
         let options: DaemonStartOptions = serde_json::from_value(json).unwrap();
@@ -2620,6 +2626,7 @@ mod tests {
         assert_eq!(options.tun_interface.as_deref(), Some("p2pnet0"));
         assert_eq!(options.udp_bind.as_deref(), Some("0.0.0.0:60207"));
         assert_eq!(options.udp_advertise.as_deref(), Some("203.0.113.10:60207"));
+        assert_eq!(options.socket_pool.as_deref(), Some("3"));
         assert_eq!(options.mtu, Some(1420));
     }
 
@@ -2637,6 +2644,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--udp-advertise", "203.0.113.10:60207"]));
+        assert!(args.windows(2).any(|pair| pair == ["--socket-pool", "3"]));
     }
 
     #[test]

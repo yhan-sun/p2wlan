@@ -170,6 +170,7 @@ Linux 桌面安装包仍在完善中；当前 release 优先提供 headless/serv
 | `udp-bind` | `0.0.0.0:60207` | 本机直连 UDP 监听地址；云服务器建议固定端口 |
 | `udp-advertise` | `203.0.113.10:60207` | 发布给其他节点的公网 UDP 地址；用 `off` 清空 |
 | `stun` | `stun.cloudflare.com:3478,stun.miwifi.com:3478,stun.l.google.com:19302` | STUN 服务器列表，支持域名或 IP；用 `off` 禁用 |
+| `socket-pool` | `3` / `off` | 地址/端口依赖 NAT 下的增强打洞实验；守护进程只在 NAT profile 命中时激活，取值 2–4 |
 | `diagnostics` | `127.0.0.1:39277` | 本机诊断端点，只允许回环地址 |
 | `relay` | `default@47.109.40.237:18081` | Relay 候选列表 |
 | `relay-policy` | `auto` / `relay` | `auto` 优先直连，`relay` 强制中继 |
