@@ -2052,6 +2052,43 @@ impl PeerManager {
         true
     }
 
+    /// Learn an endpoint from a legacy ACK correlated to an outstanding nonce.
+    ///
+    /// The caller must verify the nonce, generation, local socket, and source
+    /// IP before using this method. Unlike Probe v2 learning, this endpoint is
+    /// deliberately classified as merely learned rather than peer-reflexive.
+    pub async fn learn_correlated_probe_endpoint(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> bool {
+        let generation = self.current_network_generation().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+
+        if let Some(previous_endpoint) = conn.endpoint {
+            let previous_endpoint_text = previous_endpoint.to_string();
+            if !conn.candidates.contains(&previous_endpoint_text) {
+                conn.candidates.push(previous_endpoint_text);
+            }
+        }
+        conn.endpoint = Some(endpoint);
+        let endpoint_text = endpoint.to_string();
+        if !conn.candidates.contains(&endpoint_text) {
+            conn.candidates.push(endpoint_text.clone());
+        }
+        conn.candidate_sources
+            .insert(endpoint_text, CandidatePairSource::Learned);
+        conn.mark_candidate_pair_probing_with_source(
+            endpoint,
+            generation,
+            CandidatePairSource::Learned,
+        );
+        true
+    }
+
     /// Learn a candidate endpoint after receiving a probe or packet from that address.
     ///
     /// This intentionally does not mark the peer as Direct. UDP punch probes only
@@ -3604,6 +3641,27 @@ mod tests {
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.signaled_endpoint, None);
         assert_eq!(conn.endpoint, Some(learned));
+    }
+
+    #[tokio::test]
+    async fn correlated_legacy_probe_endpoint_is_not_marked_authenticated() {
+        let manager = PeerManager::new(test_config());
+        let peer = test_peer("peer1", "1.2.3.4:5000".parse().unwrap());
+        manager.add_peer(&peer).await;
+        let learned: SocketAddr = "1.2.3.4:6001".parse().unwrap();
+
+        assert!(
+            manager
+                .learn_correlated_probe_endpoint("peer1", learned)
+                .await
+        );
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.endpoint, Some(learned));
+        assert_eq!(
+            conn.candidate_sources.get(&learned.to_string()),
+            Some(&CandidatePairSource::Learned)
+        );
     }
 
     #[tokio::test]

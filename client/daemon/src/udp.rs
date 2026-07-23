@@ -79,6 +79,19 @@ struct PendingProbe {
     accepts_legacy_ack: bool,
 }
 
+fn legacy_ack_matches_pending(
+    pending: &PendingProbe,
+    source: SocketAddr,
+    generation: u64,
+    socket_index: usize,
+) -> bool {
+    pending.generation == generation
+        && pending.socket_index == socket_index
+        && pending.accepts_legacy_ack
+        && (pending.endpoint == source
+            || (pending.peer_id.is_some() && pending.endpoint.ip() == source.ip()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeScheduleRound {
     delay_before: Duration,
@@ -1111,10 +1124,12 @@ impl UdpTransport {
                             let matched = pending_probes
                                 .get(&packet.nonce)
                                 .filter(|pending| {
-                                    pending.endpoint == source
-                                        && pending.generation == generation
-                                        && pending.socket_index == socket_index
-                                        && pending.accepts_legacy_ack
+                                    legacy_ack_matches_pending(
+                                        pending,
+                                        source,
+                                        generation,
+                                        socket_index,
+                                    )
                                 })
                                 .map(|pending| {
                                     (
@@ -1128,12 +1143,18 @@ impl UdpTransport {
                             }
                             matched
                         };
-                        let learned_peer_id = self.peers.learn_endpoint_from_addr(source).await;
-                        let peer_id = learned_peer_id.or_else(|| {
-                            ack_match
-                                .as_ref()
-                                .and_then(|(_, _, peer_id)| peer_id.clone())
-                        });
+                        let pending_peer_id = ack_match
+                            .as_ref()
+                            .and_then(|(_, _, peer_id)| peer_id.clone());
+                        let peer_id = match pending_peer_id.as_ref() {
+                            Some(peer_id) => {
+                                self.peers
+                                    .learn_correlated_probe_endpoint(peer_id, source)
+                                    .await;
+                                Some(peer_id.clone())
+                            }
+                            None => self.peers.learn_endpoint_from_addr(source).await,
+                        };
                         if let Some(peer_id) = peer_id {
                             if let Some((latency, generation, _)) = ack_match {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
@@ -1291,6 +1312,38 @@ mod tests {
         config.node.public_key = hex::encode(identity.public_key());
         config.node.private_key = hex::encode(identity.private_key());
         config
+    }
+
+    #[test]
+    fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
+        let pending = PendingProbe {
+            sent_at: Instant::now(),
+            endpoint: "203.0.113.10:40000".parse().unwrap(),
+            socket_index: 2,
+            generation: 7,
+            peer_id: Some("peer-b".to_string()),
+            accepts_authenticated_ack: true,
+            accepts_legacy_ack: true,
+        };
+
+        assert!(legacy_ack_matches_pending(
+            &pending,
+            "203.0.113.10:40123".parse().unwrap(),
+            7,
+            2,
+        ));
+        assert!(!legacy_ack_matches_pending(
+            &pending,
+            "203.0.113.11:40123".parse().unwrap(),
+            7,
+            2,
+        ));
+        assert!(!legacy_ack_matches_pending(
+            &pending,
+            "203.0.113.10:40123".parse().unwrap(),
+            8,
+            2,
+        ));
     }
 
     #[test]
@@ -1711,6 +1764,12 @@ mod tests {
 
         let diagnostics = transport.socket_pool_diagnostics().await;
         assert_eq!(diagnostics[0].probe_acks_received, 1);
+        let conn = peers.get_connection("peer-b").await.unwrap();
+        assert_eq!(
+            conn.candidate_sources
+                .get(&remote_candidate_addr.to_string()),
+            Some(&crate::peer::CandidatePairSource::Learned)
+        );
 
         worker.abort();
     }
