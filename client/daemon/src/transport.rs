@@ -121,6 +121,24 @@ impl WireGuardTransport {
         packet: OutboundPacket,
     ) -> Result<Option<EncryptedPeerPacket>> {
         let mut sessions = self.sessions.lock().await;
+        // Session expiry is an expected boundary during a rekey.  It must not
+        // terminate the long-lived TUN-to-WireGuard worker: the handshake
+        // maintenance loop will notice the missing session and establish a
+        // replacement.  Dropping this one packet is preferable to tearing
+        // down the entire overlay (and the diagnostics endpoint) while a
+        // replacement handshake is in flight.
+        if sessions
+            .get(&packet.peer_id)
+            .is_some_and(TransportSession::is_expired)
+        {
+            sessions.remove(&packet.peer_id);
+            debug!(
+                "WireGuard session for peer {} expired; dropping {} byte packet until rekey completes",
+                packet.peer_id,
+                packet.packet.len()
+            );
+            return Ok(None);
+        }
         let Some(session) = sessions.get_mut(&packet.peer_id) else {
             debug!(
                 "No WireGuard session for peer {}; dropping {} byte packet",
@@ -360,6 +378,36 @@ mod tests {
             .unwrap();
 
         assert!(dropped.is_none());
+        assert!(encrypted_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drops_expired_outbound_session_without_stopping_transport() {
+        let (_remote, local) = establish_sessions();
+        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        transport
+            .add_session(
+                "peer-a",
+                local.with_thresholds(
+                    u64::MAX,
+                    Duration::MAX,
+                    0,
+                    Duration::MAX,
+                ),
+            )
+            .await;
+
+        let dropped = transport
+            .encrypt_outbound(OutboundPacket {
+                peer_id: "peer-a".to_string(),
+                dst_ip: "10.20.0.1".to_string(),
+                packet: vec![0x45, 0x00, 0x00, 0x14],
+            })
+            .await
+            .unwrap();
+
+        assert!(dropped.is_none());
+        assert!(!transport.has_session("peer-a").await);
         assert!(encrypted_rx.try_recv().is_err());
     }
 
