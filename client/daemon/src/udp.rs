@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet, build_punch_ack,
-    build_punch_packet, candidate_report_from_observations, decode_authenticated_punch_packet,
-    decode_punch_packet, gather_candidate_report, peek_authenticated_punch_identity,
-    CandidateGatherReport, IceConfig, PunchPacketKind, StunAttribute, StunMessage, StunObservation,
-    BINDING_RESPONSE, MAGIC_COOKIE,
+    build_punch_packet, build_punch_packet_with_nonce, candidate_report_from_observations,
+    decode_authenticated_punch_packet, decode_punch_packet, gather_candidate_report,
+    peek_authenticated_punch_identity, CandidateGatherReport, IceConfig, PunchPacketKind,
+    StunAttribute, StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -75,7 +75,8 @@ struct PendingProbe {
     socket_index: usize,
     generation: u64,
     peer_id: Option<String>,
-    authenticated: bool,
+    accepts_authenticated_ack: bool,
+    accepts_legacy_ack: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,15 +363,29 @@ impl UdpTransport {
             _ => None,
         };
 
-        let (bytes, nonce, authenticated) = if let Some((bytes, nonce)) = authenticated_probe {
-            (bytes, nonce, true)
-        } else {
-            let bytes = build_punch_packet();
-            let nonce = decode_punch_packet(&bytes)
-                .map(|packet| packet.nonce)
-                .ok_or_else(|| DaemonError::Network("failed to create UDP probe".to_string()))?;
-            (bytes.to_vec(), nonce, false)
-        };
+        let (bytes, nonce, accepts_authenticated_ack, compat_legacy_probe) =
+            if let Some((bytes, nonce)) = authenticated_probe {
+                // Compatibility bridge for pre-v2 peers. v0.1.24 and older only
+                // understand PNCH v1 and otherwise forward PNCH v2 into the
+                // WireGuard parser, producing "invalid message type: 80".
+                // Send a legacy probe with the same nonce so either ACK form clears
+                // the same pending probe without weakening the v2 path between
+                // upgraded peers.
+                (
+                    bytes,
+                    nonce,
+                    true,
+                    Some(build_punch_packet_with_nonce(nonce).to_vec()),
+                )
+            } else {
+                let bytes = build_punch_packet();
+                let nonce = decode_punch_packet(&bytes)
+                    .map(|packet| packet.nonce)
+                    .ok_or_else(|| {
+                        DaemonError::Network("failed to create UDP probe".to_string())
+                    })?;
+                (bytes.to_vec(), nonce, false, None)
+            };
 
         {
             let mut pending = self.pending_probes.lock().await;
@@ -386,7 +401,8 @@ impl UdpTransport {
                     socket_index,
                     generation,
                     peer_id: peer_id.map(str::to_string),
-                    authenticated,
+                    accepts_authenticated_ack,
+                    accepts_legacy_ack: true,
                 },
             );
         }
@@ -400,6 +416,36 @@ impl UdpTransport {
 
         self.update_socket_diagnostics(socket_index, |metrics| metrics.probes_sent += 1)
             .await;
+
+        if let Some(legacy_probe) = compat_legacy_probe.clone() {
+            match socket.send_to(&legacy_probe, peer_addr).await {
+                Ok(_) => {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.probes_sent += 1
+                    })
+                    .await;
+                    trace!(
+                        "Sent compatibility legacy UDP punch probe to peer {} at {}",
+                        peer_id.unwrap_or("unknown"),
+                        peer_addr
+                    );
+                    self.retransmit_probe_burst(
+                        socket.clone(),
+                        legacy_probe,
+                        peer_addr,
+                        peer_id.map(str::to_string),
+                    );
+                }
+                Err(err) => {
+                    debug!(
+                        "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
+                        peer_id.unwrap_or("unknown"),
+                        peer_addr,
+                        err
+                    );
+                }
+            }
+        }
 
         self.retransmit_probe_burst(socket, bytes, peer_addr, peer_id.map(str::to_string));
         Ok(nonce)
@@ -960,17 +1006,21 @@ impl UdpTransport {
                     PunchPacketKind::Ack => {
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
-                            let mut pending = self.pending_probes.lock().await;
-                            pending
-                                .remove(&packet.nonce)
+                            let mut pending_probes = self.pending_probes.lock().await;
+                            let matched = pending_probes
+                                .get(&packet.nonce)
                                 .filter(|pending| {
                                     pending.generation == generation
                                         && pending.socket_index == socket_index
                                         && pending.peer_id.as_deref()
                                             == Some(identity.source_node_id.as_str())
-                                        && pending.authenticated
+                                        && pending.accepts_authenticated_ack
                                 })
-                                .map(|pending| (pending.sent_at.elapsed(), pending.generation))
+                                .map(|pending| (pending.sent_at.elapsed(), pending.generation));
+                            if matched.is_some() {
+                                pending_probes.remove(&packet.nonce);
+                            }
+                            matched
                         };
 
                         if let Some((latency, generation)) = ack_match {
@@ -1057,19 +1107,35 @@ impl UdpTransport {
                     PunchPacketKind::Ack => {
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
-                            let mut pending = self.pending_probes.lock().await;
-                            pending
-                                .remove(&packet.nonce)
+                            let mut pending_probes = self.pending_probes.lock().await;
+                            let matched = pending_probes
+                                .get(&packet.nonce)
                                 .filter(|pending| {
                                     pending.endpoint == source
                                         && pending.generation == generation
                                         && pending.socket_index == socket_index
-                                        && !pending.authenticated
+                                        && pending.accepts_legacy_ack
                                 })
-                                .map(|pending| (pending.sent_at.elapsed(), pending.generation))
+                                .map(|pending| {
+                                    (
+                                        pending.sent_at.elapsed(),
+                                        pending.generation,
+                                        pending.peer_id.clone(),
+                                    )
+                                });
+                            if matched.is_some() {
+                                pending_probes.remove(&packet.nonce);
+                            }
+                            matched
                         };
-                        if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
-                            if let Some((latency, generation)) = ack_match {
+                        let learned_peer_id = self.peers.learn_endpoint_from_addr(source).await;
+                        let peer_id = learned_peer_id.or_else(|| {
+                            ack_match
+                                .as_ref()
+                                .and_then(|(_, _, peer_id)| peer_id.clone())
+                        });
+                        if let Some(peer_id) = peer_id {
+                            if let Some((latency, generation, _)) = ack_match {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
                                     metrics.probe_acks_received += 1
                                 })
@@ -1561,6 +1627,92 @@ mod tests {
         assert_eq!(packet.source_node_id.as_deref(), Some("peer-a"));
         assert_eq!(packet.target_node_id.as_deref(), Some("peer-b"));
         assert!(packet.authenticated);
+
+        let mut compat_buf = [0u8; 512];
+        let (compat_n, _from) =
+            timeout(Duration::from_secs(1), receiver.recv_from(&mut compat_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let compat_packet = decode_punch_packet(&compat_buf[..compat_n]).unwrap();
+        assert_eq!(compat_packet.kind, PunchPacketKind::Punch);
+        assert_eq!(compat_packet.nonce, packet.nonce);
+    }
+
+    #[tokio::test]
+    async fn legacy_probe_ack_confirms_authenticated_probe_for_old_peer() {
+        let local_identity = NodeIdentity::generate();
+        let peer_identity = NodeIdentity::generate();
+        let remote_candidate = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_candidate_addr = remote_candidate.local_addr().unwrap();
+
+        let peers = Arc::new(PeerManager::new(config_for_identity(
+            &local_identity,
+            "peer-a",
+        )));
+        peers
+            .add_peer(&peer_with_public_key(
+                "peer-b",
+                "10.20.0.2",
+                hex::encode(peer_identity.public_key()),
+                Some(remote_candidate_addr),
+            ))
+            .await;
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_local_node_id("peer-a");
+        let local_addr = transport.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+        transport
+            .send_probe(Some("peer-b"), remote_candidate_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 512];
+        let (n, _from) = timeout(Duration::from_secs(1), remote_candidate.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(peek_authenticated_punch_identity(&buf[..n]).is_some());
+
+        let (legacy_n, _from) =
+            timeout(Duration::from_secs(1), remote_candidate.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let legacy_probe = decode_punch_packet(&buf[..legacy_n]).unwrap();
+        assert_eq!(legacy_probe.kind, PunchPacketKind::Punch);
+
+        remote_candidate
+            .send_to(&build_punch_ack(legacy_probe.nonce), local_addr)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let conn = peers.get_connection("peer-b").await.unwrap();
+                if conn.endpoint == Some(remote_candidate_addr)
+                    && conn.direct_health.consecutive_failures == 0
+                    && conn.candidate_pairs.iter().any(|pair| {
+                        pair.remote_endpoint == remote_candidate_addr && pair.success_count > 0
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let diagnostics = transport.socket_pool_diagnostics().await;
+        assert_eq!(diagnostics[0].probe_acks_received, 1);
+
+        worker.abort();
     }
 
     #[tokio::test]

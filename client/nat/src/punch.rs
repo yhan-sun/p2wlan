@@ -238,6 +238,20 @@ pub fn build_punch_packet() -> [u8; PUNCH_PACKET_SIZE] {
     PunchPacket::new_punch().encode()
 }
 
+/// Build a legacy v1 PUNCH datagram using an existing nonce.
+///
+/// This is used by newer clients when they also send an authenticated v2
+/// probe: old clients can ACK the legacy packet while new clients can verify
+/// the authenticated packet, and both ACK variants correlate to the same
+/// pending probe.
+pub fn build_punch_packet_with_nonce(nonce: [u8; 8]) -> [u8; PUNCH_PACKET_SIZE] {
+    PunchPacket {
+        packet_type: TYPE_PUNCH,
+        nonce,
+    }
+    .encode()
+}
+
 /// Build an ACK datagram for a received PUNCH nonce.
 pub fn build_punch_ack(nonce: [u8; 8]) -> [u8; PUNCH_PACKET_SIZE] {
     PunchPacket::new_ack(nonce).encode()
@@ -608,6 +622,11 @@ mod tests {
         let decoded_ack = decode_punch_packet(&ack).unwrap();
         assert_eq!(decoded_ack.kind, PunchPacketKind::Ack);
         assert_eq!(decoded_ack.nonce, decoded.nonce);
+
+        let compat = build_punch_packet_with_nonce(decoded.nonce);
+        let decoded_compat = decode_punch_packet(&compat).unwrap();
+        assert_eq!(decoded_compat.kind, PunchPacketKind::Punch);
+        assert_eq!(decoded_compat.nonce, decoded.nonce);
     }
 
     #[test]
