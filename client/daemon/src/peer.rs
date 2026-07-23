@@ -54,6 +54,17 @@ const DIRECT_TRAVERSAL_EVENT_LIMIT: usize = 32;
 const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeTargetMode {
+    /// The synchronized offer/answer punch window. Keep this compact so
+    /// address/port-dependent NATs are not forced to create many competing
+    /// mappings before the peer can answer.
+    Synchronized,
+    /// Background retries after relay is already available. These may spend a
+    /// wider budget on birthday probes without delaying initial connectivity.
+    Background,
+}
+
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
 /// Stable reason code for direct path probe timeout/failure.
@@ -903,15 +914,18 @@ impl PeerConnection {
         local_generation: u64,
         history: &TraversalHistory,
         local_nat_profile: Option<&NatProfile>,
+        mode: ProbeTargetMode,
     ) -> Vec<SocketAddr> {
         self.ensure_current_candidate_pairs(local_generation);
         let mut endpoints = self.candidate_endpoints();
-        self.ensure_birthday_candidate_pairs(
-            local_generation,
-            history,
-            local_nat_profile,
-            &mut endpoints,
-        );
+        if mode == ProbeTargetMode::Background {
+            self.ensure_birthday_candidate_pairs(
+                local_generation,
+                history,
+                local_nat_profile,
+                &mut endpoints,
+            );
+        }
         let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
         let mut pairs = self
             .candidate_pairs
@@ -2113,8 +2127,12 @@ impl PeerManager {
         if conn.state == ConnectionState::Direct {
             return Vec::new();
         }
-        let endpoints =
-            conn.candidate_probe_endpoints(generation, &history, local_nat_profile.as_ref());
+        let endpoints = conn.candidate_probe_endpoints(
+            generation,
+            &history,
+            local_nat_profile.as_ref(),
+            ProbeTargetMode::Synchronized,
+        );
         for endpoint in &endpoints {
             conn.mark_candidate_pair_probing(*endpoint, generation);
         }
@@ -2149,6 +2167,7 @@ impl PeerManager {
                     generation,
                     &history,
                     local_nat_profile.as_ref(),
+                    ProbeTargetMode::Background,
                 );
 
                 if endpoints.is_empty() {
@@ -2197,6 +2216,7 @@ impl PeerManager {
                     generation,
                     &history,
                     local_nat_profile.as_ref(),
+                    ProbeTargetMode::Background,
                 );
 
                 if endpoints.is_empty() {
@@ -4008,7 +4028,12 @@ mod tests {
         manager.add_peer(&test_peer("peer1", endpoint)).await;
         manager.update_nat_profile(birthday_nat_profile()).await;
 
-        let targets = manager.direct_probe_targets_for("peer1").await;
+        let initial_targets = manager.direct_probe_targets_for("peer1").await;
+        assert_eq!(initial_targets, vec![endpoint]);
+
+        let background_targets = manager.direct_probe_targets().await;
+        assert_eq!(background_targets.len(), 1);
+        let targets = &background_targets[0].1;
         let birthday_count = targets
             .iter()
             .filter(|target| **target != endpoint && target.ip() == endpoint.ip())
