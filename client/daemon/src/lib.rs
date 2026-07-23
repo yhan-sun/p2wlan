@@ -95,6 +95,11 @@ use udp::{PeerReflexiveObservation, UdpTransport};
 #[derive(Default)]
 struct PendingHandshakeState {
     pending: HashMap<String, HandshakeInitiator>,
+    /// Peers for which a handshake is being prepared.  Candidate gathering and
+    /// control-peer lookups await, so a plain `pending` check is not enough to
+    /// prevent another trigger from creating and overwriting an initiator in
+    /// that window.
+    starting: HashSet<String>,
     pending_ids: HashMap<String, u64>,
     next_id: u64,
     /// Number of initiation attempts per peer (bounded retries).
@@ -102,6 +107,29 @@ struct PendingHandshakeState {
 }
 
 impl PendingHandshakeState {
+    /// Atomically claim the right to prepare a new initiator for `peer_id`.
+    ///
+    /// A caller must later either commit it with `insert_reserved` or release
+    /// it with `cancel_reservation`.
+    fn reserve_start(&mut self, peer_id: &str) -> bool {
+        if self.pending.contains_key(peer_id) || self.starting.contains(peer_id) {
+            return false;
+        }
+        self.starting.insert(peer_id.to_string());
+        true
+    }
+
+    fn cancel_reservation(&mut self, peer_id: &str) {
+        self.starting.remove(peer_id);
+    }
+
+    fn insert_reserved(&mut self, peer_id: String, initiator: HandshakeInitiator) -> Option<u64> {
+        if !self.starting.remove(&peer_id) {
+            return None;
+        }
+        Some(self.insert(peer_id, initiator))
+    }
+
     fn insert(&mut self, peer_id: String, initiator: HandshakeInitiator) -> u64 {
         self.next_id = self.next_id.saturating_add(1);
         let pending_id = self.next_id;
@@ -117,6 +145,7 @@ impl PendingHandshakeState {
 
     fn clear_peer(&mut self, peer_id: &str) {
         self.remove(peer_id);
+        self.cancel_reservation(peer_id);
         self.attempts.remove(peer_id);
     }
 
@@ -873,23 +902,29 @@ impl Daemon {
                                 );
                             }
 
-                            // Only the lexicographically smaller public key initiates handshakes.
-                            // Skip if already pending.
-                            {
-                                let state = pending.lock().await;
-                                if state.pending.contains_key(&conn.node_id) {
-                                    continue;
+                            // Reserve before any further awaits.  The peer-join path can run at
+                            // the same time as this maintenance loop; without this reservation,
+                            // both paths could create an initiator and the later one would
+                            // overwrite the former pending handshake.
+                            let reserved = {
+                                let mut state = pending.lock().await;
+                                if !state.reserve_start(&conn.node_id) {
+                                    false
+                                } else {
+                                    if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
+                                        >= MAX_HANDSHAKE_ATTEMPTS
+                                    {
+                                        warn!(
+                                            "Handshake for {} reached max attempts; resetting retry budget",
+                                            conn.node_id
+                                        );
+                                        state.attempts.remove(&conn.node_id);
+                                    }
+                                    true
                                 }
-                                if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
-                                    >= MAX_HANDSHAKE_ATTEMPTS
-                                {
-                                    warn!(
-                                        "Handshake for {} reached max attempts; resetting retry budget",
-                                        conn.node_id
-                                    );
-                                    drop(state);
-                                    pending.lock().await.attempts.remove(&conn.node_id);
-                                }
+                            };
+                            if !reserved {
+                                continue;
                             }
 
                             // PeerConnection doesn't store public key; look up from control.
@@ -899,42 +934,58 @@ impl Daemon {
                             // the peer may also rekey from its side.
                             let control_peers = control.peers().await;
                             let Some(peer_info) = control_peers.get(&conn.node_id) else {
+                                pending.lock().await.cancel_reservation(&conn.node_id);
                                 debug!("No control peer info for handshake with {}", conn.node_id);
                                 continue;
                             };
                             if node_public_key >= peer_info.public_key {
                                 // Let the other side initiate.
+                                pending.lock().await.cancel_reservation(&conn.node_id);
                                 continue;
                             }
 
                             let Ok(private_key) =
                                 decode_x25519_key(&node_private_key, "node private key")
                             else {
+                                pending.lock().await.cancel_reservation(&conn.node_id);
                                 continue;
                             };
                             let Ok(peer_public) =
                                 decode_x25519_key(&peer_info.public_key, "peer public key")
                             else {
+                                pending.lock().await.cancel_reservation(&conn.node_id);
                                 continue;
                             };
                             let identity = NodeIdentity::from_private_key(private_key);
                             let mut initiator =
                                 HandshakeInitiator::new(identity, peer_public, None);
                             let Ok(initiation) = initiator.create_initiation() else {
+                                pending.lock().await.cancel_reservation(&conn.node_id);
                                 continue;
                             };
                             let initiation_bytes = initiation.to_bytes();
                             let candidates = local_candidates.read().await.clone();
                             let candidate_sources = local_candidate_sources.read().await.clone();
 
-                            let (attempt_no, pending_id) = {
+                            // An inbound offer may have established a responder session while
+                            // candidates were being read.  Do not send a redundant initiation.
+                            if transport.has_session(&conn.node_id).await {
+                                pending.lock().await.cancel_reservation(&conn.node_id);
+                                continue;
+                            }
+
+                            let Some((attempt_no, pending_id)) = ({
                                 let mut state = pending.lock().await;
-                                let attempts =
-                                    state.attempts.entry(conn.node_id.clone()).or_insert(0);
-                                *attempts = attempts.saturating_add(1);
-                                let attempt_no = *attempts;
-                                let pending_id = state.insert(conn.node_id.clone(), initiator);
-                                (attempt_no, pending_id)
+                                state.insert_reserved(conn.node_id.clone(), initiator).map(
+                                    |pending_id| {
+                                        let attempts =
+                                            state.attempts.entry(conn.node_id.clone()).or_insert(0);
+                                        *attempts = attempts.saturating_add(1);
+                                        (*attempts, pending_id)
+                                    },
+                                )
+                            }) else {
+                                continue;
                             };
 
                             let punch_at_ms = Some(relay_assisted_punch_at_ms());
@@ -1406,45 +1457,69 @@ impl Daemon {
             return Ok(None);
         }
 
-        {
-            let state = self.pending_handshakes.lock().await;
-            if state.pending.contains_key(&peer_info.node_id) {
-                // Still pending — don't duplicate.
-                return Ok(None);
-            }
-            if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
-                >= MAX_HANDSHAKE_ATTEMPTS
-            {
-                drop(state);
-                self.pending_handshakes
-                    .lock()
-                    .await
-                    .attempts
-                    .remove(&peer_info.node_id);
-            }
-        }
-
         if self.config.node.public_key >= peer_info.public_key {
             return Ok(None);
         }
 
         let identity = self.local_identity()?;
         let peer_public = decode_x25519_key(&peer_info.public_key, "peer public key")?;
+
+        // Claim this handshake before candidate gathering.  That work awaits,
+        // and the background maintenance loop can otherwise observe an empty
+        // `pending` map and overwrite this initiator with another one.
+        let reserved = {
+            let mut state = self.pending_handshakes.lock().await;
+            if !state.reserve_start(&peer_info.node_id) {
+                false
+            } else {
+                if state.attempts.get(&peer_info.node_id).copied().unwrap_or(0)
+                    >= MAX_HANDSHAKE_ATTEMPTS
+                {
+                    state.attempts.remove(&peer_info.node_id);
+                }
+                true
+            }
+        };
+        if !reserved {
+            return Ok(None);
+        }
+
         let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
-        let initiation = initiator
-            .create_initiation()
-            .map_err(|e| DaemonError::Peer(format!("WireGuard initiation failed: {e}")))?;
+        let initiation = match initiator.create_initiation() {
+            Ok(initiation) => initiation,
+            Err(error) => {
+                self.pending_handshakes
+                    .lock()
+                    .await
+                    .cancel_reservation(&peer_info.node_id);
+                return Err(DaemonError::Peer(format!(
+                    "WireGuard initiation failed: {error}"
+                )));
+            }
+        };
         let initiation_bytes = initiation.to_bytes();
         let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
 
         let peer_id_clone = peer_info.node_id.clone();
-        let (attempt_no, pending_id) = {
+        if self.transport.has_session(&peer_id_clone).await {
+            self.pending_handshakes
+                .lock()
+                .await
+                .cancel_reservation(&peer_id_clone);
+            return Ok(None);
+        }
+
+        let Some((attempt_no, pending_id)) = ({
             let mut state = self.pending_handshakes.lock().await;
-            let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
-            *attempts = attempts.saturating_add(1);
-            let attempt_no = *attempts;
-            let pending_id = state.insert(peer_id_clone.clone(), initiator);
-            (attempt_no, pending_id)
+            state
+                .insert_reserved(peer_id_clone.clone(), initiator)
+                .map(|pending_id| {
+                    let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
+                    *attempts = attempts.saturating_add(1);
+                    (*attempts, pending_id)
+                })
+        }) else {
+            return Ok(None);
         };
 
         let punch_at_ms = relay_assisted_punch_at_ms();
@@ -4392,6 +4467,22 @@ mod tests {
         let state = daemon.pending_handshakes.lock().await;
         assert!(state.pending.contains_key(peer_id));
         assert_eq!(state.attempts.get(peer_id), Some(&1));
+    }
+
+    #[test]
+    fn handshake_start_reservation_prevents_concurrent_initiators() {
+        let mut state = PendingHandshakeState::default();
+        let peer_id = "peer-race";
+
+        assert!(state.reserve_start(peer_id));
+        assert!(state.starting.contains(peer_id));
+        assert!(
+            !state.reserve_start(peer_id),
+            "a second trigger must not start an initiator while the first gathers candidates"
+        );
+
+        state.cancel_reservation(peer_id);
+        assert!(state.reserve_start(peer_id));
     }
 
     #[tokio::test]
