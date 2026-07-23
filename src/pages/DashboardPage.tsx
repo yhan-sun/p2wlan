@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity,
@@ -34,6 +34,15 @@ export default function DashboardPage() {
   const [actionTone, setActionTone] = useState<ActionTone>("info");
   const [showControlAuth, setShowControlAuth] = useState(false);
   const navigate = useNavigate();
+
+  // An elevated daemon can become ready just after a previous startup wait
+  // expires. Do not leave that transient failure visible once a fresh status
+  // snapshot has established that the TUN is running.
+  useEffect(() => {
+    if (daemon.reachable && operation.phase === "running") {
+      setActionMessage(null);
+    }
+  }, [daemon.reachable, operation.phase]);
 
   const startTun = async () => {
     setActionLoading(true);

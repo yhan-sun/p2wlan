@@ -8,6 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 const DIAGNOSTICS_PORT_SCAN_LIMIT: u16 = 32;
+/// A cold elevated start may need to create the TUN device, collect STUN
+/// candidates, and reconnect the control plane before diagnostics is ready.
+/// Keep this aligned with the desktop UI's elevated-start outcome window.
+const MACOS_ELEVATED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1849,7 +1853,7 @@ impl DaemonManager {
                 state.last_error = None;
             }
 
-            if Self::wait_for_endpoint(&target_url, Duration::from_secs(20)).await {
+            if Self::wait_for_endpoint(&target_url, MACOS_ELEVATED_READY_TIMEOUT).await {
                 self.set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
                     .await;
                 Ok("TUN 模式已通过管理员权限启动。".to_string())
@@ -1857,7 +1861,7 @@ impl DaemonManager {
                 let mut state = self.state.lock().await;
                 state.elevated_started_by_app = false;
                 Err(Self::timeout_message_with_log(
-                    "已完成管理员授权，但守护进程未在 20 秒内响应诊断端点。",
+                    "已完成管理员授权，但守护进程未在 60 秒内响应诊断端点。",
                     &log_path,
                 ))
             }
