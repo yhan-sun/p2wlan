@@ -3553,6 +3553,20 @@ async fn spawn_hole_punch_task(
         let generation = peers.current_network_generation().await;
         let candidates = peers.direct_probe_targets_for(&peer_id).await;
         if candidates.is_empty() {
+            if peers.is_direct(&peer_id).await {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_skipped_already_direct",
+                        None,
+                        None,
+                        None,
+                        "skipped UDP punch because Direct path is already confirmed",
+                    )
+                    .await;
+                debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+                return;
+            }
             debug!("No UDP candidates for {peer_id}; skipping hole punch");
             peers
                 .record_direct_failure_for_generation(
@@ -4318,6 +4332,67 @@ mod tests {
             .direct_events
             .iter()
             .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(0)));
+    }
+
+    #[tokio::test]
+    async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = remote_socket.local_addr().unwrap();
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+        peers.record_direct_success("node-b", Some(endpoint)).await;
+        assert!(peers.is_direct("node-b").await);
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        spawn_hole_punch_task(
+            udp,
+            peers.clone(),
+            PunchAttemptDeduplicator::default(),
+            "node-b".to_string(),
+            Duration::from_millis(10),
+            1,
+            None,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let conn = peers.get_connection("node-b").await.unwrap();
+                if conn
+                    .direct_events
+                    .iter()
+                    .any(|event| event.stage == "punch_skipped_already_direct")
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled hole punch did not skip the already-direct peer");
+
+        let conn = peers.get_connection("node-b").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert!(conn.direct_health.last_error.is_none());
+        assert!(!conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == REASON_DIRECT_PROBE_FAILED));
     }
 
     #[test]
