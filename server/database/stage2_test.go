@@ -447,6 +447,43 @@ func TestDatabase_DeviceCredentialLifecycle(t *testing.T) {
 	t.Logf("Fake token rejected: %v", err)
 }
 
+func TestDatabase_RevokeDeviceCredentialsInvalidatesAllCurrentTokens(t *testing.T) {
+	db, _ := tmpDB(t)
+	user := newUser(t, db, "revoke-all@test")
+	dev := newDevice(t, db, user.ID, "default")
+
+	_, tokenA, err := db.CreateDeviceCredential(dev.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential A: %v", err)
+	}
+	_, tokenB, err := db.CreateDeviceCredential(dev.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential B: %v", err)
+	}
+
+	revoked, err := db.RevokeDeviceCredentials(dev.ID)
+	if err != nil {
+		t.Fatalf("RevokeDeviceCredentials: %v", err)
+	}
+	if revoked != 2 {
+		t.Fatalf("expected 2 revoked credentials, got %d", revoked)
+	}
+	if _, _, err := db.ValidateDeviceCredential(tokenA); err == nil {
+		t.Fatal("first credential should be revoked")
+	}
+	if _, _, err := db.ValidateDeviceCredential(tokenB); err == nil {
+		t.Fatal("second credential should be revoked")
+	}
+
+	_, freshToken, err := db.CreateDeviceCredential(dev.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential fresh: %v", err)
+	}
+	if _, _, err := db.ValidateDeviceCredential(freshToken); err != nil {
+		t.Fatalf("fresh credential should validate after bulk revoke: %v", err)
+	}
+}
+
 // 10. Default network and membership for new users
 func TestDatabase_NewUserGetsDefaultNetwork(t *testing.T) {
 	db, _ := tmpDB(t)

@@ -410,6 +410,20 @@ func (s *Server) SubmitDeviceCredential(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// RevokeCurrentDeviceCredential handles DELETE /api/v1/devices/credential.
+func (s *Server) RevokeCurrentDeviceCredential(w http.ResponseWriter, r *http.Request) {
+	deviceClaims, err := auth.GetDeviceClaims(r.Context())
+	if err != nil {
+		http.Error(w, `{"error":"device credential required"}`, http.StatusUnauthorized)
+		return
+	}
+	if err := s.db.RevokeDeviceCredential(deviceClaims.CredentialID); err != nil {
+		http.Error(w, `{"error":"credential revocation failed"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
 // verifyChallenge checks the Ed25519 signature of a challenge.
 func verifyChallenge(db *database.DB, challengeID, ed25519PubKeyHex, signatureHex string) error {
 	challengeRecord, err := db.GetChallenge(challengeID)

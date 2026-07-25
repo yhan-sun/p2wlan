@@ -178,6 +178,44 @@ func TestCreateSignalVerifiesProbeEphemeralSignature(t *testing.T) {
 	}
 }
 
+func TestRevokeCurrentDeviceCredentialInvalidatesToken(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("revoke-current@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "revoke-current-key", "device", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	cred, token, err := db.CreateDeviceCredential(device.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential: %v", err)
+	}
+
+	apiServer := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/credential", nil)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:     device.ID,
+		NetworkID:    device.NetworkID,
+		UserID:       device.UserID,
+		CredentialID: cred.ID,
+		ExpiresAt:    cred.ExpiresAt,
+	}))
+	recorder := httptest.NewRecorder()
+	apiServer.RevokeCurrentDeviceCredential(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("RevokeCurrentDeviceCredential: HTTP %d %s", recorder.Code, recorder.Body.String())
+	}
+	if _, _, err := db.ValidateDeviceCredential(token); err == nil {
+		t.Fatal("revoked current credential should no longer validate")
+	}
+}
+
 func TestParseRelayServersReturnsEmptySliceWhenUnset(t *testing.T) {
 	t.Setenv("RELAY_SERVERS", "")
 
