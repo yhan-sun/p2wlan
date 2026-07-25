@@ -103,6 +103,8 @@ func migrate(db *sql.DB) error {
 		candidate_sources TEXT NOT NULL DEFAULT '{}',
 		candidate_generation INTEGER NOT NULL DEFAULT 0,
 		candidates_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		session_id TEXT NOT NULL DEFAULT '',
+		probe_ephemeral_public_key TEXT NOT NULL DEFAULT '',
 		handshake   TEXT NOT NULL DEFAULT '',
 		punch_at_ms INTEGER NOT NULL DEFAULT 0,
 		created_at  INTEGER NOT NULL
@@ -163,6 +165,8 @@ func migrate(db *sql.DB) error {
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidate_sources TEXT NOT NULL DEFAULT '{}'`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidate_generation INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidates_expires_at_ms INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN probe_ephemeral_public_key TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN punch_at_ms INTEGER NOT NULL DEFAULT 0`)
 
 	// Insert default system user and network to satisfy foreign keys,
@@ -320,6 +324,12 @@ func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCred
 		ID: id, DeviceID: deviceID, TokenHash: hash,
 		ExpiresAt: expires, Revoked: false, CreatedAt: now,
 	}, rawToken, nil
+}
+
+// UpdateDeviceEd25519PublicKey stores the verified Ed25519 identity key for a device.
+func (db *DB) UpdateDeviceEd25519PublicKey(deviceID, ed25519PublicKey string) error {
+	_, err := db.Exec(`UPDATE devices SET ed25519_public_key = ? WHERE id = ?`, ed25519PublicKey, deviceID)
+	return err
 }
 
 // ValidateDeviceCredential validates a credential token and returns the credential and device.
@@ -709,17 +719,19 @@ func (db *DB) DeleteDevice(deviceID string) error {
 
 // Signal represents one queued control-plane signaling message.
 type Signal struct {
-	ID                    string            `json:"id"`
-	FromNodeID            string            `json:"from_node_id"`
-	ToNodeID              string            `json:"to_node_id"`
-	Type                  string            `json:"type"`
-	Candidates            []string          `json:"candidates"`
-	CandidateSources      map[string]string `json:"candidate_sources,omitempty"`
-	CandidateGeneration   int64             `json:"candidate_generation,omitempty"`
-	CandidatesExpiresAtMS int64             `json:"candidates_expires_at_ms,omitempty"`
-	Handshake             string            `json:"handshake"`
-	PunchAtMS             int64             `json:"punch_at_ms,omitempty"`
-	CreatedAt             int64             `json:"created_at"`
+	ID                      string            `json:"id"`
+	FromNodeID              string            `json:"from_node_id"`
+	ToNodeID                string            `json:"to_node_id"`
+	Type                    string            `json:"type"`
+	Candidates              []string          `json:"candidates"`
+	CandidateSources        map[string]string `json:"candidate_sources,omitempty"`
+	CandidateGeneration     int64             `json:"candidate_generation,omitempty"`
+	CandidatesExpiresAtMS   int64             `json:"candidates_expires_at_ms,omitempty"`
+	SessionID               string            `json:"session_id,omitempty"`
+	ProbeEphemeralPublicKey string            `json:"probe_ephemeral_public_key,omitempty"`
+	Handshake               string            `json:"handshake"`
+	PunchAtMS               int64             `json:"punch_at_ms,omitempty"`
+	CreatedAt               int64             `json:"created_at"`
 }
 
 const signalTTLSeconds int64 = 120
@@ -737,6 +749,11 @@ func (db *DB) CreateSignalWithPunchAt(fromNodeID, toNodeID, typ string, candidat
 // CreateSignalWithTraversalMetadata persists the candidate-set ordering metadata.
 // Legacy callers use generation 0 and no explicit expiry.
 func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64) (*Signal, error) {
+	return db.CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, "", "")
+}
+
+// CreateSignalWithTraversalSession persists candidate-set metadata plus optional traversal session key material.
+func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey string) (*Signal, error) {
 	if candidates == nil {
 		candidates = []string{}
 	}
@@ -767,8 +784,8 @@ func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string
 	if _, err = tx.Exec(`DELETE FROM signals WHERE from_node_id = ? AND to_node_id = ? AND type = ?`, fromNodeID, toNodeID, typ); err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, handshake, punch_at_ms, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), string(candidateSourcesJSON), candidateGeneration, candidatesExpiresAtMS, handshake, punchAtMS, now)
+	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, string(candidatesJSON), string(candidateSourcesJSON), candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, handshake, punchAtMS, now)
 	if err != nil {
 		return nil, err
 	}
@@ -778,7 +795,7 @@ func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string
 
 	return &Signal{
 		ID: id, FromNodeID: fromNodeID, ToNodeID: toNodeID, Type: typ,
-		Candidates: candidates, CandidateSources: candidateSources, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now,
+		Candidates: candidates, CandidateSources: candidateSources, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, SessionID: sessionID, ProbeEphemeralPublicKey: probeEphemeralPublicKey, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now,
 	}, nil
 }
 
@@ -795,7 +812,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, handshake, punch_at_ms, created_at
+	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, created_at
 		FROM signals WHERE to_node_id = ? AND created_at >= ? ORDER BY created_at ASC`, toNodeID, now-signalTTLSeconds)
 	if err != nil {
 		return nil, err
@@ -806,7 +823,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		var s Signal
 		var candidatesJSON string
 		var candidateSourcesJSON string
-		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.Handshake, &s.PunchAtMS, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(candidatesJSON), &s.Candidates); err != nil {

@@ -1414,8 +1414,24 @@ fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(summary) = direct_health_summary(peer) {
             println!("  direct-health={summary}");
         }
+        if let Some(summary) = selected_pair_summary(peer) {
+            println!("  selected-pair={summary}");
+        }
+        if let Some(consent_endpoint) = peer.get("consent_endpoint").and_then(Value::as_str) {
+            println!("  consent-endpoint={consent_endpoint}");
+        }
+        if let Some(key_type) = peer.get("probe_key_type").and_then(Value::as_str) {
+            let session = peer
+                .get("probe_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("legacy");
+            println!("  probe-key={key_type} session_id={session}");
+        }
         if let Some(summary) = candidate_pair_stats_summary(peer) {
             println!("  pair-stats={summary}");
+        }
+        if let Some(warning) = peer.get("warning").and_then(Value::as_str) {
+            println!("  warning={warning}");
         }
         if let Some(retry) = direct_retry_summary(peer) {
             println!("  direct-retry={retry}");
@@ -1965,6 +1981,88 @@ fn candidate_pair_summary(peer: &Value) -> String {
     } else {
         format!(" pairs={}({})", pairs.len(), parts.join(","))
     }
+}
+
+fn selected_pair_summary(peer: &Value) -> Option<String> {
+    let direct_type = peer
+        .get("direct_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let pair = peer
+        .get("selected_pair")
+        .or_else(|| peer.get("current_direct_pair"))?
+        .as_object()?;
+    let local = pair
+        .get("local_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let remote = pair.get("remote_endpoint").and_then(Value::as_str)?;
+    let local_type = pair
+        .get("local_candidate_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let remote_type = pair
+        .get("remote_candidate_type")
+        .or_else(|| pair.get("remote_source"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let state = pair
+        .get("pair_state")
+        .or_else(|| pair.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let rtt = pair
+        .get("rtt_ms")
+        .or_else(|| pair.get("rtt_ewma_ms"))
+        .and_then(Value::as_u64)
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let success_age = pair
+        .get("last_success_age_ms")
+        .and_then(Value::as_u64)
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let nominated = pair
+        .get("nominated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let selected = pair
+        .get("selected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let nomination = format!(" nominated={nominated} selected={selected}");
+    let probe_retry = pair
+        .get("probe_retry_after_ms")
+        .and_then(Value::as_u64)
+        .map(|after_ms| {
+            let remaining_ms = pair
+                .get("probe_retry_remaining_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let due = pair
+                .get("probe_due")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                " probe_due={due} probe_retry_after={after_ms}ms probe_retry_remaining={remaining_ms}ms"
+            )
+        })
+        .unwrap_or_default();
+    let consent = peer
+        .get("consent_endpoint")
+        .and_then(Value::as_str)
+        .map(|value| format!(" consent={value}"))
+        .unwrap_or_default();
+    let warning = peer
+        .get("warning")
+        .or_else(|| pair.get("warning"))
+        .and_then(Value::as_str)
+        .map(|value| format!(" warning={value}"))
+        .unwrap_or_default();
+
+    Some(format!(
+        "direct_type={direct_type} local={local} remote={remote} local_type={local_type} remote_type={remote_type} state={state}{nomination}{consent} rtt={rtt} last_success_age={success_age}{probe_retry}{warning}"
+    ))
 }
 
 fn candidate_pair_stats_summary(peer: &Value) -> Option<String> {
@@ -3028,6 +3126,40 @@ mod tests {
             direct_retry_summary(peer).as_deref(),
             Some("next_probe_in=4200ms backoff=10000ms")
         );
+    }
+
+    #[test]
+    fn doctor_formats_selected_pair_consent_and_pair_backoff() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "laptop",
+                "virtual_ip": "10.20.0.5",
+                "direct_type": "public_udp",
+                "consent_endpoint": "8.8.8.8:12293",
+                "selected_pair": {
+                    "local_endpoint": "192.168.1.10:51820",
+                    "remote_endpoint": "8.8.8.8:12293",
+                    "local_candidate_type": "host",
+                    "remote_candidate_type": "peer_reflexive",
+                    "pair_state": "degraded",
+                    "nominated": true,
+                    "selected": false,
+                    "rtt_ms": 18,
+                    "last_success_age_ms": 1200,
+                    "probe_due": false,
+                    "probe_retry_after_ms": 10000,
+                    "probe_retry_remaining_ms": 4200
+                }
+            }]
+        });
+        let peer = &snapshot["peers"][0];
+        let summary = selected_pair_summary(peer).unwrap();
+
+        assert!(summary.contains("consent=8.8.8.8:12293"));
+        assert!(summary.contains("probe_due=false"));
+        assert!(summary.contains("probe_retry_after=10000ms"));
+        assert!(summary.contains("probe_retry_remaining=4200ms"));
     }
 
     #[test]

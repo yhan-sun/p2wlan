@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
-use p2pnet_crypto::NodeIdentity;
+use p2pnet_crypto::{DhKeyPair, NodeIdentity};
 use p2pnet_nat::{
     CandidateGatherReport, CandidateSource, FilteringBehavior, MappingBehavior, NatProfile,
 };
@@ -84,6 +84,7 @@ use p2pnet_wireguard::{
 use peer::{
     ConnectionState, NetworkPath, PeerManager, REASON_DIRECT_PROBE_FAILED,
     REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
+    REASON_PATH_DIRECT_TRIAL,
 };
 use port_mapping::PortMappingManager;
 use relay::{
@@ -97,6 +98,8 @@ use udp::{PeerReflexiveObservation, UdpTransport};
 #[derive(Default)]
 struct PendingHandshakeState {
     pending: HashMap<String, HandshakeInitiator>,
+    pending_session_ids: HashMap<String, String>,
+    pending_probe_ephemeral: HashMap<String, DhKeyPair>,
     /// Peers for which a handshake is being prepared.  Candidate gathering and
     /// control-peer lookups await, so a plain `pending` check is not enough to
     /// prevent another trigger from creating and overwriting an initiator in
@@ -125,24 +128,57 @@ impl PendingHandshakeState {
         self.starting.remove(peer_id);
     }
 
-    fn insert_reserved(&mut self, peer_id: String, initiator: HandshakeInitiator) -> Option<u64> {
+    fn insert_reserved(
+        &mut self,
+        peer_id: String,
+        initiator: HandshakeInitiator,
+        session_id: Option<String>,
+        probe_ephemeral: Option<DhKeyPair>,
+    ) -> Option<u64> {
         if !self.starting.remove(&peer_id) {
             return None;
         }
-        Some(self.insert(peer_id, initiator))
+        Some(self.insert(peer_id, initiator, session_id, probe_ephemeral))
     }
 
-    fn insert(&mut self, peer_id: String, initiator: HandshakeInitiator) -> u64 {
+    fn insert(
+        &mut self,
+        peer_id: String,
+        initiator: HandshakeInitiator,
+        session_id: Option<String>,
+        probe_ephemeral: Option<DhKeyPair>,
+    ) -> u64 {
         self.next_id = self.next_id.saturating_add(1);
         let pending_id = self.next_id;
         self.pending.insert(peer_id.clone(), initiator);
+        if let Some(session_id) = session_id {
+            self.pending_session_ids.insert(peer_id.clone(), session_id);
+        } else {
+            self.pending_session_ids.remove(&peer_id);
+        }
+        if let Some(probe_ephemeral) = probe_ephemeral {
+            self.pending_probe_ephemeral
+                .insert(peer_id.clone(), probe_ephemeral);
+        } else {
+            self.pending_probe_ephemeral.remove(&peer_id);
+        }
         self.pending_ids.insert(peer_id, pending_id);
         pending_id
     }
 
     fn remove(&mut self, peer_id: &str) -> Option<HandshakeInitiator> {
         self.pending_ids.remove(peer_id);
+        self.pending_session_ids.remove(peer_id);
+        self.pending_probe_ephemeral.remove(peer_id);
         self.pending.remove(peer_id)
+    }
+
+    fn session_id(&self, peer_id: &str) -> Option<&str> {
+        self.pending_session_ids.get(peer_id).map(String::as_str)
+    }
+
+    fn probe_ephemeral(&self, peer_id: &str) -> Option<DhKeyPair> {
+        self.pending_probe_ephemeral.get(peer_id).cloned()
     }
 
     fn clear_peer(&mut self, peer_id: &str) {
@@ -1009,28 +1045,41 @@ impl Daemon {
                                 continue;
                             }
 
+                            let session_id = new_probe_session_id();
+                            let (probe_ephemeral, probe_ephemeral_public_key) =
+                                new_probe_ephemeral_keypair();
                             let Some((attempt_no, pending_id)) = ({
                                 let mut state = pending.lock().await;
-                                state.insert_reserved(conn.node_id.clone(), initiator).map(
-                                    |pending_id| {
+                                state
+                                    .insert_reserved(
+                                        conn.node_id.clone(),
+                                        initiator,
+                                        Some(session_id.clone()),
+                                        Some(probe_ephemeral),
+                                    )
+                                    .map(|pending_id| {
                                         let attempts =
                                             state.attempts.entry(conn.node_id.clone()).or_insert(0);
                                         *attempts = attempts.saturating_add(1);
                                         (*attempts, pending_id)
-                                    },
-                                )
+                                    })
                             }) else {
                                 continue;
                             };
+                            peers
+                                .set_probe_session_id(&conn.node_id, Some(session_id.clone()))
+                                .await;
 
                             let punch_at_ms = Some(relay_assisted_punch_at_ms());
                             if let Err(err) = control
-                                .send_peer_offer_with_sources_and_punch_at(
+                                .send_peer_offer_with_sources_punch_and_session(
                                     &conn.node_id,
                                     &candidates,
                                     &candidate_sources,
                                     &initiation_bytes,
                                     punch_at_ms,
+                                    Some(session_id.clone()),
+                                    Some(probe_ephemeral_public_key.clone()),
                                 )
                                 .await
                             {
@@ -1038,6 +1087,7 @@ impl Daemon {
                                 let mut state = pending.lock().await;
                                 if state.is_current(&conn.node_id, pending_id) {
                                     state.remove(&conn.node_id);
+                                    peers.set_probe_session_id(&conn.node_id, None).await;
                                 }
                             } else {
                                 if is_rekey {
@@ -1267,6 +1317,8 @@ impl Daemon {
                 ControlEvent::PeerOffer {
                     from_node_id,
                     candidates,
+                    session_id,
+                    probe_ephemeral_public_key,
                     candidate_sources,
                     candidate_generation,
                     candidates_expires_at_ms,
@@ -1279,6 +1331,9 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
+                    self.peers
+                        .set_probe_session_id(&from_node_id, session_id.clone())
+                        .await;
                     self.peers
                         .record_direct_event(
                             &from_node_id,
@@ -1309,6 +1364,8 @@ impl Daemon {
                                 &handshake_init,
                                 punch_at_ms,
                                 punch_at_server_ms,
+                                session_id.clone(),
+                                probe_ephemeral_public_key.clone(),
                             )
                             .await
                         {
@@ -1321,6 +1378,8 @@ impl Daemon {
                 ControlEvent::PeerAnswer {
                     from_node_id,
                     candidates,
+                    session_id,
+                    probe_ephemeral_public_key,
                     candidate_sources,
                     candidate_generation,
                     candidates_expires_at_ms,
@@ -1357,7 +1416,12 @@ impl Daemon {
                         .await;
                     if !handshake_response.is_empty() {
                         if let Err(err) = self
-                            .handle_peer_answer(&from_node_id, &handshake_response)
+                            .handle_peer_answer(
+                                &from_node_id,
+                                &handshake_response,
+                                session_id.clone(),
+                                probe_ephemeral_public_key.clone(),
+                            )
                             .await
                         {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
@@ -1552,10 +1616,17 @@ impl Daemon {
             return Ok(None);
         }
 
+        let session_id = new_probe_session_id();
+        let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
         let Some((attempt_no, pending_id)) = ({
             let mut state = self.pending_handshakes.lock().await;
             state
-                .insert_reserved(peer_id_clone.clone(), initiator)
+                .insert_reserved(
+                    peer_id_clone.clone(),
+                    initiator,
+                    Some(session_id.clone()),
+                    Some(probe_ephemeral),
+                )
                 .map(|pending_id| {
                     let attempts = state.attempts.entry(peer_id_clone.clone()).or_insert(0);
                     *attempts = attempts.saturating_add(1);
@@ -1564,22 +1635,28 @@ impl Daemon {
         }) else {
             return Ok(None);
         };
+        self.peers
+            .set_probe_session_id(&peer_id_clone, Some(session_id.clone()))
+            .await;
 
         let punch_at_ms = relay_assisted_punch_at_ms();
         if let Err(error) = self
             .control
-            .send_peer_offer_with_sources_and_punch_at(
+            .send_peer_offer_with_sources_punch_and_session(
                 &peer_id_clone,
                 &candidates,
                 &candidate_sources,
                 &initiation_bytes,
                 Some(punch_at_ms),
+                Some(session_id.clone()),
+                Some(probe_ephemeral_public_key.clone()),
             )
             .await
         {
             let mut state = self.pending_handshakes.lock().await;
             if state.is_current(&peer_id_clone, pending_id) {
                 state.remove(&peer_id_clone);
+                self.peers.set_probe_session_id(&peer_id_clone, None).await;
             }
             return Err(error);
         }
@@ -1739,6 +1816,8 @@ impl Daemon {
         handshake_init: &[u8],
         punch_at_ms: Option<u64>,
         punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
     ) -> Result<()> {
         let initiation = MessageInitiation::from_bytes(handshake_init)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard initiation: {e}")))?;
@@ -1757,6 +1836,31 @@ impl Daemon {
             }
         }
 
+        let (response_probe_ephemeral_public_key, probe_ephemeral_shared) = match (
+            session_id.as_ref(),
+            probe_ephemeral_public_key.as_deref(),
+        ) {
+            (Some(_), Some(peer_probe_public_key)) => {
+                let (local_probe_ephemeral, local_probe_public_key) = new_probe_ephemeral_keypair();
+                match derive_probe_ephemeral_shared(&local_probe_ephemeral, peer_probe_public_key) {
+                    Ok(shared) => (Some(local_probe_public_key), Some(shared)),
+                    Err(err) => {
+                        warn!(
+                            "Ignoring malformed probe ephemeral public key from {from_node_id}: {err}"
+                        );
+                        (None, None)
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+
+        if session_id.is_some() || probe_ephemeral_shared.is_some() {
+            self.peers
+                .set_probe_session_binding(from_node_id, session_id.clone(), probe_ephemeral_shared)
+                .await;
+        }
+
         let response_bytes = response.to_bytes();
         let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
         let previous_session = self
@@ -1765,7 +1869,7 @@ impl Daemon {
             .await;
         if let Err(error) = self
             .control
-            .send_peer_answer_with_sources_and_punch_schedule(
+            .send_peer_answer_with_sources_schedule_and_session(
                 from_node_id,
                 &candidates,
                 &candidate_sources,
@@ -1775,6 +1879,8 @@ impl Daemon {
                 // server deadline and retain the previous local fallback.
                 punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
                 punch_at_server_ms,
+                session_id.clone(),
+                response_probe_ephemeral_public_key,
             )
             .await
         {
@@ -1800,7 +1906,11 @@ impl Daemon {
                 None,
                 Some(candidates.len()),
                 None,
-                format!("sent answer handshake_bytes={}", response_bytes.len()),
+                format!(
+                    "sent answer handshake_bytes={} session_id={}",
+                    response_bytes.len(),
+                    session_id.as_deref().unwrap_or("legacy")
+                ),
             )
             .await;
         Ok(())
@@ -1810,11 +1920,25 @@ impl Daemon {
         &mut self,
         from_node_id: &str,
         handshake_response: &[u8],
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
     ) -> Result<()> {
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
-        let keys = {
+        let (keys, clear_session_binding, probe_ephemeral_shared) = {
             let mut state = self.pending_handshakes.lock().await;
+            let expected_session_id = state.session_id(from_node_id).map(str::to_string);
+            if let (Some(expected), Some(received)) =
+                (expected_session_id.as_deref(), session_id.as_deref())
+            {
+                if expected != received {
+                    warn!(
+                        "Ignoring WireGuard answer from {from_node_id} with mismatched session_id"
+                    );
+                    return Ok(());
+                }
+            }
+
             let Some(initiator) = state.pending.get_mut(from_node_id) else {
                 warn!("No pending WireGuard handshake for answer from {from_node_id}");
                 return Ok(());
@@ -1830,10 +1954,44 @@ impl Daemon {
                 }
             };
 
+            let probe_ephemeral_shared = match (
+                expected_session_id.as_ref(),
+                state.probe_ephemeral(from_node_id),
+                probe_ephemeral_public_key.as_deref(),
+            ) {
+                (Some(_), Some(local_probe_ephemeral), Some(peer_probe_public_key)) => {
+                    match derive_probe_ephemeral_shared(
+                        &local_probe_ephemeral,
+                        peer_probe_public_key,
+                    ) {
+                        Ok(shared) => Some(shared),
+                        Err(err) => {
+                            warn!(
+                                "Ignoring malformed probe ephemeral public key from {from_node_id}: {err}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             state.remove(from_node_id);
             state.attempts.remove(from_node_id);
-            keys
+            (
+                keys,
+                expected_session_id.is_some() && session_id.is_none(),
+                probe_ephemeral_shared,
+            )
         };
+
+        if let Some(session_id) = session_id {
+            self.peers
+                .set_probe_session_binding(from_node_id, Some(session_id), probe_ephemeral_shared)
+                .await;
+        } else if clear_session_binding {
+            self.peers.set_probe_session_id(from_node_id, None).await;
+        }
 
         // Replace old session with new one (rekey case).
         let new_session = TransportSession::new(keys);
@@ -1946,6 +2104,24 @@ fn truncate_signal_candidates(
     candidate_sources: &mut HashMap<String, String>,
 ) {
     if candidates.len() > MAX_SIGNAL_CANDIDATES {
+        let original_order = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| (endpoint.clone(), index))
+            .collect::<HashMap<_, _>>();
+        candidates.sort_by(|left, right| {
+            signal_candidate_rank(left, candidate_sources.get(left).map(String::as_str))
+                .cmp(&signal_candidate_rank(
+                    right,
+                    candidate_sources.get(right).map(String::as_str),
+                ))
+                .then_with(|| {
+                    original_order
+                        .get(left)
+                        .unwrap_or(&usize::MAX)
+                        .cmp(original_order.get(right).unwrap_or(&usize::MAX))
+                })
+        });
         warn!(
             "Truncating {} gathered UDP candidates to the signaling limit of {}",
             candidates.len(),
@@ -1955,6 +2131,37 @@ fn truncate_signal_candidates(
     }
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
+}
+
+fn signal_candidate_rank(endpoint: &str, source: Option<&str>) -> u8 {
+    match source {
+        Some("peer_reflexive" | "learned") => 0,
+        Some("upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") => 1,
+        Some("manual") => 2,
+        Some("stun_observed") => 3,
+        Some("predicted") => 4,
+        Some("host") => {
+            if endpoint
+                .parse::<SocketAddr>()
+                .is_ok_and(is_public_udp_candidate)
+            {
+                5
+            } else {
+                8
+            }
+        }
+        Some("relay") => 9,
+        Some(_) | None => {
+            if endpoint
+                .parse::<SocketAddr>()
+                .is_ok_and(is_public_udp_candidate)
+            {
+                6
+            } else {
+                8
+            }
+        }
+    }
 }
 
 fn candidate_source_label(source: CandidateSource) -> &'static str {
@@ -3136,8 +3343,15 @@ async fn run_network_outbound(
     while let Some(packet) = encrypted_rx.recv().await {
         let relay = relay_transport.read().await.clone();
         let relay_available = relay.is_some();
+        let udp = udp_transport.read().await.clone();
+        let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
         let selection = peers
-            .select_path_for_data(&packet.peer_id, prefer_direct, relay_available)
+            .select_path_for_data_with_local_endpoint(
+                &packet.peer_id,
+                prefer_direct,
+                relay_available,
+                udp_local_endpoint,
+            )
             .await;
         debug!(
             "Path selection for peer {}: path={:?} relay_hedged={} reason_code={} reason={}",
@@ -3149,43 +3363,56 @@ async fn run_network_outbound(
         );
 
         let sent_direct = if selection.path == Some(NetworkPath::Direct) {
-            match (
-                udp_transport.read().await.clone(),
-                selection.direct_endpoint,
-            ) {
-                (Some(udp), Some(endpoint)) => match udp.send_packet_to(&packet, endpoint).await {
-                    Ok(_) => true,
-                    Err(err) => {
-                        warn!(
-                            "Direct UDP send failed for peer {}; trying relay fallback: {err}",
-                            packet.peer_id
-                        );
-                        peers
-                            .record_direct_failure_with_code(
-                                &packet.peer_id,
-                                REASON_DIRECT_SEND_FAILED,
-                                err.to_string(),
-                            )
-                            .await;
-                        false
+            match (udp.clone(), selection.direct_endpoint) {
+                (Some(udp), Some(endpoint)) => {
+                    if !selection.direct_confirmed
+                        && selection.reason_code == REASON_PATH_DIRECT_TRIAL
+                    {
+                        if let Err(err) = udp.send_nomination_probe(&packet.peer_id, endpoint).await
+                        {
+                            debug!(
+                                "Failed to send nominated UDP connectivity check for peer {} at {}: {err}",
+                                packet.peer_id, endpoint
+                            );
+                        }
                     }
-                },
+                    match udp.send_packet_to(&packet, endpoint).await {
+                        Ok(_) => true,
+                        Err(err) => {
+                            warn!(
+                                "Direct UDP send failed for peer {}; trying relay fallback: {err}",
+                                packet.peer_id
+                            );
+                            peers
+                                .record_direct_failure_with_code_and_local_endpoint(
+                                    &packet.peer_id,
+                                    REASON_DIRECT_SEND_FAILED,
+                                    err.to_string(),
+                                    udp_local_endpoint,
+                                )
+                                .await;
+                            false
+                        }
+                    }
+                }
                 (None, _) => {
                     peers
-                        .record_direct_failure_with_code(
+                        .record_direct_failure_with_code_and_local_endpoint(
                             &packet.peer_id,
                             REASON_DIRECT_SEND_FAILED,
                             "UDP transport unavailable for encrypted packet",
+                            udp_local_endpoint,
                         )
                         .await;
                     false
                 }
                 (_, None) => {
                     peers
-                        .record_direct_failure_with_code(
+                        .record_direct_failure_with_code_and_local_endpoint(
                             &packet.peer_id,
                             REASON_DIRECT_SEND_FAILED,
                             "path selector chose direct without an endpoint",
+                            udp_local_endpoint,
                         )
                         .await;
                     false
@@ -3232,6 +3459,28 @@ fn unix_time_millis() -> u64 {
 
 fn relay_assisted_punch_at_ms() -> u64 {
     unix_time_millis().saturating_add(RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64)
+}
+
+fn new_probe_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn new_probe_ephemeral_keypair() -> (DhKeyPair, String) {
+    let keypair = DhKeyPair::generate();
+    let public_key_hex = hex::encode(keypair.public_key());
+    (keypair, public_key_hex)
+}
+
+fn derive_probe_ephemeral_shared(
+    local_keypair: &DhKeyPair,
+    peer_public_key_hex: &str,
+) -> Result<[u8; 32]> {
+    let peer_public = decode_x25519_key(peer_public_key_hex, "probe ephemeral public key")?;
+    local_keypair
+        .diffie_hellman(&peer_public)
+        .map_err(|e| DaemonError::Peer(format!("probe ephemeral X25519 failed: {e}")))
 }
 
 fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
@@ -3490,6 +3739,23 @@ async fn run_direct_encrypted_validation(
         )
         .await;
 
+    if peers
+        .is_direct_for_generation(&observation.peer_id, generation)
+        .await
+    {
+        peers
+            .record_direct_event(
+                &observation.peer_id,
+                "encrypted_trial_skipped",
+                Some(observation.observed_endpoint),
+                None,
+                Some(0),
+                "skipped bounded WireGuard validation because Direct is already confirmed for this network generation",
+            )
+            .await;
+        return;
+    }
+
     let validation_id = unix_time_millis() as u16;
     let mut sent = 0u32;
     for (sequence, delay) in DIRECT_ENCRYPTED_VALIDATION_DELAYS.into_iter().enumerate() {
@@ -3524,6 +3790,16 @@ async fn run_direct_encrypted_validation(
                     "Skipping encrypted Direct validation for {}; WireGuard session is not ready",
                     observation.peer_id
                 );
+                peers
+                    .record_direct_event(
+                        &observation.peer_id,
+                        "encrypted_trial_skipped",
+                        Some(observation.observed_endpoint),
+                        None,
+                        Some(sent),
+                        "skipped bounded WireGuard validation because WireGuard session is not ready",
+                    )
+                    .await;
                 return;
             }
             Err(err) => {
@@ -3531,6 +3807,16 @@ async fn run_direct_encrypted_validation(
                     "Failed to encrypt Direct validation packet for {}: {err}",
                     observation.peer_id
                 );
+                peers
+                    .record_direct_event(
+                        &observation.peer_id,
+                        "encrypted_trial_failed",
+                        Some(observation.observed_endpoint),
+                        None,
+                        Some(sent),
+                        format!("failed to encrypt bounded WireGuard validation packet: {err}"),
+                    )
+                    .await;
                 return;
             }
         };
@@ -3975,6 +4261,65 @@ mod tests {
             .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(3)));
     }
 
+    #[tokio::test]
+    async fn encrypted_direct_validation_skips_when_direct_is_already_confirmed() {
+        let remote_identity = NodeIdentity::generate();
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observed_endpoint = remote_socket.local_addr().unwrap();
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: hex::encode(remote_identity.public_key()),
+                endpoint: observed_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+        peers
+            .record_direct_success("node-b", Some(observed_endpoint))
+            .await;
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+
+        run_direct_encrypted_validation(
+            PeerReflexiveObservation {
+                peer_id: "node-b".to_string(),
+                observed_endpoint,
+            },
+            udp,
+            peers.clone(),
+            transport,
+            "10.20.0.1",
+        )
+        .await;
+
+        let mut datagram = vec![0u8; 2048];
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            remote_socket.recv_from(&mut datagram)
+        )
+        .await
+        .is_err());
+
+        let diagnostics = peers.diagnostics().await;
+        assert!(diagnostics[0].direct_events.iter().any(|event| {
+            event.stage == "encrypted_trial_skipped" && event.sent_probes == Some(0)
+        }));
+        assert!(!diagnostics[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(0)));
+    }
+
     #[test]
     fn test_advertised_udp_endpoint_uses_configured_value() {
         let local = "0.0.0.0:51820".parse().unwrap();
@@ -4030,6 +4375,40 @@ mod tests {
         assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
         assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
         assert_eq!(sources.get(&mapped).map(String::as_str), Some("upnp"));
+    }
+
+    #[test]
+    fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts() {
+        let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 4)
+            .map(|index| format!("192.168.1.{index}:51820"))
+            .collect::<Vec<_>>();
+        let stun = "203.0.113.10:42000".to_string();
+        let predicted = "203.0.113.10:42004".to_string();
+        candidates.push(stun.clone());
+        candidates.push(predicted.clone());
+
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint, "host".to_string()))
+            .collect::<HashMap<_, _>>();
+        sources.insert(stun.clone(), "stun_observed".to_string());
+        sources.insert(predicted.clone(), "predicted".to_string());
+
+        truncate_signal_candidates(&mut candidates, &mut sources);
+
+        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert!(candidates.contains(&stun));
+        assert!(candidates.contains(&predicted));
+        assert_eq!(
+            sources.get(&stun).map(String::as_str),
+            Some("stun_observed")
+        );
+        assert_eq!(
+            sources.get(&predicted).map(String::as_str),
+            Some("predicted")
+        );
+        assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
     }
 
     #[test]
@@ -4498,7 +4877,7 @@ mod tests {
 
         {
             let mut state = daemon.pending_handshakes.lock().await;
-            state.insert(peer_id.to_string(), initiator);
+            state.insert(peer_id.to_string(), initiator, None, None);
             state.attempts.insert(peer_id.to_string(), 1);
         }
 
@@ -4509,7 +4888,7 @@ mod tests {
         stale_response.receiver_index ^= 0x1111_0001;
 
         daemon
-            .handle_peer_answer(peer_id, &stale_response.to_bytes())
+            .handle_peer_answer(peer_id, &stale_response.to_bytes(), None, None)
             .await
             .unwrap();
 

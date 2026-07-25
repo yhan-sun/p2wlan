@@ -12,6 +12,28 @@ export type ConnectionState =
 
 export type NetworkPath = "direct" | "relay";
 export type PeerPath = NetworkPath | "direct_trial" | "offline";
+export type DirectPathType = "public_udp" | "overlay" | "relay" | "probing" | "unknown";
+
+export type CandidatePairSource =
+  | "signaled"
+  | "host"
+  | "stun_observed"
+  | "upnp"
+  | "pcp"
+  | "nat_pmp"
+  | "predicted"
+  | "birthday"
+  | "learned"
+  | "peer_reflexive";
+
+export type CandidatePairState =
+  | "frozen"
+  | "waiting"
+  | "probing"
+  | "succeeded"
+  | "selected"
+  | "failed"
+  | "degraded";
 
 export type HealthStatus = "healthy" | "degraded" | "unhealthy" | "shutting_down";
 
@@ -47,6 +69,45 @@ export interface PathHealthDiagnostics {
   latency_ms: number | null;
 }
 
+export interface CandidatePairDiagnostics {
+  local_endpoint: string | null;
+  remote_endpoint: string;
+  local_candidate_type: CandidatePairSource | null;
+  remote_candidate_type: CandidatePairSource;
+  local_interface: string | null;
+  local_source: string | null;
+  remote_source: CandidatePairSource;
+  source: CandidatePairSource;
+  local_generation: number;
+  state: CandidatePairState;
+  pair_state: CandidatePairState;
+  nominated: boolean;
+  selected: boolean;
+  nominated_age_ms: number | null;
+  selected_age_ms: number | null;
+  last_probe_age_ms: number | null;
+  probe_count: number;
+  probe_due: boolean;
+  probe_retry_after_ms: number | null;
+  probe_retry_remaining_ms: number | null;
+  first_success_age_ms: number | null;
+  last_success_age_ms: number | null;
+  last_failure_age_ms: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+  last_error_code: string | null;
+  rtt_ms: number | null;
+  rtt_ewma_ms: number | null;
+  jitter_ms: number | null;
+  success_count: number;
+  failure_count: number;
+  direct_type: DirectPathType;
+  is_public_udp_direct: boolean;
+  is_overlay_direct: boolean;
+  is_relay: boolean;
+  warning: string | null;
+}
+
 export interface PeerDiagnostics {
   node_id: string;
   device_name?: string;
@@ -55,6 +116,16 @@ export interface PeerDiagnostics {
   nat_type: string;
   state: ConnectionState;
   active_path: NetworkPath | null;
+  direct_type: DirectPathType;
+  probe_session_id?: string | null;
+  probe_key_type?: string;
+  selected_pair: CandidatePairDiagnostics | null;
+  current_direct_pair: CandidatePairDiagnostics | null;
+  consent_endpoint: string | null;
+  is_public_udp_direct: boolean;
+  is_overlay_direct: boolean;
+  is_relay: boolean;
+  warning: string | null;
   connected_for_ms: number | null;
   bytes_sent: number;
   bytes_received: number;
@@ -62,6 +133,7 @@ export interface PeerDiagnostics {
   candidates: string[];
   direct: PathHealthDiagnostics;
   relay: PathHealthDiagnostics;
+  candidate_pairs?: CandidatePairDiagnostics[];
   current_path_selection?: PathSelectionDiagnostics | null;
   last_path_selection?: PathSelectionDiagnostics | null;
 }

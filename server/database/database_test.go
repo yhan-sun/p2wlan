@@ -208,6 +208,31 @@ func TestSignalsPreserveCandidateSetMetadata(t *testing.T) {
 	}
 }
 
+func TestSignalsPreserveSessionID(t *testing.T) {
+	db, device := createTestDevice(t, "signal-session@p2wlan.local", "signal-session-source")
+	defer db.Close()
+	target, err := db.CreateDevice(device.UserID, "default", "signal-session-target-pubkey", "signal-session-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target failed: %v", err)
+	}
+
+	const sessionID = "0123456789abcdef0123456789abcdef"
+	const probeEphemeralPublicKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	if _, err := db.CreateSignalWithTraversalSession(
+		device.ID, target.ID, "peer_offer", []string{"203.0.113.10:51820"}, nil, "handshake", 0, 7, 0, sessionID, probeEphemeralPublicKey,
+	); err != nil {
+		t.Fatalf("CreateSignalWithTraversalSession failed: %v", err)
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals failed: %v", err)
+	}
+	if len(signals) != 1 || signals[0].SessionID != sessionID || signals[0].ProbeEphemeralPublicKey != probeEphemeralPublicKey {
+		t.Fatalf("session key material was not preserved: %#v", signals)
+	}
+}
+
 func TestSignalsIgnoreExpiredRows(t *testing.T) {
 	db, device := createTestDevice(t, "signal-ttl@p2wlan.local", "signal-ttl-source")
 	defer db.Close()

@@ -30,9 +30,10 @@ pub use ice::{
     StunObservation,
 };
 pub use punch::{
-    build_authenticated_punch_ack, build_authenticated_punch_packet, build_punch_ack,
-    build_punch_packet, build_punch_packet_with_nonce, decode_authenticated_punch_packet,
-    decode_punch_packet, hole_punch, peek_authenticated_punch_identity, send_keepalive, send_punch,
+    build_authenticated_punch_ack, build_authenticated_punch_packet,
+    build_authenticated_punch_packet_with_nomination, build_punch_ack, build_punch_packet,
+    build_punch_packet_with_nonce, decode_authenticated_punch_packet, decode_punch_packet,
+    hole_punch, peek_authenticated_punch_identity, send_keepalive, send_punch,
     AuthenticatedPunchIdentity, DecodedPunchPacket, ProbeMacKey, PunchConfig, PunchPacketKind,
     PunchResult,
 };
