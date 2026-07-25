@@ -271,12 +271,17 @@ u8    version        2
 u8    msg_type       1=PUNCH, 2=ACK
 u8[8] nonce          random correlation nonce
 u64   generation     sender local network generation, big-endian
+u8    flags          bit0=use_candidate nomination check, other bits MUST be zero
 u8    src_len        1..255
 u8    dst_len        1..255
 u8[]  src_node_id    UTF-8, src_len bytes
 u8[]  dst_node_id    UTF-8, dst_len bytes
 u8[16] mac           truncated HMAC-BLAKE2s
 ```
+
+兼容性：接收端同时接受早期 v2 skeleton（无 `flags` 字节）的已签名包，并把 `use_candidate` 视为 `false`。发送端仍会为同一个 nonce 附带一个 legacy v1 probe，确保旧 peer 至少可以用 v1 ACK 清 pending probe。
+
+发送预算：批量 connectivity probes 受 network / peer / peer+remote-IP 短窗口预算约束；预算耗尽会跳过剩余 PUNCH 并在 diagnostics timeline 记录 `probe_budget_limited`。该预算同时有进程内计数和跨进程文件计数，默认共享路径为系统临时目录下的 `p2wlan-outbound-probe-budget-v1.tsv`；可用 `P2WLAN_GLOBAL_PROBE_BUDGET_PATH` 覆盖，或用 `P2WLAN_DISABLE_GLOBAL_PROBE_BUDGET=1` 禁用跨进程计数。Direct consent freshness probes 不使用该批量探索预算，避免健康路径保活被候选探索挤掉。
 
 MAC 输入：
 
@@ -291,8 +296,26 @@ mac = HMAC_BLAKE2s_256(
 
 ```text
 shared = X25519(local_node_private_key, peer_public_key)
-probe_mac_key = HMAC_BLAKE2s_256(shared, "p2wlan udp probe v2 mac key")
+base_probe_mac_key = HMAC_BLAKE2s_256(shared, "p2wlan udp probe v2 mac key")
+
+# 当控制面 signal 携带显式 session_id 时：
+probe_mac_key = HMAC_BLAKE2s_256(
+  base_probe_mac_key,
+  "p2wlan udp probe v2 session key" || session_id
+)
+
+# 当 peer_offer / peer_answer 同时携带 probe_ephemeral_public_key 时：
+probe_ephemeral_shared = X25519(local_probe_ephemeral_private, peer_probe_ephemeral_public_key)
+probe_mac_key = HMAC_BLAKE2s_256(
+  base_probe_mac_key,
+  "p2wlan udp probe v2 ephemeral session key" || session_id || probe_ephemeral_shared
+)
+
+# legacy signal 没有 session_id 时：
+probe_mac_key = base_probe_mac_key
 ```
+
+`session_id` 和发起端 `probe_ephemeral_public_key` 由 offer 发起端生成，随 `peer_offer` 信令持久化；接收端生成自己的临时 X25519 keypair，计算 session-local shared secret，并在 `peer_answer` 原样回显 `session_id`、返回自己的 `probe_ephemeral_public_key`。接收端按 `ephemeral_session` -> `session` -> `static` 顺序验证 inbound Probe v2，以兼容旧控制面或旧客户端；发送端优先使用当前最强 key。PNCH v2 字节布局保持不变，ephemeral key material 只在控制面 signal JSON 中传递，因此既有 v2 parser 和 golden vectors 继续有效。Diagnostics 暴露 `probe_session_id` 和 `probe_key_type`，可区分 `static`、`session` 与 `ephemeral_session`。
 
 接收规则：
 
@@ -300,6 +323,9 @@ probe_mac_key = HMAC_BLAKE2s_256(shared, "p2wlan udp probe v2 mac key")
 - peer 必须已知且存在可派生的 Probe MAC key，否则丢弃。
 - MAC 验证失败、格式错误或空 node ID 直接丢弃，不转发给 WireGuard inbound。
 - v2 PUNCH 验证通过后可以学习来源 UDP 地址，即使该地址不在控制面 candidate 列表中。
+- v2 PUNCH 如果携带 `use_candidate`，只把 pair 标记为 nominated/trial-ready；仍必须等加密数据解密成功后才可以 selected/confirmed Direct。
+- v2 PUNCH 通过 MAC 验证后进入本地 nonce replay window；重复 nonce 只做幂等 ACK，不再次学习 endpoint、不刷新 pair 状态、不触发 reverse check。
+- v2 PUNCH 按 peer + UDP source 执行短窗口限速；超过预算的包静默丢弃，避免 ACK 放大和 candidate 状态刷写。
 - v2 ACK 必须匹配 pending nonce、peer ID 和本地 network generation；验证通过后可以确认来源地址为 direct endpoint。
 - legacy v1 仍保持原兼容行为；v2 不改变控制面 candidate wire format。
 
@@ -310,7 +336,7 @@ probe_mac_key = HMAC_BLAKE2s_256(shared, "p2wlan udp probe v2 mac key")
 | 1 | PUNCH | A -> B |
 | 2 | ACK | B -> A |
 
-后续 A3 目标：改为 session-bound 临时 X25519 key、显式 session ID、nonce replay window、限速预算和跨语言 golden vectors。当前 v2 skeleton 的目标是先阻止伪造 ACK 改写路径状态，并为 peer-reflexive endpoint 学习提供认证基础。
+A3 当前已覆盖：阻止伪造 ACK 改写路径状态、认证 peer-reflexive endpoint 学习、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、session/static fallback、本地 nonce replay window、peer/source 入站短窗口限速、network / peer / peer+remote-IP 发送侧短窗口预算、跨进程/跨客户端全局 probe 预算、Rust/Go golden vectors、Rust parser 畸形帧兼容回归和 cargo-fuzz `pnch_parser` target。剩余安全项是更完整的设备身份签名 transcript、安全评审和即时全局撤销，不应把当前实现表述为完成生产级安全审计。
 
 ## 7. 路径选择
 
@@ -578,6 +604,31 @@ Encoded bytes (hex):
 0b 6e 6f 64 65 2d 67 6f 6c 64 65 6e 00 14 74 65 73 74 2d 6a 77 74 2d 74 6f 6b 65 6e 2d 76 61 6c 75 65
 ```
 
+Authenticated Probe v2 测试向量：
+
+```text
+probe_mac_key = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+nonce         = a0a1a2a3a4a5a6a7
+src_node_id   = "node-a"
+dst_node_id   = "node-b"
+generation    = 0x0102030405060708
+flags         = 0x01 (use_candidate)
+
+PUNCH bytes (hex):
+504e43480201a0a1a2a3a4a5a6a701020304050607080106066e6f64652d616e6f64652d62fa09a10aa09da3d47f1b7d003a7adadb
+
+ACK:
+src_node_id   = "node-b"
+dst_node_id   = "node-a"
+generation    = 0x0102030405060709
+flags         = 0x00
+
+ACK bytes (hex):
+504e43480202a0a1a2a3a4a5a6a701020304050607090006066e6f64652d626e6f64652d619080783cb1a90b982675b2fab7399bbd
+```
+
+该向量由 Rust `p2pnet-nat` 单元测试和 Go `server` 单元测试共同校验；Rust 侧还覆盖 legacy v2（无 `flags` 字节）、未知 flags、截断帧、空 node ID、坏 UTF-8、坏 MAC 和确定性畸形帧 corpus。
+
 错误码对照表（Rust `RelayErrorCode` ↔ Go 常量）：
 | Code | Rust | Go |
 | --- | --- | --- |
@@ -605,7 +656,7 @@ Encoded bytes (hex):
 
 A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
-- Probe v2 skeleton 已提供 MAC 验证、目标绑定和认证 peer-reflexive endpoint 学习；session-bound 临时密钥、nonce replay window、probe 限速预算和即时全局撤销仍属于 Phase A3。
+- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归和 cargo-fuzz parser target；设备身份签名 transcript、安全评审和即时全局撤销仍属于后续安全收口。
 - A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
 
 ## 13. Control Signaling WebSocket V1

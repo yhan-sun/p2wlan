@@ -202,8 +202,8 @@ version | type | session_id | src_id | dst_id | timestamp | nonce | mac
 要求：
 
 - `session_id` 由已认证控制信令协商。
-- 双方为每个 session 生成临时 X25519 公钥，并使用已有 Ed25519 Device Identity Key 对临时公钥、双方设备 ID、session ID 和过期时间签名。
-- 双方验证控制面绑定的 Ed25519 公钥后，通过临时 X25519 DH 和带协议域分离的 KDF 派生 `probe_mac_key`；该密钥不能复用为 WireGuard 或控制面密钥。
+- 双方为每个 session 生成临时 X25519 公钥，通过控制面 signal 交换 `probe_ephemeral_public_key`；当前实现用已认证控制面 + 双方静态 X25519 shared secret 作为 base key，再混入临时 X25519 DH 结果派生 `probe_mac_key`。
+- 后续安全收口应使用已有 Ed25519 Device Identity Key 对临时公钥、双方设备 ID、session ID 和过期时间签名，并验证完整 transcript；Probe key 不能复用为 WireGuard 或控制面密钥。
 - `mac` 使用 `probe_mac_key`，不能接受未认证 ACK 更新路径状态；具体 KDF、MAC、截断长度和 transcript 编码必须写入协议测试向量并接受安全评审。
 - 时间戳允许有限时钟偏差，并维护短期 nonce 重放窗口。
 - 未知 session、错误目标和过期 probe 在固定成本内丢弃。
@@ -382,7 +382,7 @@ Mapping Analyzer 通过同一本地 socket 向多个 STUN endpoint 采样，必�
 硬限制：
 
 - 全局 socket 上限。
-- 单 peer、单远端 IP 和单网络的 packet rate 上限。
+- 单 peer、单远端 IP 和单网络的 packet rate 上限（当前已在 UDP punch 发送侧落地 network / peer / peer+remote-IP 短窗口硬预算）。
 - 指数退避和最大连续探测时间。
 - 已有健康 Direct 时不运行 aggressive 探测。
 - 应用进入后台或系统低电量时降级。
@@ -392,6 +392,7 @@ Mapping Analyzer 通过同一本地 socket 向多个 STUN endpoint 采样，必�
 - candidate pair 记录 `source`、`probe_count`、`last_probe_at`，并在 diagnostics 中暴露。
 - Probe 排序优先考虑状态、认证 peer-reflexive 来源、本地/IPv6/公网地址类型、探测次数、失败次数、RTT 和 jitter。
 - UDP punch 从固定全量轮询改为 adaptive burst schedule：首轮打最高分少量候选，后续快速扩展，最终轮仍覆盖所有候选，保持 `attempts=1` 的兼容全覆盖语义。
+- UDP punch 发送侧有 network / peer / peer+remote-IP 短窗口预算，包含进程内计数和跨进程/跨客户端文件计数；预算耗尽时跳过剩余 connectivity probes 并记录 `probe_budget_limited` timeline 事件；consent freshness 不走该预算。
 - 认证 Probe v2 学到 peer-reflexive endpoint 时保留旧 signaled endpoint，不再因为学习新地址而丢失原始候选。
 
 `PUNCH-02a` 暂不引入额外 socket、端口预测、birthday probing 或控制面 wire format 变更；这些进入 NAT-01b/PUNCH-03 之后再做。
@@ -645,8 +646,12 @@ PeerSessionReady / PeerSessionFailed
 - `SEC-01` 定义 Relay token、TLS 和注册状态机。
 - `SEC-02` Rust/Go Relay 实现认证与有界队列。
 - `SEC-03` 定义并实现认证 Probe v2、重放窗口和限速。
-  - 已落地：兼容 legacy v1 的 Probe v2 skeleton，使用现有 X25519 device key material 派生 MAC key，拒绝错误目标/坏 MAC，并允许认证 peer-reflexive endpoint 学习。
-  - 待补齐：session-bound 临时密钥、nonce replay window、probe 预算/限速和跨语言 golden vectors。
+  - 已落地：兼容 legacy v1 的 Probe v2 skeleton，使用现有 X25519 device key material 派生 MAC key，拒绝错误目标/坏 MAC，允许认证 peer-reflexive endpoint 学习，并对 v2 PUNCH 执行本地 nonce replay window、peer/source 入站短窗口限速，以及发送侧 network / peer / peer+remote-IP connectivity probe 预算。
+  - 已落地：Rust/Go Probe v2 golden vectors，以及 Rust parser 畸形帧 corpus/未知 flags/legacy skeleton 兼容回归。
+  - 已落地：control signal 显式 `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Probe v2 session-bound MAC key、旧 static key 兼容 fallback，以及 diagnostics `probe_session_id` / `probe_key_type` 暴露。
+  - 已落地：cargo-fuzz `pnch_parser` target，覆盖 PNCH v1 decode、PNCH v2 identity peek 和多 key MAC decode。
+  - 已落地：跨进程/跨客户端全局 outbound probe budget，复用 network / peer / peer+remote-IP 短窗口，并输出 `global_*_rate_limited` reason。
+  - 待补齐：Ed25519 transcript 签名、安全评审和即时全局撤销。
 - `SEC-04` 增加协议版本、兼容测试和 fuzz target。
 - `OBS-01` 建立稳定 reason code 和连接事件。
 
@@ -789,7 +794,7 @@ PeerSessionReady / PeerSessionFailed
 
 ### Iteration 1：先让连接可信且可解释
 
-- 完成 Relay token/TLS 设计和 Probe v2 skeleton；继续补 session-bound key、重放窗口和 probe 预算。
+- 完成 Relay token/TLS 设计和 Probe v2 skeleton；继续补 Ed25519 transcript 签名、安全评审和即时全局撤销。
 - 给所有 path/relay/control 失败建立 reason code。
 - 为网络切换引入 generation，阻止旧异步结果覆盖新状态。
 - 扩展 `p2wlan doctor` 输出最近一次 Direct 失败阶段。
