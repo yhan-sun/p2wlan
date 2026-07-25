@@ -609,6 +609,7 @@ impl ControlClient {
     }
 
     /// Send a peer offer with an explicit traversal session ID.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_peer_offer_with_sources_punch_and_session(
         &self,
         to_node_id: &str,
@@ -723,6 +724,7 @@ impl ControlClient {
     }
 
     /// Send a peer answer with an explicit traversal session ID.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_peer_answer_with_sources_schedule_and_session(
         &self,
         to_node_id: &str,
