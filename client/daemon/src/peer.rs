@@ -662,6 +662,22 @@ impl CandidatePair {
         self.state = CandidatePairState::Degraded;
     }
 
+    fn retained_for_generation(&self, local_generation: u64) -> Self {
+        let mut retained = self.clone();
+        let now = Instant::now();
+        retained.local_generation = local_generation;
+        retained.state = CandidatePairState::Selected;
+        retained.nominated = true;
+        retained.nominated_at.get_or_insert(now);
+        retained.selected_at.get_or_insert(now);
+        retained.first_success_at.get_or_insert(now);
+        retained.last_success_at.get_or_insert(now);
+        retained.consecutive_failures = 0;
+        retained.last_error_code = None;
+        retained.last_error = None;
+        retained
+    }
+
     fn failure_age(&self) -> Option<Duration> {
         self.last_failure_at
             .map(|last_failure| last_failure.elapsed())
@@ -1737,6 +1753,55 @@ impl PeerConnection {
         self.ensure_current_candidate_pairs(local_generation);
     }
 
+    fn mark_candidate_refresh_generation_changed(
+        &mut self,
+        local_generation: u64,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason = reason.into();
+        let retained_private_direct = (self.state == ConnectionState::Direct)
+            .then(|| {
+                self.candidate_pairs
+                    .iter()
+                    .find(|pair| should_retain_private_direct_pair(pair))
+                    .map(|pair| pair.retained_for_generation(local_generation))
+            })
+            .flatten();
+        let retained_endpoint = retained_private_direct
+            .as_ref()
+            .map(|pair| pair.remote_endpoint);
+
+        let peer_id = self.node_id.clone();
+        self.candidate_pairs
+            .retain(|pair| pair.local_generation.saturating_add(1) >= local_generation);
+        for pair in &mut self.candidate_pairs {
+            if pair.local_generation < local_generation {
+                let old_state = pair.state;
+                pair.record_generation_change(reason.clone());
+                log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
+            }
+        }
+        self.ensure_current_candidate_pairs(local_generation);
+
+        if let Some(retained) = retained_private_direct {
+            if let Some(index) = self.candidate_pairs.iter().position(|pair| {
+                pair.local_generation == local_generation
+                    && pair.remote_endpoint == retained.remote_endpoint
+            }) {
+                self.candidate_pairs[index] = retained;
+            } else {
+                self.candidate_pairs.push(retained);
+            }
+            if let Some(endpoint) = retained_endpoint {
+                self.endpoint = Some(endpoint);
+                self.direct_generation = local_generation;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn direct_retry_after(&self, base: Duration) -> Duration {
         self.direct_health.retry_after(base)
     }
@@ -2149,6 +2214,43 @@ impl PeerManager {
         }
 
         info!("Local network generation advanced to {generation}: {reason}");
+        generation
+    }
+
+    /// Advance local generation after a candidate refresh.
+    ///
+    /// Unlike a true interface transition, a periodic candidate refresh may
+    /// change advertised public or gateway candidates while an authenticated
+    /// low-latency private/LAN Direct path is still healthy. Preserve that
+    /// selected private pair in the new generation so data traffic does not
+    /// briefly fall back to relay on every refresh.
+    pub async fn advance_candidate_refresh_generation(&self, reason: impl Into<String>) -> u64 {
+        let reason = reason.into();
+        let generation = {
+            let mut generation = self.network_generation.write().await;
+            *generation = generation.saturating_add(1);
+            *generation
+        };
+
+        let mut retained_private_direct_count = 0usize;
+        let mut conns = self.connections.write().await;
+        for conn in conns.values_mut() {
+            let retained_private_direct =
+                conn.mark_candidate_refresh_generation_changed(generation, reason.clone());
+            if retained_private_direct {
+                retained_private_direct_count += 1;
+                continue;
+            }
+
+            conn.direct_health.record_generation_change(reason.clone());
+            if conn.state == ConnectionState::Direct {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+
+        info!(
+            "Local network generation advanced to {generation}: {reason}; retained {retained_private_direct_count} low-latency private direct path(s)"
+        );
         generation
     }
 
@@ -6284,6 +6386,89 @@ mod tests {
         let relay_score = selected.relay_score.as_ref().unwrap().score;
         assert!(direct_score < DIRECT_CONFIRMED_MIN_SCORE);
         assert!(direct_score < relay_score);
+    }
+
+    #[tokio::test]
+    async fn candidate_refresh_retains_low_latency_private_direct() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "192.168.2.11:51840".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(7)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        assert_eq!(manager.current_network_generation().await, 0);
+
+        let generation = manager
+            .advance_candidate_refresh_generation("refreshed UDP candidates")
+            .await;
+        assert_eq!(generation, 1);
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Direct);
+        assert_eq!(conn.direct_generation, generation);
+        assert_eq!(conn.endpoint, Some(endpoint));
+        assert!(conn.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == 0
+                && pair.remote_endpoint == endpoint
+                && pair.state == CandidatePairState::Degraded
+                && pair.last_error_code.as_deref() == Some(REASON_NETWORK_GENERATION_CHANGED)
+        }));
+        assert!(conn.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == generation
+                && pair.remote_endpoint == endpoint
+                && pair.state == CandidatePairState::Selected
+                && pair.rtt_ewma_ms.or(pair.rtt_ms) == Some(7)
+        }));
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(endpoint)
+        );
+        assert!(
+            manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_refresh_still_invalidates_public_direct() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "8.8.8.8:51841".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(7)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+
+        let generation = manager
+            .advance_candidate_refresh_generation("refreshed UDP candidates")
+            .await;
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        assert_eq!(
+            conn.direct_health.last_error_code.as_deref(),
+            Some(REASON_NETWORK_GENERATION_CHANGED)
+        );
+        assert!(
+            !manager
+                .should_use_direct_for_data("peer1", true, true)
+                .await
+        );
     }
 
     #[tokio::test]
