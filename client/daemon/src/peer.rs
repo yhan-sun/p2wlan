@@ -1204,6 +1204,29 @@ impl PeerConnection {
             .next()
     }
 
+    fn should_probe_private_alternates_while_direct(&self, local_generation: u64) -> bool {
+        if self.state != ConnectionState::Direct {
+            return true;
+        }
+
+        let selected_private = self
+            .selected_candidate_pair_for_diagnostics(local_generation)
+            .is_some_and(|pair| is_private_direct_endpoint(pair.remote_endpoint));
+        if selected_private {
+            return false;
+        }
+
+        self.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == local_generation
+                && is_private_direct_endpoint(pair.remote_endpoint)
+                && !matches!(
+                    pair.state,
+                    CandidatePairState::Selected | CandidatePairState::Succeeded
+                )
+                && candidate_pair_probe_due(pair)
+        })
+    }
+
     fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
         self.best_candidate_pair_for_send(local_generation)
             .map(|pair| pair.remote_endpoint)
@@ -1246,8 +1269,11 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_source_rank(a.source)
-                .cmp(&candidate_pair_source_rank(b.source))
+            candidate_pair_send_rank(a)
+                .cmp(&candidate_pair_send_rank(b))
+                .then_with(|| {
+                    candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
+                })
                 .then_with(|| {
                     a.rtt_ewma_ms
                         .or(a.rtt_ms)
@@ -2835,7 +2861,9 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return Vec::new();
         };
-        if conn.state == ConnectionState::Direct {
+        if conn.state == ConnectionState::Direct
+            && !conn.should_probe_private_alternates_while_direct(generation)
+        {
             return Vec::new();
         }
         let endpoints = conn.candidate_probe_endpoints(
@@ -2872,8 +2900,12 @@ impl PeerManager {
             .write()
             .await
             .values_mut()
-            .filter(|conn| conn.state != ConnectionState::Direct)
             .filter_map(|conn| {
+                if conn.state == ConnectionState::Direct
+                    && !conn.should_probe_private_alternates_while_direct(generation)
+                {
+                    return None;
+                }
                 let endpoints = conn.candidate_probe_endpoints(
                     generation,
                     &history,
@@ -4664,23 +4696,42 @@ fn candidate_pair_probe_retry_remaining(pair: &CandidatePair) -> Option<Duration
 }
 
 fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
+    if is_successful_low_latency_private_pair(pair) {
+        return 0;
+    }
+
     match pair.state {
-        CandidatePairState::Selected => 0,
+        CandidatePairState::Selected => 1,
         CandidatePairState::Succeeded | CandidatePairState::Probing
             if pair.source == CandidatePairSource::PeerReflexive
                 && pair.last_probe_at.is_some_and(|last_probe| {
                     last_probe.elapsed() <= PEER_REFLEXIVE_STICKY_WINDOW
                 }) =>
         {
-            1
+            2
         }
-        CandidatePairState::Succeeded => 2,
-        CandidatePairState::Probing => 3,
-        CandidatePairState::Waiting => 4,
-        CandidatePairState::Failed => 5,
-        CandidatePairState::Degraded => 6,
-        CandidatePairState::Frozen => 7,
+        CandidatePairState::Succeeded => 3,
+        CandidatePairState::Probing => 4,
+        CandidatePairState::Waiting => 5,
+        CandidatePairState::Failed => 6,
+        CandidatePairState::Degraded => 7,
+        CandidatePairState::Frozen => 8,
     }
+}
+
+fn is_successful_low_latency_private_pair(pair: &CandidatePair) -> bool {
+    matches!(
+        pair.state,
+        CandidatePairState::Selected | CandidatePairState::Succeeded
+    ) && is_private_direct_endpoint(pair.remote_endpoint)
+        && pair.consecutive_failures == 0
+        && pair
+            .success_age()
+            .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        && pair
+            .rtt_ewma_ms
+            .or(pair.rtt_ms)
+            .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -5789,6 +5840,112 @@ mod tests {
         assert_eq!(
             manager.direct_endpoints().await,
             vec![("peer1".to_string(), new_endpoint)]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_public_direct_still_probes_waiting_private_candidate() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let public_endpoint: SocketAddr = "8.8.8.8:51842".parse().unwrap();
+        let private_endpoint: SocketAddr = "192.168.2.11:51842".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", public_endpoint)).await;
+        let candidates = vec![public_endpoint.to_string(), private_endpoint.to_string()];
+        let sources = HashMap::from([
+            (public_endpoint.to_string(), "peer_reflexive".to_string()),
+            (private_endpoint.to_string(), "host".to_string()),
+        ]);
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                public_endpoint,
+                Some(Duration::from_millis(620)),
+            )
+            .await;
+        manager
+            .record_direct_success("peer1", Some(public_endpoint))
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+
+        assert!(
+            targets.contains(&private_endpoint),
+            "waiting LAN candidate should still be probed while slow public Direct is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_latency_private_candidate_beats_selected_public_direct() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let public_endpoint: SocketAddr = "8.8.8.8:51843".parse().unwrap();
+        let private_endpoint: SocketAddr = "192.168.2.11:51843".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", public_endpoint)).await;
+        let candidates = vec![public_endpoint.to_string(), private_endpoint.to_string()];
+        let sources = HashMap::from([
+            (public_endpoint.to_string(), "peer_reflexive".to_string()),
+            (private_endpoint.to_string(), "host".to_string()),
+        ]);
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                public_endpoint,
+                Some(Duration::from_millis(620)),
+            )
+            .await;
+        manager
+            .record_direct_success("peer1", Some(public_endpoint))
+            .await;
+
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                private_endpoint,
+                Some(Duration::from_millis(7)),
+            )
+            .await;
+
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(private_endpoint)
+        );
+
+        let selection = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selection.path, Some(NetworkPath::Direct));
+        assert_eq!(selection.direct_endpoint, Some(private_endpoint));
+
+        manager
+            .record_direct_success("peer1", Some(private_endpoint))
+            .await;
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+            .await;
+        let peer = diagnostics
+            .iter()
+            .find(|peer| peer.node_id == "peer1")
+            .expect("peer diagnostics should be present");
+        let private_endpoint_text = private_endpoint.to_string();
+
+        assert_eq!(peer.direct_type, DirectPathType::Lan);
+        assert_eq!(
+            peer.selected_pair
+                .as_ref()
+                .map(|pair| pair.remote_endpoint.as_str()),
+            Some(private_endpoint_text.as_str())
+        );
+        assert_eq!(
+            peer.current_direct_pair
+                .as_ref()
+                .map(|pair| pair.remote_endpoint.as_str()),
+            Some(private_endpoint_text.as_str())
         );
     }
 

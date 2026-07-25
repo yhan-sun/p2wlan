@@ -718,9 +718,6 @@ function isPrivateEndpoint(endpoint: string | null | undefined): boolean {
 }
 
 function directPairForPresentation(peer: PeerDiagnostics): CandidatePairDiagnostics | null {
-  if (peer.active_path === "direct") {
-    return peer.selected_pair ?? peer.current_direct_pair ?? null;
-  }
   return peer.current_direct_pair ?? peer.selected_pair ?? null;
 }
 
