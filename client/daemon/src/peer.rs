@@ -1900,6 +1900,19 @@ impl PeerConnection {
                     remote_endpoint,
                     selection.reason
                 ),
+                DirectPathType::Lan => info!(
+                    event = "lan_direct_selected",
+                    peer_id = %self.node_id,
+                    local_endpoint = %local_endpoint_text,
+                    remote_endpoint = %remote_endpoint_text,
+                    candidate_source = ?candidate_source,
+                    rtt_ms = ?rtt_ms,
+                    reason = %selection.reason,
+                    "lan_direct_selected peer_id={} remote_endpoint={:?} reason={}",
+                    self.node_id,
+                    remote_endpoint,
+                    selection.reason
+                ),
                 _ => {}
             }
         }
@@ -3085,6 +3098,8 @@ impl PeerManager {
                 return false;
             };
             let was_direct = conn.state == ConnectionState::Direct;
+            let previous_endpoint = conn.endpoint;
+            let previous_generation = conn.direct_generation;
             let selected_endpoint = endpoint.or(conn.endpoint);
             let source = selected_endpoint.map(|endpoint| {
                 conn.endpoint = Some(endpoint);
@@ -3104,18 +3119,23 @@ impl PeerManager {
             if let (Some(endpoint), Some(source)) = (selected_endpoint, source) {
                 let direct_type = classify_confirmed_direct_endpoint(endpoint, source);
                 let local_endpoint_text = format_log_endpoint(local_endpoint);
-                info!(
-                    event = "candidate_pair_selected",
-                    peer_id = %node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %endpoint,
-                    candidate_source = ?source,
-                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                    reason = "encrypted data path confirmed Direct UDP",
-                    "candidate_pair_selected peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
-                    node_id,
-                    endpoint
-                );
+                let direct_confirmation_changed = !was_direct
+                    || previous_endpoint != Some(endpoint)
+                    || previous_generation != generation;
+                if direct_confirmation_changed {
+                    info!(
+                        event = "candidate_pair_selected",
+                        peer_id = %node_id,
+                        local_endpoint = %local_endpoint_text,
+                        remote_endpoint = %endpoint,
+                        candidate_source = ?source,
+                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                        reason = "encrypted data path confirmed Direct UDP",
+                        "candidate_pair_selected peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
+                        node_id,
+                        endpoint
+                    );
+                }
                 if !was_direct {
                     info!(
                         event = "direct_path_promoted",
@@ -3130,32 +3150,46 @@ impl PeerManager {
                         endpoint
                     );
                 }
-                match direct_type {
-                    DirectPathType::PublicUdp => info!(
-                        event = "public_udp_direct_selected",
-                        peer_id = %node_id,
-                        local_endpoint = %local_endpoint_text,
-                        remote_endpoint = %endpoint,
-                        candidate_source = ?source,
-                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                        reason = "encrypted data path confirmed Direct UDP",
-                        "public_udp_direct_selected peer_id={} remote_endpoint={}",
-                        node_id,
-                        endpoint
-                    ),
-                    DirectPathType::Overlay => info!(
-                        event = "overlay_direct_selected",
-                        peer_id = %node_id,
-                        local_endpoint = %local_endpoint_text,
-                        remote_endpoint = %endpoint,
-                        candidate_source = ?source,
-                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                        reason = "encrypted data path confirmed Direct UDP",
-                        "overlay_direct_selected peer_id={} remote_endpoint={}",
-                        node_id,
-                        endpoint
-                    ),
-                    _ => {}
+                if direct_confirmation_changed {
+                    match direct_type {
+                        DirectPathType::PublicUdp => info!(
+                            event = "public_udp_direct_selected",
+                            peer_id = %node_id,
+                            local_endpoint = %local_endpoint_text,
+                            remote_endpoint = %endpoint,
+                            candidate_source = ?source,
+                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                            reason = "encrypted data path confirmed Direct UDP",
+                            "public_udp_direct_selected peer_id={} remote_endpoint={}",
+                            node_id,
+                            endpoint
+                        ),
+                        DirectPathType::Overlay => info!(
+                            event = "overlay_direct_selected",
+                            peer_id = %node_id,
+                            local_endpoint = %local_endpoint_text,
+                            remote_endpoint = %endpoint,
+                            candidate_source = ?source,
+                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                            reason = "encrypted data path confirmed Direct UDP",
+                            "overlay_direct_selected peer_id={} remote_endpoint={}",
+                            node_id,
+                            endpoint
+                        ),
+                        DirectPathType::Lan => info!(
+                            event = "lan_direct_selected",
+                            peer_id = %node_id,
+                            local_endpoint = %local_endpoint_text,
+                            remote_endpoint = %endpoint,
+                            candidate_source = ?source,
+                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                            reason = "encrypted data path confirmed Direct UDP",
+                            "lan_direct_selected peer_id={} remote_endpoint={}",
+                            node_id,
+                            endpoint
+                        ),
+                        _ => {}
+                    }
                 }
             }
             source
