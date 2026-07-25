@@ -93,6 +93,7 @@ fi
 
 SOURCE_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 PACKAGE_DIR=$SOURCE_DIR
+LOCAL_PACKAGE=0
 WORK_DIR=
 
 cleanup() {
@@ -142,7 +143,13 @@ detect_arch() {
   esac
 }
 
-if [ ! -f "$PACKAGE_DIR/p2wlan" ] || [ ! -f "$PACKAGE_DIR/p2pnet-daemon" ]; then
+if [ -f "$PACKAGE_DIR/p2wlan" ] &&
+  [ -f "$PACKAGE_DIR/p2pnet-daemon" ] &&
+  [ -f "$PACKAGE_DIR/README-LINUX-CLI.txt" ]; then
+  LOCAL_PACKAGE=1
+fi
+
+if [ "$LOCAL_PACKAGE" -ne 1 ]; then
   need_cmd uname
   need_cmd mktemp
   need_cmd tar

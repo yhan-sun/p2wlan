@@ -276,6 +276,19 @@ impl PunchAttemptDeduplicator {
     }
 }
 
+fn should_cancel_maintenance_offer(
+    is_rekey: bool,
+    has_session: bool,
+    needs_rekey: bool,
+    expired: bool,
+) -> bool {
+    if is_rekey {
+        has_session && !needs_rekey && !expired
+    } else {
+        has_session
+    }
+}
+
 /// The main daemon orchestrator.
 ///
 /// Holds all subsystems and coordinates their lifecycle.
@@ -962,10 +975,9 @@ impl Daemon {
                                 );
                             } else if expired {
                                 info!(
-                                    "Session for peer {} expired; removing and rekeying",
+                                    "Session for peer {} expired; rekeying before dropping old session",
                                     conn.node_id
                                 );
-                                transport.remove_session(&conn.node_id).await;
                             } else {
                                 info!(
                                     "Session for peer {} needs rekey (message/time threshold)",
@@ -1039,8 +1051,28 @@ impl Daemon {
                             let candidate_sources = local_candidate_sources.read().await.clone();
 
                             // An inbound offer may have established a responder session while
-                            // candidates were being read.  Do not send a redundant initiation.
-                            if transport.has_session(&conn.node_id).await {
+                            // candidates were being read. For normal retries, any session is
+                            // enough to cancel. For rekeys, keep the old session alive and only
+                            // cancel once it has been replaced by a session that no longer needs
+                            // rekey. This avoids a brief no-session window that pushes traffic
+                            // through relay during otherwise healthy Direct paths.
+                            let current_has_session = transport.has_session(&conn.node_id).await;
+                            let current_needs = if is_rekey && current_has_session {
+                                transport.session_needs_rekey(&conn.node_id).await
+                            } else {
+                                false
+                            };
+                            let current_expired = if is_rekey && current_has_session {
+                                transport.session_is_expired(&conn.node_id).await
+                            } else {
+                                false
+                            };
+                            if should_cancel_maintenance_offer(
+                                is_rekey,
+                                current_has_session,
+                                current_needs,
+                                current_expired,
+                            ) {
                                 pending.lock().await.cancel_reservation(&conn.node_id);
                                 continue;
                             }
@@ -5121,6 +5153,16 @@ mod tests {
         assert!(err
             .to_string()
             .contains("invalid or unresolved STUN server"));
+    }
+
+    #[test]
+    fn maintenance_offer_cancellation_keeps_rekey_initiation_alive() {
+        assert!(should_cancel_maintenance_offer(false, true, false, false));
+        assert!(!should_cancel_maintenance_offer(false, false, false, false));
+        assert!(!should_cancel_maintenance_offer(true, true, true, false));
+        assert!(!should_cancel_maintenance_offer(true, true, false, true));
+        assert!(!should_cancel_maintenance_offer(true, false, false, false));
+        assert!(should_cancel_maintenance_offer(true, true, false, false));
     }
 
     #[tokio::test]
