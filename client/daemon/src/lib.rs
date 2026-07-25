@@ -1435,7 +1435,9 @@ impl Daemon {
                     observed_endpoint,
                     punch_at_ms,
                 } => {
-                    self.add_local_peer_reflexive_candidate(&observed_endpoint).await;
+                    let local_candidate_changed = self
+                        .add_local_peer_reflexive_candidate(&observed_endpoint)
+                        .await;
                     let punch_at_ms =
                         punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
                     let candidates = self.local_candidates.read().await.clone();
@@ -1452,7 +1454,7 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    if !candidates.is_empty() {
+                    if local_candidate_changed && !candidates.is_empty() {
                         if let Err(err) = self
                             .control
                             .send_peer_offer_with_sources_and_punch_at(
@@ -1479,6 +1481,17 @@ impl Daemon {
                                 )
                                 .await;
                         }
+                    } else if !local_candidate_changed {
+                        self.peers
+                            .record_direct_event(
+                                &from_node_id,
+                                "peer_reflexive_offer_skipped",
+                                observed_endpoint.parse().ok(),
+                                Some(candidates.len()),
+                                None,
+                                "peer-reflexive candidate already advertised; skipped full offer re-advertisement",
+                            )
+                            .await;
                     }
                     self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
                 }
@@ -1742,32 +1755,29 @@ impl Daemon {
         }
     }
 
-    async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) {
-        let endpoint = match observed_endpoint.parse::<SocketAddr>() {
-            Ok(endpoint) => endpoint.to_string(),
+    async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) -> bool {
+        let mut candidates = self.local_candidates.write().await;
+        let mut candidate_sources = self.local_candidate_sources.write().await;
+        match add_peer_reflexive_candidate_to_set(
+            observed_endpoint,
+            &mut candidates,
+            &mut candidate_sources,
+        ) {
+            Ok(true) => {
+                info!(
+                    "Updated relay-assisted peer-reflexive local UDP candidate {}",
+                    observed_endpoint
+                );
+                true
+            }
+            Ok(false) => false,
             Err(err) => {
                 warn!(
                     "Ignoring invalid relay-assisted peer-reflexive endpoint '{}': {err}",
                     observed_endpoint
                 );
-                return;
+                false
             }
-        };
-
-        let mut candidates = self.local_candidates.write().await;
-        let mut candidate_sources = self.local_candidate_sources.write().await;
-        let already_present = candidates.contains(&endpoint);
-        if !already_present {
-            candidates.insert(0, endpoint.clone());
-        }
-        candidate_sources.insert(endpoint.clone(), "peer_reflexive".to_string());
-        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
-
-        if !already_present {
-            info!(
-                "Added relay-assisted peer-reflexive local UDP candidate {}",
-                endpoint
-            );
         }
     }
 
@@ -2191,6 +2201,25 @@ fn preserve_peer_reflexive_candidates(
         candidates.insert(0, endpoint.clone());
         candidate_sources.insert(endpoint.clone(), "peer_reflexive".to_string());
     }
+}
+
+fn add_peer_reflexive_candidate_to_set(
+    observed_endpoint: &str,
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) -> std::result::Result<bool, std::net::AddrParseError> {
+    let endpoint = observed_endpoint.parse::<SocketAddr>()?.to_string();
+    let already_present = candidates.contains(&endpoint);
+    let source_changed =
+        candidate_sources.get(&endpoint).map(String::as_str) != Some("peer_reflexive");
+
+    if !already_present {
+        candidates.insert(0, endpoint.clone());
+    }
+    candidate_sources.insert(endpoint, "peer_reflexive".to_string());
+    truncate_signal_candidates(candidates, candidate_sources);
+
+    Ok(!already_present || source_changed)
 }
 
 fn candidate_refresh_requires_network_generation_advance(
@@ -2960,7 +2989,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         );
         if should_advance_generation {
             peers
-                .advance_network_generation(format!(
+                .advance_candidate_refresh_generation(format!(
                     "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
                 ))
                 .await;
@@ -4601,6 +4630,64 @@ mod tests {
         assert_eq!(next[0], "93.184.216.34:45000");
         assert_eq!(
             next_sources.get("93.184.216.34:45000").map(String::as_str),
+            Some("peer_reflexive")
+        );
+    }
+
+    #[test]
+    fn peer_reflexive_candidate_update_is_idempotent_after_first_advertisement() {
+        let mut candidates = vec!["192.168.1.10:51820".to_string()];
+        let mut sources = HashMap::from([("192.168.1.10:51820".to_string(), "host".to_string())]);
+
+        assert!(add_peer_reflexive_candidate_to_set(
+            "93.184.216.34:45000",
+            &mut candidates,
+            &mut sources,
+        )
+        .unwrap());
+        assert_eq!(candidates[0], "93.184.216.34:45000");
+        assert_eq!(
+            sources.get("93.184.216.34:45000").map(String::as_str),
+            Some("peer_reflexive")
+        );
+
+        assert!(!add_peer_reflexive_candidate_to_set(
+            "93.184.216.34:45000",
+            &mut candidates,
+            &mut sources,
+        )
+        .unwrap());
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.as_str() == "93.184.216.34:45000")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn peer_reflexive_candidate_update_reports_source_upgrade_once() {
+        let mut candidates = vec!["93.184.216.34:45000".to_string()];
+        let mut sources = HashMap::from([(
+            "93.184.216.34:45000".to_string(),
+            "stun_observed".to_string(),
+        )]);
+
+        assert!(add_peer_reflexive_candidate_to_set(
+            "93.184.216.34:45000",
+            &mut candidates,
+            &mut sources,
+        )
+        .unwrap());
+        assert!(!add_peer_reflexive_candidate_to_set(
+            "93.184.216.34:45000",
+            &mut candidates,
+            &mut sources,
+        )
+        .unwrap());
+        assert_eq!(
+            sources.get("93.184.216.34:45000").map(String::as_str),
             Some("peer_reflexive")
         );
     }
