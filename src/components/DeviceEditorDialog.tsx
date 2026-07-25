@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { CheckCircle2, Copy, Save, X } from "lucide-react";
 import type { PeerStatus } from "../types/client";
-import { StatusPill, connectionTone, pathTone, zhLabel } from "./StatusPill";
+import { StatusPill, pathTone } from "./StatusPill";
 
 interface DeviceEditorDialogProps {
   peer: PeerStatus;
@@ -103,14 +103,19 @@ export default function DeviceEditorDialog({
             <div className="device-dialog-section-title">
               <h4 id="connection-details-title">连接信息</h4>
               <div className="device-dialog-pills">
-                <StatusPill label={zhLabel(peer.state)} tone={connectionTone(peer.state)} />
-                {peer.path !== peer.state && (
-                  <StatusPill label={zhLabel(peer.path)} tone={pathTone(peer.path)} />
-                )}
+                <StatusPill
+                  label={peer.connectionLabel}
+                  tone={pathTone(peer.path)}
+                  title={peer.connectionDetail}
+                />
               </div>
             </div>
 
             <dl className="device-details-list">
+              <div>
+                <dt>当前路径</dt>
+                <dd>{peer.connectionLabel}</dd>
+              </div>
               <div>
                 <dt>虚拟 IP</dt>
                 <dd className="device-detail-copy">
@@ -141,6 +146,10 @@ export default function DeviceEditorDialog({
               <div>
                 <dt>中继服务器</dt>
                 <dd><code>{peer.relayServer || "--"}</code></dd>
+              </div>
+              <div>
+                <dt>路径判定</dt>
+                <dd>{peer.pathSelectionReason || peer.connectionDetail}</dd>
               </div>
               <div>
                 <dt>直连探测</dt>

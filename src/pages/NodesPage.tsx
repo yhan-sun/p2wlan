@@ -2,11 +2,9 @@ import { useCallback, useState } from "react";
 import { useClientStatus } from "../hooks/useClientStatus";
 import {
   StatusPill,
-  connectionTone,
   pathTone,
   formatAge,
   formatBytes,
-  zhLabel,
 } from "../components/StatusPill";
 import {
   RefreshCw,
@@ -184,12 +182,10 @@ export default function NodesPage() {
                       </div>
                       <div className="device-status-box flex-row gap-xs">
                         <StatusPill
-                          label={zhLabel(peer.state)}
-                          tone={connectionTone(peer.state)}
+                          label={peer.connectionLabel}
+                          tone={pathTone(peer.path)}
+                          title={peer.connectionDetail}
                         />
-                        {peer.path !== peer.state && (
-                          <StatusPill label={zhLabel(peer.path)} tone={pathTone(peer.path)} />
-                        )}
                       </div>
                     </div>
 

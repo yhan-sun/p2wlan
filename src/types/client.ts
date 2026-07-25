@@ -13,6 +13,15 @@ export type ConnectionState =
 export type NetworkPath = "direct" | "relay";
 export type PeerPath = NetworkPath | "direct_trial" | "offline";
 export type DirectPathType = "public_udp" | "overlay" | "relay" | "probing" | "unknown";
+export type ConnectionType =
+  | "lan_direct"
+  | "public_direct"
+  | "overlay_direct"
+  | "direct"
+  | "direct_trial"
+  | "relay"
+  | "offline"
+  | "unknown";
 
 export type CandidatePairSource =
   | "signaled"
@@ -323,6 +332,9 @@ export interface PeerStatus {
   virtualIp: string;
   state: ConnectionState;
   path: PeerPath;
+  connectionType: ConnectionType;
+  connectionLabel: string;
+  connectionDetail: string;
   latencyMs: number | null;
   endpoint: string;
   natType: string;
@@ -334,6 +346,10 @@ export interface PeerStatus {
   candidates?: string[];
   directHealth?: PathHealthDiagnostics;
   relayHealth?: PathHealthDiagnostics;
+  selectedPair?: CandidatePairDiagnostics | null;
+  currentDirectPair?: CandidatePairDiagnostics | null;
+  pathSelectionReason?: string | null;
+  pathSelectionReasonCode?: string | null;
 }
 
 export interface TunnelStatus {
