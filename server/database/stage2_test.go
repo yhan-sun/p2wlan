@@ -452,11 +452,11 @@ func TestDatabase_RevokeDeviceCredentialsInvalidatesAllCurrentTokens(t *testing.
 	user := newUser(t, db, "revoke-all@test")
 	dev := newDevice(t, db, user.ID, "default")
 
-	_, tokenA, err := db.CreateDeviceCredential(dev.ID, 3600)
+	credA, tokenA, err := db.CreateDeviceCredential(dev.ID, 3600)
 	if err != nil {
 		t.Fatalf("CreateDeviceCredential A: %v", err)
 	}
-	_, tokenB, err := db.CreateDeviceCredential(dev.ID, 3600)
+	credB, tokenB, err := db.CreateDeviceCredential(dev.ID, 3600)
 	if err != nil {
 		t.Fatalf("CreateDeviceCredential B: %v", err)
 	}
@@ -473,6 +473,16 @@ func TestDatabase_RevokeDeviceCredentialsInvalidatesAllCurrentTokens(t *testing.
 	}
 	if _, _, err := db.ValidateDeviceCredential(tokenB); err == nil {
 		t.Fatal("second credential should be revoked")
+	}
+	snapshot, err := db.RelayRevocationSnapshot()
+	if err != nil {
+		t.Fatalf("RelayRevocationSnapshot after bulk revoke: %v", err)
+	}
+	if !stringSliceContains(snapshot.RevokedCredentialIDs, credA.ID) {
+		t.Fatalf("snapshot missing bulk-revoked credential %s: %+v", credA.ID, snapshot)
+	}
+	if !stringSliceContains(snapshot.RevokedCredentialIDs, credB.ID) {
+		t.Fatalf("snapshot missing bulk-revoked credential %s: %+v", credB.ID, snapshot)
 	}
 
 	_, freshToken, err := db.CreateDeviceCredential(dev.ID, 3600)
