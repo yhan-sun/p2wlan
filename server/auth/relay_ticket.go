@@ -35,7 +35,7 @@ const (
 	MinTicketTTL            = 30 * time.Second
 	MaxTicketTTL            = 15 * time.Minute
 	DefaultClockSkew        = 30 * time.Second
-	DefaultTicketRateLimit  = 5               // per device per minute
+	DefaultTicketRateLimit  = 5 // per device per minute
 	DefaultTicketRateWindow = 1 * time.Minute
 )
 
@@ -64,11 +64,12 @@ var (
 
 // RelayTicketClaims are the JWT claims carried in a relay registration ticket.
 type RelayTicketClaims struct {
-	DeviceID     string `json:"device_id"`
-	NetworkID    string `json:"network_id"`
-	NodeID       string `json:"node_id"`
-	RelayRegion  string `json:"relay_region"`
-	RelayProtocol int   `json:"relay_protocol"`
+	DeviceID      string `json:"device_id"`
+	CredentialID  string `json:"credential_id,omitempty"`
+	NetworkID     string `json:"network_id"`
+	NodeID        string `json:"node_id"`
+	RelayRegion   string `json:"relay_region"`
+	RelayProtocol int    `json:"relay_protocol"`
 	jwt.RegisteredClaims
 }
 
@@ -115,9 +116,9 @@ type SignerKey struct {
 
 // RelayTicketSigner creates and signs relay tickets.
 type RelayTicketSigner struct {
-	active    SignerKey
-	previous  *SignerKey // for rotation: kept until max ticket TTL + skew passes
-	ttl       time.Duration
+	active      SignerKey
+	previous    *SignerKey // for rotation: kept until max ticket TTL + skew passes
+	ttl         time.Duration
 	fingerprint string // hex SHA-256 of active public key, first 8 chars
 }
 
@@ -445,7 +446,7 @@ func (s *RelayTicketSigner) PublicKeyring() map[string]string {
 }
 
 // SignTicket creates a signed relay ticket JWT for the given claims.
-func (s *RelayTicketSigner) SignTicket(deviceID, networkID, nodeID, audience, region string, now time.Time) (string, int64, error) {
+func (s *RelayTicketSigner) SignTicket(deviceID, credentialID, networkID, nodeID, audience, region string, now time.Time) (string, int64, error) {
 	if s == nil {
 		return "", 0, ErrRelayTicketSignerNotConfigured
 	}
@@ -458,6 +459,7 @@ func (s *RelayTicketSigner) SignTicket(deviceID, networkID, nodeID, audience, re
 
 	claims := &RelayTicketClaims{
 		DeviceID:      deviceID,
+		CredentialID:  credentialID,
 		NetworkID:     networkID,
 		NodeID:        nodeID,
 		RelayRegion:   region,

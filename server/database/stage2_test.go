@@ -484,6 +484,58 @@ func TestDatabase_RevokeDeviceCredentialsInvalidatesAllCurrentTokens(t *testing.
 	}
 }
 
+func TestDatabase_RelayRevocationSnapshotSurvivesDeviceDelete(t *testing.T) {
+	db, _ := tmpDB(t)
+	user := newUser(t, db, "relay-revocations@test")
+	dev := newDevice(t, db, user.ID, "default")
+
+	credA, _, err := db.CreateDeviceCredential(dev.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential A: %v", err)
+	}
+	credB, _, err := db.CreateDeviceCredential(dev.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential B: %v", err)
+	}
+
+	if err := db.RevokeDeviceCredential(credA.ID); err != nil {
+		t.Fatalf("RevokeDeviceCredential: %v", err)
+	}
+	snapshot, err := db.RelayRevocationSnapshot()
+	if err != nil {
+		t.Fatalf("RelayRevocationSnapshot after credential revoke: %v", err)
+	}
+	if !stringSliceContains(snapshot.RevokedCredentialIDs, credA.ID) {
+		t.Fatalf("snapshot missing revoked credential %s: %+v", credA.ID, snapshot)
+	}
+
+	if err := db.DeleteDevice(dev.ID); err != nil {
+		t.Fatalf("DeleteDevice: %v", err)
+	}
+	snapshot, err = db.RelayRevocationSnapshot()
+	if err != nil {
+		t.Fatalf("RelayRevocationSnapshot after device delete: %v", err)
+	}
+	if !stringSliceContains(snapshot.RevokedDeviceIDs, dev.ID) {
+		t.Fatalf("snapshot missing deleted device %s: %+v", dev.ID, snapshot)
+	}
+	if !stringSliceContains(snapshot.RevokedCredentialIDs, credB.ID) {
+		t.Fatalf("snapshot missing deleted device credential %s: %+v", credB.ID, snapshot)
+	}
+	if snapshot.GeneratedAt == "" || snapshot.Version == 0 {
+		t.Fatalf("snapshot should include generated_at and version: %+v", snapshot)
+	}
+}
+
+func stringSliceContains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
 // 10. Default network and membership for new users
 func TestDatabase_NewUserGetsDefaultNetwork(t *testing.T) {
 	db, _ := tmpDB(t)

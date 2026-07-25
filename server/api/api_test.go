@@ -216,6 +216,101 @@ func TestRevokeCurrentDeviceCredentialInvalidatesToken(t *testing.T) {
 	}
 }
 
+func TestRelayRevocationFeedRequiresBearerAndReturnsSnapshot(t *testing.T) {
+	t.Setenv("RELAY_REVOCATION_FEED_TOKEN", "relay-feed-token")
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("relay-feed@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "relay-feed-key", "device", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	credA, _, err := db.CreateDeviceCredential(device.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential A: %v", err)
+	}
+	credB, _, err := db.CreateDeviceCredential(device.ID, 3600)
+	if err != nil {
+		t.Fatalf("CreateDeviceCredential B: %v", err)
+	}
+
+	apiServer := NewServer(nil, nil, db)
+	revokeReq := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/credential", nil)
+	revokeReq = revokeReq.WithContext(context.WithValue(revokeReq.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:     device.ID,
+		NetworkID:    device.NetworkID,
+		UserID:       device.UserID,
+		CredentialID: credA.ID,
+		ExpiresAt:    credA.ExpiresAt,
+	}))
+	revokeRecorder := httptest.NewRecorder()
+	apiServer.RevokeCurrentDeviceCredential(revokeRecorder, revokeReq)
+	if revokeRecorder.Code != http.StatusOK {
+		t.Fatalf("RevokeCurrentDeviceCredential: HTTP %d %s", revokeRecorder.Code, revokeRecorder.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+device.ID, nil)
+	deleteReq.SetPathValue("id", device.ID)
+	deleteReq = deleteReq.WithContext(context.WithValue(deleteReq.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:     device.ID,
+		NetworkID:    device.NetworkID,
+		UserID:       device.UserID,
+		CredentialID: credB.ID,
+		ExpiresAt:    credB.ExpiresAt,
+	}))
+	deleteRecorder := httptest.NewRecorder()
+	apiServer.DeleteDevice(deleteRecorder, deleteReq)
+	if deleteRecorder.Code != http.StatusOK {
+		t.Fatalf("DeleteDevice: HTTP %d %s", deleteRecorder.Code, deleteRecorder.Body.String())
+	}
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/api/v1/relay/revocations", nil)
+	unauthorizedRecorder := httptest.NewRecorder()
+	apiServer.RelayRevocations(unauthorizedRecorder, unauthorizedReq)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("RelayRevocations without token: HTTP %d", unauthorizedRecorder.Code)
+	}
+
+	feedReq := httptest.NewRequest(http.MethodGet, "/api/v1/relay/revocations", nil)
+	feedReq.Header.Set("Authorization", "Bearer relay-feed-token")
+	feedRecorder := httptest.NewRecorder()
+	apiServer.RelayRevocations(feedRecorder, feedReq)
+	if feedRecorder.Code != http.StatusOK {
+		t.Fatalf("RelayRevocations: HTTP %d %s", feedRecorder.Code, feedRecorder.Body.String())
+	}
+	var snapshot database.RelayRevocationSnapshot
+	if err := json.Unmarshal(feedRecorder.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if !apiStringSliceContains(snapshot.RevokedCredentialIDs, credA.ID) {
+		t.Fatalf("snapshot missing revoked credential %s: %+v", credA.ID, snapshot)
+	}
+	if !apiStringSliceContains(snapshot.RevokedCredentialIDs, credB.ID) {
+		t.Fatalf("snapshot missing deleted device credential %s: %+v", credB.ID, snapshot)
+	}
+	if !apiStringSliceContains(snapshot.RevokedDeviceIDs, device.ID) {
+		t.Fatalf("snapshot missing deleted device %s: %+v", device.ID, snapshot)
+	}
+	if snapshot.GeneratedAt == "" || snapshot.Version == 0 {
+		t.Fatalf("snapshot should include generated_at and version: %+v", snapshot)
+	}
+}
+
+func apiStringSliceContains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseRelayServersReturnsEmptySliceWhenUnset(t *testing.T) {
 	t.Setenv("RELAY_SERVERS", "")
 

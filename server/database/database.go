@@ -143,6 +143,14 @@ func migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_dev_cred_hash ON device_credentials(token_hash);
 	CREATE INDEX IF NOT EXISTS idx_dev_cred_expires ON device_credentials(expires_at);
 
+	CREATE TABLE IF NOT EXISTS relay_revocations (
+		kind       TEXT NOT NULL,
+		value      TEXT NOT NULL,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		PRIMARY KEY(kind, value)
+	);
+	CREATE INDEX IF NOT EXISTS idx_relay_revocations_created ON relay_revocations(created_at);
+
 	CREATE TABLE IF NOT EXISTS network_memberships (
 		id          TEXT PRIMARY KEY,
 		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -252,6 +260,21 @@ type DeviceCredential struct {
 	Revoked   bool   `json:"revoked"`
 	CreatedAt int64  `json:"created_at"`
 }
+
+// RelayRevocationSnapshot is the control-plane snapshot consumed by relays.
+type RelayRevocationSnapshot struct {
+	GeneratedAt          string   `json:"generated_at"`
+	Version              int64    `json:"version"`
+	RevokedDeviceIDs     []string `json:"revoked_device_ids"`
+	RevokedCredentialIDs []string `json:"revoked_credential_ids"`
+	RevokedJTIs          []string `json:"revoked_jtis,omitempty"`
+}
+
+const (
+	RelayRevocationDeviceID     = "device_id"
+	RelayRevocationCredentialID = "credential_id"
+	RelayRevocationJTI          = "jti"
+)
 
 // NetworkMembership links a user to a network.
 type NetworkMembership struct {
@@ -363,17 +386,98 @@ func (db *DB) ValidateDeviceCredential(token string) (*DeviceCredential, *Device
 
 // RevokeDeviceCredential revokes a device credential.
 func (db *DB) RevokeDeviceCredential(credentialID string) error {
-	_, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE id = ?`, credentialID)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`UPDATE device_credentials SET revoked = 1 WHERE id = ?`, credentialID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO relay_revocations (kind, value, created_at)
+		SELECT ?, id, ? FROM device_credentials WHERE id = ?`,
+		RelayRevocationCredentialID, now, credentialID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RevokeDeviceCredentials revokes all credentials currently issued to a device.
 func (db *DB) RevokeDeviceCredentials(deviceID string) (int64, error) {
-	res, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE device_id = ? AND revoked = 0`, deviceID)
+	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO relay_revocations (kind, value, created_at)
+		SELECT ?, id, ? FROM device_credentials WHERE device_id = ?`,
+		RelayRevocationCredentialID, now, deviceID); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`UPDATE device_credentials SET revoked = 1 WHERE device_id = ? AND revoked = 0`, deviceID)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+// RecordRelayTicketRevocation stores a ticket jti tombstone for relay denylist feeds.
+func (db *DB) RecordRelayTicketRevocation(jti string) error {
+	if strings.TrimSpace(jti) == "" {
+		return nil
+	}
+	_, err := db.Exec(`INSERT OR IGNORE INTO relay_revocations (kind, value, created_at) VALUES (?, ?, ?)`,
+		RelayRevocationJTI, strings.TrimSpace(jti), time.Now().Unix())
+	return err
+}
+
+// RelayRevocationSnapshot returns all relay revocation tombstones.
+func (db *DB) RelayRevocationSnapshot() (*RelayRevocationSnapshot, error) {
+	rows, err := db.Query(`SELECT kind, value, created_at FROM relay_revocations ORDER BY kind, value`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshot := &RelayRevocationSnapshot{
+		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+		RevokedDeviceIDs:     []string{},
+		RevokedCredentialIDs: []string{},
+		RevokedJTIs:          []string{},
+	}
+	for rows.Next() {
+		var kind, value string
+		var createdAt int64
+		if err := rows.Scan(&kind, &value, &createdAt); err != nil {
+			return nil, err
+		}
+		if createdAt > snapshot.Version {
+			snapshot.Version = createdAt
+		}
+		switch kind {
+		case RelayRevocationDeviceID:
+			snapshot.RevokedDeviceIDs = append(snapshot.RevokedDeviceIDs, value)
+		case RelayRevocationCredentialID:
+			snapshot.RevokedCredentialIDs = append(snapshot.RevokedCredentialIDs, value)
+		case RelayRevocationJTI:
+			snapshot.RevokedJTIs = append(snapshot.RevokedJTIs, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 // ---- Network membership operations ----
@@ -726,6 +830,16 @@ func (db *DB) DeleteDevice(deviceID string) error {
 	}
 	defer tx.Rollback()
 
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO relay_revocations (kind, value, created_at) VALUES (?, ?, ?)`,
+		RelayRevocationDeviceID, deviceID, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO relay_revocations (kind, value, created_at)
+		SELECT ?, id, ? FROM device_credentials WHERE device_id = ?`,
+		RelayRevocationCredentialID, now, deviceID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE device_credentials SET revoked = 1 WHERE device_id = ? AND revoked = 0`, deviceID); err != nil {
 		return err
 	}

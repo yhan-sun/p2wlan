@@ -18,10 +18,10 @@ import (
 // relayTicketRateLimiter is a simple per-device rate limiter for the
 // relay ticket endpoint.
 type relayTicketRateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*ticketRateBucket
-	maxReqs  int
-	window   time.Duration
+	mu      sync.Mutex
+	buckets map[string]*ticketRateBucket
+	maxReqs int
+	window  time.Duration
 }
 
 type ticketRateBucket struct {
@@ -157,6 +157,7 @@ func (s *Server) CreateRelayTicket(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	tokenStr, expiresAt, err := s.relayTicketSigner.SignTicket(
 		device.ID,
+		deviceClaims.CredentialID,
 		device.NetworkID,
 		device.ID, // node_id = device_id in current model
 		descriptor.Audience,
