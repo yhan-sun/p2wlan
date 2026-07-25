@@ -201,6 +201,20 @@ p2wlan up
 p2wlan doctor
 ```
 
+开发或现场验收时，可以用仓库内脚本一次性保存诊断、socket 和可选抓包证据，并让脚本判定当前路径是不是“真实公网 UDP 直连”：
+
+```bash
+DIAGNOSTICS_URL=http://127.0.0.1:39277/status PEER=10.20.0.5 scripts/direct-path-verify.sh
+
+# 最终验收建议启用严格模式：必须是新版 pair diagnostics，且不能是 Relay。
+REQUIRE_NEW_SCHEMA=1 REQUIRE_PUBLIC_UDP=1 REQUIRE_NO_RELAY=1 PEER=10.20.0.5 scripts/direct-path-verify.sh
+
+# 如需抓包，把 IFACE 换成实际出口网卡，例如 en0/en5：
+REQUIRE_NEW_SCHEMA=1 REQUIRE_PUBLIC_UDP=1 REQUIRE_NO_RELAY=1 CAPTURE_SECONDS=20 IFACE=en5 PEER=10.20.0.5 scripts/direct-path-verify.sh
+```
+
+脚本只在 diagnostics 已确认 `public_udp`、selected pair 为公网 endpoint 且不是 `10.20.0.0/16` overlay 时输出 `PASS_PUBLIC_UDP_CONFIRMED`；如果只是 `overlay`、`relay` 或 `probing`，不会误当作 UU/WebRTC ICE 意义上的公网 P2P。
+
 同时在云厂商安全组和 Linux 防火墙中放行 UDP `60207` 入站。Windows 云电脑也需要在云安全组和 Windows Defender 防火墙中放行对应 UDP 入站；如果 Windows 端没有可被公网访问的 UDP 入口，双方仍可能只能由 Linux 侧被动接收或回退 Relay。
 
 Windows 桌面端从 `v0.1.23` 开始可在“设置 > 高级配置项”里填写同样的直连参数：`UDP 监听地址` 填 `0.0.0.0:60207`，`公网 UDP 地址` 填云电脑的公网 `IP:端口`。保存后需要停止并重新启动 TUN，让 daemon 重新注册候选端点。
