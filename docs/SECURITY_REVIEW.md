@@ -23,6 +23,31 @@ This document records the current repository security posture. It is not an exte
 - A relay that is not configured for the online feed, cannot reach the feed, or has not yet polled a fresh snapshot may still accept an already-signed ticket until that ticket expires.
 - Old tickets that do not contain `credential_id` remain compatible for the short TTL window; they can still be denied by `jti`, `device_id`, or expiry.
 
+## Relay Revocation Operations
+
+Control plane:
+
+```bash
+RELAY_REVOCATION_FEED_TOKEN='<long random shared secret>' \
+./p2wlan-control
+```
+
+Relay:
+
+```bash
+RELAY_REVOCATION_FEED_URL='https://control.example.com/api/v1/relay/revocations' \
+RELAY_REVOCATION_FEED_TOKEN='<same long random shared secret>' \
+RELAY_REVOCATION_POLL_INTERVAL='30s' \
+RELAY_TICKET_REVOKED_JTIS_JSON='[]' \
+RELAY_TICKET_REVOKED_DEVICES_JSON='[]' \
+./p2wlan-relay
+```
+
+- Treat `RELAY_REVOCATION_FEED_TOKEN` as a shared secret between the control plane and each relay. Rotate it with a coordinated relay rollout; a relay using the old token receives 401 responses and keeps its last successful snapshot.
+- Feed polling failures do not clear previously known online revocations. The remaining exposure is for newly revoked IDs that are not yet in the relay snapshot; those already-signed tickets can survive until their short TTL expires.
+- `RELAY_TICKET_REVOKED_JTIS_JSON` and `RELAY_TICKET_REVOKED_DEVICES_JSON` are local static denylist inputs for one relay process. They are useful for emergency per-relay blocks, but they are not a global immediate revocation system.
+- The online control-plane feed is the global revocation source once relays are configured and have successfully polled it; alerting should watch for repeated feed refresh failures.
+
 ## Remaining Boundaries
 
 - No external security audit has been completed.

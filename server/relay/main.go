@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -217,6 +218,8 @@ type relayRevocationFeedSnapshot struct {
 	RevokedJTIs          []string `json:"revoked_jtis"`
 }
 
+const maxRevocationFeedJSONBytes = 1 << 20
+
 func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 	// Validate keyring BEFORE opening listener to avoid leaking listener on failure
 	keyring, err := loadTicketKeyring(config)
@@ -321,14 +324,21 @@ func (s *RelayServer) startRevocationPolling() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.pollRevocationFeedOnce()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-s.shutdownChan
+			cancel()
+		}()
+
+		s.pollRevocationFeedOnce(ctx)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				s.pollRevocationFeedOnce()
+				s.pollRevocationFeedOnce(ctx)
 			case <-s.shutdownChan:
 				return
 			}
@@ -336,8 +346,8 @@ func (s *RelayServer) startRevocationPolling() {
 	}()
 }
 
-func (s *RelayServer) pollRevocationFeedOnce() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *RelayServer) pollRevocationFeedOnce(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	if err := s.refreshRevocationFeed(ctx); err != nil {
 		log.Printf("relay revocation feed refresh failed: %v", err)
@@ -371,10 +381,21 @@ func (s *RelayServer) refreshRevocationFeed(ctx context.Context) error {
 		return fmt.Errorf("revocation feed HTTP %d", resp.StatusCode)
 	}
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRevocationFeedJSONBytes+1))
+	if err != nil {
+		return fmt.Errorf("read revocation feed: %w", err)
+	}
+	if len(body) > maxRevocationFeedJSONBytes {
+		return fmt.Errorf("revocation feed body exceeds %d bytes", maxRevocationFeedJSONBytes)
+	}
+
 	var snapshot relayRevocationFeedSnapshot
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&snapshot); err != nil {
 		return fmt.Errorf("decode revocation feed: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return fmt.Errorf("decode revocation feed: trailing JSON data")
 	}
 	s.applyRevocationSnapshot(snapshot)
 	log.Printf("relay revocation feed updated: version=%d devices=%d credentials=%d jtis=%d",
