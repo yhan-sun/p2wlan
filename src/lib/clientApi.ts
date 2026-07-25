@@ -17,6 +17,8 @@ import {
   type DiagnosticsReport,
   type DiagnosticsSnapshot,
   type DesktopStatus,
+  type CandidatePairDiagnostics,
+  type ConnectionType,
   type PathHealthDiagnostics,
   type PeerDiagnostics,
   type PeerPath,
@@ -687,6 +689,117 @@ function mapSnapshotToDaemonStatus(
   };
 }
 
+function endpointHost(endpoint: string | null | undefined): string | null {
+  const value = endpoint?.trim();
+  if (!value) return null;
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    return end > 1 ? value.slice(1, end).toLowerCase() : null;
+  }
+  const separator = value.lastIndexOf(":");
+  return (separator > 0 ? value.slice(0, separator) : value).toLowerCase();
+}
+
+function isPrivateEndpoint(endpoint: string | null | undefined): boolean {
+  const host = endpointHost(endpoint);
+  if (!host) return false;
+  if (host === "localhost" || host === "::1") return true;
+  if (host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) return true;
+  const octets = host.split(".").map(part => Number(part));
+  if (octets.length !== 4 || octets.some(part => !Number.isInteger(part))) return false;
+  const [a, b] = octets;
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+function directPairForPresentation(peer: PeerDiagnostics): CandidatePairDiagnostics | null {
+  if (peer.active_path === "direct") {
+    return peer.selected_pair ?? peer.current_direct_pair ?? null;
+  }
+  return peer.current_direct_pair ?? peer.selected_pair ?? null;
+}
+
+function connectionPresentation(
+  peer: PeerDiagnostics,
+  path: PeerPath
+): { type: ConnectionType; label: string; detail: string } {
+  const pair = directPairForPresentation(peer);
+  const endpoint = pair?.remote_endpoint ?? peer.endpoint ?? null;
+  const reason = peer.current_path_selection?.reason;
+
+  if (path === "offline") {
+    return {
+      type: "offline",
+      label: "离线",
+      detail: peer.warning ?? peer.direct.last_error ?? peer.relay.last_error ?? "当前没有可用路径",
+    };
+  }
+
+  if (path === "relay") {
+    return {
+      type: "relay",
+      label: "中继",
+      detail: reason ?? (peer.relay_server ? `通过 ${peer.relay_server}` : "当前流量经中继转发"),
+    };
+  }
+
+  if (path === "direct_trial") {
+    return {
+      type: "direct_trial",
+      label: "直连试探",
+      detail: reason ?? (endpoint ? `正在验证 ${endpoint}` : "正在验证直连路径"),
+    };
+  }
+
+  if (path === "direct") {
+    const directType = pair?.direct_type ?? peer.direct_type;
+    if (pair?.is_public_udp_direct || directType === "public_udp") {
+      return {
+        type: "public_direct",
+        label: "公网直连",
+        detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走公网 UDP 直连",
+      };
+    }
+    if (pair?.is_overlay_direct || directType === "overlay") {
+      return {
+        type: "overlay_direct",
+        label: "Overlay 直连",
+        detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走 overlay 端点直连",
+      };
+    }
+    if (endpoint && isPrivateEndpoint(endpoint)) {
+      return {
+        type: "lan_direct",
+        label: "局域网直连",
+        detail: `当前直连端点 ${endpoint}`,
+      };
+    }
+    if (directType === "probing") {
+      return {
+        type: "direct_trial",
+        label: "直连试探",
+        detail: endpoint ? `正在验证 ${endpoint}` : "正在验证直连路径",
+      };
+    }
+    return {
+      type: "direct",
+      label: "直连",
+      detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走直连路径",
+    };
+  }
+
+  return {
+    type: "unknown",
+    label: "未知",
+    detail: "当前路径类型未知",
+  };
+}
+
 function mapPeer(peer: PeerDiagnostics): PeerStatus {
   const isDirectTrial =
     peer.active_path === "relay" &&
@@ -713,12 +826,16 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
         : path === "relay"
           ? peer.relay.latency_ms
           : null;
+  const presentation = connectionPresentation(peer, path);
   return {
     id: peer.node_id,
     name: peer.device_name?.trim() || peer.node_id.slice(0, 12),
     virtualIp: peer.virtual_ip,
     state: peer.state,
     path,
+    connectionType: presentation.type,
+    connectionLabel: presentation.label,
+    connectionDetail: presentation.detail,
     latencyMs,
     endpoint: peer.endpoint ?? "",
     natType: peer.nat_type || "unknown",
@@ -730,6 +847,10 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     candidates: peer.candidates,
     directHealth: peer.direct,
     relayHealth: peer.relay,
+    selectedPair: peer.selected_pair,
+    currentDirectPair: peer.current_direct_pair,
+    pathSelectionReason: peer.current_path_selection?.reason ?? null,
+    pathSelectionReasonCode: peer.current_path_selection?.reason_code ?? null,
   };
 }
 
