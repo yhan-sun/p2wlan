@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // testConfig returns a RelayConfig suitable for local testing (plaintext enabled).
@@ -65,6 +69,69 @@ func TestConfigValidation(t *testing.T) {
 	if cfg.RegisterTimeout != 10*time.Second {
 		t.Errorf("expected RegisterTimeout 10s, got %v", cfg.RegisterTimeout)
 	}
+}
+
+func TestVerifyTicketRejectsRevokedJTIAndDevice(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	const kid = "kid-test"
+	const jti = "jti-revoked"
+	const deviceID = "device-revoked"
+	ticket := signRelayTicketForTest(t, priv, kid, jti, deviceID)
+
+	baseConfig := &RelayConfig{
+		RelayAudience:      "relay-test",
+		RelayRegion:        "test-region",
+		TicketMaxClockSkew: time.Second,
+	}
+	baseKeyring := map[string]ed25519.PublicKey{kid: pub}
+
+	server := &RelayServer{config: baseConfig, ticketKeyring: baseKeyring}
+	if _, err := server.verifyTicket(ticket); err != nil {
+		t.Fatalf("valid ticket rejected: %v", err)
+	}
+
+	server.revokedTicketJTIs = map[string]struct{}{jti: {}}
+	if _, err := server.verifyTicket(ticket); err == nil {
+		t.Fatal("ticket with revoked jti should be rejected")
+	}
+
+	server.revokedTicketJTIs = nil
+	server.revokedDeviceIDs = map[string]struct{}{deviceID: {}}
+	if _, err := server.verifyTicket(ticket); err == nil {
+		t.Fatal("ticket for revoked device should be rejected")
+	}
+}
+
+func signRelayTicketForTest(t *testing.T, privateKey ed25519.PrivateKey, kid, jti, deviceID string) string {
+	t.Helper()
+	now := time.Now()
+	claims := relayTicketClaims{
+		DeviceID:      deviceID,
+		NetworkID:     "network-test",
+		NodeID:        deviceID,
+		RelayRegion:   "test-region",
+		RelayProtocol: 1,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "p2wlan-control",
+			Subject:   deviceID,
+			Audience:  jwt.ClaimStrings{"relay-test"},
+			ID:        jti,
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now.Add(-time.Second)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = kid
+	token.Header["typ"] = "p2wlan-relay+jwt"
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+	return signed
 }
 
 func TestSendQueueFullBackpressure(t *testing.T) {

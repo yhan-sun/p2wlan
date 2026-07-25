@@ -589,7 +589,7 @@ Relay peer table 以 `(network_id, node_id)` 为身份键：
 
 - 撤销 device credential 或删除 device 后，控制面立即拒绝该 credential，并停止签发新 ticket；`DELETE /api/v1/devices/credential` 可撤销当前 device credential，删除 device 会先撤销该 device 的全部 credential。
 - 已签发的 ticket 最迟在短 TTL（默认 5 分钟）到期后失效。
-- 尚未实现 relay 在线查询或推送式全局 jti 撤销列表，因此已签 relay ticket 的撤销边界仍是短 TTL。
+- Relay 可通过 `RELAY_TICKET_REVOKED_JTIS_JSON` / `RELAY_TICKET_REVOKED_DEVICES_JSON` 配置本地 denylist，验证后按 `jti` 或 `device_id` 拒绝 ticket；尚未实现 relay 在线查询或推送式全局撤销 feed，因此跨 relay 即时撤销仍需后续服务化。
 
 ### 12.8 Rust/Go 跨语言 Golden Vectors
 
@@ -656,7 +656,7 @@ ACK bytes (hex):
 
 A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
-- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归和 cargo-fuzz parser target；安全评审和 relay 侧即时全局 ticket 撤销服务仍属于后续安全收口。
+- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归、cargo-fuzz parser target 和 relay 本地 ticket denylist；安全评审和 relay 侧在线全局撤销 feed 仍属于后续安全收口。
 - A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
 
 ## 13. Control Signaling WebSocket V1

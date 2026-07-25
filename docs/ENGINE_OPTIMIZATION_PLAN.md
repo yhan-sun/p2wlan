@@ -651,8 +651,8 @@ PeerSessionReady / PeerSessionFailed
   - 已落地：control signal 显式 `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Probe v2 session-bound MAC key、旧 static key 兼容 fallback，以及 diagnostics `probe_session_id` / `probe_key_type` 暴露。
   - 已落地：cargo-fuzz `pnch_parser` target，覆盖 PNCH v1 decode、PNCH v2 identity peek 和多 key MAC decode。
   - 已落地：跨进程/跨客户端全局 outbound probe budget，复用 network / peer / peer+remote-IP 短窗口，并输出 `global_*_rate_limited` reason。
-  - 已落地：Ed25519 transcript 签名，以及控制面当前/设备级 credential 即时撤销入口。
-  - 待补齐：安全评审和 relay 侧即时全局 ticket 撤销服务。
+  - 已落地：Ed25519 transcript 签名、控制面当前/设备级 credential 即时撤销入口，以及 relay 本地 ticket `jti` / `device_id` denylist。
+  - 待补齐：安全评审和 relay 侧在线全局 ticket 撤销 feed。
 - `SEC-04` 增加协议版本、兼容测试和 fuzz target。
 - `OBS-01` 建立稳定 reason code 和连接事件。
 
@@ -795,7 +795,7 @@ PeerSessionReady / PeerSessionFailed
 
 ### Iteration 1：先让连接可信且可解释
 
-- 完成 Relay token/TLS 设计、Probe v2 skeleton 和 Ed25519 transcript 签名；继续补安全评审和 relay 侧即时全局 ticket 撤销服务。
+- 完成 Relay token/TLS 设计、Probe v2 skeleton、Ed25519 transcript 签名和本地 ticket denylist；继续补安全评审和 relay 侧在线全局 ticket 撤销 feed。
 - 给所有 path/relay/control 失败建立 reason code。
 - 为网络切换引入 generation，阻止旧异步结果覆盖新状态。
 - 扩展 `p2wlan doctor` 输出最近一次 Direct 失败阶段。

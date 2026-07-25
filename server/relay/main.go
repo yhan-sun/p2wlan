@@ -72,10 +72,12 @@ type RelayConfig struct {
 	TLSPrivateKeyPath          string
 	AllowInsecurePlaintext     bool
 	// A2: ticket verification
-	TicketKeyringJSON  string
-	RelayAudience      string
-	RelayRegion        string
-	TicketMaxClockSkew time.Duration
+	TicketKeyringJSON        string
+	RelayAudience            string
+	RelayRegion              string
+	TicketMaxClockSkew       time.Duration
+	TicketRevokedJTIsJSON    string
+	TicketRevokedDevicesJSON string
 }
 
 // networkNodeKey is the composite key for the peer table: (network_id, node_id).
@@ -178,7 +180,9 @@ type RelayServer struct {
 	connections map[net.Conn]struct{}
 
 	// A2: ticket verification
-	ticketKeyring map[string]ed25519.PublicKey
+	ticketKeyring     map[string]ed25519.PublicKey
+	revokedTicketJTIs map[string]struct{}
+	revokedDeviceIDs  map[string]struct{}
 }
 
 // RelayTicketClaims are the JWT claims for relay registration.
@@ -199,6 +203,14 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 			return nil, fmt.Errorf("ticket keyring required when authentication is enabled: %w", err)
 		}
 		log.Printf("WARNING: no ticket keyring configured; authentication disabled")
+	}
+	revokedJTIs, err := loadStringSet(config.TicketRevokedJTIsJSON, "ticket revoked jtis")
+	if err != nil {
+		return nil, err
+	}
+	revokedDevices, err := loadStringSet(config.TicketRevokedDevicesJSON, "ticket revoked devices")
+	if err != nil {
+		return nil, err
 	}
 
 	// Determine TLS or plaintext
@@ -230,13 +242,35 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 	}
 
 	return &RelayServer{
-		config:        config,
-		listener:      listener,
-		hub:           newHub(),
-		shutdownChan:  make(chan struct{}),
-		connections:   make(map[net.Conn]struct{}),
-		ticketKeyring: keyring,
+		config:            config,
+		listener:          listener,
+		hub:               newHub(),
+		shutdownChan:      make(chan struct{}),
+		connections:       make(map[net.Conn]struct{}),
+		ticketKeyring:     keyring,
+		revokedTicketJTIs: revokedJTIs,
+		revokedDeviceIDs:  revokedDevices,
 	}, nil
+}
+
+func loadStringSet(raw, label string) (map[string]struct{}, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("invalid %s JSON: %w", label, err)
+	}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		set[value] = struct{}{}
+	}
+	return set, nil
 }
 
 // loadTicketKeyring parses RELAY_TICKET_KEYRING_JSON or config field.
@@ -341,6 +375,12 @@ func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) 
 	}
 	if claims.ID == "" {
 		return nil, fmt.Errorf("missing jti")
+	}
+	if _, revoked := s.revokedTicketJTIs[claims.ID]; revoked {
+		return nil, fmt.Errorf("ticket revoked")
+	}
+	if _, revoked := s.revokedDeviceIDs[claims.DeviceID]; revoked {
+		return nil, fmt.Errorf("device revoked")
 	}
 	if claims.IssuedAt == nil {
 		return nil, fmt.Errorf("missing iat")
@@ -547,6 +587,8 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	ticketKeyring := fs.String("ticket-keyring", getenv("RELAY_TICKET_KEYRING_JSON", ""), "Ticket verification keyring JSON")
 	relayAudience := fs.String("relay-audience", getenv("RELAY_AUDIENCE", ""), "This relay's audience ID")
 	relayRegion := fs.String("relay-region", getenv("RELAY_REGION", ""), "This relay's region label")
+	revokedJTIs := fs.String("ticket-revoked-jtis", getenv("RELAY_TICKET_REVOKED_JTIS_JSON", ""), "JSON array of revoked relay ticket jti values")
+	revokedDevices := fs.String("ticket-revoked-devices", getenv("RELAY_TICKET_REVOKED_DEVICES_JSON", ""), "JSON array of revoked relay ticket device_id values")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -567,6 +609,8 @@ func parseConfig(args []string) (*RelayConfig, error) {
 		TicketKeyringJSON:          *ticketKeyring,
 		RelayAudience:              *relayAudience,
 		RelayRegion:                *relayRegion,
+		TicketRevokedJTIsJSON:      *revokedJTIs,
+		TicketRevokedDevicesJSON:   *revokedDevices,
 	}
 
 	if config.SendQueueCapacity <= 0 {
