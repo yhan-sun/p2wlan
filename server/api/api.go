@@ -24,13 +24,14 @@ var signalLongPollFallbackInterval = 100 * time.Millisecond
 
 // Server handles API requests.
 type Server struct {
-	auth              *auth.Service
-	hub               *signaling.Hub
-	db                *database.DB
-	relayServers      []string
-	relayCatalog      *RelayCatalog
-	relayTicketSigner *auth.RelayTicketSigner
-	signalNotifier    *signalNotifier
+	auth                     *auth.Service
+	hub                      *signaling.Hub
+	db                       *database.DB
+	relayServers             []string
+	relayCatalog             *RelayCatalog
+	relayTicketSigner        *auth.RelayTicketSigner
+	relayRevocationFeedToken string
+	signalNotifier           *signalNotifier
 }
 
 // NewServer creates a new API server.
@@ -63,13 +64,14 @@ func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *
 	}
 
 	return &Server{
-		auth:              authService,
-		hub:               hub,
-		db:                db,
-		relayServers:      parseRelayServers(),
-		relayCatalog:      catalog,
-		relayTicketSigner: signer,
-		signalNotifier:    newSignalNotifier(),
+		auth:                     authService,
+		hub:                      hub,
+		db:                       db,
+		relayServers:             parseRelayServers(),
+		relayCatalog:             catalog,
+		relayTicketSigner:        signer,
+		relayRevocationFeedToken: strings.TrimSpace(os.Getenv("RELAY_REVOCATION_FEED_TOKEN")),
+		signalNotifier:           newSignalNotifier(),
 	}
 }
 
