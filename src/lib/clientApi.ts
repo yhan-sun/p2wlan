@@ -721,6 +721,11 @@ function directPairForPresentation(peer: PeerDiagnostics): CandidatePairDiagnost
   return peer.current_direct_pair ?? peer.selected_pair ?? null;
 }
 
+function directPairLatencyMs(peer: PeerDiagnostics): number | null {
+  const pair = directPairForPresentation(peer);
+  return pair?.rtt_ewma_ms ?? pair?.rtt_ms ?? peer.direct.latency_ms;
+}
+
 function connectionPresentation(
   peer: PeerDiagnostics,
   path: PeerPath
@@ -728,6 +733,7 @@ function connectionPresentation(
   const pair = directPairForPresentation(peer);
   const endpoint = pair?.remote_endpoint ?? peer.endpoint ?? null;
   const reason = peer.current_path_selection?.reason;
+  const relayHedged = peer.current_path_selection?.relay_hedged === true;
 
   if (path === "offline") {
     return {
@@ -758,8 +764,12 @@ function connectionPresentation(
     if (pair?.is_public_udp_direct || directType === "public_udp") {
       return {
         type: "public_direct",
-        label: "公网直连",
-        detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走公网 UDP 直连",
+        label: relayHedged ? "公网直连 + 中继备用" : "公网直连",
+        detail: relayHedged
+          ? reason ?? (endpoint ? `当前直连端点 ${endpoint}，同时发送中继备用流量` : "当前走公网 UDP 直连，并启用中继备用")
+          : endpoint
+            ? `当前直连端点 ${endpoint}`
+            : "当前走公网 UDP 直连",
       };
     }
     if (directType === "lan") {
@@ -792,8 +802,12 @@ function connectionPresentation(
     }
     return {
       type: "direct",
-      label: "直连",
-      detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走直连路径",
+      label: relayHedged ? "直连 + 中继备用" : "直连",
+      detail: relayHedged
+        ? reason ?? (endpoint ? `当前直连端点 ${endpoint}，同时发送中继备用流量` : "当前走直连路径，并启用中继备用")
+        : endpoint
+          ? `当前直连端点 ${endpoint}`
+          : "当前走直连路径",
     };
   }
 
@@ -826,9 +840,9 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     peer.connected_for_ms;
   const latencyMs =
     path === "direct"
-      ? peer.direct.latency_ms
+      ? directPairLatencyMs(peer)
       : path === "direct_trial"
-        ? peer.direct.latency_ms ?? peer.relay.latency_ms
+        ? directPairLatencyMs(peer) ?? peer.relay.latency_ms
         : path === "relay"
           ? peer.relay.latency_ms
           : null;

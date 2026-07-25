@@ -1481,7 +1481,7 @@ impl PeerConnection {
             if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
                 if !retain_private_direct
                     && direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
-                    && direct_score.score < relay_score.score
+                    && direct_score.score <= relay_score.score
                 {
                     if !self
                         .relay_health
@@ -4860,7 +4860,9 @@ fn latency_score(latency_ms: Option<u64>) -> i32 {
         Some(ms) if ms <= 80 => 6,
         Some(ms) if ms <= 150 => 2,
         Some(ms) if ms <= 300 => -5,
-        Some(_) => -15,
+        Some(ms) if ms <= 500 => -20,
+        Some(ms) if ms <= 1000 => -50,
+        Some(_) => -70,
         None => 0,
     }
 }
@@ -6740,7 +6742,6 @@ mod tests {
         let relay_score = selected.relay_score.as_ref().unwrap().score;
         assert!(direct_score < DIRECT_CONFIRMED_MIN_SCORE);
         assert!(direct_score < relay_score);
-        assert!(direct_score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN >= relay_score);
     }
 
     #[tokio::test]
@@ -6783,6 +6784,42 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .relay_hedged
+        );
+    }
+
+    #[tokio::test]
+    async fn very_slow_public_direct_is_hedged_with_unconfirmed_relay() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "8.8.8.8:51842".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(570)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.rtt_ewma_ms = Some(570);
+            conn.direct_health.jitter_ms = Some(0);
+            conn.direct_health.success_count = 100;
+            conn.direct_health.failure_count = 0;
+            conn.direct_health.consecutive_failures = 0;
+        }
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Direct));
+        assert!(selected.direct_confirmed);
+        assert!(selected.relay_hedged);
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
+        assert!(
+            selected.direct_score.as_ref().unwrap().score
+                < selected.relay_score.as_ref().unwrap().score
         );
     }
 
