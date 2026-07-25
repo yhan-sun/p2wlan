@@ -1,7 +1,7 @@
 # P2WLAN 协议与状态机草案
 
 Version: 0.1  
-Date: 2026-07-16
+Date: 2026-07-25
 
 ## 1. 设计原则
 
@@ -336,7 +336,7 @@ probe_mac_key = base_probe_mac_key
 | 1 | PUNCH | A -> B |
 | 2 | ACK | B -> A |
 
-A3 当前已覆盖：阻止伪造 ACK 改写路径状态、认证 peer-reflexive endpoint 学习、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、本地 nonce replay window、peer/source 入站短窗口限速、network / peer / peer+remote-IP 发送侧短窗口预算、跨进程/跨客户端全局 probe 预算、Rust/Go golden vectors、Rust parser 畸形帧兼容回归和 cargo-fuzz `pnch_parser` target。剩余安全项是安全评审和 relay 侧即时全局 ticket 撤销服务，不应把当前实现表述为完成生产级安全审计。
+A3 当前已覆盖：阻止伪造 ACK 改写路径状态、认证 peer-reflexive endpoint 学习、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、本地 nonce replay window、peer/source 入站短窗口限速、network / peer / peer+remote-IP 发送侧短窗口预算、跨进程/跨客户端全局 probe 预算、Rust/Go golden vectors、Rust parser 畸形帧兼容回归、cargo-fuzz `pnch_parser` target、credential revoke 入口、relay 本地 denylist 和 relay 在线撤销 feed。剩余安全项是独立安全评审、部署面检查和两端新版 daemon 公网 UDP 实机验收，不应把当前实现表述为完成生产级安全审计。
 
 ## 7. 路径选择
 
@@ -518,6 +518,7 @@ Relay 服务端和客户端均支持严格的资源边界参数配置：
 | `exp` | int64 | 过期时间 |
 | `jti` | string | 128-bit CSPRNG 随机值（hex 编码）|
 | `device_id` | string | 设备 ID |
+| `credential_id` | string | 签发该 ticket 的 device credential ID；新 ticket 必须携带，旧短 TTL ticket 可缺省 |
 | `network_id` | string | 网络 ID（由控制面从数据库读取，不接受客户端填写）|
 | `node_id` | string | 节点 ID（通常等于 device_id）|
 | `relay_region` | string | 目标 Relay region |
@@ -587,9 +588,13 @@ Relay peer table 以 `(network_id, node_id)` 为身份键：
 
 ### 12.7 撤销边界
 
-- 撤销 device credential 或删除 device 后，控制面立即拒绝该 credential，并停止签发新 ticket；`DELETE /api/v1/devices/credential` 可撤销当前 device credential，删除 device 会先撤销该 device 的全部 credential。
-- 已签发的 ticket 最迟在短 TTL（默认 5 分钟）到期后失效。
-- Relay 可通过 `RELAY_TICKET_REVOKED_JTIS_JSON` / `RELAY_TICKET_REVOKED_DEVICES_JSON` 配置本地 denylist，验证后按 `jti` 或 `device_id` 拒绝 ticket；尚未实现 relay 在线查询或推送式全局撤销 feed，因此跨 relay 即时撤销仍需后续服务化。
+- 撤销 device credential 或删除 device 后，控制面立即拒绝该 credential，并停止签发新 ticket；`DELETE /api/v1/devices/credential` 可撤销当前 device credential，删除 device 会先写入 device/credential revocation tombstone，再删除 device。
+- 控制面提供 relay 只读 snapshot：`GET /api/v1/relay/revocations`，由 `RELAY_REVOCATION_FEED_TOKEN` 配置 bearer token；无正确 token 返回 401，未配置 token 返回 503。
+- feed JSON 至少包含 `generated_at`、`version`、`revoked_device_ids`、`revoked_credential_ids`，并可包含 `revoked_jtis`。device 删除后仍通过 tombstone 保留撤销 feed 所需 ID，不依赖 `device_credentials` cascade 后的行仍存在。
+- 新签发的 relay ticket 携带 `credential_id`。Relay 验证 JWT 签名、`kid`、`typ`、`aud`、`relay_region`、`sub == device_id`、时间窗口和 `jti` 后，再检查 `jti`、`device_id`、`credential_id` 是否被撤销。
+- Relay 本地 denylist 仍可通过 `RELAY_TICKET_REVOKED_JTIS_JSON` / `RELAY_TICKET_REVOKED_DEVICES_JSON` 生效；在线 feed 通过 `RELAY_REVOCATION_FEED_URL`、`RELAY_REVOCATION_FEED_TOKEN`、`RELAY_REVOCATION_POLL_INTERVAL` 轮询并与本地 denylist 合并。
+- feed 拉取失败时，Relay 不会放开已知 revoked entries；它保留上一份成功 snapshot 并记录日志。未配置在线 feed 或长期无法拉取的 Relay 对已签 ticket 仍受短 TTL（默认 5 分钟）残留窗口约束。
+- 旧 ticket 可能缺少 `credential_id`，为了兼容短 TTL 窗口，Relay 不因缺少该字段直接拒绝；这类 ticket 仍可被 `jti`/`device_id` denylist 或过期时间拒绝。
 
 ### 12.8 Rust/Go 跨语言 Golden Vectors
 
@@ -656,8 +661,8 @@ ACK bytes (hex):
 
 A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
-- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归、cargo-fuzz parser target 和 relay 本地 ticket denylist；安全评审和 relay 侧在线全局撤销 feed 仍属于后续安全收口。
-- A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
+- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归、cargo-fuzz parser target、credential revoke、relay 本地 ticket denylist 和 relay 在线 revocation feed。
+- A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维；也不能宣称达到 UU/WebRTC 级可靠度，除非两端新版 daemon 在公网实机验收中跑通 `PASS_PUBLIC_UDP_CONFIRMED`，确认 selected/current pair 是公网 UDP endpoint、非 `10.20.x.x` overlay、无 relay fallback，并保留 tcpdump 证据。
 
 ## 13. Control Signaling WebSocket V1
 

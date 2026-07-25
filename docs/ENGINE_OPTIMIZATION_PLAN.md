@@ -182,14 +182,14 @@ impl Engine {
 Relay 连接必须满足：
 
 - 默认 TLS 1.3；自托管开发环境可显式允许明文，不允许静默降级。
-- 控制面签发短期 Relay token，至少绑定 `device_id`、`network_id`、Relay audience、过期时间和随机 ID。
+- 控制面签发短期 Relay token，至少绑定 `device_id`、`credential_id`、`network_id`、Relay audience、过期时间和随机 ID。
 - Relay 校验 token 后再接受注册；客户端不能仅凭 node ID 占用路由表项。
 - 同一设备重复注册必须有确定的替换规则并产生审计事件。
 - Frame 包含协议版本、源/目标、长度和必要的会话标识；服务器校验源身份。
 - 设置单连接和单设备的帧大小、速率、队列长度和并发限制。
 - Rust Relay 与 Go Relay 共享测试向量和兼容性测试。
 
-Relay token 建议是控制面签名的紧凑二进制声明或标准 JWT/PASETO。选择哪种格式不是关键，关键是短期、可验证、可撤销和 audience 限定。
+Relay token 当前使用控制面 Ed25519 签名 JWT；关键边界是短期、可验证、可撤销、绑定 `credential_id` 并限定 audience。Relay 可合并本地静态 denylist 和控制面 `GET /api/v1/relay/revocations` 在线 snapshot；feed 拉取失败时保留上一份成功 snapshot，不放开已知撤销项。
 
 ### 6.2 认证 Probe
 
@@ -215,7 +215,7 @@ version | type | session_id | src_id | dst_id | timestamp | nonce | mac
 - 配置文件中的私钥、设备凭据和 refresh token 保持最小权限。
 - 日志、诊断包和 UI 状态永不输出完整 token 或私钥。
 - Device Identity Key 与 WireGuard key 的绑定由控制面验证并可轮换。
-- 定义设备删除、凭据撤销和密钥轮换后的连接终止行为。
+- 定义设备删除、凭据撤销和密钥轮换后的连接终止行为；当前已保留 relay revocation tombstone，避免 device 删除后因 cascade 丢失 feed 所需 ID。
 
 ## 7. 控制面优化
 
@@ -651,8 +651,8 @@ PeerSessionReady / PeerSessionFailed
   - 已落地：control signal 显式 `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Probe v2 session-bound MAC key、旧 static key 兼容 fallback，以及 diagnostics `probe_session_id` / `probe_key_type` 暴露。
   - 已落地：cargo-fuzz `pnch_parser` target，覆盖 PNCH v1 decode、PNCH v2 identity peek 和多 key MAC decode。
   - 已落地：跨进程/跨客户端全局 outbound probe budget，复用 network / peer / peer+remote-IP 短窗口，并输出 `global_*_rate_limited` reason。
-  - 已落地：Ed25519 transcript 签名、控制面当前/设备级 credential 即时撤销入口，以及 relay 本地 ticket `jti` / `device_id` denylist。
-  - 待补齐：安全评审和 relay 侧在线全局 ticket 撤销 feed。
+  - 已落地：Ed25519 transcript 签名、控制面当前/设备级 credential 即时撤销入口、relay 本地 ticket `jti` / `device_id` denylist，以及 relay 在线撤销 feed（`jti` / `device_id` / `credential_id`）。
+  - 待补齐：独立安全评审、部署面检查和两端新版 daemon 公网 UDP 实机验收；不得据此宣称已达到 UU/WebRTC 级可靠度。
 - `SEC-04` 增加协议版本、兼容测试和 fuzz target。
 - `OBS-01` 建立稳定 reason code 和连接事件。
 
@@ -795,7 +795,7 @@ PeerSessionReady / PeerSessionFailed
 
 ### Iteration 1：先让连接可信且可解释
 
-- 完成 Relay token/TLS 设计、Probe v2 skeleton、Ed25519 transcript 签名和本地 ticket denylist；继续补安全评审和 relay 侧在线全局 ticket 撤销 feed。
+- 完成 Relay token/TLS 设计、Probe v2 skeleton、Ed25519 transcript 签名、本地 ticket denylist 和 relay 在线撤销 feed；继续补安全评审、部署面检查和两端新版 daemon 公网 UDP 实机验收。
 - 给所有 path/relay/control 失败建立 reason code。
 - 为网络切换引入 generation，阻止旧异步结果覆盖新状态。
 - 扩展 `p2wlan doctor` 输出最近一次 Direct 失败阶段。
