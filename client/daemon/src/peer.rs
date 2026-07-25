@@ -41,6 +41,7 @@ const PEER_REFLEXIVE_STICKY_WINDOW: Duration = Duration::from_secs(10);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 1;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
+const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 6;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 12;
@@ -1430,10 +1431,12 @@ impl PeerConnection {
             confirmed_direct,
             trial_direct,
         );
+        let retain_private_direct = selected_pair.is_some_and(should_retain_private_direct_pair);
 
         if confirmed_direct {
             if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
-                if direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
+                if !retain_private_direct
+                    && direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
                     && direct_score.score < relay_score.score
                 {
                     if !self
@@ -1461,7 +1464,9 @@ impl PeerConnection {
                     )
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                 }
-                if direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score {
+                if !retain_private_direct
+                    && direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score
+                {
                     if !self
                         .relay_health
                         .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE)
@@ -4330,6 +4335,34 @@ fn is_public_probe_endpoint(endpoint: SocketAddr) -> bool {
     }
 }
 
+fn is_private_direct_endpoint(endpoint: SocketAddr) -> bool {
+    match endpoint.ip() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            let is_unique_local = (first_segment & 0xfe00) == 0xfc00;
+            let is_link_local = (first_segment & 0xffc0) == 0xfe80;
+            is_unique_local || is_link_local
+        }
+    }
+}
+
+fn should_retain_private_direct_pair(pair: &CandidatePair) -> bool {
+    if pair.state != CandidatePairState::Selected
+        || !is_private_direct_endpoint(pair.remote_endpoint)
+        || pair.consecutive_failures > 0
+        || !pair
+            .success_age()
+            .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+    {
+        return false;
+    }
+
+    pair.rtt_ewma_ms
+        .or(pair.rtt_ms)
+        .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
+}
+
 fn is_overlay_endpoint(endpoint: SocketAddr) -> bool {
     match endpoint.ip() {
         IpAddr::V4(ip) => {
@@ -6213,6 +6246,44 @@ mod tests {
             degraded.direct_score.as_ref().unwrap().score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN
                 < degraded.relay_score.as_ref().unwrap().score
         );
+    }
+
+    #[tokio::test]
+    async fn path_selector_retains_low_latency_private_direct_over_relay() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let endpoint: SocketAddr = "192.168.2.11:51839".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                endpoint,
+                Some(Duration::from_millis(6)),
+            )
+            .await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        manager
+            .record_relay_success("peer1", "relay.test:443", false)
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.consecutive_failures = 3;
+            conn.direct_health.failure_count = 5;
+            conn.direct_health.rtt_ewma_ms = Some(650);
+            conn.direct_health.jitter_ms = Some(120);
+        }
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Direct));
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+        assert!(selected.direct_confirmed);
+        let direct_score = selected.direct_score.as_ref().unwrap().score;
+        let relay_score = selected.relay_score.as_ref().unwrap().score;
+        assert!(direct_score < DIRECT_CONFIRMED_MIN_SCORE);
+        assert!(direct_score < relay_score);
     }
 
     #[tokio::test]
