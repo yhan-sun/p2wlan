@@ -344,7 +344,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "p2pnet-crypto"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "p2pnet-nat"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "if-addrs",
  "p2pnet-crypto",

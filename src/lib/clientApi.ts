@@ -801,11 +801,13 @@ function connectionPresentation(
 }
 
 function mapPeer(peer: PeerDiagnostics): PeerStatus {
+  const selection = peer.current_path_selection;
   const isDirectTrial =
-    peer.active_path === "relay" &&
-    peer.current_path_selection?.path === "direct" &&
-    peer.current_path_selection?.reason_code === "path_direct_trial" &&
-    peer.current_path_selection?.relay_hedged === true;
+    selection?.path === "direct" &&
+    selection?.reason_code === "path_direct_trial" &&
+    (selection?.relay_hedged === true ||
+      peer.active_path === null ||
+      peer.active_path === undefined);
   const path: PeerPath = isDirectTrial ? "direct_trial" : peer.active_path ?? "offline";
   const pathErrors = [peer.direct, peer.relay]
     .filter(health => health.last_error)
