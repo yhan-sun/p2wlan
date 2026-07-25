@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -78,6 +80,9 @@ type RelayConfig struct {
 	TicketMaxClockSkew       time.Duration
 	TicketRevokedJTIsJSON    string
 	TicketRevokedDevicesJSON string
+	RevocationFeedURL        string
+	RevocationFeedToken      string
+	RevocationPollInterval   time.Duration
 }
 
 // networkNodeKey is the composite key for the peer table: (network_id, node_id).
@@ -180,19 +185,36 @@ type RelayServer struct {
 	connections map[net.Conn]struct{}
 
 	// A2: ticket verification
-	ticketKeyring     map[string]ed25519.PublicKey
+	ticketKeyring map[string]ed25519.PublicKey
+
+	// Static local denylist from RELAY_TICKET_REVOKED_* JSON env/flags.
 	revokedTicketJTIs map[string]struct{}
 	revokedDeviceIDs  map[string]struct{}
+
+	// Online control-plane revocation feed snapshot.
+	revocationMu               sync.RWMutex
+	onlineRevokedTicketJTIs    map[string]struct{}
+	onlineRevokedDeviceIDs     map[string]struct{}
+	onlineRevokedCredentialIDs map[string]struct{}
 }
 
 // RelayTicketClaims are the JWT claims for relay registration.
 type relayTicketClaims struct {
 	DeviceID      string `json:"device_id"`
+	CredentialID  string `json:"credential_id,omitempty"`
 	NetworkID     string `json:"network_id"`
 	NodeID        string `json:"node_id"`
 	RelayRegion   string `json:"relay_region"`
 	RelayProtocol int    `json:"relay_protocol"`
 	jwt.RegisteredClaims
+}
+
+type relayRevocationFeedSnapshot struct {
+	GeneratedAt          string   `json:"generated_at"`
+	Version              int64    `json:"version"`
+	RevokedDeviceIDs     []string `json:"revoked_device_ids"`
+	RevokedCredentialIDs []string `json:"revoked_credential_ids"`
+	RevokedJTIs          []string `json:"revoked_jtis"`
 }
 
 func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
@@ -241,7 +263,7 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		log.Printf("WARNING: plaintext mode enabled on %s (development only)", config.Bind)
 	}
 
-	return &RelayServer{
+	server := &RelayServer{
 		config:            config,
 		listener:          listener,
 		hub:               newHub(),
@@ -250,7 +272,9 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		ticketKeyring:     keyring,
 		revokedTicketJTIs: revokedJTIs,
 		revokedDeviceIDs:  revokedDevices,
-	}, nil
+	}
+	server.startRevocationPolling()
+	return server, nil
 }
 
 func loadStringSet(raw, label string) (map[string]struct{}, error) {
@@ -271,6 +295,103 @@ func loadStringSet(raw, label string) (map[string]struct{}, error) {
 		set[value] = struct{}{}
 	}
 	return set, nil
+}
+
+func stringSetFromValues(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func (s *RelayServer) startRevocationPolling() {
+	if s.config == nil || strings.TrimSpace(s.config.RevocationFeedURL) == "" {
+		return
+	}
+	interval := s.config.RevocationPollInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.pollRevocationFeedOnce()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.pollRevocationFeedOnce()
+			case <-s.shutdownChan:
+				return
+			}
+		}
+	}()
+}
+
+func (s *RelayServer) pollRevocationFeedOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.refreshRevocationFeed(ctx); err != nil {
+		log.Printf("relay revocation feed refresh failed: %v", err)
+	}
+}
+
+func (s *RelayServer) refreshRevocationFeed(ctx context.Context) error {
+	url := strings.TrimSpace(s.config.RevocationFeedURL)
+	token := strings.TrimSpace(s.config.RevocationFeedToken)
+	if url == "" {
+		return nil
+	}
+	if token == "" {
+		return fmt.Errorf("revocation feed token is required when feed url is configured")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("build revocation feed request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch revocation feed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("revocation feed HTTP %d", resp.StatusCode)
+	}
+
+	var snapshot relayRevocationFeedSnapshot
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	if err := decoder.Decode(&snapshot); err != nil {
+		return fmt.Errorf("decode revocation feed: %w", err)
+	}
+	s.applyRevocationSnapshot(snapshot)
+	log.Printf("relay revocation feed updated: version=%d devices=%d credentials=%d jtis=%d",
+		snapshot.Version,
+		len(snapshot.RevokedDeviceIDs),
+		len(snapshot.RevokedCredentialIDs),
+		len(snapshot.RevokedJTIs),
+	)
+	return nil
+}
+
+func (s *RelayServer) applyRevocationSnapshot(snapshot relayRevocationFeedSnapshot) {
+	s.revocationMu.Lock()
+	defer s.revocationMu.Unlock()
+	s.onlineRevokedDeviceIDs = stringSetFromValues(snapshot.RevokedDeviceIDs)
+	s.onlineRevokedCredentialIDs = stringSetFromValues(snapshot.RevokedCredentialIDs)
+	s.onlineRevokedTicketJTIs = stringSetFromValues(snapshot.RevokedJTIs)
 }
 
 // loadTicketKeyring parses RELAY_TICKET_KEYRING_JSON or config field.
@@ -306,6 +427,36 @@ func loadTicketKeyring(config *RelayConfig) (map[string]ed25519.PublicKey, error
 	}
 
 	return keyring, nil
+}
+
+func (s *RelayServer) isTicketJTIRevoked(jti string) bool {
+	if _, revoked := s.revokedTicketJTIs[jti]; revoked {
+		return true
+	}
+	s.revocationMu.RLock()
+	defer s.revocationMu.RUnlock()
+	_, revoked := s.onlineRevokedTicketJTIs[jti]
+	return revoked
+}
+
+func (s *RelayServer) isDeviceRevoked(deviceID string) bool {
+	if _, revoked := s.revokedDeviceIDs[deviceID]; revoked {
+		return true
+	}
+	s.revocationMu.RLock()
+	defer s.revocationMu.RUnlock()
+	_, revoked := s.onlineRevokedDeviceIDs[deviceID]
+	return revoked
+}
+
+func (s *RelayServer) isCredentialRevoked(credentialID string) bool {
+	if credentialID == "" {
+		return false
+	}
+	s.revocationMu.RLock()
+	defer s.revocationMu.RUnlock()
+	_, revoked := s.onlineRevokedCredentialIDs[credentialID]
+	return revoked
 }
 
 // verifyTicket parses and validates a relay ticket JWT.
@@ -376,11 +527,14 @@ func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) 
 	if claims.ID == "" {
 		return nil, fmt.Errorf("missing jti")
 	}
-	if _, revoked := s.revokedTicketJTIs[claims.ID]; revoked {
+	if s.isTicketJTIRevoked(claims.ID) {
 		return nil, fmt.Errorf("ticket revoked")
 	}
-	if _, revoked := s.revokedDeviceIDs[claims.DeviceID]; revoked {
+	if s.isDeviceRevoked(claims.DeviceID) {
 		return nil, fmt.Errorf("device revoked")
+	}
+	if s.isCredentialRevoked(claims.CredentialID) {
+		return nil, fmt.Errorf("credential revoked")
 	}
 	if claims.IssuedAt == nil {
 		return nil, fmt.Errorf("missing iat")
@@ -571,6 +725,10 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	envRevocationPollInterval, err := getDurationEnv("RELAY_REVOCATION_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
 	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
@@ -589,6 +747,9 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	relayRegion := fs.String("relay-region", getenv("RELAY_REGION", ""), "This relay's region label")
 	revokedJTIs := fs.String("ticket-revoked-jtis", getenv("RELAY_TICKET_REVOKED_JTIS_JSON", ""), "JSON array of revoked relay ticket jti values")
 	revokedDevices := fs.String("ticket-revoked-devices", getenv("RELAY_TICKET_REVOKED_DEVICES_JSON", ""), "JSON array of revoked relay ticket device_id values")
+	revocationFeedURL := fs.String("revocation-feed-url", getenv("RELAY_REVOCATION_FEED_URL", ""), "Control-plane relay revocation feed URL")
+	revocationFeedToken := fs.String("revocation-feed-token", getenv("RELAY_REVOCATION_FEED_TOKEN", ""), "Bearer token for the relay revocation feed")
+	revocationPollInterval := fs.Duration("revocation-poll-interval", envRevocationPollInterval, "Relay revocation feed polling interval")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -611,6 +772,9 @@ func parseConfig(args []string) (*RelayConfig, error) {
 		RelayRegion:                *relayRegion,
 		TicketRevokedJTIsJSON:      *revokedJTIs,
 		TicketRevokedDevicesJSON:   *revokedDevices,
+		RevocationFeedURL:          strings.TrimSpace(*revocationFeedURL),
+		RevocationFeedToken:        strings.TrimSpace(*revocationFeedToken),
+		RevocationPollInterval:     *revocationPollInterval,
 	}
 
 	if config.SendQueueCapacity <= 0 {
@@ -627,6 +791,12 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	}
 	if config.MaxFramePayload <= 0 || config.MaxFramePayload > 65535 {
 		return nil, fmt.Errorf("max-frame-payload must be between 1 and 65535")
+	}
+	if config.RevocationPollInterval <= 0 {
+		return nil, fmt.Errorf("revocation-poll-interval must be > 0")
+	}
+	if config.RevocationFeedURL != "" && config.RevocationFeedToken == "" {
+		return nil, fmt.Errorf("revocation-feed-token is required when revocation-feed-url is set")
 	}
 
 	// A2: validate security config at startup

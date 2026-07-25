@@ -2,11 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +74,11 @@ func TestConfigValidation(t *testing.T) {
 	if cfg.RegisterTimeout != 10*time.Second {
 		t.Errorf("expected RegisterTimeout 10s, got %v", cfg.RegisterTimeout)
 	}
+
+	_, err = parseConfig([]string{"-require-auth=false", "-revocation-feed-url=https://control.example.test/api/v1/relay/revocations"})
+	if err == nil {
+		t.Fatal("expected error when revocation feed URL is configured without token")
+	}
 }
 
 func TestVerifyTicketRejectsRevokedJTIAndDevice(t *testing.T) {
@@ -105,11 +115,128 @@ func TestVerifyTicketRejectsRevokedJTIAndDevice(t *testing.T) {
 	}
 }
 
-func signRelayTicketForTest(t *testing.T, privateKey ed25519.PrivateKey, kid, jti, deviceID string) string {
+func TestRevocationFeedRejectsRevokedDeviceAndCredential(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	const kid = "kid-test"
+	const revokedDeviceID = "device-revoked-by-feed"
+	const revokedCredentialID = "credential-revoked-by-feed"
+	deviceTicket := signRelayTicketForTest(t, priv, kid, "jti-device-feed", revokedDeviceID, "credential-ok")
+	credentialTicket := signRelayTicketForTest(t, priv, kid, "jti-credential-feed", "device-ok", revokedCredentialID)
+
+	server := newAuthTestRelayServer(pub, kid)
+	if _, err := server.verifyTicket(deviceTicket); err != nil {
+		t.Fatalf("valid device ticket rejected before feed refresh: %v", err)
+	}
+	if _, err := server.verifyTicket(credentialTicket); err != nil {
+		t.Fatalf("valid credential ticket rejected before feed refresh: %v", err)
+	}
+
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer feed-token" {
+			t.Fatalf("unexpected Authorization header: %q", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode(relayRevocationFeedSnapshot{
+			GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+			Version:              1,
+			RevokedDeviceIDs:     []string{revokedDeviceID},
+			RevokedCredentialIDs: []string{revokedCredentialID},
+		})
+	}))
+	defer feed.Close()
+
+	server.config.RevocationFeedURL = feed.URL
+	server.config.RevocationFeedToken = "feed-token"
+	if err := server.refreshRevocationFeed(context.Background()); err != nil {
+		t.Fatalf("refreshRevocationFeed: %v", err)
+	}
+	if _, err := server.verifyTicket(deviceTicket); err == nil {
+		t.Fatal("ticket for feed-revoked device should be rejected")
+	}
+	if _, err := server.verifyTicket(credentialTicket); err == nil {
+		t.Fatal("ticket for feed-revoked credential should be rejected")
+	}
+}
+
+func TestRevocationFeedFailurePreservesExistingSnapshot(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	const kid = "kid-test"
+	const deviceID = "device-revoked-before-failure"
+	ticket := signRelayTicketForTest(t, priv, kid, "jti-preserve", deviceID, "credential-preserve")
+
+	server := newAuthTestRelayServer(pub, kid)
+	server.applyRevocationSnapshot(relayRevocationFeedSnapshot{
+		Version:          1,
+		RevokedDeviceIDs: []string{deviceID},
+	})
+
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "feed unavailable", http.StatusServiceUnavailable)
+	}))
+	defer feed.Close()
+
+	server.config.RevocationFeedURL = feed.URL
+	server.config.RevocationFeedToken = "feed-token"
+	if err := server.refreshRevocationFeed(context.Background()); err == nil {
+		t.Fatal("expected refreshRevocationFeed to fail")
+	}
+	if _, err := server.verifyTicket(ticket); err == nil {
+		t.Fatal("existing revocation snapshot should remain active after feed failure")
+	}
+}
+
+func TestLocalJSONDenylistStillRejectsTickets(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	const kid = "kid-test"
+	const deviceID = "device-local-json"
+	ticket := signRelayTicketForTest(t, priv, kid, "jti-local-json", deviceID, "credential-local-json")
+
+	config := testConfig()
+	config.Bind = "127.0.0.1:0"
+	config.RelayAudience = "relay-test"
+	config.RelayRegion = "test-region"
+	config.TicketKeyringJSON = `{"` + kid + `":"` + hex.EncodeToString(pub) + `"}`
+	config.TicketRevokedDevicesJSON = `["` + deviceID + `"]`
+	server, err := NewRelayServer(config)
+	if err != nil {
+		t.Fatalf("NewRelayServer: %v", err)
+	}
+	defer server.Close()
+
+	if _, err := server.verifyTicket(ticket); err == nil {
+		t.Fatal("local JSON device denylist should reject ticket")
+	}
+}
+
+func newAuthTestRelayServer(pub ed25519.PublicKey, kid string) *RelayServer {
+	return &RelayServer{
+		config: &RelayConfig{
+			RelayAudience:      "relay-test",
+			RelayRegion:        "test-region",
+			TicketMaxClockSkew: time.Second,
+		},
+		ticketKeyring: map[string]ed25519.PublicKey{kid: pub},
+	}
+}
+
+func signRelayTicketForTest(t *testing.T, privateKey ed25519.PrivateKey, kid, jti, deviceID string, credentialID ...string) string {
 	t.Helper()
 	now := time.Now()
+	credID := "credential-test"
+	if len(credentialID) > 0 {
+		credID = credentialID[0]
+	}
 	claims := relayTicketClaims{
 		DeviceID:      deviceID,
+		CredentialID:  credID,
 		NetworkID:     "network-test",
 		NodeID:        deviceID,
 		RelayRegion:   "test-region",
