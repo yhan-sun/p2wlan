@@ -11,7 +11,7 @@ import {
   ArrowRight,
 } from "lucide-react";
 import ControlAuthPanel from "../components/ControlAuthPanel";
-import { StatusPill, zhLabel, formatAge, formatBytes, pathTone } from "../components/StatusPill";
+import { StatusPill, formatAge, formatBytes, pathTone } from "../components/StatusPill";
 import { useClientStatus } from "../hooks/useClientStatus";
 import { getSettings, openLogs } from "../lib/clientApi";
 
@@ -424,7 +424,11 @@ export default function DashboardPage() {
                       <span className="text-xs text-mono text-accent mt-xs">{peer.virtualIp}</span>
                     </div>
                     <div className="flex-row items-center gap-sm">
-                      <StatusPill label={zhLabel(peer.path)} tone={pathTone(peer.path)} />
+                      <StatusPill
+                        label={peer.connectionLabel}
+                        tone={pathTone(peer.path)}
+                        title={peer.connectionDetail}
+                      />
                       {peer.lastActiveMs != null && (
                         <span className="text-xs text-secondary">{formatAge(peer.lastActiveMs)}</span>
                       )}

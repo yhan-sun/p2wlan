@@ -2242,20 +2242,38 @@ fn stable_network_candidate_signature(
             .get(endpoint)
             .map(String::as_str)
             .unwrap_or("signaled");
-        match source {
-            "host" | "manual" | "upnp" | "pcp" | "nat_pmp" => {
-                signature.push(format!("{source}:{endpoint}"));
-            }
-            "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
-                match endpoint.parse::<SocketAddr>() {
-                    Ok(addr) if is_public_udp_candidate(addr) => {
-                        signature.push(format!("public-ip:{}", addr.ip()));
-                    }
-                    Ok(_) => {}
-                    Err(_) => signature.push(format!("{source}:{endpoint}")),
+        match endpoint.parse::<SocketAddr>() {
+            Ok(addr) if is_public_udp_candidate(addr) => match source {
+                "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
+                    signature.push(format!("public-ip:{}", addr.ip()));
                 }
-            }
-            _ => {}
+                "host" | "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
+                    signature.push(format!("{source}:{addr}"));
+                }
+                _ => {}
+            },
+            Ok(addr) => match source {
+                // A LAN endpoint can be reported as either a gathered host candidate
+                // or a peer-reflexive observation from another machine on the same
+                // LAN. Treat the endpoint itself as stable so source-label churn
+                // does not invalidate healthy direct paths every refresh.
+                "host" | "peer_reflexive" | "learned" => {
+                    signature.push(format!("private-endpoint:{addr}"));
+                }
+                "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
+                    signature.push(format!("{source}:{addr}"));
+                }
+                _ => {}
+            },
+            Err(_) => match source {
+                "host" | "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
+                    signature.push(format!("{source}:{endpoint}"));
+                }
+                "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
+                    signature.push(format!("{source}:{endpoint}"));
+                }
+                _ => {}
+            },
         }
     }
     signature.sort();
@@ -4590,6 +4608,42 @@ mod tests {
             &previous_sources,
             &next,
             &learned_next_sources,
+        ));
+    }
+
+    #[test]
+    fn candidate_refresh_generation_ignores_private_source_label_churn() {
+        let previous = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:27106".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            (
+                "192.168.1.10:59288".to_string(),
+                "peer_reflexive".to_string(),
+            ),
+            (
+                "93.184.216.34:27106".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+        let next = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:31999".to_string(),
+        ];
+        let next_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:31999".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+
+        assert!(!candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
         ));
     }
 
