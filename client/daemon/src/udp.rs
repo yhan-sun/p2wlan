@@ -77,6 +77,7 @@ impl GlobalOutboundProbeBudget {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&self.path)?;
         lock_budget_file(&file)?;
 

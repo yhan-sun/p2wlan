@@ -1819,6 +1819,7 @@ impl Daemon {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_peer_offer(
         &mut self,
         from_node_id: &str,

@@ -625,7 +625,7 @@ impl CandidatePair {
         if !self.nominated || self.selected_at.is_some() {
             return false;
         }
-        if !self.nomination_age().is_some_and(|age| age > window) {
+        if self.nomination_age().is_none_or(|age| age <= window) {
             return false;
         }
 
@@ -4521,9 +4521,9 @@ fn should_retain_private_direct_pair(pair: &CandidatePair) -> bool {
     if pair.state != CandidatePairState::Selected
         || !is_private_direct_endpoint(pair.remote_endpoint)
         || pair.consecutive_failures > 0
-        || !pair
+        || pair
             .success_age()
-            .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+            .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
     {
         return false;
     }
