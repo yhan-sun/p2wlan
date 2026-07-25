@@ -336,7 +336,7 @@ probe_mac_key = base_probe_mac_key
 | 1 | PUNCH | A -> B |
 | 2 | ACK | B -> A |
 
-A3 当前已覆盖：阻止伪造 ACK 改写路径状态、认证 peer-reflexive endpoint 学习、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、session/static fallback、本地 nonce replay window、peer/source 入站短窗口限速、network / peer / peer+remote-IP 发送侧短窗口预算、跨进程/跨客户端全局 probe 预算、Rust/Go golden vectors、Rust parser 畸形帧兼容回归和 cargo-fuzz `pnch_parser` target。剩余安全项是更完整的设备身份签名 transcript、安全评审和即时全局撤销，不应把当前实现表述为完成生产级安全审计。
+A3 当前已覆盖：阻止伪造 ACK 改写路径状态、认证 peer-reflexive endpoint 学习、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、本地 nonce replay window、peer/source 入站短窗口限速、network / peer / peer+remote-IP 发送侧短窗口预算、跨进程/跨客户端全局 probe 预算、Rust/Go golden vectors、Rust parser 畸形帧兼容回归和 cargo-fuzz `pnch_parser` target。剩余安全项是安全评审和 relay 侧即时全局 ticket 撤销服务，不应把当前实现表述为完成生产级安全审计。
 
 ## 7. 路径选择
 
@@ -587,9 +587,9 @@ Relay peer table 以 `(network_id, node_id)` 为身份键：
 
 ### 12.7 撤销边界
 
-- 撤销 device credential 或删除 device 后，控制面停止签发新 ticket。
+- 撤销 device credential 或删除 device 后，控制面立即拒绝该 credential，并停止签发新 ticket；`DELETE /api/v1/devices/credential` 可撤销当前 device credential，删除 device 会先撤销该 device 的全部 credential。
 - 已签发的 ticket 最迟在短 TTL（默认 5 分钟）到期后失效。
-- A2 不包含全局即时 jti 撤销列表。
+- 尚未实现 relay 在线查询或推送式全局 jti 撤销列表，因此已签 relay ticket 的撤销边界仍是短 TTL。
 
 ### 12.8 Rust/Go 跨语言 Golden Vectors
 
@@ -656,7 +656,7 @@ ACK bytes (hex):
 
 A2 完成后：
 - Relay 注册和传输已达到 Phase A2 安全基线。
-- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归和 cargo-fuzz parser target；设备身份签名 transcript、安全评审和即时全局撤销仍属于后续安全收口。
+- Probe v2 skeleton 已提供 MAC 验证、目标绑定、显式 signal `session_id`、临时 X25519 `probe_ephemeral_public_key` 会话密钥轮换、Ed25519 设备身份签名 transcript、session/static fallback、认证 peer-reflexive endpoint 学习、本地 nonce replay window、入站 probe 限速、发送侧进程内/跨进程 probe 预算、跨语言 golden vector 回归和 cargo-fuzz parser target；安全评审和 relay 侧即时全局 ticket 撤销服务仍属于后续安全收口。
 - A2 不代表整个 P2WLAN 已完成安全审计或可用于公网生产运维。
 
 ## 13. Control Signaling WebSocket V1

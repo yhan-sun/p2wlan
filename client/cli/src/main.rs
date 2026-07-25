@@ -162,7 +162,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Commands::Login(args) => authenticate(&config_path, args, false).await,
         Commands::Register(args) => authenticate(&config_path, args, true).await,
-        Commands::Logout => logout(&config_path),
+        Commands::Logout => logout(&config_path).await,
         Commands::Up => start(&config_path).await,
         Commands::Down => stop(&config_path).await,
         Commands::Status { json } => status(&config_path, json).await,
@@ -264,15 +264,48 @@ async fn authenticate(path: &Path, args: AuthArgs, register: bool) -> Result<(),
     Ok(())
 }
 
-fn logout(path: &Path) -> Result<(), String> {
+async fn logout(path: &Path) -> Result<(), String> {
     reject_sudo_config_write()?;
     let mut config = load_config(path)?;
+    if let Err(error) = revoke_current_device_credential(&config).await {
+        eprintln!("警告：无法撤销远端设备凭证：{error}");
+    }
     config.control.auth_token.clear();
     config.control.device_credential.clear();
     config.control.credential_issued = false;
     save_config(&config, path)?;
     println!("已退出登录，设备身份密钥和网络设置已保留。");
     Ok(())
+}
+
+async fn revoke_current_device_credential(config: &Config) -> Result<(), String> {
+    let credential = config.control.device_credential.trim();
+    if credential.is_empty() {
+        return Ok(());
+    }
+    let server = normalize_control_server(&config.control.server_url)?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("无法初始化网络请求：{error}"))?
+        .delete(format!("{server}/api/v1/devices/credential"))
+        .bearer_auth(credential)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "连接控制服务器超时".to_string()
+            } else {
+                format!("无法连接控制服务器：{error}")
+            }
+        })?;
+    if response.status().is_success() || response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("HTTP {status}: {body}"))
 }
 
 async fn start(config_path: &Path) -> Result<(), String> {

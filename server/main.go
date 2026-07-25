@@ -91,6 +91,7 @@ func main() {
 
 	// Device-only routes (device credential required)
 	deviceAuth := auth.RequireDeviceAuth(db)
+	mux.HandleFunc("DELETE /api/v1/devices/credential", deviceAuth(apiServer.RevokeCurrentDeviceCredential))
 	mux.HandleFunc("DELETE /api/v1/devices/{id}", deviceAuth(apiServer.DeleteDevice))
 
 	// Relay ticket endpoint (device-credential-only, rate limited)

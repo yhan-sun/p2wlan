@@ -367,6 +367,15 @@ func (db *DB) RevokeDeviceCredential(credentialID string) error {
 	return err
 }
 
+// RevokeDeviceCredentials revokes all credentials currently issued to a device.
+func (db *DB) RevokeDeviceCredentials(deviceID string) (int64, error) {
+	res, err := db.Exec(`UPDATE device_credentials SET revoked = 1 WHERE device_id = ? AND revoked = 0`, deviceID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ---- Network membership operations ----
 
 // CreateNetworkMembership adds a user to a network.
@@ -711,8 +720,19 @@ func (db *DB) UpdateDeviceName(deviceID, deviceName string) error {
 
 // DeleteDevice removes a device.
 func (db *DB) DeleteDevice(deviceID string) error {
-	_, err := db.Exec(`DELETE FROM devices WHERE id = ?`, deviceID)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE device_credentials SET revoked = 1 WHERE device_id = ? AND revoked = 0`, deviceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM devices WHERE id = ?`, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- Signaling operations ----
