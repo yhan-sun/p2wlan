@@ -215,10 +215,8 @@ fn allowed_cors_origin(request: &str) -> Option<&str> {
 
 async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let udp = context.udp_transport.read().await.clone();
-    let udp_local_addr = udp
-        .as_ref()
-        .and_then(|udp| udp.local_addr().ok())
-        .map(|addr| addr.to_string());
+    let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+    let udp_local_addr = udp_local_endpoint.map(|addr| addr.to_string());
     let udp_socket_count = udp.as_ref().map(UdpTransport::socket_count).unwrap_or(0);
     let udp_socket_pool_active = udp.as_ref().is_some_and(UdpTransport::socket_pool_active);
     let udp_socket_pool = match udp.as_ref() {
@@ -239,6 +237,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
             context.config.relay.prefer_direct,
             relay_connected,
             direct_retry_after,
+            udp_local_endpoint,
         )
         .await;
     let stats = PeerManagerStats::from_diagnostics(&peers);

@@ -390,6 +390,10 @@ func (s *Server) SubmitDeviceCredential(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 		return
 	}
+	if err := s.db.UpdateDeviceEd25519PublicKey(req.DeviceID, req.Ed25519PublicKey); err != nil {
+		http.Error(w, `{"error":"device identity update failed"}`, http.StatusInternalServerError)
+		return
+	}
 
 	// Issue device credential with 30-day TTL
 	cred, token, err := s.db.CreateDeviceCredential(req.DeviceID, 30*24*3600)
@@ -438,6 +442,61 @@ func verifyChallenge(db *database.DB, challengeID, ed25519PubKeyHex, signatureHe
 		return fmt.Errorf("signature verification failed")
 	}
 
+	return nil
+}
+
+func probeEphemeralTranscript(signalType, fromNodeID, toNodeID, sessionID, probeEphemeralPublicKey string, candidateGeneration, candidatesExpiresAtMS int64) []byte {
+	var b strings.Builder
+	b.WriteString("p2wlan signal probe ephemeral v1\n")
+	b.WriteString("type=")
+	b.WriteString(signalType)
+	b.WriteByte('\n')
+	b.WriteString("from=")
+	b.WriteString(fromNodeID)
+	b.WriteByte('\n')
+	b.WriteString("to=")
+	b.WriteString(toNodeID)
+	b.WriteByte('\n')
+	b.WriteString("session_id=")
+	b.WriteString(sessionID)
+	b.WriteByte('\n')
+	b.WriteString("probe_ephemeral_public_key=")
+	b.WriteString(strings.ToLower(probeEphemeralPublicKey))
+	b.WriteByte('\n')
+	b.WriteString("candidate_generation=")
+	b.WriteString(strconv.FormatInt(candidateGeneration, 10))
+	b.WriteByte('\n')
+	b.WriteString("candidates_expires_at_ms=")
+	b.WriteString(strconv.FormatInt(candidatesExpiresAtMS, 10))
+	b.WriteByte('\n')
+	return []byte(b.String())
+}
+
+func verifyProbeEphemeralSignature(sender *database.Device, signalType, fromNodeID, toNodeID, sessionID, probeEphemeralPublicKey, signatureHex string, candidateGeneration, candidatesExpiresAtMS int64) error {
+	if strings.TrimSpace(probeEphemeralPublicKey) == "" {
+		return nil
+	}
+	if strings.TrimSpace(sender.Ed25519PublicKey) == "" {
+		return nil // legacy/unverified device identity; keep compatibility while rollout completes
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session_id required for signed probe ephemeral key")
+	}
+	if strings.TrimSpace(signatureHex) == "" {
+		return fmt.Errorf("probe_ephemeral_signature required")
+	}
+	pubKey, err := hex.DecodeString(sender.Ed25519PublicKey)
+	if err != nil || len(pubKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("sender ed25519 public key invalid")
+	}
+	signature, err := hex.DecodeString(signatureHex)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("probe_ephemeral_signature must be 64-byte hex")
+	}
+	transcript := probeEphemeralTranscript(signalType, fromNodeID, toNodeID, sessionID, probeEphemeralPublicKey, candidateGeneration, candidatesExpiresAtMS)
+	if !ed25519.Verify(ed25519.PublicKey(pubKey), transcript, signature) {
+		return fmt.Errorf("probe_ephemeral_signature mismatch")
+	}
 	return nil
 }
 
@@ -628,15 +687,18 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 // CreateSignal handles POST /api/v1/signals.
 func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FromNodeID            string            `json:"from_node_id"`
-		ToNodeID              string            `json:"to_node_id"`
-		Type                  string            `json:"type"`
-		Candidates            []string          `json:"candidates"`
-		CandidateSources      map[string]string `json:"candidate_sources"`
-		CandidateGeneration   int64             `json:"candidate_generation"`
-		CandidatesExpiresAtMS int64             `json:"candidates_expires_at_ms"`
-		Handshake             string            `json:"handshake"`
-		PunchAtMS             int64             `json:"punch_at_ms"`
+		FromNodeID              string            `json:"from_node_id"`
+		ToNodeID                string            `json:"to_node_id"`
+		Type                    string            `json:"type"`
+		Candidates              []string          `json:"candidates"`
+		CandidateSources        map[string]string `json:"candidate_sources"`
+		CandidateGeneration     int64             `json:"candidate_generation"`
+		CandidatesExpiresAtMS   int64             `json:"candidates_expires_at_ms"`
+		SessionID               string            `json:"session_id"`
+		ProbeEphemeralPublicKey string            `json:"probe_ephemeral_public_key"`
+		ProbeEphemeralSignature string            `json:"probe_ephemeral_signature"`
+		Handshake               string            `json:"handshake"`
+		PunchAtMS               int64             `json:"punch_at_ms"`
 		// PunchAtServerMS echoes an already normalized server deadline from
 		// an offer. It lets the answer join the same synchronized punch window
 		// instead of scheduling a second one after the round trip.
@@ -690,6 +752,27 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := candidateSet[endpoint]; !ok {
 			http.Error(w, `{"error":"candidate source references unknown candidate"}`, http.StatusBadRequest)
+			return
+		}
+	}
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if len(req.SessionID) > 128 {
+		http.Error(w, `{"error":"session_id too long"}`, http.StatusBadRequest)
+		return
+	}
+	req.ProbeEphemeralPublicKey = strings.TrimSpace(req.ProbeEphemeralPublicKey)
+	if req.ProbeEphemeralPublicKey != "" {
+		decoded, err := hex.DecodeString(req.ProbeEphemeralPublicKey)
+		if err != nil || len(decoded) != 32 {
+			http.Error(w, `{"error":"probe_ephemeral_public_key must be 32-byte hex"}`, http.StatusBadRequest)
+			return
+		}
+	}
+	req.ProbeEphemeralSignature = strings.TrimSpace(req.ProbeEphemeralSignature)
+	if req.ProbeEphemeralSignature != "" {
+		decoded, err := hex.DecodeString(req.ProbeEphemeralSignature)
+		if err != nil || len(decoded) != ed25519.SignatureSize {
+			http.Error(w, `{"error":"probe_ephemeral_signature must be 64-byte hex"}`, http.StatusBadRequest)
 			return
 		}
 	}
@@ -753,10 +836,17 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	// Determine from_node_id and network_id from auth context
 	fromNodeID := ""
 	var networkID string
+	var senderDevice *database.Device
 
 	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
 		fromNodeID = deviceClaims.DeviceID
 		networkID = deviceClaims.NetworkID
+		device, err := s.db.GetDevice(fromNodeID)
+		if err != nil {
+			http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
+			return
+		}
+		senderDevice = device
 	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
 		// User JWT: from_node_id is provided by the client, validate it
 		req.FromNodeID = strings.TrimSpace(req.FromNodeID)
@@ -781,6 +871,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		networkID = device.NetworkID
+		senderDevice = device
 	} else {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
@@ -796,8 +887,12 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"target device is in a different network"}`, http.StatusForbidden)
 		return
 	}
+	if err := verifyProbeEphemeralSignature(senderDevice, req.Type, fromNodeID, req.ToNodeID, req.SessionID, req.ProbeEphemeralPublicKey, req.ProbeEphemeralSignature, req.CandidateGeneration, req.CandidatesExpiresAtMS); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+		return
+	}
 
-	signal, err := s.db.CreateSignalWithTraversalMetadata(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS)
+	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return

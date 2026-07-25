@@ -61,6 +61,9 @@ const PUNCH_PACKET_SIZE: usize = 14;
 /// Length of the truncated authentication tag on v2 probes.
 const AUTH_PUNCH_MAC_SIZE: usize = 16;
 
+/// ICE-style nomination bit for authenticated v2 connectivity checks.
+const AUTH_PUNCH_FLAG_USE_CANDIDATE: u8 = 0x01;
+
 /// Domain separator for authenticated UDP probe MACs.
 const AUTH_PUNCH_MAC_DOMAIN: &[u8] = b"p2wlan-udp-probe-v2";
 
@@ -125,6 +128,8 @@ pub struct DecodedPunchPacket {
     pub target_node_id: Option<String>,
     /// Sender-side local network generation for authenticated v2 probes.
     pub generation: Option<u64>,
+    /// Whether this check nominates the candidate pair for direct data trials.
+    pub use_candidate: bool,
     /// Whether the packet MAC was verified.
     pub authenticated: bool,
 }
@@ -140,6 +145,8 @@ pub struct AuthenticatedPunchIdentity {
     pub target_node_id: String,
     /// Sender-side local network generation.
     pub generation: u64,
+    /// Whether this check nominates the candidate pair for direct data trials.
+    pub use_candidate: bool,
 }
 
 /// A parsed punch packet.
@@ -223,6 +230,7 @@ impl From<PunchPacket> for DecodedPunchPacket {
             source_node_id: None,
             target_node_id: None,
             generation: None,
+            use_candidate: false,
             authenticated: false,
         }
     }
@@ -264,6 +272,23 @@ pub fn build_authenticated_punch_packet(
     generation: u64,
     key: &ProbeMacKey,
 ) -> (Vec<u8>, [u8; 8]) {
+    build_authenticated_punch_packet_with_nomination(
+        source_node_id,
+        target_node_id,
+        generation,
+        false,
+        key,
+    )
+}
+
+/// Build a fresh authenticated v2 PUNCH datagram with an ICE-style nomination bit.
+pub fn build_authenticated_punch_packet_with_nomination(
+    source_node_id: &str,
+    target_node_id: &str,
+    generation: u64,
+    use_candidate: bool,
+    key: &ProbeMacKey,
+) -> (Vec<u8>, [u8; 8]) {
     use rand::RngCore;
 
     let mut nonce = [0u8; 8];
@@ -274,9 +299,34 @@ pub fn build_authenticated_punch_packet(
         source_node_id,
         target_node_id,
         generation,
+        use_candidate,
         key,
     );
     (bytes, nonce)
+}
+
+/// Build an authenticated v2 PUNCH datagram using a caller-provided nonce.
+///
+/// This is primarily used for protocol fixtures and cross-language golden
+/// vectors. Runtime probing should normally use
+/// [`build_authenticated_punch_packet_with_nomination`] so nonces remain fresh.
+pub fn build_authenticated_punch_packet_with_nonce(
+    nonce: [u8; 8],
+    source_node_id: &str,
+    target_node_id: &str,
+    generation: u64,
+    use_candidate: bool,
+    key: &ProbeMacKey,
+) -> Vec<u8> {
+    encode_authenticated_punch(
+        PunchPacketKind::Punch,
+        nonce,
+        source_node_id,
+        target_node_id,
+        generation,
+        use_candidate,
+        key,
+    )
 }
 
 /// Build an authenticated v2 ACK datagram for a received v2 PUNCH nonce.
@@ -293,6 +343,7 @@ pub fn build_authenticated_punch_ack(
         source_node_id,
         target_node_id,
         generation,
+        false,
         key,
     )
 }
@@ -305,6 +356,7 @@ pub fn peek_authenticated_punch_identity(data: &[u8]) -> Option<AuthenticatedPun
         source_node_id: parsed.source_node_id,
         target_node_id: parsed.target_node_id,
         generation: parsed.generation,
+        use_candidate: parsed.use_candidate,
     })
 }
 
@@ -327,6 +379,7 @@ pub fn decode_authenticated_punch_packet(
         source_node_id: Some(parsed.source_node_id),
         target_node_id: Some(parsed.target_node_id),
         generation: Some(parsed.generation),
+        use_candidate: parsed.use_candidate,
         authenticated: true,
     })
 }
@@ -337,6 +390,7 @@ fn encode_authenticated_punch(
     source_node_id: &str,
     target_node_id: &str,
     generation: u64,
+    use_candidate: bool,
     key: &ProbeMacKey,
 ) -> Vec<u8> {
     let source = source_node_id.as_bytes();
@@ -347,7 +401,7 @@ fn encode_authenticated_punch(
     );
 
     let mut frame = Vec::with_capacity(
-        4 + 1 + 1 + 8 + 8 + 1 + 1 + source.len() + target.len() + AUTH_PUNCH_MAC_SIZE,
+        4 + 1 + 1 + 8 + 8 + 1 + 1 + 1 + source.len() + target.len() + AUTH_PUNCH_MAC_SIZE,
     );
     frame.extend_from_slice(&PUNCH_MAGIC);
     frame.push(AUTH_PUNCH_VERSION);
@@ -357,6 +411,11 @@ fn encode_authenticated_punch(
     });
     frame.extend_from_slice(&nonce);
     frame.extend_from_slice(&generation.to_be_bytes());
+    frame.push(if use_candidate {
+        AUTH_PUNCH_FLAG_USE_CANDIDATE
+    } else {
+        0
+    });
     frame.push(source.len() as u8);
     frame.push(target.len() as u8);
     frame.extend_from_slice(source);
@@ -371,12 +430,28 @@ struct ParsedAuthenticatedPunch {
     kind: PunchPacketKind,
     nonce: [u8; 8],
     generation: u64,
+    use_candidate: bool,
     source_node_id: String,
     target_node_id: String,
 }
 
 fn parse_authenticated_punch(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
-    let minimum = 4 + 1 + 1 + 8 + 8 + 1 + 1 + AUTH_PUNCH_MAC_SIZE;
+    parse_authenticated_punch_with_flags(data).or_else(|| parse_authenticated_punch_legacy(data))
+}
+
+fn parse_authenticated_punch_with_flags(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
+    parse_authenticated_punch_inner(data, true)
+}
+
+fn parse_authenticated_punch_legacy(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
+    parse_authenticated_punch_inner(data, false)
+}
+
+fn parse_authenticated_punch_inner(
+    data: &[u8],
+    has_flags: bool,
+) -> Option<ParsedAuthenticatedPunch> {
+    let minimum = 4 + 1 + 1 + 8 + 8 + usize::from(has_flags) + 1 + 1 + AUTH_PUNCH_MAC_SIZE;
     if data.len() < minimum {
         return None;
     }
@@ -393,9 +468,22 @@ fn parse_authenticated_punch(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
     let mut generation_bytes = [0u8; 8];
     generation_bytes.copy_from_slice(&data[14..22]);
     let generation = u64::from_be_bytes(generation_bytes);
-    let source_len = data[22] as usize;
-    let target_len = data[23] as usize;
-    let source_start: usize = 24;
+    let mut cursor: usize = 22;
+    let flags = if has_flags {
+        let flags = data[cursor];
+        if flags & !AUTH_PUNCH_FLAG_USE_CANDIDATE != 0 {
+            return None;
+        }
+        cursor += 1;
+        flags
+    } else {
+        0
+    };
+    let source_len = data[cursor] as usize;
+    cursor += 1;
+    let target_len = data[cursor] as usize;
+    cursor += 1;
+    let source_start = cursor;
     let target_start = source_start.checked_add(source_len)?;
     let mac_start = data.len().checked_sub(AUTH_PUNCH_MAC_SIZE)?;
     let target_end = target_start.checked_add(target_len)?;
@@ -416,6 +504,7 @@ fn parse_authenticated_punch(data: &[u8]) -> Option<ParsedAuthenticatedPunch> {
         kind,
         nonce,
         generation,
+        use_candidate: flags & AUTH_PUNCH_FLAG_USE_CANDIDATE != 0,
         source_node_id,
         target_node_id,
     })
@@ -586,6 +675,13 @@ pub async fn send_keepalive(socket: &UdpSocket, peer_addr: SocketAddr) -> Result
 mod tests {
     use super::*;
 
+    fn hex_lower(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    }
+
     #[test]
     fn test_punch_packet_encode_decode() {
         let punch = PunchPacket::new_punch();
@@ -647,8 +743,97 @@ mod tests {
         assert_eq!(decoded.source_node_id.as_deref(), Some("node-a"));
         assert_eq!(decoded.target_node_id.as_deref(), Some("node-b"));
         assert_eq!(decoded.generation, Some(7));
+        assert!(!decoded.use_candidate);
         assert!(decoded.authenticated);
         assert!(decode_punch_packet(&packet).is_none());
+    }
+
+    #[test]
+    fn test_authenticated_nomination_punch_encode_decode() {
+        let key = [0x42; 32];
+        let (packet, nonce) =
+            build_authenticated_punch_packet_with_nomination("node-a", "node-b", 7, true, &key);
+
+        let identity = peek_authenticated_punch_identity(&packet).unwrap();
+        assert_eq!(identity.kind, PunchPacketKind::Punch);
+        assert!(identity.use_candidate);
+
+        let decoded = decode_authenticated_punch_packet(&packet, &key).unwrap();
+        assert_eq!(decoded.kind, PunchPacketKind::Punch);
+        assert_eq!(decoded.nonce, nonce);
+        assert!(decoded.use_candidate);
+        assert!(decoded.authenticated);
+    }
+
+    #[test]
+    fn test_authenticated_punch_golden_vectors() {
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let nonce = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+
+        let punch = build_authenticated_punch_packet_with_nonce(
+            nonce,
+            "node-a",
+            "node-b",
+            0x0102_0304_0506_0708,
+            true,
+            &key,
+        );
+        assert_eq!(
+            hex_lower(&punch),
+            "504e43480201a0a1a2a3a4a5a6a701020304050607080106066e6f64652d616e6f64652d62fa09a10aa09da3d47f1b7d003a7adadb"
+        );
+        let decoded_punch = decode_authenticated_punch_packet(&punch, &key).unwrap();
+        assert_eq!(decoded_punch.kind, PunchPacketKind::Punch);
+        assert_eq!(decoded_punch.nonce, nonce);
+        assert_eq!(decoded_punch.generation, Some(0x0102_0304_0506_0708));
+        assert!(decoded_punch.use_candidate);
+
+        let ack =
+            build_authenticated_punch_ack(nonce, "node-b", "node-a", 0x0102_0304_0506_0709, &key);
+        assert_eq!(
+            hex_lower(&ack),
+            "504e43480202a0a1a2a3a4a5a6a701020304050607090006066e6f64652d626e6f64652d619080783cb1a90b982675b2fab7399bbd"
+        );
+        let decoded_ack = decode_authenticated_punch_packet(&ack, &key).unwrap();
+        assert_eq!(decoded_ack.kind, PunchPacketKind::Ack);
+        assert_eq!(decoded_ack.nonce, nonce);
+        assert_eq!(decoded_ack.generation, Some(0x0102_0304_0506_0709));
+        assert!(!decoded_ack.use_candidate);
+    }
+
+    #[test]
+    fn test_legacy_authenticated_v2_without_flags_still_decodes() {
+        let key = [0x42; 32];
+        let source = b"node-a";
+        let target = b"node-b";
+        let nonce = [0xA5; 8];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&PUNCH_MAGIC);
+        frame.push(AUTH_PUNCH_VERSION);
+        frame.push(TYPE_PUNCH);
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&7_u64.to_be_bytes());
+        frame.push(source.len() as u8);
+        frame.push(target.len() as u8);
+        frame.extend_from_slice(source);
+        frame.extend_from_slice(target);
+        let mac = punch_v2_mac(&frame, &key);
+        frame.extend_from_slice(&mac);
+
+        let identity = peek_authenticated_punch_identity(&frame).unwrap();
+        assert!(!identity.use_candidate);
+
+        let decoded = decode_authenticated_punch_packet(&frame, &key).unwrap();
+        assert_eq!(decoded.kind, PunchPacketKind::Punch);
+        assert_eq!(decoded.nonce, nonce);
+        assert_eq!(decoded.source_node_id.as_deref(), Some("node-a"));
+        assert_eq!(decoded.target_node_id.as_deref(), Some("node-b"));
+        assert_eq!(decoded.generation, Some(7));
+        assert!(!decoded.use_candidate);
+        assert!(decoded.authenticated);
     }
 
     #[test]
@@ -663,6 +848,7 @@ mod tests {
         assert_eq!(decoded.source_node_id.as_deref(), Some("node-b"));
         assert_eq!(decoded.target_node_id.as_deref(), Some("node-a"));
         assert_eq!(decoded.generation, Some(9));
+        assert!(!decoded.use_candidate);
     }
 
     #[test]
@@ -675,6 +861,95 @@ mod tests {
         let last = packet.len() - 1;
         packet[last] ^= 0x01;
         assert!(decode_authenticated_punch_packet(&packet, &key).is_none());
+    }
+
+    #[test]
+    fn test_authenticated_punch_rejects_unknown_flags_even_with_valid_mac() {
+        let key = [0x42; 32];
+        let source = b"node-a";
+        let target = b"node-b";
+        let nonce = [0xA6; 8];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&PUNCH_MAGIC);
+        frame.push(AUTH_PUNCH_VERSION);
+        frame.push(TYPE_PUNCH);
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&7_u64.to_be_bytes());
+        frame.push(0x02);
+        frame.push(source.len() as u8);
+        frame.push(target.len() as u8);
+        frame.extend_from_slice(source);
+        frame.extend_from_slice(target);
+        let mac = punch_v2_mac(&frame, &key);
+        frame.extend_from_slice(&mac);
+
+        assert!(peek_authenticated_punch_identity(&frame).is_none());
+        assert!(decode_authenticated_punch_packet(&frame, &key).is_none());
+    }
+
+    #[test]
+    fn test_authenticated_punch_malformed_corpus_does_not_authenticate() {
+        let key = [0x42; 32];
+        let (packet, _nonce) = build_authenticated_punch_packet("node-a", "node-b", 7, &key);
+
+        for len in 0..packet.len() {
+            assert!(decode_authenticated_punch_packet(&packet[..len], &key).is_none());
+        }
+
+        let mut wrong_mac = packet.clone();
+        let last = wrong_mac.len() - 1;
+        wrong_mac[last] ^= 0x80;
+        assert!(decode_authenticated_punch_packet(&wrong_mac, &key).is_none());
+        assert!(peek_authenticated_punch_identity(&wrong_mac).is_some());
+
+        let mut zero_source = Vec::new();
+        zero_source.extend_from_slice(&PUNCH_MAGIC);
+        zero_source.push(AUTH_PUNCH_VERSION);
+        zero_source.push(TYPE_PUNCH);
+        zero_source.extend_from_slice(&[0xA7; 8]);
+        zero_source.extend_from_slice(&7_u64.to_be_bytes());
+        zero_source.push(0);
+        zero_source.push(0);
+        zero_source.push(1);
+        zero_source.push(b'b');
+        let mac = punch_v2_mac(&zero_source, &key);
+        zero_source.extend_from_slice(&mac);
+        assert!(decode_authenticated_punch_packet(&zero_source, &key).is_none());
+
+        let mut invalid_utf8 = Vec::new();
+        invalid_utf8.extend_from_slice(&PUNCH_MAGIC);
+        invalid_utf8.push(AUTH_PUNCH_VERSION);
+        invalid_utf8.push(TYPE_PUNCH);
+        invalid_utf8.extend_from_slice(&[0xA8; 8]);
+        invalid_utf8.extend_from_slice(&7_u64.to_be_bytes());
+        invalid_utf8.push(0);
+        invalid_utf8.push(1);
+        invalid_utf8.push(1);
+        invalid_utf8.push(0xFF);
+        invalid_utf8.push(b'b');
+        let mac = punch_v2_mac(&invalid_utf8, &key);
+        invalid_utf8.extend_from_slice(&mac);
+        assert!(decode_authenticated_punch_packet(&invalid_utf8, &key).is_none());
+    }
+
+    #[test]
+    fn test_authenticated_punch_parser_fuzz_corpus_does_not_panic() {
+        let key = [0x42; 32];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+
+        for len in 0..160 {
+            let mut frame = vec![0u8; len];
+            for byte in &mut frame {
+                seed ^= seed << 7;
+                seed ^= seed >> 9;
+                seed ^= seed << 8;
+                *byte = seed as u8;
+            }
+
+            let _ = peek_authenticated_punch_identity(&frame);
+            let _ = decode_authenticated_punch_packet(&frame, &key);
+            let _ = decode_punch_packet(&frame);
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use futures_util::{SinkExt, StreamExt};
+use p2pnet_crypto::Ed25519KeyPair;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -90,6 +91,12 @@ pub enum ControlMessage {
         to_node_id: String,
         candidates: Vec<String>,
         #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        probe_ephemeral_public_key: Option<String>,
+        #[serde(default)]
+        probe_ephemeral_signature: Option<String>,
+        #[serde(default)]
         candidate_sources: HashMap<String, String>,
         #[serde(default)]
         candidate_generation: u64,
@@ -107,6 +114,12 @@ pub enum ControlMessage {
         from_node_id: String,
         to_node_id: String,
         candidates: Vec<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        probe_ephemeral_public_key: Option<String>,
+        #[serde(default)]
+        probe_ephemeral_signature: Option<String>,
         #[serde(default)]
         candidate_sources: HashMap<String, String>,
         #[serde(default)]
@@ -226,6 +239,8 @@ pub enum ControlEvent {
     PeerOffer {
         from_node_id: String,
         candidates: Vec<String>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
@@ -239,6 +254,8 @@ pub enum ControlEvent {
     PeerAnswer {
         from_node_id: String,
         candidates: Vec<String>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
@@ -369,6 +386,10 @@ struct SignalResponse {
     #[serde(default)]
     candidates: Vec<String>,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    probe_ephemeral_public_key: Option<String>,
+    #[serde(default)]
     candidate_sources: HashMap<String, String>,
     #[serde(default)]
     candidate_generation: u64,
@@ -412,6 +433,8 @@ enum ControlCommand {
     SendPeerOffer {
         to_node_id: String,
         candidates: Vec<String>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
         punch_at_ms: Option<u64>,
@@ -421,6 +444,8 @@ enum ControlCommand {
     SendPeerAnswer {
         to_node_id: String,
         candidates: Vec<String>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
         candidate_sources: HashMap<String, String>,
         handshake_response: Vec<u8>,
         punch_at_ms: Option<u64>,
@@ -570,6 +595,37 @@ impl ControlClient {
             .send(ControlCommand::SendPeerOffer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: candidate_sources.clone(),
+                handshake_init: handshake_init.to_vec(),
+                punch_at_ms,
+                response_tx,
+            })
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
+    }
+
+    /// Send a peer offer with an explicit traversal session ID.
+    pub async fn send_peer_offer_with_sources_punch_and_session(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::SendPeerOffer {
+                to_node_id: to_node_id.to_string(),
+                candidates: candidates.to_vec(),
+                session_id,
+                probe_ephemeral_public_key,
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
@@ -652,6 +708,39 @@ impl ControlClient {
             .send(ControlCommand::SendPeerAnswer {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: candidate_sources.clone(),
+                handshake_response: handshake_response.to_vec(),
+                punch_at_ms,
+                punch_at_server_ms,
+                response_tx,
+            })
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("peer answer response channel closed".into()))?
+    }
+
+    /// Send a peer answer with an explicit traversal session ID.
+    pub async fn send_peer_answer_with_sources_schedule_and_session(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_response: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::SendPeerAnswer {
+                to_node_id: to_node_id.to_string(),
+                candidates: candidates.to_vec(),
+                session_id,
+                probe_ephemeral_public_key,
                 candidate_sources: candidate_sources.clone(),
                 handshake_response: handshake_response.to_vec(),
                 punch_at_ms,
@@ -795,6 +884,8 @@ impl ControlClient {
             ControlMessage::PeerOffer {
                 from_node_id,
                 candidates,
+                session_id,
+                probe_ephemeral_public_key,
                 candidate_sources,
                 candidate_generation,
                 candidates_expires_at_ms,
@@ -805,6 +896,8 @@ impl ControlClient {
                 let _ = self.event_tx.send(ControlEvent::PeerOffer {
                     from_node_id,
                     candidates,
+                    session_id,
+                    probe_ephemeral_public_key,
                     candidate_sources,
                     candidate_generation,
                     candidates_expires_at_ms,
@@ -817,6 +910,8 @@ impl ControlClient {
             ControlMessage::PeerAnswer {
                 from_node_id,
                 candidates,
+                session_id,
+                probe_ephemeral_public_key,
                 candidate_sources,
                 candidate_generation,
                 candidates_expires_at_ms,
@@ -827,6 +922,8 @@ impl ControlClient {
                 let _ = self.event_tx.send(ControlEvent::PeerAnswer {
                     from_node_id,
                     candidates,
+                    session_id,
+                    probe_ephemeral_public_key,
                     candidate_sources,
                     candidate_generation,
                     candidates_expires_at_ms,
@@ -1220,6 +1317,7 @@ async fn run_control_loop(
     } else {
         token.clone()
     };
+    let signal_signing_identity = SignalSigningIdentity::from_config(&config);
 
     info!("Connecting to control plane at {base_url}");
 
@@ -1569,8 +1667,8 @@ async fn run_control_loop(
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerOffer { to_node_id, candidates, candidate_sources, handshake_init, punch_at_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms, None).await;
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_init, punch_at_ms, response_tx } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms, None, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer offer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
@@ -1583,8 +1681,8 @@ async fn run_control_loop(
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, candidate_sources, handshake_response, punch_at_ms, punch_at_server_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms, punch_at_server_ms).await;
+                        ControlCommand::SendPeerAnswer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_response, punch_at_ms, punch_at_server_ms, response_tx } => {
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms, punch_at_server_ms, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;
                             match &res {
                                 Ok(()) => { debug!("Sent peer answer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
                                 Err(err) => {
@@ -1602,7 +1700,7 @@ async fn run_control_loop(
                             let candidate_sources = HashMap::from([
                                 (observed_endpoint.clone(), "peer_reflexive".to_string())
                             ]);
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms, None).await;
+                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms, None, None, None, None).await;
                             match &res {
                                 Ok(()) => {
                                     debug!(
@@ -1836,6 +1934,7 @@ async fn register_device(
         .bearer_auth(token)
         .json(&serde_json::json!({
             "public_key": config.node.public_key,
+            "ed25519_public_key": config.node.ed25519_public_key,
             "device_name": config.node.device_name,
             "platform": config.node.platform,
             "network_id": config.network.network_id,
@@ -1934,12 +2033,26 @@ async fn send_signal(
     handshake: &[u8],
     punch_at_ms: Option<u64>,
     punch_at_server_ms: Option<u64>,
+    session_id: Option<&str>,
+    probe_ephemeral_public_key: Option<&str>,
+    signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<()> {
     // Keep the revision and expiry derived from one instant: a candidate set
     // must have a coherent lifetime even if the wall clock is adjusted while
     // this request is being assembled.
     let candidate_generation = next_candidate_generation();
     let client_time_ms = unix_time_millis();
+    let candidates_expires_at_ms = client_time_ms.saturating_add(45_000);
+    let probe_ephemeral_signature = sign_probe_ephemeral_transcript(
+        signing_identity,
+        signal_type,
+        from_node_id,
+        to_node_id,
+        session_id,
+        probe_ephemeral_public_key,
+        candidate_generation,
+        candidates_expires_at_ms,
+    );
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
         .bearer_auth(token)
@@ -1950,7 +2063,10 @@ async fn send_signal(
             "candidates": candidates,
             "candidate_sources": candidate_sources,
             "candidate_generation": candidate_generation,
-            "candidates_expires_at_ms": client_time_ms.saturating_add(45_000),
+            "candidates_expires_at_ms": candidates_expires_at_ms,
+            "session_id": session_id,
+            "probe_ephemeral_public_key": probe_ephemeral_public_key,
+            "probe_ephemeral_signature": probe_ephemeral_signature,
             "handshake": hex::encode(handshake),
             "punch_at_ms": punch_at_ms,
             "punch_at_server_ms": punch_at_server_ms,
@@ -2035,6 +2151,8 @@ async fn poll_signals(
                 let _ = event_tx.send(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
+                    session_id: signal.session_id,
+                    probe_ephemeral_public_key: signal.probe_ephemeral_public_key,
                     candidate_sources: signal.candidate_sources,
                     candidate_generation: signal.candidate_generation,
                     candidates_expires_at_ms,
@@ -2047,6 +2165,8 @@ async fn poll_signals(
                 let _ = event_tx.send(ControlEvent::PeerAnswer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
+                    session_id: signal.session_id,
+                    probe_ephemeral_public_key: signal.probe_ephemeral_public_key,
                     candidate_sources: signal.candidate_sources,
                     candidate_generation: signal.candidate_generation,
                     candidates_expires_at_ms,
@@ -2130,6 +2250,73 @@ fn unix_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(u64::MAX)
+}
+
+#[derive(Clone)]
+struct SignalSigningIdentity {
+    keypair: Ed25519KeyPair,
+}
+
+impl SignalSigningIdentity {
+    fn from_config(config: &Config) -> Option<Self> {
+        let private_key = hex::decode(config.node.ed25519_private_key.trim()).ok()?;
+        let private_key: [u8; 32] = private_key.as_slice().try_into().ok()?;
+        Some(Self {
+            keypair: Ed25519KeyPair::from_private_key(&private_key),
+        })
+    }
+}
+
+fn probe_ephemeral_transcript(
+    signal_type: &str,
+    from_node_id: &str,
+    to_node_id: &str,
+    session_id: &str,
+    probe_ephemeral_public_key: &str,
+    candidate_generation: u64,
+    candidates_expires_at_ms: u64,
+) -> Vec<u8> {
+    format!(
+        "p2wlan signal probe ephemeral v1\n\
+type={signal_type}\n\
+from={from_node_id}\n\
+to={to_node_id}\n\
+session_id={session_id}\n\
+probe_ephemeral_public_key={}\n\
+candidate_generation={candidate_generation}\n\
+candidates_expires_at_ms={candidates_expires_at_ms}\n",
+        probe_ephemeral_public_key.trim().to_ascii_lowercase()
+    )
+    .into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_probe_ephemeral_transcript(
+    signing_identity: Option<&SignalSigningIdentity>,
+    signal_type: &str,
+    from_node_id: &str,
+    to_node_id: &str,
+    session_id: Option<&str>,
+    probe_ephemeral_public_key: Option<&str>,
+    candidate_generation: u64,
+    candidates_expires_at_ms: u64,
+) -> Option<String> {
+    let signing_identity = signing_identity?;
+    let session_id = session_id?.trim();
+    let probe_ephemeral_public_key = probe_ephemeral_public_key?.trim();
+    if session_id.is_empty() || probe_ephemeral_public_key.is_empty() {
+        return None;
+    }
+    let transcript = probe_ephemeral_transcript(
+        signal_type,
+        from_node_id,
+        to_node_id,
+        session_id,
+        probe_ephemeral_public_key,
+        candidate_generation,
+        candidates_expires_at_ms,
+    );
+    Some(hex::encode(signing_identity.keypair.sign(&transcript)))
 }
 
 fn peer_reflexive_endpoint_from_signal(signal: &SignalResponse) -> Option<String> {
@@ -2465,6 +2652,11 @@ mod tests {
             from_node_id: "alice".to_string(),
             to_node_id: "bob".to_string(),
             candidates: vec!["10.0.0.1:5000".to_string()],
+            session_id: Some("sess-test".to_string()),
+            probe_ephemeral_public_key: Some(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string(),
+            ),
+            probe_ephemeral_signature: None,
             candidate_sources: HashMap::new(),
             candidate_generation: 7,
             candidates_expires_at_ms: Some(42_000),
@@ -2516,6 +2708,8 @@ mod tests {
                 "198.51.100.1:40000".to_string(),
                 "203.0.113.10:51820".to_string(),
             ],
+            session_id: None,
+            probe_ephemeral_public_key: None,
             candidate_sources: HashMap::from([
                 (
                     "198.51.100.1:40000".to_string(),
@@ -2544,6 +2738,8 @@ mod tests {
             from_node_id: "alice".to_string(),
             signal_type: "peer_reflexive".to_string(),
             candidates: vec!["198.51.100.1:40000".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
             candidate_sources: HashMap::new(),
             candidate_generation: 0,
             candidates_expires_at_ms: None,

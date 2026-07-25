@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -64,7 +67,8 @@ func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) 
 	}
 
 	apiServer := NewServer(nil, hub, db)
-	body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":["203.0.113.10:51820"],"handshake":"abcd"}`)
+	const probeEphemeralPublicKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":["203.0.113.10:51820"],"session_id":"sess-api-1","probe_ephemeral_public_key":"` + probeEphemeralPublicKey + `","handshake":"abcd"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
 	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
 		DeviceID:  source.ID,
@@ -113,6 +117,64 @@ func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) 
 	}
 	if len(listed.Signals) != 1 || listed.Signals[0].FromNodeID != source.ID {
 		t.Fatalf("durable signal missing after WebSocket wake: %+v", listed.Signals)
+	}
+	if listed.Signals[0].SessionID != "sess-api-1" || listed.Signals[0].ProbeEphemeralPublicKey != probeEphemeralPublicKey {
+		t.Fatalf("expected session key material to round trip, got %+v", listed.Signals[0])
+	}
+}
+
+func TestCreateSignalVerifiesProbeEphemeralSignature(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("probe-sig@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "probe-sig-source-key", "source", "macos", hex.EncodeToString(edPub))
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "probe-sig-target-key", "target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	apiServer := NewServer(nil, nil, db)
+	const sessionID = "sess-probe-sig"
+	const probeEphemeralPublicKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	transcript := probeEphemeralTranscript("peer_offer", source.ID, target.ID, sessionID, probeEphemeralPublicKey, 7, 42_000)
+	validSignature := hex.EncodeToString(ed25519.Sign(edPriv, transcript))
+
+	for _, tc := range []struct {
+		name      string
+		signature string
+		wantCode  int
+	}{
+		{name: "valid", signature: validSignature, wantCode: http.StatusOK},
+		{name: "invalid", signature: hex.EncodeToString(make([]byte, ed25519.SignatureSize)), wantCode: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":["203.0.113.10:51820"],"candidate_generation":7,"candidates_expires_at_ms":42000,"session_id":"` + sessionID + `","probe_ephemeral_public_key":"` + probeEphemeralPublicKey + `","probe_ephemeral_signature":"` + tc.signature + `","handshake":"abcd","client_time_ms":1}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+			req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+				DeviceID:  source.ID,
+				NetworkID: source.NetworkID,
+				UserID:    source.UserID,
+				ExpiresAt: time.Now().Add(time.Hour).Unix(),
+			}))
+			recorder := httptest.NewRecorder()
+			apiServer.CreateSignal(recorder, req)
+			if recorder.Code != tc.wantCode {
+				t.Fatalf("CreateSignal: got HTTP %d, want %d: %s", recorder.Code, tc.wantCode, recorder.Body.String())
+			}
+		})
 	}
 }
 

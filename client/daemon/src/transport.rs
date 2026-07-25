@@ -33,6 +33,8 @@ pub struct EncryptedPeerPacket {
 pub struct ReceivedEncryptedPacket {
     /// Source socket address when known.
     pub source: Option<SocketAddr>,
+    /// Local UDP socket address that received this packet, when known.
+    pub local_endpoint: Option<SocketAddr>,
     /// Relay endpoint that delivered this packet, when received through Relay.
     pub relay_endpoint: Option<String>,
     /// Relay-authenticated source node ID, checked against the decrypted session owner.
@@ -223,6 +225,7 @@ impl WireGuardTransport {
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
             let source = packet.source;
+            let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
             let relay_peer_id = packet.relay_peer_id;
             match self.decrypt_inbound(&packet.wire_bytes).await {
@@ -243,7 +246,11 @@ impl WireGuardTransport {
                                 .learn_authenticated_endpoint(&inbound.peer_id, source)
                                 .await;
                             peers
-                                .record_direct_success(&inbound.peer_id, Some(source))
+                                .record_direct_success_with_local_endpoint(
+                                    &inbound.peer_id,
+                                    Some(source),
+                                    local_endpoint,
+                                )
                                 .await;
                             debug!(
                                 "Confirmed direct UDP data path from {source} for peer {}",
@@ -500,6 +507,7 @@ mod tests {
         encrypted_tx
             .send(ReceivedEncryptedPacket {
                 source: None,
+                local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
                 wire_bytes,
@@ -559,6 +567,7 @@ mod tests {
         encrypted_tx
             .send(ReceivedEncryptedPacket {
                 source: None,
+                local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("different-peer".to_string()),
                 wire_bytes,

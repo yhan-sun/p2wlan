@@ -796,6 +796,7 @@ impl RelayTransport {
                     inbound_tx
                         .send(ReceivedEncryptedPacket {
                             source: None,
+                            local_endpoint: None,
                             relay_endpoint: Some(self.relay_endpoint.clone()),
                             relay_peer_id: Some(from_node),
                             wire_bytes: data,
@@ -983,7 +984,7 @@ mod tests {
         .expect("relay 404 was not attributed to node-b");
 
         let diagnostics = peers
-            .diagnostics_with_path_selection(true, true, Duration::from_secs(5))
+            .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
             .await;
         assert_eq!(diagnostics[0].active_path, None);
 

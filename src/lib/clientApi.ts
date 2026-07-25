@@ -500,6 +500,14 @@ function diagnosticsFromDaemonLogs(
         nat_type: "unknown",
         state: "connecting",
         active_path: null,
+        direct_type: "unknown",
+        selected_pair: null,
+        current_direct_pair: null,
+        consent_endpoint: null,
+        is_public_udp_direct: false,
+        is_overlay_direct: false,
+        is_relay: false,
+        warning: null,
         connected_for_ms: null,
         bytes_sent: 0,
         bytes_received: 0,
@@ -507,6 +515,7 @@ function diagnosticsFromDaemonLogs(
         candidates: [],
         direct: emptyPathHealth(),
         relay: emptyPathHealth(),
+        candidate_pairs: [],
       });
     }
 
@@ -519,6 +528,9 @@ function diagnosticsFromDaemonLogs(
         peer.state = normalized;
         peer.active_path =
           normalized === "direct" ? "direct" : normalized === "relay" ? "relay" : null;
+        peer.direct_type =
+          normalized === "direct" ? "probing" : normalized === "relay" ? "relay" : "unknown";
+        peer.is_relay = normalized === "relay";
         if (normalized === "relay") {
           peer.relay = { ...emptyPathHealth(), last_success_age_ms: 0, latency_ms: relayLatency };
           peer.direct = emptyPathHealth("UDP 打洞未成功，已切到中继");
