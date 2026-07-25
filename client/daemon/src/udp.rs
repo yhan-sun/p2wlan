@@ -2265,6 +2265,22 @@ mod tests {
         ))
     }
 
+    fn refresh_global_probe_budget_timestamps(path: &PathBuf) {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let now_ms = unix_time_millis();
+        let entries = contents
+            .lines()
+            .filter_map(|line| {
+                let (_, key) = line.split_once('\t')?;
+                Some((now_ms, key.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        lock_budget_file(&file).unwrap();
+        write_global_probe_budget_entries(&mut file, &entries).unwrap();
+        unlock_budget_file(&file).unwrap();
+    }
+
     #[tokio::test]
     async fn global_outbound_probe_budget_limits_across_transports() {
         let path = unique_global_probe_budget_path("global-probe-budget");
@@ -2275,7 +2291,7 @@ mod tests {
         let transport_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
             .await
             .unwrap()
-            .with_global_probe_budget_path(path);
+            .with_global_probe_budget_path(path.clone());
 
         for index in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
             let endpoint: SocketAddr = format!("127.222.0.1:{}", 40_000 + index).parse().unwrap();
@@ -2292,6 +2308,7 @@ mod tests {
             );
         }
 
+        refresh_global_probe_budget_timestamps(&path);
         assert_eq!(
             transport_b
                 .admit_outbound_connectivity_probe(
