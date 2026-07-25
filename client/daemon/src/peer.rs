@@ -154,6 +154,8 @@ pub enum NetworkPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectPathType {
+    /// Confirmed direct UDP over a private/link-local LAN endpoint.
+    Lan,
     /// Confirmed direct UDP over a public Internet endpoint.
     PublicUdp,
     /// Direct packets are using the overlay/TUN address space, not NAT traversal.
@@ -4510,6 +4512,10 @@ fn classify_candidate_pair_path(
         return DirectPathType::Overlay;
     }
 
+    if is_private_direct_endpoint(pair.remote_endpoint) {
+        return DirectPathType::Lan;
+    }
+
     if is_public_probe_endpoint(pair.remote_endpoint) && is_public_udp_direct_source(pair.source) {
         DirectPathType::PublicUdp
     } else {
@@ -4523,6 +4529,8 @@ fn classify_confirmed_direct_endpoint(
 ) -> DirectPathType {
     if is_overlay_endpoint(endpoint) {
         DirectPathType::Overlay
+    } else if is_private_direct_endpoint(endpoint) {
+        DirectPathType::Lan
     } else if is_public_probe_endpoint(endpoint) && is_public_udp_direct_source(source) {
         DirectPathType::PublicUdp
     } else {
@@ -5264,6 +5272,41 @@ mod tests {
         assert_eq!(
             peer.selected_pair.as_ref().unwrap().direct_type,
             DirectPathType::Overlay
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_classifies_lan_direct_for_private_remote_endpoint() {
+        let manager = PeerManager::new(test_config());
+        let remote: SocketAddr = "192.168.2.11:56250".parse().unwrap();
+        let local: SocketAddr = "192.168.2.14:59435".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", remote)).await;
+        manager
+            .record_direct_probe_success_with_latency_and_local_endpoint(
+                "peer1",
+                remote,
+                Some(Duration::from_millis(7)),
+                Some(local),
+            )
+            .await;
+        manager
+            .record_direct_success_with_local_endpoint("peer1", Some(remote), Some(local))
+            .await;
+
+        let diagnostics = manager
+            .diagnostics_with_path_selection(true, false, Duration::from_secs(5), Some(local))
+            .await;
+        let peer = &diagnostics[0];
+
+        assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+        assert_eq!(peer.direct_type, DirectPathType::Lan);
+        assert!(!peer.is_public_udp_direct);
+        assert!(!peer.is_overlay_direct);
+        assert!(!peer.is_relay);
+        assert_eq!(
+            peer.selected_pair.as_ref().unwrap().direct_type,
+            DirectPathType::Lan
         );
     }
 

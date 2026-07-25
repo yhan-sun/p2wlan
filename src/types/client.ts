@@ -12,7 +12,7 @@ export type ConnectionState =
 
 export type NetworkPath = "direct" | "relay";
 export type PeerPath = NetworkPath | "direct_trial" | "offline";
-export type DirectPathType = "public_udp" | "overlay" | "relay" | "probing" | "unknown";
+export type DirectPathType = "lan" | "public_udp" | "overlay" | "relay" | "probing" | "unknown";
 export type ConnectionType =
   | "lan_direct"
   | "public_direct"

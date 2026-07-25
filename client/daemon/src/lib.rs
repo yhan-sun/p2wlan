@@ -2246,13 +2246,15 @@ fn stable_network_candidate_signature(
             "host" | "manual" | "upnp" | "pcp" | "nat_pmp" => {
                 signature.push(format!("{source}:{endpoint}"));
             }
-            "stun_observed" | "predicted" => match endpoint.parse::<SocketAddr>() {
-                Ok(addr) if is_public_udp_candidate(addr) => {
-                    signature.push(format!("public-ip:{}", addr.ip()));
+            "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
+                match endpoint.parse::<SocketAddr>() {
+                    Ok(addr) if is_public_udp_candidate(addr) => {
+                        signature.push(format!("public-ip:{}", addr.ip()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => signature.push(format!("{source}:{endpoint}")),
                 }
-                Ok(_) => {}
-                Err(_) => signature.push(format!("{source}:{endpoint}")),
-            },
+            }
             _ => {}
         }
     }
@@ -4545,6 +4547,49 @@ mod tests {
             &previous_sources,
             &next,
             &next_sources,
+        ));
+    }
+
+    #[test]
+    fn candidate_refresh_generation_ignores_public_source_label_churn() {
+        let previous = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:27106".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:27106".to_string(),
+                "peer_reflexive".to_string(),
+            ),
+        ]);
+        let next = vec![
+            "192.168.1.10:59288".to_string(),
+            "93.184.216.34:31999".to_string(),
+        ];
+        let next_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            (
+                "93.184.216.34:31999".to_string(),
+                "stun_observed".to_string(),
+            ),
+        ]);
+        let learned_next_sources = HashMap::from([
+            ("192.168.1.10:59288".to_string(), "host".to_string()),
+            ("93.184.216.34:31999".to_string(), "learned".to_string()),
+        ]);
+
+        assert!(!candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
+        ));
+        assert!(!candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &learned_next_sources,
         ));
     }
 

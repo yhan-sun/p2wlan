@@ -765,6 +765,13 @@ function connectionPresentation(
         detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走公网 UDP 直连",
       };
     }
+    if (directType === "lan") {
+      return {
+        type: "lan_direct",
+        label: "局域网直连",
+        detail: endpoint ? `当前直连端点 ${endpoint}` : "当前走局域网直连",
+      };
+    }
     if (pair?.is_overlay_direct || directType === "overlay") {
       return {
         type: "overlay_direct",
