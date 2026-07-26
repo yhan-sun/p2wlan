@@ -3479,50 +3479,54 @@ async fn run_relay_peer_validation_loop(
                 );
                 continue;
             };
-            if let Err(err) = send_relay_validation_packet(
-                &peer_id,
-                &peer_virtual_ip,
+            let packet = RelayValidationPacket {
+                peer_id: &peer_id,
+                peer_virtual_ip: &peer_virtual_ip,
                 local_ip,
                 peer_ip,
-                &transport,
-                &relay,
                 validation_id,
-                sequence as u16,
-            )
-            .await
-            {
+                sequence: sequence as u16,
+            };
+            if let Err(err) = send_relay_validation_packet(packet, &transport, &relay).await {
                 debug!("Relay peer validation skipped for {peer_id}: {err}");
             }
         }
     }
 }
 
-async fn send_relay_validation_packet(
-    peer_id: &str,
-    peer_virtual_ip: &str,
+struct RelayValidationPacket<'a> {
+    peer_id: &'a str,
+    peer_virtual_ip: &'a str,
     local_ip: Ipv4Addr,
     peer_ip: Ipv4Addr,
-    transport: &WireGuardTransport,
-    relay: &RelayTransport,
     validation_id: u16,
     sequence: u16,
+}
+
+async fn send_relay_validation_packet(
+    validation: RelayValidationPacket<'_>,
+    transport: &WireGuardTransport,
+    relay: &RelayTransport,
 ) -> Result<()> {
     let packet = Ipv4Packet::build_icmp_echo_request(
-        local_ip,
-        peer_ip,
-        validation_id,
-        sequence,
+        validation.local_ip,
+        validation.peer_ip,
+        validation.validation_id,
+        validation.sequence,
         RELAY_PEER_VALIDATION_PAYLOAD,
     );
     let encrypted = transport
         .encrypt_outbound(OutboundPacket {
-            peer_id: peer_id.to_string(),
-            dst_ip: peer_virtual_ip.to_string(),
+            peer_id: validation.peer_id.to_string(),
+            dst_ip: validation.peer_virtual_ip.to_string(),
             packet,
         })
         .await?
         .ok_or_else(|| {
-            DaemonError::Peer(format!("WireGuard session for peer {peer_id} is not ready"))
+            DaemonError::Peer(format!(
+                "WireGuard session for peer {} is not ready",
+                validation.peer_id
+            ))
         })?;
 
     relay.send_packet(&encrypted).await
@@ -4513,14 +4517,16 @@ mod tests {
             .await;
 
         send_relay_validation_packet(
-            "node-b",
-            "10.20.0.2",
-            Ipv4Addr::new(10, 20, 0, 1),
-            Ipv4Addr::new(10, 20, 0, 2),
+            RelayValidationPacket {
+                peer_id: "node-b",
+                peer_virtual_ip: "10.20.0.2",
+                local_ip: Ipv4Addr::new(10, 20, 0, 1),
+                peer_ip: Ipv4Addr::new(10, 20, 0, 2),
+                validation_id: 7,
+                sequence: 1,
+            },
             &transport,
             &relay_a,
-            7,
-            1,
         )
         .await
         .unwrap();
