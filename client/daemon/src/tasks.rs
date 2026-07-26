@@ -397,4 +397,16 @@ mod tests {
         assert!(!snap.control_connected);
         assert!(snap.last_control_success_secs_ago.unwrap() > CONTROL_HEALTH_STALE_AFTER.as_secs());
     }
+
+    #[tokio::test]
+    async fn explicit_control_disconnect_overrides_recent_success() {
+        let health = HealthState::new();
+        health.mark_control_success().await;
+        health.set_control_connected(false);
+
+        let snap = health.snapshot(&[]).await;
+
+        assert!(!snap.control_connected);
+        assert_eq!(snap.last_control_success_secs_ago, Some(0));
+    }
 }
