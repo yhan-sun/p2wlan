@@ -1471,11 +1471,13 @@ async fn run_control_loop(
         .await
         {
             warn!("Initial peer polling failed: {err}");
+            let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
         if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
             warn!("Initial signal polling failed: {err}");
+            let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
@@ -1550,6 +1552,7 @@ async fn run_control_loop(
                             poll_failures = poll_failures.saturating_add(1);
                             let delay = backoff_delay(poll_failures.saturating_sub(1));
                             warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}: {err_str}");
+                            let _ = event_tx.send(ControlEvent::Disconnected);
                             // After several consecutive failures, force a full re-register
                             // so device session and peer map are refreshed after control restart.
                             if poll_failures >= 3 {
@@ -1591,6 +1594,7 @@ async fn run_control_loop(
                             }
                             signal_failures = signal_failures.saturating_add(1);
                             warn!("Signal fetch after WebSocket wake failed: {err_str}");
+                            let _ = event_tx.send(ControlEvent::Disconnected);
                         }
                     }
                 }
@@ -1635,6 +1639,7 @@ async fn run_control_loop(
                             warn!(
                                 "Signal polling failed (attempt {signal_failures}); continuing: {err_str}"
                             );
+                            let _ = event_tx.send(ControlEvent::Disconnected);
                             if signal_failures >= 3 {
                                 warn!("Signal polling failed {signal_failures} times; re-registering with control plane");
                                 break;
