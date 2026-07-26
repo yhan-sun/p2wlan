@@ -111,15 +111,26 @@ impl HealthState {
     }
 
     pub async fn snapshot(&self, tasks: &[TaskStatus]) -> HealthSnapshot {
-        let status = *self.status.lock().await;
-        let reason = self.reason.lock().await.clone();
+        let mut status = *self.status.lock().await;
+        let mut reason = self.reason.lock().await.clone();
         let last = self
             .last_control_success
             .lock()
             .await
             .map(|t| t.elapsed().as_secs());
-        let control_connected = self.control_connected.load(Ordering::SeqCst)
-            && last.is_some_and(|age| age <= CONTROL_HEALTH_STALE_AFTER.as_secs());
+        let raw_control_connected = self.control_connected.load(Ordering::SeqCst);
+        let control_stale = raw_control_connected
+            && last.is_some_and(|age| age > CONTROL_HEALTH_STALE_AFTER.as_secs());
+        let control_connected = raw_control_connected && !control_stale;
+        if control_stale && status == HealthStatus::Healthy {
+            status = HealthStatus::Degraded;
+            if reason.is_none() {
+                let age = last.unwrap_or_default();
+                reason = Some(format!(
+                    "control plane last successful sync was {age}s ago; peer and candidate state may be stale"
+                ));
+            }
+        }
         HealthSnapshot {
             status,
             reason,
@@ -395,6 +406,8 @@ mod tests {
         let snap = health.snapshot(&[]).await;
 
         assert!(!snap.control_connected);
+        assert_eq!(snap.status, HealthStatus::Degraded);
+        assert!(snap.reason.as_deref().unwrap().contains("control plane"));
         assert!(snap.last_control_success_secs_ago.unwrap() > CONTROL_HEALTH_STALE_AFTER.as_secs());
     }
 

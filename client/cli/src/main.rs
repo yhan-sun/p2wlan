@@ -476,6 +476,7 @@ async fn status(config_path: &Path, json: bool) -> Result<(), String> {
                 .map(Vec::len)
                 .unwrap_or(0);
             println!("状态：运行中");
+            println!("版本：{}", value_text(&snapshot, "version", "未知"));
             println!("虚拟 IP：{}", value_text(&snapshot, "virtual_ip", "未知"));
             println!("网络：{}", value_text(&snapshot, "network_id", "未知"));
             println!("节点：{}", value_text(&snapshot, "node_id", "未知"));

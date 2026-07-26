@@ -259,6 +259,7 @@ export interface UdpSocketPoolMemberDiagnostics {
 
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
+  version?: string;
   process_id?: number;
   node_id: string;
   virtual_ip: string;
