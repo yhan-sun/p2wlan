@@ -2265,56 +2265,36 @@ mod tests {
         ))
     }
 
-    fn refresh_global_probe_budget_timestamps(path: &PathBuf) {
-        let contents = std::fs::read_to_string(path).unwrap();
-        let now_ms = unix_time_millis();
-        let entries = contents
-            .lines()
-            .filter_map(|line| {
-                let (_, key) = line.split_once('\t')?;
-                Some((now_ms, key.to_string()))
-            })
-            .collect::<Vec<_>>();
-        let mut file = OpenOptions::new().write(true).open(path).unwrap();
-        lock_budget_file(&file).unwrap();
-        write_global_probe_budget_entries(&mut file, &entries).unwrap();
-        unlock_budget_file(&file).unwrap();
-    }
-
     #[tokio::test]
     async fn global_outbound_probe_budget_limits_across_transports() {
         let path = unique_global_probe_budget_path("global-probe-budget");
-        let transport_a = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
-            .await
-            .unwrap()
-            .with_global_probe_budget_path(path.clone());
         let transport_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
             .await
             .unwrap()
             .with_global_probe_budget_path(path.clone());
+        let peer_id = "peer-global";
+        let endpoint: SocketAddr = "203.0.113.1:49999".parse().unwrap();
+        let peer_key = global_probe_peer_key(peer_id);
+        let remote_ip_key = global_probe_remote_ip_key(peer_id, endpoint.ip());
+        let now_ms = unix_time_millis();
+        let mut entries = Vec::new();
 
-        for index in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
-            let endpoint: SocketAddr = format!("127.222.0.1:{}", 40_000 + index).parse().unwrap();
-            let transport = if index % 2 == 0 {
-                &transport_a
-            } else {
-                &transport_b
-            };
-            assert_eq!(
-                transport
-                    .admit_outbound_connectivity_probe("peer-global", endpoint)
-                    .await,
-                OutboundProbeAdmission::Accepted
-            );
+        for _ in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
+            entries.push((now_ms, "network".to_string()));
+            entries.push((now_ms, peer_key.clone()));
+            entries.push((now_ms, remote_ip_key.clone()));
         }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        write_global_probe_budget_entries(&mut file, &entries).unwrap();
 
-        refresh_global_probe_budget_timestamps(&path);
         assert_eq!(
             transport_b
-                .admit_outbound_connectivity_probe(
-                    "peer-global",
-                    "127.222.0.1:49999".parse().unwrap(),
-                )
+                .admit_outbound_connectivity_probe(peer_id, endpoint)
                 .await,
             OutboundProbeAdmission::GlobalRemoteIpRateLimited
         );
