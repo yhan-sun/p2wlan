@@ -1063,7 +1063,7 @@ impl PeerConnection {
             .filter(|pair| {
                 pair.local_generation == local_generation
                     && endpoints.contains(&pair.remote_endpoint)
-                    && candidate_pair_probe_due(pair)
+                    && (mode == ProbeTargetMode::Synchronized || candidate_pair_probe_due(pair))
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
@@ -6323,10 +6323,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostics_reports_candidate_pair_probe_cooldown_remaining() {
+    async fn synchronized_probe_targets_bypass_failure_cooldown() {
         let config = test_config();
         let manager = PeerManager::new(config);
         let failed_endpoint: SocketAddr = "127.0.0.1:51846".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", failed_endpoint)).await;
+        manager
+            .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "no ACK")
+            .await;
+        manager
+            .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "still no ACK")
+            .await;
+
+        let background_targets = manager
+            .direct_probe_targets_due(Duration::from_secs(5))
+            .await;
+        assert!(background_targets.is_empty());
+
+        let synchronized_targets = manager.direct_probe_targets_for("peer1").await;
+        assert_eq!(synchronized_targets, vec![failed_endpoint]);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_candidate_pair_probe_cooldown_remaining() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let failed_endpoint: SocketAddr = "127.0.0.1:51847".parse().unwrap();
 
         manager.add_peer(&test_peer("peer1", failed_endpoint)).await;
         {
