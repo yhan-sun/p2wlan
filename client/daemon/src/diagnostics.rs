@@ -25,6 +25,7 @@ use crate::udp::{UdpSocketPoolMemberDiagnostics, UdpTransport};
 /// Runtime diagnostics snapshot returned by the local endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
+    pub version: String,
     pub process_id: u32,
     pub node_id: String,
     pub virtual_ip: String,
@@ -243,6 +244,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let stats = PeerManagerStats::from_diagnostics(&peers);
 
     DiagnosticsSnapshot {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         process_id: std::process::id(),
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
@@ -375,6 +377,7 @@ mod tests {
         assert!(response.contains("Access-Control-Allow-Origin: http://127.0.0.1:1420\r\n"));
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
+        assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(snapshot.process_id, std::process::id());
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.network_generation, 0);
