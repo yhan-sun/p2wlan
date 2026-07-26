@@ -253,6 +253,10 @@ const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
 ];
 const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
+/// Confirm relay peer reachability proactively instead of waiting for user traffic.
+const RELAY_PEER_VALIDATION_INTERVAL: Duration = Duration::from_secs(5);
+const RELAY_PEER_VALIDATION_MAX_AGE: Duration = Duration::from_secs(15);
+const RELAY_PEER_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-relay-validation";
 /// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.
@@ -584,6 +588,18 @@ impl Daemon {
                     fallback_timeout,
                     punch_interval,
                     punch_attempts.clamp(1, 3),
+                ),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "relay-peer-validation",
+                false,
+                run_relay_peer_validation_loop(
+                    self.peers.clone(),
+                    self.transport.clone(),
+                    self.relay_transport.clone(),
+                    virtual_ip.clone(),
                 ),
             )
             .await;
@@ -1566,6 +1582,9 @@ impl Daemon {
                     info!("Control plane recovered after disconnection");
                     self.health.mark_control_success().await;
                 }
+                ControlEvent::ControlHealthy => {
+                    self.health.mark_control_success().await;
+                }
                     }
                 }
             }
@@ -2224,11 +2243,22 @@ fn preserve_peer_reflexive_candidates(
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
 ) {
+    let current_candidate_ips = candidates
+        .iter()
+        .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+        .map(|candidate| candidate.ip())
+        .collect::<Vec<_>>();
     for endpoint in previous_candidates.iter().rev() {
         if previous_candidate_sources.get(endpoint).map(String::as_str) != Some("peer_reflexive") {
             continue;
         }
-        if endpoint.parse::<SocketAddr>().is_err() || candidates.contains(endpoint) {
+        let Ok(addr) = endpoint.parse::<SocketAddr>() else {
+            continue;
+        };
+        if !is_public_udp_candidate(addr)
+            || !current_candidate_ips.contains(&addr.ip())
+            || candidates.contains(endpoint)
+        {
             continue;
         }
         candidates.insert(0, endpoint.clone());
@@ -3415,6 +3445,89 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+async fn run_relay_peer_validation_loop(
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    local_virtual_ip: String,
+) {
+    let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
+        debug!("Skipping relay peer validation; local virtual IP '{local_virtual_ip}' is not IPv4");
+        return;
+    };
+    let mut ticker = interval(RELAY_PEER_VALIDATION_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let Some(relay) = relay_transport.read().await.clone() else {
+            continue;
+        };
+
+        let targets = peers
+            .relay_validation_targets(RELAY_PEER_VALIDATION_MAX_AGE)
+            .await;
+        if targets.is_empty() {
+            continue;
+        }
+
+        let validation_id = unix_time_millis() as u16;
+        for (sequence, (peer_id, peer_virtual_ip)) in targets.into_iter().enumerate() {
+            let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
+                debug!(
+                    "Skipping relay peer validation for {peer_id}; peer virtual IP '{peer_virtual_ip}' is not IPv4"
+                );
+                continue;
+            };
+            if let Err(err) = send_relay_validation_packet(
+                &peer_id,
+                &peer_virtual_ip,
+                local_ip,
+                peer_ip,
+                &transport,
+                &relay,
+                validation_id,
+                sequence as u16,
+            )
+            .await
+            {
+                debug!("Relay peer validation skipped for {peer_id}: {err}");
+            }
+        }
+    }
+}
+
+async fn send_relay_validation_packet(
+    peer_id: &str,
+    peer_virtual_ip: &str,
+    local_ip: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    transport: &WireGuardTransport,
+    relay: &RelayTransport,
+    validation_id: u16,
+    sequence: u16,
+) -> Result<()> {
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        local_ip,
+        peer_ip,
+        validation_id,
+        sequence,
+        RELAY_PEER_VALIDATION_PAYLOAD,
+    );
+    let encrypted = transport
+        .encrypt_outbound(OutboundPacket {
+            peer_id: peer_id.to_string(),
+            dst_ip: peer_virtual_ip.to_string(),
+            packet,
+        })
+        .await?
+        .ok_or_else(|| {
+            DaemonError::Peer(format!("WireGuard session for peer {peer_id} is not ready"))
+        })?;
+
+    relay.send_packet(&encrypted).await
+}
+
 async fn run_network_outbound(
     mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>,
     peers: Arc<PeerManager>,
@@ -4358,6 +4471,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_validation_sends_encrypted_probe_through_relay() {
+        let local_identity = NodeIdentity::generate();
+        let remote_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(local_identity, remote_identity.public_key(), None);
+        let initiation = initiator.create_initiation().unwrap();
+        let mut responder = HandshakeResponder::new(remote_identity, None);
+        let (response, remote_keys) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        let local_keys = initiator.consume_response(&response).unwrap();
+
+        let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+        let relay_endpoint = server.addr.to_string();
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: hex::encode(responder.initiator_public_key().unwrap()),
+                endpoint: String::new(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers)
+            .await
+            .unwrap();
+        let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+            .await
+            .unwrap();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport
+            .add_session("node-b", TransportSession::new(local_keys))
+            .await;
+
+        send_relay_validation_packet(
+            "node-b",
+            "10.20.0.2",
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            &transport,
+            &relay_a,
+            7,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RelayMessage::Data { from_node, data } = received else {
+            panic!("Expected relay Data message");
+        };
+        assert_eq!(from_node, "node-a");
+
+        let mut remote_session = TransportSession::new(remote_keys);
+        let decrypted = remote_session.decrypt_from_bytes(&data).unwrap();
+        let packet = Ipv4Packet::new(&decrypted).unwrap();
+        assert_eq!(packet.src_addr(), Ipv4Addr::new(10, 20, 0, 1));
+        assert_eq!(packet.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
+        assert!(packet.payload().ends_with(RELAY_PEER_VALIDATION_PAYLOAD));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn encrypted_direct_validation_skips_when_direct_is_already_confirmed() {
         let remote_identity = NodeIdentity::generate();
         let peers = Arc::new(PeerManager::new(
@@ -4763,6 +4950,67 @@ mod tests {
         assert_eq!(
             next_sources.get("93.184.216.34:45000").map(String::as_str),
             Some("peer_reflexive")
+        );
+    }
+
+    #[test]
+    fn preserve_peer_reflexive_candidates_drops_private_endpoint_after_refresh() {
+        let previous = vec![
+            "192.168.2.14:59366".to_string(),
+            "93.184.216.34:45000".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            (
+                "192.168.2.14:59366".to_string(),
+                "peer_reflexive".to_string(),
+            ),
+            (
+                "93.184.216.34:45000".to_string(),
+                "peer_reflexive".to_string(),
+            ),
+        ]);
+        let mut next = vec!["10.46.107.87:59366".to_string()];
+        let mut next_sources =
+            HashMap::from([("10.46.107.87:59366".to_string(), "host".to_string())]);
+
+        preserve_peer_reflexive_candidates(
+            &previous,
+            &previous_sources,
+            &mut next,
+            &mut next_sources,
+        );
+
+        assert!(!next.contains(&"192.168.2.14:59366".to_string()));
+        assert_eq!(
+            next_sources.get("192.168.2.14:59366").map(String::as_str),
+            None
+        );
+    }
+
+    #[test]
+    fn preserve_peer_reflexive_candidates_drops_old_public_ip_after_refresh() {
+        let previous = vec!["93.184.216.34:45000".to_string()];
+        let previous_sources = HashMap::from([(
+            "93.184.216.34:45000".to_string(),
+            "peer_reflexive".to_string(),
+        )]);
+        let mut next = vec!["198.51.100.9:31999".to_string()];
+        let mut next_sources = HashMap::from([(
+            "198.51.100.9:31999".to_string(),
+            "stun_observed".to_string(),
+        )]);
+
+        preserve_peer_reflexive_candidates(
+            &previous,
+            &previous_sources,
+            &mut next,
+            &mut next_sources,
+        );
+
+        assert_eq!(next, vec!["198.51.100.9:31999"]);
+        assert_eq!(
+            next_sources.get("93.184.216.34:45000").map(String::as_str),
+            None
         );
     }
 

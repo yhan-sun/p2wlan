@@ -34,6 +34,7 @@ import {
 const SETTINGS_KEY = "p2wlan.client.settings";
 const LOG_KEY = "p2wlan.client.logs";
 const MAX_LOG_LINES = 400;
+const CONTROL_STALE_AFTER_SECS = 30;
 
 export type AuthMode = "login" | "register";
 
@@ -657,6 +658,16 @@ function mapSnapshotToDaemonStatus(
   snapshot: DiagnosticsSnapshot,
   settings: ClientSettings
 ): DaemonStatus {
+  const lastControlSuccessSecsAgo = snapshot.health.last_control_success_secs_ago;
+  const controlStale =
+    lastControlSuccessSecsAgo != null && lastControlSuccessSecsAgo > CONTROL_STALE_AFTER_SECS;
+  const controlConnected = snapshot.health.control_connected && !controlStale;
+  const healthReason = controlStale
+    ? `控制面最近成功同步已 ${lastControlSuccessSecsAgo} 秒，peer/候选状态可能已过期`
+    : snapshot.health.reason;
+  const healthStatus =
+    snapshot.health.status === "healthy" && controlStale ? "degraded" : snapshot.health.status;
+
   return {
     lifecycle: "running",
     reachable: true,
@@ -670,11 +681,11 @@ function mapSnapshotToDaemonStatus(
     mtu: settings.mtu,
     udpLocalAddr: snapshot.udp_local_addr,
     diagnosticsUrl: settings.diagnosticsUrl,
-    controlConnected: snapshot.health.control_connected,
+    controlConnected,
     controlServer: settings.controlServer,
     reauthRequired: snapshot.health.reauth_required,
-    healthStatus: snapshot.health.status,
-    healthReason: snapshot.health.reason,
+    healthStatus,
+    healthReason,
     relayConnected: snapshot.relay_connected,
     relayEndpoint: snapshot.relay_selection.selected_endpoint,
     relayRegion: snapshot.relay_selection.selected_region,
@@ -682,7 +693,7 @@ function mapSnapshotToDaemonStatus(
     natType: inferNatType(snapshot.peers),
     activePathSummary: activePathSummary(snapshot),
     lastError: lastErrorFromSnapshot(snapshot),
-    lastControlSuccessSecsAgo: snapshot.health.last_control_success_secs_ago,
+    lastControlSuccessSecsAgo,
     peerStats: snapshot.stats,
     criticalTasks: snapshot.health.critical_tasks,
     updatedAt: Date.now(),
@@ -726,6 +737,17 @@ function directPairLatencyMs(peer: PeerDiagnostics): number | null {
   return pair?.rtt_ewma_ms ?? pair?.rtt_ms ?? peer.direct.latency_ms;
 }
 
+function minNullable(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number => value != null);
+  return present.length ? Math.min(...present) : null;
+}
+
+function pathSuccessAgeMs(peer: PeerDiagnostics, path: PeerPath): number | null {
+  if (path === "relay") return peer.relay.last_success_age_ms;
+  if (path === "direct") return peer.direct.last_success_age_ms;
+  return minNullable([peer.direct.last_success_age_ms, peer.relay.last_success_age_ms]);
+}
+
 function connectionPresentation(
   peer: PeerDiagnostics,
   path: PeerPath
@@ -736,18 +758,28 @@ function connectionPresentation(
   const relayHedged = peer.current_path_selection?.relay_hedged === true;
 
   if (path === "offline") {
+    const waitingForRelay =
+      peer.state === "fallback_to_relay" || peer.current_path_selection?.path === "relay";
     return {
       type: "offline",
-      label: "离线",
-      detail: peer.warning ?? peer.direct.last_error ?? peer.relay.last_error ?? "当前没有可用路径",
+      label: waitingForRelay ? "不可达" : "离线",
+      detail:
+        peer.warning ??
+        peer.relay.last_error ??
+        (waitingForRelay
+          ? `直连不可用，relay 尚未完成 peer 确认${peer.direct.last_error ? `：${peer.direct.last_error}` : ""}`
+          : peer.direct.last_error ?? "当前没有可用路径"),
     };
   }
 
   if (path === "relay") {
+    const directFailure = peer.direct.last_error ? `；直连不可用：${peer.direct.last_error}` : "";
     return {
       type: "relay",
-      label: "中继",
-      detail: reason ?? (peer.relay_server ? `通过 ${peer.relay_server}` : "当前流量经中继转发"),
+      label: peer.direct.last_error ? "中继兜底" : "中继",
+      detail:
+        (reason ?? (peer.relay_server ? `通过 ${peer.relay_server}` : "当前流量经中继转发")) +
+        directFailure,
     };
   }
 
@@ -834,10 +866,7 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
         (left.last_failure_age_ms ?? Number.POSITIVE_INFINITY) -
         (right.last_failure_age_ms ?? Number.POSITIVE_INFINITY)
     );
-  const lastActiveMs =
-    peer.direct.last_success_age_ms ??
-    peer.relay.last_success_age_ms ??
-    peer.connected_for_ms;
+  const lastActiveMs = pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms;
   const latencyMs =
     path === "direct"
       ? directPairLatencyMs(peer)
