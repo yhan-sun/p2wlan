@@ -52,6 +52,7 @@ const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 48;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(10);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 4;
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
+const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const DIRECT_TRAVERSAL_EVENT_LIMIT: usize = 32;
 const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
@@ -3701,6 +3702,28 @@ impl PeerManager {
         self.connections.read().await.values().cloned().collect()
     }
 
+    /// Return peers that need an active relay data-plane confirmation.
+    pub async fn relay_validation_targets(
+        &self,
+        max_success_age: Duration,
+    ) -> Vec<(String, String)> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| {
+                conn.state != ConnectionState::Direct
+                    || conn
+                        .direct_health
+                        .rtt_ewma_ms
+                        .or(conn.direct_health.latency_ms)
+                        .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS)
+            })
+            .filter(|conn| !conn.relay_health.is_confirmed_recent(max_success_age))
+            .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone()))
+            .collect()
+    }
+
     /// Get serializable diagnostics for every peer.
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
@@ -7269,6 +7292,37 @@ mod tests {
                 .and_then(|selection| selection.path),
             Some(NetworkPath::Relay)
         );
+    }
+
+    #[tokio::test]
+    async fn relay_validation_targets_include_slow_direct_but_skip_fast_direct() {
+        let manager = PeerManager::new(test_config());
+        let fast_endpoint: SocketAddr = "127.0.0.1:51845".parse().unwrap();
+        let slow_endpoint: SocketAddr = "127.0.0.1:51846".parse().unwrap();
+
+        manager.add_peer(&test_peer("fast", fast_endpoint)).await;
+        manager.add_peer(&test_peer("slow", slow_endpoint)).await;
+        {
+            let mut conns = manager.connections.write().await;
+            let fast = conns.get_mut("fast").unwrap();
+            fast.transition(ConnectionState::Direct);
+            fast.direct_health
+                .record_success_with_latency(Duration::from_millis(20));
+
+            let slow = conns.get_mut("slow").unwrap();
+            slow.transition(ConnectionState::Direct);
+            slow.direct_health
+                .record_success_with_latency(Duration::from_millis(
+                    SLOW_DIRECT_RELAY_VALIDATION_RTT_MS,
+                ));
+        }
+
+        let targets = manager
+            .relay_validation_targets(Duration::from_secs(15))
+            .await;
+
+        assert!(!targets.iter().any(|(node_id, _)| node_id == "fast"));
+        assert!(targets.iter().any(|(node_id, _)| node_id == "slow"));
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+const CONTROL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(30);
+
 /// Health status reported by diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,11 +118,13 @@ impl HealthState {
             .lock()
             .await
             .map(|t| t.elapsed().as_secs());
+        let control_connected = self.control_connected.load(Ordering::SeqCst)
+            && last.is_some_and(|age| age <= CONTROL_HEALTH_STALE_AFTER.as_secs());
         HealthSnapshot {
             status,
             reason,
             critical_tasks: tasks.to_vec(),
-            control_connected: self.control_connected.load(Ordering::SeqCst),
+            control_connected,
             last_control_success_secs_ago: last,
             reauth_required: self.reauth_required.load(Ordering::SeqCst),
         }
@@ -377,5 +381,20 @@ mod tests {
             .await;
         manager.shutdown_all(Duration::from_millis(200)).await;
         assert!(manager.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn stale_control_success_reports_disconnected() {
+        let health = HealthState::new();
+        health.mark_control_success().await;
+        {
+            let mut last = health.last_control_success.lock().await;
+            *last = Some(Instant::now() - CONTROL_HEALTH_STALE_AFTER - Duration::from_secs(1));
+        }
+
+        let snap = health.snapshot(&[]).await;
+
+        assert!(!snap.control_connected);
+        assert!(snap.last_control_success_secs_ago.unwrap() > CONTROL_HEALTH_STALE_AFTER.as_secs());
     }
 }

@@ -291,6 +291,8 @@ pub enum ControlEvent {
         virtual_ip: String,
         cidr: Option<String>,
     },
+    /// A lightweight control-plane request succeeded.
+    ControlHealthy,
 }
 
 /// Control plane client state.
@@ -1469,9 +1471,13 @@ async fn run_control_loop(
         .await
         {
             warn!("Initial peer polling failed: {err}");
+        } else {
+            let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
         if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
             warn!("Initial signal polling failed: {err}");
+        } else {
+            let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
 
         let signal_ws_connected = Arc::new(AtomicBool::new(false));
@@ -1563,6 +1569,7 @@ async fn run_control_loop(
                                 });
                             }
                             poll_failures = 0;
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                     }
                 }
@@ -1571,6 +1578,7 @@ async fn run_control_loop(
                         Ok(()) => {
                             signal_failures = 0;
                             last_signal_reconcile = Instant::now();
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -1598,6 +1606,7 @@ async fn run_control_loop(
                             if ws_connected {
                                 last_signal_reconcile = Instant::now();
                             }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -1658,6 +1667,7 @@ async fn run_control_loop(
                                     advertised_endpoint = endpoint;
                                     advertised_nat_type = nat_type;
                                     debug!("Updated endpoint for {self_node_id}: {advertised_endpoint} ({advertised_nat_type})");
+                                    let _ = event_tx.send(ControlEvent::ControlHealthy);
                                 }
                                 Err(err) => {
                                     let err_str = err.to_string();
