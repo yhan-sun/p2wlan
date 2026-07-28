@@ -919,9 +919,12 @@ fn infer_filtering_behavior(
         return FilteringBehavior::UdpBlocked;
     }
     match mapping_behavior {
-        MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent => {
-            FilteringBehavior::LikelyEndpointIndependent
-        }
+        MappingBehavior::OpenInternet => FilteringBehavior::EndpointIndependent,
+        // A stable public mapping does not prove that the gateway accepts
+        // unsolicited UDP from a peer.  Many home routers are EIM + APDF:
+        // stable port, strict filtering.  Only the active CHANGE-REQUEST
+        // probe may upgrade this to endpoint/address-dependent filtering.
+        MappingBehavior::EndpointIndependent => FilteringBehavior::Unknown,
         MappingBehavior::AddressOrPortDependent => FilteringBehavior::AddressOrPortDependent,
         MappingBehavior::Unknown | MappingBehavior::UdpBlocked => FilteringBehavior::Unknown,
     }
@@ -1248,10 +1251,7 @@ mod tests {
         assert_eq!(profile.port_preserved, Some(false));
         assert_eq!(profile.likely_symmetric, Some(false));
         assert_eq!(profile.port_delta, Some(0));
-        assert_eq!(
-            profile.filtering_behavior,
-            FilteringBehavior::LikelyEndpointIndependent
-        );
+        assert_eq!(profile.filtering_behavior, FilteringBehavior::Unknown);
         assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
         assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
         assert!(!profile.prediction_candidate);
@@ -1499,7 +1499,7 @@ mod tests {
         );
         assert_eq!(
             report.nat_profile.filtering_behavior,
-            FilteringBehavior::LikelyEndpointIndependent
+            FilteringBehavior::EndpointIndependent
         );
         assert_eq!(
             report.nat_profile.hairpin_behavior,
