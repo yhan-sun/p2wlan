@@ -24,20 +24,55 @@ node_modules/
 dist/
 build/
 .vite/
+.cache/
+.turbo/
 desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/target/
 
-# Local exports and release packages
+# Coverage/test output
+coverage/
+*.lcov
+*.profraw
+
+# Local document exports
 *.doc
 *.docx
+*.rtf
+*.odt
+*.pages
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.odp
+*.ods
+~$*
+.~lock.*#
+
+# Release packages and archives
 *.pdf
 *.dmg
-*.zip
-*.tar.gz
-*.tgz
 *.pkg
 *.msi
+*.msix
+*.exe
+*.AppImage
+*.deb
+*.rpm
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.sha256
+*.sig
+artifacts/
+release/
+releases/
 
 # Logs/env
 *.log
@@ -51,3 +86,5 @@ desktop/src-tauri/target/
 *.sqlite3
 p2pnet-config.json
 .temp/
+*.tmp
+*.bak
