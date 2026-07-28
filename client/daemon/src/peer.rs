@@ -49,6 +49,10 @@ const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 2;
 const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 24;
 const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 48;
+const BIRTHDAY_PROBE_DELTAS: [i32; 30] = [
+    1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12, 16, -16, 20, -20, 24, -24,
+    32, -32, 48, -48, 64, -64,
+];
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(10);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 4;
 const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
@@ -1116,14 +1120,6 @@ impl PeerConnection {
         local_nat_profile: Option<&NatProfile>,
         endpoints: &mut Vec<SocketAddr>,
     ) {
-        if !local_nat_profile.is_some_and(|profile| profile.birthday_candidate) {
-            return;
-        }
-        let budget = birthday_probe_budget(history);
-        if budget == 0 {
-            return;
-        }
-
         let bases = endpoints
             .iter()
             .copied()
@@ -1139,22 +1135,32 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
 
+        let local_needs_birthday =
+            local_nat_profile.is_some_and(|profile| profile.birthday_candidate);
+        let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases);
+        if !local_needs_birthday && !peer_looks_port_dependent {
+            return;
+        }
+
+        let budget = birthday_probe_budget(history);
+        if budget == 0 {
+            return;
+        }
+
         let mut generated = 0usize;
-        for base in bases {
-            for endpoint in birthday_probe_endpoints(base) {
-                if generated >= budget {
-                    return;
-                }
-                if endpoints.contains(&endpoint) {
-                    continue;
-                }
-                endpoints.push(endpoint);
-                self.ensure_candidate_pair_with_source(
-                    endpoint,
-                    local_generation,
-                    CandidatePairSource::Birthday,
-                );
-                generated += 1;
+        for endpoint in birthday_probe_endpoints_for_bases(&bases, budget) {
+            if endpoints.contains(&endpoint) {
+                continue;
+            }
+            endpoints.push(endpoint);
+            self.ensure_candidate_pair_with_source(
+                endpoint,
+                local_generation,
+                CandidatePairSource::Birthday,
+            );
+            generated += 1;
+            if generated >= budget {
+                return;
             }
         }
     }
@@ -4558,19 +4564,52 @@ fn discovered_endpoint_probe_rank(source: CandidatePairSource) -> u8 {
 }
 
 fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
-    const DELTAS: [i32; 30] = [
-        1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12, 16, -16, 20, -20, 24,
-        -24, 32, -32, 48, -48, 64, -64,
-    ];
-
-    DELTAS
+    BIRTHDAY_PROBE_DELTAS
         .into_iter()
-        .filter_map(|delta| {
-            let port = base.port() as i32 + delta;
-            let port = u16::try_from(port).ok()?;
-            (port > 0).then_some(SocketAddr::new(base.ip(), port))
-        })
+        .filter_map(|delta| birthday_probe_endpoint(base, delta))
         .collect()
+}
+
+fn birthday_probe_endpoints_for_bases(bases: &[SocketAddr], budget: usize) -> Vec<SocketAddr> {
+    if let [base] = bases {
+        return birthday_probe_endpoints(*base)
+            .into_iter()
+            .take(budget)
+            .collect();
+    }
+
+    let mut endpoints = Vec::new();
+    for delta in BIRTHDAY_PROBE_DELTAS {
+        for base in bases {
+            if endpoints.len() >= budget {
+                return endpoints;
+            }
+            let Some(endpoint) = birthday_probe_endpoint(*base, delta) else {
+                continue;
+            };
+            if !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+    endpoints
+}
+
+fn birthday_probe_endpoint(base: SocketAddr, delta: i32) -> Option<SocketAddr> {
+    let port = base.port() as i32 + delta;
+    let port = u16::try_from(port).ok()?;
+    (port > 0).then_some(SocketAddr::new(base.ip(), port))
+}
+
+fn peer_candidates_need_port_scatter(bases: &[SocketAddr]) -> bool {
+    let mut ports_by_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    for endpoint in bases {
+        ports_by_ip
+            .entry(endpoint.ip())
+            .or_default()
+            .insert(endpoint.port());
+    }
+    ports_by_ip.values().any(|ports| ports.len() >= 2)
 }
 
 fn is_public_probe_endpoint(endpoint: SocketAddr) -> bool {
@@ -6298,6 +6337,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn birthday_probe_endpoints_for_bases_interleaves_public_ports() {
+        let bases = vec![
+            "203.0.113.10:40000".parse::<SocketAddr>().unwrap(),
+            "203.0.113.10:40100".parse::<SocketAddr>().unwrap(),
+            "203.0.113.10:40200".parse::<SocketAddr>().unwrap(),
+        ];
+
+        let endpoints = birthday_probe_endpoints_for_bases(&bases, 6);
+        let ports = endpoints
+            .iter()
+            .map(SocketAddr::port)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(endpoints.len(), 6);
+        for port in [40001, 39999, 40101, 40099, 40201, 40199] {
+            assert!(
+                ports.contains(&port),
+                "missing interleaved birthday port {port}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn birthday_candidates_use_wider_default_probe_budget() {
         let config = test_config();
@@ -6320,6 +6382,53 @@ mod tests {
 
         assert!(targets.contains(&endpoint));
         assert_eq!(birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+    }
+
+    #[tokio::test]
+    async fn remote_port_churn_triggers_birthday_probe_targets() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let candidates = vec![
+            "203.0.113.10:41001".to_string(),
+            "203.0.113.10:41037".to_string(),
+            "203.0.113.10:41113".to_string(),
+        ];
+        let sources = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
+            .collect::<HashMap<_, _>>();
+
+        manager
+            .add_peer(&test_peer("peer1", registry_endpoint))
+            .await;
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+
+        let background_targets = manager.direct_probe_targets().await;
+        assert_eq!(background_targets.len(), 1);
+        let targets = &background_targets[0].1;
+        let birthday_targets = targets
+            .iter()
+            .filter(|target| {
+                target.ip().to_string() == "203.0.113.10"
+                    && !candidates.contains(&target.to_string())
+                    && **target != registry_endpoint
+            })
+            .collect::<Vec<_>>();
+
+        assert!(targets.contains(&registry_endpoint));
+        assert_eq!(birthday_targets.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41001) <= 2));
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41037) <= 2));
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41113) <= 2));
     }
 
     #[tokio::test]
