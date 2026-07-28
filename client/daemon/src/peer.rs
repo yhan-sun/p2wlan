@@ -32,6 +32,7 @@ use crate::traversal_history::{
 
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const PEER_REFLEXIVE_STICKY_WINDOW: Duration = Duration::from_secs(10);
+const RECENT_DIRECT_TRIAL_FAILURE_TOLERANCE: u32 = 1;
 /// Keep relay-backed direct probing alive.
 ///
 /// Relay already provides the data-plane safety net, so direct UDP retries should stay cheap but
@@ -607,6 +608,7 @@ impl CandidatePair {
             self.state,
             CandidatePairState::Probing
                 | CandidatePairState::Succeeded
+                | CandidatePairState::Degraded
                 | CandidatePairState::Selected
         ) || self.nominated
         {
@@ -1173,13 +1175,13 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
-                    && matches!(
+                    && (matches!(
                         pair.state,
                         CandidatePairState::Selected
                             | CandidatePairState::Succeeded
                             | CandidatePairState::Probing
                             | CandidatePairState::Waiting
-                    )
+                    ) || is_recent_successful_direct_trial_pair(pair))
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
@@ -1471,6 +1473,8 @@ impl PeerConnection {
         let selected_pair_state = selected_pair.map(|pair| pair.state);
         let confirmed_direct = self.state == ConnectionState::Direct
             && selected_pair_state == Some(CandidatePairState::Selected);
+        let recent_success_trial =
+            selected_pair.is_some_and(is_recent_successful_direct_trial_pair);
         let trial_direct = selected_pair.is_some_and(|pair| {
             pair.state == CandidatePairState::Succeeded
                 || (pair.state == CandidatePairState::Probing && pair.nominated)
@@ -1479,7 +1483,8 @@ impl PeerConnection {
                 .direct_health
                 .success_age()
                 .map(|age| age <= DIRECT_TRIAL_WINDOW)
-                .unwrap_or(false);
+                .unwrap_or(false)
+            || recent_success_trial;
         let direct_score = self.direct_path_score(
             local_generation,
             Some(endpoint),
@@ -1571,10 +1576,14 @@ impl PeerConnection {
         }
 
         if trial_direct {
-            let trial_is_viable = match (&direct_score, &relay_score) {
-                (Some(direct_score), Some(_)) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
-                (Some(direct_score), None) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
-                (None, _) => true,
+            let trial_is_viable = if recent_success_trial {
+                true
+            } else {
+                match (&direct_score, &relay_score) {
+                    (Some(direct_score), Some(_)) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
+                    (Some(direct_score), None) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
+                    (None, _) => true,
+                }
             };
 
             if trial_is_viable {
@@ -4741,6 +4750,7 @@ fn is_public_udp_direct_source(source: CandidatePairSource) -> bool {
     matches!(
         source,
         CandidatePairSource::StunObserved
+            | CandidatePairSource::Signaled
             | CandidatePairSource::Upnp
             | CandidatePairSource::Pcp
             | CandidatePairSource::NatPmp
@@ -4836,6 +4846,10 @@ fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
         return 0;
     }
 
+    if is_recent_successful_direct_trial_pair(pair) {
+        return 2;
+    }
+
     match pair.state {
         CandidatePairState::Selected => 1,
         CandidatePairState::Succeeded | CandidatePairState::Probing
@@ -4853,6 +4867,21 @@ fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
         CandidatePairState::Degraded => 7,
         CandidatePairState::Frozen => 8,
     }
+}
+
+fn is_recent_successful_direct_trial_pair(pair: &CandidatePair) -> bool {
+    if matches!(
+        pair.source,
+        CandidatePairSource::Predicted | CandidatePairSource::Birthday
+    ) || !is_public_probe_endpoint(pair.remote_endpoint)
+        || pair.last_error_code.as_deref() == Some(REASON_DIRECT_TRIAL_EXPIRED)
+        || pair.consecutive_failures > RECENT_DIRECT_TRIAL_FAILURE_TOLERANCE
+    {
+        return false;
+    }
+
+    pair.success_age()
+        .is_some_and(|age| age <= DIRECT_TRIAL_WINDOW)
 }
 
 fn is_successful_low_latency_private_pair(pair: &CandidatePair) -> bool {
@@ -7312,6 +7341,68 @@ mod tests {
         assert!(!pair.nominated);
         assert!(!pair.selected);
         assert_ne!(pair.direct_type, DirectPathType::PublicUdp);
+    }
+
+    #[tokio::test]
+    async fn recent_public_probe_success_stays_trial_candidate_after_single_timeout() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let stable_endpoint: SocketAddr = "8.8.8.8:60207".parse().unwrap();
+        let birthday_endpoint: SocketAddr = "8.8.8.8:60183".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        manager.set_relay("peer1", "relay.test:443").await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &[stable_endpoint.to_string()],
+                &HashMap::from([(stable_endpoint.to_string(), "peer_reflexive".to_string())]),
+            )
+            .await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer1",
+                stable_endpoint,
+                Some(Duration::from_millis(45)),
+            )
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.ensure_candidate_pair_with_source(
+                birthday_endpoint,
+                0,
+                CandidatePairSource::Birthday,
+            )
+            .record_probing(None);
+            let stable_pair = conn
+                .candidate_pairs
+                .iter_mut()
+                .find(|pair| pair.remote_endpoint == stable_endpoint)
+                .unwrap();
+            stable_pair.record_failure(REASON_DIRECT_PROBE_FAILED, "one missed batch", None);
+            conn.direct_health
+                .record_failure(REASON_DIRECT_PROBE_FAILED, "one missed batch");
+        }
+
+        assert_eq!(
+            manager.direct_endpoint_for_send("peer1").await,
+            Some(stable_endpoint),
+            "a recently successful public endpoint should stay ahead of speculative birthday ports"
+        );
+
+        let selected = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selected.path, Some(NetworkPath::Direct));
+        assert_eq!(selected.reason_code, REASON_PATH_DIRECT_TRIAL);
+        assert_eq!(selected.direct_endpoint, Some(stable_endpoint));
+        assert!(selected.relay_hedged);
+        assert!(!selected.direct_confirmed);
+
+        let diagnostics = manager.diagnostics().await;
+        let current = diagnostics[0].current_direct_pair.as_ref().unwrap();
+        assert_eq!(current.remote_endpoint, stable_endpoint.to_string());
+        assert!(current.nominated);
     }
 
     #[tokio::test]
