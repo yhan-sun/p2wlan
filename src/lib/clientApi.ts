@@ -35,6 +35,7 @@ const SETTINGS_KEY = "p2wlan.client.settings";
 const LOG_KEY = "p2wlan.client.logs";
 const MAX_LOG_LINES = 400;
 const CONTROL_STALE_AFTER_SECS = 30;
+const RELAY_PRESENTATION_FRESH_MS = 30_000;
 
 export type AuthMode = "login" | "register";
 
@@ -748,6 +749,14 @@ function pathSuccessAgeMs(peer: PeerDiagnostics, path: PeerPath): number | null 
   return minNullable([peer.direct.last_success_age_ms, peer.relay.last_success_age_ms]);
 }
 
+function hasFreshRelayConfirmation(peer: PeerDiagnostics): boolean {
+  return (
+    peer.relay.last_success_age_ms != null &&
+    peer.relay.last_success_age_ms <= RELAY_PRESENTATION_FRESH_MS &&
+    peer.relay.consecutive_failures === 0
+  );
+}
+
 function connectionPresentation(
   peer: PeerDiagnostics,
   path: PeerPath
@@ -858,7 +867,10 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
     (selection?.relay_hedged === true ||
       peer.active_path === null ||
       peer.active_path === undefined);
-  const path: PeerPath = isDirectTrial ? "direct_trial" : peer.active_path ?? "offline";
+  const path: PeerPath = isDirectTrial
+    ? "direct_trial"
+    : peer.active_path ??
+      (selection?.path === "relay" && hasFreshRelayConfirmation(peer) ? "relay" : "offline");
   const pathErrors = [peer.direct, peer.relay]
     .filter(health => health.last_error)
     .sort(
