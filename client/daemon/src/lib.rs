@@ -793,11 +793,6 @@ impl Daemon {
                                     info!(
                                         "UDP transport listening on {addr}; advertising {endpoint}"
                                     );
-                                    if let Err(err) =
-                                        control.update_endpoint(&endpoint, "unknown").await
-                                    {
-                                        warn!("Failed to queue UDP endpoint update: {err}");
-                                    }
                                 } else {
                                     warn!(
                                         "UDP transport listening on {addr}; no reachable endpoint was discovered or configured."
@@ -823,6 +818,14 @@ impl Daemon {
                             &mut candidate_endpoints,
                             &mut candidate_sources,
                         );
+                        if let Some(endpoint) = control_udp_endpoint_from_candidates(
+                            &candidate_endpoints,
+                            &candidate_sources,
+                        ) {
+                            if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+                                warn!("Failed to queue UDP endpoint update '{endpoint}': {err}");
+                            }
+                        }
 
                         info!(
                             "Prepared {} UDP candidate endpoints for signaling",
@@ -2142,6 +2145,64 @@ fn advertised_udp_endpoint(
         .map(|candidate| candidate.to_string())
 }
 
+fn control_udp_endpoint_from_candidates(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> Option<String> {
+    candidates
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, endpoint)| {
+            let endpoint = endpoint.as_str();
+            (
+                control_udp_endpoint_rank(
+                    endpoint,
+                    candidate_sources.get(endpoint).map(String::as_str),
+                ),
+                *index,
+            )
+        })
+        .and_then(|(_, endpoint)| {
+            let endpoint = endpoint.as_str();
+            (control_udp_endpoint_rank(
+                endpoint,
+                candidate_sources.get(endpoint).map(String::as_str),
+            ) < u8::MAX)
+                .then(|| endpoint.to_string())
+        })
+}
+
+fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
+    match source {
+        Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") => 0,
+        Some("stun_observed")
+            if endpoint
+                .parse::<SocketAddr>()
+                .is_ok_and(is_public_udp_candidate) =>
+        {
+            1
+        }
+        Some("host")
+            if endpoint
+                .parse::<SocketAddr>()
+                .is_ok_and(is_public_udp_candidate) =>
+        {
+            2
+        }
+        Some("peer_reflexive" | "learned" | "predicted" | "birthday") => u8::MAX,
+        Some("relay") => u8::MAX,
+        Some(_) | None => {
+            if endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
+                !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
+            }) {
+                3
+            } else {
+                u8::MAX
+            }
+        }
+    }
+}
+
 fn candidate_endpoints_from_report(
     report: &CandidateGatherReport,
 ) -> (Vec<String>, HashMap<String, String>) {
@@ -3081,7 +3142,9 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                 "UDP candidate refresh changed only volatile reflexive ports; keeping network generation stable"
             );
         }
-        let endpoint = advertised_endpoint.unwrap_or_default();
+        let endpoint = control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
+            .or(advertised_endpoint)
+            .unwrap_or_default();
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
             warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
         }
@@ -4701,6 +4764,48 @@ mod tests {
         assert_eq!(
             advertised_udp_endpoint(local, None, &[]),
             Some("127.0.0.1:51820".to_string())
+        );
+    }
+
+    #[test]
+    fn control_endpoint_prefers_explicit_mapping_over_stun_candidate() {
+        let candidates = vec!["8.8.8.8:41000".to_string(), "1.1.1.1:60207".to_string()];
+        let sources = HashMap::from([
+            ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
+            ("1.1.1.1:60207".to_string(), "pcp".to_string()),
+        ]);
+
+        assert_eq!(
+            control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
+            Some("1.1.1.1:60207")
+        );
+    }
+
+    #[test]
+    fn control_endpoint_does_not_publish_peer_reflexive_as_global_endpoint() {
+        let candidates = vec!["1.1.1.1:42000".to_string(), "8.8.8.8:41000".to_string()];
+        let sources = HashMap::from([
+            ("1.1.1.1:42000".to_string(), "peer_reflexive".to_string()),
+            ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
+        ]);
+
+        assert_eq!(
+            control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
+            Some("8.8.8.8:41000")
+        );
+    }
+
+    #[test]
+    fn control_endpoint_does_not_publish_speculative_candidate() {
+        let candidates = vec!["1.1.1.1:42008".to_string(), "8.8.8.8:41000".to_string()];
+        let sources = HashMap::from([
+            ("1.1.1.1:42008".to_string(), "predicted".to_string()),
+            ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
+        ]);
+
+        assert_eq!(
+            control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
+            Some("8.8.8.8:41000")
         );
     }
 

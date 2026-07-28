@@ -1305,6 +1305,21 @@ fn nat_profile_suggestions(snapshot: &Value, udp_advertise_configured: bool) -> 
         );
     }
 
+    let filtering = profile
+        .get("filtering_behavior")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if mapping == "endpoint_independent"
+        && filtering != "endpoint_independent"
+        && !udp_advertise_configured
+        && gateway_mapping_candidate(snapshot).is_none()
+    {
+        suggestions.push(
+            "本机公网 UDP 映射稳定，但过滤是否开放尚未被证明；稳定 STUN 端口不等于可接收陌生入站包。若要让困难 NAT 对端主动打入，请优先启用 UPnP/PCP/NAT-PMP，或在路由器/云安全组做 UDP 端口转发并配置 udp-advertise。"
+                .to_string(),
+        );
+    }
+
     if !udp_advertise_configured
         && profile
             .get("public_endpoint")
@@ -1325,6 +1340,16 @@ fn nat_profile_suggestions(snapshot: &Value, udp_advertise_configured: bool) -> 
     }
 
     suggestions
+}
+
+fn gateway_mapping_candidate(snapshot: &Value) -> Option<(&str, &str)> {
+    let mapping = snapshot.get("gateway_mapping")?;
+    let endpoint = mapping.get("candidate_endpoint").and_then(Value::as_str)?;
+    let source = mapping
+        .get("candidate_source")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway");
+    Some((endpoint, source))
 }
 
 fn local_candidate_strings(snapshot: &Value) -> Vec<String> {
@@ -1611,6 +1636,7 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
     let mut generation_changed_peers = Vec::new();
     let mut handshake_timeout_peers = Vec::new();
     let mut direct_send_failed_peers = Vec::new();
+    let mut public_without_open_ingress_peers = Vec::new();
     let mut generic_direct_failures = 0_u64;
     for peer in peers {
         let direct_error_code = direct_error_code(peer);
@@ -1637,6 +1663,11 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
             .any(|endpoint| is_private_or_local_ip(endpoint.ip()));
         if has_direct_error && !has_public_endpoint && has_private_or_local_endpoint {
             private_only_peers.push(peer_display_name(peer));
+        } else if has_direct_error
+            && has_public_endpoint
+            && peer_has_only_stun_like_public_candidates(peer)
+        {
+            public_without_open_ingress_peers.push(peer_display_name(peer));
         }
     }
 
@@ -1664,6 +1695,11 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
             "对端 {} 只上报了私网/回环 UDP 候选；请在对应设备配置 udp-advertise <公网IP>:<端口>，并放行同一个 UDP 入站端口。",
             private_only_peers.join("、")
         ));
+    } else if !public_without_open_ingress_peers.is_empty() {
+        suggestions.push(format!(
+            "对端 {} 有公网候选但 Direct 仍失败；公网 STUN 映射稳定不代表 NAT 过滤开放。请优先在较友好的一侧启用 UPnP/PCP/NAT-PMP 或手动 UDP 端口转发，让困难 NAT 设备能把第一包打进去。",
+            public_without_open_ingress_peers.join("、")
+        ));
     } else if generic_direct_failures > 0 {
         suggestions.push(
             "检测到 Direct UDP 探测失败；请确认两端 udp-bind/udp-advertise、云安全组和系统防火墙使用同一个 UDP 端口。"
@@ -1671,6 +1707,39 @@ fn peer_direct_suggestions(snapshot: &Value) -> Vec<String> {
         );
     }
     suggestions
+}
+
+fn peer_has_only_stun_like_public_candidates(peer: &Value) -> bool {
+    let Some(pairs) = peer.get("candidate_pairs").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut saw_public = false;
+    for pair in pairs {
+        let Some(endpoint) = pair
+            .get("remote_endpoint")
+            .and_then(Value::as_str)
+            .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        else {
+            continue;
+        };
+        if !is_public_udp_endpoint(&endpoint) {
+            continue;
+        }
+        saw_public = true;
+        let source = pair
+            .get("remote_candidate_type")
+            .or_else(|| pair.get("remote_source"))
+            .or_else(|| pair.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if matches!(
+            source,
+            "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" | "peer_reflexive" | "learned"
+        ) {
+            return false;
+        }
+    }
+    saw_public
 }
 
 fn relay_path_reason(snapshot: &Value, peer: &Value) -> Option<String> {
@@ -2768,7 +2837,7 @@ mod tests {
             "local_candidates": ["192.168.2.4:60207", "203.0.113.10:62000"],
             "nat_profile": {
                 "mapping_behavior": "endpoint_independent",
-                "filtering_behavior": "likely_endpoint_independent",
+                "filtering_behavior": "unknown",
                 "hairpin_behavior": "unknown",
                 "mapping_lifetime": { "lower_bound_ms": 250 },
                 "udp_blocked": false,
@@ -2800,7 +2869,7 @@ mod tests {
 
         assert_eq!(
             nat_profile_summary(&snapshot).as_deref(),
-            Some("mapping=endpoint_independent filtering=likely_endpoint_independent hairpin=unknown lifetime=lower_bound_ms=250 public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false predicted=0 birthday=false")
+            Some("mapping=endpoint_independent filtering=unknown hairpin=unknown lifetime=lower_bound_ms=250 public=203.0.113.10:62000 stun=2/3 confidence=70 symmetric=false port_preserved=false prediction=false predicted=0 birthday=false")
         );
         assert_eq!(
             stun_observation_summaries(&snapshot, 2),
@@ -2809,7 +2878,39 @@ mod tests {
                 "server=stun-b.example:3478 mapped=203.0.113.10:62000 rtt=18ms".to_string(),
             ]
         );
-        assert!(nat_profile_suggestions(&snapshot, false).is_empty());
+        let suggestions = nat_profile_suggestions(&snapshot, false);
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("公网 UDP 映射稳定")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("稳定 STUN 端口不等于可接收陌生入站包")));
+
+        let with_gateway_mapping = serde_json::json!({
+            "local_candidates": ["192.168.2.4:60207", "203.0.113.10:62000", "203.0.113.10:60207"],
+            "gateway_mapping": {
+                "candidate_endpoint": "203.0.113.10:60207",
+                "candidate_source": "pcp"
+            },
+            "nat_profile": {
+                "mapping_behavior": "endpoint_independent",
+                "filtering_behavior": "unknown",
+                "hairpin_behavior": "unknown",
+                "mapping_lifetime": "unknown",
+                "udp_blocked": false,
+                "public_endpoint": "203.0.113.10:62000",
+                "likely_symmetric": false,
+                "port_preserved": false,
+                "prediction_candidate": false,
+                "predicted_endpoints": [],
+                "birthday_candidate": false,
+                "confidence": 70,
+                "observations": []
+            }
+        });
+        assert!(!nat_profile_suggestions(&with_gateway_mapping, false)
+            .iter()
+            .any(|item| item.contains("稳定 STUN 端口不等于")));
     }
 
     #[test]
@@ -3038,6 +3139,30 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert!(suggestions[0].contains("Direct UDP 探测失败"));
         assert!(!suggestions[0].contains("只上报了私网/回环"));
+    }
+
+    #[test]
+    fn doctor_explains_public_stun_candidate_without_open_ingress() {
+        let snapshot = serde_json::json!({
+            "peers": [{
+                "node_id": "peer1",
+                "device_name": "home-router-peer",
+                "virtual_ip": "10.20.0.8",
+                "endpoint": "203.0.113.10:62000",
+                "candidates": ["203.0.113.10:62000"],
+                "candidate_pairs": [{
+                    "remote_endpoint": "203.0.113.10:62000",
+                    "remote_candidate_type": "stun_observed",
+                    "remote_source": "stun_observed"
+                }],
+                "direct": { "last_error": "no direct probe ACK after 6 retry probes" }
+            }]
+        });
+        let suggestions = peer_direct_suggestions(&snapshot);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("home-router-peer(10.20.0.8)"));
+        assert!(suggestions[0].contains("公网 STUN 映射稳定不代表 NAT 过滤开放"));
+        assert!(suggestions[0].contains("UPnP/PCP/NAT-PMP"));
     }
 
     #[test]
