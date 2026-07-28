@@ -51,6 +51,7 @@ const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 24;
 const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 48;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(10);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 4;
+const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
@@ -1069,6 +1070,7 @@ impl PeerConnection {
         pairs.sort_by(|a, b| {
             candidate_pair_probe_rank(a.state)
                 .cmp(&candidate_pair_probe_rank(b.state))
+                .then_with(|| outbound_probe_priority_rank(a).cmp(&outbound_probe_priority_rank(b)))
                 .then_with(|| {
                     candidate_pair_source_quality_rank(&source_stats, history, a.source).cmp(
                         &candidate_pair_source_quality_rank(&source_stats, history, b.source),
@@ -4323,28 +4325,95 @@ fn apply_adaptive_probe_budgets<'a>(
     let birthday_budget = birthday_probe_budget(history);
     let mut predicted_used = 0usize;
     let mut birthday_used = 0usize;
-    pairs
-        .into_iter()
-        .filter(|pair| match pair.source {
-            CandidatePairSource::Predicted => {
-                if predicted_used < predicted_budget {
-                    predicted_used += 1;
-                    true
-                } else {
-                    false
-                }
+
+    let mut guaranteed_pairs = Vec::new();
+    let mut budgeted_pairs = Vec::new();
+    for pair in pairs {
+        if is_priority_outbound_probe_pair(pair) {
+            guaranteed_pairs.push(pair);
+        } else {
+            budgeted_pairs.push(pair);
+        }
+    }
+
+    guaranteed_pairs.extend(budgeted_pairs.into_iter().filter(|pair| {
+        apply_speculative_probe_budget(
+            pair.source,
+            predicted_budget,
+            birthday_budget,
+            &mut predicted_used,
+            &mut birthday_used,
+        )
+    }));
+    guaranteed_pairs
+}
+
+fn is_priority_outbound_probe_pair(pair: &CandidatePair) -> bool {
+    matches!(
+        pair.source,
+        CandidatePairSource::PeerReflexive
+            | CandidatePairSource::Learned
+            | CandidatePairSource::Host
+    ) || is_stable_public_probe_pair(pair)
+}
+
+fn is_stable_public_probe_pair(pair: &CandidatePair) -> bool {
+    is_public_probe_endpoint(pair.remote_endpoint)
+        && matches!(
+            pair.source,
+            CandidatePairSource::PeerReflexive
+                | CandidatePairSource::StunObserved
+                | CandidatePairSource::Signaled
+                | CandidatePairSource::Learned
+                | CandidatePairSource::Upnp
+                | CandidatePairSource::Pcp
+                | CandidatePairSource::NatPmp
+        )
+}
+
+fn outbound_probe_priority_rank(pair: &CandidatePair) -> u8 {
+    if is_priority_outbound_probe_pair(pair) {
+        0
+    } else if is_speculative_probe_source(pair.source) {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_speculative_probe_source(source: CandidatePairSource) -> bool {
+    matches!(
+        source,
+        CandidatePairSource::Predicted | CandidatePairSource::Birthday
+    )
+}
+
+fn apply_speculative_probe_budget(
+    source: CandidatePairSource,
+    predicted_budget: usize,
+    birthday_budget: usize,
+    predicted_used: &mut usize,
+    birthday_used: &mut usize,
+) -> bool {
+    match source {
+        CandidatePairSource::Predicted => {
+            if *predicted_used < predicted_budget {
+                *predicted_used += 1;
+                true
+            } else {
+                false
             }
-            CandidatePairSource::Birthday => {
-                if birthday_used < birthday_budget {
-                    birthday_used += 1;
-                    true
-                } else {
-                    false
-                }
+        }
+        CandidatePairSource::Birthday => {
+            if *birthday_used < birthday_budget {
+                *birthday_used += 1;
+                true
+            } else {
+                false
             }
-            _ => true,
-        })
-        .collect()
+        }
+        _ => true,
+    }
 }
 
 fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &TraversalHistory) -> usize {
@@ -4700,6 +4769,9 @@ fn candidate_pair_failure_cooldown(pair: &CandidatePair) -> Option<Duration> {
         CandidatePairState::Failed | CandidatePairState::Degraded
     ) {
         return None;
+    }
+    if is_priority_outbound_probe_pair(pair) {
+        return Some(PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN);
     }
     let exponent = pair
         .consecutive_failures
@@ -6174,6 +6246,41 @@ mod tests {
         assert_eq!(predicted_count, PREDICTED_PROBE_BUDGET_PER_CYCLE);
     }
 
+    #[tokio::test]
+    async fn stable_public_candidate_precedes_predicted_budget_in_synchronized_punch() {
+        let mut history = TraversalHistory::default();
+        history.record_success(CandidatePairSource::Predicted);
+        history.record_success(CandidatePairSource::Predicted);
+        let manager = PeerManager::new_with_history(test_config(), None, history);
+        let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        let candidates = (0..20)
+            .map(|index| format!("8.8.8.8:{}", 41_000 + index))
+            .collect::<Vec<_>>();
+        let sources = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+        let predicted_endpoints = candidates
+            .iter()
+            .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+            .collect::<HashSet<_>>();
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        let predicted_count = targets
+            .iter()
+            .filter(|target| predicted_endpoints.contains(target))
+            .count();
+
+        assert_eq!(targets.first().copied(), Some(stable_endpoint));
+        assert!(targets.contains(&stable_endpoint));
+        assert_eq!(predicted_count, PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE);
+    }
+
     #[test]
     fn birthday_probe_endpoints_cover_layered_port_window() {
         let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
@@ -6213,6 +6320,129 @@ mod tests {
 
         assert!(targets.contains(&endpoint));
         assert_eq!(birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+    }
+
+    #[tokio::test]
+    async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
+        let mut history = TraversalHistory::default();
+        history.record_success(CandidatePairSource::Birthday);
+        let manager = PeerManager::new_with_history(test_config(), None, history);
+        let stable_endpoint: SocketAddr = "8.8.4.4:40000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+
+        let due_targets = manager
+            .direct_probe_targets_due(Duration::from_secs(0))
+            .await;
+        assert_eq!(due_targets.len(), 1);
+        assert_eq!(due_targets[0].0, "peer1");
+
+        let targets = &due_targets[0].1;
+        let birthday_count = targets
+            .iter()
+            .filter(|target| **target != stable_endpoint && target.ip() == stable_endpoint.ip())
+            .count();
+
+        assert_eq!(targets.first().copied(), Some(stable_endpoint));
+        assert!(targets.contains(&stable_endpoint));
+        assert_eq!(
+            birthday_count,
+            birthday_probe_endpoints(stable_endpoint).len()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stable_public_candidate_gets_short_background_retry() {
+        let manager = PeerManager::new(test_config());
+        let stable_endpoint: SocketAddr = "8.8.4.4:40000".parse().unwrap();
+        let peer = PeerInfo {
+            node_id: "peer1".to_string(),
+            device_name: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+        };
+
+        manager.add_peer(&peer).await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &[stable_endpoint.to_string()],
+                &HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]),
+            )
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            let pair = conn
+                .candidate_pairs
+                .iter_mut()
+                .find(|pair| pair.remote_endpoint == stable_endpoint)
+                .unwrap();
+            for _ in 0..4 {
+                pair.record_failure(REASON_DIRECT_PROBE_FAILED, "old failure", None);
+            }
+            pair.last_failure_at = Some(
+                Instant::now() - PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN - Duration::from_secs(1),
+            );
+        }
+
+        let due_targets = manager
+            .direct_probe_targets_due(Duration::from_secs(5))
+            .await;
+        assert_eq!(due_targets.len(), 1);
+        assert_eq!(due_targets[0].1, vec![stable_endpoint]);
+    }
+
+    #[tokio::test]
+    async fn failed_speculative_candidate_keeps_exponential_background_cooldown() {
+        let manager = PeerManager::new(test_config());
+        let predicted_endpoint: SocketAddr = "8.8.4.4:41000".parse().unwrap();
+        let peer = PeerInfo {
+            node_id: "peer1".to_string(),
+            device_name: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+        };
+
+        manager.add_peer(&peer).await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &[predicted_endpoint.to_string()],
+                &HashMap::from([(predicted_endpoint.to_string(), "predicted".to_string())]),
+            )
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            let pair = conn
+                .candidate_pairs
+                .iter_mut()
+                .find(|pair| pair.remote_endpoint == predicted_endpoint)
+                .unwrap();
+            for _ in 0..4 {
+                pair.record_failure(REASON_DIRECT_PROBE_FAILED, "old failure", None);
+            }
+            pair.last_failure_at = Some(
+                Instant::now() - PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN - Duration::from_secs(1),
+            );
+        }
+
+        let due_targets = manager
+            .direct_probe_targets_due(Duration::from_secs(5))
+            .await;
+        assert!(due_targets.is_empty());
     }
 
     #[tokio::test]
@@ -6370,9 +6600,9 @@ mod tests {
             .find(|pair| pair.remote_endpoint == failed_endpoint.to_string())
             .unwrap();
         assert!(!pair.probe_due);
-        assert_eq!(pair.probe_retry_after_ms, Some(10_000));
+        assert_eq!(pair.probe_retry_after_ms, Some(5_000));
         assert!(pair.probe_retry_remaining_ms.unwrap() > 0);
-        assert!(pair.probe_retry_remaining_ms.unwrap() <= 10_000);
+        assert!(pair.probe_retry_remaining_ms.unwrap() <= 5_000);
 
         {
             let mut conns = manager.connections.write().await;
@@ -6394,7 +6624,7 @@ mod tests {
             .find(|pair| pair.remote_endpoint == failed_endpoint.to_string())
             .unwrap();
         assert!(pair.probe_due);
-        assert_eq!(pair.probe_retry_after_ms, Some(10_000));
+        assert_eq!(pair.probe_retry_after_ms, Some(5_000));
         assert_eq!(pair.probe_retry_remaining_ms, Some(0));
     }
 
