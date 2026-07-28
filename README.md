@@ -26,8 +26,6 @@
   </p>
 </div>
 
-![P2WLAN desktop client](docs/assets/p2wlan-devices.jpg)
-
 ## 项目简介
 
 P2WLAN 是一个开源、P2P 优先、可自托管的虚拟内网项目。它会在每台设备上创建真实的系统虚拟网卡，分配稳定的 `10.20.x.x` 私有地址，并尽可能通过端到端加密的 UDP 直连传输数据。
@@ -266,7 +264,6 @@ server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
 src/          React 桌面客户端界面
 src-tauri/    Tauri 外壳、托盘、权限、daemon 生命周期和平台打包
 scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
-docs/         协议、安全、路线图、测试和发布说明
 fuzz/         协议与解析器模糊测试
 proto/        Protobuf 协议草案
 ```

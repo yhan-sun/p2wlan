@@ -50,6 +50,11 @@ coverage/
 ~$*
 .~lock.*#
 
+# Local-only project notes and research drafts
+P2PNet-Design.md
+PRODUCT.md
+docs/
+
 # Release packages and archives
 *.pdf
 *.dmg
