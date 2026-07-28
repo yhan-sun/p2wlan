@@ -28,6 +28,17 @@ desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/target/
 
+# Local exports and release packages
+*.doc
+*.docx
+*.pdf
+*.dmg
+*.zip
+*.tar.gz
+*.tgz
+*.pkg
+*.msi
+
 # Logs/env
 *.log
 .env
