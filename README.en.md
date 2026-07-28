@@ -26,6 +26,8 @@
   </p>
 </div>
 
+![P2WLAN desktop client](docs/assets/p2wlan-devices.jpg)
+
 ## Overview
 
 P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. It creates a real system network interface on each device, assigns stable `10.20.x.x` private addresses, and prefers end-to-end encrypted UDP direct paths whenever the network allows it.
@@ -264,6 +266,9 @@ server/       Go control plane, auth, SQLite, signaling, relay server, revocatio
 src/          React desktop client interface
 src-tauri/    Tauri shell, tray, permissions, daemon lifecycle, platform packaging
 scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
+docs/         Protocol, security, roadmap, testing, and release notes
+fuzz/         Protocol and parser fuzzing
+proto/        Protobuf protocol draft
 ```
 
 ## Contributing
