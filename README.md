@@ -1,80 +1,85 @@
 <div align="center">
   <img src="src-tauri/icons/icon.png" width="96" alt="P2WLAN icon" />
   <h1>P2WLAN</h1>
-  <p><strong>Self-hostable encrypted virtual LAN for real devices, real networks, and real diagnostics.</strong></p>
-  <p>把 Mac、Windows、Linux、云服务器、NAS 和临时设备组成一张可观测、P2P 优先、可自托管的私有局域网。</p>
+  <p><strong>把分散在不同网络里的设备，连成一张真正可用的加密虚拟局域网。</strong></p>
+  <p>Mac、Windows、Linux、云服务器、NAS、家庭设备，都可以拥有稳定的私有虚拟 IP。</p>
+
+  <p>
+    <a href="README.md"><strong>简体中文</strong></a>
+    · <a href="README.en.md">English</a>
+  </p>
 
   <p>
     <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI" /></a>
     <a href="https://github.com/yhan-sun/p2wlan/releases"><img src="https://img.shields.io/github/v/release/yhan-sun/p2wlan?style=for-the-badge&display_name=tag&label=Release" alt="Release" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge" alt="MIT License" /></a>
-    <img src="https://img.shields.io/badge/core-Rust-dea584?style=for-the-badge" alt="Rust core" />
+    <img src="https://img.shields.io/badge/Rust-core-dea584?style=for-the-badge" alt="Rust core" />
+    <img src="https://img.shields.io/badge/macOS%20%7C%20Windows%20%7C%20Linux-supported-4c8bf5?style=for-the-badge" alt="Platforms" />
   </p>
 
   <p>
-    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
-    · <a href="#quick-start">Quick Start</a>
-    · <a href="#architecture">Architecture</a>
-    · <a href="#self-hosting">Self-hosting</a>
-    · <a href="docs/SECURITY_REVIEW.md">Security</a>
-    · <a href="docs/ROADMAP.md">Roadmap</a>
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>下载客户端</strong></a>
+    · <a href="#快速开始">快速开始</a>
+    · <a href="#连接路径">连接路径</a>
+    · <a href="#自托管">自托管</a>
+    · <a href="#安全边界">安全边界</a>
   </p>
 </div>
 
 ![P2WLAN desktop client](docs/assets/p2wlan-devices.jpg)
 
-## Overview
+## 项目简介
 
-P2WLAN is an open-source private virtual LAN. It creates a real system network interface on each device, assigns stable `10.20.x.x` virtual IPs, and prefers encrypted peer-to-peer paths whenever the network allows it.
+P2WLAN 是一个开源、P2P 优先、可自托管的虚拟内网项目。它会在每台设备上创建真实的系统虚拟网卡，分配稳定的 `10.20.x.x` 私有地址，并尽可能通过端到端加密的 UDP 直连传输数据。
 
-When direct UDP is blocked by NAT, CGNAT, restrictive firewalls, or cloud security rules, P2WLAN falls back to an encrypted relay path so the private network remains usable. The product is designed to be operationally honest: you can see whether a peer is on LAN direct, public UDP direct, relay, or unreachable instead of guessing what happened underneath.
+如果直连被 NAT、CGNAT、企业防火墙、校园网或云安全组阻断，P2WLAN 会自动回退到加密中继，让网络保持可用。它不会把连接状态藏成一个模糊的“在线”：你可以清楚看到设备正在使用局域网直连、公网 UDP 直连、中继，还是暂时不可达。
 
-> P2WLAN is currently in **Preview**. It is useful for real testing and self-hosted deployments, but direct connectivity still depends on both sides of the network path. Treat high-value production traffic conservatively until the project completes broader compatibility work and independent security review.
+> 当前项目处于 **Preview** 阶段，适合真实环境测试、自托管部署和开发验证。用于高敏感生产流量前，请先完成自己的安全审查，并理解直连能力仍取决于两端网络环境。
 
-## Product DNA
+## 核心亮点
 
 <table>
   <tr>
     <td width="33%" valign="top">
-      <h3>Private by Default</h3>
-      <p>Use virtual IPs for SSH, RDP, databases, dashboards, and dev services without exposing every service to the public internet.</p>
+      <h3>真实虚拟网卡</h3>
+      <p>基于 macOS <code>utun</code>、Windows Wintun 和 Linux TUN，虚拟 IP 可以直接用于 <code>ping</code>、SSH、RDP、数据库和浏览器访问。</p>
     </td>
     <td width="33%" valign="top">
-      <h3>P2P First</h3>
-      <p>Prefer LAN and public UDP direct paths, keep NAT mappings alive, and recover to relay only when direct transport is not confirmed.</p>
+      <h3>P2P 优先</h3>
+      <p>优先尝试局域网直连和公网 UDP 直连，持续探测、保活和恢复；直连不可用时再切到中继。</p>
     </td>
     <td width="33%" valign="top">
-      <h3>Self-hostable</h3>
-      <p>Run the Go control plane, SQLite database, and relay on your own public Linux instance for transparent private networking.</p>
+      <h3>加密数据面</h3>
+      <p>设备流量通过加密会话传输；中继只转发密文，不解密业务数据。</p>
     </td>
   </tr>
   <tr>
     <td width="33%" valign="top">
-      <h3>Observable</h3>
-      <p>Inspect peer reachability, path type, latency, endpoint candidates, diagnostics, and daemon state from the client or CLI.</p>
+      <h3>连接可观测</h3>
+      <p>客户端展示设备状态、连接路径、延迟、端点候选和本地诊断信息，方便判断问题发生在哪一层。</p>
     </td>
     <td width="33%" valign="top">
-      <h3>Encrypted</h3>
-      <p>Device traffic is protected by an encrypted data plane; relay nodes forward ciphertext and do not terminate private payloads.</p>
+      <h3>完整自托管</h3>
+      <p>控制面、SQLite 数据库和中继服务都可以部署在自己的公网 Linux 服务器上。</p>
     </td>
     <td width="33%" valign="top">
-      <h3>Cross-platform</h3>
-      <p>Use Tauri desktop on macOS and Windows, plus a Linux CLI for servers, NAS devices, cloud machines, and headless workflows.</p>
+      <h3>跨平台体验</h3>
+      <p>macOS 与 Windows 提供 Tauri 桌面客户端，Linux 提供适合服务器、NAS 和无桌面环境的 CLI。</p>
     </td>
   </tr>
 </table>
 
-## Use Cases
+## 适合场景
 
-- **Cloud machine access**: reach SSH, RDP, HTTP dashboards, databases, and dev servers through virtual IPs instead of public service exposure.
-- **Home lab and NAS**: connect laptops, mini PCs, NAS devices, and remote servers without hand-maintaining VPN routes.
-- **Cross-cloud operations**: place machines from different providers, regions, and network policies into one small private LAN.
-- **Temporary field networks**: connect devices across hotel Wi-Fi, mobile hotspots, campus networks, and home broadband with explicit fallback behavior.
-- **Networking research**: inspect NAT probing, direct-path verification, relay tickets, revocation feeds, protocol boundaries, and diagnostics from source.
+- **远程访问云主机**：通过虚拟 IP 访问 SSH、RDP、Web 控制台、数据库和开发服务，减少公网端口暴露。
+- **家庭实验室与 NAS**：把笔记本、迷你主机、NAS、远程服务器放进同一张私有网络。
+- **跨云组网**：让不同云厂商、不同地域、不同安全策略下的机器拥有统一的私有地址空间。
+- **临时网络协作**：在酒店 Wi-Fi、移动热点、校园网、家庭宽带等复杂网络下建立可诊断的连接。
+- **自托管与网络研究**：从源码审查 NAT 探测、中继票据、撤销机制、诊断端点和协议边界。
 
-## Quick Start
+## 快速开始
 
-Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases), sign in on at least two devices, start the virtual network interface, then test another device by its virtual IP:
+从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载最新版客户端，在至少两台设备上登录同一个账号并启动虚拟网卡，然后使用对端虚拟 IP 测试：
 
 ```bash
 ping 10.20.0.5
@@ -83,13 +88,13 @@ ssh user@10.20.0.5
 
 ### macOS
 
-Download the universal `.dmg`, drag P2WLAN into Applications, open the app, and approve the system authorization prompt when starting the virtual interface.
+下载 universal `.dmg`，拖入 Applications，打开 P2WLAN，并在启动虚拟网卡时确认系统授权。
 
-Preview builds may use ad-hoc signing before full Apple notarization. If Gatekeeper blocks the first launch, open the app from Finder with right-click -> Open.
+Preview 构建可能尚未完成 Apple 公证。如果 Gatekeeper 阻止首次启动，请在 Finder 中右键应用并选择 Open。
 
 ### Windows
 
-Download the Windows release archive, keep these files in the same folder, and run `p2wlan-desktop.exe`:
+下载 Windows 压缩包，保持以下文件在同一目录，然后运行 `p2wlan-desktop.exe`：
 
 ```text
 p2wlan-desktop.exe
@@ -97,11 +102,11 @@ p2pnet-daemon.exe
 wintun.dll
 ```
 
-Windows asks for UAC approval when the virtual adapter starts. P2WLAN does not read or store your administrator password.
+启动虚拟网卡时 Windows 会显示 UAC 授权窗口。P2WLAN 不读取、保存或接管系统管理员密码。
 
 ### Linux
 
-Install the headless CLI on servers, NAS devices, and development machines:
+Linux 当前优先支持服务器、NAS 和无桌面环境的 CLI：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -112,7 +117,7 @@ p2wlan up
 p2wlan status
 ```
 
-Useful commands:
+常用命令：
 
 ```bash
 p2wlan doctor
@@ -121,56 +126,53 @@ p2wlan down
 p2wlan update
 ```
 
-Linux desktop packaging is still being refined; the current Linux release is optimized for CLI and server-style usage.
+## 连接路径
 
-## Connection Modes
+P2WLAN 会直接展示当前使用的连接路径，方便快速定位网络问题。
 
-P2WLAN exposes connection path state directly. That makes troubleshooting more practical than a single generic "online" label.
-
-| Mode | Meaning | When you usually see it |
+| 路径 | 含义 | 常见环境 |
 | --- | --- | --- |
-| **LAN direct** | Devices can reach each other on the local network. | Same LAN, office network, home lab |
-| **Public UDP direct** | Devices communicate through public UDP endpoints after probing or explicit UDP exposure. | Cloud server with UDP ingress, less restrictive NAT |
-| **Encrypted relay** | Direct path is unavailable, so packets are forwarded through relay as ciphertext. | CGNAT, blocked UDP, strict firewall, missing security-group rule |
-| **Unreachable** | No valid direct or relay path is currently confirmed. | Peer offline, auth expired, network partition, relay unavailable |
+| **局域网直连** | 两台设备可在本地网络直接互通。 | 家庭 LAN、办公网络、实验室网络 |
+| **公网 UDP 直连** | 通过公网 UDP 端点完成 NAT 穿透或显式 UDP 暴露。 | 云服务器固定端口、限制较少的 NAT |
+| **加密中继** | 直连未确认，流量通过中继转发密文。 | CGNAT、UDP 被阻断、云安全组未放行 |
+| **不可达** | 当前没有确认可用的直连或中继路径。 | 对端离线、凭据过期、网络分区、中继不可用 |
 
-Direct UDP is not guaranteed. For cloud machines that should accept public UDP directly, configure a stable UDP listen port and allow it in both the cloud firewall and the operating-system firewall.
+如果云服务器希望被公网 UDP 直连，请固定 UDP 监听端口，并同时在云安全组和操作系统防火墙中放行对应入站规则。
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart LR
-    A["Device A<br/>Desktop or CLI<br/>TUN / Wintun / utun"]
-    B["Device B<br/>Desktop or CLI<br/>TUN / Wintun / utun"]
-    C["Control Plane<br/>auth, devices, IPs, signaling"]
-    R["Relay<br/>ciphertext forwarding"]
+    A["设备 A<br/>Desktop / CLI<br/>TUN / Wintun / utun"]
+    B["设备 B<br/>Desktop / CLI<br/>TUN / Wintun / utun"]
+    C["控制面<br/>认证、设备、IP、信令"]
+    R["中继<br/>密文转发"]
 
-    A <-->|"preferred: encrypted direct UDP"| B
-    A <-->|"registration and signaling"| C
-    B <-->|"registration and signaling"| C
-    A -.->|"fallback when direct fails"| R
-    B -.->|"fallback when direct fails"| R
+    A <-->|"优先：加密 UDP 直连"| B
+    A <-->|"注册与信令"| C
+    B <-->|"注册与信令"| C
+    A -.->|"直连失败时回退"| R
+    B -.->|"直连失败时回退"| R
 ```
 
-| Layer | Implementation | Responsibility |
+| 层级 | 实现 | 主要职责 |
 | --- | --- | --- |
-| Desktop | React, Tauri | Login, device status, system authorization, tray lifecycle, settings, diagnostics |
-| Daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback, local diagnostics |
-| Control plane | Go, SQLite | Accounts, device registry, virtual IP allocation, credential state, relay tickets, signaling |
-| Relay | Go | Ciphertext forwarding, ticket validation, revocation-feed polling |
-| Protocol docs | Markdown, protobuf draft | Packet flow, security boundaries, diagnostics, deployment notes |
+| 桌面客户端 | React, Tauri | 登录、设备状态、系统授权、托盘、设置、诊断 |
+| 本地守护进程 | Rust | 虚拟网卡、加密会话、Peer 状态、NAT 探测、中继回退 |
+| 控制面 | Go, SQLite | 账号、设备注册、虚拟 IP 分配、凭据状态、中继票据、信令 |
+| 中继服务 | Go | 密文转发、票据校验、撤销信息同步 |
 
-## Platform Status
+## 平台状态
 
-| Platform | Client | Virtual interface | Status |
+| 平台 | 客户端 | 虚拟网卡 | 当前状态 |
 | --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | Desktop app | `utun` | Preview, real bidirectional virtual-IP testing completed |
-| Windows 10/11 x64 | Portable desktop app | Wintun | Preview, remote smoke coverage in progress |
-| Linux x64 / arm64 | CLI | TUN | Preview, server and headless workflows supported |
+| macOS Apple Silicon / Intel | 桌面客户端 | `utun` | Preview，已完成真实双向虚拟 IP 测试 |
+| Windows 10/11 x64 | 便携桌面客户端 | Wintun | Preview，远程 smoke 覆盖持续完善 |
+| Linux x64 / arm64 | CLI | TUN | Preview，支持服务器和无桌面工作流 |
 
-## Self-hosting
+## 自托管
 
-P2WLAN can run on your own infrastructure. A small public Linux server is enough for a control plane and relay for testing or personal use.
+P2WLAN 的控制面和中继都可以部署在自己的公网 Linux 服务器上。个人测试或小规模自用场景，一台小型服务器通常就足够。
 
 ```bash
 cd server
@@ -179,7 +181,7 @@ go build -o p2wlan-control .
 go build -o p2wlan-relay ./relay
 ```
 
-Control plane example:
+控制面示例：
 
 ```bash
 JWT_SECRET="replace-with-a-long-random-secret" \
@@ -190,7 +192,7 @@ RELAY_REVOCATION_FEED_TOKEN="replace-with-a-second-random-secret" \
 ./p2wlan-control
 ```
 
-Relay example:
+中继示例：
 
 ```bash
 RELAY_BIND=":18081" \
@@ -200,40 +202,39 @@ RELAY_REVOCATION_POLL_INTERVAL="30s" \
 ./p2wlan-relay
 ```
 
-Put HTTPS/WSS in front of the control plane for internet-facing deployments. Keep SQLite files, diagnostics endpoints, and relay tokens private. If the relay cannot fetch the revocation feed, it keeps the last successful snapshot; short-lived relay tickets still define the remaining exposure window.
+公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。
 
-More detail:
+## 安全边界
 
-- [Protocol and deployment notes](docs/PROTOCOL.md)
-- [Security boundaries and revocation model](docs/SECURITY_REVIEW.md)
-- [Release packaging](docs/RELEASE_PACKAGING.md)
+- 加入同一虚拟网络的设备应被视为同一信任边界内的节点。
+- 控制面可以看到账号、设备身份、虚拟 IP、候选端点、中继票据和连接元数据。
+- 中继可以看到节点标识、时间和包大小，但只转发加密后的业务载荷。
+- 本地静态拒绝列表只影响本机守护进程或当前中继实例；线上中继撤销信息由控制面撤销源驱动。
+- Preview 版本尚未完成独立安全审计。高敏感场景建议自托管、启用 TLS、轮换中继令牌并自行审查发布产物。
 
-## Build from Source
+## 从源码构建
 
-Install Rust stable, Go 1.22+, Node.js 20+, and pnpm 10+. Linux desktop builds also need GTK/WebKit2GTK development dependencies.
+需要 Rust stable、Go 1.22+、Node.js 20+ 和 pnpm 10+。Linux 桌面构建还需要 GTK/WebKit2GTK 开发依赖。
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
 cd p2wlan
 pnpm install --frozen-lockfile
 
-# Rust daemon
 cargo build -p p2pnet-daemon
-
-# Desktop development shell
 cargo tauri dev
 ```
 
-Build macOS release packages through the project script so the daemon is placed into the app resource directory:
+macOS 打包建议使用项目脚本，确保 daemon 被放入应用资源目录：
 
 ```bash
 pnpm run icons
 pnpm run package:macos
 ```
 
-## Quality Gates
+## 质量检查
 
-Run the relevant checks before submitting code changes:
+提交代码前建议运行相关检查：
 
 ```bash
 cargo fmt --all --check
@@ -250,56 +251,37 @@ pnpm run build
 ./scripts/control-smoke.sh
 ```
 
-Real TUN smoke tests require elevated privileges:
+真实 TUN smoke 测试需要管理员权限：
 
 ```bash
-# Linux network namespace two-node test
 sudo -E ./scripts/tun-ping-smoke.sh
-
-# macOS local plus remote Linux bidirectional ping
 sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```
 
-Windows testing details are in [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md). macOS testing details are in [docs/MAC_TESTING.md](docs/MAC_TESTING.md).
-
-## Repository Map
+## 仓库结构
 
 ```text
-client/       Rust networking core: TUN, crypto, WireGuard-style sessions, NAT, relay, daemon, CLI
-server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
-src/          React desktop client interface
-src-tauri/    Tauri shell, tray, permissions, daemon lifecycle, platform packaging
-scripts/      Build, packaging, install, direct-path, and cross-platform smoke scripts
-docs/         Protocol, security, roadmap, research, release, and platform testing notes
-fuzz/         Fuzz targets for protocol/parser hardening
-proto/        Protobuf protocol draft
+client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、CLI
+server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
+src/          React 桌面客户端界面
+src-tauri/    Tauri 外壳、托盘、权限、daemon 生命周期和平台打包
+scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
+docs/         协议、安全、路线图、测试和发布说明
+fuzz/         协议与解析器模糊测试
+proto/        Protobuf 协议草案
 ```
 
-## Documentation
+## 贡献
 
-- [Protocol](docs/PROTOCOL.md): packet flow, relay tickets, revocation feed, diagnostics, and security boundaries.
-- [Security review](docs/SECURITY_REVIEW.md): trust boundaries, known risks, disclosure guidance, and preview-stage caveats.
-- [Roadmap](docs/ROADMAP.md): product milestones and remaining stabilization work.
-- [Engine optimization plan](docs/ENGINE_OPTIMIZATION_PLAN.md): NAT traversal, relay behavior, diagnostics, and performance work.
-- [Release packaging](docs/RELEASE_PACKAGING.md): build and publishing process for maintainers.
-- [macOS testing](docs/MAC_TESTING.md): platform-specific validation notes.
-- [Windows testing](docs/WINDOWS_TESTING.md): Windows smoke and compatibility guidance.
+欢迎提交 Issue、Pull Request、真实网络测试结果、平台兼容性反馈和安全审查建议。当前最有价值的反馈包括：
 
-## Contributing
+- 家庭路由、校园网、企业网、移动热点和云厂商环境下的直连 / 中继结果；
+- Windows 10/11 在不同网卡、驱动和防火墙配置下的兼容性；
+- Linux NAS、服务器、桌面发行版的安装与权限体验；
+- 中继区域、撤销机制、可观测性和性能优化；
+- 控制面、中继票据、加密传输和本地权限边界审查。
 
-P2WLAN welcomes issues, pull requests, platform test reports, NAT traversal observations, documentation improvements, and security review.
-
-High-value contributions right now:
-
-- real-world direct-vs-relay reports from home routers, campus networks, mobile hotspots, and cloud providers;
-- Windows 10/11 compatibility data across adapters, drivers, and firewall profiles;
-- Linux packaging feedback for NAS, server, and desktop distributions;
-- relay-region, revocation, observability, and performance improvements;
-- review of the control plane, relay tickets, encrypted transport, and local privilege boundaries.
-
-Please keep the repository clean: do not commit exported artifacts or local packages such as `.docx`, `.pdf`, `.dmg`, `.zip`, `.tar.gz`, logs, local databases, or generated runtime files. Use source documents and reproducible scripts instead.
-
-Before submitting code, run the relevant quality gates above and keep user-facing claims conservative unless they are backed by reproducible tests.
+请保持仓库干净，不要提交 `.docx`、`.pdf`、`.dmg`、`.zip`、`.tar.gz`、日志、本地数据库或运行时生成文件。需要说明的内容请使用 Markdown 源文件和可复现脚本。
 
 ## License
 
