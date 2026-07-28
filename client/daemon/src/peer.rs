@@ -1053,14 +1053,13 @@ impl PeerConnection {
     ) -> Vec<SocketAddr> {
         self.ensure_current_candidate_pairs(local_generation);
         let mut endpoints = self.candidate_endpoints();
-        if mode == ProbeTargetMode::Background {
-            self.ensure_birthday_candidate_pairs(
-                local_generation,
-                history,
-                local_nat_profile,
-                &mut endpoints,
-            );
-        }
+        self.ensure_birthday_candidate_pairs(
+            local_generation,
+            history,
+            local_nat_profile,
+            mode == ProbeTargetMode::Background,
+            &mut endpoints,
+        );
         let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
         let mut pairs = self
             .candidate_pairs
@@ -1118,6 +1117,7 @@ impl PeerConnection {
         local_generation: u64,
         history: &TraversalHistory,
         local_nat_profile: Option<&NatProfile>,
+        allow_local_nat_trigger: bool,
         endpoints: &mut Vec<SocketAddr>,
     ) {
         let bases = endpoints
@@ -1128,6 +1128,8 @@ impl PeerConnection {
                 !matches!(
                     self.candidate_source_for_endpoint(*endpoint),
                     CandidatePairSource::Host
+                        | CandidatePairSource::Predicted
+                        | CandidatePairSource::Birthday
                         | CandidatePairSource::Upnp
                         | CandidatePairSource::Pcp
                         | CandidatePairSource::NatPmp
@@ -1135,8 +1137,8 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
 
-        let local_needs_birthday =
-            local_nat_profile.is_some_and(|profile| profile.birthday_candidate);
+        let local_needs_birthday = allow_local_nat_trigger
+            && local_nat_profile.is_some_and(|profile| profile.birthday_candidate);
         let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases);
         if !local_needs_birthday && !peer_looks_port_dependent {
             return;
@@ -6409,6 +6411,51 @@ mod tests {
         let background_targets = manager.direct_probe_targets().await;
         assert_eq!(background_targets.len(), 1);
         let targets = &background_targets[0].1;
+        let birthday_targets = targets
+            .iter()
+            .filter(|target| {
+                target.ip().to_string() == "203.0.113.10"
+                    && !candidates.contains(&target.to_string())
+                    && **target != registry_endpoint
+            })
+            .collect::<Vec<_>>();
+
+        assert!(targets.contains(&registry_endpoint));
+        assert_eq!(birthday_targets.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41001) <= 2));
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41037) <= 2));
+        assert!(birthday_targets
+            .iter()
+            .any(|target| target.port().abs_diff(41113) <= 2));
+    }
+
+    #[tokio::test]
+    async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+        let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let candidates = vec![
+            "203.0.113.10:41001".to_string(),
+            "203.0.113.10:41037".to_string(),
+            "203.0.113.10:41113".to_string(),
+        ];
+        let sources = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
+            .collect::<HashMap<_, _>>();
+
+        manager
+            .add_peer(&test_peer("peer1", registry_endpoint))
+            .await;
+        manager
+            .add_candidates_with_sources("peer1", &candidates, &sources)
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
         let birthday_targets = targets
             .iter()
             .filter(|target| {
