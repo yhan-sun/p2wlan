@@ -177,7 +177,7 @@ P2WLAN currently uses a self-contained WireGuard-like data plane instead of call
 
 There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and add test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review.
 
-For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md).
+For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), and use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation.
 
 ## NAT And Relay
 
@@ -187,7 +187,7 @@ Important limits:
 
 - **Not a complete RFC8445 ICE checklist**: candidate priority, nomination, retries, and failure reasons exist as foundations, but this is not the full browser-grade ICE/TURN stack.
 - **Not standard TURN**: relay is a DERP-like forwarder. Environments that require TURN allocation/permission/channel semantics need an additional gateway or future implementation.
-- **Complex NAT success is not guaranteed**: campus networks, enterprise networks, mobile networks, CGNAT, and double symmetric NAT require real-world matrix testing.
+- **Complex NAT success is not guaranteed**: campus networks, enterprise networks, mobile networks, CGNAT, and double symmetric NAT require real-world matrix testing; use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) to record each run.
 - **Relays still expose metadata**: relays see node identifiers, timing, and packet sizes even though payloads remain encrypted.
 
 ## MTU And Performance

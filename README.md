@@ -177,7 +177,7 @@ P2WLAN 当前采用自研的 WireGuard-like 数据面，而不是直接调用内
 
 长期生产化有两条路线：一是复用 `boringtun`、`wireguard-go` 或平台 WireGuard 实现来降低密码协议维护风险；二是保留自研数据面，但补齐测试向量、fuzz、重放/重密钥/异常包测试、互操作说明和独立安全审计。
 
-生产化前的完整验收项见 [生产化验收清单](docs/production-hardening.zh.md)。
+生产化前的完整验收项见 [生产化验收清单](docs/production-hardening.zh.md)，真实网络验证模板见 [NAT 穿透验收矩阵](docs/nat-traversal-matrix.zh.md)。
 
 ## NAT 与中继
 
@@ -187,7 +187,7 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 
 - **不是完整 RFC8445 ICE checklist**：候选优先级、提名、重试和失败原因已经有雏形，但还不是浏览器 WebRTC 那种完整 ICE/TURN 栈。
 - **不是标准 TURN 服务**：relay 是 DERP-like 转发器；如果你的环境强制要求 TURN 语义，需要额外网关或后续实现。
-- **复杂 NAT 成功率不可保证**：校园网、企业网、移动网络、CGNAT 和双 symmetric NAT 需要依赖真实网络矩阵验证。
+- **复杂 NAT 成功率不可保证**：校园网、企业网、移动网络、CGNAT 和双 symmetric NAT 需要依赖真实网络矩阵验证；建议按 [NAT 穿透验收矩阵](docs/nat-traversal-matrix.zh.md) 逐项记录。
 - **中继仍暴露元数据**：中继只能看到节点标识、时间和包大小，不能解密业务数据，但它仍是连接元数据观察点。
 
 ## MTU 与性能
