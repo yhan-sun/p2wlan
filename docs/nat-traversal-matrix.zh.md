@@ -53,6 +53,7 @@ p2wlan doctor
 p2wlan status --json
 ping <peer-virtual-ip>
 ssh <peer-virtual-ip>
+scripts/mtu-smoke.sh <peer-virtual-ip>
 p2wlan config set mtu 1380
 p2wlan down && p2wlan up
 ```

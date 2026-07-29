@@ -48,7 +48,7 @@ This document turns the README protocol boundaries and networking caveats into c
 
 - Keep the default MTU conservative and explain the risk profile for `1280`, `1380`, `1420`, and `1500+` in CLI/GUI diagnostics.
 - When relay paths exist and MTU is above `1380`, diagnostics should call out large-packet loss and PMTU blackhole risk.
-- Add repeatable MTU smoke tests: ICMP, small TCP flow, large TCP flow, UDP payload, and relay path.
+- Use `scripts/mtu-smoke.sh` for repeatable ICMP MTU smoke; later extend coverage to small TCP flow, large TCP flow, UDP payload, and relay path.
 - Later add automatic PMTU probing: start at a safe floor, raise after success, and roll back on failure.
 - Document and test IPv4 fragments, DF behavior, missing ICMP fragmentation-needed messages, and Windows firewall interactions.
 
