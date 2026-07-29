@@ -369,6 +369,8 @@ struct EndpointUpdateResponse {
 #[derive(Debug, Deserialize)]
 struct SignalCreateResponse {
     success: bool,
+    #[serde(default)]
+    protocol_version: Option<u8>,
     error: Option<String>,
 }
 
@@ -377,7 +379,13 @@ struct ListSignalsResponse {
     #[serde(default)]
     signals: Vec<SignalResponse>,
     #[serde(default)]
+    protocol_version: Option<u8>,
+    #[serde(default)]
     server_time_ms: Option<u64>,
+}
+
+fn default_signal_rest_protocol_version() -> u8 {
+    SIGNAL_REST_PROTOCOL_VERSION
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +393,8 @@ struct SignalResponse {
     from_node_id: String,
     #[serde(rename = "type")]
     signal_type: String,
+    #[serde(default = "default_signal_rest_protocol_version")]
+    protocol_version: u8,
     #[serde(default)]
     candidates: Vec<String>,
     #[serde(default)]
@@ -1009,6 +1019,7 @@ const SIGNAL_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNAL_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGNAL_WS_PROTOCOL: &str = "p2wlan.signaling.v1";
 const SIGNAL_WS_PROTOCOL_VERSION: u8 = 1;
+const SIGNAL_REST_PROTOCOL_VERSION: u8 = 1;
 const SIGNAL_WS_WAKE_QUEUE: usize = 32;
 const MIN_PEER_POLL_INTERVAL_SECS: u64 = 5;
 
@@ -2077,6 +2088,7 @@ async fn send_signal(
             "from_node_id": from_node_id,
             "to_node_id": to_node_id,
             "type": signal_type,
+            "protocol_version": SIGNAL_REST_PROTOCOL_VERSION,
             "candidates": candidates,
             "candidate_sources": candidate_sources,
             "candidate_generation": candidate_generation,
@@ -2110,6 +2122,14 @@ async fn send_signal(
             body.error
                 .unwrap_or_else(|| "send signal failed".to_string()),
         ));
+    }
+    if let Some(protocol_version) = body.protocol_version {
+        if protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
+            warn!(
+                "Control server returned unsupported signal protocol_version={} (client supports {})",
+                protocol_version, SIGNAL_REST_PROTOCOL_VERSION
+            );
+        }
     }
 
     Ok(())
@@ -2145,8 +2165,23 @@ async fn poll_signals(
         .map_err(|e| DaemonError::ControlPlane(format!("list signals decode failed: {e}")))?;
     let received_at_ms = unix_time_millis();
     let server_time_ms = body.server_time_ms;
+    if let Some(protocol_version) = body.protocol_version {
+        if protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
+            warn!(
+                "Control server list response used signal protocol_version={} (client supports {})",
+                protocol_version, SIGNAL_REST_PROTOCOL_VERSION
+            );
+        }
+    }
 
     for signal in body.signals {
+        if signal.protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
+            warn!(
+                "Skipping unsupported signal protocol_version={} from {} type={}",
+                signal.protocol_version, signal.from_node_id, signal.signal_type
+            );
+            continue;
+        }
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
         let punch_at_server_ms = signal.punch_at_ms.filter(|_| server_time_ms.is_some());
@@ -2717,10 +2752,25 @@ mod tests {
     }
 
     #[test]
+    fn rest_signal_response_defaults_to_v1_for_legacy_servers() {
+        let signal: SignalResponse = serde_json::from_str(
+            r#"{
+                "from_node_id": "alice",
+                "type": "peer_offer",
+                "candidates": ["203.0.113.10:51820"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(signal.protocol_version, SIGNAL_REST_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
         let signal = SignalResponse {
             from_node_id: "alice".to_string(),
             signal_type: "peer_reflexive".to_string(),
+            protocol_version: SIGNAL_REST_PROTOCOL_VERSION,
             candidates: vec![
                 "198.51.100.1:40000".to_string(),
                 "203.0.113.10:51820".to_string(),
@@ -2754,6 +2804,7 @@ mod tests {
         let signal = SignalResponse {
             from_node_id: "alice".to_string(),
             signal_type: "peer_reflexive".to_string(),
+            protocol_version: SIGNAL_REST_PROTOCOL_VERSION,
             candidates: vec!["198.51.100.1:40000".to_string()],
             session_id: None,
             probe_ephemeral_public_key: None,

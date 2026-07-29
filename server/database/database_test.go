@@ -219,7 +219,7 @@ func TestSignalsPreserveSessionID(t *testing.T) {
 	const sessionID = "0123456789abcdef0123456789abcdef"
 	const probeEphemeralPublicKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 	if _, err := db.CreateSignalWithTraversalSession(
-		device.ID, target.ID, "peer_offer", []string{"203.0.113.10:51820"}, nil, "handshake", 0, 7, 0, sessionID, probeEphemeralPublicKey,
+		device.ID, target.ID, "peer_offer", SignalProtocolVersion, []string{"203.0.113.10:51820"}, nil, "handshake", 0, 7, 0, sessionID, probeEphemeralPublicKey,
 	); err != nil {
 		t.Fatalf("CreateSignalWithTraversalSession failed: %v", err)
 	}
@@ -230,6 +230,9 @@ func TestSignalsPreserveSessionID(t *testing.T) {
 	}
 	if len(signals) != 1 || signals[0].SessionID != sessionID || signals[0].ProbeEphemeralPublicKey != probeEphemeralPublicKey {
 		t.Fatalf("session key material was not preserved: %#v", signals)
+	}
+	if signals[0].ProtocolVersion != SignalProtocolVersion {
+		t.Fatalf("protocol version was not preserved: %#v", signals)
 	}
 }
 
