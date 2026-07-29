@@ -21,6 +21,7 @@
     <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
     · <a href="#quick-start">Quick Start</a>
     · <a href="#connection-paths">Connection Paths</a>
+    · <a href="#protocol-boundaries">Protocols</a>
     · <a href="#self-hosting">Self-hosting</a>
     · <a href="#security-boundaries">Security</a>
   </p>
@@ -32,7 +33,7 @@ P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. It creates a rea
 
 When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus networks, or cloud security groups, P2WLAN falls back to encrypted relay forwarding so the private network stays usable. It also keeps connection state visible: peers can be LAN direct, public UDP direct, relayed, or unreachable.
 
-> P2WLAN is currently in **Preview**. It is useful for real-world testing, self-hosted deployments, and development validation. For sensitive production traffic, review the security model and remember that direct connectivity still depends on both network environments.
+> P2WLAN is currently in **Preview**. It already includes an encrypted data plane, NAT probing, UDP hole punching, and relay fallback, but it has not completed an independent security audit and should not be treated as an official WireGuard-compatible implementation. For sensitive production traffic, review the security model and remember that direct connectivity still depends on both network environments.
 
 ## Highlights
 
@@ -48,7 +49,7 @@ When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus 
     </td>
     <td width="33%" valign="top">
       <h3>Encrypted data plane</h3>
-      <p>Device traffic travels through encrypted sessions; relay nodes forward ciphertext and do not terminate private payloads.</p>
+      <p>Device traffic travels through WireGuard-like Noise sessions; relay nodes forward ciphertext and do not terminate private payloads.</p>
     </td>
   </tr>
   <tr>
@@ -131,11 +132,11 @@ P2WLAN shows the active path directly so troubleshooting starts with facts.
 | Path | Meaning | Common environment |
 | --- | --- | --- |
 | **LAN direct** | Devices can reach each other on the local network. | Home LAN, office network, lab network |
-| **Public UDP direct** | Devices communicate through public UDP endpoints after probing or explicit UDP exposure. | Cloud server with fixed UDP ingress, less restrictive NAT |
-| **Encrypted relay** | Direct path is not confirmed, so packets are forwarded as ciphertext. | CGNAT, blocked UDP, missing cloud security-group rule |
+| **Public UDP direct** | Devices communicate through public UDP endpoints after NAT probing, peer-reflexive discovery, or explicit UDP exposure. | Cloud server with fixed UDP ingress, less restrictive NAT |
+| **Encrypted relay** | Direct path is not confirmed, so packets are forwarded as ciphertext through a DERP-like relay. | CGNAT, blocked UDP, missing cloud security-group rule |
 | **Unreachable** | No valid direct or relay path is currently confirmed. | Peer offline, expired credentials, network partition, relay unavailable |
 
-For cloud servers that should accept public UDP directly, configure a stable UDP listen port and allow it in both the cloud firewall and the operating-system firewall.
+Direct candidates can come from local interfaces, STUN observations, manual public UDP configuration, peer-reflexive observations, and a small bounded prediction window. In complex networks, direct success depends on both peers' NAT mapping and filtering behavior. For cloud servers that should accept public UDP directly, configure a stable UDP listen port and allow it in both the cloud firewall and the operating-system firewall.
 
 ## Architecture
 
@@ -159,6 +160,48 @@ flowchart LR
 | Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
 | Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
 | Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
+
+## Protocol Boundaries
+
+P2WLAN currently uses a self-contained WireGuard-like data plane instead of calling kernel WireGuard or `wireguard-go` directly. This keeps TUN handling, desktop diagnostics, signaling, and relay fallback tightly integrated, but it also means production use needs stronger validation and review.
+
+| Boundary | Current implementation | Notes |
+| --- | --- | --- |
+| Data-plane handshake | `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` style | Tracks WireGuard's Noise IK shape, but does not claim official WireGuard interoperability |
+| Key exchange | X25519 | Used for peer-to-peer encrypted session negotiation |
+| Encryption | ChaCha20-Poly1305 | AEAD for handshake messages and transport payloads |
+| Hash / KDF | BLAKE2s / HKDF-BLAKE2s | Keeps WireGuard-style semantics; P2WLAN does not use BLAKE3 here |
+| Device auth | Ed25519 challenge-response | Used for control-plane device credentials and signaling identity binding |
+| Control signaling | JSON over HTTPS / WSS | Easy to inspect; `proto/` contains a protobuf draft |
+| Relay | DERP-like TCP/TLS ciphertext forwarder | Not standard TURN; relays do not decrypt private payloads |
+
+There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and keep adding test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review. Current tests cover the RFC ChaCha20-Poly1305 AEAD vector and WireGuard-like replay-window boundaries.
+
+For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation, and track long-term direction in the [v2 architecture roadmap](docs/v2-architecture-roadmap.en.md).
+
+## NAT And Relay
+
+P2WLAN's traversal layer is more than a single STUN lookup. The daemon gathers host and STUN server-reflexive candidates, performs UDP hole punching, learns peer-reflexive endpoints, maintains direct-path keepalives, and falls back to relay when direct transport is not confirmed.
+
+Important limits:
+
+- **Not a complete RFC8445 ICE checklist**: candidate priority, nomination, retries, and failure reasons exist as foundations, but this is not the full browser-grade ICE/TURN stack.
+- **Not standard TURN**: relay is a DERP-like forwarder. Environments that require TURN allocation/permission/channel semantics need an additional gateway or future implementation.
+- **Complex NAT success is not guaranteed**: campus networks, enterprise networks, mobile networks, CGNAT, and double symmetric NAT require real-world matrix testing; use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) to record each run.
+- **Relays still expose metadata**: relays see node identifiers, timing, and packet sizes even though payloads remain encrypted.
+
+## MTU And Performance
+
+The default TUN MTU is `1420`, which fits many WireGuard-style encapsulation scenarios, but it is not the result of automatic path MTU discovery. Some networks have a lower practical MTU and may show large-packet loss, stalled SSH sessions, incomplete page loads, or poor relay throughput.
+
+Troubleshooting guidance:
+
+- If small `ping` packets work but larger flows stall, try lowering MTU to `1380`, `1360`, or `1280`.
+- Relay paths carry ciphertext over TCP/TLS, so latency and congestion behavior differ from direct UDP.
+- `p2wlan doctor` and local diagnostics `/status` now emit structured MTU risk codes and a suggested downgrade when relay paths are observed above `1380`.
+- `scripts/mtu-smoke.sh` records daemon runtime MTU, relay-path state, risk codes, and suggested safe MTU in `summary.env`; use `P2WLAN_MTU_SMOKE_SELF_TEST=1` to verify the script parser.
+- Networks that drop ICMP fragmentation-needed messages can create PMTU blackholes; automatic PMTU probing is a key future hardening item.
+- P2WLAN is a transparent layer-3 virtual network. It does not split SSH, file transfer, or game traffic into separate application streams. If QUIC is introduced later, QUIC DATAGRAM or relay transport is the more natural starting point than rewriting application protocols.
 
 ## Platform Status
 
@@ -197,18 +240,32 @@ RELAY_BIND=":18081" \
 RELAY_REVOCATION_FEED_URL="https://control.example.com/api/v1/relay/revocations" \
 RELAY_REVOCATION_FEED_TOKEN="same-token-as-control-plane" \
 RELAY_REVOCATION_POLL_INTERVAL="30s" \
+RELAY_AUTH_FAILURE_LIMIT="20" \
+RELAY_AUTH_FAILURE_WINDOW="1m" \
 ./p2wlan-relay
 ```
 
-Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files, diagnostics endpoints, and relay tokens private.
+Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files, diagnostics endpoints, and relay tokens private. Relay runtime stats now count authentication failures and rate-limited attempts, with per-source windows exposed only as short hashed source keys so tickets, JWTs, and payload plaintext are not leaked.
 
 ## Security Boundaries
 
 - Devices joined to the same virtual network should be treated as nodes within the same trust boundary.
+- X25519 node identity is used for data-plane handshakes; Ed25519 device identity is used for control-plane challenge signing and signaling identity binding.
 - The control plane can see accounts, device identities, virtual IPs, endpoint candidates, relay tickets, and connection metadata.
 - Relays can see node identifiers, timing, and packet sizes, but forward encrypted payloads.
+- Self-hosted internet-facing control planes should use HTTPS/WSS, public relays should use TLS, and operators should rotate JWT secrets, relay revocation tokens, and device credentials.
 - Local static denylists only affect the local daemon or relay instance; online relay revocation is driven by the control plane feed.
-- Preview releases have not completed independent security audit. For sensitive deployments, self-host, enable TLS, rotate relay tokens, and review release artifacts.
+- Preview releases have not completed independent security audit. For sensitive deployments, self-host, enable TLS, rotate relay tokens, review release artifacts, and roll out only within an accepted risk boundary.
+
+## Troubleshooting
+
+| Symptom | Check first |
+| --- | --- |
+| Peer is online but direct path fails | Local firewall, UDP listen port, STUN reachability, cloud security-group UDP ingress |
+| Traffic always uses relay | CGNAT, enterprise/campus UDP filtering, symmetric NAT, expired candidates |
+| `ping` works but SSH/RDP stalls | MTU too high, PMTU blackhole, relay latency or loss |
+| Self-hosted relay cannot connect | Relay endpoint format, TLS certificate, revocation token, control-plane relay catalog |
+| Device credential fails | Ed25519 keypair, challenge-response flow, control-plane clock, credential state |
 
 ## Build from Source
 

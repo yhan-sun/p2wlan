@@ -47,6 +47,7 @@ message SignalingMessage {
     PeerAnswer answer = 5;           // Answer to a peer offer
     PeerReject reject = 6;           // Reject a peer connection
   }
+  uint32 protocol_version = 7;        // Durable signaling schema version (current: 1)
 }
 
 /// Node announcing its presence.

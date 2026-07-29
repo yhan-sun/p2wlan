@@ -393,8 +393,8 @@ impl TransportKeyPair {
 impl std::fmt::Debug for TransportKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransportKeyPair")
-            .field("send_key", &hex::encode(self.send_key))
-            .field("recv_key", &hex::encode(self.recv_key))
+            .field("send_key", &"[redacted]")
+            .field("recv_key", &"[redacted]")
             .field("our_index", &self.our_index)
             .field("peer_index", &self.peer_index)
             .finish()
@@ -442,6 +442,23 @@ mod tests {
         // Verify indices
         assert_eq!(initiator_keys.our_index, responder_keys.peer_index);
         assert_eq!(initiator_keys.peer_index, responder_keys.our_index);
+    }
+
+    #[test]
+    fn test_transport_key_pair_debug_redacts_keys() {
+        let keys = TransportKeyPair {
+            send_key: [0xAB; 32],
+            recv_key: [0xCD; 32],
+            our_index: 1,
+            peer_index: 2,
+        };
+
+        let debug = format!("{keys:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&hex::encode(keys.send_key)));
+        assert!(!debug.contains(&hex::encode(keys.recv_key)));
+        assert!(debug.contains("our_index"));
+        assert!(debug.contains("peer_index"));
     }
 
     #[test]

@@ -13,6 +13,38 @@ import {
   Copy,
 } from "lucide-react";
 
+function boolLabel(value: boolean | undefined): string {
+  return value ? "是" : "否";
+}
+
+function protocolCopyLine(protocol: DiagnosticsReport["protocol"]): string {
+  if (!protocol) return "未上报";
+  return `${protocol.data_plane} handshake=${protocol.handshake} aead=${protocol.aead} wg-interop=${boolLabel(protocol.wireguard_interop)} turn=${boolLabel(protocol.turn_compatible)} audit=${protocol.security_audit}`;
+}
+
+function mtuCopyLine(mtu: DiagnosticsReport["mtu"]): string {
+  if (!mtu) return "未上报";
+  return `runtime=${mtu.configured_mtu} profile=${mtu.profile} relay-safe=${mtu.relay_safe_mtu} auto-pmtu=${boolLabel(mtu.automatic_pmtu)}`;
+}
+
+function protocolTone(protocol: DiagnosticsReport["protocol"]): "ok" | "warn" | "muted" {
+  if (!protocol) return "muted";
+  return protocol.security_audit === "completed" ? "ok" : "warn";
+}
+
+function mtuTone(
+  mtu: DiagnosticsReport["mtu"],
+  daemon: DaemonStatus | null
+): "ok" | "warn" | "muted" {
+  if (!mtu) return "muted";
+  if (daemon && mtu.configured_mtu !== daemon.mtu) return "warn";
+  if (daemon && daemon.peerStats.relay_connections > 0 && mtu.configured_mtu > mtu.relay_safe_mtu) {
+    return "warn";
+  }
+  if (!mtu.automatic_pmtu && mtu.configured_mtu > mtu.wireguard_style_mtu) return "warn";
+  return "ok";
+}
+
 export default function DiagnosticsPage() {
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
   const [permissions, setPermissions] = useState<PermissionStatus | null>(null);
@@ -75,6 +107,8 @@ export default function DiagnosticsPage() {
 本机节点 ID: ${daemon.nodeId || "未分配"}
 虚拟内网 IP: ${daemon.virtualIp || "未分配"}
 控制面地址: ${daemon.controlServer}
+协议边界: ${protocolCopyLine(report.protocol)}
+运行 MTU: ${mtuCopyLine(report.mtu)}
 在线节点总数: ${daemon.peerStats.total_peers}
 直连连接数: ${daemon.peerStats.direct_connections}
 中继连接数: ${daemon.peerStats.relay_connections}
@@ -116,6 +150,8 @@ ${report.logs.slice(-80).join("\n") || "无"}
     : { pass: 0, warn: 0, fail: 0 };
   const daemonRunning = daemon?.lifecycle === "running" && daemon.reachable;
   const permissionReady = daemonRunning || (permissions ? !permissions.needsElevation : false);
+  const protocol = report?.protocol;
+  const mtu = report?.mtu;
 
   return (
     <div className="page-container diagnostics-page">
@@ -196,6 +232,82 @@ ${report.logs.slice(-80).join("\n") || "无"}
           <div className="banner-content">
             <span className="banner-desc">{logStatus}</span>
           </div>
+        </div>
+      )}
+
+      {(protocol || mtu) && (
+        <div className="diagnostics-boundary-grid">
+          {protocol && (
+            <section className="panel-section">
+              <div className="panel-header">
+                <h3>协议边界</h3>
+                <StatusPill
+                  label={protocol.security_audit === "completed" ? "已审计" : "待审计"}
+                  tone={protocolTone(protocol)}
+                />
+              </div>
+              <div className="panel-body diagnostics-kv-list">
+                <div className="diagnostics-kv-row">
+                  <span>数据面</span>
+                  <strong>{protocol.data_plane}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>握手</span>
+                  <strong className="text-mono">{protocol.handshake}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>加密 / KDF</span>
+                  <strong>{protocol.aead} · {protocol.hash_kdf}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>设备身份</span>
+                  <strong>{protocol.device_identity}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>WG / TURN 兼容</span>
+                  <strong>
+                    {boolLabel(protocol.wireguard_interop)} / {boolLabel(protocol.turn_compatible)}
+                  </strong>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {mtu && (
+            <section className="panel-section">
+              <div className="panel-header">
+                <h3>MTU 策略</h3>
+                <StatusPill
+                  label={mtuTone(mtu, daemon) === "ok" ? "正常" : "需关注"}
+                  tone={mtuTone(mtu, daemon)}
+                />
+              </div>
+              <div className="panel-body diagnostics-kv-list">
+                <div className="diagnostics-kv-row">
+                  <span>运行 MTU</span>
+                  <strong>{mtu.configured_mtu}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>Profile</span>
+                  <strong>{mtu.profile}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>Relay-safe / WG-like</span>
+                  <strong>{mtu.relay_safe_mtu} / {mtu.wireguard_style_mtu}</strong>
+                </div>
+                <div className="diagnostics-kv-row">
+                  <span>自动 PMTU</span>
+                  <strong>{boolLabel(mtu.automatic_pmtu)}</strong>
+                </div>
+                {daemon && mtu.configured_mtu !== daemon.mtu && (
+                  <div className="diagnostics-kv-row text-warning">
+                    <span>配置漂移</span>
+                    <strong>配置 {daemon.mtu}，运行中 {mtu.configured_mtu}</strong>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
         </div>
       )}
 

@@ -81,6 +81,17 @@ func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("CreateSignal: HTTP %d %s", recorder.Code, recorder.Body.String())
 	}
+	var created struct {
+		Success         bool            `json:"success"`
+		ProtocolVersion int64           `json:"protocol_version"`
+		Signal          database.Signal `json:"signal"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created signal: %v", err)
+	}
+	if !created.Success || created.ProtocolVersion != database.SignalProtocolVersion || created.Signal.ProtocolVersion != database.SignalProtocolVersion {
+		t.Fatalf("unexpected created signal version: %+v", created)
+	}
 
 	_, payload, err := conn.ReadMessage()
 	if err != nil {
@@ -110,7 +121,8 @@ func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) 
 		t.Fatalf("ListSignals: HTTP %d %s", listRecorder.Code, listRecorder.Body.String())
 	}
 	var listed struct {
-		Signals []database.Signal `json:"signals"`
+		Signals         []database.Signal `json:"signals"`
+		ProtocolVersion int64             `json:"protocol_version"`
 	}
 	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode listed signals: %v", err)
@@ -118,8 +130,64 @@ func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) 
 	if len(listed.Signals) != 1 || listed.Signals[0].FromNodeID != source.ID {
 		t.Fatalf("durable signal missing after WebSocket wake: %+v", listed.Signals)
 	}
+	if listed.ProtocolVersion != database.SignalProtocolVersion || listed.Signals[0].ProtocolVersion != database.SignalProtocolVersion {
+		t.Fatalf("unexpected listed signal version: %+v", listed)
+	}
 	if listed.Signals[0].SessionID != "sess-api-1" || listed.Signals[0].ProbeEphemeralPublicKey != probeEphemeralPublicKey {
 		t.Fatalf("expected session key material to round trip, got %+v", listed.Signals[0])
+	}
+}
+
+func TestCreateSignalRejectsUnsupportedProtocolVersion(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-version@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-version-source-key", "source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-version-target-key", "target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	apiServer := NewServer(nil, nil, db)
+	body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","protocol_version":99,"candidates":["203.0.113.10:51820"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    source.UserID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	recorder := httptest.NewRecorder()
+	apiServer.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("CreateSignal: got HTTP %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	var response struct {
+		Error                    string `json:"error"`
+		ErrorCode                string `json:"error_code"`
+		SupportedProtocolVersion int64  `json:"supported_protocol_version"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.ErrorCode != "unsupported_signal_protocol_version" || response.SupportedProtocolVersion != database.SignalProtocolVersion {
+		t.Fatalf("unexpected error response: %+v", response)
+	}
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("unsupported signal version should not be persisted: %+v", signals)
 	}
 }
 

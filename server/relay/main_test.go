@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +35,12 @@ func testConfig() *RelayConfig {
 
 func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 	t.Helper()
+	_, addr, cleanup := startTestServerWithInstance(t, config)
+	return addr, cleanup
+}
+
+func startTestServerWithInstance(t *testing.T, config *RelayConfig) (*RelayServer, string, func()) {
+	t.Helper()
 	server, err := NewRelayServer(config)
 	if err != nil {
 		t.Fatalf("failed to start relay server: %v", err)
@@ -45,7 +52,26 @@ func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 		_ = server.Close()
 	}
 
-	return server.Addr().String(), cleanup
+	return server, server.Addr().String(), cleanup
+}
+
+func readTestFrame(t *testing.T, conn net.Conn) (byte, []byte) {
+	t.Helper()
+	header := make([]byte, frameHeader)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatalf("read frame header: %v", err)
+	}
+	if string(header[:4]) != string(magic) {
+		t.Fatalf("unexpected frame magic: %q", string(header[:4]))
+	}
+	length := int(binary.BigEndian.Uint16(header[6:8]))
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			t.Fatalf("read frame payload: %v", err)
+		}
+	}
+	return header[5], payload
 }
 
 func TestEnvValidation(t *testing.T) {
@@ -86,6 +112,31 @@ func TestConfigValidation(t *testing.T) {
 	_, err = parseConfig([]string{"-require-auth=false", "-revocation-feed-url=https://control.example.test/api/v1/relay/revocations"})
 	if err == nil {
 		t.Fatal("expected error when revocation feed URL is configured without token")
+	}
+}
+
+func TestAuthFailureRateLimitConfigValidation(t *testing.T) {
+	cfg, err := parseConfig([]string{"-require-auth=false", "-auth-failure-limit=7", "-auth-failure-window=2m"})
+	if err != nil {
+		t.Fatalf("unexpected parsing error: %v", err)
+	}
+	if cfg.AuthFailureLimit != 7 || cfg.AuthFailureWindow != 2*time.Minute {
+		t.Fatalf("unexpected auth failure limit config: %+v", cfg)
+	}
+
+	if _, err := parseConfig([]string{"-require-auth=false", "-auth-failure-limit=-1"}); err == nil {
+		t.Fatal("expected error for negative auth failure limit")
+	}
+	if _, err := parseConfig([]string{"-require-auth=false", "-auth-failure-limit=1", "-auth-failure-window=0s"}); err == nil {
+		t.Fatal("expected error for enabled auth failure limit with zero window")
+	}
+
+	cfg, err = parseConfig([]string{"-require-auth=false", "-auth-failure-limit=0", "-auth-failure-window=0s"})
+	if err != nil {
+		t.Fatalf("disabled auth failure limiter should allow zero window: %v", err)
+	}
+	if cfg.AuthFailureLimit != 0 {
+		t.Fatalf("expected disabled auth failure limiter, got %d", cfg.AuthFailureLimit)
 	}
 }
 
@@ -442,6 +493,78 @@ func signRelayTicketForTest(t *testing.T, privateKey ed25519.PrivateKey, kid, jt
 	return signed
 }
 
+func TestAuthFailuresAreRateLimitedBySource(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	const kid = "kid-rate-limit"
+	keyringJSON, err := json.Marshal(map[string]string{kid: hex.EncodeToString(pub)})
+	if err != nil {
+		t.Fatalf("Marshal keyring: %v", err)
+	}
+
+	config := testConfig()
+	config.Bind = "127.0.0.1:0"
+	config.RequireAuthentication = true
+	config.AllowLegacyUnauthenticated = false
+	config.TicketKeyringJSON = string(keyringJSON)
+	config.RelayAudience = "relay-test"
+	config.RelayRegion = "test-region"
+	config.AuthFailureLimit = 2
+	config.AuthFailureWindow = time.Minute
+	server, addr, cleanup := startTestServerWithInstance(t, config)
+	defer cleanup()
+
+	for i := 0; i < 2; i++ {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial failure %d: %v", i, err)
+		}
+		_, _ = conn.Write(makeFrame(msgRegister, []byte("legacy-node")))
+		typ, payload := readTestFrame(t, conn)
+		_ = conn.Close()
+		if typ != msgError {
+			t.Fatalf("expected auth error frame, got type=%d payload=%v", typ, payload)
+		}
+		if got := binary.BigEndian.Uint16(payload[:2]); got != errAuthRequired {
+			t.Fatalf("expected auth-required code %d, got %d", errAuthRequired, got)
+		}
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial rate-limited source: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	typ, payload := readTestFrame(t, conn)
+	if typ != msgError {
+		t.Fatalf("expected rate-limit error frame, got type=%d payload=%v", typ, payload)
+	}
+	if got := binary.BigEndian.Uint16(payload[:2]); got != errAuthRateLimited {
+		t.Fatalf("expected auth-rate-limited code %d, got %d", errAuthRateLimited, got)
+	}
+
+	stats := server.Stats()
+	if stats.AuthFailuresTotal != 3 || stats.AuthRateLimitedTotal != 1 {
+		t.Fatalf("unexpected auth failure stats: %+v", stats)
+	}
+	if len(stats.AuthFailureSources) != 1 {
+		t.Fatalf("expected one auth failure source snapshot, got %+v", stats.AuthFailureSources)
+	}
+	source := stats.AuthFailureSources[0]
+	if source.Failures != 2 || source.RateLimited != 1 {
+		t.Fatalf("unexpected source counters: %+v", source)
+	}
+	if len(source.SourceKey) != 16 || strings.ContainsAny(source.SourceKey, ".:") {
+		t.Fatalf("source key should be a short hash, got %q", source.SourceKey)
+	}
+	if source.WindowResetUnix <= time.Now().Unix() {
+		t.Fatalf("expected future window reset, got %+v", source)
+	}
+}
+
 func TestSendQueueFullBackpressure(t *testing.T) {
 	config := testConfig()
 	config.SendQueueCapacity = 1
@@ -664,6 +787,75 @@ func TestOutboundFrameSizeBoundary(t *testing.T) {
 	code := binary.BigEndian.Uint16(buf[8:10])
 	if code != 4006 {
 		t.Errorf("expected 4006, got %d", code)
+	}
+}
+
+func TestRelayStatsTrackRegistrationLimitsAndForwarding(t *testing.T) {
+	config := testConfig()
+	config.MaxConnections = 2
+	server, addr, cleanup := startTestServerWithInstance(t, config)
+	defer cleanup()
+
+	bob, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial bob: %v", err)
+	}
+	defer bob.Close()
+	_, _ = bob.Write(makeFrame(msgRegister, []byte("bob")))
+	typ, payload := readTestFrame(t, bob)
+	if typ != msgRegistered || string(payload) != "bob" {
+		t.Fatalf("unexpected bob registration frame: type=%d payload=%q", typ, string(payload))
+	}
+
+	alice, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial alice: %v", err)
+	}
+	defer alice.Close()
+	_, _ = alice.Write(makeFrame(msgRegister, []byte("alice")))
+	typ, payload = readTestFrame(t, alice)
+	if typ != msgRegistered || string(payload) != "alice" {
+		t.Fatalf("unexpected alice registration frame: type=%d payload=%q", typ, string(payload))
+	}
+
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial extra: %v", err)
+	}
+	defer extra.Close()
+	typ, payload = readTestFrame(t, extra)
+	if typ != msgError || binary.BigEndian.Uint16(payload[:2]) != 4005 {
+		t.Fatalf("expected connection-limit error, got type=%d payload=%v", typ, payload)
+	}
+
+	forward := func(dst string, data []byte) []byte {
+		payload := make([]byte, 1+len(dst)+len(data))
+		payload[0] = byte(len(dst))
+		copy(payload[1:], dst)
+		copy(payload[1+len(dst):], data)
+		return payload
+	}
+
+	_, _ = alice.Write(makeFrame(msgForward, forward("bob", []byte("hello"))))
+	typ, payload = readTestFrame(t, bob)
+	if typ != msgReceived {
+		t.Fatalf("expected received frame for bob, got type=%d payload=%v", typ, payload)
+	}
+	_, _ = alice.Write(makeFrame(msgForward, forward("missing", []byte("hello"))))
+	typ, payload = readTestFrame(t, alice)
+	if typ != msgError || binary.BigEndian.Uint16(payload[:2]) != 404 {
+		t.Fatalf("expected peer-not-found error, got type=%d payload=%v", typ, payload)
+	}
+
+	stats := server.Stats()
+	if stats.AcceptedConnectionsTotal != 2 || stats.RejectedConnectionsTotal != 1 {
+		t.Fatalf("unexpected connection stats: %+v", stats)
+	}
+	if stats.LegacyRegistrationsTotal != 2 || stats.RegisteredPeers != 2 {
+		t.Fatalf("unexpected registration stats: %+v", stats)
+	}
+	if stats.ForwardedFramesTotal != 1 || stats.ForwardErrorsTotal != 1 {
+		t.Fatalf("unexpected forwarding stats: %+v", stats)
 	}
 }
 

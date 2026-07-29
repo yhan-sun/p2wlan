@@ -399,6 +399,27 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_window_accepts_edge_and_rejects_old_counter() {
+        let (mut sender, mut receiver) = establish_session();
+        let messages: Vec<_> = (0..=64)
+            .map(|counter| {
+                sender
+                    .encrypt(format!("packet-{counter}").as_bytes())
+                    .unwrap()
+            })
+            .collect();
+
+        let newest = receiver.decrypt(&messages[64]).unwrap();
+        assert_eq!(&newest, b"packet-64");
+
+        let edge = receiver.decrypt(&messages[1]).unwrap();
+        assert_eq!(&edge, b"packet-1");
+
+        let too_old = receiver.decrypt(&messages[0]);
+        assert!(matches!(too_old, Err(WireGuardError::ReplayDetected(0))));
+    }
+
+    #[test]
     fn test_wrong_receiver_index() {
         let (mut sender, mut receiver) = establish_session();
 
