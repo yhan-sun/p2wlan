@@ -82,9 +82,9 @@ use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
 };
 use peer::{
-    ConnectionState, NetworkPath, PeerManager, REASON_DIRECT_PROBE_FAILED,
-    REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
-    REASON_PATH_DIRECT_TRIAL,
+    ConnectionState, NetworkPath, PeerManager, DIRECT_RETRY_BASE_INTERVAL,
+    REASON_DIRECT_PROBE_FAILED, REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT,
+    REASON_NETWORK_GENERATION_CHANGED, REASON_PATH_DIRECT_TRIAL,
 };
 use port_mapping::PortMappingManager;
 use relay::{
@@ -261,6 +261,7 @@ const RELAY_PEER_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-relay-validation";
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.
 const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
+const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Default)]
 struct PunchAttemptDeduplicator {
@@ -269,9 +270,14 @@ struct PunchAttemptDeduplicator {
 
 impl PunchAttemptDeduplicator {
     async fn claim(&self, peer_id: &str) -> bool {
+        self.claim_with_window(peer_id, PUNCH_SESSION_DEDUP_WINDOW)
+            .await
+    }
+
+    async fn claim_with_window(&self, peer_id: &str, window: Duration) -> bool {
         let now = Instant::now();
         let mut starts = self.recent_starts.lock().await;
-        starts.retain(|_, started| now.duration_since(*started) < PUNCH_SESSION_DEDUP_WINDOW);
+        starts.retain(|_, started| now.duration_since(*started) < window);
         if starts.contains_key(peer_id) {
             return false;
         }
@@ -558,7 +564,6 @@ impl Daemon {
         let upnp_enabled = self.config.network.upnp_enabled;
         let socket_pool_enabled = self.config.network.socket_pool_enabled;
         let socket_pool_size = self.config.network.socket_pool_size;
-        let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let punch_attempts = self.config.network.punch_attempts;
@@ -585,7 +590,7 @@ impl Daemon {
                     self.peers.clone(),
                     self.udp_transport.clone(),
                     self.punch_attempts.clone(),
-                    fallback_timeout,
+                    DIRECT_RETRY_BASE_INTERVAL,
                     punch_interval,
                     punch_attempts.clamp(1, 3),
                 ),
@@ -4145,15 +4150,32 @@ async fn run_direct_probe_loop(
         };
 
         for (peer_id, candidates) in peers.direct_probe_targets_due(retry_after).await {
-            if !punch_deduplicator.claim(&peer_id).await {
+            let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
+            let dedup_window = if reclaim_active {
+                DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW
+            } else {
+                PUNCH_SESSION_DEDUP_WINDOW
+            };
+            if !punch_deduplicator
+                .claim_with_window(&peer_id, dedup_window)
+                .await
+            {
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "retry_punch_suppressed",
+                        if reclaim_active {
+                            "direct_reclaim_punch_suppressed"
+                        } else {
+                            "retry_punch_suppressed"
+                        },
                         candidates.first().copied(),
                         Some(candidates.len()),
                         None,
-                        "suppressed overlapping UDP retry session for this peer",
+                        if reclaim_active {
+                            "suppressed overlapping UDP Direct reclaim session for this peer"
+                        } else {
+                            "suppressed overlapping UDP retry session for this peer"
+                        },
                     )
                     .await;
                 continue;
@@ -4163,18 +4185,48 @@ async fn run_direct_probe_loop(
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
+                let punch_started_stage = if reclaim_active {
+                    "direct_reclaim_punch_started"
+                } else {
+                    "retry_punch_started"
+                };
+                let probes_sent_stage = if reclaim_active {
+                    "direct_reclaim_probes_sent"
+                } else {
+                    "retry_probes_sent"
+                };
+                let ack_timeout_stage = if reclaim_active {
+                    "direct_reclaim_ack_timeout"
+                } else {
+                    "retry_ack_timeout"
+                };
+                let probe_succeeded_stage = if reclaim_active {
+                    "direct_reclaim_probe_succeeded"
+                } else {
+                    "retry_probe_succeeded"
+                };
+                let send_error_stage = if reclaim_active {
+                    "direct_reclaim_send_error"
+                } else {
+                    "retry_send_error"
+                };
+                let retry_label = if reclaim_active {
+                    "generation-change Direct reclaim"
+                } else {
+                    "background UDP retry"
+                };
                 let success_count_before = peers
                     .direct_probe_success_count_for_generation(&peer_id, generation)
                     .await;
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "retry_punch_started",
+                        punch_started_stage,
                         candidates.first().copied(),
                         Some(candidates.len()),
                         None,
                         format!(
-                            "starting background UDP retry across {} candidates",
+                            "starting {retry_label} across {} candidates",
                             candidates.len()
                         ),
                     )
@@ -4188,11 +4240,11 @@ async fn run_direct_probe_loop(
                         peers
                             .record_direct_event(
                                 &peer_id,
-                                "retry_probes_sent",
+                                probes_sent_stage,
                                 candidates.first().copied(),
                                 Some(candidates.len()),
                                 Some(sent),
-                                format!("sent {sent} background retry probes"),
+                                format!("sent {sent} {retry_label} probes"),
                             )
                             .await;
                         sleep(direct_probe_ack_grace(probe_interval)).await;
@@ -4203,11 +4255,13 @@ async fn run_direct_probe_loop(
                             peers
                                 .record_direct_event(
                                     &peer_id,
-                                    "retry_ack_timeout",
+                                    ack_timeout_stage,
                                     candidates.first().copied(),
                                     Some(candidates.len()),
                                     Some(sent),
-                                    format!("no direct probe ACK after {sent} retry probes"),
+                                    format!(
+                                        "no direct probe ACK after {sent} {retry_label} probes"
+                                    ),
                                 )
                                 .await;
                             peers
@@ -4215,7 +4269,9 @@ async fn run_direct_probe_loop(
                                     &peer_id,
                                     generation,
                                     REASON_DIRECT_PROBE_FAILED,
-                                    format!("no direct probe ACK after {sent} retry probes"),
+                                    format!(
+                                        "no direct probe ACK after {sent} {retry_label} probes"
+                                    ),
                                 )
                                 .await;
                             debug!("Direct UDP retry probes for peer {peer_id} received no ACK");
@@ -4223,11 +4279,13 @@ async fn run_direct_probe_loop(
                             peers
                                 .record_direct_event(
                                     &peer_id,
-                                    "retry_probe_succeeded",
+                                    probe_succeeded_stage,
                                     candidates.first().copied(),
                                     Some(candidates.len()),
                                     Some(sent),
-                                    "background UDP retry received an ACK; awaiting encrypted validation",
+                                    format!(
+                                        "{retry_label} received an ACK; awaiting encrypted validation"
+                                    ),
                                 )
                                 .await;
                             debug!(
@@ -4239,11 +4297,11 @@ async fn run_direct_probe_loop(
                         peers
                             .record_direct_event(
                                 &peer_id,
-                                "retry_send_error",
+                                send_error_stage,
                                 candidates.first().copied(),
                                 Some(candidates.len()),
                                 None,
-                                format!("direct retry failed: {err}"),
+                                format!("{retry_label} failed: {err}"),
                             )
                             .await;
                         peers
@@ -4251,7 +4309,7 @@ async fn run_direct_probe_loop(
                                 &peer_id,
                                 generation,
                                 REASON_DIRECT_PROBE_FAILED,
-                                format!("direct retry failed: {err}"),
+                                format!("{retry_label} failed: {err}"),
                             )
                             .await;
                         warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");

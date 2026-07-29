@@ -27,10 +27,31 @@ pub struct ControlAuthSession {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDeviceRequest {
+    pub control_server: String,
+    pub auth_token: String,
+    pub device_id: String,
+    pub device_name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDeviceResponse {
+    pub device_name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ControlAuthResponse {
     success: Option<bool>,
     token: Option<String>,
     user: Option<ControlAuthUser>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ControlRenameResponse {
+    success: Option<bool>,
     error: Option<String>,
 }
 
@@ -161,6 +182,75 @@ pub async fn authenticate(req: ControlAuthRequest) -> Result<ControlAuthSession,
         token,
         user: body.user,
         control_server,
+    })
+}
+
+pub async fn rename_device(req: RenameDeviceRequest) -> Result<RenameDeviceResponse, String> {
+    let control_server = normalize_control_server(&req.control_server)?;
+    let auth_token = req.auth_token.trim();
+    if auth_token.is_empty() {
+        return Err("登录状态已失效，请重新登录".to_string());
+    }
+    let device_id = req.device_id.trim();
+    if device_id.is_empty() {
+        return Err("设备标识不能为空".to_string());
+    }
+    let device_name = req.device_name.trim();
+    if device_name.is_empty() {
+        return Err("设备名称不能为空".to_string());
+    }
+    if device_name.chars().count() > 128 {
+        return Err("设备名称不能超过 128 个字符".to_string());
+    }
+
+    let endpoint = format!(
+        "{}/api/v1/devices/{}",
+        control_server,
+        url::form_urlencoded::byte_serialize(device_id.as_bytes()).collect::<String>()
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("初始化控制面请求失败：{e}"))?;
+
+    let res = client
+        .patch(endpoint)
+        .bearer_auth(auth_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&serde_json::json!({ "device_name": device_name }))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "连接控制服务器超时".to_string()
+            } else if e.is_connect() {
+                "无法连接控制服务器，请检查网络后重试".to_string()
+            } else {
+                format!("控制服务器请求失败：{e}")
+            }
+        })?;
+
+    let status = res.status();
+    let body_text = res
+        .text()
+        .await
+        .map_err(|e| format!("读取控制服务器响应失败：{e}"))?;
+    let body = serde_json::from_str::<ControlRenameResponse>(&body_text).ok();
+
+    if !status.is_success() || body.as_ref().and_then(|b| b.success) != Some(true) {
+        let message = match status.as_u16() {
+            401 | 403 => "当前账号没有权限修改该设备".to_string(),
+            404 => "控制服务器暂不支持设备重命名，请先更新服务端".to_string(),
+            _ => body
+                .and_then(|b| b.error)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| "设备名称保存失败".to_string()),
+        };
+        return Err(message);
+    }
+
+    Ok(RenameDeviceResponse {
+        device_name: device_name.to_string(),
     })
 }
 

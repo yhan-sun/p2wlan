@@ -6,7 +6,9 @@ mod daemon_manager;
 mod permissions;
 mod tray;
 
-use control_auth::{ControlAuthRequest, ControlAuthSession};
+use control_auth::{
+    ControlAuthRequest, ControlAuthSession, RenameDeviceRequest, RenameDeviceResponse,
+};
 use daemon_manager::{DaemonManager, DaemonOperationStatus, DaemonStartOptions, DesktopStatus};
 use std::path::PathBuf;
 use tauri::{Manager, State};
@@ -71,6 +73,13 @@ async fn daemon_stop(
 #[tauri::command]
 async fn control_authenticate(request: ControlAuthRequest) -> Result<ControlAuthSession, String> {
     control_auth::authenticate(request).await
+}
+
+#[tauri::command]
+async fn control_rename_device(
+    request: RenameDeviceRequest,
+) -> Result<RenameDeviceResponse, String> {
+    control_auth::rename_device(request).await
 }
 
 #[tauri::command]
@@ -176,6 +185,7 @@ fn main() {
             daemon_start_elevated,
             daemon_stop,
             control_authenticate,
+            control_rename_device,
             open_logs,
             daemon_log_tail,
             permission_status,
