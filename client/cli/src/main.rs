@@ -554,6 +554,11 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             "relay-only"
         }
     );
+    println!(
+        "STUN config：{}",
+        stun_config_summary(&config.network.stun_servers)
+    );
+    suggestions.extend(stun_config_suggestions(&config.network.stun_servers));
 
     if let Ok(bind) = config.network.udp_bind.parse::<SocketAddr>() {
         if bind.port() == 0 {
@@ -1160,6 +1165,42 @@ fn udp_socket_pool_summary(snapshot: &Value) -> Option<String> {
         Some(members) => format!("sockets={socket_count} {state} {members}"),
         None => format!("sockets={socket_count} {state}"),
     })
+}
+
+fn stun_config_summary(servers: &[String]) -> String {
+    let configured = configured_stun_servers(servers);
+    if servers.is_empty() {
+        "default public STUN set".to_string()
+    } else if configured.is_empty() {
+        "disabled".to_string()
+    } else {
+        format!("{} configured ({})", configured.len(), configured.join(","))
+    }
+}
+
+fn stun_config_suggestions(servers: &[String]) -> Vec<String> {
+    let configured = configured_stun_servers(servers);
+    if !servers.is_empty() && configured.is_empty() {
+        return vec![
+            "STUN 已禁用；跨 NAT 直连将主要依赖手动 udp-advertise、端口映射或 Relay。".to_string(),
+        ];
+    }
+    if configured.len() == 1 {
+        return vec![
+            "当前只配置了 1 个 STUN 观测点；建议至少配置 2 个不同网络的 STUN server，才能更可靠地区分端口相关/对称 NAT。"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+fn configured_stun_servers(servers: &[String]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|server| server.trim())
+        .filter(|server| !is_clear_value(server))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn nat_profile_summary(snapshot: &Value) -> Option<String> {
@@ -3019,6 +3060,33 @@ mod tests {
             udp_socket_pool_summary(&snapshot).as_deref(),
             Some("sockets=3 active #0 p=12 ack=2/3 stun=0 enc=4/5 #1 p=12 ack=1/0 stun=0 enc=2/1")
         );
+    }
+
+    #[test]
+    fn stun_config_summary_and_suggestions_explain_observer_quality() {
+        assert_eq!(stun_config_summary(&[]), "default public STUN set");
+        assert!(stun_config_suggestions(&[]).is_empty());
+
+        let disabled = vec!["off".to_string()];
+        assert_eq!(stun_config_summary(&disabled), "disabled");
+        assert!(stun_config_suggestions(&disabled)
+            .iter()
+            .any(|item| item.contains("STUN 已禁用")));
+
+        let single = vec!["stun.example.com:3478".to_string()];
+        assert_eq!(
+            stun_config_summary(&single),
+            "1 configured (stun.example.com:3478)"
+        );
+        assert!(stun_config_suggestions(&single)
+            .iter()
+            .any(|item| item.contains("至少配置 2 个")));
+
+        let multiple = vec![
+            "stun-a.example.com:3478".to_string(),
+            "stun-b.example.com:3478".to_string(),
+        ];
+        assert!(stun_config_suggestions(&multiple).is_empty());
     }
 
     #[test]
