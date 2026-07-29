@@ -79,9 +79,9 @@ impl MessageInitiation {
 
     /// Deserialize from wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < INITIALIZATION_MSG_SIZE {
+        if data.len() != INITIALIZATION_MSG_SIZE {
             return Err(WireGuardError::InvalidPacket(format!(
-                "initiation message too short: {} < {}",
+                "initiation message invalid length: {} != {}",
                 data.len(),
                 INITIALIZATION_MSG_SIZE
             )));
@@ -166,9 +166,9 @@ impl MessageResponse {
 
     /// Deserialize from wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < RESPONSE_MSG_SIZE {
+        if data.len() != RESPONSE_MSG_SIZE {
             return Err(WireGuardError::InvalidPacket(format!(
-                "response message too short: {} < {}",
+                "response message invalid length: {} != {}",
                 data.len(),
                 RESPONSE_MSG_SIZE
             )));
@@ -340,8 +340,8 @@ impl SessionKeys {
 impl std::fmt::Debug for SessionKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionKeys")
-            .field("send_key", &hex::encode(self.send_key))
-            .field("recv_key", &hex::encode(self.recv_key))
+            .field("send_key", &"[redacted]")
+            .field("recv_key", &"[redacted]")
             .field("send_counter", &self.send_counter)
             .field("recv_counter", &self.recv_counter)
             .finish()
@@ -374,6 +374,18 @@ mod tests {
     }
 
     #[test]
+    fn test_session_keys_debug_redacts_keys() {
+        let keys = SessionKeys::new([0xAB; 32], [0xCD; 32]);
+
+        let debug = format!("{keys:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&hex::encode(keys.send_key)));
+        assert!(!debug.contains(&hex::encode(keys.recv_key)));
+        assert!(debug.contains("send_counter"));
+        assert!(debug.contains("recv_counter"));
+    }
+
+    #[test]
     fn test_response_roundtrip() {
         let msg = MessageResponse {
             sender_index: 0xAAAAAAAA,
@@ -391,6 +403,87 @@ mod tests {
         assert_eq!(decoded.sender_index, 0xAAAAAAAA);
         assert_eq!(decoded.receiver_index, 0xBBBBBBBB);
         assert_eq!(decoded.ephemeral, [0x42; 32]);
+    }
+
+    #[test]
+    fn test_fixed_handshake_messages_reject_trailing_bytes() {
+        let init = MessageInitiation {
+            sender_index: 0x12345678,
+            ephemeral: [0xAB; 32],
+            encrypted_static: [0xCD; 48],
+            encrypted_timestamp: [0xEF; 28],
+            mac1: [0x11; 16],
+            mac2: [0x22; 16],
+        };
+        let mut init_bytes = init.to_bytes();
+        init_bytes.push(0xFF);
+        assert!(matches!(
+            MessageInitiation::from_bytes(&init_bytes),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+
+        let response = MessageResponse {
+            sender_index: 0xAAAAAAAA,
+            receiver_index: 0xBBBBBBBB,
+            ephemeral: [0x42; 32],
+            encrypted_empty: [0x99; 16],
+            mac1: [0x33; 16],
+            mac2: [0x44; 16],
+        };
+        let mut response_bytes = response.to_bytes();
+        response_bytes.push(0xFF);
+        assert!(matches!(
+            MessageResponse::from_bytes(&response_bytes),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
+    fn test_fixed_handshake_messages_reject_truncated_bytes() {
+        let init_bytes = vec![TYPE_INITIALIZATION; INITIALIZATION_MSG_SIZE - 1];
+        assert!(matches!(
+            MessageInitiation::from_bytes(&init_bytes),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+
+        let response_bytes = vec![TYPE_RESPONSE; RESPONSE_MSG_SIZE - 1];
+        assert!(matches!(
+            MessageResponse::from_bytes(&response_bytes),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
+    fn test_handshake_messages_reject_wrong_type() {
+        let init = MessageInitiation {
+            sender_index: 0x12345678,
+            ephemeral: [0xAB; 32],
+            encrypted_static: [0xCD; 48],
+            encrypted_timestamp: [0xEF; 28],
+            mac1: [0x11; 16],
+            mac2: [0x22; 16],
+        };
+        let mut init_bytes = init.to_bytes();
+        init_bytes[0] = TYPE_RESPONSE;
+        assert!(matches!(
+            MessageInitiation::from_bytes(&init_bytes),
+            Err(WireGuardError::InvalidMessageType(TYPE_RESPONSE))
+        ));
+
+        let response = MessageResponse {
+            sender_index: 0xAAAAAAAA,
+            receiver_index: 0xBBBBBBBB,
+            ephemeral: [0x42; 32],
+            encrypted_empty: [0x99; 16],
+            mac1: [0x33; 16],
+            mac2: [0x44; 16],
+        };
+        let mut response_bytes = response.to_bytes();
+        response_bytes[0] = TYPE_INITIALIZATION;
+        assert!(matches!(
+            MessageResponse::from_bytes(&response_bytes),
+            Err(WireGuardError::InvalidMessageType(TYPE_INITIALIZATION))
+        ));
     }
 
     #[test]

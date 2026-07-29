@@ -46,7 +46,7 @@ pub struct Config {
 }
 
 /// Node identity configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// This node's ID (hex, derived from public key).
     pub node_id: String,
@@ -66,6 +66,31 @@ pub struct NodeConfig {
     /// Ed25519 private key (hex) — do NOT log this value.
     #[serde(default)]
     pub ed25519_private_key: String,
+}
+
+fn redacted_presence(value: &str) -> &'static str {
+    if value.trim().is_empty() {
+        "[empty]"
+    } else {
+        "[redacted]"
+    }
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("node_id", &self.node_id)
+            .field("public_key", &self.public_key)
+            .field("private_key", &redacted_presence(&self.private_key))
+            .field("device_name", &self.device_name)
+            .field("platform", &self.platform)
+            .field("ed25519_public_key", &self.ed25519_public_key)
+            .field(
+                "ed25519_private_key",
+                &redacted_presence(&self.ed25519_private_key),
+            )
+            .finish()
+    }
 }
 
 fn default_device_name() -> String {
@@ -178,7 +203,7 @@ fn default_socket_pool_size() -> usize {
 }
 
 /// Control plane server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
     /// Control server URL (e.g. "https://control.p2pnet.io:443").
     pub server_url: String,
@@ -197,6 +222,22 @@ pub struct ControlConfig {
     /// Heartbeat interval in seconds.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
+}
+
+impl std::fmt::Debug for ControlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlConfig")
+            .field("server_url", &self.server_url)
+            .field("auth_token", &redacted_presence(&self.auth_token))
+            .field(
+                "device_credential",
+                &redacted_presence(&self.device_credential),
+            )
+            .field("credential_issued", &self.credential_issued)
+            .field("reconnect_interval_secs", &self.reconnect_interval_secs)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .finish()
+    }
 }
 
 fn default_reconnect_interval() -> u64 {
@@ -594,6 +635,22 @@ mod tests {
             decoded.relay.selection_timeout_ms,
             config.relay.selection_timeout_ms
         );
+    }
+
+    #[test]
+    fn test_config_debug_redacts_sensitive_values() {
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.control.auth_token = "jwt-secret-token".to_string();
+        config.control.device_credential = "dc-secret-token".to_string();
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("node_id"));
+        assert!(debug.contains("server_url"));
+        assert!(!debug.contains(&config.node.private_key));
+        assert!(!debug.contains(&config.node.ed25519_private_key));
+        assert!(!debug.contains(&config.control.auth_token));
+        assert!(!debug.contains(&config.control.device_credential));
     }
 
     #[test]

@@ -82,9 +82,9 @@ use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
 };
 use peer::{
-    ConnectionState, NetworkPath, PeerManager, REASON_DIRECT_PROBE_FAILED,
-    REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT, REASON_NETWORK_GENERATION_CHANGED,
-    REASON_PATH_DIRECT_TRIAL,
+    ConnectionState, NetworkPath, PeerManager, DIRECT_RETRY_BASE_INTERVAL,
+    REASON_DIRECT_PROBE_FAILED, REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT,
+    REASON_NETWORK_GENERATION_CHANGED, REASON_PATH_DIRECT_TRIAL,
 };
 use port_mapping::PortMappingManager;
 use relay::{
@@ -261,6 +261,7 @@ const RELAY_PEER_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-relay-validation";
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.
 const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
+const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Default)]
 struct PunchAttemptDeduplicator {
@@ -269,9 +270,14 @@ struct PunchAttemptDeduplicator {
 
 impl PunchAttemptDeduplicator {
     async fn claim(&self, peer_id: &str) -> bool {
+        self.claim_with_window(peer_id, PUNCH_SESSION_DEDUP_WINDOW)
+            .await
+    }
+
+    async fn claim_with_window(&self, peer_id: &str, window: Duration) -> bool {
         let now = Instant::now();
         let mut starts = self.recent_starts.lock().await;
-        starts.retain(|_, started| now.duration_since(*started) < PUNCH_SESSION_DEDUP_WINDOW);
+        starts.retain(|_, started| now.duration_since(*started) < window);
         if starts.contains_key(peer_id) {
             return false;
         }
@@ -558,7 +564,6 @@ impl Daemon {
         let upnp_enabled = self.config.network.upnp_enabled;
         let socket_pool_enabled = self.config.network.socket_pool_enabled;
         let socket_pool_size = self.config.network.socket_pool_size;
-        let fallback_timeout = Duration::from_millis(self.config.relay.fallback_timeout_ms);
         let prefer_direct = self.config.relay.prefer_direct;
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let punch_attempts = self.config.network.punch_attempts;
@@ -584,8 +589,9 @@ impl Daemon {
                 run_direct_probe_loop(
                     self.peers.clone(),
                     self.udp_transport.clone(),
+                    self.local_candidates.clone(),
                     self.punch_attempts.clone(),
-                    fallback_timeout,
+                    DIRECT_RETRY_BASE_INTERVAL,
                     punch_interval,
                     punch_attempts.clamp(1, 3),
                 ),
@@ -979,6 +985,9 @@ impl Daemon {
                         tick.tick().await;
                         let conns = peers.all_connections().await;
                         for conn in conns {
+                            if !conn.online {
+                                continue;
+                            }
                             // Establish missing sessions and refresh sessions that need rekey.
                             let has_session = transport.has_session(&conn.node_id).await;
                             let needs = transport.session_needs_rekey(&conn.node_id).await;
@@ -1289,33 +1298,59 @@ impl Daemon {
                     );
                     self.peers.add_peer(&peer_info).await;
 
-                    match self.maybe_initiate_handshake(&peer_info).await {
-                        Ok(punch_at_ms) => {
-                            self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
+                    if peer_info.online {
+                        match self.maybe_initiate_handshake(&peer_info).await {
+                            Ok(punch_at_ms) => {
+                                self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to initiate WireGuard handshake with {}: {err}",
+                                    peer_info.node_id
+                                );
+                                self.start_hole_punch(&peer_info.node_id).await;
+                            }
                         }
-                        Err(err) => {
-                            warn!(
-                                "Failed to initiate WireGuard handshake with {}: {err}",
-                                peer_info.node_id
-                            );
-                            self.start_hole_punch(&peer_info.node_id).await;
-                        }
-                    }
 
-                    if self.dns.is_enabled() {
-                        self.dns
-                            .register(
-                                &peer_info.node_id,
-                                &peer_info.virtual_ip,
-                                Some(&peer_info.node_id),
-                            )
-                            .await;
+                        if self.dns.is_enabled() {
+                            self.dns
+                                .register(
+                                    &peer_info.node_id,
+                                    &peer_info.virtual_ip,
+                                    Some(&peer_info.node_id),
+                                )
+                                .await;
+                        }
+                    } else {
+                        debug!(
+                            "Peer {} is currently offline; keeping it in diagnostics without starting traversal",
+                            peer_info.node_id
+                        );
                     }
                 }
 
                 ControlEvent::PeerUpdated(peer_info) => {
                     let previous = self.peers.get_connection(&peer_info.node_id).await;
                     let update = self.peers.add_peer(&peer_info).await;
+                    if !peer_info.online {
+                        self.transport.remove_session(&peer_info.node_id).await;
+                        self.pending_handshakes
+                            .lock()
+                            .await
+                            .clear_peer(&peer_info.node_id);
+                        if self.dns.is_enabled() {
+                            if let Some(previous) = previous.as_ref() {
+                                self.dns.unregister(&previous.virtual_ip).await;
+                            } else {
+                                self.dns.unregister(&peer_info.virtual_ip).await;
+                            }
+                        }
+                        debug!(
+                            "Peer {} is offline according to control plane; cleared active sessions and skipped traversal",
+                            peer_info.node_id
+                        );
+                        continue;
+                    }
                     if update.public_key_changed {
                         self.transport.remove_session(&peer_info.node_id).await;
                         self.pending_handshakes
@@ -1327,7 +1362,8 @@ impl Daemon {
                             peer_info.node_id
                         );
                     }
-                    if update.virtual_ip_changed && self.dns.is_enabled() {
+                    let was_offline = previous.as_ref().is_some_and(|peer| !peer.online);
+                    if (update.virtual_ip_changed || was_offline) && self.dns.is_enabled() {
                         if let Some(previous) = previous {
                             self.dns.unregister(&previous.virtual_ip).await;
                         }
@@ -1849,6 +1885,21 @@ impl Daemon {
             debug!("No peer connection for {node_id}; skipping hole punch");
             return;
         };
+
+        if self.local_candidates.read().await.is_empty() {
+            self.peers
+                .record_direct_event(
+                    node_id,
+                    "punch_delayed_local_candidates_not_ready",
+                    None,
+                    Some(0),
+                    None,
+                    "delayed UDP punch until local candidates are ready",
+                )
+                .await;
+            debug!("Local UDP candidates are not ready; delaying hole punch for {node_id}");
+            return;
+        }
 
         if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
             self.peers
@@ -3183,7 +3234,10 @@ async fn publish_local_candidates_to_known_peers(
 
     let attempts = peers.recommended_punch_attempts(attempts).await;
 
-    for peer_id in control.peers().await.into_keys() {
+    for (peer_id, peer_info) in control.peers().await {
+        if !peer_info.online {
+            continue;
+        }
         let punch_at_ms = Some(relay_assisted_punch_at_ms());
         if let Err(error) = control
             .send_peer_offer_with_sources_and_punch_at(
@@ -4127,6 +4181,7 @@ async fn run_direct_encrypted_validation(
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    local_candidates: Arc<RwLock<Vec<String>>>,
     punch_deduplicator: PunchAttemptDeduplicator,
     retry_after: Duration,
     probe_interval: Duration,
@@ -4144,16 +4199,38 @@ async fn run_direct_probe_loop(
             continue;
         };
 
+        if local_candidates.read().await.is_empty() {
+            debug!("Local UDP candidates are not ready; delaying background Direct probe cycle");
+            continue;
+        }
+
         for (peer_id, candidates) in peers.direct_probe_targets_due(retry_after).await {
-            if !punch_deduplicator.claim(&peer_id).await {
+            let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
+            let dedup_window = if reclaim_active {
+                DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW
+            } else {
+                PUNCH_SESSION_DEDUP_WINDOW
+            };
+            if !punch_deduplicator
+                .claim_with_window(&peer_id, dedup_window)
+                .await
+            {
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "retry_punch_suppressed",
+                        if reclaim_active {
+                            "direct_reclaim_punch_suppressed"
+                        } else {
+                            "retry_punch_suppressed"
+                        },
                         candidates.first().copied(),
                         Some(candidates.len()),
                         None,
-                        "suppressed overlapping UDP retry session for this peer",
+                        if reclaim_active {
+                            "suppressed overlapping UDP Direct reclaim session for this peer"
+                        } else {
+                            "suppressed overlapping UDP retry session for this peer"
+                        },
                     )
                     .await;
                 continue;
@@ -4163,18 +4240,48 @@ async fn run_direct_probe_loop(
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
+                let punch_started_stage = if reclaim_active {
+                    "direct_reclaim_punch_started"
+                } else {
+                    "retry_punch_started"
+                };
+                let probes_sent_stage = if reclaim_active {
+                    "direct_reclaim_probes_sent"
+                } else {
+                    "retry_probes_sent"
+                };
+                let ack_timeout_stage = if reclaim_active {
+                    "direct_reclaim_ack_timeout"
+                } else {
+                    "retry_ack_timeout"
+                };
+                let probe_succeeded_stage = if reclaim_active {
+                    "direct_reclaim_probe_succeeded"
+                } else {
+                    "retry_probe_succeeded"
+                };
+                let send_error_stage = if reclaim_active {
+                    "direct_reclaim_send_error"
+                } else {
+                    "retry_send_error"
+                };
+                let retry_label = if reclaim_active {
+                    "generation-change Direct reclaim"
+                } else {
+                    "background UDP retry"
+                };
                 let success_count_before = peers
                     .direct_probe_success_count_for_generation(&peer_id, generation)
                     .await;
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "retry_punch_started",
+                        punch_started_stage,
                         candidates.first().copied(),
                         Some(candidates.len()),
                         None,
                         format!(
-                            "starting background UDP retry across {} candidates",
+                            "starting {retry_label} across {} candidates",
                             candidates.len()
                         ),
                     )
@@ -4188,11 +4295,11 @@ async fn run_direct_probe_loop(
                         peers
                             .record_direct_event(
                                 &peer_id,
-                                "retry_probes_sent",
+                                probes_sent_stage,
                                 candidates.first().copied(),
                                 Some(candidates.len()),
                                 Some(sent),
-                                format!("sent {sent} background retry probes"),
+                                format!("sent {sent} {retry_label} probes"),
                             )
                             .await;
                         sleep(direct_probe_ack_grace(probe_interval)).await;
@@ -4203,11 +4310,13 @@ async fn run_direct_probe_loop(
                             peers
                                 .record_direct_event(
                                     &peer_id,
-                                    "retry_ack_timeout",
+                                    ack_timeout_stage,
                                     candidates.first().copied(),
                                     Some(candidates.len()),
                                     Some(sent),
-                                    format!("no direct probe ACK after {sent} retry probes"),
+                                    format!(
+                                        "no direct probe ACK after {sent} {retry_label} probes"
+                                    ),
                                 )
                                 .await;
                             peers
@@ -4215,7 +4324,9 @@ async fn run_direct_probe_loop(
                                     &peer_id,
                                     generation,
                                     REASON_DIRECT_PROBE_FAILED,
-                                    format!("no direct probe ACK after {sent} retry probes"),
+                                    format!(
+                                        "no direct probe ACK after {sent} {retry_label} probes"
+                                    ),
                                 )
                                 .await;
                             debug!("Direct UDP retry probes for peer {peer_id} received no ACK");
@@ -4223,11 +4334,13 @@ async fn run_direct_probe_loop(
                             peers
                                 .record_direct_event(
                                     &peer_id,
-                                    "retry_probe_succeeded",
+                                    probe_succeeded_stage,
                                     candidates.first().copied(),
                                     Some(candidates.len()),
                                     Some(sent),
-                                    "background UDP retry received an ACK; awaiting encrypted validation",
+                                    format!(
+                                        "{retry_label} received an ACK; awaiting encrypted validation"
+                                    ),
                                 )
                                 .await;
                             debug!(
@@ -4239,11 +4352,11 @@ async fn run_direct_probe_loop(
                         peers
                             .record_direct_event(
                                 &peer_id,
-                                "retry_send_error",
+                                send_error_stage,
                                 candidates.first().copied(),
                                 Some(candidates.len()),
                                 None,
-                                format!("direct retry failed: {err}"),
+                                format!("{retry_label} failed: {err}"),
                             )
                             .await;
                         peers
@@ -4251,7 +4364,7 @@ async fn run_direct_probe_loop(
                                 &peer_id,
                                 generation,
                                 REASON_DIRECT_PROBE_FAILED,
-                                format!("direct retry failed: {err}"),
+                                format!("{retry_label} failed: {err}"),
                             )
                             .await;
                         warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");
@@ -4448,6 +4561,41 @@ mod tests {
         assert!(deduplicator.claim("peer-b").await);
     }
 
+    #[tokio::test]
+    async fn start_hole_punch_waits_for_local_candidates_before_state_change() {
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let daemon = Daemon::new(config);
+        let remote_endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
+        daemon
+            .peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: "peer-public-key".to_string(),
+                endpoint: remote_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+            .await
+            .unwrap();
+        *daemon.udp_transport.write().await = Some(udp);
+
+        daemon.start_hole_punch_at("node-b", None).await;
+
+        let conn = daemon.peers.get_connection("node-b").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert_eq!(conn.direct_health.failure_count, 0);
+        assert!(conn.direct_events.iter().any(|event| {
+            event.stage == "punch_delayed_local_candidates_not_ready"
+                && event.candidate_count == Some(0)
+        }));
+    }
+
     #[test]
     fn relay_assisted_punch_starts_slightly_before_advertised_time() {
         let punch_at_ms = unix_time_millis() + RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64;
@@ -4535,6 +4683,72 @@ mod tests {
             .direct_events
             .iter()
             .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(3)));
+    }
+
+    #[tokio::test]
+    async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let remote_endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: "node-b".to_string(),
+                device_name: String::new(),
+                public_key: "peer-public-key".to_string(),
+                endpoint: remote_endpoint.to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+            })
+            .await;
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let udp_transport = Arc::new(RwLock::new(Some(udp)));
+        let local_candidates = Arc::new(RwLock::new(Vec::new()));
+
+        let probe_task = tokio::spawn(run_direct_probe_loop(
+            peers.clone(),
+            udp_transport,
+            local_candidates.clone(),
+            PunchAttemptDeduplicator::default(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            1,
+        ));
+
+        sleep(Duration::from_millis(80)).await;
+        let diagnostics = peers.diagnostics().await;
+        assert_eq!(diagnostics[0].direct.failure_count, 0);
+        assert!(!diagnostics[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "retry_punch_started"));
+
+        local_candidates
+            .write()
+            .await
+            .push("127.0.0.1:50000".to_string());
+
+        let mut observed_probe_targets_due = false;
+        for _ in 0..20 {
+            if peers.diagnostics().await[0]
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "retry_punch_started")
+            {
+                observed_probe_targets_due = true;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        probe_task.abort();
+        let _ = probe_task.await;
+        assert!(observed_probe_targets_due);
     }
 
     #[tokio::test]

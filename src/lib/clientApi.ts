@@ -18,6 +18,7 @@ import {
   type DiagnosticsSnapshot,
   type DesktopStatus,
   type CandidatePairDiagnostics,
+  type CandidatePairSourceStats,
   type ConnectionType,
   type PathHealthDiagnostics,
   type PeerDiagnostics,
@@ -519,6 +520,7 @@ function diagnosticsFromDaemonLogs(
         candidates: [],
         direct: emptyPathHealth(),
         relay: emptyPathHealth(),
+        candidate_pair_stats: [],
         candidate_pairs: [],
       });
     }
@@ -626,6 +628,121 @@ function natProfileSummary(snapshot: DiagnosticsSnapshot | null): string | null 
     profile.public_endpoint ? `public=${profile.public_endpoint}` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" ") : null;
+}
+
+function formatPerMille(value: number | null | undefined): string {
+  if (value == null) return "n/a";
+  return `${(value / 10).toFixed(1)}%`;
+}
+
+function formatCooldown(ms: number | null | undefined): string | null {
+  if (ms == null || ms <= 0) return null;
+  return `cooldown=${Math.ceil(ms / 1000)}s`;
+}
+
+function interestingCandidateSourceStats(snapshot: DiagnosticsSnapshot | null): Array<{
+  peerId: string;
+  stats: CandidatePairSourceStats;
+}> {
+  if (!snapshot) return [];
+  return snapshot.peers.flatMap((peer) =>
+    (peer.candidate_pair_stats ?? [])
+      .filter(
+        (stats) =>
+          stats.source === "predicted" ||
+          stats.source === "birthday" ||
+          (stats.history_cooldown_remaining_ms ?? 0) > 0
+      )
+      .map((stats) => ({ peerId: peer.node_id, stats }))
+  );
+}
+
+function candidateSourcePolicyCheck(
+  snapshot: DiagnosticsSnapshot | null
+): Pick<DiagnosticCheck, "status" | "detail"> | null {
+  const rows = interestingCandidateSourceStats(snapshot);
+  if (rows.length === 0) return null;
+
+  const hasCooldown = rows.some(({ stats }) => (stats.history_cooldown_remaining_ms ?? 0) > 0);
+  const hasZeroBudget = rows.some(({ stats }) => stats.probe_budget_per_cycle === 0);
+  const detail = rows
+    .slice(0, 6)
+    .map(({ peerId, stats }) => {
+      const budget =
+        stats.probe_budget_per_cycle == null
+          ? "budget=guaranteed"
+          : `budget=${stats.probe_budget_per_cycle}`;
+      const cooldown = formatCooldown(stats.history_cooldown_remaining_ms);
+      return [
+        `${peerId.slice(0, 8)} ${stats.source}`,
+        `pairs=${stats.current_pair_count}/${stats.pair_count}`,
+        `rate=${formatPerMille(stats.success_rate_per_mille)}`,
+        `history=${formatPerMille(stats.history_success_rate_per_mille)}`,
+        budget,
+        `reason=${stats.probe_budget_reason ?? "unknown"}`,
+        cooldown,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .join("; ");
+
+  return {
+    status: hasCooldown || hasZeroBudget ? "warn" : "pass",
+    detail,
+  };
+}
+
+function yesNo(value: boolean): string {
+  return value ? "yes" : "no";
+}
+
+function protocolBoundaryDetail(protocol: NonNullable<DiagnosticsSnapshot["protocol"]>): string {
+  return [
+    protocol.data_plane,
+    `handshake=${protocol.handshake}`,
+    `aead=${protocol.aead}`,
+    `wg-interop=${yesNo(protocol.wireguard_interop)}`,
+    `turn=${yesNo(protocol.turn_compatible)}`,
+    `audit=${protocol.security_audit}`,
+  ].join(" ");
+}
+
+function protocolBoundaryStatus(
+  protocol: NonNullable<DiagnosticsSnapshot["protocol"]>
+): DiagnosticCheck["status"] {
+  return protocol.security_audit === "completed" ? "pass" : "warn";
+}
+
+function mtuRuntimeDetail(
+  mtu: NonNullable<DiagnosticsSnapshot["mtu"]>,
+  settings: ClientSettings,
+  relayConnections: number
+): string {
+  const parts = [
+    `runtime=${mtu.configured_mtu}`,
+    `profile=${mtu.profile}`,
+    `relay-safe=${mtu.relay_safe_mtu}`,
+    `auto-pmtu=${yesNo(mtu.automatic_pmtu)}`,
+  ];
+  if (mtu.configured_mtu !== settings.mtu) {
+    parts.push(`config=${settings.mtu} pending-restart`);
+  }
+  if (relayConnections > 0 && mtu.configured_mtu > mtu.relay_safe_mtu) {
+    parts.push(`relay-risk=${relayConnections}`);
+  }
+  return parts.join(" ");
+}
+
+function mtuRuntimeStatus(
+  mtu: NonNullable<DiagnosticsSnapshot["mtu"]>,
+  settings: ClientSettings,
+  relayConnections: number
+): DiagnosticCheck["status"] {
+  if (mtu.configured_mtu !== settings.mtu) return "warn";
+  if (relayConnections > 0 && mtu.configured_mtu > mtu.relay_safe_mtu) return "warn";
+  if (!mtu.automatic_pmtu && mtu.configured_mtu > mtu.wireguard_style_mtu) return "warn";
+  return "pass";
 }
 
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
@@ -757,6 +874,13 @@ function hasFreshRelayConfirmation(peer: PeerDiagnostics): boolean {
   );
 }
 
+function controlLastSeenAgeMs(peer: PeerDiagnostics): number | null {
+  if (!peer.last_seen) return null;
+  const timestampMs = peer.last_seen < 10_000_000_000 ? peer.last_seen * 1000 : peer.last_seen;
+  const ageMs = Date.now() - timestampMs;
+  return Number.isFinite(ageMs) ? Math.max(0, ageMs) : null;
+}
+
 function connectionPresentation(
   peer: PeerDiagnostics,
   path: PeerPath
@@ -767,17 +891,37 @@ function connectionPresentation(
   const relayHedged = peer.current_path_selection?.relay_hedged === true;
 
   if (path === "offline") {
-    const waitingForRelay =
-      peer.state === "fallback_to_relay" || peer.current_path_selection?.path === "relay";
+    if (peer.online === false) {
+      return {
+        type: "offline",
+        label: "离线",
+        detail: "控制面标记该设备离线；等待对端重新注册或续租",
+      };
+    }
     return {
       type: "offline",
-      label: waitingForRelay ? "不可达" : "离线",
+      label: "不可达",
       detail:
         peer.warning ??
         peer.relay.last_error ??
+        peer.direct.last_error ??
+        "当前没有可用路径",
+    };
+  }
+
+  if (path === "connecting") {
+    const waitingForRelay =
+      peer.state === "fallback_to_relay" || peer.current_path_selection?.path === "relay";
+    return {
+      type: "connecting",
+      label: waitingForRelay ? "中继确认中" : "连接中",
+      detail:
+        reason ??
         (waitingForRelay
-          ? `直连不可用，relay 尚未完成 peer 确认${peer.direct.last_error ? `：${peer.direct.last_error}` : ""}`
-          : peer.direct.last_error ?? "当前没有可用路径"),
+          ? `直连仍在探测，正在等待 relay peer 确认${peer.direct.last_error ? `：${peer.direct.last_error}` : ""}`
+          : endpoint
+            ? `正在验证 ${endpoint}`
+            : "正在建立可用路径"),
     };
   }
 
@@ -869,8 +1013,17 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
       peer.active_path === undefined);
   const path: PeerPath = isDirectTrial
     ? "direct_trial"
-    : peer.active_path ??
-      (selection?.path === "relay" && hasFreshRelayConfirmation(peer) ? "relay" : "offline");
+    : peer.online === false
+      ? "offline"
+      : peer.active_path ??
+        (selection?.path === "relay" && hasFreshRelayConfirmation(peer)
+          ? "relay"
+          : selection?.path === "relay" ||
+              peer.state === "fallback_to_relay" ||
+              peer.state === "hole_punching" ||
+              peer.state === "connecting"
+            ? "connecting"
+            : "offline");
   const pathErrors = [peer.direct, peer.relay]
     .filter(health => health.last_error)
     .sort(
@@ -878,7 +1031,10 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
         (left.last_failure_age_ms ?? Number.POSITIVE_INFINITY) -
         (right.last_failure_age_ms ?? Number.POSITIVE_INFINITY)
     );
-  const lastActiveMs = pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms;
+  const lastActiveMs =
+    peer.online === false
+      ? controlLastSeenAgeMs(peer) ?? pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms
+      : pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms ?? controlLastSeenAgeMs(peer);
   const latencyMs =
     path === "direct"
       ? directPairLatencyMs(peer)
@@ -1143,6 +1299,21 @@ export async function renamePeerDevice(
 
   try {
     const controlServer = normalizeControlServer(settings.controlServer);
+    if (isTauri()) {
+      const response = await tryInvoke<{ deviceName: string }>("control_rename_device", {
+        request: {
+          controlServer,
+          authToken: settings.authToken,
+          deviceId: peerId,
+          deviceName,
+        },
+      });
+      if (response?.deviceName) {
+        appendLog(`device renamed (${peerId}) via native bridge`);
+        return { data: { deviceName: response.deviceName }, source: "live" };
+      }
+    }
+
     const response = await fetch(
       `${controlServer}/api/v1/devices/${encodeURIComponent(peerId)}`,
       {
@@ -1174,6 +1345,8 @@ export async function renamePeerDevice(
         ? "无法连接控制服务器，请检查网络后重试"
         : error instanceof Error
           ? error.message
+          : typeof error === "string"
+            ? error
           : "设备名称保存失败";
     appendLog(`device rename failed (${peerId}): ${message}`);
     return { data: fallback, source: "fallback", error: message };
@@ -1210,6 +1383,16 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
       ? `可访问 (${status.healthStatus})`
       : status.lastError ?? "不可访问",
   });
+
+  if (snapshot?.protocol) {
+    checks.push({
+      id: "protocol-boundary",
+      name: "协议边界",
+      category: "protocol",
+      status: protocolBoundaryStatus(snapshot.protocol),
+      detail: protocolBoundaryDetail(snapshot.protocol),
+    });
+  }
 
   checks.push({
     id: "control",
@@ -1260,6 +1443,17 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
         : "fail",
     detail: udpDetails.join("; "),
   });
+
+  const sourcePolicy = candidateSourcePolicyCheck(snapshot);
+  if (sourcePolicy) {
+    checks.push({
+      id: "candidate-source-policy",
+      name: "候选源策略",
+      category: "nat",
+      status: !status.reachable ? "skipped" : sourcePolicy.status,
+      detail: !status.reachable ? "守护进程离线" : sourcePolicy.detail,
+    });
+  }
 
   const gatewayMapping = snapshot?.gateway_mapping;
   if (gatewayMapping) {
@@ -1329,6 +1523,16 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
         : "尚未分配虚拟 IP",
   });
 
+  if (snapshot?.mtu) {
+    checks.push({
+      id: "mtu-policy",
+      name: "MTU 策略",
+      category: "performance",
+      status: mtuRuntimeStatus(snapshot.mtu, settings, status.peerStats.relay_connections),
+      detail: mtuRuntimeDetail(snapshot.mtu, settings, status.peerStats.relay_connections),
+    });
+  }
+
   const route = await getRouteStatus();
   const routeState = route.data.entries[0]?.state ?? "unknown";
   checks.push({
@@ -1372,6 +1576,8 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
     data: {
       checks,
       logs: combinedLogs,
+      protocol: snapshot?.protocol,
+      mtu: snapshot?.mtu,
       source: statusResult.source,
       generatedAt: Date.now(),
     },

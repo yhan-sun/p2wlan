@@ -33,13 +33,20 @@ use crate::traversal_history::{
 const DIRECT_TRIAL_WINDOW: Duration = Duration::from_secs(10);
 const PEER_REFLEXIVE_STICKY_WINDOW: Duration = Duration::from_secs(10);
 const RECENT_DIRECT_TRIAL_FAILURE_TOLERANCE: u32 = 1;
-/// Keep relay-backed direct probing alive.
+/// Aggressive Direct reclaim window after the local network generation changes.
 ///
-/// Relay already provides the data-plane safety net, so direct UDP retries should stay cheap but
-/// frequent enough to catch peer-reflexive discoveries, refreshed NAT mappings, and brief symmetric
-/// NAT punch windows.  With the default 5s base interval this caps the retry cadence at 10s instead
-/// of drifting out to 40s after repeated failures.
-const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 1;
+/// A peer that has previously confirmed Direct is likely to recover after a
+/// mobile hotspot/base-station handover once fresh NAT mappings are visible.
+/// During this short window we bypass ordinary background backoff while Relay
+/// keeps the data plane usable.
+pub const DIRECT_RECLAIM_WINDOW: Duration = Duration::from_secs(10);
+/// Base cadence for relay-backed Direct reconnection.
+///
+/// Relay already provides the data-plane safety net, so peers with a plausible
+/// punch window should retry quickly after a Direct path falls apart.  The
+/// peer-level backoff below yields 1s, 2s, 4s, then 8s retries.
+pub const DIRECT_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(1);
+const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
@@ -54,9 +61,9 @@ const BIRTHDAY_PROBE_DELTAS: [i32; 30] = [
     1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12, 16, -16, 20, -20, 24, -24,
     32, -32, 48, -48, 64, -64,
 ];
-const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(10);
-const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 4;
-const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
+const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
+const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
+const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
@@ -75,6 +82,20 @@ enum ProbeTargetMode {
     /// Background retries after relay is already available. These may spend a
     /// wider budget on birthday probes without delaying initial connectivity.
     Background,
+    /// Short relay-backed recovery window after a generation change. This
+    /// keeps birthday-style coverage but bypasses pair cooldowns like a
+    /// synchronized punch so a previously working Direct path can be reclaimed.
+    Reclaim,
+}
+
+impl ProbeTargetMode {
+    fn bypasses_pair_cooldown(self) -> bool {
+        matches!(self, Self::Synchronized | Self::Reclaim)
+    }
+
+    fn allows_local_nat_birthday(self) -> bool {
+        matches!(self, Self::Background | Self::Reclaim)
+    }
 }
 
 /// Stable reason code emitted when a local network generation changes.
@@ -840,6 +861,10 @@ pub struct PeerConnection {
     pub signaled_endpoint: Option<SocketAddr>,
     /// Peer's NAT type.
     pub nat_type: String,
+    /// Whether the control plane currently reports this peer online.
+    pub online: bool,
+    /// Last seen timestamp reported by the control plane.
+    pub last_seen: u64,
     /// Current connection state.
     pub state: ConnectionState,
     /// When the connection was established.
@@ -866,6 +891,9 @@ pub struct PeerConnection {
     pub relay_health: PathHealth,
     /// Local network generation in which the direct path was last confirmed.
     pub direct_generation: u64,
+    /// Short window after a local generation change where previous Direct peers
+    /// are reprobed aggressively before returning to normal retry backoff.
+    direct_reclaim_until: Option<Instant>,
     /// Direct candidate-pair reachability table.
     pub candidate_pairs: Vec<CandidatePair>,
     /// Last selector decision made for outbound peer traffic.
@@ -890,6 +918,8 @@ impl PeerConnection {
             endpoint: None,
             signaled_endpoint: None,
             nat_type: String::new(),
+            online: true,
+            last_seen: 0,
             state: ConnectionState::Idle,
             connected_at: None,
             bytes_sent: 0,
@@ -903,6 +933,7 @@ impl PeerConnection {
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
             direct_generation: 0,
+            direct_reclaim_until: None,
             candidate_pairs: Vec::new(),
             last_path_selection: None,
             path_events: Vec::new(),
@@ -925,6 +956,7 @@ impl PeerConnection {
         self.direct_health = PathHealth::default();
         self.relay_health = PathHealth::default();
         self.direct_generation = 0;
+        self.direct_reclaim_until = None;
         self.candidate_pairs.clear();
         self.last_path_selection = None;
         self.path_events.clear();
@@ -1059,17 +1091,18 @@ impl PeerConnection {
             local_generation,
             history,
             local_nat_profile,
-            mode == ProbeTargetMode::Background,
+            mode.allows_local_nat_birthday(),
             &mut endpoints,
         );
-        let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
+        let source_stats =
+            candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
         let mut pairs = self
             .candidate_pairs
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
                     && endpoints.contains(&pair.remote_endpoint)
-                    && (mode == ProbeTargetMode::Synchronized || candidate_pair_probe_due(pair))
+                    && (mode.bypasses_pair_cooldown() || candidate_pair_probe_due(pair))
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
@@ -1862,6 +1895,96 @@ impl PeerConnection {
         self.direct_health.retry_due(base)
     }
 
+    fn direct_reclaim_active(&self) -> bool {
+        self.direct_reclaim_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn start_direct_reclaim_window(&mut self, local_generation: u64, reason: &str) -> bool {
+        if !self.has_direct_success_history() || self.candidate_endpoints().is_empty() {
+            return false;
+        }
+
+        self.direct_reclaim_until = Some(Instant::now() + DIRECT_RECLAIM_WINDOW);
+        let candidate_count = self.candidate_endpoints().len();
+        self.record_direct_event(
+            local_generation,
+            "direct_reclaim_window_started",
+            self.endpoint,
+            Some(candidate_count),
+            None,
+            format!(
+                "network changed after previous Direct success; aggressively reprobing for {}ms: {reason}",
+                duration_millis(DIRECT_RECLAIM_WINDOW)
+            ),
+        );
+        true
+    }
+
+    fn clear_direct_reclaim_window(&mut self) {
+        self.direct_reclaim_until = None;
+    }
+
+    fn has_direct_success_history(&self) -> bool {
+        self.direct_health.success_count > 0
+            || self
+                .candidate_pairs
+                .iter()
+                .any(|pair| pair.success_count > 0 || pair.selected_at.is_some())
+    }
+
+    fn has_private_direct_candidate(&self) -> bool {
+        self.candidate_endpoints()
+            .into_iter()
+            .any(|endpoint| is_private_direct_endpoint(endpoint) || is_overlay_endpoint(endpoint))
+    }
+
+    fn has_mapping_assisted_candidate(&self) -> bool {
+        self.candidate_endpoints().into_iter().any(|endpoint| {
+            matches!(
+                self.candidate_source_for_endpoint(endpoint),
+                CandidatePairSource::Upnp
+                    | CandidatePairSource::Pcp
+                    | CandidatePairSource::NatPmp
+                    | CandidatePairSource::Predicted
+            )
+        })
+    }
+
+    fn peer_public_candidates_need_scatter(&self) -> bool {
+        let bases = self
+            .candidate_endpoints()
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .collect::<Vec<_>>();
+        peer_candidates_need_port_scatter(&bases)
+    }
+
+    fn has_direct_retry_opportunity(&self, local_nat_profile: Option<&NatProfile>) -> bool {
+        let endpoints = self.candidate_endpoints();
+        if endpoints.is_empty() {
+            return false;
+        }
+
+        // A path that has worked before is exactly the kind of transient NAT
+        // window we want to recover quickly after sleep, network refresh, or
+        // daemon socket rebinding.
+        if self.has_direct_success_history()
+            || self.has_private_direct_candidate()
+            || self.has_mapping_assisted_candidate()
+        {
+            return true;
+        }
+
+        if local_nat_profile.is_some_and(|profile| profile.udp_blocked) {
+            return false;
+        }
+
+        let local_is_hard = local_nat_profile.is_some_and(is_hard_nat_profile);
+        let peer_looks_hard = self.peer_public_candidates_need_scatter();
+        !(local_is_hard && peer_looks_hard)
+    }
+
     fn record_path_selection_event(
         &mut self,
         local_generation: u64,
@@ -2265,6 +2388,7 @@ impl PeerManager {
             *generation
         };
 
+        let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
             conn.direct_health.record_generation_change(reason.clone());
@@ -2272,9 +2396,14 @@ impl PeerManager {
             if conn.state == ConnectionState::Direct {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
+            if conn.start_direct_reclaim_window(generation, &reason) {
+                direct_reclaim_count += 1;
+            }
         }
 
-        info!("Local network generation advanced to {generation}: {reason}");
+        info!(
+            "Local network generation advanced to {generation}: {reason}; opened {direct_reclaim_count} Direct reclaim window(s)"
+        );
         generation
     }
 
@@ -2294,6 +2423,7 @@ impl PeerManager {
         };
 
         let mut retained_private_direct_count = 0usize;
+        let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
             let retained_private_direct =
@@ -2307,10 +2437,13 @@ impl PeerManager {
             if conn.state == ConnectionState::Direct {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
+            if conn.start_direct_reclaim_window(generation, &reason) {
+                direct_reclaim_count += 1;
+            }
         }
 
         info!(
-            "Local network generation advanced to {generation}: {reason}; retained {retained_private_direct_count} low-latency private direct path(s)"
+            "Local network generation advanced to {generation}: {reason}; retained {retained_private_direct_count} low-latency private direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"
         );
         generation
     }
@@ -2354,6 +2487,8 @@ impl PeerManager {
             conn.reset_for_identity_change();
         }
         conn.nat_type = info.nat_type.clone();
+        conn.online = info.online;
+        conn.last_seen = info.last_seen;
 
         let signaled_endpoint = if info.endpoint.trim().is_empty() {
             None
@@ -2376,6 +2511,14 @@ impl PeerManager {
         conn.signaled_endpoint = signaled_endpoint;
         if let Some(addr) = signaled_endpoint {
             conn.ensure_candidate_pair(addr, generation);
+        }
+        if !info.online {
+            conn.transition(ConnectionState::Closed);
+            conn.relay_server = None;
+            conn.probe_session_id = None;
+            conn.probe_ephemeral_shared = None;
+        } else if conn.state == ConnectionState::Closed {
+            conn.transition(ConnectionState::Idle);
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
@@ -2926,6 +3069,28 @@ impl PeerManager {
                 {
                     return None;
                 }
+                if conn.state != ConnectionState::Direct
+                    && !conn.has_direct_retry_opportunity(local_nat_profile.as_ref())
+                {
+                    if conn
+                        .direct_events
+                        .last()
+                        .is_none_or(|event| {
+                            event.network_generation != generation
+                                || event.stage != "retry_skipped_no_viable_nat_window"
+                        })
+                    {
+                        conn.record_direct_event(
+                            generation,
+                            "retry_skipped_no_viable_nat_window",
+                            conn.endpoint,
+                            None,
+                            None,
+                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                        );
+                    }
+                    return None;
+                }
                 let endpoints = conn.candidate_probe_endpoints(
                     generation,
                     &history,
@@ -2959,8 +3124,9 @@ impl PeerManager {
     /// Return candidate endpoints that are due for direct-path reprobe.
     ///
     /// Unlike `direct_probe_targets`, this only transitions pairs to Probing
-    /// after the peer-level retry cooldown has elapsed, so diagnostics do not
-    /// report a probe that was intentionally suppressed by backoff.
+    /// after the peer-level retry cooldown has elapsed, except during the
+    /// short generation-change reclaim window for peers with previous Direct
+    /// success.
     pub async fn direct_probe_targets_due(
         &self,
         base_retry_after: Duration,
@@ -2972,14 +3138,43 @@ impl PeerManager {
             .write()
             .await
             .values_mut()
-            .filter(|conn| conn.state != ConnectionState::Direct)
-            .filter(|conn| conn.direct_retry_due(base_retry_after))
             .filter_map(|conn| {
+                if conn.state == ConnectionState::Direct {
+                    return None;
+                }
+                let reclaim_active = conn.direct_reclaim_active();
+                if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
+                    return None;
+                }
+                if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
+                    if conn
+                        .direct_events
+                        .last()
+                        .is_none_or(|event| {
+                            event.network_generation != generation
+                                || event.stage != "retry_skipped_no_viable_nat_window"
+                        })
+                    {
+                        conn.record_direct_event(
+                            generation,
+                            "retry_skipped_no_viable_nat_window",
+                            conn.endpoint,
+                            None,
+                            None,
+                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                        );
+                    }
+                    return None;
+                }
                 let endpoints = conn.candidate_probe_endpoints(
                     generation,
                     &history,
                     local_nat_profile.as_ref(),
-                    ProbeTargetMode::Background,
+                    if reclaim_active {
+                        ProbeTargetMode::Reclaim
+                    } else {
+                        ProbeTargetMode::Background
+                    },
                 );
 
                 if endpoints.is_empty() {
@@ -2987,6 +3182,19 @@ impl PeerManager {
                 } else {
                     for endpoint in &endpoints {
                         conn.mark_candidate_pair_probing(*endpoint, generation);
+                    }
+                    if reclaim_active {
+                        conn.record_direct_event(
+                            generation,
+                            "direct_reclaim_targets_due",
+                            endpoints.first().copied(),
+                            Some(endpoints.len()),
+                            None,
+                            format!(
+                                "selected {} UDP candidates for generation-change Direct reclaim",
+                                endpoints.len()
+                            ),
+                        );
                     }
                     Some((conn.node_id.clone(), endpoints))
                 }
@@ -3075,6 +3283,15 @@ impl PeerManager {
         conn.direct_retry_due(retry_after)
     }
 
+    /// Whether the peer is inside the aggressive Direct reclaim window.
+    pub async fn direct_reclaim_active(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(PeerConnection::direct_reclaim_active)
+    }
+
     /// Whether the peer currently has a verified direct path.
     pub async fn is_direct(&self, node_id: &str) -> bool {
         self.connections
@@ -3159,6 +3376,7 @@ impl PeerManager {
             });
             conn.direct_generation = generation;
             conn.direct_health.record_success();
+            conn.clear_direct_reclaim_window();
             conn.record_direct_event(
                 generation,
                 "direct_confirmed",
@@ -3746,6 +3964,7 @@ impl PeerManager {
     /// Get serializable diagnostics for every peer.
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
+        let traversal_history = self.traversal_history.read().await.clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -3753,7 +3972,12 @@ impl PeerManager {
             .values()
             .map(|conn| {
                 PeerDiagnostics::from_connection_with_path_selection(
-                    conn, None, None, generation, None,
+                    conn,
+                    None,
+                    None,
+                    generation,
+                    None,
+                    Some(&traversal_history),
                 )
             })
             .collect();
@@ -3774,6 +3998,7 @@ impl PeerManager {
         local_endpoint: Option<SocketAddr>,
     ) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
+        let traversal_history = self.traversal_history.read().await.clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -3788,6 +4013,7 @@ impl PeerManager {
                     Some(direct_retry_after),
                     generation,
                     local_endpoint,
+                    Some(&traversal_history),
                 )
             })
             .collect();
@@ -3865,6 +4091,14 @@ pub struct CandidatePairSourceStats {
     pub success_rate_per_mille: Option<u16>,
     pub last_success_age_ms: Option<u64>,
     pub last_failure_age_ms: Option<u64>,
+    pub history_success_count: Option<u64>,
+    pub history_failure_count: Option<u64>,
+    pub history_consecutive_failures: Option<u32>,
+    pub history_success_rate_per_mille: Option<u16>,
+    pub history_cooldown_remaining_ms: Option<u64>,
+    pub source_quality_rank: Option<u16>,
+    pub probe_budget_per_cycle: Option<usize>,
+    pub probe_budget_reason: Option<String>,
 }
 
 /// Serializable peer connection diagnostics.
@@ -3875,6 +4109,8 @@ pub struct PeerDiagnostics {
     pub virtual_ip: String,
     pub endpoint: Option<String>,
     pub nat_type: String,
+    pub online: bool,
+    pub last_seen: u64,
     pub state: ConnectionState,
     pub active_path: Option<NetworkPath>,
     pub direct_type: DirectPathType,
@@ -3917,6 +4153,7 @@ impl PeerDiagnostics {
         direct_retry_after: Option<Duration>,
         local_generation: u64,
         local_endpoint: Option<SocketAddr>,
+        traversal_history: Option<&TraversalHistory>,
     ) -> Self {
         let active_path = match current_selection {
             Some(selection) => match selection.path {
@@ -4004,6 +4241,8 @@ impl PeerDiagnostics {
             virtual_ip: conn.virtual_ip.clone(),
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
+            online: conn.online,
+            last_seen: conn.last_seen,
             state: conn.state,
             active_path,
             direct_type,
@@ -4029,6 +4268,7 @@ impl PeerDiagnostics {
             candidate_pair_stats: candidate_pair_source_stats(
                 &conn.candidate_pairs,
                 local_generation,
+                traversal_history,
             ),
             candidate_pairs,
             direct_retry_after_ms: direct_retry_after
@@ -4056,7 +4296,14 @@ impl PeerDiagnostics {
 
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
-        Self::from_connection_with_path_selection(conn, None, None, conn.direct_generation, None)
+        Self::from_connection_with_path_selection(
+            conn,
+            None,
+            None,
+            conn.direct_generation,
+            None,
+            None,
+        )
     }
 }
 
@@ -4262,8 +4509,9 @@ impl From<&PathHealth> for PathHealthDiagnostics {
 fn candidate_pair_source_stats(
     pairs: &[CandidatePair],
     local_generation: u64,
+    history: Option<&TraversalHistory>,
 ) -> Vec<CandidatePairSourceStats> {
-    [
+    let mut stats = [
         CandidatePairSource::PeerReflexive,
         CandidatePairSource::Learned,
         CandidatePairSource::Host,
@@ -4276,14 +4524,32 @@ fn candidate_pair_source_stats(
         CandidatePairSource::Birthday,
     ]
     .into_iter()
-    .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source))
-    .collect()
+    .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source, history))
+    .collect::<Vec<_>>();
+
+    if let Some(history) = history {
+        let stats_snapshot = stats.clone();
+        for source_stats in &mut stats {
+            source_stats.source_quality_rank = Some(candidate_pair_source_quality_rank(
+                &stats_snapshot,
+                history,
+                source_stats.source,
+            ));
+            let (budget, reason) =
+                candidate_pair_source_probe_budget(&stats_snapshot, history, source_stats.source);
+            source_stats.probe_budget_per_cycle = budget;
+            source_stats.probe_budget_reason = Some(reason.to_string());
+        }
+    }
+
+    stats
 }
 
 fn candidate_pair_source_stats_for(
     pairs: &[CandidatePair],
     local_generation: u64,
     source: CandidatePairSource,
+    history: Option<&TraversalHistory>,
 ) -> Option<CandidatePairSourceStats> {
     let mut pair_count = 0u64;
     let mut current_pair_count = 0u64;
@@ -4316,6 +4582,8 @@ fn candidate_pair_source_stats_for(
         last_failure_at = latest_instant(last_failure_at, pair.last_failure_at);
     }
 
+    let history_entry = history.and_then(|history| history.source(source));
+
     (pair_count > 0).then(|| CandidatePairSourceStats {
         source,
         pair_count,
@@ -4330,6 +4598,16 @@ fn candidate_pair_source_stats_for(
         success_rate_per_mille: success_rate_per_mille(success_count, failure_count),
         last_success_age_ms: last_success_at.map(|at| duration_millis(at.elapsed())),
         last_failure_age_ms: last_failure_at.map(|at| duration_millis(at.elapsed())),
+        history_success_count: history_entry.map(|entry| entry.success_count),
+        history_failure_count: history_entry.map(|entry| entry.failure_count),
+        history_consecutive_failures: history_entry.map(|entry| entry.consecutive_failures),
+        history_success_rate_per_mille: history_entry
+            .and_then(|entry| entry.success_rate_per_mille()),
+        history_cooldown_remaining_ms: history
+            .and_then(|history| history.source_cooldown_remaining_ms(source)),
+        source_quality_rank: None,
+        probe_budget_per_cycle: None,
+        probe_budget_reason: None,
     })
 }
 
@@ -4434,14 +4712,24 @@ fn apply_speculative_probe_budget(
 }
 
 fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &TraversalHistory) -> usize {
+    predicted_probe_budget_with_reason(stats, history).0
+}
+
+fn predicted_probe_budget_with_reason(
+    stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
+) -> (usize, &'static str) {
     if history.source_in_cooldown(CandidatePairSource::Predicted) {
-        return PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE;
+        return (
+            PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE,
+            "history_cooldown",
+        );
     }
     if history
         .source(CandidatePairSource::Predicted)
         .is_some_and(|entry| entry.consecutive_failures >= 3)
     {
-        return PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE, "history_failures");
     }
     if history
         .source(CandidatePairSource::Predicted)
@@ -4449,27 +4737,31 @@ fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &Traversa
             entry.success_count >= 2 && entry.success_rate_per_mille().unwrap_or(0) >= 500
         })
     {
-        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE, "history_success");
     }
     if stats
         .iter()
         .find(|stats| stats.source == CandidatePairSource::Predicted)
         .is_some_and(|stats| stats.success_count > 0)
     {
-        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE, "current_success");
     }
-    PREDICTED_PROBE_BUDGET_PER_CYCLE
+    (PREDICTED_PROBE_BUDGET_PER_CYCLE, "default")
 }
 
 fn birthday_probe_budget(history: &TraversalHistory) -> usize {
+    birthday_probe_budget_with_reason(history).0
+}
+
+fn birthday_probe_budget_with_reason(history: &TraversalHistory) -> (usize, &'static str) {
     if history.source_in_cooldown(CandidatePairSource::Birthday) {
-        return 0;
+        return (0, "history_cooldown");
     }
     if history
         .source(CandidatePairSource::Birthday)
         .is_some_and(|entry| entry.consecutive_failures >= 3)
     {
-        return 0;
+        return (0, "history_failures");
     }
     if history
         .source(CandidatePairSource::Birthday)
@@ -4477,9 +4769,27 @@ fn birthday_probe_budget(history: &TraversalHistory) -> usize {
             entry.success_count > 0 && entry.success_rate_per_mille().unwrap_or(0) >= 500
         })
     {
-        return BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE, "history_success");
     }
-    BIRTHDAY_PROBE_BUDGET_PER_CYCLE
+    (BIRTHDAY_PROBE_BUDGET_PER_CYCLE, "default")
+}
+
+fn candidate_pair_source_probe_budget(
+    stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
+    source: CandidatePairSource,
+) -> (Option<usize>, &'static str) {
+    match source {
+        CandidatePairSource::Predicted => {
+            let (budget, reason) = predicted_probe_budget_with_reason(stats, history);
+            (Some(budget), reason)
+        }
+        CandidatePairSource::Birthday => {
+            let (budget, reason) = birthday_probe_budget_with_reason(history);
+            (Some(budget), reason)
+        }
+        _ => (None, "guaranteed"),
+    }
 }
 
 fn latest_instant(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
@@ -4561,6 +4871,12 @@ fn candidate_pair_source_rank(source: CandidatePairSource) -> u8 {
         CandidatePairSource::Predicted => 8,
         CandidatePairSource::Birthday => 9,
     }
+}
+
+fn is_hard_nat_profile(profile: &NatProfile) -> bool {
+    !profile.udp_blocked
+        && profile.likely_symmetric == Some(true)
+        && profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
 }
 
 /// An endpoint observed from an authenticated packet is more valuable than
@@ -5753,6 +6069,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_control_peer_remains_visible_without_active_path() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer-offline".to_string(),
+                device_name: "Travel Laptop".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: "203.0.113.10:5000".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.9".to_string(),
+                online: false,
+                last_seen: 1_785_320_000,
+            })
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].node_id, "peer-offline");
+        assert_eq!(diagnostics[0].device_name, "Travel Laptop");
+        assert!(!diagnostics[0].online);
+        assert_eq!(diagnostics[0].last_seen, 1_785_320_000);
+        assert_eq!(diagnostics[0].state, ConnectionState::Closed);
+        assert_eq!(diagnostics[0].active_path, None);
+    }
+
+    #[tokio::test]
     async fn peer_update_removes_old_virtual_ip_and_clears_signaled_endpoint() {
         let manager = PeerManager::new(test_config());
         let mut peer = test_peer("peer1", "1.2.3.4:5000".parse().unwrap());
@@ -6197,6 +6541,60 @@ mod tests {
             pair.remote_endpoint == "203.0.113.10:40007"
                 && pair.source == CandidatePairSource::Predicted
         }));
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_stats_include_history_budget_diagnostics() {
+        let mut history = TraversalHistory::default();
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        let manager = PeerManager::new_with_history(test_config(), None, history);
+        let endpoint: SocketAddr = "127.0.0.1:51848".parse().unwrap();
+        let predicted_endpoint = "203.0.113.10:40007".to_string();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &[predicted_endpoint.clone()],
+                &HashMap::from([(predicted_endpoint.clone(), "predicted".to_string())]),
+            )
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        let predicted = diagnostics[0]
+            .candidate_pair_stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::Predicted)
+            .unwrap();
+
+        assert_eq!(predicted.current_pair_count, 1);
+        assert_eq!(predicted.history_success_count, Some(0));
+        assert_eq!(predicted.history_failure_count, Some(3));
+        assert_eq!(predicted.history_consecutive_failures, Some(3));
+        assert_eq!(predicted.history_success_rate_per_mille, Some(0));
+        assert!(predicted
+            .history_cooldown_remaining_ms
+            .is_some_and(|remaining| remaining > 0));
+        assert_eq!(predicted.source_quality_rank, Some(1100));
+        assert_eq!(
+            predicted.probe_budget_per_cycle,
+            Some(PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE)
+        );
+        assert_eq!(
+            predicted.probe_budget_reason.as_deref(),
+            Some("history_cooldown")
+        );
+
+        let json = serde_json::to_value(&diagnostics[0]).unwrap();
+        let predicted_json = json["candidate_pair_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stats| stats["source"] == "predicted")
+            .unwrap();
+        assert_eq!(predicted_json["probe_budget_reason"], "history_cooldown");
     }
 
     #[tokio::test]
@@ -6760,6 +7158,160 @@ mod tests {
         assert_eq!(synchronized_targets, vec![failed_endpoint]);
     }
 
+    #[test]
+    fn direct_retry_backoff_uses_one_two_four_eight_seconds() {
+        let mut health = PathHealth::default();
+        let base = DIRECT_RETRY_BASE_INTERVAL;
+
+        health.record_failure(REASON_DIRECT_PROBE_FAILED, "first failure");
+        assert_eq!(health.retry_after(base), Duration::from_secs(1));
+
+        health.record_failure(REASON_DIRECT_PROBE_FAILED, "second failure");
+        assert_eq!(health.retry_after(base), Duration::from_secs(2));
+
+        health.record_failure(REASON_DIRECT_PROBE_FAILED, "third failure");
+        assert_eq!(health.retry_after(base), Duration::from_secs(4));
+
+        health.record_failure(REASON_DIRECT_PROBE_FAILED, "fourth failure");
+        assert_eq!(health.retry_after(base), Duration::from_secs(8));
+
+        health.record_failure(REASON_DIRECT_PROBE_FAILED, "fifth failure");
+        assert_eq!(health.retry_after(base), Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn hard_local_and_scattered_peer_without_history_skip_background_retry() {
+        let manager = PeerManager::new(test_config());
+        let endpoint_a: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let endpoint_b: SocketAddr = "203.0.113.10:40037".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint_a)).await;
+        manager
+            .add_candidates("peer1", &[endpoint_b.to_string()])
+            .await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+
+        let targets = manager
+            .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
+            .await;
+        assert!(targets.is_empty());
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert!(conn.direct_events.iter().any(|event| {
+            event.stage == "retry_skipped_no_viable_nat_window" && event.network_generation == 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn previous_direct_success_fast_retries_even_when_nat_now_looks_hard() {
+        let manager = PeerManager::new(test_config());
+        let endpoint_a: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let endpoint_b: SocketAddr = "203.0.113.10:40037".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint_a)).await;
+        manager
+            .add_candidates("peer1", &[endpoint_b.to_string()])
+            .await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+        manager
+            .record_direct_success("peer1", Some(endpoint_a))
+            .await;
+        manager
+            .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "lost direct")
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            conn.direct_health.last_failure_at =
+                Some(Instant::now() - DIRECT_RETRY_BASE_INTERVAL - Duration::from_millis(10));
+            for pair in &mut conn.candidate_pairs {
+                pair.last_failure_at = Some(
+                    Instant::now()
+                        - CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE
+                        - Duration::from_millis(10),
+                );
+            }
+        }
+
+        let targets = manager
+            .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
+            .await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "peer1");
+        assert!(targets[0].1.contains(&endpoint_a));
+    }
+
+    #[tokio::test]
+    async fn generation_change_opens_immediate_direct_reclaim_window() {
+        let manager = PeerManager::new(test_config());
+        let endpoint: SocketAddr = "203.0.113.20:41000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+
+        let generation = manager.advance_network_generation("hotspot_handover").await;
+        assert_eq!(generation, 1);
+        assert!(manager.direct_reclaim_active("peer1").await);
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+        assert_eq!(
+            conn.direct_health.last_error_code.as_deref(),
+            Some(REASON_NETWORK_GENERATION_CHANGED)
+        );
+        assert!(conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_reclaim_window_started"));
+
+        let targets = manager
+            .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
+            .await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "peer1");
+        assert!(targets[0].1.contains(&endpoint));
+    }
+
+    #[tokio::test]
+    async fn direct_reclaim_window_bypasses_retry_and_pair_cooldowns() {
+        let manager = PeerManager::new(test_config());
+        let endpoint: SocketAddr = "203.0.113.21:41000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager.record_direct_success("peer1", Some(endpoint)).await;
+        let generation = manager.advance_network_generation("hotspot_handover").await;
+
+        let first_targets = manager
+            .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
+            .await;
+        assert_eq!(first_targets.len(), 1);
+
+        assert!(
+            manager
+                .record_direct_failure_for_generation(
+                    "peer1",
+                    generation,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no reclaim ACK yet",
+                )
+                .await
+        );
+
+        let second_targets = manager
+            .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
+            .await;
+        assert_eq!(second_targets.len(), 1);
+        assert_eq!(second_targets[0].0, "peer1");
+        assert!(second_targets[0].1.contains(&endpoint));
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert!(conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_reclaim_targets_due"));
+    }
+
     #[tokio::test]
     async fn diagnostics_reports_candidate_pair_probe_cooldown_remaining() {
         let config = test_config();
@@ -6785,9 +7337,9 @@ mod tests {
             .find(|pair| pair.remote_endpoint == failed_endpoint.to_string())
             .unwrap();
         assert!(!pair.probe_due);
-        assert_eq!(pair.probe_retry_after_ms, Some(5_000));
+        assert_eq!(pair.probe_retry_after_ms, Some(1_000));
         assert!(pair.probe_retry_remaining_ms.unwrap() > 0);
-        assert!(pair.probe_retry_remaining_ms.unwrap() <= 5_000);
+        assert!(pair.probe_retry_remaining_ms.unwrap() <= 1_000);
 
         {
             let mut conns = manager.connections.write().await;
@@ -6809,7 +7361,7 @@ mod tests {
             .find(|pair| pair.remote_endpoint == failed_endpoint.to_string())
             .unwrap();
         assert!(pair.probe_due);
-        assert_eq!(pair.probe_retry_after_ms, Some(5_000));
+        assert_eq!(pair.probe_retry_after_ms, Some(1_000));
         assert_eq!(pair.probe_retry_remaining_ms, Some(0));
     }
 

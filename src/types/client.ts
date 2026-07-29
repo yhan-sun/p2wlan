@@ -11,7 +11,7 @@ export type ConnectionState =
   | "closed";
 
 export type NetworkPath = "direct" | "relay";
-export type PeerPath = NetworkPath | "direct_trial" | "offline";
+export type PeerPath = NetworkPath | "direct_trial" | "connecting" | "offline";
 export type DirectPathType = "lan" | "public_udp" | "overlay" | "relay" | "probing" | "unknown";
 export type ConnectionType =
   | "lan_direct"
@@ -19,6 +19,7 @@ export type ConnectionType =
   | "overlay_direct"
   | "direct"
   | "direct_trial"
+  | "connecting"
   | "relay"
   | "offline"
   | "unknown";
@@ -75,7 +76,12 @@ export interface PathHealthDiagnostics {
   last_failure_age_ms: number | null;
   consecutive_failures: number;
   last_error: string | null;
+  last_error_code?: string | null;
   latency_ms: number | null;
+  rtt_ewma_ms?: number | null;
+  jitter_ms?: number | null;
+  success_count?: number;
+  failure_count?: number;
 }
 
 export interface CandidatePairDiagnostics {
@@ -117,12 +123,38 @@ export interface CandidatePairDiagnostics {
   warning: string | null;
 }
 
+export interface CandidatePairSourceStats {
+  source: CandidatePairSource;
+  pair_count: number;
+  current_pair_count: number;
+  selected_count: number;
+  succeeded_count: number;
+  probing_count: number;
+  failed_count: number;
+  degraded_count: number;
+  success_count: number;
+  failure_count: number;
+  success_rate_per_mille: number | null;
+  last_success_age_ms: number | null;
+  last_failure_age_ms: number | null;
+  history_success_count: number | null;
+  history_failure_count: number | null;
+  history_consecutive_failures: number | null;
+  history_success_rate_per_mille: number | null;
+  history_cooldown_remaining_ms: number | null;
+  source_quality_rank: number | null;
+  probe_budget_per_cycle: number | null;
+  probe_budget_reason: string | null;
+}
+
 export interface PeerDiagnostics {
   node_id: string;
   device_name?: string;
   virtual_ip: string;
   endpoint: string | null;
   nat_type: string;
+  online?: boolean;
+  last_seen?: number;
   state: ConnectionState;
   active_path: NetworkPath | null;
   direct_type: DirectPathType;
@@ -142,6 +174,7 @@ export interface PeerDiagnostics {
   candidates: string[];
   direct: PathHealthDiagnostics;
   relay: PathHealthDiagnostics;
+  candidate_pair_stats?: CandidatePairSourceStats[];
   candidate_pairs?: CandidatePairDiagnostics[];
   current_path_selection?: PathSelectionDiagnostics | null;
   last_path_selection?: PathSelectionDiagnostics | null;
@@ -257,6 +290,44 @@ export interface UdpSocketPoolMemberDiagnostics {
   stun_mappings_discovered?: number;
 }
 
+export interface ProtocolDiagnostics {
+  data_plane: string;
+  handshake: string;
+  key_exchange: string;
+  aead: string;
+  hash_kdf: string;
+  device_identity: string;
+  relay_transport: string;
+  wireguard_interop: boolean;
+  turn_compatible: boolean;
+  security_audit: string;
+}
+
+export interface MtuDiagnostics {
+  configured_mtu: number;
+  profile: "low" | "relay_safe" | "default" | "high" | "jumbo_high_risk" | string;
+  ipv6_safe_min_mtu: number;
+  relay_safe_mtu: number;
+  wireguard_style_mtu: number;
+  common_ethernet_mtu: number;
+  automatic_pmtu: boolean;
+}
+
+export interface TraversalSourceHistoryDiagnostics {
+  source: string;
+  success_count: number;
+  failure_count: number;
+  consecutive_failures: number;
+  success_rate_per_mille: number | null;
+  last_success_age_ms: number | null;
+  last_failure_age_ms: number | null;
+  cooldown_remaining_ms: number | null;
+}
+
+export interface TraversalHistoryDiagnostics {
+  sources: TraversalSourceHistoryDiagnostics[];
+}
+
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
   version?: string;
@@ -265,6 +336,8 @@ export interface DiagnosticsSnapshot {
   virtual_ip: string;
   network_id: string;
   network_generation?: number;
+  protocol?: ProtocolDiagnostics;
+  mtu?: MtuDiagnostics;
   udp_local_addr: string | null;
   udp_socket_count?: number;
   udp_socket_pool_active?: boolean;
@@ -275,6 +348,7 @@ export interface DiagnosticsSnapshot {
   relay_servers: string[];
   relay_connected: boolean;
   relay_selection: RelaySelectionDiagnostics;
+  traversal_history?: TraversalHistoryDiagnostics;
   peers: PeerDiagnostics[];
   stats: PeerManagerStats;
   health: HealthSnapshot;
@@ -394,7 +468,15 @@ export interface ClientStatusSnapshot {
 export interface DiagnosticCheck {
   id: string;
   name: string;
-  category: "control" | "nat" | "relay" | "tun" | "route" | "daemon";
+  category:
+    | "control"
+    | "nat"
+    | "relay"
+    | "tun"
+    | "route"
+    | "daemon"
+    | "protocol"
+    | "performance";
   status: DiagnosticCheckStatus;
   detail: string;
   latencyMs?: number | null;
@@ -403,6 +485,8 @@ export interface DiagnosticCheck {
 export interface DiagnosticsReport {
   checks: DiagnosticCheck[];
   logs: string[];
+  protocol?: ProtocolDiagnostics;
+  mtu?: MtuDiagnostics;
   source: DataSource;
   generatedAt: number;
 }

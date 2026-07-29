@@ -18,6 +18,10 @@ const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
 const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-policy、direct-timeout";
+const IPV6_SAFE_MIN_MTU: u32 = 1280;
+const RELAY_SAFE_MTU: u32 = 1380;
+const WIREGUARD_STYLE_MTU: u32 = 1420;
+const COMMON_ETHERNET_MTU: u32 = 1500;
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -530,6 +534,8 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
         "虚拟网卡：{} MTU {}",
         config.network.interface, config.network.mtu
     );
+    println!("MTU profile：{}", mtu_profile(config.network.mtu));
+    suggestions.extend(mtu_config_suggestions(config.network.mtu));
     println!("UDP bind：{}", config.network.udp_bind);
     println!(
         "UDP advertise：{}",
@@ -548,6 +554,11 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             "relay-only"
         }
     );
+    println!(
+        "STUN config：{}",
+        stun_config_summary(&config.network.stun_servers)
+    );
+    suggestions.extend(stun_config_suggestions(&config.network.stun_servers));
 
     if let Ok(bind) = config.network.udp_bind.parse::<SocketAddr>() {
         if bind.port() == 0 {
@@ -579,6 +590,12 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
     match fetch_status(&status_url(&config)).await {
         Ok(snapshot) => {
             println!("Daemon：运行中");
+            if let Some(summary) = protocol_boundary_summary(&snapshot) {
+                println!("Protocol：{summary}");
+            }
+            if let Some(summary) = runtime_mtu_summary(&snapshot) {
+                println!("Runtime MTU：{summary}");
+            }
             println!("虚拟 IP：{}", value_text(&snapshot, "virtual_ip", "未知"));
             println!(
                 "网络代际：{}",
@@ -615,6 +632,14 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "direct_connections"),
                 value_u64(stats, "relay_connections")
             );
+            suggestions.extend(protocol_boundary_suggestions(&snapshot));
+            suggestions.extend(mtu_snapshot_suggestions(config.network.mtu, &snapshot));
+            let mtu_diagnostics = mtu_diagnostic_suggestions(&snapshot);
+            if mtu_diagnostics.is_empty() {
+                suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
+            } else {
+                suggestions.extend(mtu_diagnostics);
+            }
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
             suggestions.extend(nat_profile_suggestions(
@@ -1079,6 +1104,162 @@ fn clear_device_credential(config: &mut Config) {
     config.control.credential_issued = false;
 }
 
+fn protocol_boundary_summary(snapshot: &Value) -> Option<String> {
+    let protocol = snapshot.get("protocol")?.as_object()?;
+    let data_plane = protocol
+        .get("data_plane")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let handshake = protocol
+        .get("handshake")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let aead = protocol
+        .get("aead")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let wireguard_interop = yes_no(
+        protocol
+            .get("wireguard_interop")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let turn_compatible = yes_no(
+        protocol
+            .get("turn_compatible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let audit = protocol
+        .get("security_audit")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Some(format!(
+        "{data_plane} handshake={handshake} aead={aead} wg-interop={wireguard_interop} turn={turn_compatible} audit={audit}"
+    ))
+}
+
+fn protocol_boundary_suggestions(snapshot: &Value) -> Vec<String> {
+    let Some(protocol) = snapshot.get("protocol").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    if protocol
+        .get("security_audit")
+        .and_then(Value::as_str)
+        .is_some_and(|audit| audit != "completed")
+    {
+        suggestions.push(
+            "协议安全审计未完成；发布 Production 前需要独立审计、威胁建模和互操作边界复核。"
+                .to_string(),
+        );
+    }
+    if protocol
+        .get("wireguard_interop")
+        .and_then(Value::as_bool)
+        .is_some_and(|interop| !interop)
+    {
+        suggestions.push("当前数据面是 WireGuard-like Noise，不是官方 WireGuard 互通实现；文档和部署脚本应避免承诺 WireGuard 客户端兼容。".to_string());
+    }
+    suggestions
+}
+
+fn runtime_mtu_summary(snapshot: &Value) -> Option<String> {
+    let mtu = snapshot.get("mtu")?.as_object()?;
+    let configured_mtu = mtu
+        .get("configured_mtu")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let profile = mtu
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let relay_safe_mtu = mtu
+        .get("relay_safe_mtu")
+        .and_then(Value::as_u64)
+        .unwrap_or(RELAY_SAFE_MTU as u64);
+    let automatic_pmtu = yes_no(
+        mtu.get("automatic_pmtu")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let mut summary = format!(
+        "configured={configured_mtu} profile={profile} relay-safe={relay_safe_mtu} auto-pmtu={automatic_pmtu}"
+    );
+    if let Some(relay_path_observed) = mtu.get("relay_path_observed").and_then(Value::as_bool) {
+        summary.push_str(&format!(" relay-path={}", yes_no(relay_path_observed)));
+    }
+    if let Some(suggested) = mtu.get("suggested_safe_mtu").and_then(Value::as_u64) {
+        summary.push_str(&format!(" suggested={suggested}"));
+    }
+    let risk_codes: Vec<&str> = mtu
+        .get("risks")
+        .and_then(Value::as_array)
+        .map(|risks| {
+            risks
+                .iter()
+                .filter_map(|risk| risk.get("code").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !risk_codes.is_empty() {
+        summary.push_str(&format!(" risks={}", risk_codes.join(",")));
+    }
+    Some(summary)
+}
+
+fn mtu_snapshot_suggestions(config_mtu: u32, snapshot: &Value) -> Vec<String> {
+    let Some(runtime_mtu) = snapshot
+        .get("mtu")
+        .and_then(|mtu| mtu.get("configured_mtu"))
+        .and_then(Value::as_u64)
+    else {
+        return Vec::new();
+    };
+
+    if runtime_mtu != config_mtu as u64 {
+        vec![format!(
+            "当前配置 MTU 为 {config_mtu}，daemon 运行中 MTU 为 {runtime_mtu}；执行 p2wlan down && p2wlan up 让配置生效。"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn mtu_diagnostic_suggestions(snapshot: &Value) -> Vec<String> {
+    let Some(risks) = snapshot
+        .get("mtu")
+        .and_then(|mtu| mtu.get("risks"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    for risk in risks {
+        let Some(message) = risk.get("message").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(suggested_mtu) = risk.get("suggested_mtu").and_then(Value::as_u64) {
+            suggestions.push(format!(
+                "{message} 建议：p2wlan config set mtu {suggested_mtu}"
+            ));
+        } else {
+            suggestions.push(message.to_string());
+        }
+    }
+    dedupe_strings(suggestions)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 fn print_nat_diagnostics(snapshot: &Value) {
     let candidates = local_candidate_strings(snapshot);
     if !candidates.is_empty() {
@@ -1153,6 +1334,42 @@ fn udp_socket_pool_summary(snapshot: &Value) -> Option<String> {
         Some(members) => format!("sockets={socket_count} {state} {members}"),
         None => format!("sockets={socket_count} {state}"),
     })
+}
+
+fn stun_config_summary(servers: &[String]) -> String {
+    let configured = configured_stun_servers(servers);
+    if servers.is_empty() {
+        "default public STUN set".to_string()
+    } else if configured.is_empty() {
+        "disabled".to_string()
+    } else {
+        format!("{} configured ({})", configured.len(), configured.join(","))
+    }
+}
+
+fn stun_config_suggestions(servers: &[String]) -> Vec<String> {
+    let configured = configured_stun_servers(servers);
+    if !servers.is_empty() && configured.is_empty() {
+        return vec![
+            "STUN 已禁用；跨 NAT 直连将主要依赖手动 udp-advertise、端口映射或 Relay。".to_string(),
+        ];
+    }
+    if configured.len() == 1 {
+        return vec![
+            "当前只配置了 1 个 STUN 观测点；建议至少配置 2 个不同网络的 STUN server，才能更可靠地区分端口相关/对称 NAT。"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+fn configured_stun_servers(servers: &[String]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|server| server.trim())
+        .filter(|server| !is_clear_value(server))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn nat_profile_summary(snapshot: &Value) -> Option<String> {
@@ -2350,6 +2567,49 @@ fn short_text(value: &str, max_len: usize) -> String {
     }
 }
 
+fn mtu_profile(mtu: u32) -> &'static str {
+    match mtu {
+        0..=1279 => "low (<1280, compatibility workaround)",
+        1280..=RELAY_SAFE_MTU => "relay-safe",
+        1381..=WIREGUARD_STYLE_MTU => "default",
+        1421..=COMMON_ETHERNET_MTU => "high",
+        _ => "jumbo/high-risk",
+    }
+}
+
+fn mtu_config_suggestions(mtu: u32) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    if mtu < IPV6_SAFE_MIN_MTU {
+        suggestions.push(
+            "当前 MTU 低于 1280；除非正在规避 PMTU blackhole，否则吞吐和 IPv6 兼容性可能受影响。"
+                .to_string(),
+        );
+    }
+    if mtu > COMMON_ETHERNET_MTU {
+        suggestions.push(
+            "当前 MTU 超过常见以太网 1500；除非端到端路径都支持 jumbo frame，否则建议降到 1420 或 1380。"
+                .to_string(),
+        );
+    } else if mtu > WIREGUARD_STYLE_MTU {
+        suggestions.push(
+            "当前 MTU 高于 WireGuard-like 默认 1420；复杂 NAT、移动网络或中继路径更容易出现大包丢失。"
+                .to_string(),
+        );
+    }
+    suggestions
+}
+
+fn mtu_runtime_suggestions(mtu: u32, stats: &Value) -> Vec<String> {
+    let relay_connections = value_u64(stats, "relay_connections");
+    if relay_connections > 0 && mtu > RELAY_SAFE_MTU {
+        vec![format!(
+            "当前存在 {relay_connections} 条 Relay 路径且 MTU 大于 {RELAY_SAFE_MTU}；如果 SSH/RDP 卡顿或大流量不稳定，优先尝试：p2wlan config set mtu {RELAY_SAFE_MTU}"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 fn value_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -2832,6 +3092,115 @@ mod tests {
     }
 
     #[test]
+    fn mtu_profile_describes_common_ranges() {
+        assert_eq!(mtu_profile(1279), "low (<1280, compatibility workaround)");
+        assert_eq!(mtu_profile(1280), "relay-safe");
+        assert_eq!(mtu_profile(1380), "relay-safe");
+        assert_eq!(mtu_profile(1420), "default");
+        assert_eq!(mtu_profile(1500), "high");
+        assert_eq!(mtu_profile(9000), "jumbo/high-risk");
+    }
+
+    #[test]
+    fn mtu_suggestions_warn_for_high_and_relay_paths() {
+        assert!(mtu_config_suggestions(1420).is_empty());
+        assert!(mtu_config_suggestions(1200)
+            .iter()
+            .any(|item| item.contains("低于 1280")));
+        assert!(mtu_config_suggestions(1501)
+            .iter()
+            .any(|item| item.contains("超过常见以太网 1500")));
+
+        let relay_stats = serde_json::json!({
+            "direct_connections": 0,
+            "relay_connections": 2
+        });
+        assert!(mtu_runtime_suggestions(1420, &relay_stats)
+            .iter()
+            .any(|item| item.contains("Relay 路径") && item.contains("1380")));
+        assert!(mtu_runtime_suggestions(1380, &relay_stats).is_empty());
+    }
+
+    #[test]
+    fn protocol_boundary_helpers_explain_runtime_contract() {
+        let snapshot = serde_json::json!({
+            "protocol": {
+                "data_plane": "wireguard_like_noise",
+                "handshake": "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s",
+                "aead": "ChaCha20-Poly1305",
+                "wireguard_interop": false,
+                "turn_compatible": false,
+                "security_audit": "not_completed"
+            }
+        });
+
+        assert_eq!(
+            protocol_boundary_summary(&snapshot).as_deref(),
+            Some("wireguard_like_noise handshake=Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s aead=ChaCha20-Poly1305 wg-interop=no turn=no audit=not_completed")
+        );
+        let suggestions = protocol_boundary_suggestions(&snapshot);
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("协议安全审计未完成")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("不是官方 WireGuard 互通实现")));
+        assert!(protocol_boundary_summary(&serde_json::json!({})).is_none());
+        assert!(protocol_boundary_suggestions(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn runtime_mtu_helpers_report_daemon_profile_and_config_drift() {
+        let snapshot = serde_json::json!({
+            "mtu": {
+                "configured_mtu": 1420,
+                "profile": "default",
+                "relay_safe_mtu": 1380,
+                "automatic_pmtu": false
+            }
+        });
+
+        assert_eq!(
+            runtime_mtu_summary(&snapshot).as_deref(),
+            Some("configured=1420 profile=default relay-safe=1380 auto-pmtu=no")
+        );
+        assert!(mtu_snapshot_suggestions(1420, &snapshot).is_empty());
+        assert!(mtu_snapshot_suggestions(1380, &snapshot)
+            .iter()
+            .any(|item| item.contains("daemon 运行中 MTU 为 1420")));
+        assert!(runtime_mtu_summary(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn runtime_mtu_helpers_use_structured_risks_when_present() {
+        let snapshot = serde_json::json!({
+            "mtu": {
+                "configured_mtu": 1420,
+                "profile": "default",
+                "relay_safe_mtu": 1380,
+                "automatic_pmtu": false,
+                "relay_path_observed": true,
+                "suggested_safe_mtu": 1380,
+                "risks": [{
+                    "code": "relay_path_high_mtu",
+                    "severity": "warning",
+                    "message": "Relay path observed with MTU 1420; try lowering MTU.",
+                    "suggested_mtu": 1380
+                }]
+            }
+        });
+
+        assert_eq!(
+            runtime_mtu_summary(&snapshot).as_deref(),
+            Some("configured=1420 profile=default relay-safe=1380 auto-pmtu=no relay-path=yes suggested=1380 risks=relay_path_high_mtu")
+        );
+        assert!(mtu_diagnostic_suggestions(&snapshot)
+            .iter()
+            .any(|item| item.contains("p2wlan config set mtu 1380")));
+        assert!(mtu_diagnostic_suggestions(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
     fn nat_profile_summary_formats_stable_mapping() {
         let snapshot = serde_json::json!({
             "local_candidates": ["192.168.2.4:60207", "203.0.113.10:62000"],
@@ -2939,6 +3308,33 @@ mod tests {
             udp_socket_pool_summary(&snapshot).as_deref(),
             Some("sockets=3 active #0 p=12 ack=2/3 stun=0 enc=4/5 #1 p=12 ack=1/0 stun=0 enc=2/1")
         );
+    }
+
+    #[test]
+    fn stun_config_summary_and_suggestions_explain_observer_quality() {
+        assert_eq!(stun_config_summary(&[]), "default public STUN set");
+        assert!(stun_config_suggestions(&[]).is_empty());
+
+        let disabled = vec!["off".to_string()];
+        assert_eq!(stun_config_summary(&disabled), "disabled");
+        assert!(stun_config_suggestions(&disabled)
+            .iter()
+            .any(|item| item.contains("STUN 已禁用")));
+
+        let single = vec!["stun.example.com:3478".to_string()];
+        assert_eq!(
+            stun_config_summary(&single),
+            "1 configured (stun.example.com:3478)"
+        );
+        assert!(stun_config_suggestions(&single)
+            .iter()
+            .any(|item| item.contains("至少配置 2 个")));
+
+        let multiple = vec![
+            "stun-a.example.com:3478".to_string(),
+            "stun-b.example.com:3478".to_string(),
+        ];
+        assert!(stun_config_suggestions(&multiple).is_empty());
     }
 
     #[test]
