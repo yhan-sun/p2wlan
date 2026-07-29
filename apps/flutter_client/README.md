@@ -208,6 +208,14 @@ flutter test
 flutter build macos --debug
 ```
 
+GitHub Actions:
+
+- `.github/workflows/flutter-client.yml` runs analyze/test plus Android, Linux,
+  macOS, and Windows debug app builds.
+- Each platform build uploads a debug artifact for smoke testing.
+- The workflow is intentionally UI-only; it does not package or control the Rust
+  daemon.
+
 ## P1/P1.5 Acceptance Checklist
 
 - [ ] `flutter analyze` passes.
