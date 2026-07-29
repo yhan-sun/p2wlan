@@ -7,6 +7,7 @@ import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/settings/settings_page.dart';
 import '../shared/widgets/status_badge.dart';
+import 'app_constants.dart';
 
 enum P2WlanSection {
   dashboard('Dashboard', Icons.dashboard_outlined),
@@ -59,11 +60,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
       builder: (context, _) {
         return LayoutBuilder(
           builder: (context, constraints) {
-            final wide = constraints.maxWidth >= 860;
+            final wide = constraints.maxWidth >= 900;
             final body = pages[_section]!;
             return Scaffold(
               appBar: AppBar(
-                title: const Text('P2WLAN Console'),
+                title: const Text(p2wlanAppName),
                 centerTitle: false,
                 actions: [
                   Padding(
@@ -145,7 +146,7 @@ class _WideShell extends StatelessWidget {
           onDestinationSelected: (index) =>
               onSelect(P2WlanSection.values[index]),
           labelType: NavigationRailLabelType.all,
-          minWidth: 92,
+          minWidth: 96,
           destinations: [
             for (final item in P2WlanSection.values)
               NavigationRailDestination(

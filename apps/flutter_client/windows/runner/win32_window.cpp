@@ -29,6 +29,9 @@ constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme"
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
 
+constexpr int kMinWindowWidth = 860;
+constexpr int kMinWindowHeight = 560;
+
 using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 
 // Scale helper to convert logical scaler values to physical using passed in
@@ -197,6 +200,15 @@ Win32Window::MessageHandler(HWND hwnd,
 
       return 0;
     }
+    case WM_GETMINMAXINFO: {
+      auto minmax_info = reinterpret_cast<MINMAXINFO*>(lparam);
+      const UINT dpi = FlutterDesktopGetDpiForWindow(hwnd);
+      const double scale_factor = dpi / 96.0;
+      minmax_info->ptMinTrackSize.x = Scale(kMinWindowWidth, scale_factor);
+      minmax_info->ptMinTrackSize.y = Scale(kMinWindowHeight, scale_factor);
+      return 0;
+    }
+
     case WM_SIZE: {
       RECT rect = GetClientArea();
       if (child_content_ != nullptr) {

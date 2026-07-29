@@ -9,7 +9,7 @@ void main() {
     );
     await _waitForBootstrap(tester);
 
-    expect(find.text('P2WLAN Console'), findsOneWidget);
+    expect(find.text('P2WLAN Diagnostics'), findsOneWidget);
     expect(find.text('Dashboard'), findsWidgets);
     expect(find.text('Offline'), findsWidgets);
   });
