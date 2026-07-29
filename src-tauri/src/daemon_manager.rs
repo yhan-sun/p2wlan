@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -673,25 +673,12 @@ impl DaemonManager {
     }
 
     pub fn diagnostics_bind_from_url(url: &str) -> String {
-        Self::diagnostics_socket_addr_from_url(url)
-            .map(|address| address.to_string())
-            .unwrap_or_else(|| "127.0.0.1:39277".to_string())
+        p2wlan_desktop_host::diagnostics_bind_from_url(url)
+            .unwrap_or_else(|_| "127.0.0.1:39277".to_string())
     }
 
     fn diagnostics_socket_addr_from_url(url: &str) -> Option<SocketAddr> {
-        let parsed = url::Url::parse(url).ok()?;
-        let ip = match parsed.host()? {
-            url::Host::Ipv4(ip) => IpAddr::V4(ip),
-            url::Host::Ipv6(ip) => IpAddr::V6(ip),
-            url::Host::Domain(host) if host.eq_ignore_ascii_case("localhost") => {
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            }
-            _ => return None,
-        };
-        if !ip.is_loopback() {
-            return None;
-        }
-        Some(SocketAddr::new(ip, parsed.port()?))
+        p2wlan_desktop_host::diagnostics_socket_addr_from_url(url).ok()
     }
 
     fn available_diagnostics_url(preferred_url: &str) -> Result<String, String> {
@@ -729,10 +716,7 @@ impl DaemonManager {
     }
 
     pub fn default_config_path() -> PathBuf {
-        let base = dirs::config_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("p2wlan").join("p2pnet-config.json")
+        p2wlan_desktop_host::default_config_path()
     }
 
     #[cfg(unix)]
@@ -790,27 +774,15 @@ impl DaemonManager {
     }
 
     pub fn default_log_dir() -> PathBuf {
-        if cfg!(target_os = "macos") {
-            dirs::home_dir()
-                .map(|h| h.join("Library").join("Logs").join("p2wlan"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        } else if cfg!(target_os = "windows") {
-            std::env::var("LOCALAPPDATA")
-                .map(|l| PathBuf::from(l).join("p2wlan").join("logs"))
-                .unwrap_or_else(|_| PathBuf::from("."))
-        } else {
-            dirs::home_dir()
-                .map(|h| h.join(".p2wlan").join("logs"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        }
+        p2wlan_desktop_host::default_log_dir()
     }
 
     fn default_pid_path() -> PathBuf {
-        Self::default_log_dir().join("p2pnet-daemon.pid")
+        p2wlan_desktop_host::pid_path_from_log_dir(Self::default_log_dir())
     }
 
     fn default_endpoint_path() -> PathBuf {
-        Self::default_log_dir().join("p2pnet-daemon.endpoint")
+        p2wlan_desktop_host::endpoint_path_from_log_dir(Self::default_log_dir())
     }
 
     fn persist_diagnostics_url(url: &str) -> Result<(), String> {
@@ -884,9 +856,7 @@ impl DaemonManager {
 
     pub fn recent_daemon_log_lines(max_lines: usize) -> Vec<String> {
         let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
-        Self::log_tail(&log_path, max_lines)
-            .map(|tail| tail.lines().map(ToString::to_string).collect())
-            .unwrap_or_default()
+        p2wlan_desktop_host::recent_daemon_log_lines(log_path, max_lines).unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -2259,6 +2229,48 @@ mod tests {
     }
 
     #[test]
+    fn operation_phase_busy_states_match_desktop_host_contract() {
+        let pairs = [
+            (
+                DaemonOperationPhase::Stopped,
+                p2wlan_desktop_host::DesktopHostPhase::Stopped,
+            ),
+            (
+                DaemonOperationPhase::Authorizing,
+                p2wlan_desktop_host::DesktopHostPhase::Authorizing,
+            ),
+            (
+                DaemonOperationPhase::Launching,
+                p2wlan_desktop_host::DesktopHostPhase::Launching,
+            ),
+            (
+                DaemonOperationPhase::WaitingForDaemon,
+                p2wlan_desktop_host::DesktopHostPhase::WaitingForDaemon,
+            ),
+            (
+                DaemonOperationPhase::Running,
+                p2wlan_desktop_host::DesktopHostPhase::Running,
+            ),
+            (
+                DaemonOperationPhase::Stopping,
+                p2wlan_desktop_host::DesktopHostPhase::Stopping,
+            ),
+            (
+                DaemonOperationPhase::Error,
+                p2wlan_desktop_host::DesktopHostPhase::Error,
+            ),
+        ];
+
+        for (tauri_phase, host_phase) in pairs {
+            assert_eq!(tauri_phase.is_busy(), host_phase.is_busy());
+            assert_eq!(
+                serde_json::to_value(tauri_phase).unwrap(),
+                serde_json::to_value(host_phase).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn persisted_endpoint_recovers_an_untracked_elevated_daemon() {
         let (url, recovered) = desktop_diagnostics_url(
             "http://127.0.0.1:39277/status".to_string(),
@@ -2359,6 +2371,40 @@ mod tests {
         assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
         assert!(status.diagnostics_alive);
         assert!(status.diagnostics.is_none());
+        assert!(!status.diagnostics_stale);
+        assert!(status
+            .diagnostics_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("守护进程不可达"));
+        assert_eq!(manager.state.lock().await.consecutive_status_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn desktop_status_marks_cached_snapshot_stale_when_status_decode_fails() {
+        let manager = DaemonManager::new();
+        let cached = serde_json::json!({"node_id": "cached-node"});
+        manager
+            .set_operation(DaemonOperationPhase::Running, "TUN 已连接", None)
+            .await;
+        let url = status_server_once("not json").await;
+        {
+            let mut state = manager.state.lock().await;
+            state.diagnostics_url = url.clone();
+            state.last_diagnostics = Some(cached.clone());
+        }
+
+        let status = manager.desktop_status(Some(url)).await;
+
+        assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+        assert!(status.diagnostics_alive);
+        assert!(status.diagnostics_stale);
+        assert_eq!(status.diagnostics, Some(cached));
+        assert!(status
+            .diagnostics_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("解析守护进程状态失败"));
         assert_eq!(manager.state.lock().await.consecutive_status_failures, 0);
     }
 
@@ -2374,6 +2420,12 @@ mod tests {
         for expected_failures in 1..=2 {
             let status = manager.desktop_status(Some(url.clone())).await;
             assert_eq!(status.operation.phase, DaemonOperationPhase::Running);
+            assert!(!status.diagnostics_alive);
+            assert!(!status.diagnostics_stale);
+            assert_eq!(
+                status.diagnostics_error.as_deref(),
+                Some("本地健康检查端点不可访问")
+            );
             assert_eq!(
                 manager.state.lock().await.consecutive_status_failures,
                 expected_failures
@@ -2382,6 +2434,12 @@ mod tests {
 
         let status = manager.desktop_status(Some(url)).await;
         assert_eq!(status.operation.phase, DaemonOperationPhase::Error);
+        assert!(!status.diagnostics_alive);
+        assert!(!status.diagnostics_stale);
+        assert_eq!(
+            status.diagnostics_error.as_deref(),
+            Some("本地健康检查端点不可访问")
+        );
         assert_eq!(
             status.operation.last_error.as_deref(),
             Some("连续 3 次无法访问本地健康检查端点")
@@ -2482,6 +2540,38 @@ mod tests {
         assert_eq!(
             DaemonManager::diagnostics_bind_from_url("http://[::1]:39277/status"),
             "[::1]:39277"
+        );
+    }
+
+    #[test]
+    fn diagnostics_helpers_match_desktop_host_for_loopback_urls() {
+        for url in [
+            "http://127.0.0.1:39277/status",
+            "http://localhost:39278/status",
+            "http://[::1]:39279/status",
+        ] {
+            assert_eq!(
+                DaemonManager::diagnostics_bind_from_url(url),
+                p2wlan_desktop_host::diagnostics_bind_from_url(url).unwrap()
+            );
+        }
+
+        let normalized = p2wlan_desktop_host::normalize_diagnostics_url("http://localhost:39277")
+            .expect("desktop-host should normalize a loopback diagnostics base URL");
+        assert_eq!(normalized, "http://localhost:39277/status");
+        assert_eq!(
+            DaemonManager::diagnostics_bind_from_url(&normalized),
+            p2wlan_desktop_host::diagnostics_bind_from_url(&normalized).unwrap()
+        );
+
+        let health_url =
+            p2wlan_desktop_host::health_url_from_status_url("http://127.0.0.1:39277/status")
+                .unwrap();
+        assert_eq!(health_url, "http://127.0.0.1:39277/health");
+
+        assert!(DaemonManager::available_diagnostics_url("http://0.0.0.0:39277/status").is_err());
+        assert!(
+            p2wlan_desktop_host::normalize_diagnostics_url("http://0.0.0.0:39277/status").is_err()
         );
     }
 
@@ -2598,6 +2688,23 @@ mod tests {
     }
 
     #[test]
+    fn default_paths_match_desktop_host_layout() {
+        let config_path = DaemonManager::default_config_path();
+        assert_eq!(config_path, p2wlan_desktop_host::default_config_path());
+
+        let log_dir = DaemonManager::default_log_dir();
+        assert_eq!(log_dir, p2wlan_desktop_host::default_log_dir());
+        assert_eq!(
+            DaemonManager::default_pid_path(),
+            p2wlan_desktop_host::pid_path_from_log_dir(&log_dir)
+        );
+        assert_eq!(
+            DaemonManager::default_endpoint_path(),
+            p2wlan_desktop_host::endpoint_path_from_log_dir(&log_dir)
+        );
+    }
+
+    #[test]
     fn test_daemon_start_options_deserialize_from_camel_case() {
         let json = serde_json::json!({
             "diagnosticsUrl": "http://127.0.0.1:39277/status",
@@ -2628,6 +2735,106 @@ mod tests {
         assert_eq!(options.udp_advertise.as_deref(), Some("203.0.113.10:60207"));
         assert_eq!(options.socket_pool.as_deref(), Some("3"));
         assert_eq!(options.mtu, Some(1420));
+    }
+
+    #[test]
+    fn start_options_deserialize_like_desktop_host_contract() {
+        let json = serde_json::json!({
+            "diagnosticsUrl": "http://127.0.0.1:39277/status",
+            "controlServer": "http://127.0.0.1:8080",
+            "authToken": "token",
+            "networkId": "default",
+            "deviceName": "mac",
+            "tunInterface": "p2pnet0",
+            "udpBind": "0.0.0.0:60207",
+            "udpAdvertise": "203.0.113.10:60207",
+            "socketPool": "3",
+            "mtu": 1420
+        });
+        let tauri_options: DaemonStartOptions = serde_json::from_value(json.clone()).unwrap();
+        let host_options: p2wlan_desktop_host::DesktopHostStartOptions =
+            serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(tauri_options.diagnostics_url, host_options.diagnostics_url);
+        assert_eq!(tauri_options.control_server, host_options.control_server);
+        assert_eq!(tauri_options.auth_token, host_options.auth_token);
+        assert_eq!(tauri_options.network_id, host_options.network_id);
+        assert_eq!(tauri_options.device_name, host_options.device_name);
+        assert_eq!(tauri_options.tun_interface, host_options.tun_interface);
+        assert_eq!(tauri_options.udp_bind, host_options.udp_bind);
+        assert_eq!(tauri_options.udp_advertise, host_options.udp_advertise);
+        assert_eq!(tauri_options.socket_pool, host_options.socket_pool);
+        assert_eq!(tauri_options.mtu, host_options.mtu);
+        assert_eq!(serde_json::to_value(host_options).unwrap(), json);
+    }
+
+    #[test]
+    fn desktop_status_serializes_external_command_contract() {
+        let status = DesktopStatus {
+            operation: DaemonOperationStatus {
+                phase: DaemonOperationPhase::Running,
+                message: "TUN 已连接".to_string(),
+                started_at_ms: 42,
+                last_error: None,
+            },
+            diagnostics: Some(serde_json::json!({"node_id": "node-1"})),
+            diagnostics_url: "http://127.0.0.1:39277/status".to_string(),
+            diagnostics_alive: true,
+            diagnostics_stale: false,
+            diagnostics_error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({
+                "operation": {
+                    "phase": "running",
+                    "message": "TUN 已连接",
+                    "startedAtMs": 42,
+                    "lastError": null
+                },
+                "diagnostics": {"node_id": "node-1"},
+                "diagnosticsUrl": "http://127.0.0.1:39277/status",
+                "diagnosticsAlive": true,
+                "diagnosticsStale": false,
+                "diagnosticsError": null
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_status_json_keys_match_desktop_host_contract() {
+        let tauri_status = DesktopStatus {
+            operation: DaemonOperationStatus {
+                phase: DaemonOperationPhase::Running,
+                message: "TUN 已连接".to_string(),
+                started_at_ms: 42,
+                last_error: Some("last".to_string()),
+            },
+            diagnostics: Some(serde_json::json!({"node_id": "node-1"})),
+            diagnostics_url: "http://127.0.0.1:39277/status".to_string(),
+            diagnostics_alive: true,
+            diagnostics_stale: true,
+            diagnostics_error: Some("status decode failed".to_string()),
+        };
+        let host_status = p2wlan_desktop_host::DesktopHostStatus {
+            operation: p2wlan_desktop_host::DesktopHostOperation {
+                phase: p2wlan_desktop_host::DesktopHostPhase::Running,
+                message: "TUN 已连接".to_string(),
+                started_at_ms: 42,
+                last_error: Some("last".to_string()),
+            },
+            diagnostics: Some(serde_json::json!({"node_id": "node-1"})),
+            diagnostics_url: "http://127.0.0.1:39277/status".to_string(),
+            diagnostics_alive: true,
+            diagnostics_stale: true,
+            diagnostics_error: Some("status decode failed".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(tauri_status).unwrap(),
+            serde_json::to_value(host_status).unwrap()
+        );
     }
 
     #[test]
