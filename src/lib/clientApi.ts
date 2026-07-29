@@ -18,6 +18,7 @@ import {
   type DiagnosticsSnapshot,
   type DesktopStatus,
   type CandidatePairDiagnostics,
+  type CandidatePairSourceStats,
   type ConnectionType,
   type PathHealthDiagnostics,
   type PeerDiagnostics,
@@ -519,6 +520,7 @@ function diagnosticsFromDaemonLogs(
         candidates: [],
         direct: emptyPathHealth(),
         relay: emptyPathHealth(),
+        candidate_pair_stats: [],
         candidate_pairs: [],
       });
     }
@@ -626,6 +628,69 @@ function natProfileSummary(snapshot: DiagnosticsSnapshot | null): string | null 
     profile.public_endpoint ? `public=${profile.public_endpoint}` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" ") : null;
+}
+
+function formatPerMille(value: number | null | undefined): string {
+  if (value == null) return "n/a";
+  return `${(value / 10).toFixed(1)}%`;
+}
+
+function formatCooldown(ms: number | null | undefined): string | null {
+  if (ms == null || ms <= 0) return null;
+  return `cooldown=${Math.ceil(ms / 1000)}s`;
+}
+
+function interestingCandidateSourceStats(snapshot: DiagnosticsSnapshot | null): Array<{
+  peerId: string;
+  stats: CandidatePairSourceStats;
+}> {
+  if (!snapshot) return [];
+  return snapshot.peers.flatMap((peer) =>
+    (peer.candidate_pair_stats ?? [])
+      .filter(
+        (stats) =>
+          stats.source === "predicted" ||
+          stats.source === "birthday" ||
+          (stats.history_cooldown_remaining_ms ?? 0) > 0
+      )
+      .map((stats) => ({ peerId: peer.node_id, stats }))
+  );
+}
+
+function candidateSourcePolicyCheck(
+  snapshot: DiagnosticsSnapshot | null
+): Pick<DiagnosticCheck, "status" | "detail"> | null {
+  const rows = interestingCandidateSourceStats(snapshot);
+  if (rows.length === 0) return null;
+
+  const hasCooldown = rows.some(({ stats }) => (stats.history_cooldown_remaining_ms ?? 0) > 0);
+  const hasZeroBudget = rows.some(({ stats }) => stats.probe_budget_per_cycle === 0);
+  const detail = rows
+    .slice(0, 6)
+    .map(({ peerId, stats }) => {
+      const budget =
+        stats.probe_budget_per_cycle == null
+          ? "budget=guaranteed"
+          : `budget=${stats.probe_budget_per_cycle}`;
+      const cooldown = formatCooldown(stats.history_cooldown_remaining_ms);
+      return [
+        `${peerId.slice(0, 8)} ${stats.source}`,
+        `pairs=${stats.current_pair_count}/${stats.pair_count}`,
+        `rate=${formatPerMille(stats.success_rate_per_mille)}`,
+        `history=${formatPerMille(stats.history_success_rate_per_mille)}`,
+        budget,
+        `reason=${stats.probe_budget_reason ?? "unknown"}`,
+        cooldown,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .join("; ");
+
+  return {
+    status: hasCooldown || hasZeroBudget ? "warn" : "pass",
+    detail,
+  };
 }
 
 function yesNo(value: boolean): string {
@@ -1339,6 +1404,17 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
         : "fail",
     detail: udpDetails.join("; "),
   });
+
+  const sourcePolicy = candidateSourcePolicyCheck(snapshot);
+  if (sourcePolicy) {
+    checks.push({
+      id: "candidate-source-policy",
+      name: "候选源策略",
+      category: "nat",
+      status: !status.reachable ? "skipped" : sourcePolicy.status,
+      detail: !status.reachable ? "守护进程离线" : sourcePolicy.detail,
+    });
+  }
 
   const gatewayMapping = snapshot?.gateway_mapping;
   if (gatewayMapping) {

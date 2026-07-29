@@ -108,6 +108,14 @@ impl TraversalHistory {
             .is_some_and(|until| until > now)
     }
 
+    pub fn source_cooldown_remaining_ms(&self, source: CandidatePairSource) -> Option<u64> {
+        let now = now_ms();
+        self.source(source)
+            .and_then(|entry| entry.cooldown_until_ms)
+            .map(|until| until.saturating_sub(now))
+            .filter(|remaining| *remaining > 0)
+    }
+
     pub fn prune_expired(&mut self, now_ms: u64) {
         self.sources.retain(|_, entry| {
             let latest = entry
@@ -231,6 +239,9 @@ mod tests {
 
         history.record_failure(CandidatePairSource::Predicted);
         assert!(history.source_in_cooldown(CandidatePairSource::Predicted));
+        assert!(history
+            .source_cooldown_remaining_ms(CandidatePairSource::Predicted)
+            .is_some_and(|remaining| remaining > 0 && remaining <= SHORT_COOLDOWN_MS));
 
         history.record_success(CandidatePairSource::Predicted);
         let entry = history.source(CandidatePairSource::Predicted).unwrap();

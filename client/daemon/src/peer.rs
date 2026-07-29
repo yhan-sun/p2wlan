@@ -1088,7 +1088,8 @@ impl PeerConnection {
             mode.allows_local_nat_birthday(),
             &mut endpoints,
         );
-        let source_stats = candidate_pair_source_stats(&self.candidate_pairs, local_generation);
+        let source_stats =
+            candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -3947,6 +3948,7 @@ impl PeerManager {
     /// Get serializable diagnostics for every peer.
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
+        let traversal_history = self.traversal_history.read().await.clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -3954,7 +3956,12 @@ impl PeerManager {
             .values()
             .map(|conn| {
                 PeerDiagnostics::from_connection_with_path_selection(
-                    conn, None, None, generation, None,
+                    conn,
+                    None,
+                    None,
+                    generation,
+                    None,
+                    Some(&traversal_history),
                 )
             })
             .collect();
@@ -3975,6 +3982,7 @@ impl PeerManager {
         local_endpoint: Option<SocketAddr>,
     ) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
+        let traversal_history = self.traversal_history.read().await.clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -3989,6 +3997,7 @@ impl PeerManager {
                     Some(direct_retry_after),
                     generation,
                     local_endpoint,
+                    Some(&traversal_history),
                 )
             })
             .collect();
@@ -4066,6 +4075,14 @@ pub struct CandidatePairSourceStats {
     pub success_rate_per_mille: Option<u16>,
     pub last_success_age_ms: Option<u64>,
     pub last_failure_age_ms: Option<u64>,
+    pub history_success_count: Option<u64>,
+    pub history_failure_count: Option<u64>,
+    pub history_consecutive_failures: Option<u32>,
+    pub history_success_rate_per_mille: Option<u16>,
+    pub history_cooldown_remaining_ms: Option<u64>,
+    pub source_quality_rank: Option<u16>,
+    pub probe_budget_per_cycle: Option<usize>,
+    pub probe_budget_reason: Option<String>,
 }
 
 /// Serializable peer connection diagnostics.
@@ -4118,6 +4135,7 @@ impl PeerDiagnostics {
         direct_retry_after: Option<Duration>,
         local_generation: u64,
         local_endpoint: Option<SocketAddr>,
+        traversal_history: Option<&TraversalHistory>,
     ) -> Self {
         let active_path = match current_selection {
             Some(selection) => match selection.path {
@@ -4230,6 +4248,7 @@ impl PeerDiagnostics {
             candidate_pair_stats: candidate_pair_source_stats(
                 &conn.candidate_pairs,
                 local_generation,
+                traversal_history,
             ),
             candidate_pairs,
             direct_retry_after_ms: direct_retry_after
@@ -4257,7 +4276,14 @@ impl PeerDiagnostics {
 
 impl From<&PeerConnection> for PeerDiagnostics {
     fn from(conn: &PeerConnection) -> Self {
-        Self::from_connection_with_path_selection(conn, None, None, conn.direct_generation, None)
+        Self::from_connection_with_path_selection(
+            conn,
+            None,
+            None,
+            conn.direct_generation,
+            None,
+            None,
+        )
     }
 }
 
@@ -4463,8 +4489,9 @@ impl From<&PathHealth> for PathHealthDiagnostics {
 fn candidate_pair_source_stats(
     pairs: &[CandidatePair],
     local_generation: u64,
+    history: Option<&TraversalHistory>,
 ) -> Vec<CandidatePairSourceStats> {
-    [
+    let mut stats = [
         CandidatePairSource::PeerReflexive,
         CandidatePairSource::Learned,
         CandidatePairSource::Host,
@@ -4477,14 +4504,32 @@ fn candidate_pair_source_stats(
         CandidatePairSource::Birthday,
     ]
     .into_iter()
-    .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source))
-    .collect()
+    .filter_map(|source| candidate_pair_source_stats_for(pairs, local_generation, source, history))
+    .collect::<Vec<_>>();
+
+    if let Some(history) = history {
+        let stats_snapshot = stats.clone();
+        for source_stats in &mut stats {
+            source_stats.source_quality_rank = Some(candidate_pair_source_quality_rank(
+                &stats_snapshot,
+                history,
+                source_stats.source,
+            ));
+            let (budget, reason) =
+                candidate_pair_source_probe_budget(&stats_snapshot, history, source_stats.source);
+            source_stats.probe_budget_per_cycle = budget;
+            source_stats.probe_budget_reason = Some(reason.to_string());
+        }
+    }
+
+    stats
 }
 
 fn candidate_pair_source_stats_for(
     pairs: &[CandidatePair],
     local_generation: u64,
     source: CandidatePairSource,
+    history: Option<&TraversalHistory>,
 ) -> Option<CandidatePairSourceStats> {
     let mut pair_count = 0u64;
     let mut current_pair_count = 0u64;
@@ -4517,6 +4562,8 @@ fn candidate_pair_source_stats_for(
         last_failure_at = latest_instant(last_failure_at, pair.last_failure_at);
     }
 
+    let history_entry = history.and_then(|history| history.source(source));
+
     (pair_count > 0).then(|| CandidatePairSourceStats {
         source,
         pair_count,
@@ -4531,6 +4578,16 @@ fn candidate_pair_source_stats_for(
         success_rate_per_mille: success_rate_per_mille(success_count, failure_count),
         last_success_age_ms: last_success_at.map(|at| duration_millis(at.elapsed())),
         last_failure_age_ms: last_failure_at.map(|at| duration_millis(at.elapsed())),
+        history_success_count: history_entry.map(|entry| entry.success_count),
+        history_failure_count: history_entry.map(|entry| entry.failure_count),
+        history_consecutive_failures: history_entry.map(|entry| entry.consecutive_failures),
+        history_success_rate_per_mille: history_entry
+            .and_then(|entry| entry.success_rate_per_mille()),
+        history_cooldown_remaining_ms: history
+            .and_then(|history| history.source_cooldown_remaining_ms(source)),
+        source_quality_rank: None,
+        probe_budget_per_cycle: None,
+        probe_budget_reason: None,
     })
 }
 
@@ -4635,14 +4692,24 @@ fn apply_speculative_probe_budget(
 }
 
 fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &TraversalHistory) -> usize {
+    predicted_probe_budget_with_reason(stats, history).0
+}
+
+fn predicted_probe_budget_with_reason(
+    stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
+) -> (usize, &'static str) {
     if history.source_in_cooldown(CandidatePairSource::Predicted) {
-        return PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE;
+        return (
+            PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE,
+            "history_cooldown",
+        );
     }
     if history
         .source(CandidatePairSource::Predicted)
         .is_some_and(|entry| entry.consecutive_failures >= 3)
     {
-        return PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE, "history_failures");
     }
     if history
         .source(CandidatePairSource::Predicted)
@@ -4650,27 +4717,31 @@ fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &Traversa
             entry.success_count >= 2 && entry.success_rate_per_mille().unwrap_or(0) >= 500
         })
     {
-        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE, "history_success");
     }
     if stats
         .iter()
         .find(|stats| stats.source == CandidatePairSource::Predicted)
         .is_some_and(|stats| stats.success_count > 0)
     {
-        return PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE, "current_success");
     }
-    PREDICTED_PROBE_BUDGET_PER_CYCLE
+    (PREDICTED_PROBE_BUDGET_PER_CYCLE, "default")
 }
 
 fn birthday_probe_budget(history: &TraversalHistory) -> usize {
+    birthday_probe_budget_with_reason(history).0
+}
+
+fn birthday_probe_budget_with_reason(history: &TraversalHistory) -> (usize, &'static str) {
     if history.source_in_cooldown(CandidatePairSource::Birthday) {
-        return 0;
+        return (0, "history_cooldown");
     }
     if history
         .source(CandidatePairSource::Birthday)
         .is_some_and(|entry| entry.consecutive_failures >= 3)
     {
-        return 0;
+        return (0, "history_failures");
     }
     if history
         .source(CandidatePairSource::Birthday)
@@ -4678,9 +4749,27 @@ fn birthday_probe_budget(history: &TraversalHistory) -> usize {
             entry.success_count > 0 && entry.success_rate_per_mille().unwrap_or(0) >= 500
         })
     {
-        return BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE;
+        return (BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE, "history_success");
     }
-    BIRTHDAY_PROBE_BUDGET_PER_CYCLE
+    (BIRTHDAY_PROBE_BUDGET_PER_CYCLE, "default")
+}
+
+fn candidate_pair_source_probe_budget(
+    stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
+    source: CandidatePairSource,
+) -> (Option<usize>, &'static str) {
+    match source {
+        CandidatePairSource::Predicted => {
+            let (budget, reason) = predicted_probe_budget_with_reason(stats, history);
+            (Some(budget), reason)
+        }
+        CandidatePairSource::Birthday => {
+            let (budget, reason) = birthday_probe_budget_with_reason(history);
+            (Some(budget), reason)
+        }
+        _ => (None, "guaranteed"),
+    }
 }
 
 fn latest_instant(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
@@ -6404,6 +6493,60 @@ mod tests {
             pair.remote_endpoint == "203.0.113.10:40007"
                 && pair.source == CandidatePairSource::Predicted
         }));
+    }
+
+    #[tokio::test]
+    async fn candidate_pair_stats_include_history_budget_diagnostics() {
+        let mut history = TraversalHistory::default();
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        let manager = PeerManager::new_with_history(test_config(), None, history);
+        let endpoint: SocketAddr = "127.0.0.1:51848".parse().unwrap();
+        let predicted_endpoint = "203.0.113.10:40007".to_string();
+
+        manager.add_peer(&test_peer("peer1", endpoint)).await;
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &[predicted_endpoint.clone()],
+                &HashMap::from([(predicted_endpoint.clone(), "predicted".to_string())]),
+            )
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        let predicted = diagnostics[0]
+            .candidate_pair_stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::Predicted)
+            .unwrap();
+
+        assert_eq!(predicted.current_pair_count, 1);
+        assert_eq!(predicted.history_success_count, Some(0));
+        assert_eq!(predicted.history_failure_count, Some(3));
+        assert_eq!(predicted.history_consecutive_failures, Some(3));
+        assert_eq!(predicted.history_success_rate_per_mille, Some(0));
+        assert!(predicted
+            .history_cooldown_remaining_ms
+            .is_some_and(|remaining| remaining > 0));
+        assert_eq!(predicted.source_quality_rank, Some(1100));
+        assert_eq!(
+            predicted.probe_budget_per_cycle,
+            Some(PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE)
+        );
+        assert_eq!(
+            predicted.probe_budget_reason.as_deref(),
+            Some("history_cooldown")
+        );
+
+        let json = serde_json::to_value(&diagnostics[0]).unwrap();
+        let predicted_json = json["candidate_pair_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stats| stats["source"] == "predicted")
+            .unwrap();
+        assert_eq!(predicted_json["probe_budget_reason"], "history_cooldown");
     }
 
     #[tokio::test]
