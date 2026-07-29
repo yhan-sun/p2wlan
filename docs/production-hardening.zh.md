@@ -14,7 +14,7 @@
 
 - 明确数据面协议：当前是 WireGuard-like `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`，不声明官方 WireGuard 互操作兼容。
 - 明确算法套件：X25519、ChaCha20-Poly1305、BLAKE2s/HKDF-BLAKE2s、Ed25519 challenge-response。
-- 为握手、传输包、重放窗口、重密钥、异常包解析补充固定测试向量。
+- 为握手、传输包、重放窗口、重密钥、异常包解析补充固定测试向量；当前至少保留 RFC ChaCha20-Poly1305 AEAD 向量和 64 包 replay-window 边界测试。
 - 固定长度握手帧必须严格校验长度和类型，拒绝截断帧与尾部拼接帧。
 - 为控制面信令签名、candidate generation、candidate expiry、probe ephemeral key 绑定补充回归测试。
 - 禁止在日志、诊断接口和崩溃输出中泄漏 X25519/Ed25519 私钥、派生会话密钥、Noise chaining key、relay ticket、JWT、device credential。

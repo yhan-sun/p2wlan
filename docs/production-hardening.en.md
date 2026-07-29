@@ -14,7 +14,7 @@ This document turns the README protocol boundaries and networking caveats into c
 
 - State the data-plane protocol explicitly: current implementation is WireGuard-like `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`, without claiming official WireGuard interoperability.
 - State the algorithm suite: X25519, ChaCha20-Poly1305, BLAKE2s/HKDF-BLAKE2s, and Ed25519 challenge-response.
-- Add fixed test vectors for handshakes, transport packets, replay windows, rekeying, and malformed packet parsing.
+- Add fixed test vectors for handshakes, transport packets, replay windows, rekeying, and malformed packet parsing; current coverage must retain the RFC ChaCha20-Poly1305 AEAD vector and 64-packet replay-window boundary test.
 - Fixed-length handshake frames must validate exact length and type, rejecting truncated frames and trailing-byte smuggling.
 - Add regression coverage for signaling signatures, candidate generation, candidate expiry, and probe ephemeral key binding.
 - Never expose X25519/Ed25519 private keys, derived session keys, Noise chaining keys, relay tickets, JWTs, or device credentials in logs, diagnostics, or panic output.

@@ -175,7 +175,7 @@ P2WLAN 当前采用自研的 WireGuard-like 数据面，而不是直接调用内
 | 控制信令 | HTTPS / WSS 上的 JSON 消息 | 便于调试；`proto/` 中保留 Protobuf 草案 |
 | 中继 | DERP-like TCP/TLS 密文转发 | 不是标准 TURN；中继不解密业务载荷 |
 
-长期生产化有两条路线：一是复用 `boringtun`、`wireguard-go` 或平台 WireGuard 实现来降低密码协议维护风险；二是保留自研数据面，但补齐测试向量、fuzz、重放/重密钥/异常包测试、互操作说明和独立安全审计。
+长期生产化有两条路线：一是复用 `boringtun`、`wireguard-go` 或平台 WireGuard 实现来降低密码协议维护风险；二是保留自研数据面，但持续补齐测试向量、fuzz、重放/重密钥/异常包测试、互操作说明和独立安全审计。当前测试已覆盖 RFC ChaCha20-Poly1305 AEAD 向量和 WireGuard-like replay window 边界。
 
 生产化前的完整验收项见 [生产化验收清单](docs/production-hardening.zh.md)，真实网络验证模板见 [NAT 穿透验收矩阵](docs/nat-traversal-matrix.zh.md)，长期技术路线见 [v2 架构路线图](docs/v2-architecture-roadmap.zh.md)。
 

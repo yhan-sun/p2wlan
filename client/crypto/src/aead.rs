@@ -143,6 +143,35 @@ mod tests {
     }
 
     #[test]
+    fn test_rfc8439_aead_chacha20_poly1305_vector() {
+        let key: AeadKey =
+            hex::decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let nonce: AeadNonce = hex::decode("070000004041424344454647")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected = hex::decode(concat!(
+            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d",
+            "63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b",
+            "3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d",
+            "7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902e",
+            "cbd0600691",
+        ))
+        .unwrap();
+
+        let ciphertext = encrypt(&key, &nonce, &aad, plaintext).unwrap();
+        assert_eq!(ciphertext, expected);
+
+        let decrypted = decrypt(&key, &nonce, &aad, &ciphertext).unwrap();
+        assert_eq!(&decrypted, plaintext);
+    }
+
+    #[test]
     fn test_ciphertext_size() {
         let key = [0x42u8; 32];
         let plaintext = b"test";
