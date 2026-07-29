@@ -177,6 +177,8 @@ P2WLAN currently uses a self-contained WireGuard-like data plane instead of call
 
 There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and add test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review.
 
+For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md).
+
 ## NAT And Relay
 
 P2WLAN's traversal layer is more than a single STUN lookup. The daemon gathers host and STUN server-reflexive candidates, performs UDP hole punching, learns peer-reflexive endpoints, maintains direct-path keepalives, and falls back to relay when direct transport is not confirmed.

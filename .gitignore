@@ -53,7 +53,9 @@ coverage/
 # Local-only project notes and research drafts
 P2PNet-Design.md
 PRODUCT.md
-docs/
+docs/*
+!docs/production-hardening.zh.md
+!docs/production-hardening.en.md
 
 # Release packages and archives
 *.pdf
