@@ -257,6 +257,29 @@ export interface UdpSocketPoolMemberDiagnostics {
   stun_mappings_discovered?: number;
 }
 
+export interface ProtocolDiagnostics {
+  data_plane: string;
+  handshake: string;
+  key_exchange: string;
+  aead: string;
+  hash_kdf: string;
+  device_identity: string;
+  relay_transport: string;
+  wireguard_interop: boolean;
+  turn_compatible: boolean;
+  security_audit: string;
+}
+
+export interface MtuDiagnostics {
+  configured_mtu: number;
+  profile: "low" | "relay_safe" | "default" | "high" | "jumbo_high_risk" | string;
+  ipv6_safe_min_mtu: number;
+  relay_safe_mtu: number;
+  wireguard_style_mtu: number;
+  common_ethernet_mtu: number;
+  automatic_pmtu: boolean;
+}
+
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
   version?: string;
@@ -265,6 +288,8 @@ export interface DiagnosticsSnapshot {
   virtual_ip: string;
   network_id: string;
   network_generation?: number;
+  protocol?: ProtocolDiagnostics;
+  mtu?: MtuDiagnostics;
   udp_local_addr: string | null;
   udp_socket_count?: number;
   udp_socket_pool_active?: boolean;
