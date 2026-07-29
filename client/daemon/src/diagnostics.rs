@@ -22,6 +22,69 @@ use crate::tasks::{HealthState, TaskManager};
 use crate::traversal_history::TraversalHistoryDiagnostics;
 use crate::udp::{UdpSocketPoolMemberDiagnostics, UdpTransport};
 
+const IPV6_SAFE_MIN_MTU: u32 = 1280;
+const RELAY_SAFE_MTU: u32 = 1380;
+const WIREGUARD_STYLE_MTU: u32 = 1420;
+const COMMON_ETHERNET_MTU: u32 = 1500;
+
+/// Static protocol boundary advertised by diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolDiagnostics {
+    pub data_plane: String,
+    pub handshake: String,
+    pub key_exchange: String,
+    pub aead: String,
+    pub hash_kdf: String,
+    pub device_identity: String,
+    pub relay_transport: String,
+    pub wireguard_interop: bool,
+    pub turn_compatible: bool,
+    pub security_audit: String,
+}
+
+impl ProtocolDiagnostics {
+    fn current() -> Self {
+        Self {
+            data_plane: "wireguard_like_noise".to_string(),
+            handshake: "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".to_string(),
+            key_exchange: "X25519".to_string(),
+            aead: "ChaCha20-Poly1305".to_string(),
+            hash_kdf: "BLAKE2s/HKDF-BLAKE2s".to_string(),
+            device_identity: "Ed25519 challenge-response".to_string(),
+            relay_transport: "DERP-like TCP/TLS ciphertext forwarding".to_string(),
+            wireguard_interop: false,
+            turn_compatible: false,
+            security_audit: "not_completed".to_string(),
+        }
+    }
+}
+
+/// MTU boundary and current TUN configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtuDiagnostics {
+    pub configured_mtu: u32,
+    pub profile: String,
+    pub ipv6_safe_min_mtu: u32,
+    pub relay_safe_mtu: u32,
+    pub wireguard_style_mtu: u32,
+    pub common_ethernet_mtu: u32,
+    pub automatic_pmtu: bool,
+}
+
+impl MtuDiagnostics {
+    fn from_configured(configured_mtu: u32) -> Self {
+        Self {
+            configured_mtu,
+            profile: mtu_profile(configured_mtu).to_string(),
+            ipv6_safe_min_mtu: IPV6_SAFE_MIN_MTU,
+            relay_safe_mtu: RELAY_SAFE_MTU,
+            wireguard_style_mtu: WIREGUARD_STYLE_MTU,
+            common_ethernet_mtu: COMMON_ETHERNET_MTU,
+            automatic_pmtu: false,
+        }
+    }
+}
+
 /// Runtime diagnostics snapshot returned by the local endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
@@ -31,6 +94,8 @@ pub struct DiagnosticsSnapshot {
     pub virtual_ip: String,
     pub network_id: String,
     pub network_generation: u64,
+    pub protocol: ProtocolDiagnostics,
+    pub mtu: MtuDiagnostics,
     pub udp_local_addr: Option<String>,
     /// Number of live direct UDP sockets (one unless the bounded experiment is enabled).
     pub udp_socket_count: usize,
@@ -94,6 +159,16 @@ impl DiagnosticsContext {
             task_manager,
             shutdown_tx,
         }
+    }
+}
+
+fn mtu_profile(mtu: u32) -> &'static str {
+    match mtu {
+        0..=1279 => "low",
+        1280..=RELAY_SAFE_MTU => "relay_safe",
+        1381..=WIREGUARD_STYLE_MTU => "default",
+        1421..=COMMON_ETHERNET_MTU => "high",
+        _ => "jumbo_high_risk",
     }
 }
 
@@ -250,6 +325,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation().await,
+        protocol: ProtocolDiagnostics::current(),
+        mtu: MtuDiagnostics::from_configured(context.config.network.mtu),
         udp_local_addr,
         udp_socket_count,
         udp_socket_pool_active,
@@ -381,6 +458,18 @@ mod tests {
         assert_eq!(snapshot.process_id, std::process::id());
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.network_generation, 0);
+        assert_eq!(
+            snapshot.protocol.handshake,
+            "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+        );
+        assert_eq!(snapshot.protocol.aead, "ChaCha20-Poly1305");
+        assert!(!snapshot.protocol.wireguard_interop);
+        assert!(!snapshot.protocol.turn_compatible);
+        assert_eq!(snapshot.protocol.security_audit, "not_completed");
+        assert_eq!(snapshot.mtu.configured_mtu, 1420);
+        assert_eq!(snapshot.mtu.profile, "default");
+        assert_eq!(snapshot.mtu.relay_safe_mtu, 1380);
+        assert!(!snapshot.mtu.automatic_pmtu);
         assert!(snapshot.local_candidates.is_empty());
         assert_eq!(snapshot.nat_profile, None);
         assert_eq!(snapshot.peers.len(), 1);
