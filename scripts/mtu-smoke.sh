@@ -56,6 +56,102 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+emit_status_mtu_summary() {
+  local status_file=$1
+  [[ -s "$status_file" ]] || return 0
+  has_cmd python3 || return 0
+
+  python3 - "$status_file" <<'PY'
+import json
+import sys
+
+status_file = sys.argv[1]
+try:
+    with open(status_file, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception as exc:
+    print(f"[mtu-smoke] WARN: unable to parse diagnostics MTU status: {exc}", file=sys.stderr)
+    sys.exit(0)
+
+mtu = data.get("mtu") or {}
+if not isinstance(mtu, dict):
+    sys.exit(0)
+
+lines = []
+configured = mtu.get("configured_mtu")
+if configured is not None:
+    lines.append(f"runtime_mtu={configured}")
+
+relay_path = bool(mtu.get("relay_path_observed", False))
+lines.append(f"relay_path_observed={1 if relay_path else 0}")
+
+suggested = mtu.get("suggested_safe_mtu")
+if suggested is not None:
+    lines.append(f"mtu_suggested_safe={suggested}")
+
+risks = mtu.get("risks") or []
+if not isinstance(risks, list):
+    risks = []
+codes = []
+for risk in risks:
+    if not isinstance(risk, dict):
+        continue
+    code = risk.get("code")
+    message = risk.get("message")
+    if code:
+        codes.append(str(code))
+    if code and message:
+        print(f"[mtu-smoke] WARN: diagnostics mtu risk {code}: {message}", file=sys.stderr)
+
+lines.append(f"mtu_risk_codes={','.join(codes) if codes else 'none'}")
+print("\n".join(lines))
+PY
+}
+
+run_self_test() {
+  if ! has_cmd python3; then
+    echo "[mtu-smoke] self-test SKIP: python3 unavailable"
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp -d /tmp/p2wlan-mtu-smoke-self.XXXXXX)
+  cat >"$tmp/status.json" <<'JSON'
+{
+  "mtu": {
+    "configured_mtu": 1420,
+    "relay_path_observed": true,
+    "suggested_safe_mtu": 1380,
+    "risks": [{
+      "code": "relay_path_high_mtu",
+      "message": "Relay path observed with MTU 1420; try lowering MTU."
+    }]
+  }
+}
+JSON
+
+  local summary
+  summary=$(emit_status_mtu_summary "$tmp/status.json")
+  rm -rf "$tmp"
+  [[ "$summary" == *"runtime_mtu=1420"* ]] || {
+    echo "[mtu-smoke] self-test FAIL: missing runtime_mtu" >&2
+    return 1
+  }
+  [[ "$summary" == *"relay_path_observed=1"* ]] || {
+    echo "[mtu-smoke] self-test FAIL: missing relay_path_observed" >&2
+    return 1
+  }
+  [[ "$summary" == *"mtu_suggested_safe=1380"* ]] || {
+    echo "[mtu-smoke] self-test FAIL: missing mtu_suggested_safe" >&2
+    return 1
+  }
+  [[ "$summary" == *"mtu_risk_codes=relay_path_high_mtu"* ]] || {
+    echo "[mtu-smoke] self-test FAIL: missing risk code" >&2
+    return 1
+  }
+  echo "[mtu-smoke] self-test PASS"
+}
+
 write_zero_payload() {
   local bytes=$1
   dd if=/dev/zero bs="$bytes" count=1 2>/dev/null
@@ -82,6 +178,11 @@ resolve_p2wlan_bin() {
   printf '\n'
 }
 
+if [[ "${P2WLAN_MTU_SMOKE_SELF_TEST:-0}" == "1" ]]; then
+  run_self_test
+  exit $?
+fi
+
 if [[ "$PEER" == "-h" || "$PEER" == "--help" ]]; then
   usage
   exit 0
@@ -105,10 +206,17 @@ fi
 if command -v curl >/dev/null 2>&1; then
   curl -fsS "$DIAGNOSTICS_URL" -o "$OUT_DIR/status.json" 2>"$OUT_DIR/status.err" || true
 fi
+MTU_STATUS_SUMMARY=""
+if [[ -s "$OUT_DIR/status.json" ]]; then
+  MTU_STATUS_SUMMARY=$(emit_status_mtu_summary "$OUT_DIR/status.json" || true)
+fi
 
 echo "[mtu-smoke] peer: $PEER"
 echo "[mtu-smoke] output: $OUT_DIR"
 echo "[mtu-smoke] packet sizes: $MTUS"
+if [[ -n "$MTU_STATUS_SUMMARY" ]]; then
+  echo "[mtu-smoke] diagnostics mtu: $(printf '%s' "$MTU_STATUS_SUMMARY" | tr '\n' ' ')"
+fi
 if [[ -n "$TCP_PORT" ]]; then
   echo "[mtu-smoke] tcp payload test: $TCP_PORT small=$TCP_SMALL_BYTES large=$TCP_LARGE_BYTES"
 else
@@ -256,6 +364,9 @@ fi
   echo "tcp_large=$TCP_LARGE_RESULT"
   echo "udp_payload=$UDP_RESULT"
   echo "out_dir=$OUT_DIR"
+  if [[ -n "$MTU_STATUS_SUMMARY" ]]; then
+    printf '%s\n' "$MTU_STATUS_SUMMARY"
+  fi
 } >"$OUT_DIR/summary.env"
 
 if [[ "$PASS_MAX" -eq 0 ]]; then

@@ -198,6 +198,8 @@ Troubleshooting guidance:
 
 - If small `ping` packets work but larger flows stall, try lowering MTU to `1380`, `1360`, or `1280`.
 - Relay paths carry ciphertext over TCP/TLS, so latency and congestion behavior differ from direct UDP.
+- `p2wlan doctor` and local diagnostics `/status` now emit structured MTU risk codes and a suggested downgrade when relay paths are observed above `1380`.
+- `scripts/mtu-smoke.sh` records daemon runtime MTU, relay-path state, risk codes, and suggested safe MTU in `summary.env`; use `P2WLAN_MTU_SMOKE_SELF_TEST=1` to verify the script parser.
 - Networks that drop ICMP fragmentation-needed messages can create PMTU blackholes; automatic PMTU probing is a key future hardening item.
 - P2WLAN is a transparent layer-3 virtual network. It does not split SSH, file transfer, or game traffic into separate application streams. If QUIC is introduced later, QUIC DATAGRAM or relay transport is the more natural starting point than rewriting application protocols.
 

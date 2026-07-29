@@ -69,10 +69,23 @@ pub struct MtuDiagnostics {
     pub wireguard_style_mtu: u32,
     pub common_ethernet_mtu: u32,
     pub automatic_pmtu: bool,
+    pub relay_path_observed: bool,
+    pub suggested_safe_mtu: Option<u32>,
+    pub risks: Vec<MtuRiskDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtuRiskDiagnostics {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    pub suggested_mtu: Option<u32>,
 }
 
 impl MtuDiagnostics {
-    fn from_configured(configured_mtu: u32) -> Self {
+    fn from_runtime(configured_mtu: u32, relay_path_observed: bool) -> Self {
+        let risks = mtu_risks(configured_mtu, relay_path_observed);
+        let suggested_safe_mtu = suggested_safe_mtu(configured_mtu, relay_path_observed);
         Self {
             configured_mtu,
             profile: mtu_profile(configured_mtu).to_string(),
@@ -81,6 +94,9 @@ impl MtuDiagnostics {
             wireguard_style_mtu: WIREGUARD_STYLE_MTU,
             common_ethernet_mtu: COMMON_ETHERNET_MTU,
             automatic_pmtu: false,
+            relay_path_observed,
+            suggested_safe_mtu,
+            risks,
         }
     }
 }
@@ -170,6 +186,62 @@ fn mtu_profile(mtu: u32) -> &'static str {
         1421..=COMMON_ETHERNET_MTU => "high",
         _ => "jumbo_high_risk",
     }
+}
+
+fn suggested_safe_mtu(mtu: u32, relay_path_observed: bool) -> Option<u32> {
+    if mtu < IPV6_SAFE_MIN_MTU {
+        Some(IPV6_SAFE_MIN_MTU)
+    } else if relay_path_observed && mtu > RELAY_SAFE_MTU {
+        Some(RELAY_SAFE_MTU)
+    } else if mtu > WIREGUARD_STYLE_MTU {
+        Some(WIREGUARD_STYLE_MTU)
+    } else {
+        None
+    }
+}
+
+fn mtu_risks(mtu: u32, relay_path_observed: bool) -> Vec<MtuRiskDiagnostics> {
+    let mut risks = Vec::new();
+    if mtu < IPV6_SAFE_MIN_MTU {
+        risks.push(MtuRiskDiagnostics {
+            code: "below_ipv6_safe_min".to_string(),
+            severity: "warning".to_string(),
+            message: format!(
+                "Configured MTU {mtu} is below the IPv6 minimum {IPV6_SAFE_MIN_MTU}; use it only as a temporary PMTU blackhole workaround."
+            ),
+            suggested_mtu: Some(IPV6_SAFE_MIN_MTU),
+        });
+    }
+    if relay_path_observed && mtu > RELAY_SAFE_MTU {
+        risks.push(MtuRiskDiagnostics {
+            code: "relay_path_high_mtu".to_string(),
+            severity: "warning".to_string(),
+            message: format!(
+                "Relay path observed with MTU {mtu}; if large flows stall, try lowering MTU to {RELAY_SAFE_MTU} before changing the default globally."
+            ),
+            suggested_mtu: Some(RELAY_SAFE_MTU),
+        });
+    }
+    if mtu > COMMON_ETHERNET_MTU {
+        risks.push(MtuRiskDiagnostics {
+            code: "jumbo_mtu_high_risk".to_string(),
+            severity: "warning".to_string(),
+            message: format!(
+                "Configured MTU {mtu} exceeds common Ethernet MTU {COMMON_ETHERNET_MTU}; require end-to-end jumbo-frame validation or lower to {WIREGUARD_STYLE_MTU}."
+            ),
+            suggested_mtu: Some(WIREGUARD_STYLE_MTU),
+        });
+    } else if mtu > WIREGUARD_STYLE_MTU {
+        risks.push(MtuRiskDiagnostics {
+            code: "above_wireguard_style_default".to_string(),
+            severity: "notice".to_string(),
+            message: format!(
+                "Configured MTU {mtu} is above the WireGuard-style default {WIREGUARD_STYLE_MTU}; mobile, CGNAT, or enterprise paths may blackhole large packets."
+            ),
+            suggested_mtu: Some(WIREGUARD_STYLE_MTU),
+        });
+    }
+    risks
 }
 
 /// Run the local diagnostics HTTP endpoint until the listener fails.
@@ -326,7 +398,10 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation().await,
         protocol: ProtocolDiagnostics::current(),
-        mtu: MtuDiagnostics::from_configured(context.config.network.mtu),
+        mtu: MtuDiagnostics::from_runtime(
+            context.config.network.mtu,
+            relay_connected || stats.relay_connections > 0,
+        ),
         udp_local_addr,
         udp_socket_count,
         udp_socket_pool_active,
@@ -396,6 +471,32 @@ mod tests {
             allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: https://example.com\r\n\r\n"),
             None
         );
+    }
+
+    #[test]
+    fn mtu_diagnostics_explain_relay_high_mtu_risk() {
+        let default_direct = MtuDiagnostics::from_runtime(1420, false);
+        assert_eq!(default_direct.profile, "default");
+        assert!(!default_direct.relay_path_observed);
+        assert_eq!(default_direct.suggested_safe_mtu, None);
+        assert!(default_direct.risks.is_empty());
+
+        let relay_default = MtuDiagnostics::from_runtime(1420, true);
+        assert!(relay_default.relay_path_observed);
+        assert_eq!(relay_default.suggested_safe_mtu, Some(RELAY_SAFE_MTU));
+        assert!(relay_default
+            .risks
+            .iter()
+            .any(|risk| risk.code == "relay_path_high_mtu"
+                && risk.suggested_mtu == Some(RELAY_SAFE_MTU)));
+
+        let jumbo = MtuDiagnostics::from_runtime(9000, false);
+        assert_eq!(jumbo.profile, "jumbo_high_risk");
+        assert!(jumbo
+            .risks
+            .iter()
+            .any(|risk| risk.code == "jumbo_mtu_high_risk"
+                && risk.suggested_mtu == Some(WIREGUARD_STYLE_MTU)));
     }
 
     #[tokio::test]
@@ -470,6 +571,9 @@ mod tests {
         assert_eq!(snapshot.mtu.profile, "default");
         assert_eq!(snapshot.mtu.relay_safe_mtu, 1380);
         assert!(!snapshot.mtu.automatic_pmtu);
+        assert!(!snapshot.mtu.relay_path_observed);
+        assert_eq!(snapshot.mtu.suggested_safe_mtu, None);
+        assert!(snapshot.mtu.risks.is_empty());
         assert!(snapshot.local_candidates.is_empty());
         assert_eq!(snapshot.nat_profile, None);
         assert_eq!(snapshot.peers.len(), 1);

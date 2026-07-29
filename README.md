@@ -198,6 +198,8 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 
 - 如果小包 `ping` 正常但大流量异常，先尝试把 MTU 调低到 `1380`、`1360` 或 `1280`。
 - 如果经过中继路径，注意 relay 使用 TCP/TLS 承载密文包，延迟和拥塞行为会不同于直连 UDP。
+- `p2wlan doctor` 和本地 diagnostics `/status` 会在观察到 relay 路径且 MTU 高于 `1380` 时给出结构化风险码和建议降级值。
+- `scripts/mtu-smoke.sh` 会把 daemon 的 runtime MTU、relay-path 状态、风险码和建议安全 MTU 写入 `summary.env`，可用 `P2WLAN_MTU_SMOKE_SELF_TEST=1` 验证脚本解析逻辑。
 - 如果底层网络丢弃 ICMP fragmentation-needed，可能出现 PMTU blackhole；这属于后续自动 PMTU 探测需要重点解决的问题。
 - P2WLAN 是透明三层虚拟网卡，不会把 SSH、文件传输或游戏流量拆成独立应用层 stream；未来如果引入 QUIC，更适合优先评估 QUIC DATAGRAM 或 relay 传输，而不是强行重写应用协议。
 
