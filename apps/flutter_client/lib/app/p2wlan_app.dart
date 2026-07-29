@@ -6,8 +6,13 @@ import '../core/state/status_store.dart';
 import 'navigation.dart';
 
 class P2WlanApp extends StatefulWidget {
-  const P2WlanApp({super.key, this.autoStartPolling = true});
+  const P2WlanApp({
+    super.key,
+    this.initialRefresh = true,
+    this.autoStartPolling = false,
+  });
 
+  final bool initialRefresh;
   final bool autoStartPolling;
 
   @override
@@ -32,6 +37,9 @@ class _P2WlanAppState extends State<P2WlanApp> {
 
   Future<void> _bootstrap() async {
     await _settingsStore.load();
+    if (widget.initialRefresh) {
+      await _statusStore.refresh();
+    }
     if (widget.autoStartPolling) {
       _statusStore.startPolling();
     }

@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../core/models/daemon_models.dart';
 import '../../core/state/status_store.dart';
@@ -24,7 +27,7 @@ class DiagnosticsPage extends StatelessWidget {
           children: [
             _Summary(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 16),
-            _RawJson(snapshot: snapshot),
+            _RawJson(statusStore: statusStore, snapshot: snapshot),
           ],
         );
       },
@@ -52,33 +55,53 @@ class _Summary extends StatelessWidget {
         runSpacing: 8,
         children: [
           MetricTile(
-            label: 'Health endpoint',
+            label: 'GET /health',
             value: statusStore.healthReachable ? 'reachable' : 'offline',
+            detail: statusStore.lastHealthError,
           ),
-          MetricTile(label: 'Daemon health', value: health?.status ?? '-'),
+          MetricTile(
+            label: 'GET /status',
+            value: statusStore.statusReachable
+                ? 'loaded'
+                : statusStore.healthReachable
+                ? 'error'
+                : 'skipped',
+            detail: statusStore.lastStatusError,
+          ),
+          MetricTile(label: 'Daemon health', value: dash(health?.status)),
           MetricTile(
             label: 'Control connected',
-            value: formatBool(health?.controlConnected ?? false),
+            value: formatOptionalBool(health?.controlConnected),
           ),
           MetricTile(
             label: 'Reauth required',
-            value: formatBool(health?.reauthRequired ?? false),
+            value: formatOptionalBool(health?.reauthRequired),
           ),
           MetricTile(
             label: 'UDP sockets',
-            value: formatInt(snapshot?.udpSocketCount ?? 0),
+            value: snapshot == null ? '—' : formatInt(snapshot!.udpSocketCount),
           ),
           MetricTile(
             label: 'Socket pool active',
-            value: formatBool(snapshot?.udpSocketPoolActive ?? false),
+            value: formatOptionalBool(snapshot?.udpSocketPoolActive),
           ),
           MetricTile(
             label: 'Relay connected',
-            value: formatBool(snapshot?.relayConnected ?? false),
+            value: formatOptionalBool(snapshot?.relayConnected),
           ),
           MetricTile(
             label: 'Peer count',
-            value: formatInt(snapshot?.stats.totalPeers ?? 0),
+            value: snapshot == null
+                ? '—'
+                : formatInt(snapshot!.stats.totalPeers),
+          ),
+          MetricTile(
+            label: 'Last refresh',
+            value: formatDateTime(statusStore.lastFetchedAt),
+          ),
+          MetricTile(
+            label: 'Request duration',
+            value: formatDuration(statusStore.lastRequestDuration),
           ),
           if (statusStore.lastError != null)
             MetricTile(label: 'Last error', value: statusStore.lastError!),
@@ -91,15 +114,21 @@ class _Summary extends StatelessWidget {
 }
 
 class _RawJson extends StatelessWidget {
-  const _RawJson({required this.snapshot});
+  const _RawJson({required this.statusStore, required this.snapshot});
 
+  final StatusStore statusStore;
   final DaemonSnapshot? snapshot;
 
   @override
   Widget build(BuildContext context) {
-    final raw = snapshot?.prettyJson ?? '{\n  "status": "offline"\n}';
+    final raw = snapshot?.prettyJson ?? _readableErrorJson();
     return InfoCard(
       title: 'Raw /status JSON',
+      trailing: OutlinedButton.icon(
+        onPressed: () => _copy(context, raw),
+        icon: const Icon(Icons.copy_all_outlined),
+        label: const Text('Copy'),
+      ),
       child: Container(
         width: double.infinity,
         constraints: const BoxConstraints(minHeight: 260),
@@ -122,5 +151,31 @@ class _RawJson extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  String _readableErrorJson() {
+    const encoder = JsonEncoder.withIndent('  ');
+    return encoder.convert({
+      'status': statusStore.healthReachable ? 'status_unavailable' : 'offline',
+      'health_endpoint': statusStore.healthReachable ? 'reachable' : 'offline',
+      'status_endpoint': statusStore.statusReachable
+          ? 'loaded'
+          : statusStore.healthReachable
+          ? 'error'
+          : 'skipped',
+      if (statusStore.lastError != null) 'error': statusStore.lastError,
+      if (statusStore.lastFetchedAt != null)
+        'last_refresh': statusStore.lastFetchedAt!.toIso8601String(),
+      if (statusStore.lastRequestDuration != null)
+        'request_duration_ms': statusStore.lastRequestDuration!.inMilliseconds,
+    });
+  }
+
+  Future<void> _copy(BuildContext context, String raw) async {
+    await Clipboard.setData(ClipboardData(text: raw));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Diagnostics JSON copied')));
   }
 }

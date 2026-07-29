@@ -1,6 +1,6 @@
 # P2WLAN Flutter Client
 
-Read-only P1 Flutter prototype for the P2WLAN local daemon diagnostics API.
+Read-only P1/P1.5 Flutter prototype for the P2WLAN local daemon diagnostics API.
 
 This app follows `docs/adr/0002-flutter-rust-client-migration.md`:
 
@@ -17,12 +17,53 @@ cd apps/flutter_client
 flutter run -d macos
 ```
 
+The app performs one read-only refresh on startup. Auto refresh is off by
+default in P1.5 so the prototype does not keep polling an offline local port in
+the background. Users can turn on the Dashboard auto refresh switch for a low
+frequency 30 second poll; auto refresh only issues `GET /health` and
+`GET /status`.
+
 To point the UI at a manually started daemon, open Settings and set the
 diagnostics URL. The default is:
 
 ```text
 http://127.0.0.1:39277/status
 ```
+
+Settings are saved only to the Flutter client's local settings JSON. They do not
+write daemon configuration.
+
+## P1.5 Smoke
+
+Offline smoke, with no daemon started by this app:
+
+```bash
+cd apps/flutter_client
+flutter run -d macos
+```
+
+Expected offline result:
+
+- Dashboard shows `Offline`, a failed `GET /health`, skipped `GET /status`, last
+  refresh time, and request duration.
+- Diagnostics shows health/status summary plus a readable offline/error JSON
+  block instead of crashing.
+- Nodes shows peer count `0` and no peer cards.
+- Settings rejects invalid URLs, can restore the default URL, and states that the
+  URL is saved only in Flutter local settings.
+- The app does not start, stop, elevate, or shut down the daemon.
+
+Manual refresh smoke after starting an existing daemon yourself:
+
+- Click Dashboard `Refresh now`; health and status should update separately.
+- Confirm Dashboard shows `Healthy`, `Degraded`, or `Unhealthy` based on
+  `/status.health.status`, not only socket reachability.
+- Confirm Diagnostics raw JSON matches `GET /status` and the Copy button copies
+  the visible JSON using Flutter's built-in Clipboard API.
+- Confirm Nodes shows peer count, peer ID/name, virtual IP, path, connection
+  type, and Direct/Relay route; missing fields display `—`.
+- Optional: turn on Auto refresh and verify the UI refreshes every 30 seconds,
+  then turn it back off.
 
 ## Real Daemon Smoke
 
@@ -63,11 +104,17 @@ flutter run -d macos
 
 Expected smoke result:
 
-- Dashboard changes from Offline to Online.
-- Dashboard shows node ID, virtual IP, network ID, daemon health, UDP local addr,
-  relay status, and peer count from `GET /status`.
-- Diagnostics shows summary fields and raw JSON from `GET /status`.
-- Settings can change only the local diagnostics URL used by the Flutter app.
+- Dashboard changes from Offline to Healthy/Degraded/Unhealthy based on the
+  daemon health reported by `GET /status`.
+- Dashboard shows separate `GET /health` and `GET /status` states, node ID,
+  virtual IP, network ID, daemon health, UDP local addr, relay status, peer
+  count, last refresh time, and request duration.
+- Diagnostics shows summary fields and raw JSON from `GET /status`; Copy uses
+  Flutter's built-in Clipboard API.
+- Nodes shows peer count and clearer peer ID/name, virtual IP, path, connection
+  type, and Direct/Relay route fields.
+- Settings can change only the local diagnostics URL used by the Flutter app and
+  can restore the default URL.
 - The Flutter app does not call `POST /shutdown`; stop the manually started
   daemon from Terminal 1 when the smoke is complete.
 
@@ -127,12 +174,16 @@ flutter test
 flutter build macos --debug
 ```
 
-## P1 Acceptance Checklist
+## P1/P1.5 Acceptance Checklist
 
 - [ ] `flutter analyze` passes.
 - [ ] `flutter test` passes.
 - [ ] Offline daemon state renders without crashing.
-- [ ] Manually started daemon is visible through `GET /health` and `GET /status`.
+- [ ] Manual refresh works against a manually started daemon through `GET /health` and `GET /status`.
+- [ ] Auto refresh defaults off and, when enabled, only polls `GET /health` and `GET /status`.
+- [ ] Dashboard shows last refresh time and request duration.
+- [ ] Diagnostics shows raw JSON, readable offline/error JSON, and Copy support.
+- [ ] Settings validates diagnostics URLs and stores them only in Flutter local settings.
 - [ ] Fixture parsing covers node ID, virtual IP, network ID, UDP local addr,
       relay status, peer path, and peer connection type.
 - [ ] No code calls `POST /shutdown`.
