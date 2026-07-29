@@ -58,6 +58,8 @@ docs/*
 !docs/production-hardening.en.md
 !docs/nat-traversal-matrix.zh.md
 !docs/nat-traversal-matrix.en.md
+!docs/v2-architecture-roadmap.zh.md
+!docs/v2-architecture-roadmap.en.md
 
 # Release packages and archives
 *.pdf
