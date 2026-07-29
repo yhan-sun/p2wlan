@@ -861,6 +861,10 @@ pub struct PeerConnection {
     pub signaled_endpoint: Option<SocketAddr>,
     /// Peer's NAT type.
     pub nat_type: String,
+    /// Whether the control plane currently reports this peer online.
+    pub online: bool,
+    /// Last seen timestamp reported by the control plane.
+    pub last_seen: u64,
     /// Current connection state.
     pub state: ConnectionState,
     /// When the connection was established.
@@ -914,6 +918,8 @@ impl PeerConnection {
             endpoint: None,
             signaled_endpoint: None,
             nat_type: String::new(),
+            online: true,
+            last_seen: 0,
             state: ConnectionState::Idle,
             connected_at: None,
             bytes_sent: 0,
@@ -2481,6 +2487,8 @@ impl PeerManager {
             conn.reset_for_identity_change();
         }
         conn.nat_type = info.nat_type.clone();
+        conn.online = info.online;
+        conn.last_seen = info.last_seen;
 
         let signaled_endpoint = if info.endpoint.trim().is_empty() {
             None
@@ -2503,6 +2511,14 @@ impl PeerManager {
         conn.signaled_endpoint = signaled_endpoint;
         if let Some(addr) = signaled_endpoint {
             conn.ensure_candidate_pair(addr, generation);
+        }
+        if !info.online {
+            conn.transition(ConnectionState::Closed);
+            conn.relay_server = None;
+            conn.probe_session_id = None;
+            conn.probe_ephemeral_shared = None;
+        } else if conn.state == ConnectionState::Closed {
+            conn.transition(ConnectionState::Idle);
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
@@ -4093,6 +4109,8 @@ pub struct PeerDiagnostics {
     pub virtual_ip: String,
     pub endpoint: Option<String>,
     pub nat_type: String,
+    pub online: bool,
+    pub last_seen: u64,
     pub state: ConnectionState,
     pub active_path: Option<NetworkPath>,
     pub direct_type: DirectPathType,
@@ -4223,6 +4241,8 @@ impl PeerDiagnostics {
             virtual_ip: conn.virtual_ip.clone(),
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
+            online: conn.online,
+            last_seen: conn.last_seen,
             state: conn.state,
             active_path,
             direct_type,
@@ -6046,6 +6066,34 @@ mod tests {
 
         manager.remove_peer("peer1").await;
         assert!(manager.get_connection("peer1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn offline_control_peer_remains_visible_without_active_path() {
+        let config = test_config();
+        let manager = PeerManager::new(config);
+
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer-offline".to_string(),
+                device_name: "Travel Laptop".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: "203.0.113.10:5000".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.9".to_string(),
+                online: false,
+                last_seen: 1_785_320_000,
+            })
+            .await;
+
+        let diagnostics = manager.diagnostics().await;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].node_id, "peer-offline");
+        assert_eq!(diagnostics[0].device_name, "Travel Laptop");
+        assert!(!diagnostics[0].online);
+        assert_eq!(diagnostics[0].last_seen, 1_785_320_000);
+        assert_eq!(diagnostics[0].state, ConnectionState::Closed);
+        assert_eq!(diagnostics[0].active_path, None);
     }
 
     #[tokio::test]

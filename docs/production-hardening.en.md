@@ -35,6 +35,8 @@ This document turns the README protocol boundaries and networking caveats into c
 - For each scenario, record direct success, relay fallback, time to first usable path, candidate source, failure reason, and log summary.
 - Budget and cool down peer-reflexive, predicted, birthday probing, and socket-pool probes to avoid probe bursts.
 - When STUN fully fails or UDP appears blocked, diagnostics should clearly say direct transport will depend heavily on relay or manual port mapping.
+- During daemon startup or network changes, background probes and hole punching must not count failures before local UDP candidates are ready; after candidate publication, the daemon must automatically re-offer candidates and retry punching.
+- Offline devices returned by the control plane should remain visible in local diagnostics and UI with offline state and last_seen; only devices omitted by the control plane should be removed from the local peer table.
 
 ## P1 Relay
 
@@ -86,5 +88,5 @@ Before a real-network release, also complete:
 - Bidirectional virtual-IP testing across at least two different NAT environments.
 - At least one relay-only environment test.
 - At least one MTU downgrade test.
-- At least one daemon restart, network switch, relay reconnect, and short control-plane outage test.
+- At least one daemon restart, network switch, relay reconnect, short control-plane outage, and peer-starts-before/after reconnect test.
 - README, release notes, and known-limit updates.

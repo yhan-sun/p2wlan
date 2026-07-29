@@ -874,6 +874,13 @@ function hasFreshRelayConfirmation(peer: PeerDiagnostics): boolean {
   );
 }
 
+function controlLastSeenAgeMs(peer: PeerDiagnostics): number | null {
+  if (!peer.last_seen) return null;
+  const timestampMs = peer.last_seen < 10_000_000_000 ? peer.last_seen * 1000 : peer.last_seen;
+  const ageMs = Date.now() - timestampMs;
+  return Number.isFinite(ageMs) ? Math.max(0, ageMs) : null;
+}
+
 function connectionPresentation(
   peer: PeerDiagnostics,
   path: PeerPath
@@ -884,17 +891,37 @@ function connectionPresentation(
   const relayHedged = peer.current_path_selection?.relay_hedged === true;
 
   if (path === "offline") {
-    const waitingForRelay =
-      peer.state === "fallback_to_relay" || peer.current_path_selection?.path === "relay";
+    if (peer.online === false) {
+      return {
+        type: "offline",
+        label: "离线",
+        detail: "控制面标记该设备离线；等待对端重新注册或续租",
+      };
+    }
     return {
       type: "offline",
-      label: waitingForRelay ? "不可达" : "离线",
+      label: "不可达",
       detail:
         peer.warning ??
         peer.relay.last_error ??
+        peer.direct.last_error ??
+        "当前没有可用路径",
+    };
+  }
+
+  if (path === "connecting") {
+    const waitingForRelay =
+      peer.state === "fallback_to_relay" || peer.current_path_selection?.path === "relay";
+    return {
+      type: "connecting",
+      label: waitingForRelay ? "中继确认中" : "连接中",
+      detail:
+        reason ??
         (waitingForRelay
-          ? `直连不可用，relay 尚未完成 peer 确认${peer.direct.last_error ? `：${peer.direct.last_error}` : ""}`
-          : peer.direct.last_error ?? "当前没有可用路径"),
+          ? `直连仍在探测，正在等待 relay peer 确认${peer.direct.last_error ? `：${peer.direct.last_error}` : ""}`
+          : endpoint
+            ? `正在验证 ${endpoint}`
+            : "正在建立可用路径"),
     };
   }
 
@@ -986,8 +1013,17 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
       peer.active_path === undefined);
   const path: PeerPath = isDirectTrial
     ? "direct_trial"
-    : peer.active_path ??
-      (selection?.path === "relay" && hasFreshRelayConfirmation(peer) ? "relay" : "offline");
+    : peer.online === false
+      ? "offline"
+      : peer.active_path ??
+        (selection?.path === "relay" && hasFreshRelayConfirmation(peer)
+          ? "relay"
+          : selection?.path === "relay" ||
+              peer.state === "fallback_to_relay" ||
+              peer.state === "hole_punching" ||
+              peer.state === "connecting"
+            ? "connecting"
+            : "offline");
   const pathErrors = [peer.direct, peer.relay]
     .filter(health => health.last_error)
     .sort(
@@ -995,7 +1031,10 @@ function mapPeer(peer: PeerDiagnostics): PeerStatus {
         (left.last_failure_age_ms ?? Number.POSITIVE_INFINITY) -
         (right.last_failure_age_ms ?? Number.POSITIVE_INFINITY)
     );
-  const lastActiveMs = pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms;
+  const lastActiveMs =
+    peer.online === false
+      ? controlLastSeenAgeMs(peer) ?? pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms
+      : pathSuccessAgeMs(peer, path) ?? peer.connected_for_ms ?? controlLastSeenAgeMs(peer);
   const latencyMs =
     path === "direct"
       ? directPairLatencyMs(peer)

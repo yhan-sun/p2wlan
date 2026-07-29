@@ -11,7 +11,7 @@ export type ConnectionState =
   | "closed";
 
 export type NetworkPath = "direct" | "relay";
-export type PeerPath = NetworkPath | "direct_trial" | "offline";
+export type PeerPath = NetworkPath | "direct_trial" | "connecting" | "offline";
 export type DirectPathType = "lan" | "public_udp" | "overlay" | "relay" | "probing" | "unknown";
 export type ConnectionType =
   | "lan_direct"
@@ -19,6 +19,7 @@ export type ConnectionType =
   | "overlay_direct"
   | "direct"
   | "direct_trial"
+  | "connecting"
   | "relay"
   | "offline"
   | "unknown";
@@ -152,6 +153,8 @@ export interface PeerDiagnostics {
   virtual_ip: string;
   endpoint: string | null;
   nat_type: string;
+  online?: boolean;
+  last_seen?: number;
   state: ConnectionState;
   active_path: NetworkPath | null;
   direct_type: DirectPathType;

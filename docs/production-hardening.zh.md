@@ -35,6 +35,8 @@
 - 每个场景记录 direct success、relay fallback、首次可用路径耗时、候选来源、失败原因和日志摘要。
 - 对 peer-reflexive、predicted、birthday probing、socket pool 设置预算和冷却时间，避免探测风暴。
 - 当 STUN 全失败或 UDP blocked 时，明确提示用户直连将高度依赖 relay 或手动端口映射。
+- daemon 启动或网络切换时，本地 UDP candidates 未准备好前不得把后台探测或打洞失败计入直连失败；candidates 发布后必须自动重新发起 offer/打洞。
+- 控制面返回的离线设备应保留在本地诊断和 UI 中，标记为离线并展示 last_seen；只有控制面不再返回的设备才从本地 peer 表删除。
 
 ## P1 Relay
 
@@ -86,5 +88,5 @@ pnpm run build
 - 至少两个不同 NAT 环境的双向虚拟 IP 测试。
 - 至少一个 relay-only 环境测试。
 - 至少一次 MTU 降级测试。
-- 至少一次 daemon 重启、网络切换、relay 重连和控制面短暂不可用测试。
+- 至少一次 daemon 重启、网络切换、relay 重连、控制面短暂不可用和“对端先/后启动”重连测试。
 - 更新 README、release notes 和已知限制。
