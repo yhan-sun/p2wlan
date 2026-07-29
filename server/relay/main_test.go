@@ -34,6 +34,12 @@ func testConfig() *RelayConfig {
 
 func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 	t.Helper()
+	_, addr, cleanup := startTestServerWithInstance(t, config)
+	return addr, cleanup
+}
+
+func startTestServerWithInstance(t *testing.T, config *RelayConfig) (*RelayServer, string, func()) {
+	t.Helper()
 	server, err := NewRelayServer(config)
 	if err != nil {
 		t.Fatalf("failed to start relay server: %v", err)
@@ -45,7 +51,26 @@ func startTestServer(t *testing.T, config *RelayConfig) (string, func()) {
 		_ = server.Close()
 	}
 
-	return server.Addr().String(), cleanup
+	return server, server.Addr().String(), cleanup
+}
+
+func readTestFrame(t *testing.T, conn net.Conn) (byte, []byte) {
+	t.Helper()
+	header := make([]byte, frameHeader)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatalf("read frame header: %v", err)
+	}
+	if string(header[:4]) != string(magic) {
+		t.Fatalf("unexpected frame magic: %q", string(header[:4]))
+	}
+	length := int(binary.BigEndian.Uint16(header[6:8]))
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			t.Fatalf("read frame payload: %v", err)
+		}
+	}
+	return header[5], payload
 }
 
 func TestEnvValidation(t *testing.T) {
@@ -664,6 +689,75 @@ func TestOutboundFrameSizeBoundary(t *testing.T) {
 	code := binary.BigEndian.Uint16(buf[8:10])
 	if code != 4006 {
 		t.Errorf("expected 4006, got %d", code)
+	}
+}
+
+func TestRelayStatsTrackRegistrationLimitsAndForwarding(t *testing.T) {
+	config := testConfig()
+	config.MaxConnections = 2
+	server, addr, cleanup := startTestServerWithInstance(t, config)
+	defer cleanup()
+
+	bob, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial bob: %v", err)
+	}
+	defer bob.Close()
+	_, _ = bob.Write(makeFrame(msgRegister, []byte("bob")))
+	typ, payload := readTestFrame(t, bob)
+	if typ != msgRegistered || string(payload) != "bob" {
+		t.Fatalf("unexpected bob registration frame: type=%d payload=%q", typ, string(payload))
+	}
+
+	alice, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial alice: %v", err)
+	}
+	defer alice.Close()
+	_, _ = alice.Write(makeFrame(msgRegister, []byte("alice")))
+	typ, payload = readTestFrame(t, alice)
+	if typ != msgRegistered || string(payload) != "alice" {
+		t.Fatalf("unexpected alice registration frame: type=%d payload=%q", typ, string(payload))
+	}
+
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial extra: %v", err)
+	}
+	defer extra.Close()
+	typ, payload = readTestFrame(t, extra)
+	if typ != msgError || binary.BigEndian.Uint16(payload[:2]) != 4005 {
+		t.Fatalf("expected connection-limit error, got type=%d payload=%v", typ, payload)
+	}
+
+	forward := func(dst string, data []byte) []byte {
+		payload := make([]byte, 1+len(dst)+len(data))
+		payload[0] = byte(len(dst))
+		copy(payload[1:], dst)
+		copy(payload[1+len(dst):], data)
+		return payload
+	}
+
+	_, _ = alice.Write(makeFrame(msgForward, forward("bob", []byte("hello"))))
+	typ, payload = readTestFrame(t, bob)
+	if typ != msgReceived {
+		t.Fatalf("expected received frame for bob, got type=%d payload=%v", typ, payload)
+	}
+	_, _ = alice.Write(makeFrame(msgForward, forward("missing", []byte("hello"))))
+	typ, payload = readTestFrame(t, alice)
+	if typ != msgError || binary.BigEndian.Uint16(payload[:2]) != 404 {
+		t.Fatalf("expected peer-not-found error, got type=%d payload=%v", typ, payload)
+	}
+
+	stats := server.Stats()
+	if stats.AcceptedConnectionsTotal != 2 || stats.RejectedConnectionsTotal != 1 {
+		t.Fatalf("unexpected connection stats: %+v", stats)
+	}
+	if stats.LegacyRegistrationsTotal != 2 || stats.RegisteredPeers != 2 {
+		t.Fatalf("unexpected registration stats: %+v", stats)
+	}
+	if stats.ForwardedFramesTotal != 1 || stats.ForwardErrorsTotal != 1 {
+		t.Fatalf("unexpected forwarding stats: %+v", stats)
 	}
 }
 
