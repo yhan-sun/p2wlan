@@ -238,10 +238,12 @@ RELAY_BIND=":18081" \
 RELAY_REVOCATION_FEED_URL="https://control.example.com/api/v1/relay/revocations" \
 RELAY_REVOCATION_FEED_TOKEN="same-token-as-control-plane" \
 RELAY_REVOCATION_POLL_INTERVAL="30s" \
+RELAY_AUTH_FAILURE_LIMIT="20" \
+RELAY_AUTH_FAILURE_WINDOW="1m" \
 ./p2wlan-relay
 ```
 
-公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。
+公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。relay 的运行时统计会累计认证失败与限速次数，并仅以短哈希来源键暴露失败来源窗口，避免泄漏 ticket/JWT 或客户端 payload 明文。
 
 ## 安全边界
 

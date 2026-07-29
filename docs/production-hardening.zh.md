@@ -42,8 +42,8 @@
 - 公网 relay 默认启用 TLS；仅本地开发允许 plaintext TCP。
 - relay ticket 必须有 audience、region、过期时间和撤销路径。
 - relay 诊断至少展示选中区域、endpoint、连接 RTT、pong 时间、错误码、cooldown 和候选数量。
-- relay 服务端至少保留活动连接、注册 peer、连接拒绝、认证失败、frame 错误、转发成功/失败和 revocation feed 刷新结果的累计计数。
-- 对 relay 做限速、连接数限制、认证失败速率限制和日志脱敏。
+- relay 服务端至少保留活动连接、注册 peer、连接拒绝、认证失败、认证限速、frame 错误、转发成功/失败和 revocation feed 刷新结果的累计计数。
+- 对 relay 做限速、连接数限制、按来源窗口统计的认证失败速率限制和日志脱敏；来源维度只暴露短哈希键，不输出原始 ticket/JWT/private key/payload 明文。
 - 明确 relay 可见元数据：node id、时间、包大小、连接频率；不可见业务 payload 明文。
 
 ## P1 MTU 与性能

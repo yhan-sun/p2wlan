@@ -42,8 +42,8 @@ This document turns the README protocol boundaries and networking caveats into c
 - Enable TLS by default for public relays; plaintext TCP should be local-development only.
 - Relay tickets must carry audience, region, expiry, and a revocation path.
 - Relay diagnostics should show selected region, endpoint, connect RTT, pong timing, error code, cooldown, and candidate count.
-- Relay servers should keep counters for active connections, registered peers, rejected connections, authentication failures, frame errors, forwarding success/failure, and revocation-feed refresh results.
-- Add rate limits for connections, authentication failures, and data forwarding; keep logs redacted.
+- Relay servers should keep counters for active connections, registered peers, rejected connections, authentication failures, authentication rate limits, frame errors, forwarding success/failure, and revocation-feed refresh results.
+- Add rate limits for connections, source-window authentication failures, and data forwarding; expose source dimensions only as short hashed keys, and never log raw tickets, JWTs, private keys, or payload plaintext.
 - State relay-visible metadata: node IDs, timing, packet sizes, and connection frequency. Relays must not see private payload plaintext.
 
 ## P1 MTU And Performance

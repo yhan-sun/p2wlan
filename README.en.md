@@ -238,10 +238,12 @@ RELAY_BIND=":18081" \
 RELAY_REVOCATION_FEED_URL="https://control.example.com/api/v1/relay/revocations" \
 RELAY_REVOCATION_FEED_TOKEN="same-token-as-control-plane" \
 RELAY_REVOCATION_POLL_INTERVAL="30s" \
+RELAY_AUTH_FAILURE_LIMIT="20" \
+RELAY_AUTH_FAILURE_WINDOW="1m" \
 ./p2wlan-relay
 ```
 
-Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files, diagnostics endpoints, and relay tokens private.
+Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files, diagnostics endpoints, and relay tokens private. Relay runtime stats now count authentication failures and rate-limited attempts, with per-source windows exposed only as short hashed source keys so tickets, JWTs, and payload plaintext are not leaked.
 
 ## Security Boundaries
 
