@@ -1,0 +1,192 @@
+{
+  "version": "0.1.62",
+  "process_id": 4242,
+  "node_id": "node-local-abcdef1234567890",
+  "virtual_ip": "10.20.0.10",
+  "network_id": "default",
+  "network_generation": 7,
+  "udp_local_addr": "192.0.2.10:60207",
+  "udp_socket_count": 3,
+  "udp_socket_pool_active": true,
+  "udp_socket_pool": [],
+  "local_candidates": [
+    "192.0.2.10:60207",
+    "198.51.100.20:62000"
+  ],
+  "nat_profile": {
+    "mapping_behavior": "endpoint_independent",
+    "filtering_behavior": "address_dependent",
+    "public_endpoint": "198.51.100.20:62000"
+  },
+  "gateway_mapping": {
+    "enabled": true,
+    "candidate_endpoint": "198.51.100.20:62000",
+    "candidate_source": "upnp",
+    "lease_seconds": 600,
+    "upnp": {
+      "status": "success",
+      "last_error": null,
+      "attempts": 1,
+      "last_attempt_age_ms": 1200,
+      "last_success_age_ms": 1100
+    },
+    "pcp": {
+      "status": "idle",
+      "last_error": null,
+      "attempts": 0,
+      "last_attempt_age_ms": null,
+      "last_success_age_ms": null
+    },
+    "nat_pmp": {
+      "status": "idle",
+      "last_error": null,
+      "attempts": 0,
+      "last_attempt_age_ms": null,
+      "last_success_age_ms": null
+    }
+  },
+  "relay_servers": [
+    "cn-east@203.0.113.10:18081"
+  ],
+  "relay_connected": true,
+  "relay_selection": {
+    "selected_region": "cn-east",
+    "selected_endpoint": "203.0.113.10:18081",
+    "selected_connect_latency_ms": 38,
+    "candidates": [
+      {
+        "region": "cn-east",
+        "endpoint": "203.0.113.10:18081",
+        "connect_latency_ms": 38,
+        "error": null
+      }
+    ],
+    "last_error": null
+  },
+  "traversal_history": {
+    "sources": []
+  },
+  "peers": [
+    {
+      "node_id": "peer-direct-001",
+      "device_name": "direct-laptop",
+      "virtual_ip": "10.20.0.11",
+      "endpoint": "198.51.100.21:61111",
+      "nat_type": "endpoint_independent",
+      "state": "direct",
+      "active_path": "direct",
+      "direct_type": "public_udp",
+      "probe_session_id": "probe-direct",
+      "probe_key_type": "ephemeral_session",
+      "selected_pair": null,
+      "current_direct_pair": null,
+      "consent_endpoint": "198.51.100.21:61111",
+      "is_public_udp_direct": true,
+      "is_overlay_direct": false,
+      "is_relay": false,
+      "warning": null,
+      "connected_for_ms": 34000,
+      "bytes_sent": 12048,
+      "bytes_received": 22128,
+      "relay_server": null,
+      "candidates": [
+        "198.51.100.21:61111"
+      ],
+      "direct": {
+        "last_success_age_ms": 750,
+        "last_failure_age_ms": null,
+        "consecutive_failures": 0,
+        "last_error": null,
+        "latency_ms": 24
+      },
+      "relay": {
+        "last_success_age_ms": null,
+        "last_failure_age_ms": null,
+        "consecutive_failures": 0,
+        "last_error": null,
+        "latency_ms": null
+      },
+      "candidate_pairs": [],
+      "current_path_selection": {
+        "path": "direct",
+        "direct_endpoint": "198.51.100.21:61111",
+        "reason_code": "path_direct_confirmed",
+        "reason": "public UDP pair confirmed",
+        "direct_confirmed": true,
+        "relay_hedged": false
+      },
+      "last_path_selection": null
+    },
+    {
+      "node_id": "peer-relay-002",
+      "device_name": "relay-nas",
+      "virtual_ip": "10.20.0.12",
+      "endpoint": null,
+      "nat_type": "symmetric",
+      "state": "relay",
+      "active_path": "relay",
+      "direct_type": "relay",
+      "probe_session_id": "probe-relay",
+      "probe_key_type": "ephemeral_session",
+      "selected_pair": null,
+      "current_direct_pair": null,
+      "consent_endpoint": null,
+      "is_public_udp_direct": false,
+      "is_overlay_direct": false,
+      "is_relay": true,
+      "warning": null,
+      "connected_for_ms": 28000,
+      "bytes_sent": 4200,
+      "bytes_received": 5300,
+      "relay_server": "203.0.113.10:18081",
+      "candidates": [],
+      "direct": {
+        "last_success_age_ms": null,
+        "last_failure_age_ms": 1800,
+        "consecutive_failures": 2,
+        "last_error": "direct probe timed out",
+        "latency_ms": null
+      },
+      "relay": {
+        "last_success_age_ms": 300,
+        "last_failure_age_ms": null,
+        "consecutive_failures": 0,
+        "last_error": null,
+        "latency_ms": 43
+      },
+      "candidate_pairs": [],
+      "current_path_selection": {
+        "path": "relay",
+        "direct_endpoint": null,
+        "reason_code": "path_relay_fallback",
+        "reason": "direct path unavailable; relay confirmed",
+        "direct_confirmed": false,
+        "relay_hedged": false
+      },
+      "last_path_selection": null
+    }
+  ],
+  "stats": {
+    "total_peers": 2,
+    "direct_connections": 1,
+    "relay_connections": 1,
+    "total_bytes_sent": 16248,
+    "total_bytes_received": 27428
+  },
+  "health": {
+    "status": "healthy",
+    "reason": null,
+    "critical_tasks": [
+      {
+        "name": "dataplane",
+        "critical": true,
+        "running": true,
+        "finished": false,
+        "error": null
+      }
+    ],
+    "control_connected": true,
+    "last_control_success_secs_ago": 2,
+    "reauth_required": false
+  }
+}
