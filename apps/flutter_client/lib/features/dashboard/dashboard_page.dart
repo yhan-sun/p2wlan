@@ -31,10 +31,22 @@ class DashboardPage extends StatelessWidget {
           children: [
             _ConnectionBanner(
               url: settingsStore.settings.diagnosticsUrl,
+              snapshot: snapshot,
               online: statusStore.online,
               healthReachable: statusStore.healthReachable,
+              statusReachable: statusStore.statusReachable,
+              refreshing: statusStore.refreshing,
+              autoRefreshEnabled: statusStore.autoRefreshEnabled,
               error: statusStore.lastError,
+              healthError: statusStore.lastHealthError,
+              statusError: statusStore.lastStatusError,
               lastFetchedAt: statusStore.lastFetchedAt,
+              requestDuration: statusStore.lastRequestDuration,
+              onRefresh: statusStore.refresh,
+              onAutoRefreshChanged: (value) => statusStore.setAutoRefresh(
+                enabled: value,
+                refreshImmediately: value,
+              ),
             ),
             const SizedBox(height: 16),
             if (snapshot == null)
@@ -54,45 +66,136 @@ class DashboardPage extends StatelessWidget {
 class _ConnectionBanner extends StatelessWidget {
   const _ConnectionBanner({
     required this.url,
+    required this.snapshot,
     required this.online,
     required this.healthReachable,
+    required this.statusReachable,
+    required this.refreshing,
+    required this.autoRefreshEnabled,
     required this.error,
+    required this.healthError,
+    required this.statusError,
     required this.lastFetchedAt,
+    required this.requestDuration,
+    required this.onRefresh,
+    required this.onAutoRefreshChanged,
   });
 
   final String url;
+  final DaemonSnapshot? snapshot;
   final bool online;
   final bool healthReachable;
+  final bool statusReachable;
+  final bool refreshing;
+  final bool autoRefreshEnabled;
   final String? error;
+  final String? healthError;
+  final String? statusError;
   final DateTime? lastFetchedAt;
+  final Duration? requestDuration;
+  final Future<void> Function() onRefresh;
+  final ValueChanged<bool> onAutoRefreshChanged;
 
   @override
   Widget build(BuildContext context) {
-    final tone = online
-        ? StatusTone.good
-        : healthReachable
-        ? StatusTone.warn
-        : StatusTone.bad;
+    final overallLabel = _overallLabel();
+    final tone = _overallTone(overallLabel);
     return InfoCard(
       title: 'Local daemon',
-      trailing: StatusBadge(label: online ? 'Online' : 'Offline', tone: tone),
-      child: Wrap(
-        spacing: 28,
-        runSpacing: 8,
+      trailing: StatusBadge(label: overallLabel, tone: tone),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          MetricTile(label: 'Diagnostics URL', value: url),
-          MetricTile(
-            label: 'Health endpoint',
-            value: healthReachable ? 'reachable' : 'offline',
+          Wrap(
+            spacing: 28,
+            runSpacing: 8,
+            children: [
+              MetricTile(label: 'Diagnostics URL', value: url),
+              MetricTile(label: 'Daemon state', value: overallLabel),
+              MetricTile(
+                label: 'GET /health',
+                value: healthReachable ? 'reachable' : 'offline',
+                detail: healthError,
+              ),
+              MetricTile(
+                label: 'GET /status',
+                value: _statusEndpointLabel(),
+                detail: statusError,
+              ),
+              MetricTile(
+                label: 'Last refresh',
+                value: formatDateTime(lastFetchedAt),
+              ),
+              MetricTile(
+                label: 'Request duration',
+                value: formatDuration(requestDuration),
+              ),
+              if (error != null) MetricTile(label: 'Last error', value: error!),
+            ],
           ),
-          MetricTile(
-            label: 'Last refresh',
-            value: formatDateTime(lastFetchedAt),
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                key: const Key('dashboard-refresh-button'),
+                onPressed: refreshing ? null : onRefresh,
+                icon: refreshing
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh),
+                label: Text(refreshing ? 'Refreshing' : 'Refresh now'),
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 320),
+                child: SwitchListTile(
+                  key: const Key('auto-refresh-switch'),
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Auto refresh'),
+                  subtitle: Text(
+                    'Every ${StatusStore.defaultAutoRefreshInterval.inSeconds}s, read-only GETs.',
+                  ),
+                  value: autoRefreshEnabled,
+                  onChanged: onAutoRefreshChanged,
+                ),
+              ),
+            ],
           ),
-          if (error != null) MetricTile(label: 'Last error', value: error!),
         ],
       ),
     );
+  }
+
+  String _overallLabel() {
+    if (!healthReachable) return 'Offline';
+    if (!statusReachable) return 'Degraded';
+    final status = snapshot?.health.status.toLowerCase();
+    return switch (status) {
+      'healthy' => 'Healthy',
+      'degraded' => 'Degraded',
+      'unhealthy' => 'Unhealthy',
+      'shutting_down' => 'Unavailable',
+      _ => 'Online',
+    };
+  }
+
+  String _statusEndpointLabel() {
+    if (statusReachable) return 'loaded';
+    if (healthReachable) return 'error';
+    return 'skipped';
+  }
+
+  StatusTone _overallTone(String label) {
+    return switch (label) {
+      'Healthy' || 'Online' => StatusTone.good,
+      'Degraded' => StatusTone.warn,
+      _ => StatusTone.bad,
+    };
   }
 }
 
@@ -104,7 +207,7 @@ class _OfflineSummary extends StatelessWidget {
     return const InfoCard(
       title: 'Snapshot',
       child: Text(
-        'No daemon snapshot is available. Start an existing p2pnet-daemon manually and keep this P1 prototype in read-only mode.',
+        'No daemon snapshot is available. Use an already running p2pnet-daemon outside this app and keep this P1 prototype in read-only mode.',
       ),
     );
   }

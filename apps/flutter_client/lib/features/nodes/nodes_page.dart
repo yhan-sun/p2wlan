@@ -17,11 +17,14 @@ class NodesPage extends StatelessWidget {
     return AnimatedBuilder(
       animation: statusStore,
       builder: (context, _) {
-        final peers = statusStore.snapshot?.peers ?? const <PeerSnapshot>[];
+        final snapshot = statusStore.snapshot;
+        final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         return PageScaffold(
           title: 'Nodes',
           subtitle: 'Read-only peer list from the daemon status snapshot.',
           children: [
+            _PeerSummary(snapshot: snapshot, peerCount: peers.length),
+            const SizedBox(height: 16),
             if (peers.isEmpty)
               const InfoCard(
                 title: 'Peers',
@@ -45,6 +48,36 @@ class NodesPage extends StatelessWidget {
   }
 }
 
+class _PeerSummary extends StatelessWidget {
+  const _PeerSummary({required this.snapshot, required this.peerCount});
+
+  final DaemonSnapshot? snapshot;
+  final int peerCount;
+
+  @override
+  Widget build(BuildContext context) {
+    final stats = snapshot?.stats;
+    return InfoCard(
+      title: 'Peer summary',
+      child: Wrap(
+        spacing: 24,
+        runSpacing: 8,
+        children: [
+          MetricTile(label: 'Peer count', value: formatInt(peerCount)),
+          MetricTile(
+            label: 'Direct paths',
+            value: stats == null ? '—' : formatInt(stats.directConnections),
+          ),
+          MetricTile(
+            label: 'Relay paths',
+            value: stats == null ? '—' : formatInt(stats.relayConnections),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _PeerTable extends StatelessWidget {
   const _PeerTable({required this.peers});
 
@@ -60,10 +93,12 @@ class _PeerTable extends StatelessWidget {
           columnSpacing: 28,
           columns: const [
             DataColumn(label: Text('Device')),
+            DataColumn(label: Text('Peer ID')),
             DataColumn(label: Text('Virtual IP')),
             DataColumn(label: Text('State')),
             DataColumn(label: Text('Path')),
             DataColumn(label: Text('Connection type')),
+            DataColumn(label: Text('Route')),
             DataColumn(label: Text('Latency')),
             DataColumn(label: Text('Endpoint')),
           ],
@@ -71,11 +106,13 @@ class _PeerTable extends StatelessWidget {
             for (final peer in peers)
               DataRow(
                 cells: [
-                  DataCell(Text(peer.displayName)),
+                  DataCell(Text(dash(peer.displayName))),
+                  DataCell(SelectableText(shortId(peer.nodeId))),
                   DataCell(SelectableText(dash(peer.virtualIp))),
-                  DataCell(Text(peer.state)),
+                  DataCell(Text(dash(peer.state))),
                   DataCell(_PathBadge(peer: peer)),
-                  DataCell(Text(peer.connectionType)),
+                  DataCell(Text(dash(peer.connectionType))),
+                  DataCell(Text(_routeLabel(peer))),
                   DataCell(Text(formatLatency(peer.latencyMs))),
                   DataCell(
                     SelectableText(dash(peer.endpoint ?? peer.relayServer)),
@@ -106,12 +143,15 @@ class _PeerList extends StatelessWidget {
               spacing: 20,
               runSpacing: 8,
               children: [
+                MetricTile(label: 'Peer ID', value: shortId(peer.nodeId)),
                 MetricTile(label: 'Virtual IP', value: dash(peer.virtualIp)),
-                MetricTile(label: 'State', value: peer.state),
+                MetricTile(label: 'State', value: dash(peer.state)),
+                MetricTile(label: 'Path', value: pathLabel(peer.path)),
                 MetricTile(
                   label: 'Connection type',
-                  value: peer.connectionType,
+                  value: dash(peer.connectionType),
                 ),
+                MetricTile(label: 'Route', value: _routeLabel(peer)),
                 MetricTile(
                   label: 'Latency',
                   value: formatLatency(peer.latencyMs),
@@ -130,6 +170,12 @@ class _PeerList extends StatelessWidget {
       ],
     );
   }
+}
+
+String _routeLabel(PeerSnapshot peer) {
+  if (peer.path == 'direct') return 'Direct';
+  if (peer.path == 'relay' || peer.isRelay) return 'Relay';
+  return '—';
 }
 
 class _PathBadge extends StatelessWidget {

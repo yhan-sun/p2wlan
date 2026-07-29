@@ -1,5 +1,5 @@
 String dash(String? value) {
-  if (value == null || value.trim().isEmpty) return '-';
+  if (value == null || value.trim().isEmpty) return '—';
   return value;
 }
 
@@ -9,6 +9,9 @@ String shortId(String value) {
 }
 
 String formatBool(bool value) => value ? 'yes' : 'no';
+
+String formatOptionalBool(bool? value) =>
+    value == null ? '—' : formatBool(value);
 
 String formatInt(int value) => value.toString();
 
@@ -25,15 +28,22 @@ String formatBytes(int value) {
 }
 
 String formatLatency(int? latencyMs) {
-  if (latencyMs == null) return '-';
+  if (latencyMs == null) return '—';
   return '$latencyMs ms';
 }
 
 String formatDateTime(DateTime? value) {
-  if (value == null) return '-';
+  if (value == null) return '—';
   final local = value.toLocal();
   String two(int n) => n.toString().padLeft(2, '0');
   return '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
+}
+
+String formatDuration(Duration? value) {
+  if (value == null) return '—';
+  if (value.inMilliseconds < 1000) return '${value.inMilliseconds} ms';
+  final seconds = value.inMilliseconds / 1000;
+  return '${seconds.toStringAsFixed(1)} s';
 }
 
 String pathLabel(String path) {
@@ -47,6 +57,6 @@ String pathLabel(String path) {
     case 'offline':
       return 'Offline';
     default:
-      return path.isEmpty ? '-' : path;
+      return dash(path);
   }
 }

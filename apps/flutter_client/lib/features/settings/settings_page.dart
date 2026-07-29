@@ -59,6 +59,8 @@ class _SettingsPageState extends State<SettingsPage> {
                     decoration: InputDecoration(
                       labelText: 'Diagnostics URL',
                       hintText: defaultDiagnosticsUrl,
+                      helperText:
+                          'Saved only to this Flutter app; daemon config is not changed.',
                       border: const OutlineInputBorder(),
                       errorText: _error,
                     ),
@@ -85,7 +87,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       OutlinedButton.icon(
                         onPressed: _saving ? null : _reset,
                         icon: const Icon(Icons.restore),
-                        label: const Text('Reset default'),
+                        label: const Text('Restore default URL'),
                       ),
                       OutlinedButton.icon(
                         onPressed: widget.statusStore.refreshing
@@ -98,7 +100,14 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    'Saved at: ${widget.settingsStore.configPath ?? '-'}',
+                    'Local settings file: ${widget.settingsStore.configPath ?? '—'}',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'This setting changes only where the Flutter read-only UI sends GET /health and GET /status.',
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                     ),
@@ -119,7 +128,7 @@ class _SettingsPageState extends State<SettingsPage> {
             const InfoCard(
               title: 'P1 boundary',
               child: Text(
-                'This prototype only reads GET /health and GET /status. It does not start, stop, elevate, shut down, or modify system networking.',
+                'This prototype only reads GET /health and GET /status. Daemon process lifecycle, elevation, and system networking stay outside this Flutter app.',
               ),
             ),
           ],
@@ -140,10 +149,13 @@ class _SettingsPageState extends State<SettingsPage> {
       await widget.settingsStore.updateDiagnosticsUrl(normalized);
       _diagnosticsUrlController.text = normalized;
       await widget.statusStore.refresh();
+      _showSnackBar('Diagnostics URL saved locally');
     } on FormatException catch (error) {
       setState(() => _error = error.message);
+      _showSnackBar('Diagnostics URL was not saved');
     } catch (error) {
       setState(() => _error = error.toString());
+      _showSnackBar('Failed to save local settings');
     } finally {
       if (mounted) {
         setState(() => _saving = false);
@@ -154,5 +166,12 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _reset() async {
     _diagnosticsUrlController.text = defaultDiagnosticsUrl;
     await _save();
+  }
+
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }

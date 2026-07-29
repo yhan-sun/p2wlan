@@ -7,6 +7,10 @@ import '../api/daemon_api.dart';
 import '../models/daemon_models.dart';
 
 class SettingsStore extends ChangeNotifier {
+  SettingsStore({File? settingsFile}) : _settingsFileOverride = settingsFile;
+
+  final File? _settingsFileOverride;
+
   AppSettings _settings = const AppSettings();
   var _loaded = false;
   String? _lastError;
@@ -67,6 +71,8 @@ class SettingsStore extends ChangeNotifier {
   }
 
   File _settingsFile() {
+    final override = _settingsFileOverride;
+    if (override != null) return override;
     return File(
       '${_configDirectory().path}${Platform.pathSeparator}flutter-client-settings.json',
     );
