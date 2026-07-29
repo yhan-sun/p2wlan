@@ -340,8 +340,8 @@ impl SessionKeys {
 impl std::fmt::Debug for SessionKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionKeys")
-            .field("send_key", &hex::encode(self.send_key))
-            .field("recv_key", &hex::encode(self.recv_key))
+            .field("send_key", &"[redacted]")
+            .field("recv_key", &"[redacted]")
             .field("send_counter", &self.send_counter)
             .field("recv_counter", &self.recv_counter)
             .finish()
@@ -371,6 +371,18 @@ mod tests {
         assert_eq!(decoded.ephemeral, [0xAB; 32]);
         assert_eq!(decoded.mac1, [0x11; 16]);
         assert_eq!(decoded.mac2, [0x22; 16]);
+    }
+
+    #[test]
+    fn test_session_keys_debug_redacts_keys() {
+        let keys = SessionKeys::new([0xAB; 32], [0xCD; 32]);
+
+        let debug = format!("{keys:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&hex::encode(keys.send_key)));
+        assert!(!debug.contains(&hex::encode(keys.recv_key)));
+        assert!(debug.contains("send_counter"));
+        assert!(debug.contains("recv_counter"));
     }
 
     #[test]

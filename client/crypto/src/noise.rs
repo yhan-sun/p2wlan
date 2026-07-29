@@ -163,8 +163,9 @@ impl Default for SymmetricState {
 impl std::fmt::Debug for SymmetricState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SymmetricState")
-            .field("ck", &hex::encode(self.ck))
+            .field("ck", &"[redacted]")
             .field("h", &hex::encode(self.h))
+            .field("temp_k", &"[redacted]")
             .finish_non_exhaustive()
     }
 }
@@ -186,6 +187,17 @@ mod tests {
 
         // temp_k should be all zeros initially
         assert_eq!(state.temp_k, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_debug_redacts_secret_state() {
+        let mut state = SymmetricState::new();
+        state.mix_key(&[0xAB; 32]);
+
+        let debug = format!("{state:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&hex::encode(state.ck)));
+        assert!(!debug.contains(&hex::encode(state.temp_k)));
     }
 
     #[test]
