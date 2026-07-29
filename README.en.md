@@ -177,7 +177,7 @@ P2WLAN currently uses a self-contained WireGuard-like data plane instead of call
 
 There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and add test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review.
 
-For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), and use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation.
+For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation, and track long-term direction in the [v2 architecture roadmap](docs/v2-architecture-roadmap.en.md).
 
 ## NAT And Relay
 

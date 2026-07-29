@@ -177,7 +177,7 @@ P2WLAN 当前采用自研的 WireGuard-like 数据面，而不是直接调用内
 
 长期生产化有两条路线：一是复用 `boringtun`、`wireguard-go` 或平台 WireGuard 实现来降低密码协议维护风险；二是保留自研数据面，但补齐测试向量、fuzz、重放/重密钥/异常包测试、互操作说明和独立安全审计。
 
-生产化前的完整验收项见 [生产化验收清单](docs/production-hardening.zh.md)，真实网络验证模板见 [NAT 穿透验收矩阵](docs/nat-traversal-matrix.zh.md)。
+生产化前的完整验收项见 [生产化验收清单](docs/production-hardening.zh.md)，真实网络验证模板见 [NAT 穿透验收矩阵](docs/nat-traversal-matrix.zh.md)，长期技术路线见 [v2 架构路线图](docs/v2-architecture-roadmap.zh.md)。
 
 ## NAT 与中继
 
