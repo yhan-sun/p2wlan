@@ -634,7 +634,12 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
             );
             suggestions.extend(protocol_boundary_suggestions(&snapshot));
             suggestions.extend(mtu_snapshot_suggestions(config.network.mtu, &snapshot));
-            suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
+            let mtu_diagnostics = mtu_diagnostic_suggestions(&snapshot);
+            if mtu_diagnostics.is_empty() {
+                suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
+            } else {
+                suggestions.extend(mtu_diagnostics);
+            }
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
             suggestions.extend(nat_profile_suggestions(
@@ -1179,9 +1184,29 @@ fn runtime_mtu_summary(snapshot: &Value) -> Option<String> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     );
-    Some(format!(
+    let mut summary = format!(
         "configured={configured_mtu} profile={profile} relay-safe={relay_safe_mtu} auto-pmtu={automatic_pmtu}"
-    ))
+    );
+    if let Some(relay_path_observed) = mtu.get("relay_path_observed").and_then(Value::as_bool) {
+        summary.push_str(&format!(" relay-path={}", yes_no(relay_path_observed)));
+    }
+    if let Some(suggested) = mtu.get("suggested_safe_mtu").and_then(Value::as_u64) {
+        summary.push_str(&format!(" suggested={suggested}"));
+    }
+    let risk_codes: Vec<&str> = mtu
+        .get("risks")
+        .and_then(Value::as_array)
+        .map(|risks| {
+            risks
+                .iter()
+                .filter_map(|risk| risk.get("code").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !risk_codes.is_empty() {
+        summary.push_str(&format!(" risks={}", risk_codes.join(",")));
+    }
+    Some(summary)
 }
 
 fn mtu_snapshot_suggestions(config_mtu: u32, snapshot: &Value) -> Vec<String> {
@@ -1200,6 +1225,31 @@ fn mtu_snapshot_suggestions(config_mtu: u32, snapshot: &Value) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+fn mtu_diagnostic_suggestions(snapshot: &Value) -> Vec<String> {
+    let Some(risks) = snapshot
+        .get("mtu")
+        .and_then(|mtu| mtu.get("risks"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    for risk in risks {
+        let Some(message) = risk.get("message").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(suggested_mtu) = risk.get("suggested_mtu").and_then(Value::as_u64) {
+            suggestions.push(format!(
+                "{message} 建议：p2wlan config set mtu {suggested_mtu}"
+            ));
+        } else {
+            suggestions.push(message.to_string());
+        }
+    }
+    dedupe_strings(suggestions)
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -3119,6 +3169,35 @@ mod tests {
             .iter()
             .any(|item| item.contains("daemon 运行中 MTU 为 1420")));
         assert!(runtime_mtu_summary(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn runtime_mtu_helpers_use_structured_risks_when_present() {
+        let snapshot = serde_json::json!({
+            "mtu": {
+                "configured_mtu": 1420,
+                "profile": "default",
+                "relay_safe_mtu": 1380,
+                "automatic_pmtu": false,
+                "relay_path_observed": true,
+                "suggested_safe_mtu": 1380,
+                "risks": [{
+                    "code": "relay_path_high_mtu",
+                    "severity": "warning",
+                    "message": "Relay path observed with MTU 1420; try lowering MTU.",
+                    "suggested_mtu": 1380
+                }]
+            }
+        });
+
+        assert_eq!(
+            runtime_mtu_summary(&snapshot).as_deref(),
+            Some("configured=1420 profile=default relay-safe=1380 auto-pmtu=no relay-path=yes suggested=1380 risks=relay_path_high_mtu")
+        );
+        assert!(mtu_diagnostic_suggestions(&snapshot)
+            .iter()
+            .any(|item| item.contains("p2wlan config set mtu 1380")));
+        assert!(mtu_diagnostic_suggestions(&serde_json::json!({})).is_empty());
     }
 
     #[test]
