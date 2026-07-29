@@ -48,7 +48,7 @@
 
 - 默认 MTU 保持保守值，并在 CLI/GUI 中解释 `1280`、`1380`、`1420`、`1500+` 的风险差异。
 - 当存在 relay 路径且 MTU 高于 `1380` 时，诊断应提示大包丢失和 PMTU blackhole 风险。
-- 使用 `scripts/mtu-smoke.sh` 做可重复的 ICMP MTU smoke；后续继续补小 TCP 流、大 TCP 流、UDP payload 和 relay path。
+- 使用 `scripts/mtu-smoke.sh` 做可重复的 ICMP MTU smoke；配置 `TCP_PORT` / `UDP_PORT` 时同时记录小 TCP 流、大 TCP 流和 UDP payload 结果，relay path 单独标注。
 - 后续实现自动 PMTU 探测：从安全下限开始探测，成功后提升，失败时自动回退。
 - 对 IPv4 fragment、DF、ICMP fragmentation-needed 缺失和 Windows 防火墙行为补充测试说明。
 
