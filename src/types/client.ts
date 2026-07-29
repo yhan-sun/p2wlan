@@ -419,7 +419,15 @@ export interface ClientStatusSnapshot {
 export interface DiagnosticCheck {
   id: string;
   name: string;
-  category: "control" | "nat" | "relay" | "tun" | "route" | "daemon";
+  category:
+    | "control"
+    | "nat"
+    | "relay"
+    | "tun"
+    | "route"
+    | "daemon"
+    | "protocol"
+    | "performance";
   status: DiagnosticCheckStatus;
   detail: string;
   latencyMs?: number | null;
@@ -428,6 +436,8 @@ export interface DiagnosticCheck {
 export interface DiagnosticsReport {
   checks: DiagnosticCheck[];
   logs: string[];
+  protocol?: ProtocolDiagnostics;
+  mtu?: MtuDiagnostics;
   source: DataSource;
   generatedAt: number;
 }
