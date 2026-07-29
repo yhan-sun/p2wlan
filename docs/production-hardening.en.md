@@ -17,7 +17,7 @@ This document turns the README protocol boundaries and networking caveats into c
 - Add fixed test vectors for handshakes, transport packets, replay windows, rekeying, and malformed packet parsing.
 - Fixed-length handshake frames must validate exact length and type, rejecting truncated frames and trailing-byte smuggling.
 - Add regression coverage for signaling signatures, candidate generation, candidate expiry, and probe ephemeral key binding.
-- Never expose X25519/Ed25519 private keys, relay tickets, JWTs, or device credentials in logs, diagnostics, or panic output.
+- Never expose X25519/Ed25519 private keys, derived session keys, Noise chaining keys, relay tickets, JWTs, or device credentials in logs, diagnostics, or panic output.
 - Get an external review for the in-repo crypto protocol path before claiming full Production readiness.
 
 ## P1 NAT Traversal

@@ -17,7 +17,7 @@
 - 为握手、传输包、重放窗口、重密钥、异常包解析补充固定测试向量。
 - 固定长度握手帧必须严格校验长度和类型，拒绝截断帧与尾部拼接帧。
 - 为控制面信令签名、candidate generation、candidate expiry、probe ephemeral key 绑定补充回归测试。
-- 禁止在日志、诊断接口和崩溃输出中泄漏 X25519/Ed25519 私钥、relay ticket、JWT、device credential。
+- 禁止在日志、诊断接口和崩溃输出中泄漏 X25519/Ed25519 私钥、派生会话密钥、Noise chaining key、relay ticket、JWT、device credential。
 - 对自研密码协议路径做一次外部审计；审计前只能标记为 Preview 或 Production Preview。
 
 ## P1 NAT 穿透
