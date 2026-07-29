@@ -140,6 +140,12 @@ func (h *hub) lookup(networkID, nodeID string) *peer {
 	return h.peers[networkNodeKey{networkID: networkID, nodeID: nodeID}]
 }
 
+func (h *hub) count() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.peers)
+}
+
 // forward forwards payload and returns error code (0 for success) and a diagnostic message.
 // Uses network-scoped lookup: source and destination must be in the same network.
 func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayload int) (uint16, string) {
@@ -177,6 +183,7 @@ type RelayServer struct {
 	listener          net.Listener
 	hub               *hub
 	activeConnections int64
+	stats             relayStats
 	wg                sync.WaitGroup
 	shutdownChan      chan struct{}
 	closeOnce         sync.Once
@@ -197,6 +204,34 @@ type RelayServer struct {
 	onlineRevokedTicketJTIs    map[string]struct{}
 	onlineRevokedDeviceIDs     map[string]struct{}
 	onlineRevokedCredentialIDs map[string]struct{}
+}
+
+type relayStats struct {
+	acceptedConnectionsTotal        uint64
+	rejectedConnectionsTotal        uint64
+	frameErrorsTotal                uint64
+	authFailuresTotal               uint64
+	legacyRegistrationsTotal        uint64
+	authenticatedRegistrationsTotal uint64
+	forwardedFramesTotal            uint64
+	forwardErrorsTotal              uint64
+	revocationRefreshesTotal        uint64
+	revocationRefreshFailuresTotal  uint64
+}
+
+type RelayStatsSnapshot struct {
+	ActiveConnections               int64  `json:"active_connections"`
+	RegisteredPeers                 int    `json:"registered_peers"`
+	AcceptedConnectionsTotal        uint64 `json:"accepted_connections_total"`
+	RejectedConnectionsTotal        uint64 `json:"rejected_connections_total"`
+	FrameErrorsTotal                uint64 `json:"frame_errors_total"`
+	AuthFailuresTotal               uint64 `json:"auth_failures_total"`
+	LegacyRegistrationsTotal        uint64 `json:"legacy_registrations_total"`
+	AuthenticatedRegistrationsTotal uint64 `json:"authenticated_registrations_total"`
+	ForwardedFramesTotal            uint64 `json:"forwarded_frames_total"`
+	ForwardErrorsTotal              uint64 `json:"forward_errors_total"`
+	RevocationRefreshesTotal        uint64 `json:"revocation_refreshes_total"`
+	RevocationRefreshFailuresTotal  uint64 `json:"revocation_refresh_failures_total"`
 }
 
 // RelayTicketClaims are the JWT claims for relay registration.
@@ -350,6 +385,7 @@ func (s *RelayServer) pollRevocationFeedOnce(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	if err := s.refreshRevocationFeed(ctx); err != nil {
+		atomic.AddUint64(&s.stats.revocationRefreshFailuresTotal, 1)
 		log.Printf("relay revocation feed refresh failed: %v", err)
 	}
 }
@@ -398,6 +434,7 @@ func (s *RelayServer) refreshRevocationFeed(ctx context.Context) error {
 		return fmt.Errorf("decode revocation feed: trailing JSON data")
 	}
 	s.applyRevocationSnapshot(snapshot)
+	atomic.AddUint64(&s.stats.revocationRefreshesTotal, 1)
 	log.Printf("relay revocation feed updated: version=%d devices=%d credentials=%d jtis=%d",
 		snapshot.Version,
 		len(snapshot.RevokedDeviceIDs),
@@ -603,6 +640,30 @@ func (s *RelayServer) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
+func (s *RelayServer) Stats() RelayStatsSnapshot {
+	if s == nil {
+		return RelayStatsSnapshot{}
+	}
+	registeredPeers := 0
+	if s.hub != nil {
+		registeredPeers = s.hub.count()
+	}
+	return RelayStatsSnapshot{
+		ActiveConnections:               atomic.LoadInt64(&s.activeConnections),
+		RegisteredPeers:                 registeredPeers,
+		AcceptedConnectionsTotal:        atomic.LoadUint64(&s.stats.acceptedConnectionsTotal),
+		RejectedConnectionsTotal:        atomic.LoadUint64(&s.stats.rejectedConnectionsTotal),
+		FrameErrorsTotal:                atomic.LoadUint64(&s.stats.frameErrorsTotal),
+		AuthFailuresTotal:               atomic.LoadUint64(&s.stats.authFailuresTotal),
+		LegacyRegistrationsTotal:        atomic.LoadUint64(&s.stats.legacyRegistrationsTotal),
+		AuthenticatedRegistrationsTotal: atomic.LoadUint64(&s.stats.authenticatedRegistrationsTotal),
+		ForwardedFramesTotal:            atomic.LoadUint64(&s.stats.forwardedFramesTotal),
+		ForwardErrorsTotal:              atomic.LoadUint64(&s.stats.forwardErrorsTotal),
+		RevocationRefreshesTotal:        atomic.LoadUint64(&s.stats.revocationRefreshesTotal),
+		RevocationRefreshFailuresTotal:  atomic.LoadUint64(&s.stats.revocationRefreshFailuresTotal),
+	}
+}
+
 func (s *RelayServer) Serve() {
 	for {
 		conn, err := s.listener.Accept()
@@ -628,6 +689,7 @@ func (s *RelayServer) Serve() {
 		// Atomic connection limit check
 		if atomic.AddInt64(&s.activeConnections, 1) > int64(s.config.MaxConnections) {
 			atomic.AddInt64(&s.activeConnections, -1)
+			atomic.AddUint64(&s.stats.rejectedConnectionsTotal, 1)
 			s.mu.Unlock()
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
@@ -636,6 +698,7 @@ func (s *RelayServer) Serve() {
 		}
 
 		s.connections[conn] = struct{}{}
+		atomic.AddUint64(&s.stats.acceptedConnectionsTotal, 1)
 		s.wg.Add(1)
 		s.mu.Unlock()
 
@@ -876,6 +939,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(s.config.RegisterTimeout))
 	typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
 	if err != nil {
+		atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			_, _ = conn.Write(errorFrame(4003, "registration timed out"))
@@ -892,6 +956,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	// ---- Handle legacy MSG_REGISTER (0x01) ----
 	if typ == msgRegister {
 		if s.config.RequireAuthentication && !s.config.AllowLegacyUnauthenticated {
+			atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
 			return
@@ -899,6 +964,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 		nodeID := string(payload)
 		if nodeID == "" || len(nodeID) > 255 || !utf8.Valid(payload) {
+			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(4000, "invalid node ID"))
 			return
@@ -906,6 +972,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 		// Legacy: network_id defaults to "" (empty string)
 		s.hub.register(p, "", nodeID)
+		atomic.AddUint64(&s.stats.legacyRegistrationsTotal, 1)
 		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
 		s.handlePostRegister(conn, p, nodeID, "")
 		return
@@ -915,6 +982,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	if typ == msgAuthRegister {
 		nodeID, ticket, err := parseAuthRegister(payload)
 		if err != nil {
+			atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errInvalidTicket, err.Error()))
 			return
@@ -923,6 +991,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		// Verify the ticket
 		claims, err := s.verifyTicket(ticket)
 		if err != nil {
+			atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			code := errInvalidTicket
 			msg := err.Error()
@@ -947,6 +1016,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 		// Verify node_id from frame matches ticket
 		if nodeID != claims.NodeID {
+			atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errIdentityMismatch, "node_id does not match ticket"))
 			return
@@ -968,6 +1038,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				})
 			} else {
 				// Ticket already expired
+				atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 				_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 				_, _ = conn.Write(errorFrame(errTicketExpired, "ticket expired"))
 				return
@@ -979,6 +1050,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 			defer expiryTimer.Stop()
 		}
 
+		atomic.AddUint64(&s.stats.authenticatedRegistrationsTotal, 1)
 		s.handlePostRegister(conn, p, nodeID, claims.NetworkID)
 		return
 	}
@@ -986,8 +1058,10 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	// Unknown first frame type
 	_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 	if s.config.RequireAuthentication {
+		atomic.AddUint64(&s.stats.authFailuresTotal, 1)
 		_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
 	} else {
+		atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 		_, _ = conn.Write(errorFrame(4002, "registration required"))
 	}
 }
@@ -998,6 +1072,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
 		if err != nil {
+			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				_, _ = conn.Write(errorFrame(4009, "idle timeout"))
@@ -1015,6 +1090,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 		case msgRegister:
 			newID := string(payload)
 			if newID != p.id || !utf8.Valid(payload) {
+				atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 				queue(p, errorFrame(4004, "already registered with a different node ID"))
 				time.Sleep(50 * time.Millisecond)
 				return
@@ -1024,12 +1100,16 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 		case msgForward:
 			dstID, data, ok := parsePeerPayload(payload)
 			if !ok {
+				atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 				queue(p, errorFrame(4000, "malformed forward payload"))
 				continue
 			}
 			status, message := s.hub.forward(networkID, p.id, dstID, data, s.config.MaxFramePayload)
 			if status != 0 {
+				atomic.AddUint64(&s.stats.forwardErrorsTotal, 1)
 				queue(p, errorFrame(status, message))
+			} else {
+				atomic.AddUint64(&s.stats.forwardedFramesTotal, 1)
 			}
 
 		case msgPing:
@@ -1039,6 +1119,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 			return
 
 		default:
+			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 			queue(p, errorFrame(4000, "unsupported frame type"))
 		}
 	}
