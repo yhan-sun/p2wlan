@@ -628,6 +628,58 @@ function natProfileSummary(snapshot: DiagnosticsSnapshot | null): string | null 
   return parts.length ? parts.join(" ") : null;
 }
 
+function yesNo(value: boolean): string {
+  return value ? "yes" : "no";
+}
+
+function protocolBoundaryDetail(protocol: NonNullable<DiagnosticsSnapshot["protocol"]>): string {
+  return [
+    protocol.data_plane,
+    `handshake=${protocol.handshake}`,
+    `aead=${protocol.aead}`,
+    `wg-interop=${yesNo(protocol.wireguard_interop)}`,
+    `turn=${yesNo(protocol.turn_compatible)}`,
+    `audit=${protocol.security_audit}`,
+  ].join(" ");
+}
+
+function protocolBoundaryStatus(
+  protocol: NonNullable<DiagnosticsSnapshot["protocol"]>
+): DiagnosticCheck["status"] {
+  return protocol.security_audit === "completed" ? "pass" : "warn";
+}
+
+function mtuRuntimeDetail(
+  mtu: NonNullable<DiagnosticsSnapshot["mtu"]>,
+  settings: ClientSettings,
+  relayConnections: number
+): string {
+  const parts = [
+    `runtime=${mtu.configured_mtu}`,
+    `profile=${mtu.profile}`,
+    `relay-safe=${mtu.relay_safe_mtu}`,
+    `auto-pmtu=${yesNo(mtu.automatic_pmtu)}`,
+  ];
+  if (mtu.configured_mtu !== settings.mtu) {
+    parts.push(`config=${settings.mtu} pending-restart`);
+  }
+  if (relayConnections > 0 && mtu.configured_mtu > mtu.relay_safe_mtu) {
+    parts.push(`relay-risk=${relayConnections}`);
+  }
+  return parts.join(" ");
+}
+
+function mtuRuntimeStatus(
+  mtu: NonNullable<DiagnosticsSnapshot["mtu"]>,
+  settings: ClientSettings,
+  relayConnections: number
+): DiagnosticCheck["status"] {
+  if (mtu.configured_mtu !== settings.mtu) return "warn";
+  if (relayConnections > 0 && mtu.configured_mtu > mtu.relay_safe_mtu) return "warn";
+  if (!mtu.automatic_pmtu && mtu.configured_mtu > mtu.wireguard_style_mtu) return "warn";
+  return "pass";
+}
+
 function lastErrorFromSnapshot(snapshot: DiagnosticsSnapshot): string | null {
   const directPathAvailable = snapshot.stats.direct_connections > 0;
   // A healthy TCP/TLS session to the relay service does not prove that any
@@ -1228,6 +1280,16 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
       : status.lastError ?? "不可访问",
   });
 
+  if (snapshot?.protocol) {
+    checks.push({
+      id: "protocol-boundary",
+      name: "协议边界",
+      category: "protocol",
+      status: protocolBoundaryStatus(snapshot.protocol),
+      detail: protocolBoundaryDetail(snapshot.protocol),
+    });
+  }
+
   checks.push({
     id: "control",
     name: "控制面",
@@ -1346,6 +1408,16 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
         : "尚未分配虚拟 IP",
   });
 
+  if (snapshot?.mtu) {
+    checks.push({
+      id: "mtu-policy",
+      name: "MTU 策略",
+      category: "performance",
+      status: mtuRuntimeStatus(snapshot.mtu, settings, status.peerStats.relay_connections),
+      detail: mtuRuntimeDetail(snapshot.mtu, settings, status.peerStats.relay_connections),
+    });
+  }
+
   const route = await getRouteStatus();
   const routeState = route.data.entries[0]?.state ?? "unknown";
   checks.push({
@@ -1389,6 +1461,8 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
     data: {
       checks,
       logs: combinedLogs,
+      protocol: snapshot?.protocol,
+      mtu: snapshot?.mtu,
       source: statusResult.source,
       generatedAt: Date.now(),
     },

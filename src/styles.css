@@ -492,6 +492,40 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.diagnostics-boundary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.diagnostics-kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.diagnostics-kv-row {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.82rem;
+}
+
+.diagnostics-kv-row span {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.diagnostics-kv-row strong {
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 650;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
 .hero-status-panel {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 220px;
@@ -620,6 +654,7 @@ select:focus-visible {
 
   .network-grid,
   .split-layout,
+  .diagnostics-boundary-grid,
   .summary-strip,
   .hero-status-panel {
     grid-template-columns: 1fr;
