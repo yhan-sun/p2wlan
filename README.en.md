@@ -175,7 +175,7 @@ P2WLAN currently uses a self-contained WireGuard-like data plane instead of call
 | Control signaling | JSON over HTTPS / WSS | Easy to inspect; `proto/` contains a protobuf draft |
 | Relay | DERP-like TCP/TLS ciphertext forwarder | Not standard TURN; relays do not decrypt private payloads |
 
-There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and add test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review.
+There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and keep adding test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review. Current tests cover the RFC ChaCha20-Poly1305 AEAD vector and WireGuard-like replay-window boundaries.
 
 For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation, and track long-term direction in the [v2 architecture roadmap](docs/v2-architecture-roadmap.en.md).
 
