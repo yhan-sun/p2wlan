@@ -108,6 +108,7 @@ export function healthTone(status: HealthStatus): Tone {
 export function pathTone(path: NetworkPath | "offline" | string): Tone {
   if (path === "direct") return "ok";
   if (path === "direct_trial") return "info";
+  if (path === "connecting") return "info";
   if (path === "relay") return "warn";
   if (path === "offline") return "muted";
   return "info";

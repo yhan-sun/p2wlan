@@ -2427,9 +2427,6 @@ async fn poll_peers(
             if node.id == self_node_id || node.public_key == config.node.public_key {
                 continue;
             }
-            if !node.online {
-                continue;
-            }
 
             let peer = PeerInfo {
                 node_id: node.id.clone(),
@@ -2541,6 +2538,7 @@ async fn create_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
@@ -2653,6 +2651,61 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         client.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_peers_preserves_offline_devices_from_control_plane() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = r#"{"nodes":[{"id":"peer-offline","device_name":"Travel Laptop","public_key":"peer-public-key","endpoint":"","nat_type":"Unknown","virtual_ip":"10.20.0.9","online":false,"last_seen":1785320000}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config = test_config();
+        let state = Arc::new(RwLock::new(ClientState {
+            registered: true,
+            peers: HashMap::new(),
+            virtual_ip: Some("10.20.0.2".to_string()),
+            _relay_servers: Vec::new(),
+        }));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        poll_peers(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "test-token",
+            &config,
+            "self-node",
+            &state,
+            &event_tx,
+        )
+        .await
+        .unwrap();
+
+        let peers = state.read().await.peers.clone();
+        let peer = peers.get("peer-offline").unwrap();
+        assert!(!peer.online);
+        assert_eq!(peer.last_seen, 1_785_320_000);
+        assert_eq!(peer.device_name, "Travel Laptop");
+
+        match event_rx.try_recv().unwrap() {
+            ControlEvent::PeerJoined(peer) => {
+                assert_eq!(peer.node_id, "peer-offline");
+                assert!(!peer.online);
+            }
+            event => panic!("expected offline peer join event, got {event:?}"),
+        }
+
         server.await.unwrap();
     }
 
