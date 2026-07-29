@@ -18,6 +18,10 @@ const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
 const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-policy、direct-timeout";
+const IPV6_SAFE_MIN_MTU: u32 = 1280;
+const RELAY_SAFE_MTU: u32 = 1380;
+const WIREGUARD_STYLE_MTU: u32 = 1420;
+const COMMON_ETHERNET_MTU: u32 = 1500;
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -530,6 +534,8 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
         "虚拟网卡：{} MTU {}",
         config.network.interface, config.network.mtu
     );
+    println!("MTU profile：{}", mtu_profile(config.network.mtu));
+    suggestions.extend(mtu_config_suggestions(config.network.mtu));
     println!("UDP bind：{}", config.network.udp_bind);
     println!(
         "UDP advertise：{}",
@@ -615,6 +621,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "direct_connections"),
                 value_u64(stats, "relay_connections")
             );
+            suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
             suggestions.extend(nat_profile_suggestions(
@@ -2350,6 +2357,49 @@ fn short_text(value: &str, max_len: usize) -> String {
     }
 }
 
+fn mtu_profile(mtu: u32) -> &'static str {
+    match mtu {
+        0..=1279 => "low (<1280, compatibility workaround)",
+        1280..=RELAY_SAFE_MTU => "relay-safe",
+        1381..=WIREGUARD_STYLE_MTU => "default",
+        1421..=COMMON_ETHERNET_MTU => "high",
+        _ => "jumbo/high-risk",
+    }
+}
+
+fn mtu_config_suggestions(mtu: u32) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    if mtu < IPV6_SAFE_MIN_MTU {
+        suggestions.push(
+            "当前 MTU 低于 1280；除非正在规避 PMTU blackhole，否则吞吐和 IPv6 兼容性可能受影响。"
+                .to_string(),
+        );
+    }
+    if mtu > COMMON_ETHERNET_MTU {
+        suggestions.push(
+            "当前 MTU 超过常见以太网 1500；除非端到端路径都支持 jumbo frame，否则建议降到 1420 或 1380。"
+                .to_string(),
+        );
+    } else if mtu > WIREGUARD_STYLE_MTU {
+        suggestions.push(
+            "当前 MTU 高于 WireGuard-like 默认 1420；复杂 NAT、移动网络或中继路径更容易出现大包丢失。"
+                .to_string(),
+        );
+    }
+    suggestions
+}
+
+fn mtu_runtime_suggestions(mtu: u32, stats: &Value) -> Vec<String> {
+    let relay_connections = value_u64(stats, "relay_connections");
+    if relay_connections > 0 && mtu > RELAY_SAFE_MTU {
+        vec![format!(
+            "当前存在 {relay_connections} 条 Relay 路径且 MTU 大于 {RELAY_SAFE_MTU}；如果 SSH/RDP 卡顿或大流量不稳定，优先尝试：p2wlan config set mtu {RELAY_SAFE_MTU}"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 fn value_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -2829,6 +2879,36 @@ mod tests {
             relay_cooldown_summaries(&relay),
             vec!["region=cn-east endpoint=relay-a.example.com:443 remaining=8500ms".to_string()]
         );
+    }
+
+    #[test]
+    fn mtu_profile_describes_common_ranges() {
+        assert_eq!(mtu_profile(1279), "low (<1280, compatibility workaround)");
+        assert_eq!(mtu_profile(1280), "relay-safe");
+        assert_eq!(mtu_profile(1380), "relay-safe");
+        assert_eq!(mtu_profile(1420), "default");
+        assert_eq!(mtu_profile(1500), "high");
+        assert_eq!(mtu_profile(9000), "jumbo/high-risk");
+    }
+
+    #[test]
+    fn mtu_suggestions_warn_for_high_and_relay_paths() {
+        assert!(mtu_config_suggestions(1420).is_empty());
+        assert!(mtu_config_suggestions(1200)
+            .iter()
+            .any(|item| item.contains("低于 1280")));
+        assert!(mtu_config_suggestions(1501)
+            .iter()
+            .any(|item| item.contains("超过常见以太网 1500")));
+
+        let relay_stats = serde_json::json!({
+            "direct_connections": 0,
+            "relay_connections": 2
+        });
+        assert!(mtu_runtime_suggestions(1420, &relay_stats)
+            .iter()
+            .any(|item| item.contains("Relay 路径") && item.contains("1380")));
+        assert!(mtu_runtime_suggestions(1380, &relay_stats).is_empty());
     }
 
     #[test]
