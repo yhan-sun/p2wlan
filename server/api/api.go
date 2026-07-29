@@ -706,6 +706,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		FromNodeID              string            `json:"from_node_id"`
 		ToNodeID                string            `json:"to_node_id"`
 		Type                    string            `json:"type"`
+		ProtocolVersion         int64             `json:"protocol_version"`
 		Candidates              []string          `json:"candidates"`
 		CandidateSources        map[string]string `json:"candidate_sources"`
 		CandidateGeneration     int64             `json:"candidate_generation"`
@@ -734,6 +735,18 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type != "peer_offer" && req.Type != "peer_answer" && req.Type != "peer_reflexive" {
 		http.Error(w, `{"error":"unsupported signal type"}`, http.StatusBadRequest)
+		return
+	}
+	protocolVersion := req.ProtocolVersion
+	if protocolVersion == 0 {
+		protocolVersion = database.SignalProtocolVersion
+	}
+	if protocolVersion != database.SignalProtocolVersion {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":                      "unsupported signal protocol_version",
+			"error_code":                 "unsupported_signal_protocol_version",
+			"supported_protocol_version": database.SignalProtocolVersion,
+		})
 		return
 	}
 	if len(req.ToNodeID) > 64 {
@@ -908,7 +921,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey)
+	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey)
 	if err != nil {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
@@ -918,7 +931,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		s.hub.Notify(req.ToNodeID)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal, "server_time_ms": time.Now().UnixMilli()})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal, "protocol_version": database.SignalProtocolVersion, "server_time_ms": time.Now().UnixMilli()})
 }
 
 // ListSignals handles GET /api/v1/signals.
@@ -957,7 +970,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(signals) > 0 || waitMS == 0 || !time.Now().Before(deadline) {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "server_time_ms": time.Now().UnixMilli()})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "protocol_version": database.SignalProtocolVersion, "server_time_ms": time.Now().UnixMilli()})
 			return
 		}
 
@@ -966,7 +979,7 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 			wait = signalLongPollFallbackInterval
 		}
 		if wait <= 0 {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "server_time_ms": time.Now().UnixMilli()})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "protocol_version": database.SignalProtocolVersion, "server_time_ms": time.Now().UnixMilli()})
 			return
 		}
 		s.signalNotifier.wait(r.Context(), nodeID, version, wait)

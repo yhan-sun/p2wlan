@@ -54,7 +54,8 @@
 
 ## P2 控制面与协议演进
 
-- JSON-over-HTTPS/WSS 保持消息版本字段和向后兼容策略。
+- JSON-over-HTTPS/WSS 保持消息版本字段和向后兼容策略；durable REST 信令必须发送并返回 `protocol_version=1`。
+- 不支持的 durable REST 信令版本必须返回稳定错误码 `unsupported_signal_protocol_version` 和 `supported_protocol_version`，不得静默降级或入库。
 - `proto/` 中的 Protobuf 只能作为草案；若切换，必须提供迁移期双栈解析和黄金样例。
 - 设备身份职责保持清晰：X25519 用于数据面，Ed25519 用于控制面认证和信令绑定。
 - relay catalog、candidate source、candidate expiry、network generation 必须保留可观测字段。

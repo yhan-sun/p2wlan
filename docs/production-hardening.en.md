@@ -54,7 +54,8 @@ This document turns the README protocol boundaries and networking caveats into c
 
 ## P2 Control Plane And Protocol Evolution
 
-- Keep JSON-over-HTTPS/WSS versioned and backward-compatible.
+- Keep JSON-over-HTTPS/WSS versioned and backward-compatible; durable REST signaling must send and return `protocol_version=1`.
+- Unsupported durable REST signaling versions must return stable `unsupported_signal_protocol_version` and `supported_protocol_version` fields instead of silently downgrading or persisting the signal.
 - Treat `proto/` as a draft until migration includes dual parsing and golden fixtures.
 - Keep identity roles separate: X25519 for data-plane handshakes, Ed25519 for control-plane authentication and signaling binding.
 - Preserve observable fields for relay catalog, candidate source, candidate expiry, and network generation.

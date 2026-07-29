@@ -35,7 +35,7 @@ flowchart TB
 | v1.3 Performance hardening | Reduce MTU blackholes and relay stalls | `scripts/mtu-smoke.sh`, manual MTU downgrade, later automatic PMTU probing | 1420/1380/1280 smoke records and visible high-MTU relay risk |
 | v2.0 Data-plane decision | Reduce crypto maintenance risk | Prefer `boringtun`/`wireguard-go`/platform WireGuard; if in-repo crypto remains, add audit and vectors | External review, fuzzing, replay/rekey/malformed-packet tests |
 | v2.1 Standardized transport | Better mobile and enterprise-network behavior | Evaluate QUIC DATAGRAM or relay transport first; avoid mapping transparent L3 traffic to application streams | TCP/UDP/relay stress, network switch, recovery tests |
-| v2.2 Protocol evolution | Evolvable control-plane messages | Versioned JSON or protobuf/capnproto dual-stack migration | Golden fixtures, backward-compat tests, staged migration |
+| v2.2 Protocol evolution | Evolvable control-plane messages | Durable REST signaling `protocol_version=1`, stable error codes, and versioned JSON or protobuf/capnproto dual-stack migration | Golden fixtures, backward-compat tests, staged migration |
 
 ## Core Tradeoffs
 

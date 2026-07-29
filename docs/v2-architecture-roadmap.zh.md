@@ -35,7 +35,7 @@ flowchart TB
 | v1.3 性能硬化 | 降低 MTU blackhole 和 relay 卡顿 | `scripts/mtu-smoke.sh`、手动 MTU 降级、后续自动 PMTU 探测 | 1420/1380/1280 smoke 记录，relay 高 MTU 风险可见 |
 | v2.0 数据面选择 | 降低密码协议维护风险 | 优先评估 `boringtun`/`wireguard-go`/平台 WireGuard；若保留自研则补审计和测试向量 | 外部审计、fuzz、replay/rekey/malformed packet 测试 |
 | v2.1 标准化传输 | 更好移动和企业网络适应性 | QUIC DATAGRAM 或 relay transport 优先；避免把透明 L3 流量拆成应用 stream | TCP/UDP/relay 压测、网络切换和恢复测试 |
-| v2.2 协议演进 | 控制面消息可演进 | JSON versioning 或 protobuf/capnproto 双栈迁移 | golden fixtures、向后兼容测试、灰度迁移 |
+| v2.2 协议演进 | 控制面消息可演进 | durable REST 信令 `protocol_version=1`、稳定错误码、JSON versioning 或 protobuf/capnproto 双栈迁移 | golden fixtures、向后兼容测试、灰度迁移 |
 
 ## 关键技术取舍
 
