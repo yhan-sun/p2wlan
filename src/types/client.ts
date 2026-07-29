@@ -75,7 +75,12 @@ export interface PathHealthDiagnostics {
   last_failure_age_ms: number | null;
   consecutive_failures: number;
   last_error: string | null;
+  last_error_code?: string | null;
   latency_ms: number | null;
+  rtt_ewma_ms?: number | null;
+  jitter_ms?: number | null;
+  success_count?: number;
+  failure_count?: number;
 }
 
 export interface CandidatePairDiagnostics {
@@ -117,6 +122,30 @@ export interface CandidatePairDiagnostics {
   warning: string | null;
 }
 
+export interface CandidatePairSourceStats {
+  source: CandidatePairSource;
+  pair_count: number;
+  current_pair_count: number;
+  selected_count: number;
+  succeeded_count: number;
+  probing_count: number;
+  failed_count: number;
+  degraded_count: number;
+  success_count: number;
+  failure_count: number;
+  success_rate_per_mille: number | null;
+  last_success_age_ms: number | null;
+  last_failure_age_ms: number | null;
+  history_success_count: number | null;
+  history_failure_count: number | null;
+  history_consecutive_failures: number | null;
+  history_success_rate_per_mille: number | null;
+  history_cooldown_remaining_ms: number | null;
+  source_quality_rank: number | null;
+  probe_budget_per_cycle: number | null;
+  probe_budget_reason: string | null;
+}
+
 export interface PeerDiagnostics {
   node_id: string;
   device_name?: string;
@@ -142,6 +171,7 @@ export interface PeerDiagnostics {
   candidates: string[];
   direct: PathHealthDiagnostics;
   relay: PathHealthDiagnostics;
+  candidate_pair_stats?: CandidatePairSourceStats[];
   candidate_pairs?: CandidatePairDiagnostics[];
   current_path_selection?: PathSelectionDiagnostics | null;
   last_path_selection?: PathSelectionDiagnostics | null;
@@ -280,6 +310,21 @@ export interface MtuDiagnostics {
   automatic_pmtu: boolean;
 }
 
+export interface TraversalSourceHistoryDiagnostics {
+  source: string;
+  success_count: number;
+  failure_count: number;
+  consecutive_failures: number;
+  success_rate_per_mille: number | null;
+  last_success_age_ms: number | null;
+  last_failure_age_ms: number | null;
+  cooldown_remaining_ms: number | null;
+}
+
+export interface TraversalHistoryDiagnostics {
+  sources: TraversalSourceHistoryDiagnostics[];
+}
+
 /** Raw JSON from daemon `GET /status`. */
 export interface DiagnosticsSnapshot {
   version?: string;
@@ -300,6 +345,7 @@ export interface DiagnosticsSnapshot {
   relay_servers: string[];
   relay_connected: boolean;
   relay_selection: RelaySelectionDiagnostics;
+  traversal_history?: TraversalHistoryDiagnostics;
   peers: PeerDiagnostics[];
   stats: PeerManagerStats;
   health: HealthSnapshot;
