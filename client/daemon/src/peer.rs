@@ -6557,7 +6557,7 @@ mod tests {
         manager
             .add_candidates_with_sources(
                 "peer1",
-                &[predicted_endpoint.clone()],
+                std::slice::from_ref(&predicted_endpoint),
                 &HashMap::from([(predicted_endpoint.clone(), "predicted".to_string())]),
             )
             .await;

@@ -2905,7 +2905,7 @@ dependencies = [
 
 [[package]]
 name = "p2wlan-desktop-host"
-version = "0.1.62"
+version = "0.1.64"
 dependencies = [
  "dirs 5.0.1",
  "reqwest 0.12.28",
