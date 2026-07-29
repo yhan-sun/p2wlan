@@ -16,7 +16,7 @@ class StatusBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = _colors(context);
     return Container(
-      constraints: const BoxConstraints(minHeight: 28),
+      constraints: const BoxConstraints(minHeight: 28, maxWidth: 180),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
         color: colors.$1,

@@ -65,6 +65,40 @@ Manual refresh smoke after starting an existing daemon yourself:
 - Optional: turn on Auto refresh and verify the UI refreshes every 30 seconds,
   then turn it back off.
 
+## Platform Notes
+
+The Flutter client keeps the same read-only diagnostics behavior on every
+platform. It does not manage daemon lifecycle on Android, Windows, Linux, or
+macOS.
+
+Common local builds:
+
+```bash
+cd apps/flutter_client
+flutter analyze
+flutter test
+flutter build apk --debug
+flutter build macos --debug
+flutter build linux --debug      # run on Linux with GTK dev packages
+flutter build windows --debug    # run on Windows with Visual Studio tooling
+```
+
+Android notes:
+
+- Release/debug Android builds include `INTERNET` because the app reads the
+  diagnostics HTTP endpoint.
+- Cleartext HTTP is allowed because the diagnostics URL is user-configurable and
+  local/LAN endpoints are expected in P1/P1.5.
+- Android emulators usually reach a host daemon through `http://10.0.2.2:<port>`
+  rather than `127.0.0.1`. Physical devices need a reachable LAN address.
+
+Desktop notes:
+
+- macOS, Linux, and Windows use the visible app/window title
+  `P2WLAN Diagnostics`.
+- Desktop windows use an 860x560 minimum size so diagnostics tables and controls
+  remain usable while still supporting compact laptop windows.
+
 ## Real Daemon Smoke
 
 This P1 prototype never starts, stops, elevates, or shuts down the daemon. Run

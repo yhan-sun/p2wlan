@@ -26,26 +26,55 @@ class InfoCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ),
-                ?trailing,
-              ],
-            ),
+            _InfoCardHeader(title: title, trailing: trailing),
             const SizedBox(height: 12),
             child,
           ],
         ),
       ),
+    );
+  }
+}
+
+class _InfoCardHeader extends StatelessWidget {
+  const _InfoCardHeader({required this.title, required this.trailing});
+
+  final String title;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final titleWidget = Text(
+      title,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: Theme.of(
+        context,
+      ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+    );
+    final trailingWidget = trailing;
+    if (trailingWidget == null) return titleWidget;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 360) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              titleWidget,
+              const SizedBox(height: 8),
+              Align(alignment: Alignment.centerLeft, child: trailingWidget),
+            ],
+          );
+        }
+        return Row(
+          children: [
+            Expanded(child: titleWidget),
+            const SizedBox(width: 12),
+            trailingWidget,
+          ],
+        );
+      },
     );
   }
 }
@@ -65,7 +94,7 @@ class MetricTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(minWidth: 180, maxWidth: 280),
+      constraints: const BoxConstraints(minWidth: 156, maxWidth: 320),
       child: Padding(
         padding: const EdgeInsets.only(right: 16, bottom: 16),
         child: Column(

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../core/api/daemon_api.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
+import 'app_constants.dart';
 import 'navigation.dart';
 
 class P2WlanApp extends StatefulWidget {
@@ -58,7 +59,7 @@ class _P2WlanAppState extends State<P2WlanApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'P2WLAN',
+      title: p2wlanAppName,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -66,7 +67,20 @@ class _P2WlanAppState extends State<P2WlanApp> {
           seedColor: const Color(0xFF176B87),
           brightness: Brightness.light,
         ),
-        visualDensity: VisualDensity.compact,
+        visualDensity: VisualDensity.standard,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFFF6F8FA),
+          foregroundColor: Color(0xFF0F172A),
+          surfaceTintColor: Colors.transparent,
+        ),
+        inputDecorationTheme: const InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(),
+        ),
+        snackBarTheme: const SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+        ),
         scaffoldBackgroundColor: const Color(0xFFF6F8FA),
       ),
       home: _ready
