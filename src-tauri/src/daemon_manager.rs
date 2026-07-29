@@ -520,17 +520,12 @@ impl DaemonManager {
     pub async fn check_endpoint(url: &str) -> bool {
         // Simple client request to the lightweight health endpoint.
         // Full `/status` snapshots can be briefly slow while peer/relay state is changing.
-        let health_url = Self::health_url_from_status_url(url).unwrap_or_else(|| url.to_string());
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_millis(1500))
-            .build();
-        if let Ok(client) = client {
-            if let Ok(res) = client.get(health_url).send().await {
-                return res.status().is_success();
-            }
-        }
-        false
+        let Ok(client) =
+            p2wlan_desktop_host::DesktopHostClient::with_timeout(Duration::from_millis(1500))
+        else {
+            return false;
+        };
+        client.fetch_health(url).await.unwrap_or(false)
     }
 
     pub async fn status(
@@ -545,28 +540,37 @@ impl DaemonManager {
             }
         };
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_millis(2500))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let res = client
-            .get(&url)
-            .send()
+        let client =
+            p2wlan_desktop_host::DesktopHostClient::with_timeout(Duration::from_millis(2500))
+                .map_err(Self::desktop_host_status_error)?;
+        client
+            .fetch_status(&url)
             .await
-            .map_err(|e| format!("守护进程不可达：{}", e))?;
+            .map_err(Self::desktop_host_status_error)
+    }
 
-        if !res.status().is_success() {
-            return Err(format!("守护进程返回异常状态码：{}", res.status()));
+    fn desktop_host_status_error(error: p2wlan_desktop_host::DesktopHostError) -> String {
+        match error.kind {
+            p2wlan_desktop_host::DesktopHostErrorKind::DaemonStatusDecodeFailed => {
+                let detail = error.details.first().unwrap_or(&error.message);
+                format!("解析守护进程状态失败：{detail}")
+            }
+            p2wlan_desktop_host::DesktopHostErrorKind::DaemonUnavailable => {
+                if let Some(status) = error
+                    .message
+                    .strip_prefix("Daemon status endpoint returned ")
+                {
+                    format!("守护进程返回异常状态码：{status}")
+                } else {
+                    let detail = error.details.first().unwrap_or(&error.message);
+                    format!("守护进程不可达：{detail}")
+                }
+            }
+            p2wlan_desktop_host::DesktopHostErrorKind::InvalidDiagnosticsUrl => {
+                format!("诊断地址无效：{}", error.message)
+            }
+            _ => error.message,
         }
-
-        let json = res
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| format!("解析守护进程状态失败：{}", e))?;
-
-        Ok(json)
     }
 
     async fn diagnostics_process_id(url: &str) -> Option<u32> {
