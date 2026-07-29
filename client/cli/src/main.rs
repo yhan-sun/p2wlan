@@ -590,6 +590,12 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
     match fetch_status(&status_url(&config)).await {
         Ok(snapshot) => {
             println!("Daemon：运行中");
+            if let Some(summary) = protocol_boundary_summary(&snapshot) {
+                println!("Protocol：{summary}");
+            }
+            if let Some(summary) = runtime_mtu_summary(&snapshot) {
+                println!("Runtime MTU：{summary}");
+            }
             println!("虚拟 IP：{}", value_text(&snapshot, "virtual_ip", "未知"));
             println!(
                 "网络代际：{}",
@@ -626,6 +632,8 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "direct_connections"),
                 value_u64(stats, "relay_connections")
             );
+            suggestions.extend(protocol_boundary_suggestions(&snapshot));
+            suggestions.extend(mtu_snapshot_suggestions(config.network.mtu, &snapshot));
             suggestions.extend(mtu_runtime_suggestions(config.network.mtu, stats));
             print_relay_diagnostics(&snapshot);
             print_peer_diagnostics(&snapshot);
@@ -1089,6 +1097,117 @@ fn auth_error(message: &str, status: u16) -> String {
 fn clear_device_credential(config: &mut Config) {
     config.control.device_credential.clear();
     config.control.credential_issued = false;
+}
+
+fn protocol_boundary_summary(snapshot: &Value) -> Option<String> {
+    let protocol = snapshot.get("protocol")?.as_object()?;
+    let data_plane = protocol
+        .get("data_plane")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let handshake = protocol
+        .get("handshake")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let aead = protocol
+        .get("aead")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let wireguard_interop = yes_no(
+        protocol
+            .get("wireguard_interop")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let turn_compatible = yes_no(
+        protocol
+            .get("turn_compatible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let audit = protocol
+        .get("security_audit")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Some(format!(
+        "{data_plane} handshake={handshake} aead={aead} wg-interop={wireguard_interop} turn={turn_compatible} audit={audit}"
+    ))
+}
+
+fn protocol_boundary_suggestions(snapshot: &Value) -> Vec<String> {
+    let Some(protocol) = snapshot.get("protocol").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    if protocol
+        .get("security_audit")
+        .and_then(Value::as_str)
+        .is_some_and(|audit| audit != "completed")
+    {
+        suggestions.push(
+            "协议安全审计未完成；发布 Production 前需要独立审计、威胁建模和互操作边界复核。"
+                .to_string(),
+        );
+    }
+    if protocol
+        .get("wireguard_interop")
+        .and_then(Value::as_bool)
+        .is_some_and(|interop| !interop)
+    {
+        suggestions.push("当前数据面是 WireGuard-like Noise，不是官方 WireGuard 互通实现；文档和部署脚本应避免承诺 WireGuard 客户端兼容。".to_string());
+    }
+    suggestions
+}
+
+fn runtime_mtu_summary(snapshot: &Value) -> Option<String> {
+    let mtu = snapshot.get("mtu")?.as_object()?;
+    let configured_mtu = mtu
+        .get("configured_mtu")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let profile = mtu
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let relay_safe_mtu = mtu
+        .get("relay_safe_mtu")
+        .and_then(Value::as_u64)
+        .unwrap_or(RELAY_SAFE_MTU as u64);
+    let automatic_pmtu = yes_no(
+        mtu.get("automatic_pmtu")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    Some(format!(
+        "configured={configured_mtu} profile={profile} relay-safe={relay_safe_mtu} auto-pmtu={automatic_pmtu}"
+    ))
+}
+
+fn mtu_snapshot_suggestions(config_mtu: u32, snapshot: &Value) -> Vec<String> {
+    let Some(runtime_mtu) = snapshot
+        .get("mtu")
+        .and_then(|mtu| mtu.get("configured_mtu"))
+        .and_then(Value::as_u64)
+    else {
+        return Vec::new();
+    };
+
+    if runtime_mtu != config_mtu as u64 {
+        vec![format!(
+            "当前配置 MTU 为 {config_mtu}，daemon 运行中 MTU 为 {runtime_mtu}；执行 p2wlan down && p2wlan up 让配置生效。"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn print_nat_diagnostics(snapshot: &Value) {
@@ -2950,6 +3069,56 @@ mod tests {
             .iter()
             .any(|item| item.contains("Relay 路径") && item.contains("1380")));
         assert!(mtu_runtime_suggestions(1380, &relay_stats).is_empty());
+    }
+
+    #[test]
+    fn protocol_boundary_helpers_explain_runtime_contract() {
+        let snapshot = serde_json::json!({
+            "protocol": {
+                "data_plane": "wireguard_like_noise",
+                "handshake": "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s",
+                "aead": "ChaCha20-Poly1305",
+                "wireguard_interop": false,
+                "turn_compatible": false,
+                "security_audit": "not_completed"
+            }
+        });
+
+        assert_eq!(
+            protocol_boundary_summary(&snapshot).as_deref(),
+            Some("wireguard_like_noise handshake=Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s aead=ChaCha20-Poly1305 wg-interop=no turn=no audit=not_completed")
+        );
+        let suggestions = protocol_boundary_suggestions(&snapshot);
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("协议安全审计未完成")));
+        assert!(suggestions
+            .iter()
+            .any(|item| item.contains("不是官方 WireGuard 互通实现")));
+        assert!(protocol_boundary_summary(&serde_json::json!({})).is_none());
+        assert!(protocol_boundary_suggestions(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn runtime_mtu_helpers_report_daemon_profile_and_config_drift() {
+        let snapshot = serde_json::json!({
+            "mtu": {
+                "configured_mtu": 1420,
+                "profile": "default",
+                "relay_safe_mtu": 1380,
+                "automatic_pmtu": false
+            }
+        });
+
+        assert_eq!(
+            runtime_mtu_summary(&snapshot).as_deref(),
+            Some("configured=1420 profile=default relay-safe=1380 auto-pmtu=no")
+        );
+        assert!(mtu_snapshot_suggestions(1420, &snapshot).is_empty());
+        assert!(mtu_snapshot_suggestions(1380, &snapshot)
+            .iter()
+            .any(|item| item.contains("daemon 运行中 MTU 为 1420")));
+        assert!(runtime_mtu_summary(&serde_json::json!({})).is_none());
     }
 
     #[test]
