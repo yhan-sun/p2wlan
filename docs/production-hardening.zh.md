@@ -23,7 +23,7 @@
 
 - 记录并展示本地 NAT profile：mapping behavior、filtering behavior、hairpin、mapping lifetime、STUN 成功率、confidence。
 - 至少用两个不同网络的 STUN observer 做默认生产配置；单 observer 只能作为有限诊断。
-- 维护真实网络矩阵，至少覆盖：
+- 维护真实网络矩阵（模板见 [NAT 穿透验收矩阵](nat-traversal-matrix.zh.md)），至少覆盖：
   - 家庭宽带 NAT 到家庭宽带 NAT
   - 家庭宽带 NAT 到云服务器公网 UDP
   - 校园网到家庭宽带
@@ -84,4 +84,3 @@ pnpm run build
 - 至少一次 MTU 降级测试。
 - 至少一次 daemon 重启、网络切换、relay 重连和控制面短暂不可用测试。
 - 更新 README、release notes 和已知限制。
-

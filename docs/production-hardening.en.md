@@ -23,7 +23,7 @@ This document turns the README protocol boundaries and networking caveats into c
 
 - Record and expose the local NAT profile: mapping behavior, filtering behavior, hairpin behavior, mapping lifetime, STUN success rate, and confidence.
 - Use at least two STUN observers from different networks for production-like configuration; one observer is only limited diagnostics.
-- Maintain a real-world network matrix covering:
+- Maintain a real-world network matrix (template: [NAT traversal acceptance matrix](nat-traversal-matrix.en.md)) covering:
   - home broadband NAT to home broadband NAT
   - home broadband NAT to cloud public UDP
   - campus network to home broadband
@@ -84,4 +84,3 @@ Before a real-network release, also complete:
 - At least one MTU downgrade test.
 - At least one daemon restart, network switch, relay reconnect, and short control-plane outage test.
 - README, release notes, and known-limit updates.
-
