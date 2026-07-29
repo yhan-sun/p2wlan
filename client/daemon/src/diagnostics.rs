@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
 use crate::gateway_mapping::GatewayMappingDiagnostics;
-use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats};
+use crate::peer::{PeerDiagnostics, PeerManager, PeerManagerStats, DIRECT_RETRY_BASE_INTERVAL};
 use crate::relay::{RelaySelectionDiagnostics, RelayTransport};
 use crate::tasks::{HealthState, TaskManager};
 use crate::traversal_history::TraversalHistoryDiagnostics;
@@ -225,7 +225,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         None => Vec::new(),
     };
     let relay_connected = context.relay_transport.read().await.is_some();
-    let direct_retry_after = Duration::from_millis(context.config.relay.fallback_timeout_ms);
+    let direct_retry_after = DIRECT_RETRY_BASE_INTERVAL;
 
     let tasks = context.task_manager.task_statuses().await;
     let health_snap = context.health.snapshot(&tasks).await;

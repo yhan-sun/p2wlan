@@ -1143,6 +1143,21 @@ export async function renamePeerDevice(
 
   try {
     const controlServer = normalizeControlServer(settings.controlServer);
+    if (isTauri()) {
+      const response = await tryInvoke<{ deviceName: string }>("control_rename_device", {
+        request: {
+          controlServer,
+          authToken: settings.authToken,
+          deviceId: peerId,
+          deviceName,
+        },
+      });
+      if (response?.deviceName) {
+        appendLog(`device renamed (${peerId}) via native bridge`);
+        return { data: { deviceName: response.deviceName }, source: "live" };
+      }
+    }
+
     const response = await fetch(
       `${controlServer}/api/v1/devices/${encodeURIComponent(peerId)}`,
       {
@@ -1174,6 +1189,8 @@ export async function renamePeerDevice(
         ? "无法连接控制服务器，请检查网络后重试"
         : error instanceof Error
           ? error.message
+          : typeof error === "string"
+            ? error
           : "设备名称保存失败";
     appendLog(`device rename failed (${peerId}): ${message}`);
     return { data: fallback, source: "fallback", error: message };
