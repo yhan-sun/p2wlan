@@ -83,6 +83,7 @@ class ControlApi {
       uri: endpoint,
       payload: {'device_name': name},
       authToken: authToken,
+      unauthorizedMessage: '登录状态已过期或无权修改该设备，请重新登录后再试',
     );
     if (body['success'] == false) {
       throw ControlApiException(
@@ -112,6 +113,7 @@ class ControlApi {
       method: 'DELETE',
       uri: endpoint,
       authToken: authToken,
+      unauthorizedMessage: '登录状态已过期或无权移除该设备，请重新登录后再试',
     );
     if (body['success'] == false) {
       throw ControlApiException(
@@ -125,6 +127,7 @@ class ControlApi {
     required Uri uri,
     Map<String, dynamic>? payload,
     String? authToken,
+    String? unauthorizedMessage,
   }) async {
     try {
       final request = await _client
@@ -153,7 +156,11 @@ class ControlApi {
           : <String, dynamic>{};
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ControlApiException(
-          _zhAuthError(body['error']?.toString(), response.statusCode),
+          _zhAuthError(
+            body['error']?.toString(),
+            response.statusCode,
+            unauthorizedMessage,
+          ),
         );
       }
       return body;
@@ -194,10 +201,14 @@ class ControlApiException implements Exception {
   String toString() => message;
 }
 
-String _zhAuthError(String? message, [int? statusCode]) {
+String _zhAuthError(
+  String? message, [
+  int? statusCode,
+  String? unauthorizedMessage,
+]) {
   final raw = message?.trim() ?? '';
   final normalized = raw.toLowerCase();
-  if (statusCode == 401) return '认证失败，请检查邮箱和密码';
+  if (statusCode == 401) return unauthorizedMessage ?? '认证失败，请检查邮箱和密码';
   if (statusCode == 403) return '当前账号没有权限执行该操作';
   if (statusCode == 404) return '控制服务器暂不支持该接口，请先更新服务端';
   if (statusCode == 409) return '账号已存在';

@@ -105,12 +105,21 @@ class _ConnectionBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final daemonAvailable = _daemonAvailable;
+    final tone = _overallTone();
     final statusMessage = _statusMessage(strings, daemonAvailable);
     return AppPanel(
       title: strings.localDiagnostics,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _ConnectionOverview(
+            snapshot: snapshot,
+            daemonAvailable: daemonAvailable,
+            tone: tone,
+            healthReachable: healthReachable,
+            statusReachable: statusReachable,
+          ),
+          const SizedBox(height: 16),
           _DashboardMetrics(
             snapshot: snapshot,
             lastFetchedAt: lastFetchedAt,
@@ -268,6 +277,129 @@ class _ManualDaemonCommand extends StatelessWidget {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(strings.copiedLaunchCommand)));
+  }
+}
+
+class _ConnectionOverview extends StatelessWidget {
+  const _ConnectionOverview({
+    required this.snapshot,
+    required this.daemonAvailable,
+    required this.tone,
+    required this.healthReachable,
+    required this.statusReachable,
+  });
+
+  final DiagnosticsSnapshot? snapshot;
+  final bool daemonAvailable;
+  final StatusTone tone;
+  final bool healthReachable;
+  final bool statusReachable;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final (bg, border, iconColor) = switch (tone) {
+      StatusTone.good => (
+        AppTokens.colorGoodBg,
+        AppTokens.colorGoodBorder,
+        AppTokens.colorGoodText,
+      ),
+      StatusTone.warn => (
+        AppTokens.colorWarnBg,
+        AppTokens.colorWarnBorder,
+        AppTokens.colorWarnText,
+      ),
+      StatusTone.bad => (
+        AppTokens.colorBadBg,
+        AppTokens.colorBadBorder,
+        AppTokens.colorBadText,
+      ),
+      StatusTone.neutral => (
+        theme.colorScheme.surfaceContainerHighest,
+        theme.colorScheme.outline,
+        theme.colorScheme.onSurfaceVariant,
+      ),
+    };
+    final statusLabel = !daemonAvailable
+        ? strings.offline
+        : tone == StatusTone.good
+        ? strings.healthy
+        : tone == StatusTone.warn
+        ? strings.degraded
+        : strings.unhealthy;
+    final title = daemonAvailable
+        ? (strings.isZh ? '虚拟网络运行中' : 'Virtual network running')
+        : (strings.isZh ? '虚拟网络未启动' : 'Virtual network stopped');
+    final subtitle = snapshot == null
+        ? (strings.isZh
+              ? '启动后会显示虚拟 IP、控制面和中继路径状态。'
+              : 'Start P2WLAN to see virtual IP, control-plane, and relay status.')
+        : '${strings.virtualIp} ${dash(snapshot!.virtualIp)} · ${snapshot!.networkId} · ${strings.endpointState} ${healthReachable || statusReachable ? strings.reachable : strings.unavailable}';
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        border: Border.all(color: border),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surface,
+                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                border: Border.all(color: border),
+              ),
+              child: Icon(
+                daemonAvailable
+                    ? Icons.hub_outlined
+                    : Icons.power_settings_new_rounded,
+                color: iconColor,
+                size: 22,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurface,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
+                      height: 1.15,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                      height: 1.3,
+                      fontFeatures: AppTokens.tabularFontFeatures,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            StatusBadge(label: statusLabel, tone: tone),
+          ],
+        ),
+      ),
+    );
   }
 }
 

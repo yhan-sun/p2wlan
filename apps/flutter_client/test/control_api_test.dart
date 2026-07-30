@@ -116,4 +116,38 @@ void main() {
 
     await deleteFuture;
   });
+
+  test(
+    'deleteDevice reports expired session instead of login credentials',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final api = ControlApi();
+      addTearDown(api.close);
+
+      final deleteFuture = api.deleteDevice(
+        controlServer: 'http://127.0.0.1:${server.port}',
+        authToken: 'expired-token',
+        deviceId: 'node-a',
+      );
+      final request = await server.first.timeout(const Duration(seconds: 3));
+      request.response.statusCode = HttpStatus.unauthorized;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write('{"error":"unauthorized"}');
+      await request.response.close();
+
+      await expectLater(
+        deleteFuture,
+        throwsA(
+          isA<ControlApiException>()
+              .having((error) => error.message, 'message', contains('重新登录'))
+              .having(
+                (error) => error.message,
+                'message',
+                isNot(contains('邮箱')),
+              ),
+        ),
+      );
+    },
+  );
 }
