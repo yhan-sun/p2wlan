@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../app/app_constants.dart';
+import '../app/app_motion.dart';
+import '../app/app_tokens.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/dashboard/dashboard_page.dart';
@@ -7,7 +10,6 @@ import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/settings/settings_page.dart';
 import '../shared/widgets/status_badge.dart';
-import 'app_constants.dart';
 
 enum P2WlanSection {
   dashboard('Dashboard', Icons.dashboard_outlined),
@@ -55,6 +57,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
       ),
     };
 
+    final duration = AppMotion.duration(context, AppTokens.durationFast);
+
     return AnimatedBuilder(
       animation: widget.statusStore,
       builder: (context, _) {
@@ -62,6 +66,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 900;
             final body = pages[_section]!;
+
+            final content = AnimatedSwitcher(
+              duration: duration,
+              switchInCurve: AppTokens.curveEase,
+              switchOutCurve: AppTokens.curveEase,
+              child: KeyedSubtree(key: ValueKey(_section), child: body),
+            );
+
             return Scaffold(
               appBar: AppBar(
                 title: const Text(p2wlanAppName),
@@ -85,8 +97,13 @@ class _P2WlanShellState extends State<P2WlanShell> {
                         : () => widget.statusStore.refresh(),
                     icon: widget.statusStore.refreshing
                         ? const SizedBox.square(
-                            dimension: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
+                            dimension: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                AppTokens.colorTextMuted,
+                              ),
+                            ),
                           )
                         : const Icon(Icons.refresh),
                   ),
@@ -95,11 +112,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
               ),
               body: wide
                   ? _WideShell(
-                      body: body,
+                      body: content,
                       selected: _section,
                       onSelect: _select,
                     )
-                  : body,
+                  : content,
               bottomNavigationBar: wide
                   ? null
                   : NavigationBar(
@@ -122,7 +139,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 
   void _select(P2WlanSection section) {
-    setState(() => _section = section);
+    if (_section != section) {
+      setState(() => _section = section);
+    }
   }
 }
 
@@ -146,7 +165,7 @@ class _WideShell extends StatelessWidget {
           onDestinationSelected: (index) =>
               onSelect(P2WlanSection.values[index]),
           labelType: NavigationRailLabelType.all,
-          minWidth: 96,
+          minWidth: 88,
           destinations: [
             for (final item in P2WlanSection.values)
               NavigationRailDestination(

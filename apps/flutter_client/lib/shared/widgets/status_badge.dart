@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_motion.dart';
+import '../../app/app_tokens.dart';
+
 enum StatusTone { good, warn, bad, neutral }
 
 class StatusBadge extends StatelessWidget {
@@ -14,48 +17,67 @@ class StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = _colors(context);
-    return Container(
-      constraints: const BoxConstraints(minHeight: 28, maxWidth: 180),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+    final (bg, border, text) = _colors();
+    final duration = AppMotion.duration(context, AppTokens.durationFast);
+    return AnimatedContainer(
+      duration: duration,
+      curve: AppTokens.curveEase,
+      constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: colors.$1,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: colors.$2),
+        color: bg,
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+        border: Border.all(color: border, width: 1),
       ),
-      child: Text(
-        label,
-        overflow: TextOverflow.ellipsis,
-        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-          color: colors.$3,
-          fontWeight: FontWeight.w700,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(color: text, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              label,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(
+                color: text,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                letterSpacing: -0.1,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  (Color, Color, Color) _colors(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+  (Color, Color, Color) _colors() {
     return switch (tone) {
       StatusTone.good => (
-        const Color(0xFFE8F5E9),
-        const Color(0xFFA5D6A7),
-        const Color(0xFF1B5E20),
+        AppTokens.colorGoodBg,
+        AppTokens.colorGoodBorder,
+        AppTokens.colorGoodText,
       ),
       StatusTone.warn => (
-        const Color(0xFFFFF8E1),
-        const Color(0xFFFFD54F),
-        const Color(0xFF7A4D00),
+        AppTokens.colorWarnBg,
+        AppTokens.colorWarnBorder,
+        AppTokens.colorWarnText,
       ),
       StatusTone.bad => (
-        const Color(0xFFFFEBEE),
-        const Color(0xFFEF9A9A),
-        const Color(0xFFB71C1C),
+        AppTokens.colorBadBg,
+        AppTokens.colorBadBorder,
+        AppTokens.colorBadText,
       ),
       StatusTone.neutral => (
-        scheme.surfaceContainerHighest,
-        scheme.outlineVariant,
-        scheme.onSurfaceVariant,
+        AppTokens.colorNeutralBg,
+        AppTokens.colorNeutralBorder,
+        AppTokens.colorNeutralText,
       ),
     };
   }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
 import '../../core/models/daemon_models.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
@@ -24,12 +25,16 @@ class NodesPage extends StatelessWidget {
           subtitle: 'Read-only peer list from the daemon status snapshot.',
           children: [
             _PeerSummary(snapshot: snapshot, peerCount: peers.length),
-            const SizedBox(height: 16),
+            const SizedBox(height: 14),
             if (peers.isEmpty)
-              const InfoCard(
+              const AppPanel(
                 title: 'Peers',
                 child: Text(
                   'No peers are present in the current daemon snapshot.',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: AppTokens.colorTextSecondary,
+                  ),
                 ),
               )
             else
@@ -57,11 +62,11 @@ class _PeerSummary extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final stats = snapshot?.stats;
-    return InfoCard(
+    return AppPanel(
       title: 'Peer summary',
       child: Wrap(
         spacing: 24,
-        runSpacing: 8,
+        runSpacing: 4,
         children: [
           MetricTile(label: 'Peer count', value: formatInt(peerCount)),
           MetricTile(
@@ -85,45 +90,105 @@ class _PeerTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InfoCard(
+    return AppPanel(
       title: 'Peers',
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: DataTable(
-          columnSpacing: 28,
-          columns: const [
-            DataColumn(label: Text('Device')),
-            DataColumn(label: Text('Peer ID')),
-            DataColumn(label: Text('Virtual IP')),
-            DataColumn(label: Text('State')),
-            DataColumn(label: Text('Path')),
-            DataColumn(label: Text('Connection type')),
-            DataColumn(label: Text('Route')),
-            DataColumn(label: Text('Latency')),
-            DataColumn(label: Text('Endpoint')),
-          ],
-          rows: [
-            for (final peer in peers)
-              DataRow(
-                cells: [
-                  DataCell(Text(dash(peer.displayName))),
-                  DataCell(SelectableText(shortId(peer.nodeId))),
-                  DataCell(SelectableText(dash(peer.virtualIp))),
-                  DataCell(Text(dash(peer.state))),
-                  DataCell(_PathBadge(peer: peer)),
-                  DataCell(Text(dash(peer.connectionType))),
-                  DataCell(Text(_routeLabel(peer))),
-                  DataCell(Text(formatLatency(peer.latencyMs))),
-                  DataCell(
-                    SelectableText(dash(peer.endpoint ?? peer.relayServer)),
-                  ),
-                ],
-              ),
-          ],
+      flushContent: true,
+      child: ClipRRect(
+        borderRadius: const BorderRadius.only(
+          bottomLeft: Radius.circular(AppTokens.radiusMd),
+          bottomRight: Radius.circular(AppTokens.radiusMd),
+        ),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: DataTable(
+            columnSpacing: 24,
+            headingRowHeight: 38,
+            dataRowMinHeight: 44,
+            dataRowMaxHeight: 48,
+            headingRowColor: WidgetStateProperty.all(
+              AppTokens.colorSurfaceSubtle,
+            ),
+            columns: const [
+              DataColumn(label: Text('Device', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Peer ID', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Virtual IP', style: _columnHeaderStyle)),
+              DataColumn(label: Text('State', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Path', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Type', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Route', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Latency', style: _columnHeaderStyle)),
+              DataColumn(label: Text('Endpoint', style: _columnHeaderStyle)),
+            ],
+            rows: [
+              for (final peer in peers)
+                DataRow(
+                  cells: [
+                    DataCell(
+                      Text(dash(peer.displayName), style: _cellStyleBold),
+                    ),
+                    DataCell(
+                      SelectableText(
+                        shortId(peer.nodeId),
+                        style: _cellMonoStyle,
+                      ),
+                    ),
+                    DataCell(
+                      SelectableText(
+                        dash(peer.virtualIp),
+                        style: _cellMonoStyle,
+                      ),
+                    ),
+                    DataCell(Text(dash(peer.state), style: _cellStyle)),
+                    DataCell(_PathBadge(peer: peer)),
+                    DataCell(
+                      Text(dash(peer.connectionType), style: _cellStyle),
+                    ),
+                    DataCell(Text(_routeLabel(peer), style: _cellStyle)),
+                    DataCell(
+                      Text(
+                        formatLatency(peer.latencyMs),
+                        style: _cellMonoStyle,
+                      ),
+                    ),
+                    DataCell(
+                      SelectableText(
+                        dash(peer.endpoint ?? peer.relayServer),
+                        style: _cellMonoStyle,
+                      ),
+                    ),
+                  ],
+                ),
+            ],
+          ),
         ),
       ),
     );
   }
+
+  static const _columnHeaderStyle = TextStyle(
+    fontSize: 12,
+    fontWeight: FontWeight.w700,
+    color: AppTokens.colorTextSecondary,
+  );
+
+  static const _cellStyle = TextStyle(
+    fontSize: 13,
+    fontWeight: FontWeight.w400,
+    color: AppTokens.colorTextPrimary,
+  );
+
+  static const _cellStyleBold = TextStyle(
+    fontSize: 13,
+    fontWeight: FontWeight.w600,
+    color: AppTokens.colorTextPrimary,
+  );
+
+  static const _cellMonoStyle = TextStyle(
+    fontSize: 12,
+    fontWeight: FontWeight.w500,
+    color: AppTokens.colorTextPrimary,
+    fontFeatures: AppTokens.tabularFontFeatures,
+  );
 }
 
 class _PeerList extends StatelessWidget {
@@ -136,12 +201,12 @@ class _PeerList extends StatelessWidget {
     return Column(
       children: [
         for (final peer in peers) ...[
-          InfoCard(
+          AppPanel(
             title: peer.displayName,
             trailing: _PathBadge(peer: peer),
             child: Wrap(
               spacing: 20,
-              runSpacing: 8,
+              runSpacing: 4,
               children: [
                 MetricTile(label: 'Peer ID', value: shortId(peer.nodeId)),
                 MetricTile(label: 'Virtual IP', value: dash(peer.virtualIp)),
@@ -165,7 +230,7 @@ class _PeerList extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
         ],
       ],
     );

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
 import '../../core/models/daemon_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -48,12 +49,12 @@ class DashboardPage extends StatelessWidget {
                 refreshImmediately: value,
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 14),
             if (snapshot == null)
               const _OfflineSummary()
             else ...[
               _StatusGrid(snapshot: snapshot),
-              const SizedBox(height: 16),
+              const SizedBox(height: 14),
               _PeerPathSummary(snapshot: snapshot),
             ],
           ],
@@ -100,15 +101,15 @@ class _ConnectionBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final overallLabel = _overallLabel();
     final tone = _overallTone(overallLabel);
-    return InfoCard(
+    return AppPanel(
       title: 'Local daemon',
       trailing: StatusBadge(label: overallLabel, tone: tone),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Wrap(
-            spacing: 28,
-            runSpacing: 8,
+            spacing: 24,
+            runSpacing: 4,
             children: [
               MetricTile(label: 'Diagnostics URL', value: url),
               MetricTile(label: 'Daemon state', value: overallLabel),
@@ -133,9 +134,11 @@ class _ConnectionBanner extends StatelessWidget {
               if (error != null) MetricTile(label: 'Last error', value: error!),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 8),
+          const Divider(),
+          const SizedBox(height: 12),
           Wrap(
-            spacing: 12,
+            spacing: 16,
             runSpacing: 8,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
@@ -144,24 +147,58 @@ class _ConnectionBanner extends StatelessWidget {
                 onPressed: refreshing ? null : onRefresh,
                 icon: refreshing
                     ? const SizedBox.square(
-                        dimension: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                        dimension: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Colors.white,
+                          ),
+                        ),
                       )
-                    : const Icon(Icons.refresh),
-                label: Text(refreshing ? 'Refreshing' : 'Refresh now'),
+                    : const Icon(Icons.refresh, size: 18),
+                label: Text(refreshing ? 'Refreshing...' : 'Refresh now'),
               ),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 320),
-                child: SwitchListTile(
-                  key: const Key('auto-refresh-switch'),
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Auto refresh'),
-                  subtitle: Text(
-                    'Every ${StatusStore.defaultAutoRefreshInterval.inSeconds}s, read-only GETs.',
+              InkWell(
+                onTap: () => onAutoRefreshChanged(!autoRefreshEnabled),
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 4,
+                    vertical: 2,
                   ),
-                  value: autoRefreshEnabled,
-                  onChanged: onAutoRefreshChanged,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 44,
+                        height: 44,
+                        child: Center(
+                          child: SizedBox(
+                            width: 36,
+                            height: 22,
+                            child: Switch(
+                              key: const Key('auto-refresh-switch'),
+                              value: autoRefreshEnabled,
+                              onChanged: onAutoRefreshChanged,
+                              activeTrackColor: AppTokens.colorAccent,
+                              materialTapTargetSize:
+                                  MaterialTapTargetSize.shrinkWrap,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Auto refresh (${StatusStore.defaultAutoRefreshInterval.inSeconds}s)',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: AppTokens.colorTextSecondary,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -204,10 +241,11 @@ class _OfflineSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const InfoCard(
+    return const AppPanel(
       title: 'Snapshot',
       child: Text(
-        'No daemon snapshot is available. Use an already running p2pnet-daemon outside this app and keep this P1 prototype in read-only mode.',
+        'No daemon snapshot is available. Run local p2pnet-daemon outside this app; this client operates in read-only diagnostics mode.',
+        style: TextStyle(fontSize: 13, color: AppTokens.colorTextSecondary),
       ),
     );
   }
@@ -221,14 +259,14 @@ class _StatusGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final relay = snapshot.relaySelection;
-    return InfoCard(
+    return AppPanel(
       title: 'Runtime snapshot',
       trailing: StatusBadge(
         label: snapshot.health.status,
         tone: _healthTone(snapshot.health.status),
       ),
       child: Wrap(
-        spacing: 12,
+        spacing: 24,
         runSpacing: 4,
         children: [
           MetricTile(
@@ -279,11 +317,11 @@ class _PeerPathSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InfoCard(
+    return AppPanel(
       title: 'Peer paths',
       child: Wrap(
-        spacing: 28,
-        runSpacing: 8,
+        spacing: 24,
+        runSpacing: 4,
         children: [
           MetricTile(
             label: 'Total peers',
