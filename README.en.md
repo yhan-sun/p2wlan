@@ -93,13 +93,13 @@ Preview builds may not yet be Apple-notarized. If Gatekeeper blocks the first la
 
 ### Windows
 
-Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`; Windows ARM devices use `p2wlan-flutter-windows-arm64-setup.exe`. Install it and launch `P2WLAN Diagnostics`.
+Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`. Install it and launch `P2WLAN Diagnostics`. The Windows ARM Flutter installer is not enabled yet; it can be added once Flutter stable/action support reliably resolves the ARM64 SDK.
 
 The current Flutter client does not start or stop the virtual adapter. Real TUN/Wintun/utun control remains on the daemon / CLI path or a later full client.
 
 ### Linux
 
-Linux desktops can use `p2wlan-flutter-linux-x64.tar.gz` or `p2wlan-flutter-linux-arm64.tar.gz` for the Flutter diagnostics client. Servers, NAS devices, and headless environments should keep using the CLI/daemon package:
+Linux desktops can use `p2wlan-flutter-linux-x64.tar.gz` for the Flutter diagnostics client. Servers, NAS devices, and headless environments should keep using the x64 / arm64 CLI/daemon package:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -202,8 +202,8 @@ Troubleshooting guidance:
 | Platform | Client | Virtual interface | Status |
 | --- | --- | --- | --- |
 | macOS Apple Silicon / Intel | Flutter DMG split by arm64 / x64 | `utun` via daemon path | Flutter diagnostics preview; TUN control is still migrating |
-| Windows 10/11 x64 / arm64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics preview; installers are architecture-specific |
-| Linux x64 / arm64 | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics preview; server and headless workflows use CLI |
+| Windows 10/11 x64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics preview; ARM64 installer is pending Flutter SDK/action support |
+| Linux x64 desktop; Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics preview uses x64 Flutter; server and headless workflows use CLI |
 | Android arm64 | Flutter APK | Future Android VPN path | Release publishes arm64 only |
 | iOS arm64 | unsigned Flutter IPA | Future Network Extension path | CI artifact, requires signing before installation |
 
