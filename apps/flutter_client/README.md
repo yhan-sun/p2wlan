@@ -215,8 +215,10 @@ GitHub Actions:
 - Android uploads only an arm64 release APK.
 - `.github/workflows/release.yml` is the publish workflow for tag releases.
 - Release publishes Android arm64 APK, unsigned iOS arm64 IPA, macOS arm64/x64
-  DMGs, Windows x64/arm64 setup installers, Linux x64/arm64 Flutter bundles,
-  and Linux x64/arm64 CLI/daemon tarballs.
+  DMGs, Windows x64 setup installer, Linux x64 Flutter bundle, and Linux
+  x64/arm64 CLI/daemon tarballs.
+- Windows and Linux Flutter ARM64 desktop packages are not enabled until the
+  GitHub Action can resolve stable Flutter ARM64 SDKs on those runners.
 - Release builds use `--split-debug-info` to keep Dart symbols out of the
   downloadable app packages.
 - The Flutter client workflow is intentionally UI-only; the tag release workflow

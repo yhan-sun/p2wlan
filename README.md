@@ -93,13 +93,13 @@ Preview 构建可能尚未完成 Apple 公证。如果 Gatekeeper 阻止首次�
 
 ### Windows
 
-普通 Intel / AMD 电脑下载 `p2wlan-flutter-windows-x64-setup.exe`，Windows ARM 设备下载 `p2wlan-flutter-windows-arm64-setup.exe`，按安装向导启动 `P2WLAN Diagnostics`。
+普通 Intel / AMD 电脑下载 `p2wlan-flutter-windows-x64-setup.exe`，按安装向导启动 `P2WLAN Diagnostics`。Windows ARM Flutter 安装包暂未打开，等 Flutter stable/action 能稳定解析 ARM64 SDK 后再加。
 
 当前 Flutter 客户端不会启动或停止虚拟网卡；需要真实 TUN/Wintun/utun 时，仍以 daemon / CLI 或后续完整客户端为准。
 
 ### Linux
 
-Linux 桌面可下载 `p2wlan-flutter-linux-x64.tar.gz` 或 `p2wlan-flutter-linux-arm64.tar.gz` 运行 Flutter 诊断客户端。服务器、NAS 和无桌面环境继续使用 CLI/daemon 包：
+Linux 桌面可下载 `p2wlan-flutter-linux-x64.tar.gz` 运行 Flutter 诊断客户端。服务器、NAS 和无桌面环境继续使用 x64 / arm64 CLI/daemon 包：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -203,8 +203,8 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 | 平台 | 客户端 | 虚拟网卡 | 当前状态 |
 | --- | --- | --- | --- |
 | macOS Apple Silicon / Intel | Flutter DMG，按 arm64 / x64 拆包 | `utun` 由 daemon 路径提供 | Flutter 诊断预览，TUN 控制迁移中 |
-| Windows 10/11 x64 / arm64 | Flutter setup 安装包 | Wintun 由 daemon 路径提供 | Flutter 诊断预览，安装包已按架构拆分 |
-| Linux x64 / arm64 | Flutter bundle + CLI/daemon tarball | TUN | 桌面诊断预览；服务器和无桌面工作流走 CLI |
+| Windows 10/11 x64 | Flutter setup 安装包 | Wintun 由 daemon 路径提供 | Flutter 诊断预览；ARM64 安装包待 Flutter SDK/action 支持 |
+| Linux x64 桌面；Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | 桌面诊断预览走 x64 Flutter；服务器和无桌面工作流走 CLI |
 | Android arm64 | Flutter APK | 后续 Android VPN 路径 | Release 仅发布 arm64 |
 | iOS arm64 | unsigned Flutter IPA | 后续 Network Extension 路径 | CI 可产物，需签名后安装 |
 

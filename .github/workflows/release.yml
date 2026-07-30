@@ -187,9 +187,9 @@ jobs:
           - arch: x64
             runner: ubuntu-22.04
             target_platform: linux-x64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            target_platform: linux-arm64
+          # Flutter stable is not currently resolved by subosito/flutter-action
+          # for GitHub-hosted Linux ARM64 runners. Linux ARM64 is still shipped
+          # below as the CLI/daemon package.
     steps:
       - uses: actions/checkout@v4
 
@@ -261,8 +261,8 @@ jobs:
         include:
           - arch: x64
             runner: windows-latest
-          - arch: arm64
-            runner: windows-11-arm
+          # Flutter stable is not currently resolved by subosito/flutter-action
+          # for GitHub-hosted Windows ARM64 runners.
     steps:
       - uses: actions/checkout@v4
 
@@ -306,10 +306,17 @@ jobs:
           }
           $versionLine = Select-String -Path "apps\flutter_client\pubspec.yaml" -Pattern "^version:\s*(.+)$"
           $version = $versionLine.Matches[0].Groups[1].Value.Split("+")[0]
-          $iscc = @(
-            "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $isccCandidates = @()
+          $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+          foreach ($base in @($programFilesX86, $env:ProgramFiles)) {
+            if ($base) {
+              $isccCandidates += (Join-Path $base "Inno Setup 6\ISCC.exe")
+            }
+          }
+          if ($env:ChocolateyInstall) {
+            $isccCandidates += (Join-Path $env:ChocolateyInstall "lib\innosetup\tools\ISCC.exe")
+          }
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) {
             throw "ISCC.exe was not found after installing Inno Setup."
           }
