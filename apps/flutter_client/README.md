@@ -77,10 +77,10 @@ Common local builds:
 cd apps/flutter_client
 flutter analyze
 flutter test
-flutter build apk --debug
-flutter build macos --debug
-flutter build linux --debug      # run on Linux with GTK dev packages
-flutter build windows --debug    # run on Windows with Visual Studio tooling
+flutter build apk --release --target-platform android-arm64
+flutter build macos --release
+flutter build linux --release      # run on Linux with GTK dev packages
+flutter build windows --release    # run on Windows with Visual Studio tooling
 ```
 
 Android notes:
@@ -205,14 +205,16 @@ Windows/Linux TODO:
 cd apps/flutter_client
 flutter analyze
 flutter test
-flutter build macos --debug
+flutter build macos --release
 ```
 
 GitHub Actions:
 
 - `.github/workflows/flutter-client.yml` runs analyze/test plus Android, Linux,
-  macOS, and Windows debug app builds.
-- Each platform build uploads a debug artifact for smoke testing.
+  macOS, and Windows release app builds.
+- Android uploads only an arm64 release APK.
+- macOS uploads separate arm64 and x64 release app zips.
+- Linux and Windows upload x64 release bundles.
 - The workflow is intentionally UI-only; it does not package or control the Rust
   daemon.
 
