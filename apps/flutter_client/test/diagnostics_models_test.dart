@@ -33,6 +33,7 @@ void main() {
     expect(snapshot.relayConnected, isTrue);
     expect(snapshot.relaySelection.selectedRegion, 'cn-east');
     expect(snapshot.relaySelection.selectedEndpoint, '203.0.113.10:18081');
+    expect(snapshot.relaySelection.latencyMs, 38);
     expect(snapshot.stats.totalPeers, 2);
     expect(snapshot.stats.directConnections, 1);
     expect(snapshot.stats.relayConnections, 1);
@@ -54,6 +55,32 @@ void main() {
     expect(relayPeer.latencyMs, 43);
     expect(relayPeer.lastError, 'direct probe timed out');
   });
+
+  test(
+    'peer latency prefers ewma and relay selection exposes pong latency',
+    () {
+      final peer = PeerSnapshot.fromJson({
+        'node_id': 'direct-peer',
+        'device_name': 'studio',
+        'virtual_ip': '10.20.0.30',
+        'online': true,
+        'state': 'direct',
+        'active_path': 'direct',
+        'direct_type': 'public_udp',
+        'is_relay': false,
+        'direct': {'latency_ms': 48, 'rtt_ewma_ms': 31},
+        'relay': <String, dynamic>{},
+      });
+      final relaySelection = RelaySelectionSnapshot.fromJson({
+        'selected_connect_latency_ms': 45,
+        'selected_last_pong_rtt_ms': 19,
+        'selected_rtt_ewma_ms': 25,
+      });
+
+      expect(peer.latencyMs, 31);
+      expect(relaySelection.latencyMs, 25);
+    },
+  );
 
   test('offline peers stay offline even when path selection says relay', () {
     final peer = PeerSnapshot.fromJson({

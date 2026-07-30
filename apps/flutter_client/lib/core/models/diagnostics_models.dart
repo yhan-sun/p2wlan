@@ -347,19 +347,28 @@ class RelaySelectionSnapshot {
     required this.selectedRegion,
     required this.selectedEndpoint,
     required this.selectedConnectLatencyMs,
+    required this.selectedLastPongRttMs,
+    required this.selectedRttEwmaMs,
     required this.lastError,
   });
 
   final String? selectedRegion;
   final String? selectedEndpoint;
   final int? selectedConnectLatencyMs;
+  final int? selectedLastPongRttMs;
+  final int? selectedRttEwmaMs;
   final String? lastError;
+
+  int? get latencyMs =>
+      selectedRttEwmaMs ?? selectedLastPongRttMs ?? selectedConnectLatencyMs;
 
   factory RelaySelectionSnapshot.fromJson(JsonMap json) {
     return RelaySelectionSnapshot(
       selectedRegion: _nullableString(json['selected_region']),
       selectedEndpoint: _nullableString(json['selected_endpoint']),
       selectedConnectLatencyMs: _intOrNull(json['selected_connect_latency_ms']),
+      selectedLastPongRttMs: _intOrNull(json['selected_last_pong_rtt_ms']),
+      selectedRttEwmaMs: _intOrNull(json['selected_rtt_ewma_ms']),
       lastError: _nullableString(json['last_error']),
     );
   }
@@ -499,10 +508,12 @@ class PeerSnapshot {
 
   int? get latencyMs {
     if (!online) return null;
-    if (path == 'direct') return direct.latencyMs;
-    if (path == 'relay') return relay.latencyMs;
-    if (path == 'direct_trial') return direct.latencyMs ?? relay.latencyMs;
-    return direct.latencyMs ?? relay.latencyMs;
+    if (path == 'direct') return direct.displayLatencyMs;
+    if (path == 'relay') return relay.displayLatencyMs;
+    if (path == 'direct_trial') {
+      return direct.displayLatencyMs ?? relay.displayLatencyMs;
+    }
+    return direct.displayLatencyMs ?? relay.displayLatencyMs;
   }
 
   DateTime? get lastSeenAt {
@@ -537,6 +548,7 @@ class PathHealthSnapshot {
     required this.consecutiveFailures,
     required this.lastError,
     required this.latencyMs,
+    required this.rttEwmaMs,
   });
 
   final int? lastSuccessAgeMs;
@@ -544,6 +556,9 @@ class PathHealthSnapshot {
   final int consecutiveFailures;
   final String? lastError;
   final int? latencyMs;
+  final int? rttEwmaMs;
+
+  int? get displayLatencyMs => rttEwmaMs ?? latencyMs;
 
   factory PathHealthSnapshot.fromJson(JsonMap json) {
     return PathHealthSnapshot(
@@ -552,6 +567,7 @@ class PathHealthSnapshot {
       consecutiveFailures: _int(json['consecutive_failures']),
       lastError: _nullableString(json['last_error']),
       latencyMs: _intOrNull(json['latency_ms']),
+      rttEwmaMs: _intOrNull(json['rtt_ewma_ms']),
     );
   }
 }
