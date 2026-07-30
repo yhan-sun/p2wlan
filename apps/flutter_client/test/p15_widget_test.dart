@@ -314,6 +314,46 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('Nodes remove action opens a visible confirmation dialog', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove device').last);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(
+      find.textContaining('This removes the device from the control plane'),
+      findsOneWidget,
+    );
+    expect(find.text('direct-laptop'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('Tunnels keeps detail rows readable on narrow screens', (
     tester,
   ) async {
