@@ -13,16 +13,18 @@ fi
 
 if [[ "$CONFIGURATION" == "Release" ]]; then
   PROFILE="release"
-  CARGO_ARGS=(--release)
 else
   PROFILE="debug"
-  CARGO_ARGS=()
 fi
 
 DAEMON_SRC="$ROOT_DIR/target/$PROFILE/p2wlan-daemon"
 if [[ ! -x "$DAEMON_SRC" ]]; then
   echo "[bundle-daemon] building p2wlan-daemon ($PROFILE)..."
-  (cd "$ROOT_DIR" && cargo build -p p2wlan-daemon "${CARGO_ARGS[@]}")
+  if [[ "$PROFILE" == "release" ]]; then
+    (cd "$ROOT_DIR" && cargo build -p p2wlan-daemon --release)
+  else
+    (cd "$ROOT_DIR" && cargo build -p p2wlan-daemon)
+  fi
 fi
 
 if [[ ! -x "$DAEMON_SRC" ]]; then
