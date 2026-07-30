@@ -10,130 +10,367 @@ permissions:
   contents: write
 
 jobs:
-  macos:
-    name: macOS Universal DMG
+  flutter-android:
+    name: Flutter Android arm64 APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Build Android arm64 release APK
+        working-directory: apps/flutter_client
+        run: >
+          flutter build apk
+          --release
+          --target-platform android-arm64
+          --split-debug-info build/symbols/android-arm64
+
+      - name: Assemble Android release artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          cp apps/flutter_client/build/app/outputs/flutter-apk/app-release.apk \
+            dist-release/p2wlan-flutter-android-arm64-release.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-flutter-android-arm64-release
+          path: dist-release/p2wlan-flutter-android-arm64-release.apk
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/p2wlan-flutter-android-arm64-release.apk
+
+  flutter-ios:
+    name: Flutter iOS arm64 IPA
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          channel: stable
+          cache: true
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 10
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
+      - name: Build unsigned iOS release app
+        working-directory: apps/flutter_client
+        run: >
+          flutter build ios
+          --release
+          --no-codesign
+          --split-debug-info build/symbols/ios-arm64
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build universal macOS app and DMG
-        run: scripts/package-macos.sh --target universal-apple-darwin
-
-      - name: Assemble macOS release artifacts
+      - name: Assemble unsigned iOS IPA
         run: |
-          mkdir -p dist-release
-          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist-release/p2wlan-macos-universal.dmg
-          ditto -c -k --keepParent target/universal-apple-darwin/release/bundle/macos/p2wlan.app dist-release/p2wlan-macos-universal.app.zip
+          set -euo pipefail
+          app="apps/flutter_client/build/ios/iphoneos/Runner.app"
+          payload="$RUNNER_TEMP/p2wlan-ios-payload"
+          rm -rf "$payload"
+          mkdir -p "$payload/Payload" dist-release
+          ditto "$app" "$payload/Payload/P2WLAN Diagnostics.app"
+          (cd "$payload" && zip -qry "$GITHUB_WORKSPACE/dist-release/p2wlan-flutter-ios-arm64-unsigned.ipa" Payload)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-macos-universal
-          path: |
-            dist-release/p2wlan-macos-universal.dmg
-            dist-release/p2wlan-macos-universal.app.zip
+          name: p2wlan-flutter-ios-arm64-unsigned
+          path: dist-release/p2wlan-flutter-ios-arm64-unsigned.ipa
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist-release/p2wlan-macos-universal.dmg
-            dist-release/p2wlan-macos-universal.app.zip
+          files: dist-release/p2wlan-flutter-ios-arm64-unsigned.ipa
 
-  windows:
-    name: Windows x64 Package
-    runs-on: windows-latest
+  flutter-macos:
+    name: Flutter macOS ${{ matrix.arch }} DMG
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            lipo_arch: arm64
+          - arch: x64
+            lipo_arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
-          targets: x86_64-pc-windows-msvc
+          channel: stable
+          cache: true
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 10
+      - name: Enable macOS desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-macos-desktop
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Build macOS release app
+        working-directory: apps/flutter_client
+        run: >
+          flutter build macos
+          --release
+          --split-debug-info build/symbols/macos
 
-      - name: Build daemon
-        run: cargo build -p p2pnet-daemon --release --target x86_64-pc-windows-msvc
-
-      - name: Build desktop shell
-        run: pnpm tauri build --no-bundle --target x86_64-pc-windows-msvc
-
-      - name: Download Wintun runtime
-        shell: pwsh
+      - name: Create architecture-specific DMG
         run: |
-          $url = "https://www.wintun.net/builds/wintun-0.14.1.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "wintun.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
-            throw "Unexpected Wintun SHA256: $hash"
-          }
-          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP "wintun") -Force
-
-      - name: Assemble portable zip
-        shell: pwsh
-        run: |
-          $pkg = Join-Path $PWD "dist-release\p2wlan-windows-x64"
-          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          Copy-Item "target\x86_64-pc-windows-msvc\release\p2pnet-daemon.exe" $pkg
-          Copy-Item "target\x86_64-pc-windows-msvc\release\p2wlan-desktop.exe" $pkg
-          Copy-Item (Join-Path $env:RUNNER_TEMP "wintun\wintun\bin\amd64\wintun.dll") $pkg
-          @"
-          p2wlan Windows x64 便携版
-
-          1. 请把 p2wlan-desktop.exe、p2pnet-daemon.exe、wintun.dll 放在同一个文件夹。
-          2. 双击启动 p2wlan-desktop.exe。
-          3. 登录或注册控制面账号。
-          4. 点击“授权启动 TUN”，在 Windows UAC 弹窗中选择“是”。
-
-          p2wlan 不会读取或保存 Windows 密码，管理员授权由 Windows 系统完成。
-          "@ | Set-Content -Path (Join-Path $pkg "README-WINDOWS.txt") -Encoding UTF8
-          Compress-Archive -Path "$pkg\*" -DestinationPath "dist-release\p2wlan-windows-x64.zip" -Force
+          set -euo pipefail
+          src="apps/flutter_client/build/macos/Build/Products/Release/P2WLAN Diagnostics.app"
+          work="$RUNNER_TEMP/p2wlan-flutter-macos-${{ matrix.arch }}"
+          app="$work/P2WLAN Diagnostics.app"
+          mkdir -p dist-release
+          rm -rf "$work"
+          mkdir -p "$work"
+          ditto "$src" "$app"
+          for binary in \
+            "$app/Contents/MacOS/P2WLAN Diagnostics" \
+            "$app/Contents/Frameworks/App.framework/Versions/A/App" \
+            "$app/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
+            lipo "$binary" -thin "${{ matrix.lipo_arch }}" -output "$binary.thin"
+            mv "$binary.thin" "$binary"
+          done
+          codesign --force --deep --sign - "$app"
+          hdiutil create \
+            -volname "P2WLAN Diagnostics" \
+            -srcfolder "$app" \
+            -ov \
+            -format UDZO \
+            "dist-release/p2wlan-flutter-macos-${{ matrix.arch }}.dmg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-windows-x64
-          path: dist-release/p2wlan-windows-x64.zip
+          name: p2wlan-flutter-macos-${{ matrix.arch }}
+          path: dist-release/p2wlan-flutter-macos-${{ matrix.arch }}.dmg
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-release/p2wlan-windows-x64.zip
+          files: dist-release/p2wlan-flutter-macos-${{ matrix.arch }}.dmg
+
+  flutter-linux:
+    name: Flutter Linux ${{ matrix.arch }} Bundle
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            target_platform: linux-x64
+          # Flutter stable is not currently resolved by subosito/flutter-action
+          # for GitHub-hosted Linux ARM64 runners. Linux ARM64 is still shipped
+          # below as the CLI/daemon package.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libgtk-3-dev \
+            liblzma-dev
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Linux desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-linux-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Build Linux release bundle
+        working-directory: apps/flutter_client
+        run: >
+          flutter build linux
+          --release
+          --target-platform ${{ matrix.target_platform }}
+          --split-debug-info build/symbols/linux-${{ matrix.arch }}
+
+      - name: Assemble Linux Flutter artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          bundle_dir="apps/flutter_client/build/linux/${{ matrix.arch }}/release/bundle"
+          if [ ! -d "$bundle_dir" ]; then
+            bundle_dir="$(find apps/flutter_client/build/linux -path '*/release/bundle' -type d | head -n 1)"
+          fi
+          if [ -z "$bundle_dir" ] || [ ! -d "$bundle_dir" ]; then
+            echo "Linux Flutter release bundle was not found." >&2
+            exit 1
+          fi
+          tar -C "$bundle_dir" -czf "dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-flutter-linux-${{ matrix.arch }}
+          path: dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz
+
+  flutter-windows:
+    name: Flutter Windows ${{ matrix.arch }} Installer
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          # Flutter stable is not currently resolved by subosito/flutter-action
+          # for GitHub-hosted Windows ARM64 runners.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-windows-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Build Windows release bundle
+        working-directory: apps/flutter_client
+        run: >
+          flutter build windows
+          --release
+          --split-debug-info build/symbols/windows-${{ matrix.arch }}
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          P2WLAN_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "dist-release" | Out-Null
+          $releaseDir = Get-ChildItem -Path "apps\flutter_client\build\windows" -Directory -Recurse |
+            Where-Object { $_.FullName -match "\\runner\\Release$" } |
+            Select-Object -First 1
+          if (-not $releaseDir) {
+            throw "Windows Flutter release directory was not found."
+          }
+          $versionLine = Select-String -Path "apps\flutter_client\pubspec.yaml" -Pattern "^version:\s*(.+)$"
+          $version = $versionLine.Matches[0].Groups[1].Value.Split("+")[0]
+          $isccCandidates = @()
+          $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+          foreach ($base in @($programFilesX86, $env:ProgramFiles)) {
+            if ($base) {
+              $isccCandidates += (Join-Path $base "Inno Setup 6\ISCC.exe")
+            }
+          }
+          if ($env:ChocolateyInstall) {
+            $isccCandidates += (Join-Path $env:ChocolateyInstall "lib\innosetup\tools\ISCC.exe")
+          }
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            throw "ISCC.exe was not found after installing Inno Setup."
+          }
+          $sourceDir = $releaseDir.FullName
+          $outputDir = (Resolve-Path "dist-release").Path
+          $iss = Join-Path $env:RUNNER_TEMP "p2wlan-flutter-windows.iss"
+          @"
+          #define SourceDir "$sourceDir"
+          #define OutputDir "$outputDir"
+          #define AppVersion "$version"
+          #define AppArch "$env:P2WLAN_ARCH"
+
+          [Setup]
+          AppId={{D2C22E34-410C-4273-B888-0E689638C994}
+          AppName=P2WLAN Diagnostics
+          AppVersion={#AppVersion}
+          AppPublisher=P2WLAN
+          DefaultDirName={localappdata}\Programs\P2WLAN Diagnostics
+          DefaultGroupName=P2WLAN Diagnostics
+          DisableProgramGroupPage=yes
+          OutputDir={#OutputDir}
+          OutputBaseFilename=p2wlan-flutter-windows-{#AppArch}-setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          UninstallDisplayIcon={app}\p2wlan_flutter_client.exe
+
+          [Files]
+          Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\P2WLAN Diagnostics"; Filename: "{app}\p2wlan_flutter_client.exe"
+          Name: "{autodesktop}\P2WLAN Diagnostics"; Filename: "{app}\p2wlan_flutter_client.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+          [Run]
+          Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN Diagnostics"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path $iss -Encoding UTF8
+          & $iscc $iss
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-flutter-windows-${{ matrix.arch }}-setup
+          path: dist-release/p2wlan-flutter-windows-${{ matrix.arch }}-setup.exe
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/p2wlan-flutter-windows-${{ matrix.arch }}-setup.exe
 
   linux-cli:
     name: Linux ${{ matrix.arch }} CLI Package
