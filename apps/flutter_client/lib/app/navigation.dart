@@ -1,4 +1,8 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../app/app_constants.dart';
 import '../app/app_strings.dart';
@@ -49,14 +53,22 @@ class _P2WlanShellState extends State<P2WlanShell> {
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 900;
         final body = _buildBody();
+        final hiddenNativeTitleBar = _usesHiddenNativeTitleBar;
+        final macosChrome = _usesMacosChrome;
+        final windowsChrome = _usesWindowsChrome;
 
         return Scaffold(
           appBar: AppBar(
+            leading: macosChrome ? const SizedBox.shrink() : null,
+            leadingWidth: macosChrome ? 76 : null,
             title: const Text(p2wlanAppName),
             centerTitle: false,
+            flexibleSpace: hiddenNativeTitleBar
+                ? const DragToMoveArea(child: SizedBox.expand())
+                : null,
             actions: [
               _ShellStatusActions(statusStore: widget.statusStore),
-              const SizedBox(width: 8),
+              SizedBox(width: windowsChrome ? 140 : 8),
             ],
           ),
           body: wide
@@ -119,6 +131,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
     }
   }
 }
+
+bool get _usesHiddenNativeTitleBar {
+  return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
+}
+
+bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
+
+bool get _usesWindowsChrome => !kIsWeb && Platform.isWindows;
 
 class _WideShell extends StatelessWidget {
   const _WideShell({

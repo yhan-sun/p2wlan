@@ -11,11 +11,21 @@ Future<void> main() async {
   final enableFlutterTray = _enableFlutterTray;
   if (_supportsDesktopHost) {
     await windowManager.ensureInitialized();
+    await _configureDesktopWindowChrome();
     if (enableFlutterTray) {
       await windowManager.setPreventClose(true);
     }
   }
   runApp(P2WlanApp(enableDesktopTray: enableFlutterTray));
+}
+
+Future<void> _configureDesktopWindowChrome() async {
+  if (Platform.isMacOS || Platform.isWindows) {
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.hidden,
+      windowButtonVisibility: true,
+    );
+  }
 }
 
 bool get _supportsDesktopHost {
