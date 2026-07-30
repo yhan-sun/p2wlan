@@ -31,10 +31,13 @@ class SettingsStore extends ChangeNotifier {
         final decoded = jsonDecode(raw);
         if (decoded is Map<String, dynamic>) {
           _settings = AppSettings.fromJson(decoded);
+          _settings = _migrateSettings(_settings);
           if (sourceFile.path != file.path) {
             await _writeSettingsFile(file);
           }
         }
+      } else {
+        _settings = _migrateSettings(_settings);
       }
       _lastError = null;
     } catch (error) {
@@ -217,6 +220,19 @@ class SettingsStore extends ChangeNotifier {
       '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan',
     );
   }
+}
+
+AppSettings _migrateSettings(AppSettings settings) {
+  final controlServer = settings.controlServer.trim();
+  final hasAuthToken = settings.authToken.trim().isNotEmpty;
+  final legacyLocalControl =
+      controlServer == 'http://127.0.0.1:8080' ||
+      controlServer == 'http://localhost:8080';
+  if (!hasAuthToken &&
+      (controlServer == legacyControlServer || legacyLocalControl)) {
+    return settings.copyWith(controlServer: defaultControlServer);
+  }
+  return settings;
 }
 
 String normalizeControlServer(String value) {

@@ -2,7 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 
 const defaultDiagnosticsUrl = 'http://127.0.0.1:39277/status';
-const defaultControlServer = 'https://control.p2wlan.io';
+const legacyControlServer = 'https://control.p2wlan.io';
+const defaultControlServer = String.fromEnvironment(
+  'P2WLAN_DEFAULT_CONTROL_SERVER',
+  defaultValue: 'http://control.example.com:18080',
+);
 const defaultNetworkId = 'default';
 const defaultLanguageCode = 'en';
 const defaultOverlayCidr = '10.20.0.0/16';
