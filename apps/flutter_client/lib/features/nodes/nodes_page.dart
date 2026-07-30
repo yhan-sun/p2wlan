@@ -29,6 +29,7 @@ class NodesPage extends StatefulWidget {
 class _NodesPageState extends State<NodesPage> {
   final _controlApi = ControlApi();
   String? _copiedKey;
+  String? _busyPeerId;
 
   @override
   void dispose() {
@@ -74,6 +75,7 @@ class _NodesPageState extends State<NodesPage> {
               _PeerList(
                 peers: peers,
                 copiedKey: _copiedKey,
+                busyPeerId: _busyPeerId,
                 onCopy: _copy,
                 onDetails: _showPeerDetails,
                 onEdit: _editPeer,
@@ -93,6 +95,13 @@ class _NodesPageState extends State<NodesPage> {
     Future<void>.delayed(const Duration(milliseconds: 1400), () {
       if (mounted && _copiedKey == key) setState(() => _copiedKey = null);
     });
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _editLocalNode(DiagnosticsSnapshot? snapshot) async {
@@ -128,28 +137,23 @@ class _NodesPageState extends State<NodesPage> {
       );
       await widget.statusStore.refresh();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            canSync
-                ? (strings.isZh
-                      ? '本机节点名称已同步：$savedName'
-                      : 'This device name synced: $savedName')
-                : (strings.isZh
-                      ? '本机节点名称已保存：$savedName'
-                      : 'This device name saved: $savedName'),
-          ),
-        ),
+      _showSnack(
+        canSync
+            ? (strings.isZh
+                  ? '本机节点名称已同步：$savedName'
+                  : 'This device name synced: $savedName')
+            : (strings.isZh
+                  ? '本机节点名称已保存：$savedName'
+                  : 'This device name saved: $savedName'),
       );
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      _showSnack(error.toString());
     }
   }
 
   Future<void> _editPeer(PeerSnapshot peer) async {
+    if (_busyPeerId != null) return;
     final strings = AppStringsScope.of(context);
     final result = await _promptDeviceName(
       initialName: peer.displayName,
@@ -157,6 +161,7 @@ class _NodesPageState extends State<NodesPage> {
     );
     if (result == null) return;
     final settings = widget.settingsStore.settings;
+    setState(() => _busyPeerId = peer.nodeId);
     try {
       final savedName = await _controlApi.renameDevice(
         controlServer: settings.controlServer,
@@ -165,49 +170,48 @@ class _NodesPageState extends State<NodesPage> {
         deviceName: result,
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            strings.isZh
-                ? '设备名称已同步：$savedName'
-                : 'Device name synced: $savedName',
-          ),
-        ),
+      _showSnack(
+        strings.isZh ? '设备名称已同步：$savedName' : 'Device name synced: $savedName',
       );
       await widget.statusStore.refresh();
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      _showSnack(error.toString());
+    } finally {
+      if (mounted && _busyPeerId == peer.nodeId) {
+        setState(() => _busyPeerId = null);
+      }
     }
   }
 
   Future<void> _deletePeer(PeerSnapshot peer) async {
+    if (_busyPeerId != null) return;
     final strings = AppStringsScope.of(context);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(strings.isZh ? '移除设备' : 'Remove device'),
-        content: Text(
-          strings.isZh
-              ? '确定要从控制面移除 ${peer.displayName} (${dash(peer.virtualIp)}) 吗？移除后该设备需要重新登录/注册才能加入。'
-              : 'Remove ${peer.displayName} (${dash(peer.virtualIp)}) from the control plane? It must sign in/register again to rejoin.',
-        ),
+        content: _RemoveDeviceDialogContent(peer: peer, strings: strings),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
             child: Text(strings.cancel),
           ),
-          FilledButton(
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              backgroundColor: AppTokens.colorBadText,
+              foregroundColor: AppTokens.colorSurface,
+            ),
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: Text(strings.isZh ? '移除' : 'Remove'),
+            icon: const Icon(Icons.delete_outline_rounded, size: 17),
+            label: Text(strings.isZh ? '移除设备' : 'Remove device'),
           ),
         ],
       ),
     );
     if (confirmed != true) return;
     final settings = widget.settingsStore.settings;
+    setState(() => _busyPeerId = peer.nodeId);
     try {
       await _controlApi.deleteDevice(
         controlServer: settings.controlServer,
@@ -216,20 +220,18 @@ class _NodesPageState extends State<NodesPage> {
       );
       await widget.statusStore.refresh();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            strings.isZh
-                ? '设备已移除：${peer.displayName}'
-                : 'Device removed: ${peer.displayName}',
-          ),
-        ),
+      _showSnack(
+        strings.isZh
+            ? '设备已移除：${peer.displayName}'
+            : 'Device removed: ${peer.displayName}',
       );
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      _showSnack(error.toString());
+    } finally {
+      if (mounted && _busyPeerId == peer.nodeId) {
+        setState(() => _busyPeerId = null);
+      }
     }
   }
 
@@ -450,6 +452,79 @@ class _LocalNodePanel extends StatelessWidget {
                 minWidth: 210,
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RemoveDeviceDialogContent extends StatelessWidget {
+  const _RemoveDeviceDialogContent({required this.peer, required this.strings});
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 420),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          DecoratedBox(
+            decoration: BoxDecoration(
+              color: AppTokens.colorBadBg,
+              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              border: Border.all(color: AppTokens.colorBadBorder),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(
+                    Icons.warning_amber_rounded,
+                    size: 20,
+                    color: AppTokens.colorBadText,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      strings.isZh
+                          ? '该设备会从控制面移除，之后需要重新登录/注册才能加入网络。'
+                          : 'This removes the device from the control plane. It must sign in or register again to rejoin.',
+                      style: const TextStyle(
+                        color: AppTokens.colorBadText,
+                        fontSize: 13,
+                        height: 1.35,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          _DetailLine(
+            label: strings.isZh ? '设备名称' : 'Device',
+            value: peer.displayName,
+          ),
+          _DetailLine(label: strings.virtualIp, value: dash(peer.virtualIp)),
+          _DetailLine(label: strings.nodeId, value: shortId(peer.nodeId)),
+          const SizedBox(height: 4),
+          Text(
+            strings.isZh
+                ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
+                : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.',
+            style: TextStyle(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 12,
+              height: 1.35,
+            ),
           ),
         ],
       ),
@@ -784,6 +859,7 @@ class _PeerList extends StatelessWidget {
   const _PeerList({
     required this.peers,
     required this.copiedKey,
+    required this.busyPeerId,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -792,6 +868,7 @@ class _PeerList extends StatelessWidget {
 
   final List<PeerSnapshot> peers;
   final String? copiedKey;
+  final String? busyPeerId;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -832,6 +909,7 @@ class _PeerList extends StatelessWidget {
                     shaded: index.isOdd,
                     compact: compact,
                     copiedKey: copiedKey,
+                    busy: busyPeerId == peers[index].nodeId,
                     onCopy: onCopy,
                     onDetails: onDetails,
                     onEdit: onEdit,
@@ -859,6 +937,7 @@ class _PeerListRow extends StatelessWidget {
     required this.shaded,
     required this.compact,
     required this.copiedKey,
+    required this.busy,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -870,6 +949,7 @@ class _PeerListRow extends StatelessWidget {
   final bool shaded;
   final bool compact;
   final String? copiedKey;
+  final bool busy;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -950,6 +1030,12 @@ class _PeerListRow extends StatelessWidget {
   }
 
   Widget _actionsMenu(String ipKey, String pingKey) {
+    if (busy) {
+      return SizedBox.square(
+        dimension: compact ? 36 : 40,
+        child: const Center(child: _TinySpinner()),
+      );
+    }
     return SizedBox.square(
       dimension: compact ? 36 : 40,
       child: PopupMenuButton<String>(
@@ -1020,6 +1106,18 @@ class _LatencyText extends StatelessWidget {
         color: AppTokens.colorTextSecondary,
         fontFeatures: AppTokens.tabularFontFeatures,
       ),
+    );
+  }
+}
+
+class _TinySpinner extends StatelessWidget {
+  const _TinySpinner();
+
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox.square(
+      dimension: 16,
+      child: CircularProgressIndicator(strokeWidth: 2),
     );
   }
 }
