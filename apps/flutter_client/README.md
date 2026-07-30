@@ -213,10 +213,14 @@ GitHub Actions:
 - `.github/workflows/flutter-client.yml` runs analyze/test plus Android, Linux,
   macOS, and Windows release app builds.
 - Android uploads only an arm64 release APK.
-- macOS uploads separate arm64 and x64 release app zips.
-- Linux and Windows upload x64 release bundles.
-- The workflow is intentionally UI-only; it does not package or control the Rust
-  daemon.
+- `.github/workflows/release.yml` is the publish workflow for tag releases.
+- Release publishes Android arm64 APK, unsigned iOS arm64 IPA, macOS arm64/x64
+  DMGs, Windows x64/arm64 setup installers, Linux x64/arm64 Flutter bundles,
+  and Linux x64/arm64 CLI/daemon tarballs.
+- Release builds use `--split-debug-info` to keep Dart symbols out of the
+  downloadable app packages.
+- The Flutter client workflow is intentionally UI-only; the tag release workflow
+  publishes Linux CLI/daemon tarballs separately.
 
 ## P1/P1.5 Acceptance Checklist
 
