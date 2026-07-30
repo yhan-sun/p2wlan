@@ -45,7 +45,7 @@ jobs:
         run: flutter test
 
   android:
-    name: Android Debug APK
+    name: Android arm64 Release APK
     runs-on: ubuntu-latest
     needs: analyze-test
     steps:
@@ -66,17 +66,17 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Build debug APK
-        run: flutter build apk --debug
+      - name: Build arm64 release APK
+        run: flutter build apk --release --target-platform android-arm64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-flutter-android-debug-apk
-          path: apps/flutter_client/build/app/outputs/flutter-apk/app-debug.apk
+          name: p2wlan-flutter-android-arm64-release-apk
+          path: apps/flutter_client/build/app/outputs/flutter-apk/app-release.apk
 
   linux:
-    name: Linux Debug Bundle
+    name: Linux x64 Release Bundle
     runs-on: ubuntu-22.04
     needs: analyze-test
     steps:
@@ -105,20 +105,20 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Build Linux debug bundle
-        run: flutter build linux --debug
+      - name: Build Linux release bundle
+        run: flutter build linux --release
 
       - name: Pack Linux bundle
-        run: tar -C build/linux/x64/debug/bundle -czf build/p2wlan-flutter-linux-debug.tar.gz .
+        run: tar -C build/linux/x64/release/bundle -czf build/p2wlan-flutter-linux-x64-release.tar.gz .
 
       - name: Upload Linux bundle
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-flutter-linux-debug
-          path: apps/flutter_client/build/p2wlan-flutter-linux-debug.tar.gz
+          name: p2wlan-flutter-linux-x64-release
+          path: apps/flutter_client/build/p2wlan-flutter-linux-x64-release.tar.gz
 
   macos:
-    name: macOS Debug App
+    name: macOS Release Apps
     runs-on: macos-14
     needs: analyze-test
     steps:
@@ -136,20 +136,43 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Build macOS debug app
-        run: flutter build macos --debug
+      - name: Build macOS release app
+        run: flutter build macos --release
 
-      - name: Pack macOS app
-        run: ditto -c -k --keepParent "build/macos/Build/Products/Debug/P2WLAN Diagnostics.app" build/p2wlan-flutter-macos-debug.app.zip
+      - name: Pack macOS apps by architecture
+        run: |
+          set -euo pipefail
+          src="build/macos/Build/Products/Release/P2WLAN Diagnostics.app"
+          for arch in arm64 x86_64; do
+            if [ "$arch" = "x86_64" ]; then
+              label="x64"
+            else
+              label="$arch"
+            fi
+            dst_dir="build/macos/Build/Products/Release/$label"
+            dst="$dst_dir/P2WLAN Diagnostics.app"
+            rm -rf "$dst_dir"
+            mkdir -p "$dst_dir"
+            cp -R "$src" "$dst"
+            for binary in \
+              "$dst/Contents/MacOS/P2WLAN Diagnostics" \
+              "$dst/Contents/Frameworks/App.framework/Versions/A/App" \
+              "$dst/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
+              lipo "$binary" -thin "$arch" -output "$binary.thin"
+              mv "$binary.thin" "$binary"
+            done
+            codesign --force --deep --sign - "$dst"
+            ditto -c -k --keepParent "$dst" "build/p2wlan-flutter-macos-$label-release.app.zip"
+          done
 
-      - name: Upload macOS app
+      - name: Upload macOS apps
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-flutter-macos-debug
-          path: apps/flutter_client/build/p2wlan-flutter-macos-debug.app.zip
+          name: p2wlan-flutter-macos-release
+          path: apps/flutter_client/build/p2wlan-flutter-macos-*-release.app.zip
 
   windows:
-    name: Windows Debug Bundle
+    name: Windows x64 Release Bundle
     runs-on: windows-latest
     needs: analyze-test
     steps:
@@ -167,15 +190,15 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Build Windows debug bundle
-        run: flutter build windows --debug
+      - name: Build Windows release bundle
+        run: flutter build windows --release
 
       - name: Pack Windows bundle
         shell: pwsh
-        run: Compress-Archive -Path build/windows/x64/runner/Debug/* -DestinationPath build/p2wlan-flutter-windows-debug.zip -Force
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath build/p2wlan-flutter-windows-x64-release.zip -Force
 
       - name: Upload Windows bundle
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-flutter-windows-debug
-          path: apps/flutter_client/build/p2wlan-flutter-windows-debug.zip
+          name: p2wlan-flutter-windows-x64-release
+          path: apps/flutter_client/build/p2wlan-flutter-windows-x64-release.zip
