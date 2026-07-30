@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../app/app_motion.dart';
+import '../app/app_theme.dart';
+import '../app/app_tokens.dart';
 import '../core/api/daemon_api.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
@@ -61,48 +64,44 @@ class _P2WlanAppState extends State<P2WlanApp> {
     return MaterialApp(
       title: p2wlanAppName,
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF176B87),
-          brightness: Brightness.light,
-        ),
-        visualDensity: VisualDensity.standard,
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFF6F8FA),
-          foregroundColor: Color(0xFF0F172A),
-          surfaceTintColor: Colors.transparent,
-        ),
-        inputDecorationTheme: const InputDecorationTheme(
-          filled: true,
-          fillColor: Colors.white,
-          border: OutlineInputBorder(),
-        ),
-        snackBarTheme: const SnackBarThemeData(
-          behavior: SnackBarBehavior.floating,
-        ),
-        scaffoldBackgroundColor: const Color(0xFFF6F8FA),
+      theme: AppTheme.lightTheme,
+      home: Builder(
+        builder: (context) {
+          final duration = AppMotion.duration(
+            context,
+            AppTokens.durationMedium,
+          );
+          return AnimatedSwitcher(
+            duration: duration,
+            switchInCurve: AppTokens.curveEase,
+            switchOutCurve: AppTokens.curveEase,
+            child: _ready
+                ? P2WlanShell(
+                    key: const ValueKey('app-shell'),
+                    settingsStore: _settingsStore,
+                    statusStore: _statusStore,
+                  )
+                : const _BootScreen(key: ValueKey('boot-screen')),
+          );
+        },
       ),
-      home: _ready
-          ? P2WlanShell(
-              settingsStore: _settingsStore,
-              statusStore: _statusStore,
-            )
-          : const _BootScreen(),
     );
   }
 }
 
 class _BootScreen extends StatelessWidget {
-  const _BootScreen();
+  const _BootScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
     return const Scaffold(
       body: Center(
         child: SizedBox.square(
-          dimension: 32,
-          child: CircularProgressIndicator(strokeWidth: 2),
+          dimension: 24,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            valueColor: AlwaysStoppedAnimation<Color>(AppTokens.colorTextMuted),
+          ),
         ),
       ),
     );

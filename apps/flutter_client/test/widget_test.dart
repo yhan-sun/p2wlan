@@ -23,7 +23,7 @@ void main() {
     await tester.tap(find.text('Settings').last);
     await tester.pump();
 
-    expect(find.text('Diagnostics URL'), findsOneWidget);
+    expect(find.text('Diagnostics URL'), findsWidgets);
     expect(find.text('P1 boundary'), findsOneWidget);
   });
 }

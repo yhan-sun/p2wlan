@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
+
 class PageScaffold extends StatelessWidget {
   const PageScaffold({
     super.key,
@@ -17,39 +19,43 @@ class PageScaffold extends StatelessWidget {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final horizontalPadding = constraints.maxWidth < 640 ? 14.0 : 24.0;
-          final titleStyle = constraints.maxWidth < 420
-              ? Theme.of(context).textTheme.titleLarge
-              : Theme.of(context).textTheme.headlineSmall;
+          final isNarrow = constraints.maxWidth < 640;
+          final horizontalPadding = isNarrow ? 14.0 : 24.0;
+          final verticalPadding = isNarrow ? 16.0 : 24.0;
 
           return ListView(
             padding: EdgeInsets.fromLTRB(
               horizontalPadding,
-              18,
+              verticalPadding,
               horizontalPadding,
-              28,
+              verticalPadding + 8,
             ),
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1120),
+                  constraints: const BoxConstraints(maxWidth: 1040),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
                         title,
-                        style: titleStyle?.copyWith(
-                          fontWeight: FontWeight.w800,
+                        style: TextStyle(
+                          fontSize: isNarrow ? 20 : 22,
+                          fontWeight: FontWeight.w700,
+                          color: AppTokens.colorTextPrimary,
+                          letterSpacing: -0.3,
                         ),
                       ),
-                      const SizedBox(height: 4),
+                      const SizedBox(height: 3),
                       Text(
                         subtitle,
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                          color: AppTokens.colorTextSecondary,
                         ),
                       ),
-                      const SizedBox(height: 18),
+                      const SizedBox(height: 16),
                       ...children,
                     ],
                   ),

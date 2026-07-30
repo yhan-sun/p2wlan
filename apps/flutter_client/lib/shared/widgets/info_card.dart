@@ -1,43 +1,55 @@
 import 'package:flutter/material.dart';
 
-class InfoCard extends StatelessWidget {
-  const InfoCard({
+import '../../app/app_tokens.dart';
+
+/// Clean native surface panel (replaces generic bloated Cards).
+class AppPanel extends StatelessWidget {
+  const AppPanel({
     super.key,
     required this.title,
     required this.child,
     this.trailing,
+    this.headerPadding = const EdgeInsets.fromLTRB(16, 16, 16, 0),
+    this.contentPadding = const EdgeInsets.all(16),
+    this.flushContent = false,
   });
 
   final String title;
   final Widget child;
   final Widget? trailing;
+  final EdgeInsetsGeometry headerPadding;
+  final EdgeInsetsGeometry contentPadding;
+  final bool flushContent;
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      color: Theme.of(context).colorScheme.surface,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+    final effectiveContentPadding = flushContent
+        ? EdgeInsets.zero
+        : contentPadding;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: AppTokens.colorSurface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        border: Border.all(color: AppTokens.colorBorder),
       ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _InfoCardHeader(title: title, trailing: trailing),
-            const SizedBox(height: 12),
-            child,
-          ],
-        ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: headerPadding,
+            child: _PanelHeader(title: title, trailing: trailing),
+          ),
+          const SizedBox(height: 12),
+          Padding(padding: effectiveContentPadding, child: child),
+        ],
       ),
     );
   }
 }
 
-class _InfoCardHeader extends StatelessWidget {
-  const _InfoCardHeader({required this.title, required this.trailing});
+class _PanelHeader extends StatelessWidget {
+  const _PanelHeader({required this.title, required this.trailing});
 
   final String title;
   final Widget? trailing;
@@ -48,10 +60,14 @@ class _InfoCardHeader extends StatelessWidget {
       title,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: Theme.of(
-        context,
-      ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+      style: const TextStyle(
+        fontSize: 14,
+        fontWeight: FontWeight.w700,
+        color: AppTokens.colorTextPrimary,
+        letterSpacing: -0.1,
+      ),
     );
+
     final trailingWidget = trailing;
     if (trailingWidget == null) return titleWidget;
 
@@ -68,6 +84,7 @@ class _InfoCardHeader extends StatelessWidget {
           );
         }
         return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Expanded(child: titleWidget),
             const SizedBox(width: 12),
@@ -79,24 +96,48 @@ class _InfoCardHeader extends StatelessWidget {
   }
 }
 
+/// Backwards compatible alias for InfoCard using AppPanel.
+class InfoCard extends StatelessWidget {
+  const InfoCard({
+    super.key,
+    required this.title,
+    required this.child,
+    this.trailing,
+  });
+
+  final String title;
+  final Widget child;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return AppPanel(title: title, trailing: trailing, child: child);
+  }
+}
+
+/// Compact metric row/tile with tabular numbers to prevent jumpiness on refresh.
 class MetricTile extends StatelessWidget {
   const MetricTile({
     super.key,
     required this.label,
     required this.value,
     this.detail,
+    this.minWidth = 140,
+    this.maxWidth = 300,
   });
 
   final String label;
   final String value;
   final String? detail;
+  final double minWidth;
+  final double maxWidth;
 
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(minWidth: 156, maxWidth: 320),
+      constraints: BoxConstraints(minWidth: minWidth, maxWidth: maxWidth),
       child: Padding(
-        padding: const EdgeInsets.only(right: 16, bottom: 16),
+        padding: const EdgeInsets.only(right: 16, bottom: 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
@@ -105,26 +146,34 @@ class MetricTile extends StatelessWidget {
               label,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: AppTokens.colorTextMuted,
               ),
             ),
-            const SizedBox(height: 5),
+            const SizedBox(height: 3),
             SelectableText(
               value,
               maxLines: 2,
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: AppTokens.colorTextPrimary,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
             ),
             if (detail != null) ...[
-              const SizedBox(height: 4),
+              const SizedBox(height: 2),
               Text(
                 detail!,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w400,
+                  color: AppTokens.colorTextMuted,
+                  fontFeatures: AppTokens.tabularFontFeatures,
                 ),
               ),
             ],
