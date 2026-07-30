@@ -99,14 +99,24 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Enable Linux desktop
         run: flutter config --enable-linux-desktop
 
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Build Linux daemon
+        working-directory: .
+        run: cargo build -p p2wlan-daemon --release
+
       - name: Build Linux release bundle
         run: flutter build linux --release
+
+      - name: Bundle Linux daemon
+        run: install -m 0755 ../../target/release/p2wlan-daemon build/linux/x64/release/bundle/p2wlan-daemon
 
       - name: Pack Linux bundle
         run: tar -C build/linux/x64/release/bundle -czf build/p2wlan-flutter-linux-x64-release.tar.gz .
@@ -184,14 +194,25 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Enable Windows desktop
         run: flutter config --enable-windows-desktop
 
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Build Windows daemon
+        working-directory: .
+        run: cargo build -p p2wlan-daemon --release
+
       - name: Build Windows release bundle
         run: flutter build windows --release
+
+      - name: Bundle Windows daemon
+        shell: pwsh
+        run: Copy-Item ..\..\target\release\p2wlan-daemon.exe build\windows\x64\runner\Release\p2wlan-daemon.exe -Force
 
       - name: Pack Windows bundle
         shell: pwsh

@@ -1,6 +1,8 @@
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
@@ -27,6 +29,11 @@ void main() {
   testWidgets('switches the shell language to simplified Chinese', (
     tester,
   ) async {
+    tester.view.physicalSize = const Size(800, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
     await _pumpTestApp(tester);
 
     await tester.tap(find.text('Settings').last);
@@ -49,6 +56,10 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir!.path}/settings.json'),
   );
+  await tester.runAsync(() async {
+    await settingsStore.load();
+    await settingsStore.updateSettings(const AppSettings(manualMode: true));
+  });
   addTearDown(() {
     if (tempDir.existsSync()) {
       tempDir.deleteSync(recursive: true);
@@ -65,8 +76,14 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
 }
 
 Future<void> _waitForBootstrap(WidgetTester tester) async {
-  await tester.runAsync(() async {
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-  });
-  await tester.pump();
+  for (var attempt = 0; attempt < 20; attempt += 1) {
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    await tester.pump();
+    if (find.text('P2WLAN').evaluate().isNotEmpty ||
+        find.text('Sign in to start the local TUN').evaluate().isNotEmpty) {
+      return;
+    }
+  }
 }

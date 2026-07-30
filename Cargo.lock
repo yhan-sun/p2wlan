@@ -2940,6 +2940,7 @@ dependencies = [
 name = "p2wlan-tray"
 version = "0.1.66"
 dependencies = [
+ "arboard",
  "p2wlan-desktop-host",
  "reqwest 0.12.28",
  "serde_json",

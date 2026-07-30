@@ -107,6 +107,27 @@ void main() {
       _expectedTrayIconAsset('assets/tray_icon_macos_attention.png'),
     );
   });
+
+  test('desktop tray close action follows close behavior setting', () async {
+    final stores = await _makeStores(api: DiagnosticsApi());
+    addTearDown(stores.dispose);
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    expect(controller.closeActionForTesting(), 'hide');
+
+    await stores.settingsStore.updateSettings(
+      stores.settingsStore.settings.copyWith(
+        manualMode: true,
+        closeBehavior: 'stop-and-quit',
+      ),
+    );
+
+    expect(controller.closeActionForTesting(), 'quit');
+  });
 }
 
 String _expectedTrayIconAsset(String macosAsset) {
