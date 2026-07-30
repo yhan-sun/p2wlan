@@ -92,17 +92,44 @@ class ControlApi {
     return body['device_name']?.toString() ?? name;
   }
 
+  Future<void> deleteDevice({
+    required String controlServer,
+    required String authToken,
+    required String deviceId,
+  }) async {
+    final id = deviceId.trim();
+    if (id.isEmpty) {
+      throw const ControlApiException('设备标识不能为空');
+    }
+    if (authToken.trim().isEmpty) {
+      throw const ControlApiException('登录状态已失效，请重新登录');
+    }
+    final normalizedControlServer = _normalizeAuthControlServer(controlServer);
+    final endpoint = Uri.parse(
+      '$normalizedControlServer/api/v1/devices/${Uri.encodeComponent(id)}',
+    );
+    final body = await _sendJson(
+      method: 'DELETE',
+      uri: endpoint,
+      authToken: authToken,
+    );
+    if (body['success'] == false) {
+      throw ControlApiException(
+        _zhAuthError(body['error']?.toString() ?? '设备删除失败'),
+      );
+    }
+  }
+
   Future<Map<String, dynamic>> _sendJson({
     required String method,
     required Uri uri,
-    required Map<String, dynamic> payload,
+    Map<String, dynamic>? payload,
     String? authToken,
   }) async {
     try {
       final request = await _client
           .openUrl(method, uri)
           .timeout(const Duration(seconds: 8));
-      request.headers.contentType = ContentType.json;
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (authToken != null && authToken.trim().isNotEmpty) {
         request.headers.set(
@@ -110,7 +137,10 @@ class ControlApi {
           'Bearer ${authToken.trim()}',
         );
       }
-      request.write(jsonEncode(payload));
+      if (payload != null) {
+        request.headers.contentType = ContentType.json;
+        request.write(jsonEncode(payload));
+      }
       final response = await request.close().timeout(
         const Duration(seconds: 8),
       );

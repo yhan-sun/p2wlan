@@ -88,11 +88,11 @@ func main() {
 	mux.HandleFunc("GET /api/v1/tunnels", anyAuth(apiServer.ListTunnels))
 	mux.HandleFunc("DELETE /api/v1/tunnels/{id}", anyAuth(apiServer.DeleteTunnel))
 	mux.HandleFunc("PATCH /api/v1/devices/{id}", anyAuth(apiServer.UpdateDevice))
+	mux.HandleFunc("DELETE /api/v1/devices/{id}", anyAuth(apiServer.DeleteDevice))
 
 	// Device-only routes (device credential required)
 	deviceAuth := auth.RequireDeviceAuth(db)
 	mux.HandleFunc("DELETE /api/v1/devices/credential", deviceAuth(apiServer.RevokeCurrentDeviceCredential))
-	mux.HandleFunc("DELETE /api/v1/devices/{id}", deviceAuth(apiServer.DeleteDevice))
 
 	// Relay ticket endpoint (device-credential-only, rate limited)
 	mux.HandleFunc("POST /api/v1/relay/tickets", deviceAuth(rateLimit(apiServer.CreateRelayTicket, 5, time.Minute)))

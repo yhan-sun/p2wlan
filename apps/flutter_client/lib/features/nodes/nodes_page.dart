@@ -43,7 +43,9 @@ class _NodesPageState extends State<NodesPage> {
       animation: Listenable.merge([widget.statusStore, widget.settingsStore]),
       builder: (context, _) {
         final snapshot = widget.statusStore.snapshot;
-        final peers = snapshot?.peers ?? const <PeerSnapshot>[];
+        final peers = _dedupeAndSortPeers(
+          snapshot?.peers ?? const <PeerSnapshot>[],
+        );
         final settings = widget.settingsStore.settings;
         return PageScaffold(
           title: strings.nodes,
@@ -55,7 +57,7 @@ class _NodesPageState extends State<NodesPage> {
               onEdit: () => _editLocalNode(snapshot),
             ),
             const SizedBox(height: 14),
-            _PeerSummary(snapshot: snapshot, peerCount: peers.length),
+            _PeerSummary(peers: peers),
             const SizedBox(height: 14),
             if (peers.isEmpty)
               AppPanel(
@@ -73,7 +75,9 @@ class _NodesPageState extends State<NodesPage> {
                 peers: peers,
                 copiedKey: _copiedKey,
                 onCopy: _copy,
+                onDetails: _showPeerDetails,
                 onEdit: _editPeer,
+                onDelete: _deletePeer,
               ),
           ],
         );
@@ -177,6 +181,109 @@ class _NodesPageState extends State<NodesPage> {
         context,
       ).showSnackBar(SnackBar(content: Text(error.toString())));
     }
+  }
+
+  Future<void> _deletePeer(PeerSnapshot peer) async {
+    final strings = AppStringsScope.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(strings.isZh ? '移除设备' : 'Remove device'),
+        content: Text(
+          strings.isZh
+              ? '确定要从控制面移除 ${peer.displayName} (${dash(peer.virtualIp)}) 吗？移除后该设备需要重新登录/注册才能加入。'
+              : 'Remove ${peer.displayName} (${dash(peer.virtualIp)}) from the control plane? It must sign in/register again to rejoin.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(strings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(strings.isZh ? '移除' : 'Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    final settings = widget.settingsStore.settings;
+    try {
+      await _controlApi.deleteDevice(
+        controlServer: settings.controlServer,
+        authToken: settings.authToken,
+        deviceId: peer.nodeId,
+      );
+      await widget.statusStore.refresh();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            strings.isZh
+                ? '设备已移除：${peer.displayName}'
+                : 'Device removed: ${peer.displayName}',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  Future<void> _showPeerDetails(PeerSnapshot peer) async {
+    final strings = AppStringsScope.of(context);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(peer.displayName),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _DetailLine(
+                label: strings.virtualIp,
+                value: dash(peer.virtualIp),
+              ),
+              _DetailLine(label: strings.nodeId, value: peer.nodeId),
+              _DetailLine(
+                label: strings.connectionType,
+                value: _connectionLabel(strings, peer),
+              ),
+              _DetailLine(
+                label: strings.latency,
+                value: formatLatency(peer.latencyMs),
+              ),
+              _DetailLine(
+                label: strings.isZh ? '在线状态' : 'Online state',
+                value: peer.online ? strings.online : strings.offline,
+              ),
+              _DetailLine(
+                label: strings.isZh ? '最后在线' : 'Last seen',
+                value: _formatLastSeen(peer),
+              ),
+              _DetailLine(label: strings.state, value: dash(peer.state)),
+              _DetailLine(
+                label: strings.type,
+                value: dash(peer.connectionType),
+              ),
+              _DetailLine(label: strings.endpoint, value: dash(peer.endpoint)),
+              _DetailLine(label: strings.relay, value: dash(peer.relayServer)),
+              if (peer.lastError != null)
+                _DetailLine(label: strings.lastError, value: peer.lastError!),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: Text(strings.cancel),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<String?> _promptDeviceName({
@@ -351,30 +458,24 @@ class _LocalNodePanel extends StatelessWidget {
 }
 
 class _PeerSummary extends StatelessWidget {
-  const _PeerSummary({required this.snapshot, required this.peerCount});
+  const _PeerSummary({required this.peers});
 
-  final DiagnosticsSnapshot? snapshot;
-  final int peerCount;
+  final List<PeerSnapshot> peers;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final stats = snapshot?.stats;
+    final directCount = peers.where((peer) => peer.path == 'direct').length;
+    final relayCount = peers.where((peer) => peer.path == 'relay').length;
     return AppPanel(
       title: strings.peerSummary,
       child: Wrap(
         spacing: 24,
         runSpacing: 4,
         children: [
-          MetricTile(label: strings.peerCount, value: formatInt(peerCount)),
-          MetricTile(
-            label: strings.directPaths,
-            value: stats == null ? '—' : formatInt(stats.directConnections),
-          ),
-          MetricTile(
-            label: strings.relayPaths,
-            value: stats == null ? '—' : formatInt(stats.relayConnections),
-          ),
+          MetricTile(label: strings.peerCount, value: formatInt(peers.length)),
+          MetricTile(label: strings.directPaths, value: formatInt(directCount)),
+          MetricTile(label: strings.relayPaths, value: formatInt(relayCount)),
         ],
       ),
     );
@@ -386,13 +487,17 @@ class _PeerTable extends StatelessWidget {
     required this.peers,
     required this.copiedKey,
     required this.onCopy,
+    required this.onDetails,
     required this.onEdit,
+    required this.onDelete,
   });
 
   final List<PeerSnapshot> peers;
   final String? copiedKey;
   final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
+  final Future<void> Function(PeerSnapshot peer) onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -680,13 +785,17 @@ class _PeerList extends StatelessWidget {
     required this.peers,
     required this.copiedKey,
     required this.onCopy,
+    required this.onDetails,
     required this.onEdit,
+    required this.onDelete,
   });
 
   final List<PeerSnapshot> peers;
   final String? copiedKey;
   final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
+  final Future<void> Function(PeerSnapshot peer) onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -716,7 +825,9 @@ class _PeerList extends StatelessWidget {
                 shaded: index.isOdd,
                 copiedKey: copiedKey,
                 onCopy: onCopy,
+                onDetails: onDetails,
                 onEdit: onEdit,
+                onDelete: onDelete,
               );
             },
           ),
@@ -725,7 +836,7 @@ class _PeerList extends StatelessWidget {
     );
   }
 
-  static const _rowHeight = 76.0;
+  static const _rowHeight = 68.0;
   static const _maxBodyHeight = 456.0;
 }
 
@@ -736,7 +847,9 @@ class _PeerListRow extends StatelessWidget {
     required this.shaded,
     required this.copiedKey,
     required this.onCopy,
+    required this.onDetails,
     required this.onEdit,
+    required this.onDelete,
   });
 
   final PeerSnapshot peer;
@@ -744,95 +857,141 @@ class _PeerListRow extends StatelessWidget {
   final bool shaded;
   final String? copiedKey;
   final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
+  final Future<void> Function(PeerSnapshot peer) onDelete;
 
   @override
   Widget build(BuildContext context) {
-    final route = _routeLabel(strings, peer);
-    final endpoint = dash(peer.endpoint ?? peer.relayServer);
-    final detail =
-        '${dash(peer.state)} / ${dash(peer.connectionType)} / $route';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14),
-      decoration: BoxDecoration(
-        color: shaded ? AppTokens.colorSurfaceSubtle : AppTokens.colorSurface,
-        border: const Border(
-          bottom: BorderSide(color: AppTokens.colorBorderSubtle),
-        ),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  dash(peer.displayName),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w700,
-                    color: AppTokens.colorTextPrimary,
-                  ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  '${shortId(peer.nodeId)} / ${dash(peer.virtualIp)}',
+    final ipKey = '${peer.nodeId}:ip';
+    final pingKey = '${peer.nodeId}:ping';
+    return Material(
+      color: shaded ? AppTokens.colorSurfaceSubtle : AppTokens.colorSurface,
+      child: InkWell(
+        onTap: () => onDetails(peer),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: const BoxDecoration(
+            border: Border(
+              bottom: BorderSide(color: AppTokens.colorBorderSubtle),
+            ),
+          ),
+          child: Row(
+            children: [
+              Expanded(flex: 3, child: _PeerPrimaryText(peer: peer)),
+              const SizedBox(width: 12),
+              SizedBox(
+                width: 92,
+                child: Text(
+                  formatLatency(peer.latencyMs),
+                  textAlign: TextAlign.right,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     fontSize: 12,
-                    fontWeight: FontWeight.w500,
+                    fontWeight: FontWeight.w700,
                     color: AppTokens.colorTextSecondary,
                     fontFeatures: AppTokens.tabularFontFeatures,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  endpoint == '—' ? detail : '$detail / $endpoint',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w400,
-                    color: AppTokens.colorTextMuted,
-                    fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+              const SizedBox(width: 12),
+              SizedBox(
+                width: 116,
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: _PathBadge(peer: peer),
+                ),
+              ),
+              const SizedBox(width: 4),
+              PopupMenuButton<String>(
+                tooltip: strings.isZh ? '设备操作' : 'Device actions',
+                onSelected: (value) {
+                  switch (value) {
+                    case 'copy_ip':
+                      onCopy(peer.virtualIp, ipKey);
+                      break;
+                    case 'copy_ping':
+                      onCopy('ping ${peer.virtualIp}', pingKey);
+                      break;
+                    case 'edit':
+                      onEdit(peer);
+                      break;
+                    case 'delete':
+                      onDelete(peer);
+                      break;
+                    case 'details':
+                      onDetails(peer);
+                      break;
+                  }
+                },
+                itemBuilder: (context) => [
+                  PopupMenuItem(
+                    value: 'details',
+                    child: Text(strings.isZh ? '查看详情' : 'View details'),
                   ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              _PathBadge(peer: peer),
-              const SizedBox(height: 5),
-              Text(
-                formatLatency(peer.latencyMs),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: AppTokens.colorTextSecondary,
-                  fontFeatures: AppTokens.tabularFontFeatures,
-                ),
+                  PopupMenuItem(
+                    value: 'copy_ip',
+                    child: Text(strings.isZh ? '复制虚拟 IP' : 'Copy virtual IP'),
+                  ),
+                  PopupMenuItem(
+                    value: 'copy_ping',
+                    child: Text(
+                      strings.isZh ? '复制 ping 命令' : 'Copy ping command',
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'edit',
+                    child: Text(strings.isZh ? '修改名称' : 'Rename'),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text(strings.isZh ? '移除设备' : 'Remove device'),
+                  ),
+                ],
               ),
             ],
           ),
-          const SizedBox(width: 8),
-          _PeerActions(
-            peer: peer,
-            copiedKey: copiedKey,
-            onCopy: onCopy,
-            onEdit: onEdit,
-          ),
-        ],
+        ),
       ),
+    );
+  }
+}
+
+class _PeerPrimaryText extends StatelessWidget {
+  const _PeerPrimaryText({required this.peer});
+
+  final PeerSnapshot peer;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          dash(peer.displayName),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 13.5,
+            fontWeight: FontWeight.w700,
+            color: AppTokens.colorTextPrimary,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          dash(peer.virtualIp),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: AppTokens.colorTextSecondary,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
+      ],
     );
   }
 }
@@ -896,6 +1055,98 @@ class _PeerActions extends StatelessWidget {
 String _routeLabel(AppStrings strings, PeerSnapshot peer) =>
     strings.routeLabel(peer.path, peer.isRelay);
 
+List<PeerSnapshot> _dedupeAndSortPeers(List<PeerSnapshot> peers) {
+  final byKey = <String, PeerSnapshot>{};
+  for (final peer in peers) {
+    final key = _peerDedupeKey(peer);
+    final known = byKey[key];
+    if (known == null || _comparePeers(peer, known) < 0) {
+      byKey[key] = peer;
+    }
+  }
+  final sorted = byKey.values.toList(growable: false);
+  sorted.sort(_comparePeers);
+  return sorted;
+}
+
+String _peerDedupeKey(PeerSnapshot peer) {
+  final ip = peer.virtualIp.trim();
+  if (ip.isNotEmpty) return 'ip:$ip';
+  return 'node:${peer.nodeId}';
+}
+
+int _comparePeers(PeerSnapshot left, PeerSnapshot right) {
+  if (left.online != right.online) return left.online ? -1 : 1;
+  final recent = right.sortTimestampMs.compareTo(left.sortTimestampMs);
+  if (recent != 0) return recent;
+  return left.displayName.compareTo(right.displayName);
+}
+
+String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
+  if (!peer.online || peer.path == 'offline') return strings.offline;
+  if (peer.path == 'relay') return strings.relay;
+  if (peer.path == 'direct_trial' || peer.path == 'probing') {
+    return strings.probing;
+  }
+  if (peer.path == 'direct') {
+    return switch (peer.connectionType) {
+      'public_udp' => strings.isZh ? '公网直连' : 'Public direct',
+      'lan' => strings.isZh ? '局域网直连' : 'LAN direct',
+      'overlay' => strings.isZh ? 'Overlay 直连' : 'Overlay direct',
+      _ => strings.direct,
+    };
+  }
+  return strings.pathLabel(peer.path);
+}
+
+String _formatLastSeen(PeerSnapshot peer) {
+  final value = peer.lastSeenAt;
+  if (value == null) return '—';
+  final local = value.toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${local.year}-${two(local.month)}-${two(local.day)} ${two(local.hour)}:${two(local.minute)}';
+}
+
+class _DetailLine extends StatelessWidget {
+  const _DetailLine({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 96,
+            child: Text(
+              label,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: AppTokens.colorTextSecondary,
+              ),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: const TextStyle(
+                fontSize: 12,
+                color: AppTokens.colorTextPrimary,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _PathBadge extends StatelessWidget {
   const _PathBadge({required this.peer});
 
@@ -909,7 +1160,7 @@ class _PathBadge extends StatelessWidget {
       _ => StatusTone.neutral,
     };
     return StatusBadge(
-      label: AppStringsScope.of(context).pathLabel(peer.path),
+      label: _connectionLabel(AppStringsScope.of(context), peer),
       tone: tone,
     );
   }

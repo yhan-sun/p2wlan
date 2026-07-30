@@ -679,15 +679,20 @@ func (s *Server) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 
 // DeleteDevice handles DELETE /api/v1/devices/{id}.
 func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
-	deviceClaims, err := auth.GetDeviceClaims(r.Context())
-	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+	pathDeviceID := strings.TrimSpace(r.PathValue("id"))
+	if pathDeviceID == "" {
+		http.Error(w, `{"error":"missing device id"}`, http.StatusBadRequest)
 		return
 	}
-
-	pathDeviceID := r.PathValue("id")
-	if pathDeviceID != deviceClaims.DeviceID {
-		http.Error(w, `{"error":"device mismatch"}`, http.StatusForbidden)
+	authorized := false
+	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
+		authorized = pathDeviceID == deviceClaims.DeviceID
+	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
+		belongs, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
+		authorized = err == nil && belongs
+	}
+	if !authorized {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
