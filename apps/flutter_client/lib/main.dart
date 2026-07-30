@@ -28,5 +28,6 @@ bool get _enableFlutterTray {
   final value = Platform.environment['P2WLAN_ENABLE_FLUTTER_TRAY']
       ?.trim()
       .toLowerCase();
-  return value == '1' || value == 'true' || value == 'yes';
+  if (value == null || value.isEmpty) return true;
+  return value != '0' && value != 'false' && value != 'no';
 }

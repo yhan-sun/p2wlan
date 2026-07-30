@@ -43,6 +43,7 @@ class StatusStore extends ChangeNotifier {
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
   bool get healthReachable => _healthReachable;
+  bool get daemonReachable => _healthReachable || _snapshot != null;
   bool get online => _healthReachable && _snapshot != null;
   bool get statusReachable => _snapshot != null;
   bool get refreshing => _refreshing;
