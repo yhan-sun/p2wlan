@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
@@ -463,7 +461,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final mtu = int.tryParse(_mtuController.text.trim()) ?? defaultMtu;
       final deviceName = _deviceNameController.text.trim().isEmpty
-          ? Platform.localHostname
+          ? await resolveDefaultDeviceName()
           : _deviceNameController.text.trim();
       await widget.settingsStore.updateConnectionSettings(
         diagnosticsUrl: _diagnosticsUrlController.text,

@@ -30,14 +30,17 @@ class SettingsStore extends ChangeNotifier {
         final raw = await sourceFile.readAsString();
         final decoded = jsonDecode(raw);
         if (decoded is Map<String, dynamic>) {
-          _settings = AppSettings.fromJson(decoded);
-          _settings = _migrateSettings(_settings);
-          if (sourceFile.path != file.path) {
+          final loadedSettings = AppSettings.fromJson(decoded);
+          _settings = await _migrateSettings(loadedSettings);
+          final migrated =
+              jsonEncode(loadedSettings.toJson()) !=
+              jsonEncode(_settings.toJson());
+          if (sourceFile.path != file.path || migrated) {
             await _writeSettingsFile(file);
           }
         }
       } else {
-        _settings = _migrateSettings(_settings);
+        _settings = await _migrateSettings(_settings);
       }
       _lastError = null;
     } catch (error) {
@@ -78,12 +81,15 @@ class SettingsStore extends ChangeNotifier {
         ? defaultNetworkId
         : networkId.trim();
     final normalizedSocketPool = normalizeSocketPool(socketPool);
+    final normalizedDeviceName = deviceName.trim().isEmpty
+        ? await resolveDefaultDeviceName()
+        : deviceName.trim();
     final nextSettings = _settings.copyWith(
       diagnosticsUrl: normalizedDiagnosticsUrl,
       controlServer: normalizedControlServer,
       authToken: authToken.trim(),
       networkId: normalizedNetworkId,
-      deviceName: deviceName.trim(),
+      deviceName: normalizedDeviceName,
       manualMode: manualMode,
       overlayCidr: overlayCidr.trim().isEmpty
           ? defaultOverlayCidr
@@ -106,13 +112,16 @@ class SettingsStore extends ChangeNotifier {
   }
 
   Future<void> updateSettings(AppSettings settings) async {
+    final normalizedDeviceName = settings.deviceName.trim().isEmpty
+        ? await resolveDefaultDeviceName()
+        : settings.deviceName.trim();
     final normalizedSettings = settings.copyWith(
       diagnosticsUrl: normalizeDiagnosticsUrl(settings.diagnosticsUrl),
       controlServer: normalizeControlServer(settings.controlServer),
       networkId: settings.networkId.trim().isEmpty
           ? defaultNetworkId
           : settings.networkId.trim(),
-      deviceName: settings.deviceName.trim(),
+      deviceName: normalizedDeviceName,
       overlayCidr: settings.overlayCidr.trim().isEmpty
           ? defaultOverlayCidr
           : settings.overlayCidr.trim(),
@@ -222,17 +231,72 @@ class SettingsStore extends ChangeNotifier {
   }
 }
 
-AppSettings _migrateSettings(AppSettings settings) {
+Future<AppSettings> _migrateSettings(AppSettings settings) async {
   final controlServer = settings.controlServer.trim();
   final hasAuthToken = settings.authToken.trim().isNotEmpty;
   final legacyLocalControl =
       controlServer == 'http://127.0.0.1:8080' ||
       controlServer == 'http://localhost:8080';
+  final currentDeviceName = settings.deviceName.trim();
+  var migrated = settings;
   if (!hasAuthToken &&
       (controlServer == legacyControlServer || legacyLocalControl)) {
-    return settings.copyWith(controlServer: defaultControlServer);
+    migrated = migrated.copyWith(controlServer: defaultControlServer);
   }
-  return settings;
+  if (_shouldReplaceDefaultDeviceName(currentDeviceName)) {
+    migrated = migrated.copyWith(deviceName: await resolveDefaultDeviceName());
+  }
+  return migrated;
+}
+
+Future<String> resolveDefaultDeviceName() async {
+  final candidates = <String>[
+    if (Platform.isMacOS) ...await _macosDeviceNameCandidates(),
+    Platform.environment['COMPUTERNAME'] ?? '',
+    Platform.environment['HOSTNAME'] ?? '',
+    Platform.localHostname,
+    'this-device',
+  ];
+  for (final candidate in candidates) {
+    final normalized = _normalizeDeviceNameCandidate(candidate);
+    if (normalized.isNotEmpty && !_looksLikeIpAddress(normalized)) {
+      return normalized;
+    }
+  }
+  return 'this-device';
+}
+
+Future<List<String>> _macosDeviceNameCandidates() async {
+  final values = <String>[];
+  for (final key in const ['ComputerName', 'HostName', 'LocalHostName']) {
+    try {
+      final result = await Process.run('scutil', [
+        '--get',
+        key,
+      ]).timeout(const Duration(milliseconds: 800));
+      if (result.exitCode == 0) values.add(result.stdout.toString());
+    } catch (_) {
+      // Ignore platform command failures and fall back to environment names.
+    }
+  }
+  return values;
+}
+
+String _normalizeDeviceNameCandidate(String value) {
+  return value.trim().split(RegExp(r'\s+')).join(' ');
+}
+
+bool _shouldReplaceDefaultDeviceName(String value) {
+  final normalized = _normalizeDeviceNameCandidate(value);
+  return normalized.isEmpty ||
+      normalized == 'this-device' ||
+      normalized == Platform.localHostname ||
+      _looksLikeIpAddress(normalized);
+}
+
+bool _looksLikeIpAddress(String value) {
+  return InternetAddress.tryParse(value) != null ||
+      RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(value);
 }
 
 String normalizeControlServer(String value) {

@@ -10,6 +10,7 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
+import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 
 void main() {
@@ -158,6 +159,44 @@ void main() {
 
     expect(find.text('Diagnostics URL must use http or https'), findsOneWidget);
     expect(find.text('Diagnostics URL was not saved'), findsOneWidget);
+  });
+
+  testWidgets('Nodes renders local device and readable peer sections', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          authToken: 'token',
+          deviceName: 'studio-mac',
+          manualMode: false,
+        ),
+      ),
+    );
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('This device'), findsOneWidget);
+    expect(find.text('studio-mac'), findsOneWidget);
+    expect(find.text('Device summary'), findsOneWidget);
+    expect(find.text('Other devices'), findsOneWidget);
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('Peer 数'), findsNothing);
   });
 
   testWidgets('Diagnostics renders summary, raw JSON, and copy action', (

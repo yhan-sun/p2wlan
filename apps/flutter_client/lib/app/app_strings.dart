@@ -106,9 +106,9 @@ class AppStrings {
   String get udpLocalAddr => isZh ? 'UDP 本地地址' : 'UDP local addr';
   String get relay => isZh ? '中继' : 'Relay';
   String get relayRegion => isZh ? '中继区域' : 'Relay region';
-  String get peers => isZh ? 'Peer 数' : 'Peers';
-  String get peerPaths => isZh ? 'Peer 路径' : 'Peer paths';
-  String get totalPeers => isZh ? '总 Peer 数' : 'Total peers';
+  String get peers => isZh ? '设备数' : 'Devices';
+  String get peerPaths => isZh ? '设备路径' : 'Device paths';
+  String get totalPeers => isZh ? '总设备数' : 'Total devices';
   String get directPaths => isZh ? '直连路径' : 'Direct paths';
   String get relayPaths => isZh ? '中继路径' : 'Relay paths';
   String get bytesSent => isZh ? '已发送' : 'Bytes sent';
@@ -125,7 +125,7 @@ class AppStrings {
   String get udpSockets => isZh ? 'UDP sockets' : 'UDP sockets';
   String get socketPoolActive => isZh ? 'Socket pool 启用' : 'Socket pool active';
   String get relayConnected => isZh ? '中继连接' : 'Relay connected';
-  String get peerCount => isZh ? 'Peer 数' : 'Peer count';
+  String get peerCount => isZh ? '设备数' : 'Device count';
   String get healthReason => isZh ? '健康原因' : 'Health reason';
   String get rawStatusJson => isZh ? '原始 /status JSON' : 'Raw /status JSON';
   String get showRawJson => isZh ? '显示 JSON' : 'Show JSON';
@@ -138,13 +138,15 @@ class AppStrings {
   String get copiedDiagnosticsJson =>
       isZh ? '诊断 JSON 已复制到剪贴板' : 'Diagnostics JSON copied to clipboard';
 
-  String get nodesSubtitle =>
-      isZh ? '从状态快照读取的peer 列表。' : 'Peer list from the status snapshot.';
-  String get noPeers =>
-      isZh ? '当前快照中没有 peers。' : 'No peers are present in the current snapshot.';
-  String get peerSummary => isZh ? 'Peer 摘要' : 'Peer summary';
+  String get nodesSubtitle => isZh
+      ? '查看本机节点和网络中的其他设备，管理名称、IP 与连接路径。'
+      : 'View this device and other devices in the network, including names, IPs, and paths.';
+  String get noPeers => isZh
+      ? '当前没有发现其他设备。'
+      : 'No other devices are present in the current snapshot.';
+  String get peerSummary => isZh ? '设备概览' : 'Device summary';
   String get device => isZh ? '设备' : 'Device';
-  String get peerId => isZh ? 'Peer ID' : 'Peer ID';
+  String get peerId => isZh ? '节点 ID' : 'Node ID';
   String get state => isZh ? '状态' : 'State';
   String get path => isZh ? '路径' : 'Path';
   String get type => isZh ? '类型' : 'Type';

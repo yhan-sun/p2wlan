@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 
 import '../../app/app_constants.dart';
@@ -236,7 +234,7 @@ class _LoginPageState extends State<LoginPage> {
       );
       final settings = widget.settingsStore.settings;
       final deviceName = settings.deviceName.trim().isEmpty
-          ? Platform.localHostname
+          ? await resolveDefaultDeviceName()
           : settings.deviceName.trim();
       await widget.settingsStore.updateSettings(
         settings.copyWith(
@@ -269,7 +267,7 @@ class _LoginPageState extends State<LoginPage> {
         authToken: '',
         manualMode: true,
         deviceName: settings.deviceName.trim().isEmpty
-            ? Platform.localHostname
+            ? await resolveDefaultDeviceName()
             : settings.deviceName.trim(),
       ),
     );
