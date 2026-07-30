@@ -47,6 +47,9 @@ class _NodesPageState extends State<NodesPage> {
         final peers = _dedupeAndSortPeers(
           snapshot?.peers ?? const <PeerSnapshot>[],
         );
+        final relayFallbackLatencyMs = snapshot?.relayConnected == true
+            ? snapshot?.relaySelection.latencyMs
+            : null;
         final settings = widget.settingsStore.settings;
         return PageScaffold(
           title: strings.nodes,
@@ -77,7 +80,11 @@ class _NodesPageState extends State<NodesPage> {
                 copiedKey: _copiedKey,
                 busyPeerId: _busyPeerId,
                 onCopy: _copy,
-                onDetails: _showPeerDetails,
+                relayFallbackLatencyMs: relayFallbackLatencyMs,
+                onDetails: (peer) => _showPeerDetails(
+                  peer,
+                  relayFallbackLatencyMs: relayFallbackLatencyMs,
+                ),
                 onEdit: _editPeer,
                 onDelete: _deletePeer,
               ),
@@ -235,7 +242,10 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 
-  Future<void> _showPeerDetails(PeerSnapshot peer) async {
+  Future<void> _showPeerDetails(
+    PeerSnapshot peer, {
+    required int? relayFallbackLatencyMs,
+  }) async {
     final strings = AppStringsScope.of(context);
     await showDialog<void>(
       context: context,
@@ -256,7 +266,9 @@ class _NodesPageState extends State<NodesPage> {
               ),
               _DetailLine(
                 label: strings.latency,
-                value: formatLatency(peer.latencyMs),
+                value: formatLatency(
+                  _displayLatencyMs(peer, relayFallbackLatencyMs),
+                ),
               ),
               _DetailLine(
                 label: strings.isZh ? '在线状态' : 'Online state',
@@ -561,6 +573,7 @@ class _PeerTable extends StatelessWidget {
   const _PeerTable({
     required this.peers,
     required this.copiedKey,
+    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -569,6 +582,7 @@ class _PeerTable extends StatelessWidget {
 
   final List<PeerSnapshot> peers;
   final String? copiedKey;
+  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -609,6 +623,7 @@ class _PeerTable extends StatelessWidget {
                         strings: strings,
                         shaded: index.isOdd,
                         copiedKey: copiedKey,
+                        relayFallbackLatencyMs: relayFallbackLatencyMs,
                         onCopy: onCopy,
                         onEdit: onEdit,
                       );
@@ -736,6 +751,7 @@ class _PeerRow extends StatelessWidget {
     required this.strings,
     required this.shaded,
     required this.copiedKey,
+    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onEdit,
   });
@@ -744,6 +760,7 @@ class _PeerRow extends StatelessWidget {
   final AppStrings strings;
   final bool shaded;
   final String? copiedKey;
+  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onEdit;
 
@@ -809,7 +826,7 @@ class _PeerRow extends StatelessWidget {
           _PeerCell(
             width: _PeerTable._latencyWidth,
             child: Text(
-              formatLatency(peer.latencyMs),
+              formatLatency(_displayLatencyMs(peer, relayFallbackLatencyMs)),
               style: _PeerTable._cellMonoStyle,
             ),
           ),
@@ -860,6 +877,7 @@ class _PeerList extends StatelessWidget {
     required this.peers,
     required this.copiedKey,
     required this.busyPeerId,
+    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -869,6 +887,7 @@ class _PeerList extends StatelessWidget {
   final List<PeerSnapshot> peers;
   final String? copiedKey;
   final String? busyPeerId;
+  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -910,6 +929,7 @@ class _PeerList extends StatelessWidget {
                     compact: compact,
                     copiedKey: copiedKey,
                     busy: busyPeerId == peers[index].nodeId,
+                    relayFallbackLatencyMs: relayFallbackLatencyMs,
                     onCopy: onCopy,
                     onDetails: onDetails,
                     onEdit: onEdit,
@@ -938,6 +958,7 @@ class _PeerListRow extends StatelessWidget {
     required this.compact,
     required this.copiedKey,
     required this.busy,
+    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -950,6 +971,7 @@ class _PeerListRow extends StatelessWidget {
   final bool compact;
   final String? copiedKey;
   final bool busy;
+  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -989,7 +1011,10 @@ class _PeerListRow extends StatelessWidget {
                     const SizedBox(height: 6),
                     Row(
                       children: [
-                        _LatencyText(peer: peer),
+                        _LatencyText(
+                          peer: peer,
+                          relayFallbackLatencyMs: relayFallbackLatencyMs,
+                        ),
                         const SizedBox(width: 10),
                         Expanded(
                           child: Align(
@@ -1009,7 +1034,10 @@ class _PeerListRow extends StatelessWidget {
                       width: 92,
                       child: Align(
                         alignment: Alignment.centerRight,
-                        child: _LatencyText(peer: peer),
+                        child: _LatencyText(
+                          peer: peer,
+                          relayFallbackLatencyMs: relayFallbackLatencyMs,
+                        ),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -1089,14 +1117,18 @@ class _PeerListRow extends StatelessWidget {
 }
 
 class _LatencyText extends StatelessWidget {
-  const _LatencyText({required this.peer});
+  const _LatencyText({
+    required this.peer,
+    required this.relayFallbackLatencyMs,
+  });
 
   final PeerSnapshot peer;
+  final int? relayFallbackLatencyMs;
 
   @override
   Widget build(BuildContext context) {
     return Text(
-      formatLatency(peer.latencyMs),
+      formatLatency(_displayLatencyMs(peer, relayFallbackLatencyMs)),
       textAlign: TextAlign.right,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
@@ -1108,6 +1140,13 @@ class _LatencyText extends StatelessWidget {
       ),
     );
   }
+}
+
+int? _displayLatencyMs(PeerSnapshot peer, int? relayFallbackLatencyMs) {
+  final peerLatency = peer.latencyMs;
+  if (peerLatency != null) return peerLatency;
+  if (peer.online && peer.path == 'relay') return relayFallbackLatencyMs;
+  return null;
 }
 
 class _TinySpinner extends StatelessWidget {

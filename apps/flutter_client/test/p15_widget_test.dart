@@ -265,6 +265,55 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('Nodes shows relay latency for online relay peers', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(() async {
+      final raw =
+          jsonDecode(
+                await File(
+                  'test/fixtures/status_connected.json',
+                ).readAsString(),
+              )
+              as Map<String, dynamic>;
+      final relaySelection = raw['relay_selection'] as Map<String, dynamic>;
+      relaySelection['selected_rtt_ewma_ms'] = 25;
+      relaySelection['selected_last_pong_rtt_ms'] = 19;
+      final peers = raw['peers'] as List<dynamic>;
+      final relayPeer = peers.cast<Map<String, dynamic>>().firstWhere(
+        (peer) => peer['node_id'] == 'peer-relay-002',
+      );
+      relayPeer['online'] = true;
+      relayPeer['state'] = 'relay';
+      relayPeer['active_path'] = 'relay';
+      (relayPeer['direct'] as Map<String, dynamic>)['latency_ms'] = null;
+      (relayPeer['direct'] as Map<String, dynamic>)['rtt_ewma_ms'] = null;
+      (relayPeer['relay'] as Map<String, dynamic>)['latency_ms'] = null;
+      (relayPeer['relay'] as Map<String, dynamic>)['rtt_ewma_ms'] = null;
+      return DiagnosticsSnapshot.fromJson(raw);
+    }))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.text('25 ms'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('Tunnels keeps detail rows readable on narrow screens', (
     tester,
   ) async {
