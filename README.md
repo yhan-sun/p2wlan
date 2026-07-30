@@ -78,7 +78,7 @@ P2WLAN 是一个开源、P2P 优先、可自托管的虚拟内网项目。它会
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载最新版客户端。当前 Release 的 Flutter 客户端是只读诊断预览版；真实虚拟网卡仍由本地 daemon / Linux CLI 路径负责，然后可用对端虚拟 IP 测试：
+从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载最新版客户端。当前 Release 的 Flutter 客户端会逐步接管桌面端 daemon 生命周期；Rust p2wlan-daemon 仍负责虚拟网卡、路由和数据面，然后可用对端虚拟 IP 测试：
 
 ```bash
 ping 10.20.0.5
@@ -87,15 +87,15 @@ ssh user@10.20.0.5
 
 ### macOS
 
-Apple Silicon 下载 `p2wlan-flutter-macos-arm64.dmg`，Intel Mac 下载 `p2wlan-flutter-macos-x64.dmg`，拖入 Applications 后打开 `P2WLAN Diagnostics`。
+Apple Silicon 下载 `p2wlan-flutter-macos-arm64.dmg`，Intel Mac 下载 `p2wlan-flutter-macos-x64.dmg`，拖入 Applications 后打开 `P2WLAN`。
 
 Preview 构建可能尚未完成 Apple 公证。如果 Gatekeeper 阻止首次启动，请在 Finder 中右键应用并选择 Open。
 
 ### Windows
 
-普通 Intel / AMD 电脑下载 `p2wlan-flutter-windows-x64-setup.exe`，按安装向导启动 `P2WLAN Diagnostics`。Windows ARM Flutter 安装包暂未打开，等 Flutter stable/action 能稳定解析 ARM64 SDK 后再加。
+普通 Intel / AMD 电脑下载 `p2wlan-flutter-windows-x64-setup.exe`，按安装向导启动 `P2WLAN`。Windows ARM Flutter 安装包暂未打开，等 Flutter stable/action 能稳定解析 ARM64 SDK 后再加。
 
-当前 Flutter 客户端不会启动或停止虚拟网卡；需要真实 TUN/Wintun/utun 时，仍以 daemon / CLI 或后续完整客户端为准。
+Flutter 客户端已接入 Dashboard 和系统托盘的 daemon 启停入口；虚拟网卡、路由和数据面仍由 Rust `p2wlan-daemon` 执行，Windows UAC、Linux 提权和发布包链路仍需完整烟测后再视为默认桌面路径。
 
 ### Linux
 
@@ -202,9 +202,9 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 
 | 平台 | 客户端 | 虚拟网卡 | 当前状态 |
 | --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | Flutter DMG，按 arm64 / x64 拆包 | `utun` 由 daemon 路径提供 | Flutter 诊断预览，TUN 控制迁移中 |
-| Windows 10/11 x64 | Flutter setup 安装包 | Wintun 由 daemon 路径提供 | Flutter 诊断预览；ARM64 安装包待 Flutter SDK/action 支持 |
-| Linux x64 桌面；Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | 桌面诊断预览走 x64 Flutter；服务器和无桌面工作流走 CLI |
+| macOS Apple Silicon / Intel | Flutter DMG，按 arm64 / x64 拆包 | `utun` 由 daemon 路径提供 | Flutter 诊断 + Dashboard/托盘生命周期控制；发布烟测进行中 |
+| Windows 10/11 x64 | Flutter setup 安装包 | Wintun 由 daemon 路径提供 | Flutter 诊断 + Dashboard/托盘入口；UAC/安装包烟测待完成，ARM64 安装包待 Flutter SDK/action 支持 |
+| Linux x64 桌面；Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | 桌面诊断 + 托盘入口；服务器、提权和无桌面工作流继续走 CLI |
 | Android arm64 | Flutter APK | 后续 Android VPN 路径 | Release 仅发布 arm64 |
 | iOS arm64 | unsigned Flutter IPA | 后续 Network Extension 路径 | CI 可产物，需签名后安装 |
 
@@ -274,7 +274,7 @@ git clone https://github.com/yhan-sun/p2wlan.git
 cd p2wlan
 pnpm install --frozen-lockfile
 
-cargo build -p p2pnet-daemon
+cargo build -p p2wlan-daemon
 cargo tauri dev
 
 cd apps/flutter_client

@@ -28,7 +28,7 @@ MAC_DIAG=${MAC_DIAG:-$((ALI_DIAG + 1))}
 TEST_ID="mac-${MODE}-$$"
 REMOTE_RUN="$REMOTE_BASE/$TEST_ID"
 LOCAL_RUN=${LOCAL_RUN:-$(mktemp -d /tmp/p2wlan-mac-${MODE}.XXXXXX)}
-DAEMON_BIN=${DAEMON_BIN:-"$ROOT_DIR/target/debug/p2pnet-daemon"}
+DAEMON_BIN=${DAEMON_BIN:-"$ROOT_DIR/target/debug/p2wlan-daemon"}
 MAC_CONFIG="$LOCAL_RUN/mac.json"
 ALI_CONFIG="$REMOTE_RUN/ali.json"
 ALI_IF=${ALI_IF:-p2wmali}
@@ -101,7 +101,7 @@ require_cmd ping
 
 if [[ ! -x "$DAEMON_BIN" ]]; then
   echo "[mac-smoke] building local daemon..."
-  (cd "$ROOT_DIR" && cargo build -p p2pnet-daemon)
+  (cd "$ROOT_DIR" && cargo build -p p2wlan-daemon)
 fi
 
 if [[ "$MODE" == "tun" && "$(uname -s)" != "Darwin" ]]; then
@@ -144,7 +144,7 @@ if [[ "$MODE" == "notun" ]]; then
   LOCAL_TUN_ENV="P2WLAN_DISABLE_TUN=1"
 fi
 
-remote "cd '$REMOTE_RUN'; env $REMOTE_TUN_ENV RUST_LOG=info nohup '$REMOTE_BASE/p2pnet-daemon' \
+remote "cd '$REMOTE_RUN'; env $REMOTE_TUN_ENV RUST_LOG=info nohup '$REMOTE_BASE/p2wlan-daemon' \
   --config '$ALI_CONFIG' \
   --control 'http://$ALI_HOST:$PORT' \
   --network default \
@@ -173,7 +173,7 @@ MAC_PID=$!
 PASS_DIRECT=0
 for _ in {1..120}; do
   MAC_STATUS=$("$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$MAC_DIAG/status" 2>/dev/null || true)
-  ALI_STATUS=$(remote "'$REMOTE_BASE/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" 2>/dev/null || true)
+  ALI_STATUS=$(remote "'$REMOTE_BASE/p2wlan-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" 2>/dev/null || true)
   if printf '%s' "$MAC_STATUS" | grep -q '"state": "direct"' && \
      printf '%s' "$ALI_STATUS" | grep -q '"state": "direct"'; then
     PASS_DIRECT=1
@@ -221,7 +221,7 @@ if [[ "$MODE" == "tun" ]]; then
     echo "--- mac status after ping ---" >&2
     "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$MAC_DIAG/status" >&2 || true
     echo "--- ali status after ping ---" >&2
-    remote "'$REMOTE_BASE/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
+    remote "'$REMOTE_BASE/p2wlan-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
     exit 1
   fi
   cat "$MAC_PING_LOG"
@@ -232,7 +232,7 @@ if [[ "$MODE" == "tun" ]]; then
     echo "--- mac status after reverse ping ---" >&2
     "$DAEMON_BIN" --status --diagnostics-url "http://127.0.0.1:$MAC_DIAG/status" >&2 || true
     echo "--- ali status after reverse ping ---" >&2
-    remote "'$REMOTE_BASE/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
+    remote "'$REMOTE_BASE/p2wlan-daemon' --status --diagnostics-url http://127.0.0.1:$ALI_DIAG/status" >&2 || true
     exit 1
   fi
   cat "$ALI_PING_LOG"

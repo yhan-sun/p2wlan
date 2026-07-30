@@ -302,7 +302,7 @@ pub fn diagnostics_socket_addr_from_url(value: &str) -> Result<SocketAddr> {
 }
 
 pub fn config_path_from_base(base: impl AsRef<Path>) -> PathBuf {
-    base.as_ref().join("p2wlan").join("p2pnet-config.json")
+    base.as_ref().join("p2wlan").join("p2wlan-config.json")
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -341,11 +341,11 @@ pub fn default_log_dir() -> PathBuf {
 }
 
 pub fn pid_path_from_log_dir(log_dir: impl AsRef<Path>) -> PathBuf {
-    log_dir.as_ref().join("p2pnet-daemon.pid")
+    log_dir.as_ref().join("p2wlan-daemon.pid")
 }
 
 pub fn endpoint_path_from_log_dir(log_dir: impl AsRef<Path>) -> PathBuf {
-    log_dir.as_ref().join("p2pnet-daemon.endpoint")
+    log_dir.as_ref().join("p2wlan-daemon.endpoint")
 }
 
 pub fn recent_daemon_log_lines(path: impl AsRef<Path>, max_lines: usize) -> Result<Vec<String>> {
@@ -588,7 +588,7 @@ mod tests {
             auth_token: Some("token".to_string()),
             network_id: Some("default".to_string()),
             device_name: Some("this-device".to_string()),
-            tun_interface: Some("p2pnet0".to_string()),
+            tun_interface: Some("p2wlan0".to_string()),
             udp_bind: Some("0.0.0.0:0".to_string()),
             udp_advertise: None,
             socket_pool: Some("3".to_string()),
@@ -646,7 +646,7 @@ mod tests {
     fn pure_path_helpers_match_existing_layout() {
         assert_eq!(
             config_path_from_base("/tmp/config"),
-            PathBuf::from("/tmp/config/p2wlan/p2pnet-config.json")
+            PathBuf::from("/tmp/config/p2wlan/p2wlan-config.json")
         );
         assert_eq!(
             macos_log_dir_from_home("/Users/test"),
@@ -662,11 +662,11 @@ mod tests {
         );
         assert_eq!(
             pid_path_from_log_dir("/tmp/logs"),
-            PathBuf::from("/tmp/logs/p2pnet-daemon.pid")
+            PathBuf::from("/tmp/logs/p2wlan-daemon.pid")
         );
         assert_eq!(
             endpoint_path_from_log_dir("/tmp/logs"),
-            PathBuf::from("/tmp/logs/p2pnet-daemon.endpoint")
+            PathBuf::from("/tmp/logs/p2wlan-daemon.endpoint")
         );
     }
 

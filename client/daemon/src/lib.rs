@@ -1,4 +1,4 @@
-//! # p2pnet-daemon
+//! # p2wlan-daemon
 //!
 //! The main client daemon that runs the P2P virtual network.
 //!
@@ -411,7 +411,7 @@ impl Daemon {
 
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
-        info!("P2PNet Daemon v{} starting...", env!("CARGO_PKG_VERSION"));
+        info!("P2WLAN daemon v{} starting...", env!("CARGO_PKG_VERSION"));
         info!("Node ID: {}", self.config.node.node_id);
         info!(
             "Network: {} ({})",

@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
-import '../../core/models/daemon_models.dart';
+import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
@@ -38,12 +40,17 @@ class DashboardPage extends StatelessWidget {
               healthReachable: statusStore.healthReachable,
               statusReachable: statusStore.statusReachable,
               refreshing: statusStore.refreshing,
+              daemonBusy: statusStore.daemonBusy,
               autoRefreshEnabled: statusStore.autoRefreshEnabled,
               error: statusStore.lastError,
               healthError: statusStore.lastHealthError,
               statusError: statusStore.lastStatusError,
+              daemonMessage: statusStore.lastDaemonMessage,
+              daemonManualCommand: statusStore.lastDaemonManualCommand,
               lastFetchedAt: statusStore.lastFetchedAt,
               requestDuration: statusStore.lastRequestDuration,
+              onStartDaemon: statusStore.startDaemon,
+              onStopDaemon: statusStore.stopDaemon,
               onRefresh: statusStore.refresh,
               onAutoRefreshChanged: (value) => statusStore.setAutoRefresh(
                 enabled: value,
@@ -73,28 +80,38 @@ class _ConnectionBanner extends StatelessWidget {
     required this.healthReachable,
     required this.statusReachable,
     required this.refreshing,
+    required this.daemonBusy,
     required this.autoRefreshEnabled,
     required this.error,
     required this.healthError,
     required this.statusError,
+    required this.daemonMessage,
+    required this.daemonManualCommand,
     required this.lastFetchedAt,
     required this.requestDuration,
+    required this.onStartDaemon,
+    required this.onStopDaemon,
     required this.onRefresh,
     required this.onAutoRefreshChanged,
   });
 
   final String url;
-  final DaemonSnapshot? snapshot;
+  final DiagnosticsSnapshot? snapshot;
   final bool online;
   final bool healthReachable;
   final bool statusReachable;
   final bool refreshing;
+  final bool daemonBusy;
   final bool autoRefreshEnabled;
   final String? error;
   final String? healthError;
   final String? statusError;
+  final String? daemonMessage;
+  final String? daemonManualCommand;
   final DateTime? lastFetchedAt;
   final Duration? requestDuration;
+  final Future<void> Function() onStartDaemon;
+  final Future<void> Function() onStopDaemon;
   final Future<void> Function() onRefresh;
   final ValueChanged<bool> onAutoRefreshChanged;
 
@@ -104,7 +121,7 @@ class _ConnectionBanner extends StatelessWidget {
     final overallLabel = _overallLabel(strings);
     final tone = _overallTone();
     return AppPanel(
-      title: strings.localDaemon,
+      title: strings.localDiagnostics,
       trailing: StatusBadge(label: overallLabel, tone: tone),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -114,7 +131,7 @@ class _ConnectionBanner extends StatelessWidget {
             runSpacing: 4,
             children: [
               MetricTile(label: strings.diagnosticsUrl, value: url),
-              MetricTile(label: strings.daemonState, value: overallLabel),
+              MetricTile(label: strings.endpointState, value: overallLabel),
               MetricTile(
                 label: 'GET /health',
                 value: healthReachable ? strings.reachable : strings.offline,
@@ -141,6 +158,11 @@ class _ConnectionBanner extends StatelessWidget {
                   label: strings.lastError,
                   value: strings.statusMessage(error) ?? error!,
                 ),
+              if (daemonMessage != null)
+                MetricTile(
+                  label: strings.lastDaemonAction,
+                  value: strings.statusMessage(daemonMessage) ?? daemonMessage!,
+                ),
             ],
           ),
           const SizedBox(height: 8),
@@ -152,24 +174,39 @@ class _ConnectionBanner extends StatelessWidget {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               FilledButton.icon(
-                key: const Key('dashboard-refresh-button'),
-                onPressed: refreshing ? null : onRefresh,
-                icon: refreshing
+                key: const Key('dashboard-start-button'),
+                onPressed: daemonBusy ? null : () => _handleStart(context),
+                icon: daemonBusy
                     ? const SizedBox.square(
                         dimension: 14,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
                           valueColor: AlwaysStoppedAnimation<Color>(
-                            Colors.white,
+                            AppTokens.colorSurface,
                           ),
                         ),
                       )
-                    : const Icon(Icons.refresh, size: 18),
+                    : const Icon(Icons.play_arrow_rounded, size: 18),
+                label: Text(
+                  daemonBusy ? strings.daemonWorking : strings.startP2wlan,
+                ),
+              ),
+              OutlinedButton.icon(
+                key: const Key('dashboard-stop-button'),
+                onPressed: daemonBusy || !healthReachable ? null : onStopDaemon,
+                icon: const Icon(Icons.stop_rounded, size: 18),
+                label: Text(strings.stopP2wlan),
+              ),
+              OutlinedButton.icon(
+                key: const Key('dashboard-refresh-button'),
+                onPressed: refreshing || daemonBusy ? null : onRefresh,
+                icon: const Icon(Icons.refresh, size: 18),
                 label: Text(
                   refreshing ? strings.refreshing : strings.refreshNow,
                 ),
               ),
               InkWell(
+                mouseCursor: SystemMouseCursors.click,
                 onTap: () => onAutoRefreshChanged(!autoRefreshEnabled),
                 borderRadius: BorderRadius.circular(AppTokens.radiusSm),
                 child: Padding(
@@ -191,7 +228,7 @@ class _ConnectionBanner extends StatelessWidget {
                               key: const Key('auto-refresh-switch'),
                               value: autoRefreshEnabled,
                               onChanged: onAutoRefreshChanged,
-                              activeTrackColor: AppTokens.colorAccent,
+                              activeTrackColor: Theme.of(context).colorScheme.primary,
                               materialTapTargetSize:
                                   MaterialTapTargetSize.shrinkWrap,
                             ),
@@ -203,10 +240,10 @@ class _ConnectionBanner extends StatelessWidget {
                         strings.autoRefresh(
                           StatusStore.defaultAutoRefreshInterval.inSeconds,
                         ),
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
-                          color: AppTokens.colorTextSecondary,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -216,9 +253,40 @@ class _ConnectionBanner extends StatelessWidget {
               ),
             ],
           ),
+          if (daemonManualCommand != null) ...[
+            const SizedBox(height: 14),
+            _ManualDaemonCommand(command: daemonManualCommand!),
+          ],
         ],
       ),
     );
+  }
+
+  Future<void> _handleStart(BuildContext context) async {
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      final strings = AppStringsScope.of(context);
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: Text(strings.macosAuthorizationTitle),
+            content: Text(strings.macosAuthorizationBody),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: Text(strings.cancel),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: Text(strings.continueAction),
+              ),
+            ],
+          );
+        },
+      );
+      if (confirmed != true) return;
+    }
+    await onStartDaemon();
   }
 
   String _overallLabel(AppStrings strings) {
@@ -245,6 +313,78 @@ class _ConnectionBanner extends StatelessWidget {
   }
 }
 
+class _ManualDaemonCommand extends StatelessWidget {
+  const _ManualDaemonCommand({required this.command});
+
+  final String command;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: AppTokens.colorConsoleBg,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        border: Border.all(color: AppTokens.colorConsoleBorder),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    strings.manualLaunchCommand,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: AppTokens.colorConsoleText,
+                    ),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: () => _copy(context, strings),
+                  icon: const Icon(Icons.copy_rounded, size: 16),
+                  label: Text(strings.copyLaunchCommand),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              strings.manualLaunchCommandBody,
+              style: const TextStyle(
+                fontSize: 12,
+                color: AppTokens.colorConsoleText,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 10),
+            SelectableText(
+              command,
+              style: const TextStyle(
+                fontSize: 12,
+                height: 1.35,
+                color: AppTokens.colorConsoleText,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _copy(BuildContext context, AppStrings strings) async {
+    await Clipboard.setData(ClipboardData(text: command));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(strings.copiedLaunchCommand)));
+  }
+}
+
 class _OfflineSummary extends StatelessWidget {
   const _OfflineSummary();
 
@@ -267,7 +407,7 @@ class _OfflineSummary extends StatelessWidget {
 class _StatusGrid extends StatelessWidget {
   const _StatusGrid({required this.snapshot});
 
-  final DaemonSnapshot snapshot;
+  final DiagnosticsSnapshot snapshot;
 
   @override
   Widget build(BuildContext context) {
@@ -276,7 +416,7 @@ class _StatusGrid extends StatelessWidget {
     return AppPanel(
       title: strings.runtimeSnapshot,
       trailing: StatusBadge(
-        label: strings.daemonHealthStatus(snapshot.health.status),
+        label: strings.healthStatusLabel(snapshot.health.status),
         tone: _healthTone(snapshot.health.status),
       ),
       child: Wrap(
@@ -291,8 +431,8 @@ class _StatusGrid extends StatelessWidget {
           MetricTile(label: strings.virtualIp, value: dash(snapshot.virtualIp)),
           MetricTile(label: strings.networkId, value: dash(snapshot.networkId)),
           MetricTile(
-            label: strings.daemonHealth,
-            value: strings.daemonHealthStatus(snapshot.health.status),
+            label: strings.serviceHealth,
+            value: strings.healthStatusLabel(snapshot.health.status),
             detail: snapshot.health.reason,
           ),
           MetricTile(
@@ -332,7 +472,7 @@ class _StatusGrid extends StatelessWidget {
 class _PeerPathSummary extends StatelessWidget {
   const _PeerPathSummary({required this.snapshot});
 
-  final DaemonSnapshot snapshot;
+  final DiagnosticsSnapshot snapshot;
 
   @override
   Widget build(BuildContext context) {

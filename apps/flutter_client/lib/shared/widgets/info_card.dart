@@ -27,11 +27,18 @@ class AppPanel extends StatelessWidget {
         ? EdgeInsets.zero
         : contentPadding;
 
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
     return Container(
       decoration: BoxDecoration(
-        color: AppTokens.colorSurface,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: AppTokens.colorBorder),
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        border: Border.all(
+          color: theme.colorScheme.outline,
+          width: 1,
+        ),
+        boxShadow: isDark ? const [] : AppTokens.shadowBorder,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -60,11 +67,11 @@ class _PanelHeader extends StatelessWidget {
       title,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: const TextStyle(
+      style: TextStyle(
         fontSize: 14,
-        fontWeight: FontWeight.w700,
-        color: AppTokens.colorTextPrimary,
-        letterSpacing: -0.1,
+        fontWeight: FontWeight.w600,
+        color: Theme.of(context).colorScheme.onSurface,
+        letterSpacing: 0,
       ),
     );
 
@@ -134,6 +141,7 @@ class MetricTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return ConstrainedBox(
       constraints: BoxConstraints(minWidth: minWidth, maxWidth: maxWidth),
       child: Padding(
@@ -146,20 +154,21 @@ class MetricTile extends StatelessWidget {
               label,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w500,
-                color: AppTokens.colorTextMuted,
+                color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
             const SizedBox(height: 3),
-            SelectableText(
+            Text(
               value,
               maxLines: 2,
-              style: const TextStyle(
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
-                color: AppTokens.colorTextPrimary,
+                color: theme.colorScheme.onSurface,
                 fontFeatures: AppTokens.tabularFontFeatures,
               ),
             ),
@@ -169,10 +178,10 @@ class MetricTile extends StatelessWidget {
                 detail!,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w400,
-                  color: AppTokens.colorTextMuted,
+                  color: theme.colorScheme.onSurfaceVariant,
                   fontFeatures: AppTokens.tabularFontFeatures,
                 ),
               ),

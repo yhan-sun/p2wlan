@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RootDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$DaemonBin = Join-Path $RootDir "target\debug\p2pnet-daemon.exe"
+$DaemonBin = Join-Path $RootDir "target\debug\p2wlan-daemon.exe"
 $Mode = if ($Tun) { "tun" } else { "notun" }
 $TestId = "windows-$Mode-$PID"
 $RemoteRun = "$RemoteBase/$TestId"
@@ -77,7 +77,7 @@ function Wait-Http {
 try {
     if (!(Test-Path $DaemonBin)) {
         Push-Location $RootDir
-        cargo build -p p2pnet-daemon
+        cargo build -p p2wlan-daemon
         Pop-Location
     }
 
@@ -107,7 +107,7 @@ try {
     $remoteTunEnv = if ($Tun) { "" } else { "P2WLAN_DISABLE_TUN=1" }
     $localTunEnv = if ($Tun) { @{} } else { @{ P2WLAN_DISABLE_TUN = "1" } }
 
-    Invoke-Remote "cd '$RemoteRun'; env $remoteTunEnv RUST_LOG=info nohup '$RemoteBase/p2pnet-daemon' --config '$AliConfig' --control 'http://$AliHost`:$Port' --network default --token '$Token' --device-name ali-windows-$Mode --interface '$AliIf' --udp-bind 0.0.0.0:$AliUdp --udp-advertise '$AliHost`:$AliUdp' --diagnostics-bind 127.0.0.1:$AliDiag --heartbeat-interval 5 >ali.log 2>&1 & echo `$! >ali.pid" | Out-Null
+    Invoke-Remote "cd '$RemoteRun'; env $remoteTunEnv RUST_LOG=info nohup '$RemoteBase/p2wlan-daemon' --config '$AliConfig' --control 'http://$AliHost`:$Port' --network default --token '$Token' --device-name ali-windows-$Mode --interface '$AliIf' --udp-bind 0.0.0.0:$AliUdp --udp-advertise '$AliHost`:$AliUdp' --diagnostics-bind 127.0.0.1:$AliDiag --heartbeat-interval 5 >ali.log 2>&1 & echo `$! >ali.pid" | Out-Null
 
     $env:RUST_LOG = "info"
     if ($Tun) {
@@ -131,7 +131,7 @@ try {
         $WinStatus = ""
         $AliStatus = ""
         try { $WinStatus = & $DaemonBin --status --diagnostics-url "http://127.0.0.1:$WinDiag/status" 2>$null | Out-String } catch {}
-        try { $AliStatus = Invoke-Remote "'$RemoteBase/p2pnet-daemon' --status --diagnostics-url http://127.0.0.1:$AliDiag/status" | Out-String } catch {}
+        try { $AliStatus = Invoke-Remote "'$RemoteBase/p2wlan-daemon' --status --diagnostics-url http://127.0.0.1:$AliDiag/status" | Out-String } catch {}
         if ($WinStatus -match '"state":\s*"direct"' -and $AliStatus -match '"state":\s*"direct"') {
             $passDirect = $true
             break

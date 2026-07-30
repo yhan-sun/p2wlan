@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PORT=${PORT:-$((18000 + $$ % 1000))}
 GO_BIN=${GO_BIN:-go}
-DAEMON_BIN=${DAEMON_BIN:-"$ROOT_DIR/target/debug/p2pnet-daemon"}
+DAEMON_BIN=${DAEMON_BIN:-"$ROOT_DIR/target/debug/p2wlan-daemon"}
 REQUIRE=${P2WLAN_REQUIRE_TUN_SMOKE:-0}
 
 SUFFIX=$$
@@ -80,7 +80,7 @@ for cmd in ip ping curl "$GO_BIN"; do
   command -v "$cmd" >/dev/null 2>&1 || skip "missing required command: $cmd"
 done
 if [[ ! -x "$DAEMON_BIN" ]]; then
-  skip "missing daemon binary at $DAEMON_BIN; run cargo build -p p2pnet-daemon first"
+  skip "missing daemon binary at $DAEMON_BIN; run cargo build -p p2wlan-daemon first"
 fi
 for interface in "$BRIDGE" "$VETH_A_HOST" "$VETH_A_NS" "$VETH_B_HOST" "$VETH_B_NS" "$TUN_A" "$TUN_B"; do
   if [[ ${#interface} -gt 15 ]]; then

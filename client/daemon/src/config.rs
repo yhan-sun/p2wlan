@@ -179,7 +179,7 @@ fn default_interface() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "p2pnet0".to_string()
+        "p2wlan0".to_string()
     }
 }
 fn default_udp_bind() -> String {
@@ -205,7 +205,7 @@ fn default_socket_pool_size() -> usize {
 /// Control plane server configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
-    /// Control server URL (e.g. "https://control.p2pnet.io:443").
+    /// Control server URL (e.g. "https://control.p2wlan.io:443").
     pub server_url: String,
     /// User authentication token (JWT) obtained after login/register.
     pub auth_token: String,
@@ -335,7 +335,7 @@ pub struct DnsConfig {
     /// Whether to enable the built-in DNS resolver.
     #[serde(default)]
     pub enabled: bool,
-    /// DNS domain suffix (e.g. "p2pnet.local").
+    /// DNS domain suffix (e.g. "p2wlan.local").
     #[serde(default = "default_dns_suffix")]
     pub suffix: String,
     /// Custom DNS mappings (hostname → virtual IP).
@@ -344,7 +344,7 @@ pub struct DnsConfig {
 }
 
 fn default_dns_suffix() -> String {
-    "p2pnet.local".to_string()
+    "p2wlan.local".to_string()
 }
 
 impl Default for DnsConfig {
@@ -671,7 +671,7 @@ mod tests {
                 "ipv6_cidr": null,
                 "mtu": 1420,
                 "netmask": "255.255.0.0",
-                "interface": "p2pnet0"
+                "interface": "p2wlan0"
             },
             "control": {
                 "server_url": "http://ctrl",
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_config_save_load_roundtrip() {
-        let dir = std::env::temp_dir().join("p2pnet_config_test");
+        let dir = std::env::temp_dir().join("p2wlan_config_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_config.json");
 
@@ -748,7 +748,7 @@ mod tests {
     fn test_dns_default() {
         let dns = DnsConfig::default();
         assert!(!dns.enabled);
-        assert_eq!(dns.suffix, "p2pnet.local");
+        assert_eq!(dns.suffix, "p2wlan.local");
         assert!(dns.mappings.is_empty());
     }
 
@@ -761,7 +761,7 @@ mod tests {
         #[cfg(target_os = "windows")]
         assert_eq!(config.network.interface, "p2wlan");
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(config.network.interface, "p2pnet0");
+        assert_eq!(config.network.interface, "p2wlan0");
         assert_eq!(config.network.udp_bind, "0.0.0.0:0");
         assert_eq!(config.network.udp_advertise, None);
         assert!(config.network.stun_servers.is_empty());

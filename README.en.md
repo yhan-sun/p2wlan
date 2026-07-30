@@ -78,7 +78,7 @@ When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus 
 
 ## Quick Start
 
-Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases). The current Flutter release client is a read-only diagnostics preview; real virtual interfaces still come from the local daemon / Linux CLI path, then you can test another peer by virtual IP:
+Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases). The Flutter release client is moving to own the desktop daemon lifecycle; Rust p2wlan-daemon still owns the virtual adapter, routes, and data plane, then you can test another peer by virtual IP:
 
 ```bash
 ping 10.20.0.5
@@ -87,15 +87,15 @@ ssh user@10.20.0.5
 
 ### macOS
 
-Apple Silicon Macs use `p2wlan-flutter-macos-arm64.dmg`; Intel Macs use `p2wlan-flutter-macos-x64.dmg`. Drag the app into Applications and open `P2WLAN Diagnostics`.
+Apple Silicon Macs use `p2wlan-flutter-macos-arm64.dmg`; Intel Macs use `p2wlan-flutter-macos-x64.dmg`. Drag the app into Applications and open `P2WLAN`.
 
 Preview builds may not yet be Apple-notarized. If Gatekeeper blocks the first launch, open the app from Finder with right-click -> Open.
 
 ### Windows
 
-Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`. Install it and launch `P2WLAN Diagnostics`. The Windows ARM Flutter installer is not enabled yet; it can be added once Flutter stable/action support reliably resolves the ARM64 SDK.
+Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`. Install it and launch `P2WLAN`. The Windows ARM Flutter installer is not enabled yet; it can be added once Flutter stable/action support reliably resolves the ARM64 SDK.
 
-The current Flutter client does not start or stop the virtual adapter. Real TUN/Wintun/utun control remains on the daemon / CLI path or a later full client.
+The Flutter client now exposes daemon start/stop actions from Dashboard and the system tray. The Rust `p2wlan-daemon` still owns the virtual adapter, routes, and data plane; Windows UAC, Linux elevation, and packaged release smoke tests still need to pass before this is treated as the default desktop path.
 
 ### Linux
 
@@ -201,9 +201,9 @@ Troubleshooting guidance:
 
 | Platform | Client | Virtual interface | Status |
 | --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | Flutter DMG split by arm64 / x64 | `utun` via daemon path | Flutter diagnostics preview; TUN control is still migrating |
-| Windows 10/11 x64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics preview; ARM64 installer is pending Flutter SDK/action support |
-| Linux x64 desktop; Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics preview uses x64 Flutter; server and headless workflows use CLI |
+| macOS Apple Silicon / Intel | Flutter DMG split by arm64 / x64 | `utun` via daemon path | Flutter diagnostics plus Dashboard/tray lifecycle controls; release smoke testing in progress |
+| Windows 10/11 x64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics plus Dashboard/tray entry points; UAC/installer smoke pending, ARM64 installer pending Flutter SDK/action support |
+| Linux x64 desktop; Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics plus tray entry point; server, elevation, and headless workflows stay on CLI |
 | Android arm64 | Flutter APK | Future Android VPN path | Release publishes arm64 only |
 | iOS arm64 | unsigned Flutter IPA | Future Network Extension path | CI artifact, requires signing before installation |
 
@@ -272,7 +272,7 @@ git clone https://github.com/yhan-sun/p2wlan.git
 cd p2wlan
 pnpm install --frozen-lockfile
 
-cargo build -p p2pnet-daemon
+cargo build -p p2wlan-daemon
 cargo tauri dev
 
 cd apps/flutter_client

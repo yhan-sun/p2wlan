@@ -26,7 +26,7 @@ Environment:
 Options:
   --version TAG       Release tag to install, for example v0.1.26
   --repo OWNER/NAME   GitHub repo to download from
-  --install-dir DIR   Install directory for p2wlan and p2pnet-daemon
+  --install-dir DIR   Install directory for p2wlan and p2wlan-daemon
   --dry-run           Print the selected package without installing
   -h, --help          Show this help
 EOF
@@ -144,7 +144,7 @@ detect_arch() {
 }
 
 if [ -f "$PACKAGE_DIR/p2wlan" ] &&
-  [ -f "$PACKAGE_DIR/p2pnet-daemon" ] &&
+  [ -f "$PACKAGE_DIR/p2wlan-daemon" ] &&
   [ -f "$PACKAGE_DIR/README-LINUX-CLI.txt" ]; then
   LOCAL_PACKAGE=1
 fi
@@ -176,14 +176,14 @@ if [ "$LOCAL_PACKAGE" -ne 1 ]; then
   PACKAGE_DIR="$WORK_DIR/p2wlan-linux-${RELEASE_ARCH}-cli"
 fi
 
-if [ ! -f "$PACKAGE_DIR/p2wlan" ] || [ ! -f "$PACKAGE_DIR/p2pnet-daemon" ]; then
-  echo "p2wlan and p2pnet-daemon were not found in $PACKAGE_DIR." >&2
+if [ ! -f "$PACKAGE_DIR/p2wlan" ] || [ ! -f "$PACKAGE_DIR/p2wlan-daemon" ]; then
+  echo "p2wlan and p2wlan-daemon were not found in $PACKAGE_DIR." >&2
   exit 1
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "Would install $PACKAGE_DIR/p2wlan to $INSTALL_DIR/p2wlan"
-  echo "Would install $PACKAGE_DIR/p2pnet-daemon to $INSTALL_DIR/p2pnet-daemon"
+  echo "Would install $PACKAGE_DIR/p2wlan-daemon to $INSTALL_DIR/p2wlan-daemon"
   exit 0
 fi
 
@@ -196,10 +196,10 @@ need_cmd install
 
 install -d "$INSTALL_DIR"
 install -m 0755 "$PACKAGE_DIR/p2wlan" "$INSTALL_DIR/p2wlan"
-install -m 0755 "$PACKAGE_DIR/p2pnet-daemon" "$INSTALL_DIR/p2pnet-daemon"
+install -m 0755 "$PACKAGE_DIR/p2wlan-daemon" "$INSTALL_DIR/p2wlan-daemon"
 
 echo "Installed p2wlan to $INSTALL_DIR/p2wlan"
-echo "Installed p2pnet-daemon to $INSTALL_DIR/p2pnet-daemon"
+echo "Installed p2wlan-daemon to $INSTALL_DIR/p2wlan-daemon"
 if [ -x "$INSTALL_DIR/p2wlan" ]; then
   "$INSTALL_DIR/p2wlan" --version
 fi

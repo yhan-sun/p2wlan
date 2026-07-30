@@ -90,7 +90,7 @@ jobs:
           payload="$RUNNER_TEMP/p2wlan-ios-payload"
           rm -rf "$payload"
           mkdir -p "$payload/Payload" dist-release
-          ditto "$app" "$payload/Payload/P2WLAN Diagnostics.app"
+          ditto "$app" "$payload/Payload/P2WLAN.app"
           (cd "$payload" && zip -qry "$GITHUB_WORKSPACE/dist-release/p2wlan-flutter-ios-arm64-unsigned.ipa" Payload)
 
       - name: Upload artifact
@@ -143,15 +143,15 @@ jobs:
       - name: Create architecture-specific DMG
         run: |
           set -euo pipefail
-          src="apps/flutter_client/build/macos/Build/Products/Release/P2WLAN Diagnostics.app"
+          src="apps/flutter_client/build/macos/Build/Products/Release/P2WLAN.app"
           work="$RUNNER_TEMP/p2wlan-flutter-macos-${{ matrix.arch }}"
-          app="$work/P2WLAN Diagnostics.app"
+          app="$work/P2WLAN.app"
           mkdir -p dist-release
           rm -rf "$work"
           mkdir -p "$work"
           ditto "$src" "$app"
           for binary in \
-            "$app/Contents/MacOS/P2WLAN Diagnostics" \
+            "$app/Contents/MacOS/P2WLAN" \
             "$app/Contents/Frameworks/App.framework/Versions/A/App" \
             "$app/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
             lipo "$binary" -thin "${{ matrix.lipo_arch }}" -output "$binary.thin"
@@ -159,7 +159,7 @@ jobs:
           done
           codesign --force --deep --sign - "$app"
           hdiutil create \
-            -volname "P2WLAN Diagnostics" \
+            -volname "P2WLAN" \
             -srcfolder "$app" \
             -ov \
             -format UDZO \
@@ -331,11 +331,11 @@ jobs:
 
           [Setup]
           AppId={{D2C22E34-410C-4273-B888-0E689638C994}
-          AppName=P2WLAN Diagnostics
+          AppName=P2WLAN
           AppVersion={#AppVersion}
           AppPublisher=P2WLAN
-          DefaultDirName={localappdata}\Programs\P2WLAN Diagnostics
-          DefaultGroupName=P2WLAN Diagnostics
+          DefaultDirName={localappdata}\Programs\P2WLAN
+          DefaultGroupName=P2WLAN
           DisableProgramGroupPage=yes
           OutputDir={#OutputDir}
           OutputBaseFilename=p2wlan-flutter-windows-{#AppArch}-setup
@@ -349,14 +349,14 @@ jobs:
           Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
           [Icons]
-          Name: "{autoprograms}\P2WLAN Diagnostics"; Filename: "{app}\p2wlan_flutter_client.exe"
-          Name: "{autodesktop}\P2WLAN Diagnostics"; Filename: "{app}\p2wlan_flutter_client.exe"; Tasks: desktopicon
+          Name: "{autoprograms}\P2WLAN"; Filename: "{app}\p2wlan_flutter_client.exe"
+          Name: "{autodesktop}\P2WLAN"; Filename: "{app}\p2wlan_flutter_client.exe"; Tasks: desktopicon
 
           [Tasks]
           Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
           [Run]
-          Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN Diagnostics"; Flags: nowait postinstall skipifsilent
+          Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN"; Flags: nowait postinstall skipifsilent
           "@ | Set-Content -Path $iss -Encoding UTF8
           & $iscc $iss
 
@@ -403,7 +403,7 @@ jobs:
           sudo apt-get install -y ${{ matrix.cross_packages }}
 
       - name: Build Linux CLI and daemon
-        run: cargo build -p p2wlan-cli -p p2pnet-daemon --release --target ${{ matrix.target }}
+        run: cargo build -p p2wlan-cli -p p2wlan-daemon --release --target ${{ matrix.target }}
 
       - name: Assemble Linux CLI tarball
         run: |
@@ -412,7 +412,7 @@ jobs:
           pkg="dist-release/$name"
           mkdir -p "$pkg"
           cp target/${{ matrix.target }}/release/p2wlan "$pkg/"
-          cp target/${{ matrix.target }}/release/p2pnet-daemon "$pkg/"
+          cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/"
           cp scripts/install-linux-cli.sh "$pkg/install.sh"
           cp LICENSE "$pkg/"
           cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
@@ -420,7 +420,7 @@ jobs:
 
           Contents:
           - p2wlan: user-facing command-line client
-          - p2pnet-daemon: background daemon with real Linux TUN support
+          - p2wlan-daemon: background daemon with real Linux TUN support
           - install.sh: system-wide installer; also works as an online GitHub release installer
           - LICENSE
 
@@ -467,7 +467,7 @@ jobs:
           - `p2wlan doctor` shows peer UDP candidate previews and warns when peers only advertise private endpoints.
           - For self-hosting, run the Go control and relay services separately.
           EOF
-          chmod +x "$pkg/p2wlan" "$pkg/p2pnet-daemon" "$pkg/install.sh"
+          chmod +x "$pkg/p2wlan" "$pkg/p2wlan-daemon" "$pkg/install.sh"
           tar -C dist-release -czf "dist-release/$name.tar.gz" "$name"
 
       - name: Upload artifact

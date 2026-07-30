@@ -34,10 +34,10 @@ echo "[smoke] building control server..."
   "$GO_BIN" build -o "$TMP_DIR/control-server" .
 )
 
-echo "[smoke] building p2pnet-daemon..."
+echo "[smoke] building p2wlan-daemon..."
 (
   cd "$ROOT_DIR"
-  cargo build -p p2pnet-daemon
+  cargo build -p p2wlan-daemon
 )
 
 PORT="$PORT" DB_PATH="$TMP_DIR/control.db" JWT_SECRET=smoke "$TMP_DIR/control-server" >"$TMP_DIR/server.log" 2>&1 &
@@ -60,7 +60,7 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
-P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2pnet-daemon" \
+P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
   --config "$TMP_DIR/node-a.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
@@ -77,7 +77,7 @@ for _ in {1..40}; do
   sleep 0.25
 done
 
-P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2pnet-daemon" \
+P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
   --config "$TMP_DIR/node-b.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
@@ -106,7 +106,7 @@ for _ in {1..80}; do
        printf '%s' "$STATUS_B" | grep -q '"peers"' && \
        printf '%s' "$STATUS_B" | grep -q '"stats"' && \
        printf '%s' "$STATUS_B" | grep -q '"relay_selection"'; then
-      "$ROOT_DIR/target/debug/p2pnet-daemon" \
+      "$ROOT_DIR/target/debug/p2wlan-daemon" \
         --config "$TMP_DIR/node-a.json" \
         --status \
         --diagnostics-url "http://127.0.0.1:$DIAG_A_PORT/status" \

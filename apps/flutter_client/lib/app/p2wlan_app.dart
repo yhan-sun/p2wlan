@@ -1,10 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../app/app_motion.dart';
+import '../app/desktop_tray_controller.dart';
 import '../app/app_strings.dart';
 import '../app/app_theme.dart';
 import '../app/app_tokens.dart';
-import '../core/api/daemon_api.dart';
+import '../core/api/diagnostics_api.dart';
+import '../core/daemon/daemon_controller.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import 'app_constants.dart';
@@ -16,13 +19,17 @@ class P2WlanApp extends StatefulWidget {
     this.initialRefresh = true,
     this.autoStartPolling = false,
     this.settingsStore,
-    this.daemonApi,
+    this.diagnosticsApi,
+    this.daemonController,
+    this.enableDesktopTray = false,
   });
 
   final bool initialRefresh;
   final bool autoStartPolling;
   final SettingsStore? settingsStore;
-  final DaemonApi? daemonApi;
+  final DiagnosticsApi? diagnosticsApi;
+  final DaemonController? daemonController;
+  final bool enableDesktopTray;
 
   @override
   State<P2WlanApp> createState() => _P2WlanAppState();
@@ -31,6 +38,7 @@ class P2WlanApp extends StatefulWidget {
 class _P2WlanAppState extends State<P2WlanApp> {
   late final SettingsStore _settingsStore;
   late final StatusStore _statusStore;
+  DesktopTrayController? _desktopTrayController;
   var _ready = false;
 
   @override
@@ -39,13 +47,21 @@ class _P2WlanAppState extends State<P2WlanApp> {
     _settingsStore = widget.settingsStore ?? SettingsStore();
     _statusStore = StatusStore(
       settingsStore: _settingsStore,
-      daemonApi: widget.daemonApi ?? DaemonApi(),
+      diagnosticsApi: widget.diagnosticsApi ?? DiagnosticsApi(),
+      daemonController: widget.daemonController,
     );
     _bootstrap();
   }
 
   Future<void> _bootstrap() async {
     await _settingsStore.load();
+    if (widget.enableDesktopTray && DesktopTrayController.isSupported) {
+      _desktopTrayController = DesktopTrayController(
+        settingsStore: _settingsStore,
+        statusStore: _statusStore,
+      );
+      await _desktopTrayController!.initialize();
+    }
     if (widget.initialRefresh) {
       await _statusStore.refresh();
     }
@@ -59,6 +75,7 @@ class _P2WlanAppState extends State<P2WlanApp> {
 
   @override
   void dispose() {
+    unawaited(_desktopTrayController?.dispose());
     _statusStore.dispose();
     _settingsStore.dispose();
     super.dispose();
@@ -66,47 +83,41 @@ class _P2WlanAppState extends State<P2WlanApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: p2wlanAppName,
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.lightTheme,
-      home: AnimatedBuilder(
-        animation: _settingsStore,
-        builder: (context, _) {
-          final strings = AppStrings.fromCode(
-            _settingsStore.settings.languageCode,
-          );
-          return AppStringsScope(
+    return AnimatedBuilder(
+      animation: _settingsStore,
+      builder: (context, _) {
+        final modeCode = _settingsStore.settings.themeMode;
+        final themeMode = switch (modeCode) {
+          'light' => ThemeMode.light,
+          'dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        };
+        final strings = AppStrings.fromCode(
+          _settingsStore.settings.languageCode,
+        );
+        return MaterialApp(
+          title: p2wlanAppName,
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          themeMode: themeMode,
+          home: AppStringsScope(
             strings: strings,
-            child: Builder(
-              builder: (context) {
-                final duration = AppMotion.duration(
-                  context,
-                  AppTokens.durationMedium,
-                );
-                return AnimatedSwitcher(
-                  duration: duration,
-                  switchInCurve: AppTokens.curveEase,
-                  switchOutCurve: AppTokens.curveEase,
-                  child: _ready
-                      ? P2WlanShell(
-                          key: const ValueKey('app-shell'),
-                          settingsStore: _settingsStore,
-                          statusStore: _statusStore,
-                        )
-                      : const _BootScreen(key: ValueKey('boot-screen')),
-                );
-              },
-            ),
-          );
-        },
-      ),
+            child: _ready
+                ? P2WlanShell(
+                    settingsStore: _settingsStore,
+                    statusStore: _statusStore,
+                  )
+                : const _BootScreen(),
+          ),
+        );
+      },
     );
   }
 }
 
 class _BootScreen extends StatelessWidget {
-  const _BootScreen({super.key});
+  const _BootScreen();
 
   @override
   Widget build(BuildContext context) {

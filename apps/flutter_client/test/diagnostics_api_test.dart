@@ -1,10 +1,10 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:p2wlan_flutter_client/core/api/daemon_api.dart';
-import 'package:p2wlan_flutter_client/core/models/daemon_models.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 
 void main() {
   group('normalizeDiagnosticsUrl', () {
-    test('keeps the daemon default status URL', () {
+    test('keeps the diagnostics default status URL', () {
       expect(
         normalizeDiagnosticsUrl(defaultDiagnosticsUrl),
         defaultDiagnosticsUrl,

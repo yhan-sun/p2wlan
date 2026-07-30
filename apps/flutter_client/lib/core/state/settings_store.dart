@@ -3,8 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
-import '../api/daemon_api.dart';
-import '../models/daemon_models.dart';
+import '../api/diagnostics_api.dart';
+import '../models/diagnostics_models.dart';
 
 class SettingsStore extends ChangeNotifier {
   SettingsStore({File? settingsFile}) : _settingsFileOverride = settingsFile;
@@ -25,11 +25,15 @@ class SettingsStore extends ChangeNotifier {
     try {
       final file = _settingsFile();
       _configPath = file.path;
-      if (await file.exists()) {
-        final raw = await file.readAsString();
+      final sourceFile = await _settingsSourceFile(file);
+      if (sourceFile != null) {
+        final raw = await sourceFile.readAsString();
         final decoded = jsonDecode(raw);
         if (decoded is Map<String, dynamic>) {
           _settings = AppSettings.fromJson(decoded);
+          if (sourceFile.path != file.path) {
+            await _writeSettingsFile(file);
+          }
         }
       }
       _lastError = null;
@@ -49,8 +53,39 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> updateConnectionSettings({
+    required String diagnosticsUrl,
+    required String controlServer,
+    required String authToken,
+    required String networkId,
+    required String deviceName,
+    required bool manualMode,
+  }) async {
+    final normalizedDiagnosticsUrl = normalizeDiagnosticsUrl(diagnosticsUrl);
+    final normalizedControlServer = normalizeControlServer(controlServer);
+    final normalizedNetworkId = networkId.trim().isEmpty
+        ? defaultNetworkId
+        : networkId.trim();
+    _settings = _settings.copyWith(
+      diagnosticsUrl: normalizedDiagnosticsUrl,
+      controlServer: normalizedControlServer,
+      authToken: authToken.trim(),
+      networkId: normalizedNetworkId,
+      deviceName: deviceName.trim(),
+      manualMode: manualMode,
+    );
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> updateLanguageCode(String languageCode) async {
     _settings = _settings.copyWith(languageCode: languageCode);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> updateThemeMode(String themeMode) async {
+    _settings = _settings.copyWith(themeMode: themeMode);
     await _save();
     notifyListeners();
   }
@@ -65,10 +100,7 @@ class SettingsStore extends ChangeNotifier {
     try {
       final file = _settingsFile();
       _configPath = file.path;
-      await file.parent.create(recursive: true);
-      await file.writeAsString(
-        const JsonEncoder.withIndent('  ').convert(_settings.toJson()),
-      );
+      await _writeSettingsFile(file);
       _lastError = null;
     } catch (error) {
       _lastError = 'Failed to save local settings: $error';
@@ -84,11 +116,34 @@ class SettingsStore extends ChangeNotifier {
     );
   }
 
+  Future<File?> _settingsSourceFile(File preferredFile) async {
+    if (await preferredFile.exists()) return preferredFile;
+    final legacyFile = _legacySettingsFile();
+    if (legacyFile != null && await legacyFile.exists()) return legacyFile;
+    return null;
+  }
+
+  Future<void> _writeSettingsFile(File file) async {
+    await file.parent.create(recursive: true);
+    await file.writeAsString(
+      const JsonEncoder.withIndent('  ').convert(_settings.toJson()),
+    );
+  }
+
+  File? _legacySettingsFile() {
+    if (!Platform.isMacOS || _settingsFileOverride != null) return null;
+    final home = Platform.environment['HOME'];
+    if (home == null || home.isEmpty) return null;
+    return File(
+      '$home/Library/Application Support/p2wlan/flutter-client-settings.json',
+    );
+  }
+
   Directory _configDirectory() {
     if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {
-        return Directory('$home/Library/Application Support/p2wlan');
+        return Directory('$home/Library/Application Support/p2wlan-client');
       }
     }
     if (Platform.isWindows) {
@@ -109,4 +164,16 @@ class SettingsStore extends ChangeNotifier {
       '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan',
     );
   }
+}
+
+String normalizeControlServer(String value) {
+  final trimmed = value.trim().isEmpty ? defaultControlServer : value.trim();
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null || !parsed.hasScheme || parsed.host.isEmpty) {
+    throw FormatException('Control server must be a valid URL', value);
+  }
+  if (parsed.scheme != 'http' && parsed.scheme != 'https') {
+    throw FormatException('Control server must use http or https', value);
+  }
+  return trimmed.replaceFirst(RegExp(r'/+$'), '');
 }
