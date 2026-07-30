@@ -5,8 +5,9 @@ legacy Tauri/WebView desktop shell while keeping the Rust networking core.
 
 The split is:
 
-- Flutter: desktop/mobile UI, settings, status, peer views, lifecycle controls,
-  and in-process desktop tray controls while the UI is running.
+- Flutter: desktop/mobile UI, settings, status, peer views, and lifecycle
+  controls. It exits normally when its window is closed in the default desktop
+  flow.
 - Rust `p2wlan-tray`: tiny native tray process for idle status, opening the
   Flutter UI on demand, and quick daemon controls without keeping WebView or
   Flutter UI memory resident.
@@ -19,10 +20,18 @@ The split is:
 # Build the daemon binary used by the Flutter desktop client.
 cargo build -p p2wlan-daemon
 
+# Run the lightweight menu bar / tray controller.
+cargo build -p p2wlan-tray
+target/debug/p2wlan-tray
+
 # Run Flutter.
 cd apps/flutter_client
 flutter run -d macos
 ```
+
+For debugging only, set `P2WLAN_ENABLE_FLUTTER_TRAY=1` before launching Flutter
+to use its in-process tray. The normal low-idle-memory path keeps tray and
+Flutter as separate processes.
 
 The client looks for `p2wlan-daemon` in this order:
 
@@ -96,8 +105,8 @@ cargo check -p p2wlan-daemon
 - [x] Flutter exposes `p2wlan-daemon` start from Dashboard.
 - [x] Flutter exposes daemon stop through `/shutdown` with PID fallback.
 - [x] Dashboard, Diagnostics, and Nodes update from `/status`.
-- [x] Flutter in-process tray exposes status, open, start, stop, refresh, logs,
-  and quit controls.
+- [x] Flutter in-process tray remains available behind
+  `P2WLAN_ENABLE_FLUTTER_TRAY=1` for debugging.
 - [x] Rust `p2wlan-tray` builds as a lightweight idle tray companion.
 - [ ] macOS release app bundles `p2wlan-daemon` in Resources and passes local
   notarization/signing smoke.

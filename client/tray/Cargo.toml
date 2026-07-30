@@ -6,6 +6,7 @@ license.workspace = true
 description = "Tiny native tray controller for P2WLAN"
 
 [dependencies]
+arboard = { version = "3.6.1", default-features = false }
 p2wlan-desktop-host = { path = "../desktop-host" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = { workspace = true }
