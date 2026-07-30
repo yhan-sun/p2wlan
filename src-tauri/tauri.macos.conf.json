@@ -2,7 +2,7 @@
   "bundle": {
     "targets": ["app", "dmg"],
     "resources": {
-      "resources/p2pnet-daemon": "p2pnet-daemon"
+      "resources/p2wlan-daemon": "p2wlan-daemon"
     }
   }
 }

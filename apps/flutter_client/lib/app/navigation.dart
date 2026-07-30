@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../app/app_constants.dart';
-import '../app/app_motion.dart';
 import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
 import '../core/state/settings_store.dart';
@@ -43,19 +42,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final duration = AppMotion.duration(context, AppTokens.durationFast);
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 900;
         final body = _buildBody();
-
-        final content = AnimatedSwitcher(
-          duration: duration,
-          switchInCurve: AppTokens.curveEase,
-          switchOutCurve: AppTokens.curveEase,
-          child: KeyedSubtree(key: ValueKey(_section), child: body),
-        );
 
         return Scaffold(
           appBar: AppBar(
@@ -68,12 +59,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
           ),
           body: wide
               ? _WideShell(
-                  body: content,
+                  body: body,
                   selected: _section,
                   strings: strings,
                   onSelect: _select,
                 )
-              : content,
+              : body,
           bottomNavigationBar: wide
               ? null
               : NavigationBar(

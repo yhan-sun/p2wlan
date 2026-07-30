@@ -112,7 +112,7 @@ struct UpdateArgs {
     /// Install a specific release tag instead of the latest release
     #[arg(long, value_name = "TAG")]
     version: Option<String>,
-    /// Installation directory for p2wlan and p2pnet-daemon
+    /// Installation directory for p2wlan and p2wlan-daemon
     #[arg(long, value_name = "DIR")]
     install_dir: Option<PathBuf>,
     /// Only print what would be installed
@@ -368,8 +368,8 @@ async fn start_daemon_as_root(args: InternalStartArgs) -> Result<(), String> {
 
     fs::create_dir_all(&args.state_dir)
         .map_err(|error| format!("无法创建运行目录 {}：{error}", args.state_dir.display()))?;
-    let log_path = args.state_dir.join("p2pnet-daemon.log");
-    let pid_path = args.state_dir.join("p2pnet-daemon.pid");
+    let log_path = args.state_dir.join("p2wlan-daemon.log");
+    let pid_path = args.state_dir.join("p2wlan-daemon.pid");
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -451,7 +451,7 @@ async fn stop(config_path: &Path) -> Result<(), String> {
             Ok(())
         }
         _ => {
-            let pid_path = state_dir().join("p2pnet-daemon.pid");
+            let pid_path = state_dir().join("p2wlan-daemon.pid");
             let Some(pid) = verified_recorded_daemon(&pid_path)? else {
                 println!("p2wlan 未运行。");
                 return Ok(());
@@ -732,7 +732,7 @@ async fn update(config_path: &Path, args: UpdateArgs) -> Result<(), String> {
 }
 
 fn logs(lines: usize, follow: bool) -> Result<(), String> {
-    let path = state_dir().join("p2pnet-daemon.log");
+    let path = state_dir().join("p2wlan-daemon.log");
     if follow {
         let status = Command::new("tail")
             .arg("-n")
@@ -2738,10 +2738,10 @@ fn extract_tar_gz(archive: &Path, directory: &Path) -> Result<(), String> {
 
 fn install_release_binaries(package_dir: &Path, install_dir: &Path) -> Result<(), String> {
     let cli = package_dir.join("p2wlan");
-    let daemon = package_dir.join("p2pnet-daemon");
+    let daemon = package_dir.join("p2wlan-daemon");
     if !cli.is_file() || !daemon.is_file() {
         return Err(format!(
-            "更新包缺少 p2wlan 或 p2pnet-daemon：{}",
+            "更新包缺少 p2wlan 或 p2wlan-daemon：{}",
             package_dir.display()
         ));
     }
@@ -2765,7 +2765,7 @@ fn install_release_binaries(package_dir: &Path, install_dir: &Path) -> Result<()
         OsString::from("-m"),
         OsString::from("0755"),
         daemon.as_os_str().to_os_string(),
-        install_dir.join("p2pnet-daemon").as_os_str().to_os_string(),
+        install_dir.join("p2wlan-daemon").as_os_str().to_os_string(),
     ])?;
     Ok(())
 }
@@ -2829,7 +2829,7 @@ fn default_config_path() -> PathBuf {
     if let Some(path) = env::var_os("P2WLAN_CONFIG") {
         return PathBuf::from(path);
     }
-    config_dir().join("p2pnet-config.json")
+    config_dir().join("p2wlan-config.json")
 }
 
 fn config_dir() -> PathBuf {
@@ -2883,12 +2883,12 @@ fn locate_daemon() -> Result<PathBuf, String> {
     }
     let sibling = env::current_exe()
         .map_err(|error| format!("无法定位当前程序：{error}"))?
-        .with_file_name("p2pnet-daemon");
+        .with_file_name("p2wlan-daemon");
     if sibling.is_file() {
         return Ok(sibling);
     }
-    find_in_path("p2pnet-daemon").ok_or_else(|| {
-        "找不到 p2pnet-daemon；请保持它与 p2wlan 位于同一目录，或设置 P2WLAN_DAEMON".to_string()
+    find_in_path("p2wlan-daemon").ok_or_else(|| {
+        "找不到 p2wlan-daemon；请保持它与 p2wlan 位于同一目录，或设置 P2WLAN_DAEMON".to_string()
     })
 }
 
@@ -2948,9 +2948,9 @@ fn verified_recorded_daemon(pid_path: &Path) -> Result<Option<i32>, String> {
             .filter_map(|part| std::str::from_utf8(part).ok())
             .collect::<Vec<_>>()
             .join(" ");
-        if !command_line.contains("p2pnet-daemon") {
+        if !command_line.contains("p2wlan-daemon") {
             return Err(format!(
-                "PID 文件 {} 指向的不是 p2pnet-daemon，拒绝结束进程",
+                "PID 文件 {} 指向的不是 p2wlan-daemon，拒绝结束进程",
                 pid_path.display()
             ));
         }
@@ -3847,7 +3847,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = env::temp_dir().join(format!("p2wlan-cli-login-{unique}"));
-        let path = directory.join("p2pnet-config.json");
+        let path = directory.join("p2wlan-config.json");
         authenticate(
             &path,
             AuthArgs {

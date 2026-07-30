@@ -34,23 +34,23 @@ fi
 APP_VERSION=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
 
 echo "[package-macos] target: $TARGET"
-DAEMON_RESOURCE="$ROOT_DIR/src-tauri/resources/p2pnet-daemon"
+DAEMON_RESOURCE="$ROOT_DIR/src-tauri/resources/p2wlan-daemon"
 
 if [[ "$TARGET" == "universal-apple-darwin" ]]; then
-  echo "[package-macos] building universal p2pnet-daemon release binary..."
+  echo "[package-macos] building universal p2wlan-daemon release binary..."
   rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
-  cargo build -p p2pnet-daemon --release --target aarch64-apple-darwin
-  cargo build -p p2pnet-daemon --release --target x86_64-apple-darwin
+  cargo build -p p2wlan-daemon --release --target aarch64-apple-darwin
+  cargo build -p p2wlan-daemon --release --target x86_64-apple-darwin
   mkdir -p "$(dirname "$DAEMON_RESOURCE")"
   lipo -create \
-    "$ROOT_DIR/target/aarch64-apple-darwin/release/p2pnet-daemon" \
-    "$ROOT_DIR/target/x86_64-apple-darwin/release/p2pnet-daemon" \
+    "$ROOT_DIR/target/aarch64-apple-darwin/release/p2wlan-daemon" \
+    "$ROOT_DIR/target/x86_64-apple-darwin/release/p2wlan-daemon" \
     -output "$DAEMON_RESOURCE"
 else
   rustup target add "$TARGET" >/dev/null
-  echo "[package-macos] building p2pnet-daemon release binary..."
-  cargo build -p p2pnet-daemon --release --target "$TARGET"
-  DAEMON_SRC="$ROOT_DIR/target/$TARGET/release/p2pnet-daemon"
+  echo "[package-macos] building p2wlan-daemon release binary..."
+  cargo build -p p2wlan-daemon --release --target "$TARGET"
+  DAEMON_SRC="$ROOT_DIR/target/$TARGET/release/p2wlan-daemon"
   if [[ ! -x "$DAEMON_SRC" ]]; then
     echo "missing daemon binary: $DAEMON_SRC" >&2
     exit 1
@@ -74,7 +74,7 @@ if [[ ! -d "$APP_DIR" && "$TARGET" == "$(rustc -vV | awk -F': ' '/host/ { print 
   DMG_DIR="$ROOT_DIR/target/release/bundle/dmg"
 fi
 
-BUNDLED_DAEMON="$APP_DIR/Contents/Resources/p2pnet-daemon"
+BUNDLED_DAEMON="$APP_DIR/Contents/Resources/p2wlan-daemon"
 if [[ ! -x "$BUNDLED_DAEMON" ]]; then
   echo "packaged app is missing executable daemon resource: $BUNDLED_DAEMON" >&2
   exit 1

@@ -1,9 +1,29 @@
 import 'dart:convert';
 
 const defaultDiagnosticsUrl = 'http://127.0.0.1:39277/status';
+const defaultControlServer = 'https://control.p2wlan.io';
+const defaultNetworkId = 'default';
 const defaultLanguageCode = 'en';
 
 typedef JsonMap = Map<String, dynamic>;
+
+enum AppThemeMode {
+  system('system'),
+  light('light'),
+  dark('dark');
+
+  const AppThemeMode(this.code);
+  final String code;
+
+  static AppThemeMode fromCode(String? code) {
+    final normalized = (code ?? 'system').trim().toLowerCase();
+    return switch (normalized) {
+      'light' => light,
+      'dark' => dark,
+      _ => system,
+    };
+  }
+}
 
 enum AppLanguage {
   english('en'),
@@ -28,36 +48,77 @@ enum AppLanguage {
 class AppSettings {
   const AppSettings({
     this.diagnosticsUrl = defaultDiagnosticsUrl,
+    this.controlServer = defaultControlServer,
+    this.authToken = '',
+    this.networkId = defaultNetworkId,
+    this.deviceName = '',
+    this.manualMode = false,
     this.languageCode = defaultLanguageCode,
+    this.themeMode = 'system',
   });
 
   final String diagnosticsUrl;
+  final String controlServer;
+  final String authToken;
+  final String networkId;
+  final String deviceName;
+  final bool manualMode;
   final String languageCode;
+  final String themeMode;
 
-  AppSettings copyWith({String? diagnosticsUrl, String? languageCode}) {
+  AppSettings copyWith({
+    String? diagnosticsUrl,
+    String? controlServer,
+    String? authToken,
+    String? networkId,
+    String? deviceName,
+    bool? manualMode,
+    String? languageCode,
+    String? themeMode,
+  }) {
     return AppSettings(
       diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl,
+      controlServer: controlServer ?? this.controlServer,
+      authToken: authToken ?? this.authToken,
+      networkId: networkId ?? this.networkId,
+      deviceName: deviceName ?? this.deviceName,
+      manualMode: manualMode ?? this.manualMode,
       languageCode: languageCode == null
           ? this.languageCode
           : AppLanguage.fromCode(languageCode).code,
+      themeMode: themeMode == null
+          ? this.themeMode
+          : AppThemeMode.fromCode(themeMode).code,
     );
   }
 
   factory AppSettings.fromJson(JsonMap json) {
     return AppSettings(
       diagnosticsUrl: _string(json['diagnosticsUrl'], defaultDiagnosticsUrl),
+      controlServer: _string(json['controlServer'], defaultControlServer),
+      authToken: _string(json['authToken']),
+      networkId: _string(json['networkId'], defaultNetworkId),
+      deviceName: _string(json['deviceName']),
+      manualMode: _bool(json['manualMode']),
       languageCode: AppLanguage.fromCode(_string(json['languageCode'])).code,
+      themeMode: AppThemeMode.fromCode(_string(json['themeMode'])).code,
     );
   }
 
   JsonMap toJson() => {
     'diagnosticsUrl': diagnosticsUrl,
+    'controlServer': controlServer,
+    'authToken': authToken,
+    'networkId': networkId,
+    'deviceName': deviceName,
+    'manualMode': manualMode,
     'languageCode': languageCode,
+    'themeMode': themeMode,
   };
 }
 
-class DaemonSnapshot {
-  DaemonSnapshot({
+class DiagnosticsSnapshot {
+  DiagnosticsSnapshot({
     required this.raw,
     required this.version,
     required this.processId,
@@ -93,8 +154,8 @@ class DaemonSnapshot {
   final PeerManagerStatsSnapshot stats;
   final HealthSnapshot health;
 
-  factory DaemonSnapshot.fromJson(JsonMap json) {
-    return DaemonSnapshot(
+  factory DiagnosticsSnapshot.fromJson(JsonMap json) {
+    return DiagnosticsSnapshot(
       raw: json,
       version: _string(json['version']),
       processId: _intOrNull(json['process_id']),

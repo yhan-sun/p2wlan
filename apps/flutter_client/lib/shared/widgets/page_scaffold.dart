@@ -1,7 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../../app/app_tokens.dart';
-
 class PageScaffold extends StatelessWidget {
   const PageScaffold({
     super.key,
@@ -20,8 +18,8 @@ class PageScaffold extends StatelessWidget {
       child: LayoutBuilder(
         builder: (context, constraints) {
           final isNarrow = constraints.maxWidth < 640;
-          final horizontalPadding = isNarrow ? 14.0 : 24.0;
-          final verticalPadding = isNarrow ? 16.0 : 24.0;
+          final horizontalPadding = isNarrow ? 14.0 : 22.0;
+          final verticalPadding = isNarrow ? 14.0 : 20.0;
 
           return ListView(
             padding: EdgeInsets.fromLTRB(
@@ -33,7 +31,7 @@ class PageScaffold extends StatelessWidget {
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1040),
+                  constraints: const BoxConstraints(maxWidth: 980),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -41,18 +39,18 @@ class PageScaffold extends StatelessWidget {
                         title,
                         style: TextStyle(
                           fontSize: isNarrow ? 20 : 22,
-                          fontWeight: FontWeight.w700,
-                          color: AppTokens.colorTextPrimary,
-                          letterSpacing: -0.3,
+                          fontWeight: FontWeight.w600,
+                          color: Theme.of(context).colorScheme.onSurface,
+                          letterSpacing: 0,
                         ),
                       ),
                       const SizedBox(height: 3),
                       Text(
                         subtitle,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w400,
-                          color: AppTokens.colorTextSecondary,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
                       ),
                       const SizedBox(height: 16),

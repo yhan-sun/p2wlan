@@ -1,5 +1,5 @@
 name: p2wlan_flutter_client
-description: "Read-only Flutter prototype for the P2WLAN local daemon diagnostics API."
+description: "Flutter client for controlling the P2WLAN Rust daemon."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -30,6 +30,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  tray_manager: ^0.5.3
+  window_manager: ^0.5.2
 
 dev_dependencies:
   flutter_test:
@@ -52,6 +54,11 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/tray_icon.ico
+    - assets/tray_icon.png
+    - assets/p2wlan_icon.svg
 
   # To add assets to your application, add an assets section, like this:
   # assets:

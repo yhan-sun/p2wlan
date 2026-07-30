@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../../app/app_motion.dart';
 import '../../app/app_tokens.dart';
 
 enum StatusTone { good, warn, bad, neutral }
@@ -17,11 +16,9 @@ class StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final (bg, border, text) = _colors();
-    final duration = AppMotion.duration(context, AppTokens.durationFast);
-    return AnimatedContainer(
-      duration: duration,
-      curve: AppTokens.curveEase,
+    final surfaceColor = Theme.of(context).colorScheme.surface;
+    final (bg, border, text, dot) = _colors(surfaceColor);
+    return Container(
       constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
@@ -35,7 +32,7 @@ class StatusBadge extends StatelessWidget {
           Container(
             width: 6,
             height: 6,
-            decoration: BoxDecoration(color: text, shape: BoxShape.circle),
+            decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
           ),
           const SizedBox(width: 6),
           Flexible(
@@ -47,7 +44,7 @@ class StatusBadge extends StatelessWidget {
                 color: text,
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
-                letterSpacing: -0.1,
+                letterSpacing: 0,
                 fontFeatures: AppTokens.tabularFontFeatures,
               ),
             ),
@@ -57,26 +54,30 @@ class StatusBadge extends StatelessWidget {
     );
   }
 
-  (Color, Color, Color) _colors() {
+  (Color, Color, Color, Color) _colors(Color surface) {
     return switch (tone) {
       StatusTone.good => (
-        AppTokens.colorGoodBg,
+        surface,
         AppTokens.colorGoodBorder,
+        AppTokens.colorGoodText,
         AppTokens.colorGoodText,
       ),
       StatusTone.warn => (
-        AppTokens.colorWarnBg,
+        surface,
         AppTokens.colorWarnBorder,
+        AppTokens.colorWarnText,
         AppTokens.colorWarnText,
       ),
       StatusTone.bad => (
-        AppTokens.colorBadBg,
+        surface,
         AppTokens.colorBadBorder,
+        AppTokens.colorBadText,
         AppTokens.colorBadText,
       ),
       StatusTone.neutral => (
-        AppTokens.colorNeutralBg,
+        surface,
         AppTokens.colorNeutralBorder,
+        AppTokens.colorNeutralText,
         AppTokens.colorNeutralText,
       ),
     };

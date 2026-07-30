@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:p2wlan_flutter_client/core/models/daemon_models.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 
 void main() {
   test('app settings persist language without breaking old settings', () {
@@ -20,7 +20,7 @@ void main() {
     final raw = await File(
       'test/fixtures/status_connected.json',
     ).readAsString();
-    final snapshot = DaemonSnapshot.fromJson(
+    final snapshot = DiagnosticsSnapshot.fromJson(
       jsonDecode(raw) as Map<String, dynamic>,
     );
 

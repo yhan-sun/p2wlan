@@ -3,8 +3,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:p2wlan_flutter_client/core/api/daemon_api.dart';
-import 'package:p2wlan_flutter_client/core/models/daemon_models.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
+import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
@@ -16,7 +17,7 @@ void main() {
     tester,
   ) async {
     final stores = (await tester.runAsync(
-      () => _makeStores(api: _FakeDaemonApi(health: false)),
+      () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
     ))!;
     addTearDown(stores.dispose);
 
@@ -35,6 +36,8 @@ void main() {
     expect(find.text('GET /status'), findsOneWidget);
     expect(find.text('skipped'), findsOneWidget);
     expect(find.textContaining('GET /health is offline'), findsWidgets);
+    expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
     expect(find.byKey(const Key('auto-refresh-switch')), findsOneWidget);
   });
@@ -44,9 +47,9 @@ void main() {
   ) async {
     final stores = (await tester.runAsync(
       () => _makeStores(
-        api: _FakeDaemonApi(
+        api: _FakeDiagnosticsApi(
           health: true,
-          statusError: const DaemonApiException('status fixture failed'),
+          statusError: const DiagnosticsApiException('status fixture failed'),
         ),
       ),
     ))!;
@@ -72,7 +75,7 @@ void main() {
     tester,
   ) async {
     final stores = (await tester.runAsync(
-      () => _makeStores(api: _FakeDaemonApi(health: false)),
+      () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
     ))!;
     addTearDown(stores.dispose);
 
@@ -98,7 +101,9 @@ void main() {
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
     final stores = (await tester.runAsync(
-      () => _makeStores(api: _FakeDaemonApi(health: true, snapshot: snapshot)),
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
     ))!;
     addTearDown(stores.dispose);
 
@@ -110,6 +115,15 @@ void main() {
     expect(find.text('Summary'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
     expect(find.text('Healthy'), findsWidgets);
+    expect(find.text('Show JSON'), findsOneWidget);
+    expect(
+      find.textContaining('Full JSON is not rendered by default'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('Show JSON'));
+    await tester.pump();
+
     expect(
       find.textContaining('"node_id": "node-local-abcdef1234567890"'),
       findsOneWidget,
@@ -123,12 +137,12 @@ void main() {
   });
 }
 
-Future<DaemonSnapshot> _loadFixtureSnapshot() async {
+Future<DiagnosticsSnapshot> _loadFixtureSnapshot() async {
   final raw = await File('test/fixtures/status_connected.json').readAsString();
-  return DaemonSnapshot.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+  return DiagnosticsSnapshot.fromJson(jsonDecode(raw) as Map<String, dynamic>);
 }
 
-Future<_Stores> _makeStores({required DaemonApi api}) async {
+Future<_Stores> _makeStores({required DiagnosticsApi api}) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
@@ -136,7 +150,8 @@ Future<_Stores> _makeStores({required DaemonApi api}) async {
   await settingsStore.load();
   final statusStore = StatusStore(
     settingsStore: settingsStore,
-    daemonApi: api,
+    diagnosticsApi: api,
+    daemonController: _FakeDaemonController(api),
     autoRefreshInterval: const Duration(minutes: 5),
   );
   return _Stores(tempDir, settingsStore, statusStore);
@@ -156,29 +171,46 @@ class _Stores {
   }
 }
 
-class _FakeDaemonApi implements DaemonApi {
-  _FakeDaemonApi({required this.health, this.snapshot, this.statusError});
+class _FakeDiagnosticsApi implements DiagnosticsApi {
+  _FakeDiagnosticsApi({required this.health, this.snapshot, this.statusError});
 
   final bool health;
-  final DaemonSnapshot? snapshot;
+  final DiagnosticsSnapshot? snapshot;
   final Object? statusError;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => health;
 
   @override
-  Future<DaemonSnapshot> fetchStatus(String diagnosticsUrl) async {
+  Future<bool> requestShutdown(String diagnosticsUrl) async => true;
+
+  @override
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
     final error = statusError;
     if (error != null) throw error;
     final value = snapshot;
     if (value == null) {
-      throw const DaemonApiException('missing fixture snapshot');
+      throw const DiagnosticsApiException('missing fixture snapshot');
     }
     return value;
   }
 
   @override
   void close() {}
+}
+
+class _FakeDaemonController extends DaemonController {
+  _FakeDaemonController(DiagnosticsApi api) : super(diagnosticsApi: api);
+
+  @override
+  Future<DaemonCommandResult> start(AppSettings settings) async {
+    return const DaemonCommandResult(ok: true, message: 'fake start');
+  }
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    return const DaemonCommandResult(ok: true, message: 'fake stop');
+  }
 }
 
 class _TestApp extends StatelessWidget {

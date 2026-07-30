@@ -45,7 +45,7 @@ fn suggested_sudo_command() -> String {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let daemon_path = DaemonManager::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "p2pnet-daemon".to_string());
+        .unwrap_or_else(|| "p2wlan-daemon".to_string());
     let quoted = shell_quote(&daemon_path);
     let config_path = DaemonManager::default_config_path();
     let quoted_config = shell_quote(&config_path.display().to_string());
@@ -153,7 +153,7 @@ pub fn check_permission_status() -> PermissionStatus {
         };
 
         let recommended_action = if needs_elevation {
-            "请通过管理员授权启动 p2pnet-daemon，以允许创建虚拟网卡和修改路由。".to_string()
+            "请通过管理员授权启动 p2wlan-daemon，以允许创建虚拟网卡和修改路由。".to_string()
         } else {
             "权限已满足，TUN 创建仍需运行时验证。".to_string()
         };
@@ -300,9 +300,9 @@ pub fn check_permission_status() -> PermissionStatus {
             recommended_action: if is_admin && wintun_path.is_some() {
                 "Windows 管理员权限和 Wintun 运行库均已就绪。".to_string()
             } else if !is_admin {
-                "请点击“授权启动 TUN”，并在 Windows UAC 弹窗中确认。请确保 wintun.dll 与 p2pnet-daemon.exe 在同一目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
+                "请点击“授权启动 TUN”，并在 Windows UAC 弹窗中确认。请确保 wintun.dll 与 p2wlan-daemon.exe 在同一目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
             } else {
-                "请把 wintun.dll 放到 p2pnet-daemon.exe 或桌面客户端同级目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
+                "请把 wintun.dll 放到 p2wlan-daemon.exe 或桌面客户端同级目录，或设置 P2WLAN_WINTUN_DLL。".to_string()
             },
             sudo_command: None,
             details: vec![

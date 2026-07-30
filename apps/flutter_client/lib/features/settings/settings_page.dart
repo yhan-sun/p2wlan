@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
-import '../../core/api/daemon_api.dart';
-import '../../core/models/daemon_models.dart';
+import '../../core/api/diagnostics_api.dart';
+import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/widgets/info_card.dart';
@@ -83,7 +83,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
                                   valueColor: AlwaysStoppedAnimation<Color>(
-                                    Colors.white,
+                                    AppTokens.colorSurface,
                                   ),
                                 ),
                               )
@@ -157,9 +157,43 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 14),
             AppPanel(
-              title: strings.p1Boundary,
+              title: strings.themeMode,
+              child: DropdownButtonFormField<String>(
+                initialValue: AppThemeMode.fromCode(
+                  widget.settingsStore.settings.themeMode,
+                ).code,
+                decoration: InputDecoration(
+                  labelText: strings.themeMode,
+                  helperText: strings.themeModeHelper,
+                ),
+                items: [
+                  DropdownMenuItem(
+                    value: AppThemeMode.system.code,
+                    child: Text(strings.themeSystem),
+                  ),
+                  DropdownMenuItem(
+                    value: AppThemeMode.light.code,
+                    child: Text(strings.themeLight),
+                  ),
+                  DropdownMenuItem(
+                    value: AppThemeMode.dark.code,
+                    child: Text(strings.themeDark),
+                  ),
+                ],
+                onChanged: _saving
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          _saveThemeMode(value);
+                        }
+                      },
+              ),
+            ),
+            const SizedBox(height: 14),
+            AppPanel(
+              title: strings.daemonControl,
               child: Text(
-                strings.p1BoundaryText,
+                strings.daemonControlText,
                 style: const TextStyle(
                   fontSize: 13,
                   color: AppTokens.colorTextSecondary,
@@ -226,6 +260,31 @@ class _SettingsPageState extends State<SettingsPage> {
     } catch (error) {
       _showSnackBar(
         AppStrings.fromCode(languageCode).failedToSaveLocalSettings,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
+    }
+  }
+
+  Future<void> _saveThemeMode(String themeMode) async {
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.settingsStore.updateThemeMode(themeMode);
+      _showSnackBar(
+        AppStrings.fromCode(
+          widget.settingsStore.settings.languageCode,
+        ).themeSaved,
+      );
+    } catch (error) {
+      _showSnackBar(
+        AppStrings.fromCode(
+          widget.settingsStore.settings.languageCode,
+        ).failedToSaveLocalSettings,
       );
     } finally {
       if (mounted) {

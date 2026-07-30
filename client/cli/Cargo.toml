@@ -10,7 +10,7 @@ name = "p2wlan"
 path = "src/main.rs"
 
 [dependencies]
-p2pnet-daemon = { path = "../daemon" }
+p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -18,4 +18,3 @@ serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7"
 libc = { workspace = true }
-

@@ -1,9 +1,16 @@
 [package]
-name = "p2pnet-daemon"
+name = "p2wlan-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "P2PNet client daemon"
+description = "P2WLAN client daemon"
+
+[lib]
+name = "p2pnet_daemon"
+
+[[bin]]
+name = "p2wlan-daemon"
+path = "src/main.rs"
 
 [dependencies]
 p2pnet-tun = { path = "../tun" }

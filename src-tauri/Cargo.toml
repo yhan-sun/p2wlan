@@ -2,7 +2,7 @@
 name = "p2wlan-desktop"
 version = "0.1.66"
 description = "p2wlan desktop client console"
-authors = ["P2PNet Team"]
+authors = ["P2WLAN Team"]
 license = "MIT"
 repository = "https://github.com/yhan-sun/p2wlan"
 edition = "2021"

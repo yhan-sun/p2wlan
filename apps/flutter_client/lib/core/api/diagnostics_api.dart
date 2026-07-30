@@ -2,10 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import '../models/daemon_models.dart';
+import '../models/diagnostics_models.dart';
 
-class DaemonApi {
-  DaemonApi({HttpClient? client}) : _client = client ?? HttpClient() {
+class DiagnosticsApi {
+  DiagnosticsApi({HttpClient? client}) : _client = client ?? HttpClient() {
     _client.connectionTimeout = _requestTimeout;
   }
 
@@ -25,18 +25,33 @@ class DaemonApi {
     }
   }
 
-  Future<DaemonSnapshot> fetchStatus(String diagnosticsUrl) async {
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
     final body = await _getText(
       _endpoint(diagnosticsUrl, '/status'),
       'application/json',
     );
     final decoded = jsonDecode(body);
     if (decoded is! Map<String, dynamic>) {
-      throw const DaemonApiException(
-        'Daemon /status did not return a JSON object',
+      throw const DiagnosticsApiException(
+        'Diagnostics endpoint /status did not return a JSON object',
       );
     }
-    return DaemonSnapshot.fromJson(decoded);
+    return DiagnosticsSnapshot.fromJson(decoded);
+  }
+
+  Future<bool> requestShutdown(String diagnosticsUrl) async {
+    try {
+      final request = await _client
+          .postUrl(_endpoint(diagnosticsUrl, '/shutdown'))
+          .timeout(_requestTimeout);
+      request.headers.set(HttpHeaders.acceptHeader, 'text/plain');
+      request.headers.contentLength = 0;
+      final response = await request.close().timeout(_requestTimeout);
+      await response.drain<void>();
+      return response.statusCode >= 200 && response.statusCode < 300;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<String> _getText(Uri uri, String accept) async {
@@ -45,7 +60,7 @@ class DaemonApi {
     final response = await request.close().timeout(_requestTimeout);
     final body = await utf8.decodeStream(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw DaemonApiException(
+      throw DiagnosticsApiException(
         'GET ${uri.path} returned HTTP ${response.statusCode}',
       );
     }
@@ -62,8 +77,8 @@ class DaemonApi {
   }
 }
 
-class DaemonApiException implements Exception {
-  const DaemonApiException(this.message);
+class DiagnosticsApiException implements Exception {
+  const DiagnosticsApiException(this.message);
 
   final String message;
 

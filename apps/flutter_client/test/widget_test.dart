@@ -6,10 +6,10 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
 
 void main() {
-  testWidgets('renders the read-only console shell', (tester) async {
+  testWidgets('renders the P2WLAN client shell', (tester) async {
     await _pumpTestApp(tester);
 
-    expect(find.text('P2WLAN Diagnostics'), findsOneWidget);
+    expect(find.text('P2WLAN'), findsOneWidget);
     expect(find.text('Dashboard'), findsWidgets);
     expect(find.text('Offline'), findsWidgets);
   });
@@ -21,7 +21,7 @@ void main() {
     await tester.pump();
 
     expect(find.text('Diagnostics URL'), findsWidgets);
-    expect(find.text('P1 boundary'), findsOneWidget);
+    expect(find.text('Daemon control'), findsOneWidget);
   });
 
   testWidgets('switches the shell language to simplified Chinese', (
@@ -38,7 +38,7 @@ void main() {
 
     expect(find.text('设置'), findsWidgets);
     expect(find.text('诊断 URL'), findsWidgets);
-    expect(find.text('P1 边界'), findsOneWidget);
+    expect(find.text('守护进程控制'), findsOneWidget);
   });
 }
 

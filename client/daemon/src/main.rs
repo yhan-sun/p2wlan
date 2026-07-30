@@ -1,4 +1,4 @@
-//! # P2PNet Daemon
+//! # P2WLAN Daemon
 //!
 //! The main client daemon that runs the P2P virtual network.
 
@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "p2pnet-daemon")]
+#[command(name = "p2wlan-daemon")]
 #[command(version)]
-#[command(about = "P2PNet client daemon", long_about = None)]
+#[command(about = "P2WLAN client daemon", long_about = None)]
 struct Cli {
     /// Run with default config or specify config file path
-    #[arg(long, default_value = "p2pnet-config.json")]
+    #[arg(long, default_value = "p2wlan-config.json")]
     config: PathBuf,
 
     /// Generate a new config
@@ -22,7 +22,7 @@ struct Cli {
     init: bool,
 
     /// Control plane server URL
-    #[arg(long, default_value = "https://control.p2pnet.io")]
+    #[arg(long, default_value = "https://control.p2wlan.io")]
     control: String,
 
     /// Network ID to join or initialize
@@ -48,6 +48,10 @@ struct Cli {
     /// Run in manual/offline mode (disable control-plane auto-assignment)
     #[arg(long)]
     manual: bool,
+
+    /// Run in managed mode (enable control-plane auto-assignment)
+    #[arg(long, conflicts_with = "manual")]
+    managed: bool,
 
     /// Override subnet mask
     #[arg(long)]
@@ -139,6 +143,10 @@ struct Cli {
 }
 
 fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
+    if cli.manual && cli.managed {
+        return Err("--manual and --managed cannot be used together".to_string());
+    }
+
     // Validate control plane URL
     let control_url = match reqwest::Url::parse(&cli.control) {
         Ok(url) => url,
@@ -324,7 +332,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
-    info!("P2PNet Daemon starting...");
+    info!("P2WLAN daemon starting...");
     info!("Platform: {}", std::env::consts::OS);
 
     // Check for --init flag (generate new config)
@@ -511,6 +519,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.manual {
         config.network.manual = true;
     }
+    if cli.managed {
+        config.network.manual = false;
+    }
     if let Some(ref netmask) = cli.netmask {
         config.network.netmask = netmask.clone();
     }
@@ -600,7 +611,7 @@ mod tests {
     fn network_arguments_override_generated_config() {
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let cli = Cli {
-            config: PathBuf::from("p2pnet-config.json"),
+            config: PathBuf::from("p2wlan-config.json"),
             init: false,
             control: "http://127.0.0.1".to_string(),
             network: "default".to_string(),
@@ -609,6 +620,7 @@ mod tests {
             interface: None,
             address: None,
             manual: false,
+            managed: false,
             netmask: Some("255.255.255.255".to_string()),
             mtu: None,
             heartbeat_interval: None,
@@ -653,15 +665,16 @@ mod tests {
     fn test_validate_cli_invalid_cases() {
         // Create base Cli
         let base_cli = Cli {
-            config: PathBuf::from("p2pnet-config.json"),
+            config: PathBuf::from("p2wlan-config.json"),
             init: false,
-            control: "https://control.p2pnet.io".to_string(),
+            control: "https://control.p2wlan.io".to_string(),
             network: "default".to_string(),
             status: false,
             token: None,
             interface: None,
             address: None,
             manual: false,
+            managed: false,
             netmask: None,
             mtu: None,
             heartbeat_interval: None,
@@ -755,6 +768,57 @@ mod tests {
         assert!(validate_cli(&cli).is_ok());
         cli.socket_pool = Some("5".to_string());
         assert!(validate_cli(&cli).is_err());
+
+        cli.socket_pool = None;
+        cli.manual = true;
+        cli.managed = true;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn managed_argument_overrides_existing_manual_config() {
+        let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        config.network.manual = true;
+
+        let cli = Cli {
+            config: PathBuf::from("p2wlan-config.json"),
+            init: false,
+            control: "http://127.0.0.1".to_string(),
+            network: "default".to_string(),
+            status: false,
+            token: Some("test-token".to_string()),
+            interface: None,
+            address: None,
+            manual: false,
+            managed: true,
+            netmask: None,
+            mtu: None,
+            heartbeat_interval: None,
+            udp_bind: None,
+            udp_advertise: None,
+            stun: None,
+            stun_timeout_ms: None,
+            punch_interval_ms: None,
+            punch_attempts: None,
+            socket_pool: None,
+            keepalive_interval_secs: None,
+            relay: None,
+            relay_regions: None,
+            relay_selection_timeout_ms: None,
+            relay_fallback_timeout_ms: None,
+            diagnostics_bind: None,
+            diagnostics_disable: false,
+            prefer_relay: false,
+            prefer_direct: false,
+            device_name: None,
+            diagnostics_url: None,
+            log_file: None,
+        };
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert!(!config.network.manual);
+        assert_eq!(config.control.auth_token, "test-token");
     }
 
     #[test]
@@ -763,7 +827,7 @@ mod tests {
 
         // Verify valid parsing
         let parsed = Cli::try_parse_from([
-            "p2pnet-daemon",
+            "p2wlan-daemon",
             "--config",
             "custom.json",
             "--control",
@@ -780,14 +844,14 @@ mod tests {
         assert!(cli.init);
 
         // Verify version and help parse cleanly
-        let parsed_help = Cli::try_parse_from(["p2pnet-daemon", "--help"]);
+        let parsed_help = Cli::try_parse_from(["p2wlan-daemon", "--help"]);
         assert!(parsed_help.is_err()); // Clap returns an Error of kind DisplayHelp
         assert_eq!(
             parsed_help.unwrap_err().kind(),
             clap::error::ErrorKind::DisplayHelp
         );
 
-        let parsed_version = Cli::try_parse_from(["p2pnet-daemon", "--version"]);
+        let parsed_version = Cli::try_parse_from(["p2wlan-daemon", "--version"]);
         assert!(parsed_version.is_err());
         assert_eq!(
             parsed_version.unwrap_err().kind(),

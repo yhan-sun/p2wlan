@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
-import '../../core/models/daemon_models.dart';
+import '../../core/models/diagnostics_models.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/widgets/info_card.dart';
@@ -42,7 +42,7 @@ class _Summary extends StatelessWidget {
   const _Summary({required this.statusStore, required this.snapshot});
 
   final StatusStore statusStore;
-  final DaemonSnapshot? snapshot;
+  final DiagnosticsSnapshot? snapshot;
 
   @override
   Widget build(BuildContext context) {
@@ -74,10 +74,10 @@ class _Summary extends StatelessWidget {
             detail: strings.statusMessage(statusStore.lastStatusError),
           ),
           MetricTile(
-            label: strings.daemonHealth,
+            label: strings.serviceHealth,
             value: health == null
                 ? '—'
-                : strings.daemonHealthStatus(health.status),
+                : strings.healthStatusLabel(health.status),
           ),
           MetricTile(
             label: strings.controlConnected,
@@ -132,7 +132,7 @@ class _RawJson extends StatefulWidget {
   const _RawJson({required this.statusStore, required this.snapshot});
 
   final StatusStore statusStore;
-  final DaemonSnapshot? snapshot;
+  final DiagnosticsSnapshot? snapshot;
 
   @override
   State<_RawJson> createState() => _RawJsonState();
@@ -140,45 +140,60 @@ class _RawJson extends StatefulWidget {
 
 class _RawJsonState extends State<_RawJson> {
   var _copied = false;
+  var _expanded = false;
+  DiagnosticsSnapshot? _cachedSnapshot;
+  String? _cachedPrettyJson;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final raw = widget.snapshot?.prettyJson ?? _readableErrorJson();
     return AppPanel(
       title: strings.rawStatusJson,
-      trailing: OutlinedButton.icon(
-        onPressed: () => _copy(raw),
-        icon: Icon(
-          _copied ? Icons.check_circle_outline : Icons.copy_all_outlined,
-          size: 16,
-        ),
-        label: Text(_copied ? strings.copied : strings.copy),
-      ),
-      child: Container(
-        width: double.infinity,
-        constraints: const BoxConstraints(minHeight: 240),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: AppTokens.colorConsoleBg,
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-          border: Border.all(color: AppTokens.colorConsoleBorder),
-        ),
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SelectableText(
-            raw,
-            style: const TextStyle(
-              color: AppTokens.colorConsoleText,
-              fontFamily: 'monospace',
-              fontSize: 12.5,
-              height: 1.4,
-              fontFeatures: AppTokens.tabularFontFeatures,
+      trailing: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          OutlinedButton.icon(
+            onPressed: () => setState(() => _expanded = !_expanded),
+            icon: Icon(
+              _expanded
+                  ? Icons.unfold_less_outlined
+                  : Icons.unfold_more_outlined,
+              size: 16,
             ),
+            label: Text(_expanded ? strings.hideRawJson : strings.showRawJson),
           ),
-        ),
+          OutlinedButton.icon(
+            onPressed: () => _copy(_rawJson()),
+            icon: Icon(
+              _copied ? Icons.check_circle_outline : Icons.copy_all_outlined,
+              size: 16,
+            ),
+            label: Text(_copied ? strings.copied : strings.copy),
+          ),
+        ],
       ),
+      child: _expanded
+          ? _RawJsonConsole(raw: _rawJson())
+          : Text(
+              strings.rawJsonCollapsed,
+              style: const TextStyle(
+                fontSize: 13,
+                height: 1.35,
+                color: AppTokens.colorTextSecondary,
+              ),
+            ),
     );
+  }
+
+  String _rawJson() {
+    final snapshot = widget.snapshot;
+    if (snapshot == null) return _readableErrorJson();
+    if (!identical(snapshot, _cachedSnapshot)) {
+      _cachedSnapshot = snapshot;
+      _cachedPrettyJson = snapshot.prettyJson;
+    }
+    return _cachedPrettyJson!;
   }
 
   String _readableErrorJson() {
@@ -220,5 +235,38 @@ class _RawJsonState extends State<_RawJson> {
     if (mounted) {
       setState(() => _copied = false);
     }
+  }
+}
+
+class _RawJsonConsole extends StatelessWidget {
+  const _RawJsonConsole({required this.raw});
+
+  final String raw;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(minHeight: 220),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTokens.colorConsoleBg,
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+        border: Border.all(color: AppTokens.colorConsoleBorder),
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Text(
+          raw,
+          style: const TextStyle(
+            color: AppTokens.colorConsoleText,
+            fontFamily: 'monospace',
+            fontSize: 12.5,
+            height: 1.4,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
+      ),
+    );
   }
 }

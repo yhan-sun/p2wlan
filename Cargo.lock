@@ -2244,6 +2244,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libxdo"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00333b8756a3d28e78def82067a377de7fa61b24909000aeaa2b446a948d14db"
+dependencies = [
+ "libxdo-sys",
+]
+
+[[package]]
+name = "libxdo-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db23b9e7e2b7831bbd8aac0bbeeeb7b68cbebc162b227e7052e8e55829a09212"
+dependencies = [
+ "libc",
+ "x11",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,6 +2373,7 @@ dependencies = [
  "dpi",
  "gtk",
  "keyboard-types",
+ "libxdo",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -2779,32 +2799,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p2pnet-daemon"
-version = "0.1.66"
-dependencies = [
- "bytes",
- "clap",
- "futures-util",
- "hex",
- "igd-next",
- "libc",
- "p2pnet-crypto",
- "p2pnet-nat",
- "p2pnet-relay",
- "p2pnet-tun",
- "p2pnet-wireguard",
- "rand 0.8.7",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "p2pnet-nat"
 version = "0.1.66"
 dependencies = [
@@ -2873,12 +2867,38 @@ version = "0.1.66"
 dependencies = [
  "clap",
  "libc",
- "p2pnet-daemon",
+ "p2wlan-daemon",
  "reqwest 0.12.28",
  "rpassword",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "p2wlan-daemon"
+version = "0.1.66"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures-util",
+ "hex",
+ "igd-next",
+ "libc",
+ "p2pnet-crypto",
+ "p2pnet-nat",
+ "p2pnet-relay",
+ "p2pnet-tun",
+ "p2pnet-wireguard",
+ "rand 0.8.7",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2914,6 +2934,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "p2wlan-tray"
+version = "0.1.66"
+dependencies = [
+ "p2wlan-desktop-host",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tao",
+ "tray-icon",
 ]
 
 [[package]]
@@ -3476,7 +3507,9 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",

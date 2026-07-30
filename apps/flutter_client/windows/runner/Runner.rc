@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "P2WLAN" "\0"
-            VALUE "FileDescription", "P2WLAN Diagnostics" "\0"
+            VALUE "FileDescription", "P2WLAN" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "p2wlan_flutter_client" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 P2WLAN. All rights reserved." "\0"
             VALUE "OriginalFilename", "p2wlan_flutter_client.exe" "\0"
-            VALUE "ProductName", "P2WLAN Diagnostics" "\0"
+            VALUE "ProductName", "P2WLAN" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

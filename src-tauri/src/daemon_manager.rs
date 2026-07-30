@@ -157,7 +157,7 @@ impl DaemonManager {
             if let Some(pid) = Self::read_pid_file(&pid_path) {
                 let is_daemon = Self::process_exists(pid)
                     && Self::process_command_line(pid)
-                        .map(|command_line| command_line.contains("p2pnet-daemon"))
+                        .map(|command_line| command_line.contains("p2wlan-daemon"))
                         .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
                 if is_daemon {
                     if Self::read_persisted_diagnostics_url().is_some() {
@@ -233,7 +233,7 @@ impl DaemonManager {
             if let Some(pid) = Self::read_pid_file(&pid_path) {
                 let is_daemon = Self::process_exists(pid)
                     && Self::process_command_line(pid)
-                        .map(|command_line| command_line.contains("p2pnet-daemon"))
+                        .map(|command_line| command_line.contains("p2wlan-daemon"))
                         .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
                 if is_daemon {
                     return true;
@@ -254,7 +254,7 @@ impl DaemonManager {
                     }
                     let _ = std::fs::write(pid_path, pid.to_string());
                 }
-                log::info!("Recovered running p2pnet-daemon PID {pid} for diagnostics {bind_addr}");
+                log::info!("Recovered running p2wlan-daemon PID {pid} for diagnostics {bind_addr}");
                 return true;
             }
         }
@@ -468,9 +468,9 @@ impl DaemonManager {
 
         // 2. Side-by-side release layout next to the desktop executable.
         let binary_name = if cfg!(windows) {
-            "p2pnet-daemon.exe"
+            "p2wlan-daemon.exe"
         } else {
-            "p2pnet-daemon"
+            "p2wlan-daemon"
         };
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(exe_dir) = current_exe.parent() {
@@ -488,7 +488,7 @@ impl DaemonManager {
         }
 
         // 3. Dev locations relative to project root
-        // Let's check target/debug/p2pnet-daemon or target/release/p2pnet-daemon relative to project root or workspace dirs
+        // Let's check target/debug/p2wlan-daemon or target/release/p2wlan-daemon relative to project root or workspace dirs
 
         // If target is inside workspace target
         // Let's traverse up to find target/debug or target/release
@@ -510,7 +510,7 @@ impl DaemonManager {
         }
 
         // 4. PATH search
-        if let Ok(path) = which::which("p2pnet-daemon") {
+        if let Ok(path) = which::which("p2wlan-daemon") {
             return Some(path);
         }
 
@@ -859,7 +859,7 @@ impl DaemonManager {
     }
 
     pub fn recent_daemon_log_lines(max_lines: usize) -> Vec<String> {
-        let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
+        let log_path = Self::default_log_dir().join("p2wlan-daemon.log");
         p2wlan_desktop_host::recent_daemon_log_lines(log_path, max_lines).unwrap_or_default()
     }
 
@@ -942,7 +942,7 @@ impl DaemonManager {
 
     fn process_name_matches_daemon(pid: u32) -> bool {
         if let Some(command_line) = Self::process_command_line(pid) {
-            return command_line.contains("p2pnet-daemon");
+            return command_line.contains("p2wlan-daemon");
         }
 
         #[cfg(windows)]
@@ -957,7 +957,7 @@ impl DaemonManager {
                 return false;
             }
             let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            stdout.contains("p2pnet-daemon.exe")
+            stdout.contains("p2wlan-daemon.exe")
         }
 
         #[cfg(not(windows))]
@@ -1033,13 +1033,13 @@ impl DaemonManager {
         }
 
         Some(format!(
-            "检测到已有 p2pnet-daemon 占用诊断端点，但它不是当前客户端要启动的守护进程。\n当前运行 PID：{pid}\n当前运行命令：{command_line}\n当前需要：{}\n请先停止 TUN，或执行：sudo kill {pid}",
+            "检测到已有 p2wlan-daemon 占用诊断端点，但它不是当前客户端要启动的守护进程。\n当前运行 PID：{pid}\n当前运行命令：{command_line}\n当前需要：{}\n请先停止 TUN，或执行：sudo kill {pid}",
             expected_bin.display()
         ))
     }
 
     fn command_line_matches_daemon_bind(command_line: &str, bind_addr: &str) -> bool {
-        command_line.contains("p2pnet-daemon")
+        command_line.contains("p2wlan-daemon")
             && command_line.contains("--diagnostics-bind")
             && command_line.contains(bind_addr)
     }
@@ -1080,7 +1080,7 @@ impl DaemonManager {
         {
             let escaped_bind = bind_addr.replace('\'', "''");
             let script = format!(
-                "$p = Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*p2pnet-daemon*' -and $_.CommandLine -like '*--diagnostics-bind*' -and $_.CommandLine -like '*{escaped_bind}*' }} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) {{ $p }}"
+                "$p = Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*p2wlan-daemon*' -and $_.CommandLine -like '*--diagnostics-bind*' -and $_.CommandLine -like '*{escaped_bind}*' }} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) {{ $p }}"
             );
             let output = Self::windows_hidden_command("powershell.exe")
                 .args(["-NoProfile", "-Command", &script])
@@ -1127,7 +1127,7 @@ impl DaemonManager {
                     continue;
                 }
                 let command_line = trimmed[split_at..].trim_start();
-                if command_line.contains("p2pnet-daemon") {
+                if command_line.contains("p2wlan-daemon") {
                     matches.push(pid);
                 }
             }
@@ -1143,7 +1143,7 @@ impl DaemonManager {
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name = 'p2pnet-daemon.exe'\" | Select-Object -ExpandProperty ProcessId",
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'p2wlan-daemon.exe'\" | Select-Object -ExpandProperty ProcessId",
                 ])
                 .output()
                 .ok()?;
@@ -1248,12 +1248,12 @@ impl DaemonManager {
             return Ok(false);
         }
         let verified = Self::process_command_line(pid)
-            .map(|command_line| command_line.contains("p2pnet-daemon"))
+            .map(|command_line| command_line.contains("p2wlan-daemon"))
             .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
         if !verified {
             Self::remove_pid_file(pid_path);
             return Err(format!(
-                "PID 文件指向的进程不是 p2pnet-daemon，已拒绝结束进程：{}",
+                "PID 文件指向的进程不是 p2wlan-daemon，已拒绝结束进程：{}",
                 pid_path.display()
             ));
         }
@@ -1273,7 +1273,7 @@ impl DaemonManager {
             "--diagnostics-bind".to_string(),
             bind_addr.to_string(),
         ];
-        let mut push_pair = |flag: &str, value: Option<&str>| {
+        fn push_pair(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
             if let Some(value) = value {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
@@ -1281,15 +1281,27 @@ impl DaemonManager {
                     args.push(trimmed.to_string());
                 }
             }
-        };
-        push_pair("--control", options.control_server.as_deref());
-        push_pair("--token", options.auth_token.as_deref());
-        push_pair("--network", options.network_id.as_deref());
-        push_pair("--device-name", options.device_name.as_deref());
-        push_pair("--interface", options.tun_interface.as_deref());
-        push_pair("--udp-bind", options.udp_bind.as_deref());
-        push_pair("--udp-advertise", options.udp_advertise.as_deref());
-        push_pair("--socket-pool", options.socket_pool.as_deref());
+        }
+
+        push_pair(&mut args, "--control", options.control_server.as_deref());
+        if options
+            .auth_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            args.push("--managed".to_string());
+        }
+        push_pair(&mut args, "--token", options.auth_token.as_deref());
+        push_pair(&mut args, "--network", options.network_id.as_deref());
+        push_pair(&mut args, "--device-name", options.device_name.as_deref());
+        push_pair(&mut args, "--interface", options.tun_interface.as_deref());
+        push_pair(&mut args, "--udp-bind", options.udp_bind.as_deref());
+        push_pair(
+            &mut args,
+            "--udp-advertise",
+            options.udp_advertise.as_deref(),
+        );
+        push_pair(&mut args, "--socket-pool", options.socket_pool.as_deref());
         if let Some(mtu) = options.mtu {
             args.push("--mtu".to_string());
             args.push(mtu.to_string());
@@ -1494,7 +1506,7 @@ impl DaemonManager {
         if let Some(pid) = Self::read_pid_file(&pid_path) {
             if Self::process_exists(pid) {
                 let verified = Self::process_command_line(pid)
-                    .map(|command_line| command_line.contains("p2pnet-daemon"))
+                    .map(|command_line| command_line.contains("p2wlan-daemon"))
                     .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
                 if verified {
                     let _ = Self::append_launcher_log(
@@ -1597,7 +1609,7 @@ impl DaemonManager {
         // freshly built target/debug daemon.
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。请确认它与桌面客户端在同一目录，或设置 P2WLAN_DAEMON_BIN。".to_string())?;
+            .ok_or_else(|| "找不到 p2wlan-daemon 可执行文件。请确认它与桌面客户端在同一目录，或设置 P2WLAN_DAEMON_BIN。".to_string())?;
 
         // 1. Is daemon already running?
         if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
@@ -1609,7 +1621,7 @@ impl DaemonManager {
 
         if !Self::has_network_admin_privileges() {
             return Err(
-                "当前桌面客户端没有网络管理权限，不能直接创建 TUN 网卡或修改路由。请在配置向导中复制 sudo 命令启动 p2pnet-daemon，或先保持一个外部 sudo daemon 运行。"
+                "当前桌面客户端没有网络管理权限，不能直接创建 TUN 网卡或修改路由。请在配置向导中复制 sudo 命令启动 p2wlan-daemon，或先保持一个外部 sudo daemon 运行。"
                     .to_string(),
             );
         }
@@ -1725,7 +1737,7 @@ impl DaemonManager {
         // freshly built target/debug daemon.
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let bin_path = Self::resolve_daemon_binary(Some("P2WLAN_DAEMON_BIN"), &current_dir)
-            .ok_or_else(|| "找不到 p2pnet-daemon 可执行文件。".to_string())?;
+            .ok_or_else(|| "找不到 p2wlan-daemon 可执行文件。".to_string())?;
 
         if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
             if let Some(error) = Self::existing_daemon_binary_conflict(pid, &bin_path) {
@@ -1747,7 +1759,7 @@ impl DaemonManager {
 
         #[cfg(target_os = "windows")]
         {
-            let log_path = Self::default_log_dir().join("p2pnet-daemon.log");
+            let log_path = Self::default_log_dir().join("p2wlan-daemon.log");
             Self::cleanup_stale_windows_daemon_before_start(&preferred_url, &log_path).await?;
             if let Some(pid) = Self::diagnostics_process_id(&preferred_url).await {
                 if let Some(error) = Self::existing_daemon_binary_conflict(pid, &bin_path) {
@@ -1778,7 +1790,7 @@ impl DaemonManager {
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             let config_path = Self::default_config_path();
             let log_dir = Self::default_log_dir();
-            let log_path = log_dir.join("p2pnet-daemon.log");
+            let log_path = log_dir.join("p2wlan-daemon.log");
             let pid_path = Self::default_pid_path();
             Self::remove_pid_file(&pid_path);
 
@@ -1857,7 +1869,7 @@ impl DaemonManager {
             let bind_addr = Self::diagnostics_bind_from_url(&target_url);
             let config_path = Self::default_config_path();
             let log_dir = Self::default_log_dir();
-            let log_path = log_dir.join("p2pnet-daemon.log");
+            let log_path = log_dir.join("p2wlan-daemon.log");
             let pid_path = Self::default_pid_path();
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -1987,7 +1999,7 @@ impl DaemonManager {
         let mut last_termination_error = None;
         if let Some(pid) = Self::diagnostics_process_id(&target_url).await {
             let verified = Self::process_command_line(pid)
-                .map(|command_line| command_line.contains("p2pnet-daemon"))
+                .map(|command_line| command_line.contains("p2wlan-daemon"))
                 .unwrap_or_else(|| Self::process_name_matches_daemon(pid));
             if verified {
                 match Self::terminate_pid(pid) {
@@ -2043,7 +2055,7 @@ impl DaemonManager {
                 .map(|error| format!(" 普通关闭/结束进程失败：{error}"))
                 .unwrap_or_default();
             Err(format!(
-                "已请求守护进程关闭，但它仍在运行。关闭路径不会再次请求管理员授权。{detail} 请手动执行 sudo kill <p2pnet-daemon PID>，或重启后再启动 TUN。诊断地址：{}",
+                "已请求守护进程关闭，但它仍在运行。关闭路径不会再次请求管理员授权。{detail} 请手动执行 sudo kill <p2wlan-daemon PID>，或重启后再启动 TUN。诊断地址：{}",
                 target_url
             ))
         }
@@ -2204,7 +2216,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let script = temp_dir.path().join("p2pnet-daemon-test");
+        let script = temp_dir.path().join("p2wlan-daemon-test");
         std::fs::write(
             &script,
             "#!/bin/sh\ntrap 'kill \"$child\" 2>/dev/null' TERM EXIT\nsleep 30 &\nchild=$!\nwait \"$child\"\n",
@@ -2511,9 +2523,9 @@ mod tests {
     fn test_resolve_daemon_binary_priority() {
         let temp_dir = tempfile::tempdir().unwrap();
         let fake_bin = temp_dir.path().join(if cfg!(windows) {
-            "p2pnet-daemon.exe"
+            "p2wlan-daemon.exe"
         } else {
-            "p2pnet-daemon"
+            "p2wlan-daemon"
         });
         std::fs::write(&fake_bin, "dummy binary").unwrap();
 
@@ -2619,7 +2631,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let endpoint_path = temp_dir.path().join("p2pnet-daemon.endpoint");
+        let endpoint_path = temp_dir.path().join("p2wlan-daemon.endpoint");
         std::fs::write(&endpoint_path, "http://127.0.0.1:1/status").unwrap();
         std::fs::set_permissions(&endpoint_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
@@ -2644,11 +2656,11 @@ mod tests {
     #[test]
     fn test_command_line_matches_daemon_bind() {
         assert!(DaemonManager::command_line_matches_daemon_bind(
-            "/tmp/p2pnet-daemon --diagnostics-bind 127.0.0.1:39277 --control http://x",
+            "/tmp/p2wlan-daemon --diagnostics-bind 127.0.0.1:39277 --control http://x",
             "127.0.0.1:39277"
         ));
         assert!(!DaemonManager::command_line_matches_daemon_bind(
-            "/tmp/p2pnet-daemon --diagnostics-bind 127.0.0.1:39278",
+            "/tmp/p2wlan-daemon --diagnostics-bind 127.0.0.1:39278",
             "127.0.0.1:39277"
         ));
         assert!(!DaemonManager::command_line_matches_daemon_bind(
@@ -2665,14 +2677,14 @@ mod tests {
             .join("target")
             .join("debug")
             .join(if cfg!(windows) {
-                "p2pnet-daemon.exe"
+                "p2wlan-daemon.exe"
             } else {
-                "p2pnet-daemon"
+                "p2wlan-daemon"
             });
         let installed = if cfg!(windows) {
-            "C:\\Program Files\\p2wlan\\p2pnet-daemon.exe"
+            "C:\\Program Files\\p2wlan\\p2wlan-daemon.exe"
         } else {
-            "/Applications/p2wlan.app/Contents/Resources/p2pnet-daemon"
+            "/Applications/p2wlan.app/Contents/Resources/p2wlan-daemon"
         };
 
         assert!(DaemonManager::daemon_command_line_uses_binary(
@@ -2688,7 +2700,7 @@ mod tests {
     #[test]
     fn test_default_config_path_uses_p2wlan_config_dir() {
         let path = DaemonManager::default_config_path();
-        assert!(path.ends_with("p2wlan/p2pnet-config.json"));
+        assert!(path.ends_with("p2wlan/p2wlan-config.json"));
     }
 
     #[test]
@@ -2716,7 +2728,7 @@ mod tests {
             "authToken": "token",
             "networkId": "default",
             "deviceName": "mac",
-            "tunInterface": "p2pnet0",
+            "tunInterface": "p2wlan0",
             "udpBind": "0.0.0.0:60207",
             "udpAdvertise": "203.0.113.10:60207",
             "socketPool": "3",
@@ -2734,7 +2746,7 @@ mod tests {
         assert_eq!(options.auth_token.as_deref(), Some("token"));
         assert_eq!(options.network_id.as_deref(), Some("default"));
         assert_eq!(options.device_name.as_deref(), Some("mac"));
-        assert_eq!(options.tun_interface.as_deref(), Some("p2pnet0"));
+        assert_eq!(options.tun_interface.as_deref(), Some("p2wlan0"));
         assert_eq!(options.udp_bind.as_deref(), Some("0.0.0.0:60207"));
         assert_eq!(options.udp_advertise.as_deref(), Some("203.0.113.10:60207"));
         assert_eq!(options.socket_pool.as_deref(), Some("3"));
@@ -2749,7 +2761,7 @@ mod tests {
             "authToken": "token",
             "networkId": "default",
             "deviceName": "mac",
-            "tunInterface": "p2pnet0",
+            "tunInterface": "p2wlan0",
             "udpBind": "0.0.0.0:60207",
             "udpAdvertise": "203.0.113.10:60207",
             "socketPool": "3",
@@ -2847,7 +2859,7 @@ mod tests {
         let args = DaemonManager::build_args(
             &options,
             "127.0.0.1:39277",
-            Path::new("/tmp/p2pnet-config.json"),
+            Path::new("/tmp/p2wlan-config.json"),
         );
         assert!(args
             .windows(2)
@@ -2856,6 +2868,7 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--udp-advertise", "203.0.113.10:60207"]));
         assert!(args.windows(2).any(|pair| pair == ["--socket-pool", "3"]));
+        assert!(args.iter().any(|arg| arg == "--managed"));
     }
 
     #[test]
@@ -2881,10 +2894,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_elevated_shell_does_not_use_nohup() {
-        let bin_path = PathBuf::from("/tmp/p2 wlan/p2pnet-daemon");
-        let config_path = PathBuf::from("/tmp/p2 wlan/config/p2pnet-config.json");
+        let bin_path = PathBuf::from("/tmp/p2 wlan/p2wlan-daemon");
+        let config_path = PathBuf::from("/tmp/p2 wlan/config/p2wlan-config.json");
         let log_dir = PathBuf::from("/tmp/p2 wlan/logs");
-        let log_path = log_dir.join("p2pnet-daemon.log");
+        let log_path = log_dir.join("p2wlan-daemon.log");
         let args = vec![
             "--config".to_string(),
             config_path.display().to_string(),
@@ -2897,11 +2910,11 @@ mod tests {
             &config_path,
             &log_dir,
             &log_path,
-            &log_dir.join("p2pnet-daemon.pid"),
+            &log_dir.join("p2wlan-daemon.pid"),
         );
         assert!(!shell.contains("nohup"));
         assert!(shell.contains("< /dev/null &"));
-        assert!(shell.contains("P2WLAN_DAEMON_BIN='/tmp/p2 wlan/p2pnet-daemon'"));
+        assert!(shell.contains("P2WLAN_DAEMON_BIN='/tmp/p2 wlan/p2wlan-daemon'"));
         assert!(shell.contains("'tok'\\''en'"));
     }
 }
