@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app/app_constants.dart';
 import '../app/app_motion.dart';
+import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
@@ -12,14 +13,13 @@ import '../features/settings/settings_page.dart';
 import '../shared/widgets/status_badge.dart';
 
 enum P2WlanSection {
-  dashboard('Dashboard', Icons.dashboard_outlined),
-  nodes('Nodes', Icons.hub_outlined),
-  diagnostics('Diagnostics', Icons.monitor_heart_outlined),
-  settings('Settings', Icons.settings_outlined);
+  dashboard(Icons.dashboard_outlined),
+  nodes(Icons.hub_outlined),
+  diagnostics(Icons.monitor_heart_outlined),
+  settings(Icons.settings_outlined);
 
-  const P2WlanSection(this.label, this.icon);
+  const P2WlanSection(this.icon);
 
-  final String label;
   final IconData icon;
 }
 
@@ -42,100 +42,72 @@ class _P2WlanShellState extends State<P2WlanShell> {
 
   @override
   Widget build(BuildContext context) {
-    final pages = {
-      P2WlanSection.dashboard: DashboardPage(
+    final strings = AppStringsScope.of(context);
+    final duration = AppMotion.duration(context, AppTokens.durationFast);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= 900;
+        final body = _buildBody();
+
+        final content = AnimatedSwitcher(
+          duration: duration,
+          switchInCurve: AppTokens.curveEase,
+          switchOutCurve: AppTokens.curveEase,
+          child: KeyedSubtree(key: ValueKey(_section), child: body),
+        );
+
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text(p2wlanAppName),
+            centerTitle: false,
+            actions: [
+              _ShellStatusActions(statusStore: widget.statusStore),
+              const SizedBox(width: 8),
+            ],
+          ),
+          body: wide
+              ? _WideShell(
+                  body: content,
+                  selected: _section,
+                  strings: strings,
+                  onSelect: _select,
+                )
+              : content,
+          bottomNavigationBar: wide
+              ? null
+              : NavigationBar(
+                  selectedIndex: _section.index,
+                  onDestinationSelected: (index) =>
+                      _select(P2WlanSection.values[index]),
+                  destinations: [
+                    for (final item in P2WlanSection.values)
+                      NavigationDestination(
+                        icon: Icon(item.icon),
+                        label: strings.sectionLabel(item.name),
+                      ),
+                  ],
+                ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBody() {
+    return switch (_section) {
+      P2WlanSection.dashboard => DashboardPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
       ),
-      P2WlanSection.nodes: NodesPage(statusStore: widget.statusStore),
-      P2WlanSection.diagnostics: DiagnosticsPage(
+      P2WlanSection.nodes => NodesPage(statusStore: widget.statusStore),
+      P2WlanSection.diagnostics => DiagnosticsPage(
         statusStore: widget.statusStore,
       ),
-      P2WlanSection.settings: SettingsPage(
+      P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
       ),
     };
-
-    final duration = AppMotion.duration(context, AppTokens.durationFast);
-
-    return AnimatedBuilder(
-      animation: widget.statusStore,
-      builder: (context, _) {
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final wide = constraints.maxWidth >= 900;
-            final body = pages[_section]!;
-
-            final content = AnimatedSwitcher(
-              duration: duration,
-              switchInCurve: AppTokens.curveEase,
-              switchOutCurve: AppTokens.curveEase,
-              child: KeyedSubtree(key: ValueKey(_section), child: body),
-            );
-
-            return Scaffold(
-              appBar: AppBar(
-                title: const Text(p2wlanAppName),
-                centerTitle: false,
-                actions: [
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: Center(
-                      child: StatusBadge(
-                        label: widget.statusStore.online ? 'Online' : 'Offline',
-                        tone: widget.statusStore.online
-                            ? StatusTone.good
-                            : StatusTone.bad,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Refresh',
-                    onPressed: widget.statusStore.refreshing
-                        ? null
-                        : () => widget.statusStore.refresh(),
-                    icon: widget.statusStore.refreshing
-                        ? const SizedBox.square(
-                            dimension: 16,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                AppTokens.colorTextMuted,
-                              ),
-                            ),
-                          )
-                        : const Icon(Icons.refresh),
-                  ),
-                  const SizedBox(width: 8),
-                ],
-              ),
-              body: wide
-                  ? _WideShell(
-                      body: content,
-                      selected: _section,
-                      onSelect: _select,
-                    )
-                  : content,
-              bottomNavigationBar: wide
-                  ? null
-                  : NavigationBar(
-                      selectedIndex: _section.index,
-                      onDestinationSelected: (index) =>
-                          _select(P2WlanSection.values[index]),
-                      destinations: [
-                        for (final item in P2WlanSection.values)
-                          NavigationDestination(
-                            icon: Icon(item.icon),
-                            label: item.label,
-                          ),
-                      ],
-                    ),
-            );
-          },
-        );
-      },
-    );
   }
 
   void _select(P2WlanSection section) {
@@ -149,11 +121,13 @@ class _WideShell extends StatelessWidget {
   const _WideShell({
     required this.body,
     required this.selected,
+    required this.strings,
     required this.onSelect,
   });
 
   final Widget body;
   final P2WlanSection selected;
+  final AppStrings strings;
   final ValueChanged<P2WlanSection> onSelect;
 
   @override
@@ -170,13 +144,58 @@ class _WideShell extends StatelessWidget {
             for (final item in P2WlanSection.values)
               NavigationRailDestination(
                 icon: Icon(item.icon),
-                label: Text(item.label),
+                label: Text(strings.sectionLabel(item.name)),
               ),
           ],
         ),
         const VerticalDivider(width: 1),
         Expanded(child: body),
       ],
+    );
+  }
+}
+
+class _ShellStatusActions extends StatelessWidget {
+  const _ShellStatusActions({required this.statusStore});
+
+  final StatusStore statusStore;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    return AnimatedBuilder(
+      animation: statusStore,
+      builder: (context, _) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Center(
+                child: StatusBadge(
+                  label: statusStore.online ? strings.online : strings.offline,
+                  tone: statusStore.online ? StatusTone.good : StatusTone.bad,
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: strings.refresh,
+              onPressed: statusStore.refreshing ? null : statusStore.refresh,
+              icon: statusStore.refreshing
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          AppTokens.colorTextMuted,
+                        ),
+                      ),
+                    )
+                  : const Icon(Icons.refresh),
+            ),
+          ],
+        );
+      },
     );
   }
 }

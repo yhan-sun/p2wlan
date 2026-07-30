@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/api/daemon_api.dart';
 import '../../core/models/daemon_models.dart';
@@ -46,22 +47,24 @@ class _SettingsPageState extends State<SettingsPage> {
     return AnimatedBuilder(
       animation: widget.settingsStore,
       builder: (context, _) {
+        final strings = AppStrings.fromCode(
+          widget.settingsStore.settings.languageCode,
+        );
         return PageScaffold(
-          title: 'Settings',
-          subtitle: 'Local Flutter client configuration.',
+          title: strings.settings,
+          subtitle: strings.settingsSubtitle,
           children: [
             AppPanel(
-              title: 'Diagnostics endpoint',
+              title: strings.diagnosticsEndpoint,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   TextField(
                     controller: _diagnosticsUrlController,
                     decoration: InputDecoration(
-                      labelText: 'Diagnostics URL',
+                      labelText: strings.diagnosticsUrl,
                       hintText: defaultDiagnosticsUrl,
-                      helperText:
-                          'Client-only endpoint configuration (read-only GET /health and GET /status).',
+                      helperText: strings.diagnosticsUrlHelper,
                       errorText: _error,
                     ),
                     keyboardType: TextInputType.url,
@@ -85,25 +88,27 @@ class _SettingsPageState extends State<SettingsPage> {
                                 ),
                               )
                             : const Icon(Icons.save_outlined, size: 16),
-                        label: const Text('Save'),
+                        label: Text(strings.save),
                       ),
                       OutlinedButton.icon(
                         onPressed: _saving ? null : _reset,
                         icon: const Icon(Icons.restore, size: 16),
-                        label: const Text('Restore default URL'),
+                        label: Text(strings.restoreDefaultUrl),
                       ),
                       OutlinedButton.icon(
                         onPressed: widget.statusStore.refreshing
                             ? null
                             : () => widget.statusStore.refresh(),
                         icon: const Icon(Icons.refresh, size: 16),
-                        label: const Text('Refresh now'),
+                        label: Text(strings.refreshNow),
                       ),
                     ],
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    'Local settings file: ${widget.settingsStore.configPath ?? '—'}',
+                    strings.localSettingsFile(
+                      widget.settingsStore.configPath ?? '—',
+                    ),
                     style: const TextStyle(
                       fontSize: 12,
                       color: AppTokens.colorTextMuted,
@@ -124,11 +129,38 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
             const SizedBox(height: 14),
-            const AppPanel(
-              title: 'P1 boundary',
+            AppPanel(
+              title: strings.language,
+              child: DropdownButtonFormField<String>(
+                initialValue: AppLanguage.fromCode(
+                  widget.settingsStore.settings.languageCode,
+                ).code,
+                decoration: InputDecoration(
+                  labelText: strings.language,
+                  helperText: strings.languageHelper,
+                ),
+                items: [
+                  for (final language in AppLanguage.values)
+                    DropdownMenuItem(
+                      value: language.code,
+                      child: Text(strings.languageLabel(language.code)),
+                    ),
+                ],
+                onChanged: _saving
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          _saveLanguage(value);
+                        }
+                      },
+              ),
+            ),
+            const SizedBox(height: 14),
+            AppPanel(
+              title: strings.p1Boundary,
               child: Text(
-                'This client operates strictly in read-only mode, fetching daemon diagnostics via GET requests. Process lifecycle, elevation, TUN interfaces, and routing remain managed exclusively by the core binary.',
-                style: TextStyle(
+                strings.p1BoundaryText,
+                style: const TextStyle(
                   fontSize: 13,
                   color: AppTokens.colorTextSecondary,
                   height: 1.4,
@@ -153,13 +185,24 @@ class _SettingsPageState extends State<SettingsPage> {
       await widget.settingsStore.updateDiagnosticsUrl(normalized);
       _diagnosticsUrlController.text = normalized;
       await widget.statusStore.refresh();
-      _showSnackBar('Diagnostics URL saved locally');
+      _showSnackBar(
+        AppStrings.fromCode(
+          widget.settingsStore.settings.languageCode,
+        ).diagnosticsUrlSaved,
+      );
     } on FormatException catch (error) {
-      setState(() => _error = error.message);
-      _showSnackBar('Diagnostics URL was not saved');
+      final strings = AppStrings.fromCode(
+        widget.settingsStore.settings.languageCode,
+      );
+      setState(() => _error = strings.diagnosticsUrlError(error.message));
+      _showSnackBar(strings.diagnosticsUrlNotSaved);
     } catch (error) {
       setState(() => _error = error.toString());
-      _showSnackBar('Failed to save local settings');
+      _showSnackBar(
+        AppStrings.fromCode(
+          widget.settingsStore.settings.languageCode,
+        ).failedToSaveLocalSettings,
+      );
     } finally {
       if (mounted) {
         setState(() => _saving = false);
@@ -170,6 +213,25 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _reset() async {
     _diagnosticsUrlController.text = defaultDiagnosticsUrl;
     await _save();
+  }
+
+  Future<void> _saveLanguage(String languageCode) async {
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.settingsStore.updateLanguageCode(languageCode);
+      _showSnackBar(AppStrings.fromCode(languageCode).languageSaved);
+    } catch (error) {
+      _showSnackBar(
+        AppStrings.fromCode(languageCode).failedToSaveLocalSettings,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
+    }
   }
 
   void _showSnackBar(String message) {

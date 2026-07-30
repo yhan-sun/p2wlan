@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/models/daemon_models.dart';
 import '../../core/state/settings_store.dart';
@@ -21,14 +22,14 @@ class DashboardPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
       animation: Listenable.merge([settingsStore, statusStore]),
       builder: (context, _) {
         final snapshot = statusStore.snapshot;
         return PageScaffold(
-          title: 'Dashboard',
-          subtitle:
-              'Read-only view of the local P2WLAN daemon diagnostics endpoint.',
+          title: strings.dashboard,
+          subtitle: strings.dashboardSubtitle,
           children: [
             _ConnectionBanner(
               url: settingsStore.settings.diagnosticsUrl,
@@ -99,10 +100,11 @@ class _ConnectionBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final overallLabel = _overallLabel();
-    final tone = _overallTone(overallLabel);
+    final strings = AppStringsScope.of(context);
+    final overallLabel = _overallLabel(strings);
+    final tone = _overallTone();
     return AppPanel(
-      title: 'Local daemon',
+      title: strings.localDaemon,
       trailing: StatusBadge(label: overallLabel, tone: tone),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -111,27 +113,34 @@ class _ConnectionBanner extends StatelessWidget {
             spacing: 24,
             runSpacing: 4,
             children: [
-              MetricTile(label: 'Diagnostics URL', value: url),
-              MetricTile(label: 'Daemon state', value: overallLabel),
+              MetricTile(label: strings.diagnosticsUrl, value: url),
+              MetricTile(label: strings.daemonState, value: overallLabel),
               MetricTile(
                 label: 'GET /health',
-                value: healthReachable ? 'reachable' : 'offline',
-                detail: healthError,
+                value: healthReachable ? strings.reachable : strings.offline,
+                detail: strings.statusMessage(healthError),
               ),
               MetricTile(
                 label: 'GET /status',
-                value: _statusEndpointLabel(),
-                detail: statusError,
+                value: strings.endpointStatusLabel(
+                  statusReachable: statusReachable,
+                  healthReachable: healthReachable,
+                ),
+                detail: strings.statusMessage(statusError),
               ),
               MetricTile(
-                label: 'Last refresh',
+                label: strings.lastRefresh,
                 value: formatDateTime(lastFetchedAt),
               ),
               MetricTile(
-                label: 'Request duration',
+                label: strings.requestDuration,
                 value: formatDuration(requestDuration),
               ),
-              if (error != null) MetricTile(label: 'Last error', value: error!),
+              if (error != null)
+                MetricTile(
+                  label: strings.lastError,
+                  value: strings.statusMessage(error) ?? error!,
+                ),
             ],
           ),
           const SizedBox(height: 8),
@@ -156,7 +165,9 @@ class _ConnectionBanner extends StatelessWidget {
                         ),
                       )
                     : const Icon(Icons.refresh, size: 18),
-                label: Text(refreshing ? 'Refreshing...' : 'Refresh now'),
+                label: Text(
+                  refreshing ? strings.refreshing : strings.refreshNow,
+                ),
               ),
               InkWell(
                 onTap: () => onAutoRefreshChanged(!autoRefreshEnabled),
@@ -189,7 +200,9 @@ class _ConnectionBanner extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        'Auto refresh (${StatusStore.defaultAutoRefreshInterval.inSeconds}s)',
+                        strings.autoRefresh(
+                          StatusStore.defaultAutoRefreshInterval.inSeconds,
+                        ),
                         style: const TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
@@ -208,29 +221,25 @@ class _ConnectionBanner extends StatelessWidget {
     );
   }
 
-  String _overallLabel() {
-    if (!healthReachable) return 'Offline';
-    if (!statusReachable) return 'Degraded';
+  String _overallLabel(AppStrings strings) {
+    if (!healthReachable) return strings.offline;
+    if (!statusReachable) return strings.degraded;
     final status = snapshot?.health.status.toLowerCase();
     return switch (status) {
-      'healthy' => 'Healthy',
-      'degraded' => 'Degraded',
-      'unhealthy' => 'Unhealthy',
-      'shutting_down' => 'Unavailable',
-      _ => 'Online',
+      'healthy' => strings.healthy,
+      'degraded' => strings.degraded,
+      'unhealthy' => strings.unhealthy,
+      'shutting_down' => strings.unavailable,
+      _ => strings.online,
     };
   }
 
-  String _statusEndpointLabel() {
-    if (statusReachable) return 'loaded';
-    if (healthReachable) return 'error';
-    return 'skipped';
-  }
-
-  StatusTone _overallTone(String label) {
-    return switch (label) {
-      'Healthy' || 'Online' => StatusTone.good,
-      'Degraded' => StatusTone.warn,
+  StatusTone _overallTone() {
+    if (!healthReachable) return StatusTone.bad;
+    if (!statusReachable) return StatusTone.warn;
+    return switch (snapshot?.health.status.toLowerCase()) {
+      'healthy' => StatusTone.good,
+      'degraded' => StatusTone.warn,
       _ => StatusTone.bad,
     };
   }
@@ -241,11 +250,15 @@ class _OfflineSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const AppPanel(
-      title: 'Snapshot',
+    final strings = AppStringsScope.of(context);
+    return AppPanel(
+      title: strings.snapshot,
       child: Text(
-        'No daemon snapshot is available. Run local p2pnet-daemon outside this app; this client operates in read-only diagnostics mode.',
-        style: TextStyle(fontSize: 13, color: AppTokens.colorTextSecondary),
+        strings.offlineSnapshotMessage,
+        style: const TextStyle(
+          fontSize: 13,
+          color: AppTokens.colorTextSecondary,
+        ),
       ),
     );
   }
@@ -258,11 +271,12 @@ class _StatusGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final relay = snapshot.relaySelection;
     return AppPanel(
-      title: 'Runtime snapshot',
+      title: strings.runtimeSnapshot,
       trailing: StatusBadge(
-        label: snapshot.health.status,
+        label: strings.daemonHealthStatus(snapshot.health.status),
         tone: _healthTone(snapshot.health.status),
       ),
       child: Wrap(
@@ -270,29 +284,34 @@ class _StatusGrid extends StatelessWidget {
         runSpacing: 4,
         children: [
           MetricTile(
-            label: 'Node ID',
+            label: strings.nodeId,
             value: shortId(snapshot.nodeId),
             detail: snapshot.nodeId,
           ),
-          MetricTile(label: 'Virtual IP', value: dash(snapshot.virtualIp)),
-          MetricTile(label: 'Network ID', value: dash(snapshot.networkId)),
+          MetricTile(label: strings.virtualIp, value: dash(snapshot.virtualIp)),
+          MetricTile(label: strings.networkId, value: dash(snapshot.networkId)),
           MetricTile(
-            label: 'Daemon health',
-            value: snapshot.health.status,
+            label: strings.daemonHealth,
+            value: strings.daemonHealthStatus(snapshot.health.status),
             detail: snapshot.health.reason,
           ),
           MetricTile(
-            label: 'UDP local addr',
+            label: strings.udpLocalAddr,
             value: dash(snapshot.udpLocalAddr),
           ),
           MetricTile(
-            label: 'Relay',
-            value: snapshot.relayConnected ? 'connected' : 'not connected',
+            label: strings.relay,
+            value: snapshot.relayConnected
+                ? strings.connected
+                : strings.notConnected,
             detail: dash(relay.selectedEndpoint ?? relay.lastError),
           ),
-          MetricTile(label: 'Relay region', value: dash(relay.selectedRegion)),
           MetricTile(
-            label: 'Peers',
+            label: strings.relayRegion,
+            value: dash(relay.selectedRegion),
+          ),
+          MetricTile(
+            label: strings.peers,
             value: formatInt(snapshot.stats.totalPeers),
           ),
         ],
@@ -317,30 +336,31 @@ class _PeerPathSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: 'Peer paths',
+      title: strings.peerPaths,
       child: Wrap(
         spacing: 24,
         runSpacing: 4,
         children: [
           MetricTile(
-            label: 'Total peers',
+            label: strings.totalPeers,
             value: formatInt(snapshot.stats.totalPeers),
           ),
           MetricTile(
-            label: 'Direct paths',
+            label: strings.directPaths,
             value: formatInt(snapshot.stats.directConnections),
           ),
           MetricTile(
-            label: 'Relay paths',
+            label: strings.relayPaths,
             value: formatInt(snapshot.stats.relayConnections),
           ),
           MetricTile(
-            label: 'Bytes sent',
+            label: strings.bytesSent,
             value: formatBytes(snapshot.stats.totalBytesSent),
           ),
           MetricTile(
-            label: 'Bytes received',
+            label: strings.bytesReceived,
             value: formatBytes(snapshot.stats.totalBytesReceived),
           ),
         ],

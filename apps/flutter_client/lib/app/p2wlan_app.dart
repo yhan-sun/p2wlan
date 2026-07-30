@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app/app_motion.dart';
+import '../app/app_strings.dart';
 import '../app/app_theme.dart';
 import '../app/app_tokens.dart';
 import '../core/api/daemon_api.dart';
@@ -14,10 +15,14 @@ class P2WlanApp extends StatefulWidget {
     super.key,
     this.initialRefresh = true,
     this.autoStartPolling = false,
+    this.settingsStore,
+    this.daemonApi,
   });
 
   final bool initialRefresh;
   final bool autoStartPolling;
+  final SettingsStore? settingsStore;
+  final DaemonApi? daemonApi;
 
   @override
   State<P2WlanApp> createState() => _P2WlanAppState();
@@ -31,10 +36,10 @@ class _P2WlanAppState extends State<P2WlanApp> {
   @override
   void initState() {
     super.initState();
-    _settingsStore = SettingsStore();
+    _settingsStore = widget.settingsStore ?? SettingsStore();
     _statusStore = StatusStore(
       settingsStore: _settingsStore,
-      daemonApi: DaemonApi(),
+      daemonApi: widget.daemonApi ?? DaemonApi(),
     );
     _bootstrap();
   }
@@ -65,23 +70,34 @@ class _P2WlanAppState extends State<P2WlanApp> {
       title: p2wlanAppName,
       debugShowCheckedModeBanner: false,
       theme: AppTheme.lightTheme,
-      home: Builder(
-        builder: (context) {
-          final duration = AppMotion.duration(
-            context,
-            AppTokens.durationMedium,
+      home: AnimatedBuilder(
+        animation: _settingsStore,
+        builder: (context, _) {
+          final strings = AppStrings.fromCode(
+            _settingsStore.settings.languageCode,
           );
-          return AnimatedSwitcher(
-            duration: duration,
-            switchInCurve: AppTokens.curveEase,
-            switchOutCurve: AppTokens.curveEase,
-            child: _ready
-                ? P2WlanShell(
-                    key: const ValueKey('app-shell'),
-                    settingsStore: _settingsStore,
-                    statusStore: _statusStore,
-                  )
-                : const _BootScreen(key: ValueKey('boot-screen')),
+          return AppStringsScope(
+            strings: strings,
+            child: Builder(
+              builder: (context) {
+                final duration = AppMotion.duration(
+                  context,
+                  AppTokens.durationMedium,
+                );
+                return AnimatedSwitcher(
+                  duration: duration,
+                  switchInCurve: AppTokens.curveEase,
+                  switchOutCurve: AppTokens.curveEase,
+                  child: _ready
+                      ? P2WlanShell(
+                          key: const ValueKey('app-shell'),
+                          settingsStore: _settingsStore,
+                          statusStore: _statusStore,
+                        )
+                      : const _BootScreen(key: ValueKey('boot-screen')),
+                );
+              },
+            ),
           );
         },
       ),

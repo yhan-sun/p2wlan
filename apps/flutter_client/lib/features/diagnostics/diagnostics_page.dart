@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/models/daemon_models.dart';
 import '../../core/state/status_store.dart';
@@ -18,13 +19,14 @@ class DiagnosticsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
       animation: statusStore,
       builder: (context, _) {
         final snapshot = statusStore.snapshot;
         return PageScaffold(
-          title: 'Diagnostics',
-          subtitle: 'Summary plus raw JSON from daemon GET /status.',
+          title: strings.diagnostics,
+          subtitle: strings.diagnosticsSubtitle,
           children: [
             _Summary(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 14),
@@ -44,11 +46,12 @@ class _Summary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final health = snapshot?.health;
     return AppPanel(
-      title: 'Summary',
+      title: strings.summary,
       trailing: StatusBadge(
-        label: statusStore.online ? 'Status loaded' : 'No snapshot',
+        label: statusStore.online ? strings.statusLoaded : strings.noSnapshot,
         tone: statusStore.online ? StatusTone.good : StatusTone.bad,
       ),
       child: Wrap(
@@ -57,57 +60,68 @@ class _Summary extends StatelessWidget {
         children: [
           MetricTile(
             label: 'GET /health',
-            value: statusStore.healthReachable ? 'reachable' : 'offline',
-            detail: statusStore.lastHealthError,
+            value: statusStore.healthReachable
+                ? strings.reachable
+                : strings.offline,
+            detail: strings.statusMessage(statusStore.lastHealthError),
           ),
           MetricTile(
             label: 'GET /status',
-            value: statusStore.statusReachable
-                ? 'loaded'
-                : statusStore.healthReachable
-                ? 'error'
-                : 'skipped',
-            detail: statusStore.lastStatusError,
-          ),
-          MetricTile(label: 'Daemon health', value: dash(health?.status)),
-          MetricTile(
-            label: 'Control connected',
-            value: formatOptionalBool(health?.controlConnected),
+            value: strings.endpointStatusLabel(
+              statusReachable: statusStore.statusReachable,
+              healthReachable: statusStore.healthReachable,
+            ),
+            detail: strings.statusMessage(statusStore.lastStatusError),
           ),
           MetricTile(
-            label: 'Reauth required',
-            value: formatOptionalBool(health?.reauthRequired),
+            label: strings.daemonHealth,
+            value: health == null
+                ? '—'
+                : strings.daemonHealthStatus(health.status),
           ),
           MetricTile(
-            label: 'UDP sockets',
+            label: strings.controlConnected,
+            value: strings.optionalBoolLabel(health?.controlConnected),
+          ),
+          MetricTile(
+            label: strings.reauthRequired,
+            value: strings.optionalBoolLabel(health?.reauthRequired),
+          ),
+          MetricTile(
+            label: strings.udpSockets,
             value: snapshot == null ? '—' : formatInt(snapshot!.udpSocketCount),
           ),
           MetricTile(
-            label: 'Socket pool active',
-            value: formatOptionalBool(snapshot?.udpSocketPoolActive),
+            label: strings.socketPoolActive,
+            value: strings.optionalBoolLabel(snapshot?.udpSocketPoolActive),
           ),
           MetricTile(
-            label: 'Relay connected',
-            value: formatOptionalBool(snapshot?.relayConnected),
+            label: strings.relayConnected,
+            value: strings.optionalBoolLabel(snapshot?.relayConnected),
           ),
           MetricTile(
-            label: 'Peer count',
+            label: strings.peerCount,
             value: snapshot == null
                 ? '—'
                 : formatInt(snapshot!.stats.totalPeers),
           ),
           MetricTile(
-            label: 'Last refresh',
+            label: strings.lastRefresh,
             value: formatDateTime(statusStore.lastFetchedAt),
           ),
           MetricTile(
-            label: 'Request duration',
+            label: strings.requestDuration,
             value: formatDuration(statusStore.lastRequestDuration),
           ),
           if (statusStore.lastError != null)
-            MetricTile(label: 'Last error', value: statusStore.lastError!),
+            MetricTile(
+              label: strings.lastError,
+              value:
+                  strings.statusMessage(statusStore.lastError) ??
+                  statusStore.lastError!,
+            ),
           if (health?.reason != null)
-            MetricTile(label: 'Health reason', value: health!.reason!),
+            MetricTile(label: strings.healthReason, value: health!.reason!),
         ],
       ),
     );
@@ -129,16 +143,17 @@ class _RawJsonState extends State<_RawJson> {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final raw = widget.snapshot?.prettyJson ?? _readableErrorJson();
     return AppPanel(
-      title: 'Raw /status JSON',
+      title: strings.rawStatusJson,
       trailing: OutlinedButton.icon(
         onPressed: () => _copy(raw),
         icon: Icon(
           _copied ? Icons.check_circle_outline : Icons.copy_all_outlined,
           size: 16,
         ),
-        label: Text(_copied ? 'Copied' : 'Copy'),
+        label: Text(_copied ? strings.copied : strings.copy),
       ),
       child: Container(
         width: double.infinity,
@@ -191,13 +206,14 @@ class _RawJsonState extends State<_RawJson> {
   }
 
   Future<void> _copy(String raw) async {
+    final strings = AppStringsScope.of(context);
     await Clipboard.setData(ClipboardData(text: raw));
     if (!mounted) return;
     setState(() => _copied = true);
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Diagnostics JSON copied to clipboard'),
-        duration: Duration(seconds: 2),
+      SnackBar(
+        content: Text(strings.copiedDiagnosticsJson),
+        duration: const Duration(seconds: 2),
       ),
     );
     await Future<void>.delayed(const Duration(seconds: 2));

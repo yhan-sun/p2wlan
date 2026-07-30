@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/models/daemon_models.dart';
 import '../../core/state/status_store.dart';
@@ -15,23 +16,24 @@ class NodesPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
       animation: statusStore,
       builder: (context, _) {
         final snapshot = statusStore.snapshot;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         return PageScaffold(
-          title: 'Nodes',
-          subtitle: 'Read-only peer list from the daemon status snapshot.',
+          title: strings.nodes,
+          subtitle: strings.nodesSubtitle,
           children: [
             _PeerSummary(snapshot: snapshot, peerCount: peers.length),
             const SizedBox(height: 14),
             if (peers.isEmpty)
-              const AppPanel(
-                title: 'Peers',
+              AppPanel(
+                title: strings.peers,
                 child: Text(
-                  'No peers are present in the current daemon snapshot.',
-                  style: TextStyle(
+                  strings.noPeers,
+                  style: const TextStyle(
                     fontSize: 13,
                     color: AppTokens.colorTextSecondary,
                   ),
@@ -61,20 +63,21 @@ class _PeerSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final stats = snapshot?.stats;
     return AppPanel(
-      title: 'Peer summary',
+      title: strings.peerSummary,
       child: Wrap(
         spacing: 24,
         runSpacing: 4,
         children: [
-          MetricTile(label: 'Peer count', value: formatInt(peerCount)),
+          MetricTile(label: strings.peerCount, value: formatInt(peerCount)),
           MetricTile(
-            label: 'Direct paths',
+            label: strings.directPaths,
             value: stats == null ? '—' : formatInt(stats.directConnections),
           ),
           MetricTile(
-            label: 'Relay paths',
+            label: strings.relayPaths,
             value: stats == null ? '—' : formatInt(stats.relayConnections),
           ),
         ],
@@ -90,8 +93,9 @@ class _PeerTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: 'Peers',
+      title: strings.peers,
       flushContent: true,
       child: ClipRRect(
         borderRadius: const BorderRadius.only(
@@ -108,16 +112,26 @@ class _PeerTable extends StatelessWidget {
             headingRowColor: WidgetStateProperty.all(
               AppTokens.colorSurfaceSubtle,
             ),
-            columns: const [
-              DataColumn(label: Text('Device', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Peer ID', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Virtual IP', style: _columnHeaderStyle)),
-              DataColumn(label: Text('State', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Path', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Type', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Route', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Latency', style: _columnHeaderStyle)),
-              DataColumn(label: Text('Endpoint', style: _columnHeaderStyle)),
+            columns: [
+              DataColumn(
+                label: Text(strings.device, style: _columnHeaderStyle),
+              ),
+              DataColumn(
+                label: Text(strings.peerId, style: _columnHeaderStyle),
+              ),
+              DataColumn(
+                label: Text(strings.virtualIp, style: _columnHeaderStyle),
+              ),
+              DataColumn(label: Text(strings.state, style: _columnHeaderStyle)),
+              DataColumn(label: Text(strings.path, style: _columnHeaderStyle)),
+              DataColumn(label: Text(strings.type, style: _columnHeaderStyle)),
+              DataColumn(label: Text(strings.route, style: _columnHeaderStyle)),
+              DataColumn(
+                label: Text(strings.latency, style: _columnHeaderStyle),
+              ),
+              DataColumn(
+                label: Text(strings.endpoint, style: _columnHeaderStyle),
+              ),
             ],
             rows: [
               for (final peer in peers)
@@ -143,7 +157,9 @@ class _PeerTable extends StatelessWidget {
                     DataCell(
                       Text(dash(peer.connectionType), style: _cellStyle),
                     ),
-                    DataCell(Text(_routeLabel(peer), style: _cellStyle)),
+                    DataCell(
+                      Text(_routeLabel(strings, peer), style: _cellStyle),
+                    ),
                     DataCell(
                       Text(
                         formatLatency(peer.latencyMs),
@@ -198,6 +214,7 @@ class _PeerList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return Column(
       children: [
         for (final peer in peers) ...[
@@ -208,25 +225,34 @@ class _PeerList extends StatelessWidget {
               spacing: 20,
               runSpacing: 4,
               children: [
-                MetricTile(label: 'Peer ID', value: shortId(peer.nodeId)),
-                MetricTile(label: 'Virtual IP', value: dash(peer.virtualIp)),
-                MetricTile(label: 'State', value: dash(peer.state)),
-                MetricTile(label: 'Path', value: pathLabel(peer.path)),
+                MetricTile(label: strings.peerId, value: shortId(peer.nodeId)),
                 MetricTile(
-                  label: 'Connection type',
+                  label: strings.virtualIp,
+                  value: dash(peer.virtualIp),
+                ),
+                MetricTile(label: strings.state, value: dash(peer.state)),
+                MetricTile(
+                  label: strings.path,
+                  value: strings.pathLabel(peer.path),
+                ),
+                MetricTile(
+                  label: strings.connectionType,
                   value: dash(peer.connectionType),
                 ),
-                MetricTile(label: 'Route', value: _routeLabel(peer)),
                 MetricTile(
-                  label: 'Latency',
+                  label: strings.route,
+                  value: _routeLabel(strings, peer),
+                ),
+                MetricTile(
+                  label: strings.latency,
                   value: formatLatency(peer.latencyMs),
                 ),
                 MetricTile(
-                  label: 'Endpoint',
+                  label: strings.endpoint,
                   value: dash(peer.endpoint ?? peer.relayServer),
                 ),
                 if (peer.lastError != null)
-                  MetricTile(label: 'Last error', value: peer.lastError!),
+                  MetricTile(label: strings.lastError, value: peer.lastError!),
               ],
             ),
           ),
@@ -237,11 +263,8 @@ class _PeerList extends StatelessWidget {
   }
 }
 
-String _routeLabel(PeerSnapshot peer) {
-  if (peer.path == 'direct') return 'Direct';
-  if (peer.path == 'relay' || peer.isRelay) return 'Relay';
-  return '—';
-}
+String _routeLabel(AppStrings strings, PeerSnapshot peer) =>
+    strings.routeLabel(peer.path, peer.isRelay);
 
 class _PathBadge extends StatelessWidget {
   const _PathBadge({required this.peer});
@@ -255,6 +278,9 @@ class _PathBadge extends StatelessWidget {
       'relay' => StatusTone.warn,
       _ => StatusTone.neutral,
     };
-    return StatusBadge(label: pathLabel(peer.path), tone: tone);
+    return StatusBadge(
+      label: AppStringsScope.of(context).pathLabel(peer.path),
+      tone: tone,
+    );
   }
 }
