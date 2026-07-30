@@ -494,25 +494,57 @@ func TestDeleteDeviceAcceptsUserTokenForOwnedDevice(t *testing.T) {
 	}
 }
 
-func TestDeleteDeviceRejectsAnotherUser(t *testing.T) {
+func TestDeleteDeviceAcceptsNetworkMember(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {
 		t.Fatalf("database.New: %v", err)
 	}
 	defer db.Close()
-	owner, _ := db.CreateUser("owner-delete-reject@example.com", "hash")
-	other, _ := db.CreateUser("other-delete-reject@example.com", "hash")
-	device, _ := db.CreateDevice(owner.ID, "default", "delete-owner-key", "keep-me", "macos", "")
+	owner, _ := db.CreateUser("owner-delete-member@example.com", "hash")
+	member, _ := db.CreateUser("member-delete-member@example.com", "hash")
+	device, _ := db.CreateDevice(owner.ID, "default", "delete-member-key", "remove-me", "macos", "")
 
 	server := NewServer(nil, nil, db)
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+device.ID, nil)
 	req.SetPathValue("id", device.ID)
-	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: other.ID}))
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: member.ID}))
 	recorder := httptest.NewRecorder()
 
 	server.DeleteDevice(recorder, req)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d: %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := db.GetDevice(device.ID); err == nil {
+		t.Fatal("expected network-member delete to remove the device")
+	}
+}
+
+func TestDeleteDeviceRejectsUserWithoutNetworkAccess(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	owner, _ := db.CreateUser("owner-delete-private@example.com", "hash")
+	outsider, _ := db.CreateUser("outsider-delete-private@example.com", "hash")
+	privateNetwork, err := db.CreateNetwork(owner.ID, "owner-private-delete", "10.77.0.0/24")
+	if err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+	device, _ := db.CreateDevice(owner.ID, privateNetwork.ID, "delete-private-key", "keep-me", "macos", "")
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+device.ID, nil)
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: outsider.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.DeleteDevice(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := db.GetDevice(device.ID); err != nil {
+		t.Fatal("private-network device should not be deleted by an outsider")
 	}
 }
 
