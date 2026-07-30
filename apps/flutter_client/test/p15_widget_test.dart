@@ -12,6 +12,7 @@ import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
+import 'package:p2wlan_flutter_client/features/tunnels/tunnels_page.dart';
 
 void main() {
   testWidgets('Dashboard renders offline/error state without crashing', (
@@ -161,6 +162,34 @@ void main() {
     expect(find.text('Diagnostics URL was not saved'), findsOneWidget);
   });
 
+  testWidgets('Settings keeps network fields usable on narrow screens', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final stores = (await tester.runAsync(
+      () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await tester.pumpWidget(
+      _TestApp(
+        child: SettingsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('Network and Tunnel'), findsOneWidget);
+    expect(find.text('Interface name'), findsOneWidget);
+    expect(find.text('UDP advertise'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('Nodes renders local device and readable peer sections', (
     tester,
   ) async {
@@ -197,6 +226,75 @@ void main() {
     expect(find.text('Other devices'), findsOneWidget);
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('Peer 数'), findsNothing);
+  });
+
+  testWidgets('Nodes keeps peer list readable on narrow screens', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(deviceName: 'studio-mac'),
+      ),
+    );
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('Other devices'), findsOneWidget);
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('10.20.0.11'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Tunnels keeps detail rows readable on narrow screens', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: TunnelsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('Tunnel summary'), findsOneWidget);
+    expect(find.text('Virtual Adapter'), findsOneWidget);
+    expect(find.text('192.0.2.10:60207'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Diagnostics renders summary, raw JSON, and copy action', (

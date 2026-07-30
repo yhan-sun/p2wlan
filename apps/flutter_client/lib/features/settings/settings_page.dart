@@ -198,27 +198,20 @@ class _SettingsPageState extends State<SettingsPage> {
               title: strings.isZh ? '网络与隧道' : 'Network and Tunnel',
               child: Column(
                 children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _SettingsTextField(
-                          controller: _tunInterfaceController,
-                          label: strings.isZh ? '网卡设备名称' : 'Interface name',
-                          helper: defaultTunInterface,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _SettingsTextField(
-                          controller: _mtuController,
-                          label: 'MTU',
-                          helper: strings.isZh
-                              ? '建议 1420；Relay 路径异常时可尝试 1280。'
-                              : '1420 is recommended; try 1280 for relay path issues.',
-                          keyboardType: TextInputType.number,
-                        ),
-                      ),
-                    ],
+                  _ResponsiveFieldRow(
+                    first: _SettingsTextField(
+                      controller: _tunInterfaceController,
+                      label: strings.isZh ? '网卡设备名称' : 'Interface name',
+                      helper: defaultTunInterface,
+                    ),
+                    second: _SettingsTextField(
+                      controller: _mtuController,
+                      label: 'MTU',
+                      helper: strings.isZh
+                          ? '建议 1420；Relay 路径异常时可尝试 1280。'
+                          : '1420 is recommended; try 1280 for relay path issues.',
+                      keyboardType: TextInputType.number,
+                    ),
                   ),
                   _gap,
                   _SettingsTextField(
@@ -227,26 +220,19 @@ class _SettingsPageState extends State<SettingsPage> {
                     helper: defaultOverlayCidr,
                   ),
                   _gap,
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _SettingsTextField(
-                          controller: _udpBindController,
-                          label: strings.isZh ? 'UDP 监听地址' : 'UDP bind',
-                          helper: '0.0.0.0:0',
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _SettingsTextField(
-                          controller: _udpAdvertiseController,
-                          label: strings.isZh ? '公网 UDP 地址' : 'UDP advertise',
-                          helper: strings.isZh
-                              ? '云主机固定入口，例如 203.0.113.10:60207。'
-                              : 'Fixed cloud endpoint such as 203.0.113.10:60207.',
-                        ),
-                      ),
-                    ],
+                  _ResponsiveFieldRow(
+                    first: _SettingsTextField(
+                      controller: _udpBindController,
+                      label: strings.isZh ? 'UDP 监听地址' : 'UDP bind',
+                      helper: '0.0.0.0:0',
+                    ),
+                    second: _SettingsTextField(
+                      controller: _udpAdvertiseController,
+                      label: strings.isZh ? '公网 UDP 地址' : 'UDP advertise',
+                      helper: strings.isZh
+                          ? '云主机固定入口，例如 203.0.113.10:60207。'
+                          : 'Fixed cloud endpoint such as 203.0.113.10:60207.',
+                    ),
                   ),
                   _gap,
                   DropdownButtonFormField<String>(
@@ -538,6 +524,32 @@ class _SettingsPageState extends State<SettingsPage> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
+class _ResponsiveFieldRow extends StatelessWidget {
+  const _ResponsiveFieldRow({required this.first, required this.second});
+
+  final Widget first;
+  final Widget second;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 560) {
+          return Column(children: [first, const SizedBox(height: 12), second]);
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: first),
+            const SizedBox(width: 12),
+            Expanded(child: second),
+          ],
+        );
+      },
+    );
   }
 }
 

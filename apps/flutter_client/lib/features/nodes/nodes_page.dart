@@ -800,44 +800,56 @@ class _PeerList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final bodyHeight = (peers.length * _rowHeight)
-        .clamp(_rowHeight, _maxBodyHeight)
-        .toDouble();
     return AppPanel(
       title: strings.isZh ? '其他设备' : 'Other devices',
       flushContent: true,
-      child: ClipRRect(
-        borderRadius: const BorderRadius.only(
-          bottomLeft: Radius.circular(AppTokens.radiusLg),
-          bottomRight: Radius.circular(AppTokens.radiusLg),
-        ),
-        child: SizedBox(
-          height: bodyHeight,
-          child: ListView.builder(
-            padding: EdgeInsets.zero,
-            primary: false,
-            itemExtent: _rowHeight,
-            itemCount: peers.length,
-            itemBuilder: (context, index) {
-              return _PeerListRow(
-                peer: peers[index],
-                strings: strings,
-                shaded: index.isOdd,
-                copiedKey: copiedKey,
-                onCopy: onCopy,
-                onDetails: onDetails,
-                onEdit: onEdit,
-                onDelete: onDelete,
-              );
-            },
-          ),
-        ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 430;
+          final rowHeight = compact ? _compactRowHeight : _rowHeight;
+          final maxBodyHeight = compact
+              ? _compactMaxBodyHeight
+              : _maxBodyHeight;
+          final bodyHeight = (peers.length * rowHeight)
+              .clamp(rowHeight, maxBodyHeight)
+              .toDouble();
+          return ClipRRect(
+            borderRadius: const BorderRadius.only(
+              bottomLeft: Radius.circular(AppTokens.radiusLg),
+              bottomRight: Radius.circular(AppTokens.radiusLg),
+            ),
+            child: SizedBox(
+              height: bodyHeight,
+              child: ListView.builder(
+                padding: EdgeInsets.zero,
+                primary: false,
+                itemExtent: rowHeight,
+                itemCount: peers.length,
+                itemBuilder: (context, index) {
+                  return _PeerListRow(
+                    peer: peers[index],
+                    strings: strings,
+                    shaded: index.isOdd,
+                    compact: compact,
+                    copiedKey: copiedKey,
+                    onCopy: onCopy,
+                    onDetails: onDetails,
+                    onEdit: onEdit,
+                    onDelete: onDelete,
+                  );
+                },
+              ),
+            ),
+          );
+        },
       ),
     );
   }
 
   static const _rowHeight = 68.0;
   static const _maxBodyHeight = 456.0;
+  static const _compactRowHeight = 90.0;
+  static const _compactMaxBodyHeight = 520.0;
 }
 
 class _PeerListRow extends StatelessWidget {
@@ -845,6 +857,7 @@ class _PeerListRow extends StatelessWidget {
     required this.peer,
     required this.strings,
     required this.shaded,
+    required this.compact,
     required this.copiedKey,
     required this.onCopy,
     required this.onDetails,
@@ -855,6 +868,7 @@ class _PeerListRow extends StatelessWidget {
   final PeerSnapshot peer;
   final AppStrings strings;
   final bool shaded;
+  final bool compact;
   final String? copiedKey;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
@@ -865,94 +879,146 @@ class _PeerListRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final ipKey = '${peer.nodeId}:ip';
     final pingKey = '${peer.nodeId}:ping';
+    final menu = _actionsMenu(ipKey, pingKey);
     return Material(
       color: shaded ? AppTokens.colorSurfaceSubtle : AppTokens.colorSurface,
       child: InkWell(
         onTap: () => onDetails(peer),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14),
+          padding: EdgeInsets.symmetric(
+            horizontal: 14,
+            vertical: compact ? 8 : 0,
+          ),
           decoration: const BoxDecoration(
             border: Border(
               bottom: BorderSide(color: AppTokens.colorBorderSubtle),
             ),
           ),
-          child: Row(
-            children: [
-              Expanded(flex: 3, child: _PeerPrimaryText(peer: peer)),
-              const SizedBox(width: 12),
-              SizedBox(
-                width: 92,
-                child: Text(
-                  formatLatency(peer.latencyMs),
-                  textAlign: TextAlign.right,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                    color: AppTokens.colorTextSecondary,
-                    fontFeatures: AppTokens.tabularFontFeatures,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              SizedBox(
-                width: 116,
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: _PathBadge(peer: peer),
-                ),
-              ),
-              const SizedBox(width: 4),
-              PopupMenuButton<String>(
-                tooltip: strings.isZh ? '设备操作' : 'Device actions',
-                onSelected: (value) {
-                  switch (value) {
-                    case 'copy_ip':
-                      onCopy(peer.virtualIp, ipKey);
-                      break;
-                    case 'copy_ping':
-                      onCopy('ping ${peer.virtualIp}', pingKey);
-                      break;
-                    case 'edit':
-                      onEdit(peer);
-                      break;
-                    case 'delete':
-                      onDelete(peer);
-                      break;
-                    case 'details':
-                      onDetails(peer);
-                      break;
-                  }
-                },
-                itemBuilder: (context) => [
-                  PopupMenuItem(
-                    value: 'details',
-                    child: Text(strings.isZh ? '查看详情' : 'View details'),
-                  ),
-                  PopupMenuItem(
-                    value: 'copy_ip',
-                    child: Text(strings.isZh ? '复制虚拟 IP' : 'Copy virtual IP'),
-                  ),
-                  PopupMenuItem(
-                    value: 'copy_ping',
-                    child: Text(
-                      strings.isZh ? '复制 ping 命令' : 'Copy ping command',
+          child: compact
+              ? Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(child: _PeerPrimaryText(peer: peer)),
+                        const SizedBox(width: 8),
+                        menu,
+                      ],
                     ),
-                  ),
-                  PopupMenuItem(
-                    value: 'edit',
-                    child: Text(strings.isZh ? '修改名称' : 'Rename'),
-                  ),
-                  PopupMenuItem(
-                    value: 'delete',
-                    child: Text(strings.isZh ? '移除设备' : 'Remove device'),
-                  ),
-                ],
-              ),
-            ],
-          ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        _LatencyText(peer: peer),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: _PathBadge(peer: peer),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                )
+              : Row(
+                  children: [
+                    Expanded(flex: 3, child: _PeerPrimaryText(peer: peer)),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 92,
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: _LatencyText(peer: peer),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 116,
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: _PathBadge(peer: peer),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    menu,
+                  ],
+                ),
         ),
+      ),
+    );
+  }
+
+  Widget _actionsMenu(String ipKey, String pingKey) {
+    return SizedBox.square(
+      dimension: compact ? 36 : 40,
+      child: PopupMenuButton<String>(
+        padding: EdgeInsets.zero,
+        iconSize: 20,
+        tooltip: strings.isZh ? '设备操作' : 'Device actions',
+        onSelected: (value) {
+          switch (value) {
+            case 'copy_ip':
+              onCopy(peer.virtualIp, ipKey);
+              break;
+            case 'copy_ping':
+              onCopy('ping ${peer.virtualIp}', pingKey);
+              break;
+            case 'edit':
+              onEdit(peer);
+              break;
+            case 'delete':
+              onDelete(peer);
+              break;
+            case 'details':
+              onDetails(peer);
+              break;
+          }
+        },
+        itemBuilder: (context) => [
+          PopupMenuItem(
+            value: 'details',
+            child: Text(strings.isZh ? '查看详情' : 'View details'),
+          ),
+          PopupMenuItem(
+            value: 'copy_ip',
+            child: Text(strings.isZh ? '复制虚拟 IP' : 'Copy virtual IP'),
+          ),
+          PopupMenuItem(
+            value: 'copy_ping',
+            child: Text(strings.isZh ? '复制 ping 命令' : 'Copy ping command'),
+          ),
+          PopupMenuItem(
+            value: 'edit',
+            child: Text(strings.isZh ? '修改名称' : 'Rename'),
+          ),
+          PopupMenuItem(
+            value: 'delete',
+            child: Text(strings.isZh ? '移除设备' : 'Remove device'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LatencyText extends StatelessWidget {
+  const _LatencyText({required this.peer});
+
+  final PeerSnapshot peer;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      formatLatency(peer.latencyMs),
+      textAlign: TextAlign.right,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(
+        fontSize: 12,
+        fontWeight: FontWeight.w700,
+        color: AppTokens.colorTextSecondary,
+        fontFeatures: AppTokens.tabularFontFeatures,
       ),
     );
   }
@@ -1117,31 +1183,38 @@ class _DetailLine extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 96,
-            child: Text(
-              label,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: AppTokens.colorTextSecondary,
-              ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final labelText = Text(
+            label,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: AppTokens.colorTextSecondary,
             ),
-          ),
-          Expanded(
-            child: SelectableText(
-              value,
-              style: const TextStyle(
-                fontSize: 12,
-                color: AppTokens.colorTextPrimary,
-                fontFeatures: AppTokens.tabularFontFeatures,
-              ),
+          );
+          final valueText = SelectableText(
+            value,
+            style: const TextStyle(
+              fontSize: 12,
+              color: AppTokens.colorTextPrimary,
+              fontFeatures: AppTokens.tabularFontFeatures,
             ),
-          ),
-        ],
+          );
+          if (constraints.maxWidth < 340) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [labelText, const SizedBox(height: 3), valueText],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(width: 96, child: labelText),
+              Expanded(child: valueText),
+            ],
+          );
+        },
       ),
     );
   }
