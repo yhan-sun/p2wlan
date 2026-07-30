@@ -6,6 +6,10 @@ class MainFlutterWindow: NSWindow {
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
     self.title = "P2WLAN"
+    self.titleVisibility = .hidden
+    self.titlebarAppearsTransparent = true
+    self.styleMask.insert(.fullSizeContentView)
+    self.isMovableByWindowBackground = true
     self.minSize = NSSize(width: 860, height: 560)
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)

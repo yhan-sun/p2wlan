@@ -354,6 +354,44 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('Nodes details action opens a visible bounded dialog', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('View details').last);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('Connection type'), findsOneWidget);
+    expect(find.text('Node ID'), findsWidgets);
+    expect(find.byType(SelectableText), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('Tunnels keeps detail rows readable on narrow screens', (
     tester,
   ) async {
