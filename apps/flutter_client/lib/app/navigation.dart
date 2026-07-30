@@ -74,7 +74,10 @@ class _P2WlanShellState extends State<P2WlanShell> {
                   destinations: [
                     for (final item in P2WlanSection.values)
                       NavigationDestination(
-                        icon: Icon(item.icon),
+                        icon: MouseRegion(
+                          cursor: SystemMouseCursors.click,
+                          child: Icon(item.icon),
+                        ),
                         label: strings.sectionLabel(item.name),
                       ),
                   ],
@@ -125,19 +128,22 @@ class _WideShell extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        NavigationRail(
-          selectedIndex: selected.index,
-          onDestinationSelected: (index) =>
-              onSelect(P2WlanSection.values[index]),
-          labelType: NavigationRailLabelType.all,
-          minWidth: 88,
-          destinations: [
-            for (final item in P2WlanSection.values)
-              NavigationRailDestination(
-                icon: Icon(item.icon),
-                label: Text(strings.sectionLabel(item.name)),
-              ),
-          ],
+        MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: NavigationRail(
+            selectedIndex: selected.index,
+            onDestinationSelected: (index) =>
+                onSelect(P2WlanSection.values[index]),
+            labelType: NavigationRailLabelType.all,
+            minWidth: 88,
+            destinations: [
+              for (final item in P2WlanSection.values)
+                NavigationRailDestination(
+                  icon: Icon(item.icon),
+                  label: Text(strings.sectionLabel(item.name)),
+                ),
+            ],
+          ),
         ),
         const VerticalDivider(width: 1),
         Expanded(child: body),
@@ -157,16 +163,15 @@ class _ShellStatusActions extends StatelessWidget {
     return AnimatedBuilder(
       animation: statusStore,
       builder: (context, _) {
+        final label = _statusLabel(strings);
+        final tone = _statusTone();
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Center(
-                child: StatusBadge(
-                  label: statusStore.online ? strings.online : strings.offline,
-                  tone: statusStore.online ? StatusTone.good : StatusTone.bad,
-                ),
+                child: StatusBadge(label: label, tone: tone),
               ),
             ),
             IconButton(
@@ -188,5 +193,22 @@ class _ShellStatusActions extends StatelessWidget {
         );
       },
     );
+  }
+
+  String _statusLabel(AppStrings strings) {
+    if (statusStore.daemonBusy) return strings.daemonWorking;
+    if (!statusStore.daemonReachable) return strings.offline;
+    final health = statusStore.snapshot?.health.status;
+    if (health == null || health.isEmpty) return strings.degraded;
+    return strings.healthStatusLabel(health);
+  }
+
+  StatusTone _statusTone() {
+    if (!statusStore.daemonReachable) return StatusTone.bad;
+    return switch (statusStore.snapshot?.health.status.toLowerCase()) {
+      'healthy' => StatusTone.good,
+      'degraded' => StatusTone.warn,
+      _ => StatusTone.warn,
+    };
   }
 }

@@ -7,7 +7,10 @@ class AppDelegate: FlutterAppDelegate {
     let raw = ProcessInfo.processInfo.environment["P2WLAN_ENABLE_FLUTTER_TRAY"]?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
-    return raw == "1" || raw == "true" || raw == "yes"
+    guard let raw, !raw.isEmpty else {
+      return true
+    }
+    return raw != "0" && raw != "false" && raw != "no"
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

@@ -14,6 +14,7 @@ class PageScaffold extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final trimmedSubtitle = subtitle.trim();
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
@@ -44,15 +45,19 @@ class PageScaffold extends StatelessWidget {
                           letterSpacing: 0,
                         ),
                       ),
-                      const SizedBox(height: 3),
-                      Text(
-                        subtitle,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w400,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      if (trimmedSubtitle.isNotEmpty) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          trimmedSubtitle,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w400,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
                         ),
-                      ),
+                      ],
                       const SizedBox(height: 16),
                       ...children,
                     ],

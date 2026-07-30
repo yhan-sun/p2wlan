@@ -31,15 +31,37 @@ void main() {
       ),
     );
 
-    expect(find.text('Offline'), findsWidgets);
-    expect(find.text('GET /health'), findsOneWidget);
-    expect(find.text('GET /status'), findsOneWidget);
-    expect(find.text('skipped'), findsOneWidget);
-    expect(find.textContaining('GET /health is offline'), findsWidgets);
+    expect(find.textContaining('No runtime snapshot'), findsWidgets);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
-    expect(find.byKey(const Key('auto-refresh-switch')), findsOneWidget);
+    expect(find.byKey(const Key('auto-refresh-toggle')), findsOneWidget);
+  });
+
+  testWidgets('Dashboard shows stop only when daemon is reachable', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('10.20.0.10'), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
   });
 
   testWidgets('Dashboard separates status endpoint errors from health', (
@@ -65,10 +87,41 @@ void main() {
       ),
     );
 
-    expect(find.text('Degraded'), findsWidgets);
-    expect(find.text('reachable'), findsOneWidget);
-    expect(find.text('error'), findsOneWidget);
     expect(find.textContaining('GET /status failed'), findsWidgets);
+    expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+  });
+
+  testWidgets('Dashboard keeps actions usable on narrow screens', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
+    expect(find.byKey(const Key('auto-refresh-toggle')), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Settings validates diagnostics URL before saving', (

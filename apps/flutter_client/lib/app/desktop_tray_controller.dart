@@ -21,9 +21,19 @@ class DesktopTrayController with TrayListener, WindowListener {
   final SettingsStore settingsStore;
   final StatusStore statusStore;
 
+  static const _macosTrayIconSize = 18;
+  static const _windowsTrayIconAsset = 'assets/tray_icon.ico';
+  static const _linuxTrayIconAsset = 'assets/tray_icon.png';
+  static const _macosBusyIconAsset = 'assets/tray_icon_macos_busy.png';
+  static const _macosOnIconAsset = 'assets/tray_icon_macos_on.png';
+  static const _macosOffIconAsset = 'assets/tray_icon_macos_off.png';
+  static const _macosAttentionIconAsset =
+      'assets/tray_icon_macos_attention.png';
+
   bool _initialized = false;
   bool _quitting = false;
   bool _menuUpdateQueued = false;
+  String? _lastTrayIconAsset;
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -40,10 +50,7 @@ class DesktopTrayController with TrayListener, WindowListener {
 
     try {
       await windowManager.setPreventClose(true);
-      await trayManager.setIcon(
-        Platform.isWindows ? 'assets/tray_icon.ico' : 'assets/tray_icon.png',
-        iconSize: 18,
-      );
+      await _updateTrayIcon(force: true);
       await _updateMenu();
     } catch (error) {
       debugPrint('Failed to initialize P2WLAN tray: $error');
@@ -95,6 +102,7 @@ class DesktopTrayController with TrayListener, WindowListener {
     final strings = AppStrings.fromCode(settingsStore.settings.languageCode);
     final statusLabel = _statusLabel(strings);
 
+    await _updateTrayIcon();
     await trayManager.setToolTip('$p2wlanAppName - $statusLabel');
     if (Platform.isMacOS) {
       await trayManager.setTitle('');
@@ -103,14 +111,30 @@ class DesktopTrayController with TrayListener, WindowListener {
     await trayManager.setContextMenu(buildMenuForTesting());
   }
 
+  Future<void> _updateTrayIcon({bool force = false}) async {
+    final asset = trayIconAssetForTesting();
+    if (!force && _lastTrayIconAsset == asset) return;
+    await trayManager.setIcon(
+      asset,
+      isTemplate: false,
+      iconSize: Platform.isMacOS ? _macosTrayIconSize : 18,
+    );
+    _lastTrayIconAsset = asset;
+  }
+
   @visibleForTesting
   Menu buildMenuForTesting() {
     final strings = AppStrings.fromCode(settingsStore.settings.languageCode);
     final snapshot = statusStore.snapshot;
-    final running = statusStore.online;
+    final daemonReachable = statusStore.daemonReachable;
     final busy = statusStore.daemonBusy;
     final statusLabel = _statusLabel(strings);
     final networkLabel = _networkLabel(strings, snapshot);
+    final primaryControlLabel = busy
+        ? strings.daemonWorking
+        : daemonReachable
+        ? strings.stopP2wlan
+        : strings.startP2wlan;
 
     return Menu(
       items: [
@@ -122,14 +146,10 @@ class DesktopTrayController with TrayListener, WindowListener {
           onClick: (_) => unawaited(_showWindow()),
         ),
         MenuItem(
-          label: busy ? strings.daemonWorking : strings.startP2wlan,
-          disabled: busy || running,
-          onClick: (_) => unawaited(_startDaemon()),
-        ),
-        MenuItem(
-          label: strings.stopP2wlan,
-          disabled: busy || !statusStore.healthReachable,
-          onClick: (_) => unawaited(_stopDaemon()),
+          label: primaryControlLabel,
+          disabled: busy,
+          onClick: (_) =>
+              unawaited(daemonReachable ? _stopDaemon() : _startDaemon()),
         ),
         MenuItem(
           label: strings.refreshNow,
@@ -155,10 +175,22 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   String _statusLabel(AppStrings strings) {
     if (statusStore.daemonBusy) return strings.daemonWorking;
-    if (!statusStore.healthReachable) return strings.offline;
+    if (!statusStore.daemonReachable) return strings.offline;
     final health = statusStore.snapshot?.health.status;
-    if (health == null || health.isEmpty) return strings.online;
+    if (health == null || health.isEmpty) return strings.degraded;
     return strings.healthStatusLabel(health);
+  }
+
+  @visibleForTesting
+  String trayIconAssetForTesting() {
+    if (!Platform.isMacOS) {
+      return Platform.isWindows ? _windowsTrayIconAsset : _linuxTrayIconAsset;
+    }
+    if (statusStore.daemonBusy) return _macosBusyIconAsset;
+    if (!statusStore.daemonReachable) return _macosOffIconAsset;
+    final health = statusStore.snapshot?.health.status.toLowerCase();
+    if (health == 'healthy') return _macosOnIconAsset;
+    return _macosAttentionIconAsset;
   }
 
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
