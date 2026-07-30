@@ -1,9 +1,17 @@
 import 'dart:convert';
+import 'dart:io';
 
 const defaultDiagnosticsUrl = 'http://127.0.0.1:39277/status';
 const defaultControlServer = 'https://control.p2wlan.io';
 const defaultNetworkId = 'default';
 const defaultLanguageCode = 'en';
+const defaultOverlayCidr = '10.20.0.0/16';
+const defaultMtu = 1420;
+const defaultUdpBind = '0.0.0.0:0';
+const defaultSocketPool = '3';
+const defaultCloseBehavior = 'keep-running';
+
+String get defaultTunInterface => Platform.isWindows ? 'p2wlan' : 'p2wlan0';
 
 typedef JsonMap = Map<String, dynamic>;
 
@@ -53,6 +61,14 @@ class AppSettings {
     this.networkId = defaultNetworkId,
     this.deviceName = '',
     this.manualMode = false,
+    this.overlayCidr = defaultOverlayCidr,
+    this.tunInterface = '',
+    this.mtu = defaultMtu,
+    this.udpBind = defaultUdpBind,
+    this.udpAdvertise = '',
+    this.socketPool = defaultSocketPool,
+    this.relayServers = '',
+    this.closeBehavior = defaultCloseBehavior,
     this.languageCode = defaultLanguageCode,
     this.themeMode = 'system',
   });
@@ -63,8 +79,21 @@ class AppSettings {
   final String networkId;
   final String deviceName;
   final bool manualMode;
+  final String overlayCidr;
+  final String tunInterface;
+  final int mtu;
+  final String udpBind;
+  final String udpAdvertise;
+  final String socketPool;
+  final String relayServers;
+  final String closeBehavior;
   final String languageCode;
   final String themeMode;
+
+  String get effectiveTunInterface {
+    final trimmed = tunInterface.trim();
+    return trimmed.isEmpty ? defaultTunInterface : trimmed;
+  }
 
   AppSettings copyWith({
     String? diagnosticsUrl,
@@ -73,6 +102,14 @@ class AppSettings {
     String? networkId,
     String? deviceName,
     bool? manualMode,
+    String? overlayCidr,
+    String? tunInterface,
+    int? mtu,
+    String? udpBind,
+    String? udpAdvertise,
+    String? socketPool,
+    String? relayServers,
+    String? closeBehavior,
     String? languageCode,
     String? themeMode,
   }) {
@@ -83,6 +120,16 @@ class AppSettings {
       networkId: networkId ?? this.networkId,
       deviceName: deviceName ?? this.deviceName,
       manualMode: manualMode ?? this.manualMode,
+      overlayCidr: overlayCidr ?? this.overlayCidr,
+      tunInterface: tunInterface ?? this.tunInterface,
+      mtu: mtu ?? this.mtu,
+      udpBind: udpBind ?? this.udpBind,
+      udpAdvertise: udpAdvertise ?? this.udpAdvertise,
+      socketPool: socketPool ?? this.socketPool,
+      relayServers: relayServers ?? this.relayServers,
+      closeBehavior: _normalizeCloseBehavior(
+        closeBehavior ?? this.closeBehavior,
+      ),
       languageCode: languageCode == null
           ? this.languageCode
           : AppLanguage.fromCode(languageCode).code,
@@ -100,6 +147,18 @@ class AppSettings {
       networkId: _string(json['networkId'], defaultNetworkId),
       deviceName: _string(json['deviceName']),
       manualMode: _bool(json['manualMode']),
+      overlayCidr: _string(json['overlayCidr'], defaultOverlayCidr),
+      tunInterface: _string(json['tunInterface'], defaultTunInterface),
+      mtu: _int(json['mtu'], defaultMtu),
+      udpBind: _string(json['udpBind'], defaultUdpBind),
+      udpAdvertise: _string(json['udpAdvertise']),
+      socketPool: _normalizeSocketPool(
+        _string(json['socketPool'], defaultSocketPool),
+      ),
+      relayServers: _string(json['relayServers']),
+      closeBehavior: _normalizeCloseBehavior(
+        _string(json['closeBehavior'], defaultCloseBehavior),
+      ),
       languageCode: AppLanguage.fromCode(_string(json['languageCode'])).code,
       themeMode: AppThemeMode.fromCode(_string(json['themeMode'])).code,
     );
@@ -112,9 +171,42 @@ class AppSettings {
     'networkId': networkId,
     'deviceName': deviceName,
     'manualMode': manualMode,
+    'overlayCidr': overlayCidr,
+    'tunInterface': effectiveTunInterface,
+    'mtu': mtu,
+    'udpBind': udpBind,
+    'udpAdvertise': udpAdvertise,
+    'socketPool': _normalizeSocketPool(socketPool),
+    'relayServers': relayServers,
+    'closeBehavior': _normalizeCloseBehavior(closeBehavior),
     'languageCode': languageCode,
     'themeMode': themeMode,
   };
+}
+
+String _normalizeCloseBehavior(String value) {
+  final normalized = value.trim();
+  if (normalized == 'stop-and-quit' || normalized == 'keep-running') {
+    return normalized;
+  }
+  return defaultCloseBehavior;
+}
+
+String _normalizeSocketPool(String value) {
+  final normalized = value.trim().toLowerCase();
+  if (normalized == 'auto' ||
+      normalized == 'on' ||
+      normalized == 'true' ||
+      normalized == 'yes') {
+    return defaultSocketPool;
+  }
+  if (normalized == 'off' ||
+      normalized == 'false' ||
+      normalized == 'no' ||
+      normalized == 'none') {
+    return 'off';
+  }
+  return normalized.isEmpty ? defaultSocketPool : normalized;
 }
 
 class DiagnosticsSnapshot {

@@ -210,6 +210,9 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Enable Linux desktop
         working-directory: apps/flutter_client
         run: flutter config --enable-linux-desktop
@@ -217,6 +220,9 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
+
+      - name: Build Linux daemon
+        run: cargo build -p p2wlan-daemon --release
 
       - name: Build Linux release bundle
         working-directory: apps/flutter_client
@@ -238,6 +244,7 @@ jobs:
             echo "Linux Flutter release bundle was not found." >&2
             exit 1
           fi
+          install -m 0755 target/release/p2wlan-daemon "$bundle_dir/p2wlan-daemon"
           tar -C "$bundle_dir" -czf "dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz" .
 
       - name: Upload artifact
@@ -272,6 +279,9 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Enable Windows desktop
         working-directory: apps/flutter_client
         run: flutter config --enable-windows-desktop
@@ -279,6 +289,9 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
+
+      - name: Build Windows daemon
+        run: cargo build -p p2wlan-daemon --release
 
       - name: Build Windows release bundle
         working-directory: apps/flutter_client
@@ -321,6 +334,7 @@ jobs:
             throw "ISCC.exe was not found after installing Inno Setup."
           }
           $sourceDir = $releaseDir.FullName
+          Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
           $outputDir = (Resolve-Path "dist-release").Path
           $iss = Join-Path $env:RUNNER_TEMP "p2wlan-flutter-windows.iss"
           @"

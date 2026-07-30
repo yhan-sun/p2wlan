@@ -74,7 +74,19 @@ class DesktopTrayController with TrayListener, WindowListener {
   @override
   void onWindowClose() {
     if (_quitting) return;
-    unawaited(_hideWindow());
+    if (closeActionForTesting() == 'quit') {
+      unawaited(_quitApp());
+    } else {
+      unawaited(_hideWindow());
+    }
+  }
+
+  @visibleForTesting
+  String closeActionForTesting() {
+    return normalizeCloseBehavior(settingsStore.settings.closeBehavior) ==
+            'stop-and-quit'
+        ? 'quit'
+        : 'hide';
   }
 
   @override

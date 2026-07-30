@@ -361,7 +361,10 @@ abstract final class AppTheme {
         }),
         iconTheme: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) {
-            return const IconThemeData(color: AppTokens.colorDarkAccent, size: 22);
+            return const IconThemeData(
+              color: AppTokens.colorDarkAccent,
+              size: 22,
+            );
           }
           return const IconThemeData(
             color: AppTokens.colorDarkTextSecondary,

@@ -9,11 +9,13 @@ import '../features/dashboard/dashboard_page.dart';
 import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/settings/settings_page.dart';
+import '../features/tunnels/tunnels_page.dart';
 import '../shared/widgets/status_badge.dart';
 
 enum P2WlanSection {
   dashboard(Icons.dashboard_outlined),
   nodes(Icons.hub_outlined),
+  tunnels(Icons.cable_outlined),
   diagnostics(Icons.monitor_heart_outlined),
   settings(Icons.settings_outlined);
 
@@ -93,7 +95,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
       ),
-      P2WlanSection.nodes => NodesPage(statusStore: widget.statusStore),
+      P2WlanSection.nodes => NodesPage(
+        settingsStore: widget.settingsStore,
+        statusStore: widget.statusStore,
+      ),
+      P2WlanSection.tunnels => TunnelsPage(
+        settingsStore: widget.settingsStore,
+        statusStore: widget.statusStore,
+      ),
       P2WlanSection.diagnostics => DiagnosticsPage(
         statusStore: widget.statusStore,
       ),

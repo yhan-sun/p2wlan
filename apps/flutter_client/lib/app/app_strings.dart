@@ -37,6 +37,7 @@ class AppStrings {
 
   String get dashboard => isZh ? '仪表盘' : 'Dashboard';
   String get nodes => isZh ? '节点' : 'Nodes';
+  String get tunnels => isZh ? '隧道' : 'Tunnels';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
 
@@ -204,6 +205,7 @@ class AppStrings {
     return switch (sectionName) {
       'dashboard' => dashboard,
       'nodes' => nodes,
+      'tunnels' => tunnels,
       'diagnostics' => diagnostics,
       'settings' => settings,
       _ => sectionName,

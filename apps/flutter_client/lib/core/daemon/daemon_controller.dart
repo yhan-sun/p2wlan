@@ -61,6 +61,8 @@ class DaemonController {
     final authToken = settings.authToken.trim();
     final deviceName = settings.deviceName.trim();
     final useManualMode = settings.manualMode || authToken.isEmpty;
+    final udpAdvertise = settings.udpAdvertise.trim();
+    final relayServers = settings.relayServers.trim();
     final args = [
       '--config',
       configPath.path,
@@ -75,6 +77,20 @@ class DaemonController {
       '--log-file',
       logPath,
       if (deviceName.isNotEmpty) ...['--device-name', deviceName],
+      '--interface',
+      settings.effectiveTunInterface,
+      '--mtu',
+      settings.mtu.toString(),
+      '--udp-bind',
+      settings.udpBind.trim().isEmpty
+          ? defaultUdpBind
+          : settings.udpBind.trim(),
+      if (udpAdvertise.isNotEmpty) ...['--udp-advertise', udpAdvertise],
+      if (settings.socketPool.trim().isNotEmpty) ...[
+        '--socket-pool',
+        settings.socketPool.trim(),
+      ],
+      if (relayServers.isNotEmpty) ...['--relay', relayServers],
       if (useManualMode) '--manual' else ...['--managed', '--token', authToken],
     ];
 
@@ -89,15 +105,22 @@ class DaemonController {
       logPath: logPath,
       pidPath: pidPath,
     );
-    final manualCommand = Platform.isMacOS && !_isRootUser()
-        ? _manualSudoCommand(elevatedShell)
-        : null;
+    final manualCommand = _manualCommandForPlatform(
+      elevatedShell: elevatedShell,
+      binary: binary,
+      args: args,
+    );
 
     try {
       if (Platform.isMacOS && !_isRootUser()) {
         await _startMacosElevated(elevatedShell);
+      } else if (Platform.isWindows && !await _isWindowsAdministrator()) {
+        await _startWindowsElevated(binary: binary, args: args);
+      } else if (Platform.isLinux && !_isRootUser()) {
+        await _startLinuxElevated(binary: binary, args: args);
       } else {
-        await _startDetached(binary: binary, args: args);
+        final process = await _startDetached(binary: binary, args: args);
+        await _writePidMarker(pidPath, process.pid);
       }
     } catch (error) {
       return DaemonCommandResult(
@@ -274,16 +297,26 @@ class DaemonController {
     return file.existsSync() ? file : null;
   }
 
-  Future<void> _startDetached({
+  Future<Process> _startDetached({
     required File binary,
     required List<String> args,
   }) async {
-    await Process.start(
+    return Process.start(
       binary.path,
       args,
       mode: ProcessStartMode.detached,
       environment: {'P2WLAN_DAEMON_BIN': binary.path},
     );
+  }
+
+  Future<void> _writePidMarker(String pidPath, int pid) async {
+    try {
+      final file = File(pidPath);
+      await file.parent.create(recursive: true);
+      await file.writeAsString('$pid');
+    } catch (_) {
+      // Best-effort only; stop() can still recover by diagnostics process id.
+    }
   }
 
   String _buildElevatedShell({
@@ -373,6 +406,59 @@ class DaemonController {
 
   String _manualSudoCommand(String elevatedShell) {
     return 'sudo /bin/sh -c ${_shellQuote(elevatedShell)}';
+  }
+
+  String? _manualCommandForPlatform({
+    required String elevatedShell,
+    required File binary,
+    required List<String> args,
+  }) {
+    if ((Platform.isMacOS || Platform.isLinux) && !_isRootUser()) {
+      return _manualSudoCommand(elevatedShell);
+    }
+    if (Platform.isWindows) {
+      final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
+      return 'powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath ${_powershellDoubleQuote(binary.path)} -ArgumentList ${_powershellDoubleQuote(argLine)}"';
+    }
+    return null;
+  }
+
+  Future<void> _startLinuxElevated({
+    required File binary,
+    required List<String> args,
+  }) async {
+    final pkexec = await _which('pkexec');
+    if (pkexec == null) {
+      throw '当前 Linux 桌面未找到 pkexec。请复制 sudo 命令手动启动，或使用 setcap 给 p2wlan-daemon 添加 CAP_NET_ADMIN。';
+    }
+    await Process.start(pkexec.path, [
+      'env',
+      '$envDaemonBin=${binary.path}',
+      binary.path,
+      ...args,
+    ], mode: ProcessStartMode.detached);
+  }
+
+  Future<void> _startWindowsElevated({
+    required File binary,
+    required List<String> args,
+  }) async {
+    final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
+    final script =
+        'Start-Process -Verb RunAs -WindowStyle Hidden '
+        '-FilePath ${_powershellSingleQuoted(binary.path)} '
+        '-ArgumentList ${_powershellSingleQuoted(argLine)}';
+    final result = await Process.run('powershell', [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      script,
+    ]);
+    if (result.exitCode != 0) {
+      final stderr = result.stderr.toString().trim();
+      throw stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr;
+    }
   }
 
   String _startFailureMessage(Object error) {
@@ -682,13 +768,62 @@ class DaemonController {
 
   bool _isRootUser() {
     if (!Platform.isMacOS && !Platform.isLinux) return false;
-    return Platform.environment['USER'] == 'root';
+    try {
+      final result = Process.runSync('id', ['-u']);
+      return result.exitCode == 0 && result.stdout.toString().trim() == '0';
+    } catch (_) {
+      return Platform.environment['USER'] == 'root';
+    }
   }
 
   String _shellQuote(String value) => "'${value.replaceAll("'", "'\\''")}'";
 
+  Future<bool> _isWindowsAdministrator() async {
+    if (!Platform.isWindows) return false;
+    final result = await Process.run('net', ['session']);
+    return result.exitCode == 0;
+  }
+
+  String _windowsCommandLineArgQuote(String value) {
+    if (value.isNotEmpty && !value.contains(RegExp(r'[\s"]'))) {
+      return value;
+    }
+    final buffer = StringBuffer('"');
+    var backslashes = 0;
+    for (final codeUnit in value.codeUnits) {
+      final char = String.fromCharCode(codeUnit);
+      if (char == '\\') {
+        backslashes += 1;
+      } else if (char == '"') {
+        buffer
+          ..write(_repeat('\\', backslashes * 2 + 1))
+          ..write('"');
+        backslashes = 0;
+      } else {
+        buffer
+          ..write(_repeat('\\', backslashes))
+          ..write(char);
+        backslashes = 0;
+      }
+    }
+    buffer
+      ..write(_repeat('\\', backslashes * 2))
+      ..write('"');
+    return buffer.toString();
+  }
+
+  String _repeat(String value, int count) => List.filled(count, value).join();
+
   String _powershellSingleQuote(String value) {
     return value.replaceAll("'", "''");
+  }
+
+  String _powershellSingleQuoted(String value) {
+    return "'${_powershellSingleQuote(value)}'";
+  }
+
+  String _powershellDoubleQuote(String value) {
+    return '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
   }
 
   String _appleScriptQuote(String value) {

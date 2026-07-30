@@ -1,26 +1,48 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/api/control_api.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
-class NodesPage extends StatelessWidget {
-  const NodesPage({super.key, required this.statusStore});
+class NodesPage extends StatefulWidget {
+  const NodesPage({
+    super.key,
+    required this.settingsStore,
+    required this.statusStore,
+  });
 
+  final SettingsStore settingsStore;
   final StatusStore statusStore;
+
+  @override
+  State<NodesPage> createState() => _NodesPageState();
+}
+
+class _NodesPageState extends State<NodesPage> {
+  final _controlApi = ControlApi();
+  String? _copiedKey;
+
+  @override
+  void dispose() {
+    _controlApi.close();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
-      animation: statusStore,
+      animation: widget.statusStore,
       builder: (context, _) {
-        final snapshot = statusStore.snapshot;
+        final snapshot = widget.statusStore.snapshot;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         return PageScaffold(
           title: strings.nodes,
@@ -43,15 +65,110 @@ class NodesPage extends StatelessWidget {
               LayoutBuilder(
                 builder: (context, constraints) {
                   if (constraints.maxWidth >= 760) {
-                    return _PeerTable(peers: peers);
+                    return _PeerTable(
+                      peers: peers,
+                      copiedKey: _copiedKey,
+                      onCopy: _copy,
+                      onEdit: _editPeer,
+                    );
                   }
-                  return _PeerList(peers: peers);
+                  return _PeerList(
+                    peers: peers,
+                    copiedKey: _copiedKey,
+                    onCopy: _copy,
+                    onEdit: _editPeer,
+                  );
                 },
               ),
           ],
         );
       },
     );
+  }
+
+  Future<void> _copy(String value, String key) async {
+    if (value.trim().isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    setState(() => _copiedKey = key);
+    Future<void>.delayed(const Duration(milliseconds: 1400), () {
+      if (mounted && _copiedKey == key) setState(() => _copiedKey = null);
+    });
+  }
+
+  Future<void> _editPeer(PeerSnapshot peer) async {
+    final strings = AppStringsScope.of(context);
+    final controller = TextEditingController(text: peer.displayName);
+    String? error;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: Text(strings.isZh ? '编辑设备名称' : 'Edit device name'),
+              content: TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: strings.deviceName,
+                  errorText: error,
+                ),
+                onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: Text(strings.cancel),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final name = controller.text.trim();
+                    if (name.isEmpty) {
+                      setDialogState(() {
+                        error = strings.isZh
+                            ? '设备名称不能为空'
+                            : 'Device name is required';
+                      });
+                      return;
+                    }
+                    Navigator.of(dialogContext).pop(name);
+                  },
+                  child: Text(strings.save),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null || result.trim().isEmpty) return;
+    final settings = widget.settingsStore.settings;
+    try {
+      final savedName = await _controlApi.renameDevice(
+        controlServer: settings.controlServer,
+        authToken: settings.authToken,
+        deviceId: peer.nodeId,
+        deviceName: result,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            strings.isZh
+                ? '设备名称已保存：$savedName'
+                : 'Device name saved: $savedName',
+          ),
+        ),
+      );
+      await widget.statusStore.refresh();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
   }
 }
 
@@ -87,9 +204,17 @@ class _PeerSummary extends StatelessWidget {
 }
 
 class _PeerTable extends StatelessWidget {
-  const _PeerTable({required this.peers});
+  const _PeerTable({
+    required this.peers,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
+  });
 
   final List<PeerSnapshot> peers;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -125,6 +250,9 @@ class _PeerTable extends StatelessWidget {
                         peer: peers[index],
                         strings: strings,
                         shaded: index.isOdd,
+                        copiedKey: copiedKey,
+                        onCopy: onCopy,
+                        onEdit: onEdit,
                       );
                     },
                   ),
@@ -137,7 +265,7 @@ class _PeerTable extends StatelessWidget {
     );
   }
 
-  static const _tableWidth = 980.0;
+  static const _tableWidth = 1100.0;
   static const _maxBodyHeight = 520.0;
   static const _rowHeight = 44.0;
   static const _deviceWidth = 142.0;
@@ -149,6 +277,7 @@ class _PeerTable extends StatelessWidget {
   static const _routeWidth = 92.0;
   static const _latencyWidth = 86.0;
   static const _endpointWidth = 122.0;
+  static const _actionWidth = 120.0;
 
   static const _columnHeaderStyle = TextStyle(
     fontSize: 12,
@@ -230,6 +359,13 @@ class _PeerHeader extends StatelessWidget {
             width: _PeerTable._endpointWidth,
             child: Text(strings.endpoint, style: _PeerTable._columnHeaderStyle),
           ),
+          _PeerCell(
+            width: _PeerTable._actionWidth,
+            child: Text(
+              strings.isZh ? '操作' : 'Actions',
+              style: _PeerTable._columnHeaderStyle,
+            ),
+          ),
         ],
       ),
     );
@@ -241,11 +377,17 @@ class _PeerRow extends StatelessWidget {
     required this.peer,
     required this.strings,
     required this.shaded,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
   });
 
   final PeerSnapshot peer;
   final AppStrings strings;
   final bool shaded;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -322,6 +464,15 @@ class _PeerRow extends StatelessWidget {
               style: _PeerTable._cellMonoStyle,
             ),
           ),
+          _PeerCell(
+            width: _PeerTable._actionWidth,
+            child: _PeerActions(
+              peer: peer,
+              copiedKey: copiedKey,
+              onCopy: onCopy,
+              onEdit: onEdit,
+            ),
+          ),
         ],
       ),
     );
@@ -347,9 +498,17 @@ class _PeerCell extends StatelessWidget {
 }
 
 class _PeerList extends StatelessWidget {
-  const _PeerList({required this.peers});
+  const _PeerList({
+    required this.peers,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
+  });
 
   final List<PeerSnapshot> peers;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -377,6 +536,9 @@ class _PeerList extends StatelessWidget {
                 peer: peers[index],
                 strings: strings,
                 shaded: index.isOdd,
+                copiedKey: copiedKey,
+                onCopy: onCopy,
+                onEdit: onEdit,
               );
             },
           ),
@@ -394,11 +556,17 @@ class _PeerListRow extends StatelessWidget {
     required this.peer,
     required this.strings,
     required this.shaded,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
   });
 
   final PeerSnapshot peer;
   final AppStrings strings;
   final bool shaded;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -478,8 +646,71 @@ class _PeerListRow extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(width: 8),
+          _PeerActions(
+            peer: peer,
+            copiedKey: copiedKey,
+            onCopy: onCopy,
+            onEdit: onEdit,
+          ),
         ],
       ),
+    );
+  }
+}
+
+class _PeerActions extends StatelessWidget {
+  const _PeerActions({
+    required this.peer,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
+  });
+
+  final PeerSnapshot peer;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final ipKey = '${peer.nodeId}:ip';
+    final pingKey = '${peer.nodeId}:ping';
+    final ipCopied = copiedKey == ipKey;
+    final pingCopied = copiedKey == pingKey;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: ipCopied
+              ? (strings.isZh ? '已复制' : 'Copied')
+              : (strings.isZh ? '复制虚拟 IP' : 'Copy virtual IP'),
+          visualDensity: VisualDensity.compact,
+          onPressed: () => onCopy(peer.virtualIp, ipKey),
+          icon: Icon(
+            ipCopied ? Icons.check_circle_outline : Icons.copy_outlined,
+            size: 18,
+          ),
+        ),
+        IconButton(
+          tooltip: pingCopied
+              ? (strings.isZh ? '已复制' : 'Copied')
+              : (strings.isZh ? '复制 ping 命令' : 'Copy ping command'),
+          visualDensity: VisualDensity.compact,
+          onPressed: () => onCopy('ping ${peer.virtualIp}', pingKey),
+          icon: Icon(
+            pingCopied ? Icons.check_circle_outline : Icons.terminal_outlined,
+            size: 18,
+          ),
+        ),
+        IconButton(
+          tooltip: strings.isZh ? '编辑设备' : 'Edit device',
+          visualDensity: VisualDensity.compact,
+          onPressed: () => onEdit(peer),
+          icon: const Icon(Icons.edit_outlined, size: 18),
+        ),
+      ],
     );
   }
 }
