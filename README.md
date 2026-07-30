@@ -63,7 +63,7 @@ P2WLAN 是一个开源、P2P 优先、可自托管的虚拟内网项目。它会
     </td>
     <td width="33%" valign="top">
       <h3>跨平台体验</h3>
-      <p>macOS 与 Windows 提供 Tauri 桌面客户端，Linux 提供适合服务器、NAS 和无桌面环境的 CLI。</p>
+      <p>Release 会发布 Flutter 诊断客户端；Linux 仍保留适合服务器、NAS 和无桌面环境的 CLI/daemon 包。</p>
     </td>
   </tr>
 </table>
@@ -78,7 +78,7 @@ P2WLAN 是一个开源、P2P 优先、可自托管的虚拟内网项目。它会
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载最新版客户端，在至少两台设备上登录同一个账号并启动虚拟网卡，然后使用对端虚拟 IP 测试：
+从 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载最新版客户端。当前 Release 的 Flutter 客户端是只读诊断预览版；真实虚拟网卡仍由本地 daemon / Linux CLI 路径负责，然后可用对端虚拟 IP 测试：
 
 ```bash
 ping 10.20.0.5
@@ -87,25 +87,19 @@ ssh user@10.20.0.5
 
 ### macOS
 
-下载 universal `.dmg`，拖入 Applications，打开 P2WLAN，并在启动虚拟网卡时确认系统授权。
+Apple Silicon 下载 `p2wlan-flutter-macos-arm64.dmg`，Intel Mac 下载 `p2wlan-flutter-macos-x64.dmg`，拖入 Applications 后打开 `P2WLAN Diagnostics`。
 
 Preview 构建可能尚未完成 Apple 公证。如果 Gatekeeper 阻止首次启动，请在 Finder 中右键应用并选择 Open。
 
 ### Windows
 
-下载 Windows 压缩包，保持以下文件在同一目录，然后运行 `p2wlan-desktop.exe`：
+普通 Intel / AMD 电脑下载 `p2wlan-flutter-windows-x64-setup.exe`，Windows ARM 设备下载 `p2wlan-flutter-windows-arm64-setup.exe`，按安装向导启动 `P2WLAN Diagnostics`。
 
-```text
-p2wlan-desktop.exe
-p2pnet-daemon.exe
-wintun.dll
-```
-
-启动虚拟网卡时 Windows 会显示 UAC 授权窗口。P2WLAN 不读取、保存或接管系统管理员密码。
+当前 Flutter 客户端不会启动或停止虚拟网卡；需要真实 TUN/Wintun/utun 时，仍以 daemon / CLI 或后续完整客户端为准。
 
 ### Linux
 
-Linux 当前优先支持服务器、NAS 和无桌面环境的 CLI：
+Linux 桌面可下载 `p2wlan-flutter-linux-x64.tar.gz` 或 `p2wlan-flutter-linux-arm64.tar.gz` 运行 Flutter 诊断客户端。服务器、NAS 和无桌面环境继续使用 CLI/daemon 包：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -157,7 +151,7 @@ flowchart LR
 
 | 层级 | 实现 | 主要职责 |
 | --- | --- | --- |
-| 桌面客户端 | React, Tauri | 登录、设备状态、系统授权、托盘、设置、诊断 |
+| 桌面客户端 | Flutter 诊断客户端 / Tauri 旧客户端 | 设备状态、诊断、迁移中的桌面体验 |
 | 本地守护进程 | Rust | 虚拟网卡、加密会话、Peer 状态、NAT 探测、中继回退 |
 | 控制面 | Go, SQLite | 账号、设备注册、虚拟 IP 分配、凭据状态、中继票据、信令 |
 | 中继服务 | Go | 密文转发、票据校验、撤销信息同步 |
@@ -208,9 +202,11 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 
 | 平台 | 客户端 | 虚拟网卡 | 当前状态 |
 | --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | 桌面客户端 | `utun` | Preview，已完成真实双向虚拟 IP 测试 |
-| Windows 10/11 x64 | 便携桌面客户端 | Wintun | Preview，远程 smoke 覆盖持续完善 |
-| Linux x64 / arm64 | CLI | TUN | Preview，支持服务器和无桌面工作流 |
+| macOS Apple Silicon / Intel | Flutter DMG，按 arm64 / x64 拆包 | `utun` 由 daemon 路径提供 | Flutter 诊断预览，TUN 控制迁移中 |
+| Windows 10/11 x64 / arm64 | Flutter setup 安装包 | Wintun 由 daemon 路径提供 | Flutter 诊断预览，安装包已按架构拆分 |
+| Linux x64 / arm64 | Flutter bundle + CLI/daemon tarball | TUN | 桌面诊断预览；服务器和无桌面工作流走 CLI |
+| Android arm64 | Flutter APK | 后续 Android VPN 路径 | Release 仅发布 arm64 |
+| iOS arm64 | unsigned Flutter IPA | 后续 Network Extension 路径 | CI 可产物，需签名后安装 |
 
 ## 自托管
 
@@ -271,7 +267,7 @@ RELAY_AUTH_FAILURE_WINDOW="1m" \
 
 ## 从源码构建
 
-需要 Rust stable、Go 1.22+、Node.js 20+ 和 pnpm 10+。Linux 桌面构建还需要 GTK/WebKit2GTK 开发依赖。
+需要 Rust stable、Go 1.22+、Node.js 20+、pnpm 10+ 和 Flutter stable。Linux Flutter 桌面构建还需要 GTK 开发依赖；旧 Tauri 桌面构建仍需要 WebKit2GTK 开发依赖。
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
@@ -280,6 +276,10 @@ pnpm install --frozen-lockfile
 
 cargo build -p p2pnet-daemon
 cargo tauri dev
+
+cd apps/flutter_client
+flutter pub get
+flutter run -d macos
 ```
 
 macOS 打包建议使用项目脚本，确保 daemon 被放入应用资源目录：
@@ -322,6 +322,7 @@ client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、C
 server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
 src/          React 桌面客户端界面
 src-tauri/    Tauri 外壳、托盘、权限、daemon 生命周期和平台打包
+apps/flutter_client/ Flutter 诊断客户端：Android、iOS、macOS、Windows、Linux
 scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
 fuzz/         协议与解析器模糊测试
 proto/        Protobuf 协议草案

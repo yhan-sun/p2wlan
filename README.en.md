@@ -63,7 +63,7 @@ When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus 
     </td>
     <td width="33%" valign="top">
       <h3>Cross-platform</h3>
-      <p>Tauri desktop apps for macOS and Windows, plus a Linux CLI for servers, NAS devices, and headless environments.</p>
+      <p>Releases publish the Flutter diagnostics client, while Linux keeps CLI/daemon packages for servers, NAS devices, and headless environments.</p>
     </td>
   </tr>
 </table>
@@ -78,7 +78,7 @@ When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus 
 
 ## Quick Start
 
-Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases), sign in on at least two devices, start the virtual interface, then test another peer by virtual IP:
+Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases). The current Flutter release client is a read-only diagnostics preview; real virtual interfaces still come from the local daemon / Linux CLI path, then you can test another peer by virtual IP:
 
 ```bash
 ping 10.20.0.5
@@ -87,25 +87,19 @@ ssh user@10.20.0.5
 
 ### macOS
 
-Download the universal `.dmg`, drag P2WLAN into Applications, open it, and approve the system authorization prompt when starting the virtual interface.
+Apple Silicon Macs use `p2wlan-flutter-macos-arm64.dmg`; Intel Macs use `p2wlan-flutter-macos-x64.dmg`. Drag the app into Applications and open `P2WLAN Diagnostics`.
 
 Preview builds may not yet be Apple-notarized. If Gatekeeper blocks the first launch, open the app from Finder with right-click -> Open.
 
 ### Windows
 
-Download the Windows archive, keep these files in the same directory, and run `p2wlan-desktop.exe`:
+Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`; Windows ARM devices use `p2wlan-flutter-windows-arm64-setup.exe`. Install it and launch `P2WLAN Diagnostics`.
 
-```text
-p2wlan-desktop.exe
-p2pnet-daemon.exe
-wintun.dll
-```
-
-Windows asks for UAC approval when the virtual adapter starts. P2WLAN does not read or store your administrator password.
+The current Flutter client does not start or stop the virtual adapter. Real TUN/Wintun/utun control remains on the daemon / CLI path or a later full client.
 
 ### Linux
 
-The current Linux release focuses on server, NAS, and headless CLI workflows:
+Linux desktops can use `p2wlan-flutter-linux-x64.tar.gz` or `p2wlan-flutter-linux-arm64.tar.gz` for the Flutter diagnostics client. Servers, NAS devices, and headless environments should keep using the CLI/daemon package:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -156,7 +150,7 @@ flowchart LR
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Desktop client | React, Tauri | Login, device status, system authorization, tray, settings, diagnostics |
+| Desktop client | Flutter diagnostics client / legacy Tauri client | Device status, diagnostics, and the desktop migration path |
 | Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
 | Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
 | Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
@@ -207,9 +201,11 @@ Troubleshooting guidance:
 
 | Platform | Client | Virtual interface | Status |
 | --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | Desktop app | `utun` | Preview, real bidirectional virtual-IP testing completed |
-| Windows 10/11 x64 | Portable desktop app | Wintun | Preview, remote smoke coverage is expanding |
-| Linux x64 / arm64 | CLI | TUN | Preview, server and headless workflows supported |
+| macOS Apple Silicon / Intel | Flutter DMG split by arm64 / x64 | `utun` via daemon path | Flutter diagnostics preview; TUN control is still migrating |
+| Windows 10/11 x64 / arm64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics preview; installers are architecture-specific |
+| Linux x64 / arm64 | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics preview; server and headless workflows use CLI |
+| Android arm64 | Flutter APK | Future Android VPN path | Release publishes arm64 only |
+| iOS arm64 | unsigned Flutter IPA | Future Network Extension path | CI artifact, requires signing before installation |
 
 ## Self-hosting
 
@@ -269,7 +265,7 @@ Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files,
 
 ## Build from Source
 
-Install Rust stable, Go 1.22+, Node.js 20+, and pnpm 10+. Linux desktop builds also need GTK/WebKit2GTK development dependencies.
+Install Rust stable, Go 1.22+, Node.js 20+, pnpm 10+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies; legacy Tauri desktop builds still need WebKit2GTK development dependencies.
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
@@ -278,6 +274,10 @@ pnpm install --frozen-lockfile
 
 cargo build -p p2pnet-daemon
 cargo tauri dev
+
+cd apps/flutter_client
+flutter pub get
+flutter run -d macos
 ```
 
 For macOS packages, use the project scripts so the daemon is placed into the app resource directory:
@@ -320,6 +320,7 @@ client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon,
 server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
 src/          React desktop client interface
 src-tauri/    Tauri shell, tray, permissions, daemon lifecycle, platform packaging
+apps/flutter_client/ Flutter diagnostics client for Android, iOS, macOS, Windows, and Linux
 scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
 fuzz/         Protocol and parser fuzzing
 proto/        Protobuf protocol draft
