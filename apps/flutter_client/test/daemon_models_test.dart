@@ -5,6 +5,17 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/daemon_models.dart';
 
 void main() {
+  test('app settings persist language without breaking old settings', () {
+    final oldSettings = AppSettings.fromJson({
+      'diagnosticsUrl': 'http://127.0.0.1:39277/status',
+    });
+    expect(oldSettings.languageCode, defaultLanguageCode);
+
+    final zhSettings = oldSettings.copyWith(languageCode: 'zh_CN');
+    expect(zhSettings.languageCode, AppLanguage.simplifiedChinese.code);
+    expect(zhSettings.toJson()['languageCode'], 'zh-Hans');
+  });
+
   test('parses connected /status fixture', () async {
     final raw = await File(
       'test/fixtures/status_connected.json',

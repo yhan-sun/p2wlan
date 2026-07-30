@@ -49,8 +49,14 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> updateLanguageCode(String languageCode) async {
+    _settings = _settings.copyWith(languageCode: languageCode);
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> resetDiagnosticsUrl() async {
-    _settings = const AppSettings();
+    _settings = _settings.copyWith(diagnosticsUrl: defaultDiagnosticsUrl);
     await _save();
     notifyListeners();
   }

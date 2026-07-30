@@ -1,25 +1,59 @@
 import 'dart:convert';
 
 const defaultDiagnosticsUrl = 'http://127.0.0.1:39277/status';
+const defaultLanguageCode = 'en';
 
 typedef JsonMap = Map<String, dynamic>;
 
+enum AppLanguage {
+  english('en'),
+  simplifiedChinese('zh-Hans');
+
+  const AppLanguage(this.code);
+
+  final String code;
+
+  static AppLanguage fromCode(String? code) {
+    final normalized = (code ?? defaultLanguageCode)
+        .trim()
+        .replaceAll('_', '-')
+        .toLowerCase();
+    return switch (normalized) {
+      'zh' || 'zh-cn' || 'zh-hans' || 'zh-hans-cn' => simplifiedChinese,
+      _ => english,
+    };
+  }
+}
+
 class AppSettings {
-  const AppSettings({this.diagnosticsUrl = defaultDiagnosticsUrl});
+  const AppSettings({
+    this.diagnosticsUrl = defaultDiagnosticsUrl,
+    this.languageCode = defaultLanguageCode,
+  });
 
   final String diagnosticsUrl;
+  final String languageCode;
 
-  AppSettings copyWith({String? diagnosticsUrl}) {
-    return AppSettings(diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl);
+  AppSettings copyWith({String? diagnosticsUrl, String? languageCode}) {
+    return AppSettings(
+      diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl,
+      languageCode: languageCode == null
+          ? this.languageCode
+          : AppLanguage.fromCode(languageCode).code,
+    );
   }
 
   factory AppSettings.fromJson(JsonMap json) {
     return AppSettings(
       diagnosticsUrl: _string(json['diagnosticsUrl'], defaultDiagnosticsUrl),
+      languageCode: AppLanguage.fromCode(_string(json['languageCode'])).code,
     );
   }
 
-  JsonMap toJson() => {'diagnosticsUrl': diagnosticsUrl};
+  JsonMap toJson() => {
+    'diagnosticsUrl': diagnosticsUrl,
+    'languageCode': languageCode,
+  };
 }
 
 class DaemonSnapshot {

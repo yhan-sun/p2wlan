@@ -109,7 +109,7 @@ void main() {
 
     expect(find.text('Summary'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
-    expect(find.text('healthy'), findsWidgets);
+    expect(find.text('Healthy'), findsWidgets);
     expect(
       find.textContaining('"node_id": "node-local-abcdef1234567890"'),
       findsOneWidget,
