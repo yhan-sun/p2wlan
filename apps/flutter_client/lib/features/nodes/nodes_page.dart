@@ -40,19 +40,26 @@ class _NodesPageState extends State<NodesPage> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
-      animation: widget.statusStore,
+      animation: Listenable.merge([widget.statusStore, widget.settingsStore]),
       builder: (context, _) {
         final snapshot = widget.statusStore.snapshot;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
+        final settings = widget.settingsStore.settings;
         return PageScaffold(
           title: strings.nodes,
           subtitle: strings.nodesSubtitle,
           children: [
+            _LocalNodePanel(
+              snapshot: snapshot,
+              settings: settings,
+              onEdit: () => _editLocalNode(snapshot),
+            ),
+            const SizedBox(height: 14),
             _PeerSummary(snapshot: snapshot, peerCount: peers.length),
             const SizedBox(height: 14),
             if (peers.isEmpty)
               AppPanel(
-                title: strings.peers,
+                title: strings.isZh ? '其他设备' : 'Other devices',
                 child: Text(
                   strings.noPeers,
                   style: const TextStyle(
@@ -62,23 +69,11 @@ class _NodesPageState extends State<NodesPage> {
                 ),
               )
             else
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  if (constraints.maxWidth >= 760) {
-                    return _PeerTable(
-                      peers: peers,
-                      copiedKey: _copiedKey,
-                      onCopy: _copy,
-                      onEdit: _editPeer,
-                    );
-                  }
-                  return _PeerList(
-                    peers: peers,
-                    copiedKey: _copiedKey,
-                    onCopy: _copy,
-                    onEdit: _editPeer,
-                  );
-                },
+              _PeerList(
+                peers: peers,
+                copiedKey: _copiedKey,
+                onCopy: _copy,
+                onEdit: _editPeer,
               ),
           ],
         );
@@ -96,9 +91,100 @@ class _NodesPageState extends State<NodesPage> {
     });
   }
 
+  Future<void> _editLocalNode(DiagnosticsSnapshot? snapshot) async {
+    final strings = AppStringsScope.of(context);
+    final settings = widget.settingsStore.settings;
+    final initialName = settings.deviceName.trim().isEmpty
+        ? await resolveDefaultDeviceName()
+        : settings.deviceName.trim();
+    if (!mounted) return;
+    final result = await _promptDeviceName(
+      initialName: initialName,
+      title: strings.isZh ? '编辑本机节点名称' : 'Edit this device name',
+    );
+    if (result == null) return;
+
+    final nodeId = snapshot?.nodeId.trim() ?? '';
+    final canSync =
+        !settings.manualMode &&
+        settings.authToken.trim().isNotEmpty &&
+        nodeId.isNotEmpty;
+    var savedName = result;
+    try {
+      if (canSync) {
+        savedName = await _controlApi.renameDevice(
+          controlServer: settings.controlServer,
+          authToken: settings.authToken,
+          deviceId: nodeId,
+          deviceName: result,
+        );
+      }
+      await widget.settingsStore.updateSettings(
+        settings.copyWith(deviceName: savedName),
+      );
+      await widget.statusStore.refresh();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            canSync
+                ? (strings.isZh
+                      ? '本机节点名称已同步：$savedName'
+                      : 'This device name synced: $savedName')
+                : (strings.isZh
+                      ? '本机节点名称已保存：$savedName'
+                      : 'This device name saved: $savedName'),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
   Future<void> _editPeer(PeerSnapshot peer) async {
     final strings = AppStringsScope.of(context);
-    final controller = TextEditingController(text: peer.displayName);
+    final result = await _promptDeviceName(
+      initialName: peer.displayName,
+      title: strings.isZh ? '编辑设备名称' : 'Edit device name',
+    );
+    if (result == null) return;
+    final settings = widget.settingsStore.settings;
+    try {
+      final savedName = await _controlApi.renameDevice(
+        controlServer: settings.controlServer,
+        authToken: settings.authToken,
+        deviceId: peer.nodeId,
+        deviceName: result,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            strings.isZh
+                ? '设备名称已同步：$savedName'
+                : 'Device name synced: $savedName',
+          ),
+        ),
+      );
+      await widget.statusStore.refresh();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  Future<String?> _promptDeviceName({
+    required String initialName,
+    required String title,
+  }) async {
+    final strings = AppStringsScope.of(context);
+    final controller = TextEditingController(text: initialName);
     String? error;
     final result = await showDialog<String>(
       context: context,
@@ -106,7 +192,7 @@ class _NodesPageState extends State<NodesPage> {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
-              title: Text(strings.isZh ? '编辑设备名称' : 'Edit device name'),
+              title: Text(title),
               content: TextField(
                 controller: controller,
                 autofocus: true,
@@ -143,32 +229,124 @@ class _NodesPageState extends State<NodesPage> {
       },
     );
     controller.dispose();
-    if (result == null || result.trim().isEmpty) return;
-    final settings = widget.settingsStore.settings;
-    try {
-      final savedName = await _controlApi.renameDevice(
-        controlServer: settings.controlServer,
-        authToken: settings.authToken,
-        deviceId: peer.nodeId,
-        deviceName: result,
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            strings.isZh
-                ? '设备名称已保存：$savedName'
-                : 'Device name saved: $savedName',
+    final name = result?.trim();
+    if (name == null || name.isEmpty) return null;
+    return name;
+  }
+}
+
+class _LocalNodePanel extends StatelessWidget {
+  const _LocalNodePanel({
+    required this.snapshot,
+    required this.settings,
+    required this.onEdit,
+  });
+
+  final DiagnosticsSnapshot? snapshot;
+  final AppSettings settings;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final deviceName = settings.deviceName.trim();
+    final nodeId = snapshot?.nodeId.trim() ?? '';
+    final virtualIp = snapshot?.virtualIp.trim() ?? '';
+    final canSync =
+        !settings.manualMode &&
+        settings.authToken.trim().isNotEmpty &&
+        nodeId.isNotEmpty;
+    final syncText = canSync
+        ? (strings.isZh ? '服务端同步已就绪' : 'Control sync ready')
+        : (strings.isZh
+              ? '本地保存，启动并登录后同步'
+              : 'Saved locally; sync after sign-in');
+
+    return AppPanel(
+      title: strings.isZh ? '本机节点' : 'This device',
+      trailing: OutlinedButton.icon(
+        onPressed: onEdit,
+        icon: const Icon(Icons.edit_outlined, size: 16),
+        label: Text(strings.isZh ? '修改名称' : 'Rename'),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: AppTokens.colorNeutralBg,
+                  borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                  border: Border.all(color: AppTokens.colorNeutralBorder),
+                ),
+                child: const Icon(
+                  Icons.computer_rounded,
+                  size: 20,
+                  color: AppTokens.colorAccent,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      dash(deviceName),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: AppTokens.colorTextPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      strings.isZh
+                          ? '修改后会同步到控制面，其他设备刷新后会看到新名称。'
+                          : 'Renames sync to the control plane and appear on other devices after refresh.',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: AppTokens.colorTextSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              StatusBadge(
+                label: snapshot == null ? strings.offline : strings.connected,
+                tone: snapshot == null ? StatusTone.neutral : StatusTone.good,
+              ),
+            ],
           ),
-        ),
-      );
-      await widget.statusStore.refresh();
-    } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
-    }
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 24,
+            runSpacing: 2,
+            children: [
+              MetricTile(
+                label: strings.virtualIp,
+                value: virtualIp.isEmpty ? '—' : virtualIp,
+              ),
+              MetricTile(
+                label: strings.nodeId,
+                value: nodeId.isEmpty ? '—' : shortId(nodeId),
+              ),
+              MetricTile(
+                label: strings.isZh ? '同步状态' : 'Sync',
+                value: syncText,
+                minWidth: 210,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -223,7 +401,7 @@ class _PeerTable extends StatelessWidget {
         .clamp(_rowHeight, _maxBodyHeight)
         .toDouble();
     return AppPanel(
-      title: strings.peers,
+      title: strings.isZh ? '其他设备' : 'Other devices',
       flushContent: true,
       child: ClipRRect(
         borderRadius: const BorderRadius.only(
@@ -517,7 +695,7 @@ class _PeerList extends StatelessWidget {
         .clamp(_rowHeight, _maxBodyHeight)
         .toDouble();
     return AppPanel(
-      title: strings.peers,
+      title: strings.isZh ? '其他设备' : 'Other devices',
       flushContent: true,
       child: ClipRRect(
         borderRadius: const BorderRadius.only(

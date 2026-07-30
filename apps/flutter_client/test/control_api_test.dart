@@ -35,6 +35,33 @@ void main() {
     expect(store.settings.controlServer, defaultControlServer);
   });
 
+  test('settings load replaces ip-like default device names', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'p2wlan_device_name_migration_test_',
+    );
+    addTearDown(() {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+    final settingsFile = File('${tempDir.path}/settings.json');
+    await settingsFile.writeAsString('''
+{
+  "controlServer": "$defaultControlServer",
+  "authToken": "token",
+  "deviceName": "192.168.2.16",
+  "manualMode": false
+}
+''');
+
+    final store = SettingsStore(settingsFile: settingsFile);
+    await store.load();
+    addTearDown(store.dispose);
+
+    expect(store.settings.deviceName, isNot('192.168.2.16'));
+    expect(store.settings.deviceName.trim(), isNotEmpty);
+  });
+
   test(
     'authenticate wraps connection failures as user-facing errors',
     () async {
