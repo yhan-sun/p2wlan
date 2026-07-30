@@ -688,11 +688,11 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
 		authorized = pathDeviceID == deviceClaims.DeviceID
 	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
-		belongs, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
-		authorized = err == nil && belongs
+		accessible, err := s.db.DeviceAccessibleByUser(pathDeviceID, userClaims.UserID)
+		authorized = err == nil && accessible
 	}
 	if !authorized {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		http.Error(w, `{"error":"device not found or access denied"}`, http.StatusForbidden)
 		return
 	}
 
