@@ -138,13 +138,21 @@ class DaemonController {
     final shutdownRequested = await _diagnosticsApi.requestShutdown(
       diagnosticsUrl,
     );
-    if (shutdownRequested &&
-        await _waitForHealthDown(diagnosticsUrl, const Duration(seconds: 8))) {
-      await _removePidMarker();
-      return const DaemonCommandResult(
-        ok: true,
-        message: 'p2wlan-daemon stopped.',
+    if (shutdownRequested) {
+      final endpointDown = await _waitForHealthDown(
+        diagnosticsUrl,
+        const Duration(seconds: 8),
       );
+      final processDown =
+          statusPid == null ||
+          await _waitForDaemonPidExit(statusPid, const Duration(seconds: 3));
+      if (endpointDown && processDown) {
+        await _removePidMarker();
+        return const DaemonCommandResult(
+          ok: true,
+          message: 'p2wlan-daemon stopped.',
+        );
+      }
     }
 
     final diagnosticsBind = _diagnosticsBindFromStatusUrl(diagnosticsUrl);
@@ -159,20 +167,24 @@ class DaemonController {
       if (!attempted.add(pid)) continue;
       if (!await _processLooksLikeDaemon(pid)) continue;
       if (!await _terminatePid(pid)) continue;
-      await _removePidMarker();
+      final processDown = await _waitForDaemonPidExit(
+        pid,
+        const Duration(seconds: 3),
+      );
       final stopped = await _waitForHealthDown(
         diagnosticsUrl,
         const Duration(seconds: 5),
       );
-      if (stopped) {
-        return DaemonCommandResult(
-          ok: true,
-          message: 'p2wlan-daemon stopped.',
-        );
+      if (stopped && processDown) {
+        await _removePidMarker();
+        return DaemonCommandResult(ok: true, message: 'p2wlan-daemon stopped.');
       }
     }
 
-    if (!await _diagnosticsApi.fetchHealth(diagnosticsUrl)) {
+    final knownPids = [statusPid, ...attempted].whereType<int>();
+    final knownProcessesDown = !await _anyDaemonPidStillRunning(knownPids);
+    if (!await _diagnosticsApi.fetchHealth(diagnosticsUrl) &&
+        knownProcessesDown) {
       await _removePidMarker();
       return const DaemonCommandResult(
         ok: true,
@@ -469,7 +481,6 @@ class DaemonController {
     );
   }
 
-
   Future<int?> _readVerifiedPid() async {
     final pidPath =
         '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';
@@ -496,6 +507,22 @@ class DaemonController {
   Future<bool> _processLooksLikeDaemon(int pid) async {
     final command = await _processCommandLine(pid);
     return command != null && command.contains(daemonBinaryName);
+  }
+
+  Future<bool> _waitForDaemonPidExit(int pid, Duration timeout) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (!await _processLooksLikeDaemon(pid)) return true;
+      await Future<void>.delayed(_readyPoll);
+    }
+    return !await _processLooksLikeDaemon(pid);
+  }
+
+  Future<bool> _anyDaemonPidStillRunning(Iterable<int> pids) async {
+    for (final pid in pids.toSet()) {
+      if (await _processLooksLikeDaemon(pid)) return true;
+    }
+    return false;
   }
 
   Future<String?> _processCommandLine(int pid) async {
@@ -533,7 +560,13 @@ class DaemonController {
         if (pid != null) matches.add(pid);
       }
     } else {
-      final result = await Process.run('ps', ['ax', '-o', 'pid=', '-o', 'command=']);
+      final result = await Process.run('ps', [
+        'ax',
+        '-o',
+        'pid=',
+        '-o',
+        'command=',
+      ]);
       if (result.exitCode != 0) return null;
       final currentPid = pid;
       for (final line in result.stdout.toString().split('\n')) {
@@ -569,7 +602,13 @@ class DaemonController {
         if (parsedPid != null) matches.add(parsedPid);
       }
     } else {
-      final result = await Process.run('ps', ['ax', '-o', 'pid=', '-o', 'command=']);
+      final result = await Process.run('ps', [
+        'ax',
+        '-o',
+        'pid=',
+        '-o',
+        'command=',
+      ]);
       if (result.exitCode != 0) return null;
       final currentPid = pid;
       for (final line in result.stdout.toString().split('\n')) {
@@ -597,15 +636,26 @@ class DaemonController {
       ]);
       return result.exitCode == 0;
     }
-    final result = await Process.run('kill', ['$pid']);
-    if (result.exitCode == 0) return true;
+    if (await _sendUnixSignal(pid, 'TERM')) {
+      if (await _waitForDaemonPidExit(pid, const Duration(seconds: 2))) {
+        return true;
+      }
+      if (await _sendUnixSignal(pid, 'KILL')) {
+        return _waitForDaemonPidExit(pid, const Duration(seconds: 2));
+      }
+    }
     if (Platform.isMacOS && !_isRootUser()) {
       try {
         await _runMacosElevated(
-          '/bin/kill ${_shellQuote('$pid')}',
+          '/bin/kill -TERM ${_shellQuote('$pid')}; '
+              '/bin/sleep 2; '
+              'if /bin/ps -p ${_shellQuote('$pid')} -o command= 2>/dev/null | '
+              '/usr/bin/grep -q p2wlan-daemon; then '
+              '/bin/kill -KILL ${_shellQuote('$pid')}; '
+              'fi',
           'p2wlan 需要管理员权限停止后台 p2wlan-daemon。',
         );
-        return true;
+        return _waitForDaemonPidExit(pid, const Duration(seconds: 3));
       } catch (_) {
         return false;
       }
@@ -613,11 +663,21 @@ class DaemonController {
     return false;
   }
 
+  Future<bool> _sendUnixSignal(int pid, String signal) async {
+    final result = await Process.run('kill', ['-$signal', '$pid']);
+    return result.exitCode == 0;
+  }
+
   Future<void> _removePidMarker() async {
     final pidPath =
         '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';
     final file = File(pidPath);
-    if (await file.exists()) await file.delete();
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Best effort cleanup; a root-owned marker must not turn a stopped
+      // daemon into a reported failure.
+    }
   }
 
   bool _isRootUser() {

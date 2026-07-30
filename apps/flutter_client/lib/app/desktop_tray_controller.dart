@@ -204,9 +204,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _hideWindow() async {
     if (!isSupported) return;
     await windowManager.hide();
-    if (Platform.isWindows || Platform.isLinux) {
-      await windowManager.setSkipTaskbar(true);
-    }
+    await windowManager.setSkipTaskbar(true);
   }
 
   Future<void> _startDaemon() async {
@@ -239,10 +237,12 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _quitApp() async {
     if (_quitting) return;
     _quitting = true;
-    try {
-      await statusStore.stopDaemon();
-    } catch (_) {
-      // Continue quitting; a failed shutdown should not strand the UI process.
+    final stopResult = await statusStore.stopDaemon();
+    if (!stopResult.ok) {
+      _quitting = false;
+      await _showWindow();
+      await _updateMenu();
+      return;
     }
     try {
       await trayManager.destroy();

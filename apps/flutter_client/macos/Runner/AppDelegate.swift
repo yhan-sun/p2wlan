@@ -3,8 +3,15 @@ import FlutterMacOS
 
 @main
 class AppDelegate: FlutterAppDelegate {
+  private var usesFlutterTray: Bool {
+    let raw = ProcessInfo.processInfo.environment["P2WLAN_ENABLE_FLUTTER_TRAY"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    return raw == "1" || raw == "true" || raw == "yes"
+  }
+
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-    return false
+    return !usesFlutterTray
   }
 
   override func applicationShouldHandleReopen(

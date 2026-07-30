@@ -2,6 +2,7 @@ use std::{
     env,
     error::Error,
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -13,11 +14,13 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder},
 };
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIcon, TrayIconBuilder,
 };
 
 const STATUS_URL: &str = p2wlan_desktop_host::DEFAULT_DIAGNOSTICS_STATUS_URL;
+const COPY_PEER_IP_PREFIX: &str = "copy-peer-ip:";
+const MAX_TRAY_DEVICES: usize = 12;
 const DAEMON_NAME: &str = if cfg!(windows) {
     "p2wlan-daemon.exe"
 } else {
@@ -33,40 +36,50 @@ enum UserEvent {
 #[derive(Clone)]
 struct TrayMenu {
     status: MenuItem,
-    refresh: MenuItem,
+    network: MenuItem,
+    devices: Submenu,
     start_daemon: MenuItem,
     stop_daemon: MenuItem,
     open_client: MenuItem,
+    open_logs: MenuItem,
     quit: MenuItem,
 }
 
 impl TrayMenu {
     fn new() -> Result<(Self, Menu), Box<dyn Error>> {
-        let status = MenuItem::with_id("status", "P2WLAN: checking...", false, None);
-        let refresh = MenuItem::with_id("refresh", "Refresh Status", true, None);
-        let start_daemon = MenuItem::with_id("start-daemon", "Start Daemon", true, None);
-        let stop_daemon = MenuItem::with_id("stop-daemon", "Stop Daemon", true, None);
-        let open_client = MenuItem::with_id("open-client", "Open P2WLAN", true, None);
-        let quit = MenuItem::with_id("quit", "Quit Tray", true, None);
+        let status = MenuItem::with_id("status", "状态：未启动", false, None);
+        let network = MenuItem::with_id("network", "虚拟 IP：— · 在线设备：—", false, None);
+        let open_client = MenuItem::with_id("open-client", "打开控制台", true, None);
+        let start_daemon = MenuItem::with_id("start-daemon", "启动 TUN", true, None);
+        let stop_daemon = MenuItem::with_id("stop-daemon", "停止 TUN", false, None);
+        let no_devices = MenuItem::with_id("no-devices", "暂无在线设备", false, None);
+        let devices = Submenu::with_id_and_items("devices", "设备（0）", true, &[&no_devices])?;
+        let open_logs = MenuItem::with_id("open-logs", "打开日志", true, None);
+        let quit = MenuItem::with_id("quit", "退出 p2wlan", true, None);
         let separator = PredefinedMenuItem::separator();
         let separator2 = PredefinedMenuItem::separator();
         let menu = Menu::with_items(&[
             &status,
-            &refresh,
+            &network,
             &separator,
+            &open_client,
             &start_daemon,
             &stop_daemon,
-            &open_client,
+            &devices,
+            &separator,
+            &open_logs,
             &separator2,
             &quit,
         ])?;
         Ok((
             Self {
                 status,
-                refresh,
+                network,
+                devices,
                 start_daemon,
                 stop_daemon,
                 open_client,
+                open_logs,
                 quit,
             },
             menu,
@@ -74,37 +87,56 @@ impl TrayMenu {
     }
 
     fn id_for(&self, event: &MenuEvent) -> MenuAction {
-        let id = event.id();
-        if id == self.refresh.id() {
-            MenuAction::Refresh
-        } else if id == self.start_daemon.id() {
+        let id = event.id().0.as_str();
+        if id == self.start_daemon.id().0.as_str() {
             MenuAction::StartDaemon
-        } else if id == self.stop_daemon.id() {
+        } else if id == self.stop_daemon.id().0.as_str() {
             MenuAction::StopDaemon
-        } else if id == self.open_client.id() {
+        } else if id == self.open_client.id().0.as_str() {
             MenuAction::OpenClient
-        } else if id == self.quit.id() {
+        } else if id == self.open_logs.id().0.as_str() {
+            MenuAction::OpenLogs
+        } else if id == self.quit.id().0.as_str() {
             MenuAction::Quit
+        } else if let Some(ip) = copy_ip_from_menu_id(id) {
+            MenuAction::CopyPeerIp(ip.to_string())
         } else {
             MenuAction::None
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuAction {
     None,
-    Refresh,
     StartDaemon,
     StopDaemon,
     OpenClient,
+    OpenLogs,
+    CopyPeerIp(String),
     Quit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayDevice {
+    name: String,
+    virtual_ip: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrayDeviceMenu {
+    devices: Vec<TrayDevice>,
+    total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonState {
     running: bool,
-    label: String,
+    busy: bool,
+    status_label: String,
+    virtual_ip: String,
+    online: Option<u64>,
+    devices: TrayDeviceMenu,
     tooltip: String,
 }
 
@@ -112,8 +144,12 @@ impl DaemonState {
     fn offline() -> Self {
         Self {
             running: false,
-            label: "P2WLAN: offline".to_string(),
-            tooltip: "p2wlan-daemon is not responding".to_string(),
+            busy: false,
+            status_label: "未启动".to_string(),
+            virtual_ip: "—".to_string(),
+            online: None,
+            devices: TrayDeviceMenu::default(),
+            tooltip: "p2wlan：未启动".to_string(),
         }
     }
 }
@@ -164,11 +200,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 app.refresh_state();
             }
             Event::UserEvent(UserEvent::Menu(event)) => match app.menu.id_for(&event) {
-                MenuAction::Refresh => app.refresh_state(),
                 MenuAction::StartDaemon => app.start_daemon(),
                 MenuAction::StopDaemon => app.stop_daemon(),
                 MenuAction::OpenClient => app.open_client(),
-                MenuAction::Quit => *control_flow = ControlFlow::Exit,
+                MenuAction::OpenLogs => app.open_logs(),
+                MenuAction::CopyPeerIp(ip) => app.copy_peer_ip(&ip),
+                MenuAction::Quit => {
+                    app.quit_p2wlan();
+                    *control_flow = ControlFlow::Exit;
+                }
                 MenuAction::None => {}
             },
             _ => {}
@@ -198,10 +238,22 @@ impl TrayApp {
         self.apply_state();
     }
 
-    fn apply_state(&self) {
-        self.menu.status.set_text(&self.last_state.label);
+    fn apply_state(&mut self) {
+        self.menu
+            .status
+            .set_text(format!("状态：{}", self.last_state.status_label));
+        self.menu.network.set_text(match self.last_state.online {
+            Some(count) => format!(
+                "虚拟 IP：{} · 在线设备：{count}",
+                self.last_state.virtual_ip
+            ),
+            None => "虚拟 IP：— · 在线设备：—".to_string(),
+        });
         self.menu.stop_daemon.set_enabled(self.last_state.running);
-        self.menu.start_daemon.set_enabled(!self.last_state.running);
+        self.menu
+            .start_daemon
+            .set_enabled(!self.last_state.running && !self.last_state.busy);
+        rebuild_device_menu(&self.menu.devices, &self.last_state.devices);
         let _ = self
             .tray_icon
             .set_tooltip(Some(self.last_state.tooltip.as_str()));
@@ -211,20 +263,23 @@ impl TrayApp {
     }
 
     fn start_daemon(&mut self) {
-        self.set_status("P2WLAN: starting...");
+        self.set_status("状态：正在启动");
         match start_daemon() {
-            Ok(()) => self.set_status("P2WLAN: daemon launched"),
-            Err(error) => self.set_status(format!("Start failed: {error}")),
+            Ok(()) => self.set_status("状态：正在建立虚拟网络"),
+            Err(error) => {
+                eprintln!("p2wlan-tray start failed: {error}");
+                self.set_status(format!("启动失败：{error}"));
+            }
         }
         thread::sleep(Duration::from_millis(700));
         self.refresh_state();
     }
 
     fn stop_daemon(&mut self) {
-        self.set_status("P2WLAN: stopping...");
+        self.set_status("状态：正在停止");
         match stop_daemon() {
-            Ok(()) => self.set_status("P2WLAN: stop requested"),
-            Err(error) => self.set_status(format!("Stop failed: {error}")),
+            Ok(()) => self.set_status("状态：停止请求已发送"),
+            Err(error) => self.set_status(format!("停止失败：{error}")),
         }
         thread::sleep(Duration::from_millis(700));
         self.refresh_state();
@@ -232,8 +287,26 @@ impl TrayApp {
 
     fn open_client(&mut self) {
         if let Err(error) = open_flutter_client() {
-            self.set_status(format!("Open failed: {error}"));
+            eprintln!("p2wlan-tray open client failed: {error}");
+            self.set_status(format!("打开控制台失败：{error}"));
         }
+    }
+
+    fn open_logs(&mut self) {
+        if let Err(error) = open_log_directory() {
+            self.set_status(format!("打开日志失败：{error}"));
+        }
+    }
+
+    fn copy_peer_ip(&mut self, ip: &str) {
+        if let Err(error) = copy_to_clipboard(ip) {
+            self.set_status(format!("复制失败：{error}"));
+        }
+    }
+
+    fn quit_p2wlan(&mut self) {
+        self.set_status("状态：正在退出");
+        let _ = stop_daemon();
     }
 
     fn set_status(&self, text: impl AsRef<str>) {
@@ -275,18 +348,139 @@ fn query_daemon_state() -> DaemonState {
         .and_then(|value| value.get("virtual_ip"))
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("no IP");
-    let peers = status
+        .unwrap_or("—")
+        .to_string();
+    let online = status.as_ref().and_then(|value| {
+        let stats = value.get("stats")?;
+        Some(
+            stats
+                .get("direct_connections")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                + stats
+                    .get("relay_connections")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+        )
+    });
+    let peer_count = status
         .as_ref()
         .and_then(|value| value.get("stats"))
         .and_then(|stats| stats.get("total_peers"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let devices = status.as_ref().map(tray_device_menu).unwrap_or_default();
     DaemonState {
         running: true,
-        label: format!("P2WLAN: connected ({virtual_ip})"),
-        tooltip: format!("p2wlan-daemon running, peers: {peers}"),
+        busy: false,
+        status_label: "已连接".to_string(),
+        virtual_ip: virtual_ip.clone(),
+        online,
+        devices,
+        tooltip: match online {
+            Some(count) => format!("p2wlan：已连接 · {virtual_ip} · {count} 台在线"),
+            None => format!("p2wlan：已连接 · {peer_count} 台设备"),
+        },
     }
+}
+
+fn tray_device_menu(status: &serde_json::Value) -> TrayDeviceMenu {
+    let Some(peers) = status.get("peers").and_then(serde_json::Value::as_array) else {
+        return TrayDeviceMenu::default();
+    };
+
+    let mut devices = peers
+        .iter()
+        .filter_map(|peer| {
+            let virtual_ip = peer.get("virtual_ip").and_then(serde_json::Value::as_str)?;
+            virtual_ip.parse::<IpAddr>().ok()?;
+            let node_id = peer
+                .get("node_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let device_name = peer
+                .get("device_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Some(TrayDevice {
+                name: display_device_name(device_name, node_id),
+                virtual_ip: virtual_ip.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    devices.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.virtual_ip.cmp(&right.virtual_ip))
+    });
+    devices.dedup_by(|left, right| left.virtual_ip == right.virtual_ip);
+
+    let total = devices.len();
+    devices.truncate(MAX_TRAY_DEVICES);
+    TrayDeviceMenu { devices, total }
+}
+
+fn display_device_name(device_name: &str, node_id: &str) -> String {
+    let normalized = device_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let fallback = if node_id.is_empty() {
+        "未知设备".to_string()
+    } else {
+        node_id.chars().take(12).collect()
+    };
+    let name = if normalized.is_empty() {
+        fallback
+    } else {
+        normalized
+    };
+
+    let mut chars = name.chars();
+    let visible = chars.by_ref().take(28).collect::<String>();
+    if chars.next().is_some() {
+        format!("{visible}...")
+    } else {
+        visible
+    }
+}
+
+fn rebuild_device_menu(submenu: &Submenu, device_menu: &TrayDeviceMenu) {
+    while !submenu.items().is_empty() {
+        let _ = submenu.remove_at(0);
+    }
+
+    submenu.set_text(format!("设备（{}）", device_menu.total));
+    if device_menu.devices.is_empty() {
+        let empty = MenuItem::with_id("no-devices", "暂无在线设备", false, None);
+        let _ = submenu.append(&empty);
+        return;
+    }
+
+    for device in &device_menu.devices {
+        let item = MenuItem::with_id(
+            format!("{COPY_PEER_IP_PREFIX}{}", device.virtual_ip),
+            format!("{} · {}", device.name, device.virtual_ip),
+            true,
+            None,
+        );
+        let _ = submenu.append(&item);
+    }
+
+    if device_menu.total > device_menu.devices.len() {
+        let remaining = device_menu.total - device_menu.devices.len();
+        let overflow = MenuItem::with_id(
+            "more-devices",
+            format!("另有 {remaining} 台设备，请在控制台查看"),
+            false,
+            None,
+        );
+        let _ = submenu.append(&overflow);
+    }
+}
+
+fn copy_ip_from_menu_id(id: &str) -> Option<&str> {
+    let ip = id.strip_prefix(COPY_PEER_IP_PREFIX)?;
+    ip.parse::<IpAddr>().ok().map(|_| ip)
 }
 
 fn stop_daemon() -> Result<(), Box<dyn Error>> {
@@ -471,6 +665,10 @@ fn locate_daemon_binary() -> Option<PathBuf> {
             dir = parent;
         }
     }
+    if let Some(root) = find_repo_root() {
+        candidates.push(root.join("target").join("debug").join(DAEMON_NAME));
+        candidates.push(root.join("target").join("release").join(DAEMON_NAME));
+    }
 
     candidates
         .into_iter()
@@ -495,16 +693,9 @@ fn which_daemon() -> Option<PathBuf> {
 fn open_flutter_client() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     {
-        let repo_app = find_repo_root()
-            .map(|root| {
-                root.join("apps/flutter_client/build/macos/Build/Products/Release/P2WLAN.app")
-            })
-            .filter(|path| path.exists());
-        let status = if let Some(app) = repo_app {
-            Command::new("open").arg(app).status()?
-        } else {
-            Command::new("open").args(["-a", "P2WLAN"]).status()?
-        };
+        let app = find_flutter_app()
+            .ok_or("未找到 Flutter 版 P2WLAN.app；请先运行 flutter build macos --debug")?;
+        let status = Command::new("open").arg(app).status()?;
         if status.success() {
             return Ok(());
         }
@@ -523,17 +714,75 @@ fn open_flutter_client() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn find_repo_root() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
-    for _ in 0..8 {
-        if dir.join("Cargo.toml").exists() && dir.join("client").exists() {
-            return Some(dir);
+#[cfg(target_os = "macos")]
+fn find_flutter_app() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("P2WLAN_FLUTTER_APP").map(PathBuf::from) {
+        if path.exists() {
+            return Some(path);
         }
-        if !dir.pop() {
-            break;
+    }
+    let root = find_repo_root()?;
+    [
+        root.join("apps/flutter_client/build/macos/Build/Products/Debug/P2WLAN.app"),
+        root.join("apps/flutter_client/build/macos/Build/Products/Release/P2WLAN.app"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn find_repo_root() -> Option<PathBuf> {
+    let mut starts = Vec::new();
+    if let Ok(current_dir) = env::current_dir() {
+        starts.push(current_dir);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            starts.push(parent.to_path_buf());
+        }
+    }
+
+    for mut dir in starts {
+        for _ in 0..12 {
+            if dir.join("Cargo.toml").exists() && dir.join("client").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                break;
+            }
         }
     }
     None
+}
+
+fn open_log_directory() -> Result<(), Box<dyn Error>> {
+    let dir = p2wlan_desktop_host::default_log_dir();
+    fs::create_dir_all(&dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open").arg(&dir).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("open logs command failed".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(&dir).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        Command::new("xdg-open").arg(&dir).spawn()?;
+        Ok(())
+    }
+}
+
+fn copy_to_clipboard(value: &str) -> Result<(), Box<dyn Error>> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(value.to_string())?;
+    Ok(())
 }
 
 fn tray_icon_image(running: bool) -> Result<Icon, Box<dyn Error>> {
