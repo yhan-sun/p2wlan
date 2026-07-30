@@ -281,31 +281,39 @@ class _Kv extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 132,
-            child: Text(
-              label,
-              style: const TextStyle(
-                fontSize: 12,
-                color: AppTokens.colorTextSecondary,
-                fontWeight: FontWeight.w600,
-              ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final labelText = Text(
+            label,
+            style: const TextStyle(
+              fontSize: 12,
+              color: AppTokens.colorTextSecondary,
+              fontWeight: FontWeight.w600,
             ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(
-                fontSize: 13,
-                color: AppTokens.colorTextPrimary,
-                fontFeatures: AppTokens.tabularFontFeatures,
-              ),
+          );
+          final valueText = Text(
+            value,
+            style: const TextStyle(
+              fontSize: 13,
+              color: AppTokens.colorTextPrimary,
+              fontFeatures: AppTokens.tabularFontFeatures,
             ),
-          ),
-        ],
+          );
+          if (constraints.maxWidth < 360) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [labelText, const SizedBox(height: 3), valueText],
+            );
+          }
+          final labelWidth = constraints.maxWidth < 460 ? 104.0 : 132.0;
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(width: labelWidth, child: labelText),
+              Expanded(child: valueText),
+            ],
+          );
+        },
       ),
     );
   }

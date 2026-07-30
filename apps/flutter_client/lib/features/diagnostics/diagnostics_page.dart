@@ -262,38 +262,51 @@ class _PermissionCheckRow extends StatelessWidget {
     final label = check.status.toUpperCase();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 76,
-            child: StatusBadge(label: label, tone: tone),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final details = Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                check.label,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                check.detail,
+                style: const TextStyle(
+                  fontSize: 12,
+                  height: 1.35,
+                  color: AppTokens.colorTextSecondary,
+                ),
+              ),
+            ],
+          );
+          if (constraints.maxWidth < 360) {
+            return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  check.label,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  check.detail,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    height: 1.35,
-                    color: AppTokens.colorTextSecondary,
-                  ),
-                ),
+                StatusBadge(label: label, tone: tone),
+                const SizedBox(height: 6),
+                details,
               ],
-            ),
-          ),
-        ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 76,
+                child: StatusBadge(label: label, tone: tone),
+              ),
+              const SizedBox(width: 10),
+              Expanded(child: details),
+            ],
+          );
+        },
       ),
     );
   }
@@ -447,31 +460,58 @@ class _TaskRow extends StatelessWidget {
     final ok = task.error == null && (task.running || task.finished);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              task.name,
-              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-            ),
-          ),
-          if (task.error != null)
-            Expanded(
-              child: Text(
-                task.error!,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: AppTokens.colorBadText,
-                ),
-              ),
-            ),
-          StatusBadge(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final badge = StatusBadge(
             label: ok ? 'OK' : 'WARN',
             tone: ok ? StatusTone.good : StatusTone.warn,
-          ),
-        ],
+          );
+          final name = Text(
+            task.name,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          );
+          final error = task.error;
+          if (constraints.maxWidth < 380 && error != null) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(child: name),
+                    const SizedBox(width: 10),
+                    badge,
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  error,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppTokens.colorBadText,
+                  ),
+                ),
+              ],
+            );
+          }
+          return Row(
+            children: [
+              Expanded(child: name),
+              if (error != null)
+                Expanded(
+                  child: Text(
+                    error,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppTokens.colorBadText,
+                    ),
+                  ),
+                ),
+              badge,
+            ],
+          );
+        },
       ),
     );
   }
