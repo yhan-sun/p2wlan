@@ -470,6 +470,52 @@ func TestUpdateDeviceRejectsAnotherUser(t *testing.T) {
 	}
 }
 
+func TestDeleteDeviceAcceptsUserTokenForOwnedDevice(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, _ := db.CreateUser("owner-delete@example.com", "hash")
+	device, _ := db.CreateDevice(user.ID, "default", "delete-key", "delete-me", "macos", "")
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+device.ID, nil)
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.DeleteDevice(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := db.GetDevice(device.ID); err == nil {
+		t.Fatal("expected deleted device to be unavailable")
+	}
+}
+
+func TestDeleteDeviceRejectsAnotherUser(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	owner, _ := db.CreateUser("owner-delete-reject@example.com", "hash")
+	other, _ := db.CreateUser("other-delete-reject@example.com", "hash")
+	device, _ := db.CreateDevice(owner.ID, "default", "delete-owner-key", "keep-me", "macos", "")
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+device.ID, nil)
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: other.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.DeleteDevice(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestCreateSignalAcceptsPeerReflexiveWithPunchWindow(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

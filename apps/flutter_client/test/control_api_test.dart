@@ -91,4 +91,29 @@ void main() {
       );
     },
   );
+
+  test('deleteDevice sends a bearer-authenticated DELETE request', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final api = ControlApi();
+    addTearDown(api.close);
+
+    final deleteFuture = api.deleteDevice(
+      controlServer: 'http://127.0.0.1:${server.port}',
+      authToken: 'token-123',
+      deviceId: 'node-a',
+    );
+    final request = await server.first.timeout(const Duration(seconds: 3));
+    expect(request.method, 'DELETE');
+    expect(request.uri.path, '/api/v1/devices/node-a');
+    expect(
+      request.headers.value(HttpHeaders.authorizationHeader),
+      'Bearer token-123',
+    );
+    request.response.headers.contentType = ContentType.json;
+    request.response.write('{"success":true}');
+    await request.response.close();
+
+    await deleteFuture;
+  });
 }

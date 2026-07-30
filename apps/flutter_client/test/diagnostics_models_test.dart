@@ -54,4 +54,29 @@ void main() {
     expect(relayPeer.latencyMs, 43);
     expect(relayPeer.lastError, 'direct probe timed out');
   });
+
+  test('offline peers stay offline even when path selection says relay', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'offline-peer',
+      'device_name': 'old-mac',
+      'virtual_ip': '10.20.0.20',
+      'online': false,
+      'last_seen': 1784710187,
+      'state': 'closed',
+      'active_path': null,
+      'direct_type': 'unknown',
+      'is_relay': false,
+      'direct': <String, dynamic>{},
+      'relay': <String, dynamic>{},
+      'current_path_selection': {
+        'path': 'relay',
+        'reason': 'relay would be preferred if reachable',
+      },
+    });
+
+    expect(peer.online, isFalse);
+    expect(peer.path, 'offline');
+    expect(peer.connectionType, 'offline');
+    expect(peer.latencyMs, isNull);
+  });
 }

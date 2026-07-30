@@ -398,6 +398,8 @@ class PeerSnapshot {
     required this.virtualIp,
     required this.endpoint,
     required this.natType,
+    required this.online,
+    required this.lastSeen,
     required this.state,
     required this.activePath,
     required this.directType,
@@ -406,6 +408,7 @@ class PeerSnapshot {
     required this.bytesReceived,
     required this.relayServer,
     required this.warning,
+    required this.connectedForMs,
     required this.direct,
     required this.relay,
     required this.currentPathSelection,
@@ -416,6 +419,8 @@ class PeerSnapshot {
   final String virtualIp;
   final String? endpoint;
   final String natType;
+  final bool online;
+  final int lastSeen;
   final String state;
   final String? activePath;
   final String directType;
@@ -424,6 +429,7 @@ class PeerSnapshot {
   final int bytesReceived;
   final String? relayServer;
   final String? warning;
+  final int? connectedForMs;
   final PathHealthSnapshot direct;
   final PathHealthSnapshot relay;
   final PathSelectionSnapshot? currentPathSelection;
@@ -436,6 +442,8 @@ class PeerSnapshot {
       virtualIp: _string(json['virtual_ip']),
       endpoint: _nullableString(json['endpoint']),
       natType: _string(json['nat_type'], 'unknown'),
+      online: _bool(json['online'], true),
+      lastSeen: _int(json['last_seen']),
       state: _string(json['state'], 'unknown'),
       activePath: _nullableString(json['active_path']),
       directType: _string(json['direct_type'], 'unknown'),
@@ -444,6 +452,7 @@ class PeerSnapshot {
       bytesReceived: _int(json['bytes_received']),
       relayServer: _nullableString(json['relay_server']),
       warning: _nullableString(json['warning']),
+      connectedForMs: _intOrNull(json['connected_for_ms']),
       direct: PathHealthSnapshot.fromJson(_map(json['direct'])),
       relay: PathHealthSnapshot.fromJson(_map(json['relay'])),
       currentPathSelection: selectionJson == null
@@ -459,27 +468,61 @@ class PeerSnapshot {
   }
 
   String get path {
+    if (!online) return 'offline';
     if (activePath != null && activePath!.isNotEmpty) return activePath!;
     final selected = currentPathSelection?.path;
-    if (selected != null && selected.isNotEmpty) return selected;
+    if (selected == 'direct') {
+      return currentPathSelection?.directConfirmed == true
+          ? 'direct'
+          : 'direct_trial';
+    }
+    if (selected == 'relay' && _hasFreshRelayConfirmation) return 'relay';
     if (state == 'direct') return 'direct';
     if (state == 'relay' || isRelay) return 'relay';
+    if (state == 'fallback_to_relay' ||
+        state == 'hole_punching' ||
+        state == 'connecting') {
+      return 'probing';
+    }
     return 'offline';
   }
 
   String get connectionType {
+    if (!online) return 'offline';
     if (path == 'direct') {
       return directType == 'unknown' ? 'direct' : directType;
     }
     if (path == 'relay') return 'relay';
-    if (state == 'hole_punching' || state == 'connecting') return 'probing';
+    if (path == 'direct_trial' || path == 'probing') return 'probing';
     return 'offline';
   }
 
   int? get latencyMs {
+    if (!online) return null;
     if (path == 'direct') return direct.latencyMs;
     if (path == 'relay') return relay.latencyMs;
+    if (path == 'direct_trial') return direct.latencyMs ?? relay.latencyMs;
     return direct.latencyMs ?? relay.latencyMs;
+  }
+
+  DateTime? get lastSeenAt {
+    if (lastSeen <= 0) return null;
+    final timestampMs = lastSeen < 10000000000 ? lastSeen * 1000 : lastSeen;
+    return DateTime.fromMillisecondsSinceEpoch(timestampMs);
+  }
+
+  int get sortTimestampMs {
+    final seen = lastSeenAt?.millisecondsSinceEpoch;
+    if (seen != null) return seen;
+    if (connectedForMs != null) {
+      return DateTime.now().millisecondsSinceEpoch - connectedForMs!;
+    }
+    return 0;
+  }
+
+  bool get _hasFreshRelayConfirmation {
+    final age = relay.lastSuccessAgeMs;
+    return age != null && age <= 15000 && relay.consecutiveFailures == 0;
   }
 
   String? get lastError {
@@ -561,11 +604,11 @@ int? _intOrNull(dynamic value) {
   return null;
 }
 
-bool _bool(dynamic value) {
+bool _bool(dynamic value, [bool fallback = false]) {
   if (value is bool) return value;
   if (value is String) return value.toLowerCase() == 'true';
   if (value is num) return value != 0;
-  return false;
+  return fallback;
 }
 
 JsonMap _map(dynamic value) {
