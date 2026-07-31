@@ -57,14 +57,19 @@ class AppStrings {
   String get no => isZh ? '否' : 'no';
 
   String get refresh => isZh ? '刷新' : 'Refresh';
-  String get refreshNow => isZh ? '立即刷新' : 'Refresh now';
-  String get refreshing => isZh ? '刷新中...' : 'Refreshing...';
+  String get refreshNow => isZh ? '手动同步数据' : 'Refresh now';
+  String get refreshing => isZh ? '同步数据中...' : 'Refreshing...';
+  String get autoRefreshTooltip => isZh
+      ? '开启后每 5 秒自动更新一次网络与设备连接状态'
+      : 'Automatically sync status every 5 seconds';
+  String autoRefresh(int seconds) =>
+      isZh ? '自动轮询 (${seconds}s)' : 'Auto sync (${seconds}s)';
   String get startP2wlan => isZh ? '启动 P2WLAN' : 'Start P2WLAN';
   String get stopP2wlan => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
-  String get lastDaemonAction => isZh ? '最近操作' : 'Last action';
   String get cancel => isZh ? '取消' : 'Cancel';
   String get continueAction => isZh ? '继续' : 'Continue';
+  String get lastDaemonAction => isZh ? '最近操作' : 'Last action';
   String get openConsole => isZh ? '打开控制台' : 'Open console';
   String get openLogs => isZh ? '打开日志' : 'Open logs';
   String get quitP2wlan => isZh ? '退出 P2WLAN' : 'Quit P2WLAN';
@@ -82,12 +87,43 @@ class AppStrings {
       : 'If system authorization fails, copy this command into Terminal, then return to P2WLAN and refresh.';
   String get copyLaunchCommand => isZh ? '复制命令' : 'Copy command';
   String get copiedLaunchCommand => isZh ? '启动命令已复制' : 'Launch command copied';
-  String autoRefresh(int seconds) =>
-      isZh ? '自动刷新 (${seconds}s)' : 'Auto refresh (${seconds}s)';
 
   String get dashboardSubtitle => isZh
       ? '启动、停止并监控本机 P2WLAN 虚拟网络。'
       : 'Start, stop, and monitor the local P2WLAN virtual network.';
+  String get networkCockpit => isZh ? '虚拟内网驾驶舱' : 'Virtual network cockpit';
+  String get virtualNetwork => isZh ? '虚拟内网' : 'Virtual network';
+  String get virtualNetworkRunning =>
+      isZh ? '虚拟内网运行中' : 'Virtual network running';
+  String get virtualNetworkStopped =>
+      isZh ? '虚拟内网未启动' : 'Virtual network stopped';
+  String get virtualNetworkRunningDetail => isZh
+      ? '本机已加入虚拟内网，可查看控制面、设备路径和中继状态。'
+      : 'This device is on the virtual network; control-plane, device paths, and relay status are available.';
+  String get virtualNetworkStoppedDetail => isZh
+      ? '启动后会显示虚拟 IP、控制面和设备路径状态。'
+      : 'Start P2WLAN to see virtual IP, control-plane, and device path status.';
+  String get daemonStatus => isZh ? '守护进程' : 'Daemon';
+  String get controlPlane => isZh ? '控制面' : 'Control plane';
+  String get onlineDevices => isZh ? '在线设备' : 'Online devices';
+  String get pathOverview => isZh ? '路径概况' : 'Path overview';
+  String get needsAttention => isZh ? '需要处理' : 'Needs attention';
+  String get reviewRecommended => isZh ? '建议确认' : 'Review recommended';
+  String get noActionNeeded => isZh ? '当前无需处理' : 'No action needed';
+  String get dashboardAllGood => isZh
+      ? '守护进程、控制面和设备路径没有上报需要处理的问题。'
+      : 'Daemon, control-plane, and device paths are not reporting anything that needs action.';
+  String get issueControlDisconnected => isZh
+      ? '控制面未连接，设备目录和配置同步可能不可用。'
+      : 'Control plane is disconnected; device catalog and config sync may be unavailable.';
+  String get issueReauthRequired => isZh
+      ? '控制面要求重新认证，请检查 Token 或重新登录。'
+      : 'Control plane requires re-authentication. Check the token or sign in again.';
+  String get issueRelayDisconnected => isZh
+      ? '中继未连接，跨 NAT 路径可能不可用。'
+      : 'Relay is not connected; cross-NAT paths may be unavailable.';
+  String peerWarnings(int count) =>
+      isZh ? '$count 台设备上报路径告警。' : '$count device(s) report path warnings.';
   String get localDiagnostics => isZh ? 'P2WLAN 守护进程' : 'P2WLAN daemon';
   String get diagnosticsUrl => isZh ? '诊断 URL' : 'Diagnostics URL';
   String get endpointState => isZh ? '端点状态' : 'Endpoint state';
@@ -137,6 +173,15 @@ class AppStrings {
   String get copied => isZh ? '已复制' : 'Copied';
   String get copiedDiagnosticsJson =>
       isZh ? '诊断 JSON 已复制到剪贴板' : 'Diagnostics JSON copied to clipboard';
+  String get diagnosticIssues =>
+      isZh ? '需要处理的问题/建议' : 'Issues and recommendations';
+  String get diagnosticNoIssues => isZh
+      ? '当前诊断没有发现需要立即处理的问题。'
+      : 'Diagnostics found no issue that needs immediate action.';
+  String get platformPermissions => isZh ? '平台权限' : 'Platform permissions';
+  String get protocolAndMtu => isZh ? '协议与 MTU' : 'Protocol and MTU';
+  String get criticalTasks => isZh ? '关键任务' : 'Critical tasks';
+  String get recentDaemonLogs => isZh ? '最近 daemon 日志' : 'Recent daemon logs';
 
   String get nodesSubtitle => isZh
       ? '查看本机节点和网络中的其他设备，管理名称、IP 与连接路径。'
@@ -157,6 +202,10 @@ class AppStrings {
   String get direct => isZh ? '直连' : 'Direct';
   String get directTrial => isZh ? '直连试探' : 'Direct trial';
   String get probing => isZh ? '探测中' : 'probing';
+  String get attentionDevices => isZh ? '异常/需确认' : 'Attention';
+  String get directDevices => isZh ? '直连设备' : 'Direct devices';
+  String get relayDevices => isZh ? '中继设备' : 'Relay devices';
+  String get offlineDevices => isZh ? '离线设备' : 'Offline devices';
 
   String get settingsSubtitle =>
       isZh ? '本地 P2WLAN 客户端配置。' : 'Local P2WLAN client configuration.';
