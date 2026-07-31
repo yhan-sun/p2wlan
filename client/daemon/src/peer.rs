@@ -844,6 +844,8 @@ pub struct PeerConnection {
     pub node_id: String,
     /// Human-readable peer device name.
     pub device_name: String,
+    /// Peer application/daemon version reported by the control plane.
+    pub app_version: String,
     /// Peer's static WireGuard/X25519 public key as hex.
     pub public_key: String,
     /// Symmetric MAC key for authenticated UDP Probe v2.
@@ -910,6 +912,7 @@ impl PeerConnection {
         Self {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: String::new(),
             probe_mac_key: None,
             probe_session_id: None,
@@ -2473,6 +2476,7 @@ impl PeerManager {
         }
         conn.virtual_ip = info.virtual_ip.clone();
         conn.device_name = info.device_name.clone();
+        conn.app_version = info.app_version.clone();
         if conn.public_key != info.public_key {
             conn.public_key = info.public_key.clone();
             conn.probe_mac_key = derive_probe_mac_key(&self.config, &info.public_key);
@@ -4106,6 +4110,7 @@ pub struct CandidatePairSourceStats {
 pub struct PeerDiagnostics {
     pub node_id: String,
     pub device_name: String,
+    pub app_version: String,
     pub virtual_ip: String,
     pub endpoint: Option<String>,
     pub nat_type: String,
@@ -4238,6 +4243,7 @@ impl PeerDiagnostics {
         Self {
             node_id: conn.node_id.clone(),
             device_name: conn.device_name.clone(),
+            app_version: conn.app_version.clone(),
             virtual_ip: conn.virtual_ip.clone(),
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
@@ -5415,6 +5421,7 @@ mod tests {
         PeerInfo {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: endpoint.to_string(),
             nat_type: "Unknown".to_string(),
@@ -6047,6 +6054,7 @@ mod tests {
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: "Office Mac".to_string(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),
@@ -6077,6 +6085,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer-offline".to_string(),
                 device_name: "Travel Laptop".to_string(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: "203.0.113.10:5000".to_string(),
                 nat_type: "Unknown".to_string(),
@@ -6202,6 +6211,7 @@ mod tests {
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),
@@ -6237,6 +6247,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -6312,6 +6323,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: old_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -6942,6 +6954,7 @@ mod tests {
         let peer = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -6989,6 +7002,7 @@ mod tests {
         let peer = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -7084,6 +7098,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: failed_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -7376,6 +7391,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: signaled_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -7458,6 +7474,7 @@ mod tests {
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -7490,6 +7507,7 @@ mod tests {
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),
@@ -8524,6 +8542,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -8621,6 +8640,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: old_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -8720,6 +8740,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "peer1".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -8748,6 +8769,7 @@ mod tests {
             let peer_info = PeerInfo {
                 node_id: id.to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: "1.2.3.4:5000".to_string(),
                 nat_type: "FullCone".to_string(),
@@ -8780,6 +8802,7 @@ mod tests {
         let peer_info = PeerInfo {
             node_id: "peer1".to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: "1.2.3.4:5000".to_string(),
             nat_type: "FullCone".to_string(),

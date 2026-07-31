@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -28,13 +30,41 @@ class NodesPage extends StatefulWidget {
 
 class _NodesPageState extends State<NodesPage> {
   final _controlApi = ControlApi();
+  final _hiddenPeerIds = <String>{};
   String? _copiedKey;
   String? _busyPeerId;
 
   @override
+  void initState() {
+    super.initState();
+    widget.statusStore.addListener(_pruneHiddenPeers);
+  }
+
+  @override
+  void didUpdateWidget(covariant NodesPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.statusStore != widget.statusStore) {
+      oldWidget.statusStore.removeListener(_pruneHiddenPeers);
+      widget.statusStore.addListener(_pruneHiddenPeers);
+    }
+  }
+
+  @override
   void dispose() {
+    widget.statusStore.removeListener(_pruneHiddenPeers);
     _controlApi.close();
     super.dispose();
+  }
+
+  void _pruneHiddenPeers() {
+    final snapshot = widget.statusStore.snapshot;
+    if (!mounted || snapshot == null || _hiddenPeerIds.isEmpty) return;
+    final currentPeerIds = snapshot.peers.map((peer) => peer.nodeId).toSet();
+    final before = _hiddenPeerIds.length;
+    _hiddenPeerIds.removeWhere((nodeId) => !currentPeerIds.contains(nodeId));
+    if (_hiddenPeerIds.length != before) {
+      setState(() {});
+    }
   }
 
   @override
@@ -46,7 +76,7 @@ class _NodesPageState extends State<NodesPage> {
         final snapshot = widget.statusStore.snapshot;
         final peers = _dedupeAndSortPeers(
           snapshot?.peers ?? const <PeerSnapshot>[],
-        );
+        ).where((peer) => !_hiddenPeerIds.contains(peer.nodeId)).toList();
         final relayFallbackLatencyMs = snapshot?.relayConnected == true
             ? snapshot?.relaySelection.latencyMs
             : null;
@@ -117,10 +147,13 @@ class _NodesPageState extends State<NodesPage> {
     final initialName = settings.deviceName.trim().isEmpty
         ? await resolveDefaultDeviceName()
         : settings.deviceName.trim();
+    final initialVirtualIp = settings.virtualIp.trim().isNotEmpty
+        ? settings.virtualIp.trim()
+        : snapshot?.virtualIp.trim() ?? '';
     if (!mounted) return;
-    final result = await _promptDeviceName(
+    final result = await _promptLocalNodeProfile(
       initialName: initialName,
-      title: strings.isZh ? '编辑本机节点名称' : 'Edit this device name',
+      initialVirtualIp: initialVirtualIp,
     );
     if (result == null) return;
 
@@ -129,29 +162,37 @@ class _NodesPageState extends State<NodesPage> {
         !settings.manualMode &&
         settings.authToken.trim().isNotEmpty &&
         nodeId.isNotEmpty;
-    var savedName = result;
+    var savedName = result.deviceName;
+    var savedVirtualIp = result.virtualIp;
     try {
       if (canSync) {
-        savedName = await _controlApi.renameDevice(
+        final saved = await _controlApi.updateDevice(
           controlServer: settings.controlServer,
           authToken: settings.authToken,
           deviceId: nodeId,
-          deviceName: result,
+          deviceName: result.deviceName,
+          virtualIp: result.virtualIp,
         );
+        savedName = saved.deviceName.trim().isEmpty
+            ? result.deviceName
+            : saved.deviceName;
+        savedVirtualIp = saved.virtualIp.trim().isEmpty
+            ? result.virtualIp
+            : saved.virtualIp;
       }
       await widget.settingsStore.updateSettings(
-        settings.copyWith(deviceName: savedName),
+        settings.copyWith(deviceName: savedName, virtualIp: savedVirtualIp),
       );
       await widget.statusStore.refresh();
       if (!mounted) return;
       _showSnack(
         canSync
             ? (strings.isZh
-                  ? '本机节点名称已同步：$savedName'
-                  : 'This device name synced: $savedName')
+                  ? '本机节点已同步：$savedName / ${dash(savedVirtualIp)}。重启 P2WLAN 后 IP 生效。'
+                  : 'This device synced: $savedName / ${dash(savedVirtualIp)}. Restart P2WLAN to apply IP changes.')
             : (strings.isZh
-                  ? '本机节点名称已保存：$savedName'
-                  : 'This device name saved: $savedName'),
+                  ? '本机节点已保存：$savedName / ${dash(savedVirtualIp)}。启动后生效。'
+                  : 'This device saved: $savedName / ${dash(savedVirtualIp)}. Applies on next start.'),
       );
     } catch (error) {
       if (!mounted) return;
@@ -225,6 +266,7 @@ class _NodesPageState extends State<NodesPage> {
         authToken: settings.authToken,
         deviceId: peer.nodeId,
       );
+      if (mounted) setState(() => _hiddenPeerIds.add(peer.nodeId));
       await widget.statusStore.refresh();
       if (!mounted) return;
       _showSnack(
@@ -311,6 +353,109 @@ class _NodesPageState extends State<NodesPage> {
     if (name == null || name.isEmpty) return null;
     return name;
   }
+
+  Future<_LocalNodeProfileResult?> _promptLocalNodeProfile({
+    required String initialName,
+    required String initialVirtualIp,
+  }) async {
+    final strings = AppStringsScope.of(context);
+    final nameController = TextEditingController(text: initialName);
+    final ipController = TextEditingController(text: initialVirtualIp);
+    String? error;
+    final result = await showDialog<_LocalNodeProfileResult>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: Text(strings.isZh ? '编辑本机节点' : 'Edit this device'),
+              content: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 420),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      autofocus: true,
+                      decoration: InputDecoration(
+                        labelText: strings.deviceName,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: ipController,
+                      decoration: InputDecoration(
+                        labelText: strings.isZh
+                            ? '期望虚拟 IP'
+                            : 'Requested virtual IP',
+                        helperText: strings.isZh
+                            ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
+                            : 'Leave blank for automatic assignment; restart P2WLAN after changing it.',
+                        errorText: error,
+                      ),
+                      keyboardType: TextInputType.number,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: Text(strings.cancel),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final name = nameController.text.trim();
+                    final virtualIp = ipController.text.trim();
+                    if (name.isEmpty) {
+                      setDialogState(() {
+                        error = strings.isZh
+                            ? '设备名称不能为空'
+                            : 'Device name is required';
+                      });
+                      return;
+                    }
+                    final parsedIp = virtualIp.isEmpty
+                        ? null
+                        : InternetAddress.tryParse(virtualIp);
+                    if (virtualIp.isNotEmpty &&
+                        parsedIp?.type != InternetAddressType.IPv4) {
+                      setDialogState(() {
+                        error = strings.isZh
+                            ? '虚拟 IP 格式不正确，例如 10.20.0.42'
+                            : 'Virtual IP must look like 10.20.0.42';
+                      });
+                      return;
+                    }
+                    Navigator.of(dialogContext).pop(
+                      _LocalNodeProfileResult(
+                        deviceName: name,
+                        virtualIp: virtualIp,
+                      ),
+                    );
+                  },
+                  child: Text(strings.save),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    nameController.dispose();
+    ipController.dispose();
+    return result;
+  }
+}
+
+class _LocalNodeProfileResult {
+  const _LocalNodeProfileResult({
+    required this.deviceName,
+    required this.virtualIp,
+  });
+
+  final String deviceName;
+  final String virtualIp;
 }
 
 class _LocalNodePanel extends StatelessWidget {
@@ -528,6 +673,10 @@ class _PeerDetailsDialog extends StatelessWidget {
                         _DetailLine(
                           label: strings.virtualIp,
                           value: dash(peer.virtualIp),
+                        ),
+                        _DetailLine(
+                          label: strings.isZh ? '版本' : 'Version',
+                          value: dash(peer.appVersion),
                         ),
                         _DetailLine(label: strings.nodeId, value: peer.nodeId),
                         _DetailLine(
@@ -816,12 +965,13 @@ class _PeerTable extends StatelessWidget {
     );
   }
 
-  static const _tableWidth = 1100.0;
+  static const _tableWidth = 1196.0;
   static const _maxBodyHeight = 520.0;
   static const _rowHeight = 44.0;
   static const _deviceWidth = 142.0;
   static const _peerIdWidth = 118.0;
   static const _virtualIpWidth = 112.0;
+  static const _versionWidth = 96.0;
   static const _stateWidth = 94.0;
   static const _pathWidth = 92.0;
   static const _typeWidth = 122.0;
@@ -883,6 +1033,13 @@ class _PeerHeader extends StatelessWidget {
             width: _PeerTable._virtualIpWidth,
             child: Text(
               strings.virtualIp,
+              style: _PeerTable._columnHeaderStyle,
+            ),
+          ),
+          _PeerCell(
+            width: _PeerTable._versionWidth,
+            child: Text(
+              strings.isZh ? '版本' : 'Version',
               style: _PeerTable._columnHeaderStyle,
             ),
           ),
@@ -969,6 +1126,15 @@ class _PeerRow extends StatelessWidget {
           _PeerCell(
             width: _PeerTable._virtualIpWidth,
             child: Text(dash(peer.virtualIp), style: _PeerTable._cellMonoStyle),
+          ),
+          _PeerCell(
+            width: _PeerTable._versionWidth,
+            child: Text(
+              dash(peer.appVersion),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: _PeerTable._cellMonoStyle,
+            ),
           ),
           _PeerCell(
             width: _PeerTable._stateWidth,
@@ -1366,7 +1532,9 @@ class _PeerPrimaryText extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(
-          dash(peer.virtualIp),
+          peer.appVersion.trim().isEmpty
+              ? dash(peer.virtualIp)
+              : '${dash(peer.virtualIp)} · v${peer.appVersion.trim()}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(

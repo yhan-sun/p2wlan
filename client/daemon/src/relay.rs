@@ -833,6 +833,7 @@ mod tests {
         PeerInfo {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: String::new(),
             nat_type: "Unknown".to_string(),

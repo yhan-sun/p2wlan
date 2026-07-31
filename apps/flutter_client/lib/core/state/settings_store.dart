@@ -64,6 +64,7 @@ class SettingsStore extends ChangeNotifier {
     required String controlServer,
     required String authToken,
     required String networkId,
+    required String virtualIp,
     required String deviceName,
     required bool manualMode,
     required String overlayCidr,
@@ -89,6 +90,7 @@ class SettingsStore extends ChangeNotifier {
       controlServer: normalizedControlServer,
       authToken: authToken.trim(),
       networkId: normalizedNetworkId,
+      virtualIp: virtualIp.trim(),
       deviceName: normalizedDeviceName,
       manualMode: manualMode,
       overlayCidr: overlayCidr.trim().isEmpty
@@ -121,6 +123,7 @@ class SettingsStore extends ChangeNotifier {
       networkId: settings.networkId.trim().isEmpty
           ? defaultNetworkId
           : settings.networkId.trim(),
+      virtualIp: settings.virtualIp.trim(),
       deviceName: normalizedDeviceName,
       overlayCidr: settings.overlayCidr.trim().isEmpty
           ? defaultOverlayCidr
@@ -350,6 +353,10 @@ List<String> validateAppSettings(AppSettings settings) {
   }
   if (settings.networkId.trim().isEmpty) {
     errors.add('Network ID is required');
+  }
+  final virtualIp = settings.virtualIp.trim();
+  if (virtualIp.isNotEmpty && !_isIpv4Address(virtualIp)) {
+    errors.add('Virtual IP must look like 10.20.0.42');
   }
   if (settings.deviceName.trim().isEmpty && !settings.manualMode) {
     errors.add('Device name is required outside manual/offline mode');

@@ -4571,6 +4571,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "peer-public-key".to_string(),
                 endpoint: remote_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -4633,6 +4634,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: hex::encode(responder.initiator_public_key().unwrap()),
                 endpoint: observed_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -4695,6 +4697,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "peer-public-key".to_string(),
                 endpoint: remote_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -4773,6 +4776,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: hex::encode(responder.initiator_public_key().unwrap()),
                 endpoint: String::new(),
                 nat_type: "Unknown".to_string(),
@@ -4839,6 +4843,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: hex::encode(remote_identity.public_key()),
                 endpoint: observed_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -4897,6 +4902,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: endpoint.to_string(),
                 nat_type: "Unknown".to_string(),
@@ -5802,6 +5808,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: String::new(),
                 nat_type: "Unknown".to_string(),
@@ -5868,6 +5875,7 @@ mod tests {
             .add_peer(&control::PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: String::new(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: direct_endpoint.to_string(),
                 nat_type: "Unknown".to_string(),

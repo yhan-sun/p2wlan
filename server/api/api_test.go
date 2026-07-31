@@ -448,6 +448,125 @@ func TestUpdateDeviceRenamesOwnedDevice(t *testing.T) {
 	}
 }
 
+func TestRegisterDeviceStoresRequestedIPAndVersion(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("register-version@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	body := strings.NewReader(`{"public_key":"register-version-key","device_name":"Studio","platform":"macos","network_id":"default","virtual_ip":"10.20.0.44","app_version":"0.1.68"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.RegisterDevice(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Success   bool   `json:"success"`
+		NodeID    string `json:"node_id"`
+		VirtualIP string `json:"virtual_ip"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Success || response.VirtualIP != "10.20.0.44" || response.NodeID == "" {
+		t.Fatalf("unexpected register response: %+v", response)
+	}
+	device, err := db.GetDeviceByPublicKey("default", "register-version-key")
+	if err != nil {
+		t.Fatalf("GetDeviceByPublicKey: %v", err)
+	}
+	if device.AppVersion != "0.1.68" {
+		t.Fatalf("expected stored app version, got %q", device.AppVersion)
+	}
+}
+
+func TestUpdateDeviceChangesVirtualIP(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("update-ip@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "update-ip-key", "old-name", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/devices/"+device.ID, strings.NewReader(`{"device_name":"Studio Mac","virtual_ip":"10.20.0.66"}`))
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.UpdateDevice(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		DeviceName string `json:"device_name"`
+		VirtualIP  string `json:"virtual_ip"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.DeviceName != "Studio Mac" || response.VirtualIP != "10.20.0.66" {
+		t.Fatalf("unexpected update response: %+v", response)
+	}
+	updated, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if updated.DeviceName != "Studio Mac" || updated.VirtualIP != "10.20.0.66" {
+		t.Fatalf("unexpected updated device: %+v", updated)
+	}
+}
+
+func TestUpdateDeviceRejectsDuplicateVirtualIP(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("update-ip-duplicate@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	first, err := db.CreateDeviceWithOptions(user.ID, "default", "update-ip-dup-a", "first", "macos", "", "10.20.0.70", "")
+	if err != nil {
+		t.Fatalf("CreateDevice first: %v", err)
+	}
+	second, err := db.CreateDevice(user.ID, "default", "update-ip-dup-b", "second", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice second: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/devices/"+second.ID, strings.NewReader(`{"virtual_ip":"`+first.VirtualIP+`"}`))
+	req.SetPathValue("id", second.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.UpdateDevice(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "already assigned") {
+		t.Fatalf("expected duplicate IP error, got %s", recorder.Body.String())
+	}
+}
+
 func TestUpdateDeviceRejectsAnotherUser(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

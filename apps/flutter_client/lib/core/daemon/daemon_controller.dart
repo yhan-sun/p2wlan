@@ -77,6 +77,10 @@ class DaemonController {
       '--log-file',
       logPath,
       if (deviceName.isNotEmpty) ...['--device-name', deviceName],
+      if (settings.virtualIp.trim().isNotEmpty) ...[
+        '--address',
+        settings.virtualIp.trim(),
+      ],
       '--interface',
       settings.effectiveTunInterface,
       '--mtu',

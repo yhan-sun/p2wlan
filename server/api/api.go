@@ -171,6 +171,8 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		DeviceName         string `json:"device_name"`
 		Platform           string `json:"platform"`
 		NetworkID          string `json:"network_id"`
+		VirtualIP          string `json:"virtual_ip"`
+		AppVersion         string `json:"app_version"`
 		Ed25519PublicKey   string `json:"ed25519_public_key"`
 		ChallengeID        string `json:"challenge_id"`
 		ChallengeSignature string `json:"challenge_signature"`
@@ -182,7 +184,10 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 
 	req.PublicKey = strings.TrimSpace(req.PublicKey)
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
+	req.Platform = strings.TrimSpace(req.Platform)
 	req.NetworkID = strings.TrimSpace(req.NetworkID)
+	req.VirtualIP = strings.TrimSpace(req.VirtualIP)
+	req.AppVersion = strings.TrimSpace(req.AppVersion)
 	if req.NetworkID == "" {
 		req.NetworkID = "default"
 	}
@@ -205,6 +210,14 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.NetworkID) > 64 {
 		http.Error(w, `{"error":"network_id too long"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.VirtualIP) > 64 {
+		http.Error(w, `{"error":"virtual_ip too long"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.AppVersion) > 64 {
+		http.Error(w, `{"error":"app_version too long"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -256,9 +269,9 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	device, err := s.db.CreateDevice(userID, networkID, req.PublicKey, req.DeviceName, req.Platform, ed25519PubKey)
+	device, err := s.db.CreateDeviceWithOptions(userID, networkID, req.PublicKey, req.DeviceName, req.Platform, ed25519PubKey, req.VirtualIP, req.AppVersion)
 	if err != nil {
-		http.Error(w, `{"error":"device registration failed"}`, http.StatusInternalServerError)
+		writeDeviceMutationError(w, err, "device registration failed")
 		return
 	}
 
@@ -650,31 +663,57 @@ func (s *Server) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		DeviceName string `json:"device_name"`
+		VirtualIP  string `json:"virtual_ip"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
-	if req.DeviceName == "" {
-		http.Error(w, `{"error":"device_name is required"}`, http.StatusBadRequest)
+	req.VirtualIP = strings.TrimSpace(req.VirtualIP)
+	if req.DeviceName == "" && req.VirtualIP == "" {
+		http.Error(w, `{"error":"device_name or virtual_ip is required"}`, http.StatusBadRequest)
 		return
 	}
-	if len([]rune(req.DeviceName)) > 128 {
+	if req.DeviceName != "" && len([]rune(req.DeviceName)) > 128 {
 		http.Error(w, `{"error":"device_name too long"}`, http.StatusBadRequest)
 		return
 	}
-
-	if err := s.db.UpdateDeviceName(pathDeviceID, req.DeviceName); err != nil {
-		http.Error(w, `{"error":"device update failed"}`, http.StatusInternalServerError)
+	if len(req.VirtualIP) > 64 {
+		http.Error(w, `{"error":"virtual_ip too long"}`, http.StatusBadRequest)
 		return
+	}
+
+	if req.DeviceName != "" {
+		if err := s.db.UpdateDeviceName(pathDeviceID, req.DeviceName); err != nil {
+			writeDeviceMutationError(w, err, "device update failed")
+			return
+		}
+	}
+	if req.VirtualIP != "" {
+		if err := s.db.UpdateDeviceVirtualIP(pathDeviceID, req.VirtualIP); err != nil {
+			writeDeviceMutationError(w, err, "virtual_ip update failed")
+			return
+		}
 	}
 	device, err := s.db.GetDevice(pathDeviceID)
 	if err != nil {
 		http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "device": device})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "device": device, "device_name": device.DeviceName, "virtual_ip": device.VirtualIP})
+}
+
+func writeDeviceMutationError(w http.ResponseWriter, err error, fallback string) {
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		message = fallback
+	}
+	status := http.StatusInternalServerError
+	if strings.Contains(message, "virtual_ip") || strings.Contains(message, "public key") || strings.Contains(message, "UNIQUE constraint") {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, map[string]interface{}{"error": message})
 }
 
 // DeleteDevice handles DELETE /api/v1/devices/{id}.

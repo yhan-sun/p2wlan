@@ -8,6 +8,9 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
+const DEFAULT_CONTROL_SERVER: &str = "https://control.p2wlan.io";
+const DEFAULT_NETWORK_ID: &str = "default";
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "p2wlan-daemon")]
 #[command(version)]
@@ -22,12 +25,12 @@ struct Cli {
     init: bool,
 
     /// Control plane server URL
-    #[arg(long, default_value = "https://control.p2wlan.io")]
-    control: String,
+    #[arg(long)]
+    control: Option<String>,
 
     /// Network ID to join or initialize
-    #[arg(long, default_value = "default")]
-    network: String,
+    #[arg(long)]
+    network: Option<String>,
 
     /// Query local runtime status
     #[arg(long)]
@@ -142,21 +145,38 @@ struct Cli {
     log_file: Option<PathBuf>,
 }
 
+impl Cli {
+    fn control_url(&self) -> &str {
+        self.control.as_deref().unwrap_or(DEFAULT_CONTROL_SERVER)
+    }
+
+    fn network_id(&self) -> &str {
+        self.network.as_deref().unwrap_or(DEFAULT_NETWORK_ID)
+    }
+}
+
 fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
     if cli.manual && cli.managed {
         return Err("--manual and --managed cannot be used together".to_string());
     }
 
-    // Validate control plane URL
-    let control_url = match reqwest::Url::parse(&cli.control) {
-        Ok(url) => url,
-        Err(_) => return Err(format!("Invalid URL for --control: {}", cli.control)),
-    };
-    if control_url.scheme() != "http" && control_url.scheme() != "https" {
-        return Err(format!(
-            "Only http and https schemes are allowed for --control: {}",
-            cli.control
-        ));
+    if let Some(ref control) = cli.control {
+        // Validate control plane URL
+        let control_url = match reqwest::Url::parse(control) {
+            Ok(url) => url,
+            Err(_) => return Err(format!("Invalid URL for --control: {}", control)),
+        };
+        if control_url.scheme() != "http" && control_url.scheme() != "https" {
+            return Err(format!(
+                "Only http and https schemes are allowed for --control: {}",
+                control
+            ));
+        }
+    }
+    if let Some(ref network) = cli.network {
+        if network.trim().is_empty() {
+            return Err("--network cannot be empty".to_string());
+        }
     }
     if let Some(ref addr) = cli.address {
         if addr.parse::<std::net::Ipv4Addr>().is_err() {
@@ -337,7 +357,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
 
     // Check for --init flag (generate new config)
     if cli.init {
-        let mut config = Config::generate_default(&cli.control, &cli.network)?;
+        let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
         apply_cli_overrides(&mut config, &cli);
         let config_path = &cli.config;
         config.config_path = Some(config_path.clone());
@@ -367,7 +387,7 @@ async fn main() -> p2pnet_daemon::Result<()> {
         Config::generate_default("http://127.0.0.1", "default")?
     } else {
         info!("No config file found. Generating default config...");
-        let mut config = Config::generate_default(&cli.control, &cli.network)?;
+        let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
         apply_cli_overrides(&mut config, &cli);
         config.config_path = Some(config_path.clone());
         config.save_to_file(config_path)?;
@@ -507,6 +527,12 @@ async fn print_status(config: &Config, cli: &Cli) -> p2pnet_daemon::Result<()> {
 }
 
 fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
+    if let Some(ref control) = cli.control {
+        config.control.server_url = control.clone();
+    }
+    if let Some(ref network) = cli.network {
+        config.network.network_id = network.clone();
+    }
     if let Some(ref token) = cli.token {
         config.control.auth_token = token.clone();
     }
@@ -607,14 +633,73 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
 mod tests {
     use super::*;
 
+    fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
+        Cli {
+            config: PathBuf::from("p2wlan-config.json"),
+            init: false,
+            control: control.map(ToString::to_string),
+            network: network.map(ToString::to_string),
+            status: false,
+            token: None,
+            interface: None,
+            address: None,
+            manual: false,
+            managed: false,
+            netmask: None,
+            mtu: None,
+            heartbeat_interval: None,
+            udp_bind: None,
+            udp_advertise: None,
+            stun: None,
+            stun_timeout_ms: None,
+            punch_interval_ms: None,
+            punch_attempts: None,
+            socket_pool: None,
+            keepalive_interval_secs: None,
+            relay: None,
+            relay_regions: None,
+            relay_selection_timeout_ms: None,
+            relay_fallback_timeout_ms: None,
+            diagnostics_bind: None,
+            diagnostics_disable: false,
+            prefer_relay: false,
+            prefer_direct: false,
+            device_name: None,
+            diagnostics_url: None,
+            log_file: None,
+        }
+    }
+
+    #[test]
+    fn explicit_control_and_network_override_loaded_config() {
+        let mut config = Config::generate_default("https://old.example", "old-net").unwrap();
+        let cli = test_cli(Some("http://127.0.0.1:18080"), Some("default"));
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert_eq!(config.control.server_url, "http://127.0.0.1:18080");
+        assert_eq!(config.network.network_id, "default");
+    }
+
+    #[test]
+    fn omitted_control_and_network_preserve_loaded_config() {
+        let mut config = Config::generate_default("https://old.example", "old-net").unwrap();
+        let cli = test_cli(None, None);
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert_eq!(config.control.server_url, "https://old.example");
+        assert_eq!(config.network.network_id, "old-net");
+    }
+
     #[test]
     fn network_arguments_override_generated_config() {
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let cli = Cli {
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
-            control: "http://127.0.0.1".to_string(),
-            network: "default".to_string(),
+            control: Some("http://127.0.0.1".to_string()),
+            network: Some("default".to_string()),
             status: false,
             token: None,
             interface: None,
@@ -667,8 +752,8 @@ mod tests {
         let base_cli = Cli {
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
-            control: "https://control.p2wlan.io".to_string(),
-            network: "default".to_string(),
+            control: Some("https://control.p2wlan.io".to_string()),
+            network: Some("default".to_string()),
             status: false,
             token: None,
             interface: None,
@@ -701,7 +786,7 @@ mod tests {
 
         // 1. Invalid control URL
         let mut cli = base_cli.clone();
-        cli.control = "not-a-url".to_string();
+        cli.control = Some("not-a-url".to_string());
         assert!(validate_cli(&cli).is_err());
 
         // 2. Invalid address
@@ -745,12 +830,12 @@ mod tests {
 
         // 9. Invalid control scheme (non-http/https)
         let mut cli = base_cli.clone();
-        cli.control = "ftp://127.0.0.1".to_string();
+        cli.control = Some("ftp://127.0.0.1".to_string());
         assert!(validate_cli(&cli).is_err());
 
         // Valid cases should pass
         let mut cli = base_cli.clone();
-        cli.control = "http://127.0.0.1:18080".to_string();
+        cli.control = Some("http://127.0.0.1:18080".to_string());
         cli.address = Some("10.20.0.2".to_string());
         cli.netmask = Some("255.255.255.0".to_string());
         cli.mtu = Some(1420);
@@ -783,8 +868,8 @@ mod tests {
         let cli = Cli {
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
-            control: "http://127.0.0.1".to_string(),
-            network: "default".to_string(),
+            control: Some("http://127.0.0.1".to_string()),
+            network: Some("default".to_string()),
             status: false,
             token: Some("test-token".to_string()),
             interface: None,
@@ -839,8 +924,8 @@ mod tests {
         assert!(parsed.is_ok());
         let cli = parsed.unwrap();
         assert_eq!(cli.config, PathBuf::from("custom.json"));
-        assert_eq!(cli.control, "http://127.0.0.1:8080");
-        assert_eq!(cli.network, "testnet");
+        assert_eq!(cli.control.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
         assert!(cli.init);
 
         // Verify version and help parse cleanly

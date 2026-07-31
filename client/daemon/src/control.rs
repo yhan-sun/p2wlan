@@ -198,6 +198,9 @@ pub struct PeerInfo {
     /// Human-readable device name from the control plane.
     #[serde(default)]
     pub device_name: String,
+    /// Peer application/daemon version reported by the control plane.
+    #[serde(default)]
+    pub app_version: String,
     /// Peer public key (hex).
     pub public_key: String,
     /// Peer public endpoint (ip:port).
@@ -340,6 +343,8 @@ struct DeviceResponse {
     id: String,
     #[serde(default)]
     device_name: String,
+    #[serde(default)]
+    app_version: String,
     public_key: String,
     #[serde(default)]
     endpoint: String,
@@ -869,6 +874,7 @@ impl ControlClient {
                 let peer = PeerInfo {
                     node_id: node_id.clone(),
                     device_name: String::new(),
+                    app_version: String::new(),
                     public_key,
                     endpoint,
                     nat_type,
@@ -1965,6 +1971,8 @@ async fn register_device(
             "ed25519_public_key": config.node.ed25519_public_key,
             "device_name": config.node.device_name,
             "platform": config.node.platform,
+            "virtual_ip": config.network.virtual_ip,
+            "app_version": env!("CARGO_PKG_VERSION"),
             "network_id": config.network.network_id,
         }))
         .send()
@@ -2431,6 +2439,7 @@ async fn poll_peers(
             let peer = PeerInfo {
                 node_id: node.id.clone(),
                 device_name: node.device_name,
+                app_version: node.app_version,
                 public_key: node.public_key,
                 endpoint: node.endpoint,
                 nat_type: node.nat_type,
@@ -2473,6 +2482,7 @@ async fn poll_peers(
 
 fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
     known.device_name != peer.device_name
+        || known.app_version != peer.app_version
         || known.public_key != peer.public_key
         || known.endpoint != peer.endpoint
         || known.nat_type != peer.nat_type
@@ -2662,7 +2672,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request).await.unwrap();
-            let body = r#"{"nodes":[{"id":"peer-offline","device_name":"Travel Laptop","public_key":"peer-public-key","endpoint":"","nat_type":"Unknown","virtual_ip":"10.20.0.9","online":false,"last_seen":1785320000}]}"#;
+            let body = r#"{"nodes":[{"id":"peer-offline","device_name":"Travel Laptop","public_key":"peer-public-key","app_version":"0.1.68","endpoint":"","nat_type":"Unknown","virtual_ip":"10.20.0.9","online":false,"last_seen":1785320000}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -2697,10 +2707,12 @@ mod tests {
         assert!(!peer.online);
         assert_eq!(peer.last_seen, 1_785_320_000);
         assert_eq!(peer.device_name, "Travel Laptop");
+        assert_eq!(peer.app_version, "0.1.68");
 
         match event_rx.try_recv().unwrap() {
             ControlEvent::PeerJoined(peer) => {
                 assert_eq!(peer.node_id, "peer-offline");
+                assert_eq!(peer.app_version, "0.1.68");
                 assert!(!peer.online);
             }
             event => panic!("expected offline peer join event, got {event:?}"),
@@ -2714,6 +2726,7 @@ mod tests {
         let known = PeerInfo {
             node_id: "peer-a".to_string(),
             device_name: "peer".to_string(),
+            app_version: String::new(),
             public_key: "key".to_string(),
             endpoint: "192.168.1.10:5000".to_string(),
             nat_type: "unknown".to_string(),
@@ -2729,6 +2742,9 @@ mod tests {
 
         updated.endpoint = known.endpoint.clone();
         assert!(!peer_metadata_changed(&known, &updated));
+
+        updated.app_version = "0.1.68".to_string();
+        assert!(peer_metadata_changed(&known, &updated));
     }
 
     #[test]

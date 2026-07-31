@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -115,6 +116,69 @@ void main() {
     await request.response.close();
 
     await deleteFuture;
+  });
+
+  test('updateDevice sends name and virtual IP in PATCH request', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final api = ControlApi();
+    addTearDown(api.close);
+
+    final updateFuture = api.updateDevice(
+      controlServer: 'http://127.0.0.1:${server.port}',
+      authToken: 'token-123',
+      deviceId: 'node-a',
+      deviceName: '  Studio Mac  ',
+      virtualIp: ' 10.20.0.88 ',
+    );
+    final request = await server.first.timeout(const Duration(seconds: 3));
+    expect(request.method, 'PATCH');
+    expect(request.uri.path, '/api/v1/devices/node-a');
+    expect(
+      request.headers.value(HttpHeaders.authorizationHeader),
+      'Bearer token-123',
+    );
+    final payload =
+        jsonDecode(await utf8.decoder.bind(request).join())
+            as Map<String, dynamic>;
+    expect(payload['device_name'], 'Studio Mac');
+    expect(payload['virtual_ip'], '10.20.0.88');
+    request.response.headers.contentType = ContentType.json;
+    request.response.write('''
+{
+  "success": true,
+  "device": {
+    "device_name": "Studio Mac",
+    "virtual_ip": "10.20.0.88"
+  }
+}
+''');
+    await request.response.close();
+
+    final result = await updateFuture;
+    expect(result.deviceName, 'Studio Mac');
+    expect(result.virtualIp, '10.20.0.88');
+  });
+
+  test('updateDevice rejects invalid virtual IP before sending', () async {
+    final api = ControlApi();
+    addTearDown(api.close);
+
+    await expectLater(
+      api.updateDevice(
+        controlServer: defaultControlServer,
+        authToken: 'token-123',
+        deviceId: 'node-a',
+        virtualIp: 'not-an-ip',
+      ),
+      throwsA(
+        isA<ControlApiException>().having(
+          (error) => error.message,
+          'message',
+          contains('虚拟 IP 格式不正确'),
+        ),
+      ),
+    );
   });
 
   test(

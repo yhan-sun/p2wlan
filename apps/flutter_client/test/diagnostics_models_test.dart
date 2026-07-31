@@ -62,6 +62,7 @@ void main() {
       final peer = PeerSnapshot.fromJson({
         'node_id': 'direct-peer',
         'device_name': 'studio',
+        'app_version': '0.1.68',
         'virtual_ip': '10.20.0.30',
         'online': true,
         'state': 'direct',
@@ -78,6 +79,7 @@ void main() {
       });
 
       expect(peer.latencyMs, 31);
+      expect(peer.appVersion, '0.1.68');
       expect(relaySelection.latencyMs, 25);
     },
   );
