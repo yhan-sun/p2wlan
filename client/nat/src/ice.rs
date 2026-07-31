@@ -61,9 +61,10 @@ const HAIRPIN_PROBE_PREFIX: &[u8] = b"P2WLAN_HAIRPIN_V1";
 ///
 /// Linear symmetric NATs often advance by one or two ports per outbound
 /// destination, but TURN/ICE checks can consume several mappings before the
-/// peer-reflexive path is nominated. Keep this window small enough for
-/// signaling, while covering the short linear run WebRTC-style ICE relies on.
-const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 12;
+/// peer-reflexive path is nominated. Keep this window bounded for signaling,
+/// while covering the observed 15-20 port jumps produced by WebRTC-style
+/// relay-first / direct-chase ICE checks on hard NATs.
+const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 24;
 
 /// Configuration for ICE candidate gathering.
 #[derive(Debug, Clone)]
@@ -1375,8 +1376,41 @@ mod tests {
         );
         assert_eq!(
             profile.predicted_endpoints.last().map(String::as_str),
-            Some("203.0.113.10:32810")
+            Some("203.0.113.10:32822")
         );
+    }
+
+    #[test]
+    fn test_predicted_reflexive_window_covers_webrtc_style_jump() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8135".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8136".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8137".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+            ],
+        );
+
+        assert_eq!(profile.port_delta, Some(1));
+        assert!(profile.prediction_candidate);
+        assert!(profile
+            .predicted_endpoints
+            .contains(&"220.163.6.190:8154".to_string()));
     }
 
     #[test]
