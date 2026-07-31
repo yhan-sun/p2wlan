@@ -57,6 +57,28 @@ abstract final class AppTokens {
   static const colorNeutralBorder = Color(0xFFD3DCDA);
   static const colorNeutralText = Color(0xFF4C585D);
 
+  // Dark status tones keep semantic color visible on dark surfaces without
+  // falling back to pale light-theme labels.
+  static const colorDarkGoodBg = Color(0xFF10241D);
+  static const colorDarkGoodBorder = Color(0xFF2F7A4F);
+  static const colorDarkGoodText = Color(0xFF8DE2B1);
+  static const colorDarkGoodDot = Color(0xFF35C46F);
+
+  static const colorDarkWarnBg = Color(0xFF2A2112);
+  static const colorDarkWarnBorder = Color(0xFF7A5D24);
+  static const colorDarkWarnText = Color(0xFFF1C96A);
+  static const colorDarkWarnDot = Color(0xFFE3A92F);
+
+  static const colorDarkBadBg = Color(0xFF2B1716);
+  static const colorDarkBadBorder = Color(0xFF8E423D);
+  static const colorDarkBadText = Color(0xFFFFA39A);
+  static const colorDarkBadDot = Color(0xFFEF5D54);
+
+  static const colorDarkNeutralBg = Color(0xFF1D2927);
+  static const colorDarkNeutralBorder = Color(0xFF3A4A47);
+  static const colorDarkNeutralText = Color(0xFFB8C7C4);
+  static const colorDarkNeutralDot = Color(0xFF81918E);
+
   // Debug Console / Raw JSON
   static const colorConsoleBg = Color(0xFF111817);
   static const colorConsoleBorder = Color(0xFF26312F);
@@ -78,7 +100,7 @@ abstract final class AppTokens {
   static const radiusLg = 12.0;
 
   // Touch Targets
-  static const minTouchTarget = 40.0;
+  static const minTouchTarget = 44.0;
 
   // --- Durations & Curves ---
   static const durationFast = Duration(milliseconds: 110);

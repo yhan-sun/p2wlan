@@ -145,7 +145,7 @@ abstract final class AppTheme {
         backgroundColor: AppTokens.colorSurface,
         elevation: 0,
         indicatorColor: AppTokens.colorSurfaceSubtle,
-        height: 58,
+        height: 64,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) {
             return const TextStyle(
@@ -214,7 +214,7 @@ abstract final class AppTheme {
         outlineVariant: AppTokens.colorDarkBorderSubtle,
         primary: AppTokens.colorDarkAccent,
         onPrimary: AppTokens.colorDarkBg,
-        error: AppTokens.colorBadText,
+        error: AppTokens.colorDarkBadText,
         surfaceContainerHighest: AppTokens.colorDarkSurfaceSubtle,
       ),
       appBarTheme: const AppBarTheme(
@@ -344,7 +344,7 @@ abstract final class AppTheme {
         backgroundColor: AppTokens.colorDarkSurface,
         elevation: 0,
         indicatorColor: AppTokens.colorDarkSurfaceSubtle,
-        height: 58,
+        height: 64,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) {
             return const TextStyle(

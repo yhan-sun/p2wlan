@@ -16,8 +16,7 @@ class StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final surfaceColor = Theme.of(context).colorScheme.surface;
-    final (bg, border, text, dot) = _colors(surfaceColor);
+    final (bg, border, text, dot) = _colors(context);
     return Container(
       constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -54,28 +53,58 @@ class StatusBadge extends StatelessWidget {
     );
   }
 
-  (Color, Color, Color, Color) _colors(Color surface) {
+  (Color, Color, Color, Color) _colors(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    if (isDark) {
+      return switch (tone) {
+        StatusTone.good => (
+          AppTokens.colorDarkGoodBg,
+          AppTokens.colorDarkGoodBorder,
+          AppTokens.colorDarkGoodText,
+          AppTokens.colorDarkGoodDot,
+        ),
+        StatusTone.warn => (
+          AppTokens.colorDarkWarnBg,
+          AppTokens.colorDarkWarnBorder,
+          AppTokens.colorDarkWarnText,
+          AppTokens.colorDarkWarnDot,
+        ),
+        StatusTone.bad => (
+          AppTokens.colorDarkBadBg,
+          AppTokens.colorDarkBadBorder,
+          AppTokens.colorDarkBadText,
+          AppTokens.colorDarkBadDot,
+        ),
+        StatusTone.neutral => (
+          AppTokens.colorDarkNeutralBg,
+          AppTokens.colorDarkNeutralBorder,
+          AppTokens.colorDarkNeutralText,
+          AppTokens.colorDarkNeutralDot,
+        ),
+      };
+    }
+
     return switch (tone) {
       StatusTone.good => (
-        surface,
+        AppTokens.colorGoodBg,
         AppTokens.colorGoodBorder,
         AppTokens.colorGoodText,
         AppTokens.colorGoodText,
       ),
       StatusTone.warn => (
-        surface,
+        AppTokens.colorWarnBg,
         AppTokens.colorWarnBorder,
         AppTokens.colorWarnText,
         AppTokens.colorWarnText,
       ),
       StatusTone.bad => (
-        surface,
+        AppTokens.colorBadBg,
         AppTokens.colorBadBorder,
         AppTokens.colorBadText,
         AppTokens.colorBadText,
       ),
       StatusTone.neutral => (
-        surface,
+        AppTokens.colorNeutralBg,
         AppTokens.colorNeutralBorder,
         AppTokens.colorNeutralText,
         AppTokens.colorNeutralText,

@@ -6,11 +6,13 @@ class PageScaffold extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.children,
+    this.showHeader = true,
   });
 
   final String title;
   final String subtitle;
   final List<Widget> children;
+  final bool showHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -36,29 +38,42 @@ class PageScaffold extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        title,
-                        style: TextStyle(
-                          fontSize: isNarrow ? 20 : 22,
-                          fontWeight: FontWeight.w600,
-                          color: Theme.of(context).colorScheme.onSurface,
-                          letterSpacing: 0,
-                        ),
-                      ),
-                      if (trimmedSubtitle.isNotEmpty) ...[
-                        const SizedBox(height: 3),
-                        Text(
-                          trimmedSubtitle,
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w400,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
+                      if (showHeader) ...[
+                        Align(
+                          alignment: Alignment.center,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Text(
+                                title,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: isNarrow ? 20 : 22,
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                  letterSpacing: 0,
+                                ),
+                              ),
+                              if (trimmedSubtitle.isNotEmpty) ...[
+                                const SizedBox(height: 3),
+                                Text(
+                                  trimmedSubtitle,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w400,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                         ),
+                        const SizedBox(height: 16),
                       ],
-                      const SizedBox(height: 16),
                       ...children,
                     ],
                   ),
