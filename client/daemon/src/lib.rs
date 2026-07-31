@@ -214,10 +214,10 @@ const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SIGNAL_CANDIDATES: usize = 20;
 /// A bounded public candidate group preserves ICE-style linear NAT coverage.
 ///
-/// Air-like linear symmetric NATs need the STUN group plus a short predicted
-/// run. Keep this below the overall signaling cap so host/manual candidates can
-/// still fit, and rely on local birthday rotation for wider coverage.
-const MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP: usize = 16;
+/// Air-like linear symmetric NATs need the STUN group plus a predicted run
+/// that reaches the high-teens port jumps seen in relay-first/direct-chase ICE.
+/// The overall signaling cap still prevents broad scanning.
+const MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP: usize = MAX_SIGNAL_CANDIDATES;
 /// Keep UPnP discovery short so unsupported gateways never delay startup much.
 const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Short UPnP lease; refreshed by the regular candidate refresh loop.
@@ -5283,7 +5283,7 @@ mod tests {
     #[test]
     fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
         let mut candidates = vec!["192.168.1.10:51820".to_string()];
-        candidates.extend((0..18).map(|index| format!("8.8.8.8:{}", 41000 + index)));
+        candidates.extend((0..24).map(|index| format!("8.8.8.8:{}", 41000 + index)));
         candidates.extend(["1.1.1.1:42000".to_string(), "1.1.1.1:42009".to_string()]);
         let mut sources = candidates
             .iter()
@@ -5294,7 +5294,7 @@ mod tests {
 
         compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
 
-        assert_eq!(candidates.len(), 19);
+        assert_eq!(candidates.len(), 23);
         assert!(candidates.contains(&"192.168.1.10:51820".to_string()));
         assert!(candidates.contains(&"1.1.1.1:42000".to_string()));
         assert!(candidates.contains(&"1.1.1.1:42009".to_string()));
@@ -5305,8 +5305,33 @@ mod tests {
                 .count(),
             MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
         );
-        assert!(!candidates.contains(&"8.8.8.8:41016".to_string()));
-        assert!(!candidates.contains(&"8.8.8.8:41017".to_string()));
+        assert!(!candidates.contains(&"8.8.8.8:41020".to_string()));
+        assert!(!candidates.contains(&"8.8.8.8:41023".to_string()));
+        assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    }
+
+    #[test]
+    fn signal_candidate_cap_preserves_high_teen_linear_prediction() {
+        let mut candidates = vec!["192.168.1.10:51820".to_string()];
+        candidates.extend((8135..=8137).map(|port| format!("220.163.6.190:{port}")));
+        candidates.extend((8138..=8161).map(|port| format!("220.163.6.190:{port}")));
+        let mut sources = HashMap::from([("192.168.1.10:51820".to_string(), "host".to_string())]);
+        for port in 8135..=8137 {
+            sources.insert(format!("220.163.6.190:{port}"), "stun_observed".to_string());
+        }
+        for port in 8138..=8161 {
+            sources.insert(format!("220.163.6.190:{port}"), "predicted".to_string());
+        }
+
+        compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
+        truncate_signal_candidates(&mut candidates, &mut sources);
+
+        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert!(candidates.contains(&"220.163.6.190:8154".to_string()));
+        assert_eq!(
+            sources.get("220.163.6.190:8154").map(String::as_str),
+            Some("predicted")
+        );
         assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
     }
 

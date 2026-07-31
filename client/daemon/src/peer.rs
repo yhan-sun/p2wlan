@@ -51,8 +51,8 @@ const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
-const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 6;
-const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 12;
+const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 18;
+const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 20;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 2;
 const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 64;
@@ -6855,16 +6855,9 @@ mod tests {
         let endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
 
         manager.add_peer(&test_peer("peer1", endpoint)).await;
-        let candidates = vec![
-            "203.0.113.10:40007".to_string(),
-            "203.0.113.10:40009".to_string(),
-            "203.0.113.10:40011".to_string(),
-            "203.0.113.10:40013".to_string(),
-            "203.0.113.10:40015".to_string(),
-            "203.0.113.10:40017".to_string(),
-            "203.0.113.10:40019".to_string(),
-            "203.0.113.10:40021".to_string(),
-        ];
+        let candidates = (0..24)
+            .map(|index| format!("203.0.113.10:{}", 40_007 + index * 2))
+            .collect::<Vec<_>>();
         let sources = candidates
             .iter()
             .map(|candidate| (candidate.clone(), "predicted".to_string()))
