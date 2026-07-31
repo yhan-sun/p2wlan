@@ -8,7 +8,6 @@ import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
-import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
@@ -17,10 +16,12 @@ class DashboardPage extends StatelessWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.showHeader = true,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final bool showHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -31,7 +32,8 @@ class DashboardPage extends StatelessWidget {
         final snapshot = statusStore.snapshot;
         return PageScaffold(
           title: strings.dashboard,
-          subtitle: '',
+          subtitle: strings.dashboardSubtitle,
+          showHeader: showHeader,
           children: [
             _ConnectionBanner(
               snapshot: snapshot,
@@ -106,12 +108,15 @@ class _ConnectionBanner extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final daemonAvailable = _daemonAvailable;
     final tone = _overallTone();
-    final statusMessage = _statusMessage(strings, daemonAvailable);
-    return AppPanel(
-      title: strings.localDiagnostics,
+    final issueMessage =
+        _statusMessage(strings, daemonAvailable) ?? _attentionMessage(strings);
+    final showIssueNote = issueMessage != null && daemonAvailable;
+    return _DashboardSurface(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          const _DashboardSurfaceHeader(),
+          const SizedBox(height: 16),
           _ConnectionOverview(
             snapshot: snapshot,
             daemonAvailable: daemonAvailable,
@@ -120,21 +125,6 @@ class _ConnectionBanner extends StatelessWidget {
             statusReachable: statusReachable,
           ),
           const SizedBox(height: 16),
-          _DashboardMetrics(
-            snapshot: snapshot,
-            lastFetchedAt: lastFetchedAt,
-            requestDuration: requestDuration,
-          ),
-          if (statusMessage != null) ...[
-            const SizedBox(height: 10),
-            _StatusNote(
-              message: statusMessage,
-              tone: daemonAvailable ? StatusTone.warn : StatusTone.bad,
-            ),
-          ],
-          const SizedBox(height: 16),
-          const Divider(),
-          const SizedBox(height: 12),
           _DashboardActions(
             daemonAvailable: daemonAvailable,
             daemonBusy: daemonBusy,
@@ -145,6 +135,24 @@ class _ConnectionBanner extends StatelessWidget {
             onRefresh: onRefresh,
             onAutoRefreshChanged: onAutoRefreshChanged,
           ),
+          if (daemonAvailable) ...[
+            const SizedBox(height: 16),
+            const Divider(),
+            const SizedBox(height: 14),
+            _DashboardMetrics(
+              snapshot: snapshot,
+              lastFetchedAt: lastFetchedAt,
+              requestDuration: requestDuration,
+            ),
+          ],
+          if (showIssueNote) ...[
+            const SizedBox(height: 12),
+            _StatusNote(
+              label: strings.reviewRecommended,
+              message: issueMessage,
+              tone: StatusTone.warn,
+            ),
+          ],
           if (daemonManualCommand != null) ...[
             const SizedBox(height: 14),
             _ManualDaemonCommand(command: daemonManualCommand!),
@@ -167,6 +175,23 @@ class _ConnectionBanner extends StatelessWidget {
     if (_overallTone() != StatusTone.good && error != null) {
       return strings.statusMessage(error) ?? error;
     }
+    return null;
+  }
+
+  String? _attentionMessage(AppStrings strings) {
+    final health = snapshot?.health;
+    if (health?.reauthRequired == true) return strings.issueReauthRequired;
+    if (health != null && !health.controlConnected) {
+      return strings.issueControlDisconnected;
+    }
+    final reason = health?.reason?.trim();
+    if (reason != null && reason.isNotEmpty) return reason;
+    if (snapshot != null && !snapshot!.relayConnected) {
+      return strings.issueRelayDisconnected;
+    }
+    final warningCount =
+        snapshot?.peers.where((peer) => peer.lastError != null).length ?? 0;
+    if (warningCount > 0) return strings.peerWarnings(warningCount);
     return null;
   }
 
@@ -198,6 +223,7 @@ class _ConnectionBanner extends StatelessWidget {
   }
 
   StatusTone _overallTone() {
+    if (!_daemonAvailable) return StatusTone.neutral;
     if (!healthReachable) return StatusTone.bad;
     if (!statusReachable) return StatusTone.warn;
     return switch (snapshot?.health.status.toLowerCase()) {
@@ -205,6 +231,54 @@ class _ConnectionBanner extends StatelessWidget {
       'degraded' => StatusTone.warn,
       _ => StatusTone.bad,
     };
+  }
+}
+
+class _DashboardSurface extends StatelessWidget {
+  const _DashboardSurface({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        border: Border.all(color: theme.colorScheme.outline, width: 1),
+        boxShadow: isDark ? const [] : AppTokens.shadowBorder,
+      ),
+      child: Padding(padding: const EdgeInsets.all(16), child: child),
+    );
+  }
+}
+
+class _DashboardSurfaceHeader extends StatelessWidget {
+  const _DashboardSurfaceHeader();
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            strings.virtualNetwork,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: theme.colorScheme.onSurface,
+              fontSize: 15,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0,
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -299,104 +373,147 @@ class _ConnectionOverview extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
-    final (bg, border, iconColor) = switch (tone) {
-      StatusTone.good => (
-        AppTokens.colorGoodBg,
-        AppTokens.colorGoodBorder,
-        AppTokens.colorGoodText,
-      ),
-      StatusTone.warn => (
-        AppTokens.colorWarnBg,
-        AppTokens.colorWarnBorder,
-        AppTokens.colorWarnText,
-      ),
-      StatusTone.bad => (
-        AppTokens.colorBadBg,
-        AppTokens.colorBadBorder,
-        AppTokens.colorBadText,
-      ),
-      StatusTone.neutral => (
-        theme.colorScheme.surfaceContainerHighest,
-        theme.colorScheme.outline,
-        theme.colorScheme.onSurfaceVariant,
-      ),
-    };
-    final statusLabel = !daemonAvailable
-        ? strings.offline
-        : tone == StatusTone.good
-        ? strings.healthy
-        : tone == StatusTone.warn
-        ? strings.degraded
-        : strings.unhealthy;
+    final colors = _tonePanelColors(context, tone);
+    final virtualIp = dash(snapshot?.virtualIp);
+    final controlConnected = snapshot?.health.controlConnected == true;
+    final controlTone = snapshot == null
+        ? StatusTone.neutral
+        : controlConnected
+        ? StatusTone.good
+        : StatusTone.warn;
+    final controlLabel = snapshot == null
+        ? strings.unavailable
+        : controlConnected
+        ? strings.connected
+        : strings.degraded;
     final title = daemonAvailable
-        ? (strings.isZh ? '虚拟网络运行中' : 'Virtual network running')
-        : (strings.isZh ? '虚拟网络未启动' : 'Virtual network stopped');
+        ? strings.virtualNetworkRunning
+        : strings.virtualNetworkStopped;
     final subtitle = snapshot == null
-        ? (strings.isZh
-              ? '启动后会显示虚拟 IP、控制面和中继路径状态。'
-              : 'Start P2WLAN to see virtual IP, control-plane, and relay status.')
-        : '${strings.virtualIp} ${dash(snapshot!.virtualIp)} · ${snapshot!.networkId} · ${strings.endpointState} ${healthReachable || statusReachable ? strings.reachable : strings.unavailable}';
+        ? strings.virtualNetworkStoppedDetail
+        : '${strings.networkId} ${dash(snapshot!.networkId)} · ${strings.endpointState} ${healthReachable || statusReachable ? strings.reachable : strings.unavailable}';
 
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: bg,
+        color: colors.bg,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: border),
+        border: Border.all(color: colors.border),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          children: [
-            Container(
-              width: 42,
-              height: 42,
+        padding: const EdgeInsets.all(14),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final statusBadges = Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                StatusBadge(
+                  label: daemonAvailable ? strings.connected : strings.offline,
+                  tone: tone,
+                ),
+                if (daemonAvailable)
+                  StatusBadge(label: controlLabel, tone: controlTone),
+              ],
+            );
+            final ipBlock = Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800,
+                    height: 1.15,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                    height: 1.3,
+                    fontFeatures: AppTokens.tabularFontFeatures,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  strings.virtualIp,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  virtualIp,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: constraints.maxWidth < 420 ? 24 : 28,
+                    fontWeight: FontWeight.w800,
+                    height: 1.05,
+                    fontFeatures: AppTokens.tabularFontFeatures,
+                  ),
+                ),
+              ],
+            );
+            final icon = Container(
+              width: 46,
+              height: 46,
               decoration: BoxDecoration(
                 color: theme.colorScheme.surface,
                 borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                border: Border.all(color: border),
+                border: Border.all(color: colors.border),
               ),
               child: Icon(
                 daemonAvailable
                     ? Icons.hub_outlined
                     : Icons.power_settings_new_rounded,
-                color: iconColor,
-                size: 22,
+                color: colors.text,
+                size: 24,
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
+            );
+
+            if (constraints.maxWidth < 560) {
+              return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: theme.colorScheme.onSurface,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w800,
-                      height: 1.15,
-                    ),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      icon,
+                      const SizedBox(width: 12),
+                      Expanded(child: ipBlock),
+                    ],
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    subtitle,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: theme.colorScheme.onSurfaceVariant,
-                      fontSize: 12,
-                      height: 1.3,
-                      fontFeatures: AppTokens.tabularFontFeatures,
-                    ),
-                  ),
+                  const SizedBox(height: 12),
+                  statusBadges,
                 ],
-              ),
-            ),
-            const SizedBox(width: 12),
-            StatusBadge(label: statusLabel, tone: tone),
-          ],
+              );
+            }
+
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                icon,
+                const SizedBox(width: 14),
+                Expanded(child: ipBlock),
+                const SizedBox(width: 18),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 260),
+                  child: statusBadges,
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
@@ -419,18 +536,30 @@ class _DashboardMetrics extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final stats = snapshot?.stats;
     final relay = snapshot?.relaySelection;
+    final totalPeers = snapshot?.peers.length ?? stats?.totalPeers;
+    final onlinePeers = snapshot?.peers.where((peer) => peer.online).length;
+    final offlinePeers = snapshot?.peers.where((peer) => !peer.online).length;
+    final probingPeers = snapshot?.peers
+        .where((peer) => peer.path == 'probing' || peer.path == 'direct_trial')
+        .length;
     final items = [
       _MetricItem(
-        label: strings.virtualIp,
-        value: dash(snapshot?.virtualIp),
-        detail: snapshot == null ? null : dash(snapshot!.networkId),
+        label: strings.onlineDevices,
+        value: onlinePeers == null
+            ? '—'
+            : '${formatInt(onlinePeers)}/${formatInt(totalPeers ?? 0)}',
+        detail: offlinePeers == null
+            ? null
+            : '${strings.offlineDevices}: ${formatInt(offlinePeers)}',
       ),
       _MetricItem(
-        label: strings.peers,
-        value: stats == null ? '—' : formatInt(stats.totalPeers),
+        label: strings.pathOverview,
+        value: stats == null
+            ? '—'
+            : '${formatInt(stats.directConnections)} / ${formatInt(stats.relayConnections)}',
         detail: stats == null
             ? null
-            : '${strings.directPaths}: ${formatInt(stats.directConnections)} · ${strings.relayPaths}: ${formatInt(stats.relayConnections)}',
+            : '${strings.directPaths} · ${strings.relayPaths}${probingPeers == null || probingPeers == 0 ? '' : ' · ${strings.probing}: ${formatInt(probingPeers)}'}',
       ),
       _MetricItem(
         label: strings.relay,
@@ -624,65 +753,66 @@ class _MetricDivider extends StatelessWidget {
 }
 
 class _StatusNote extends StatelessWidget {
-  const _StatusNote({required this.message, required this.tone});
+  const _StatusNote({
+    required this.label,
+    required this.message,
+    required this.tone,
+  });
 
+  final String label;
   final String message;
   final StatusTone tone;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final (bg, border, text) = switch (tone) {
-      StatusTone.good => (
-        AppTokens.colorGoodBg,
-        AppTokens.colorGoodBorder,
-        AppTokens.colorGoodText,
-      ),
-      StatusTone.warn => (
-        AppTokens.colorWarnBg,
-        AppTokens.colorWarnBorder,
-        AppTokens.colorWarnText,
-      ),
-      StatusTone.bad => (
-        AppTokens.colorBadBg,
-        AppTokens.colorBadBorder,
-        AppTokens.colorBadText,
-      ),
-      StatusTone.neutral => (
-        theme.colorScheme.surfaceContainerHighest,
-        theme.colorScheme.outline,
-        theme.colorScheme.onSurfaceVariant,
-      ),
-    };
+    final colors = _tonePanelColors(context, tone);
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: bg,
+        color: colors.bg,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: border, width: 1),
+        border: Border.all(color: colors.border, width: 1),
       ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Padding(
-              padding: const EdgeInsets.only(top: 6),
+              padding: const EdgeInsets.only(top: 7),
               child: Container(
                 width: 6,
                 height: 6,
-                decoration: BoxDecoration(color: text, shape: BoxShape.circle),
+                decoration: BoxDecoration(
+                  color: colors.text,
+                  shape: BoxShape.circle,
+                ),
               ),
             ),
             const SizedBox(width: 9),
             Expanded(
-              child: Text(
-                message,
-                style: TextStyle(
-                  color: text,
-                  fontSize: 12,
-                  height: 1.35,
-                  fontWeight: FontWeight.w500,
-                ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      color: colors.text,
+                      fontSize: 12,
+                      height: 1.25,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    message,
+                    style: TextStyle(
+                      color: colors.text,
+                      fontSize: 12,
+                      height: 1.35,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -690,6 +820,61 @@ class _StatusNote extends StatelessWidget {
       ),
     );
   }
+}
+
+({Color bg, Color border, Color text}) _tonePanelColors(
+  BuildContext context,
+  StatusTone tone,
+) {
+  final theme = Theme.of(context);
+  final isDark = theme.brightness == Brightness.dark;
+  if (isDark) {
+    return switch (tone) {
+      StatusTone.good => (
+        bg: AppTokens.colorDarkGoodBg,
+        border: AppTokens.colorDarkGoodBorder,
+        text: AppTokens.colorDarkGoodText,
+      ),
+      StatusTone.warn => (
+        bg: AppTokens.colorDarkWarnBg,
+        border: AppTokens.colorDarkWarnBorder,
+        text: AppTokens.colorDarkWarnText,
+      ),
+      StatusTone.bad => (
+        bg: AppTokens.colorDarkBadBg,
+        border: AppTokens.colorDarkBadBorder,
+        text: AppTokens.colorDarkBadText,
+      ),
+      StatusTone.neutral => (
+        bg: AppTokens.colorDarkNeutralBg,
+        border: AppTokens.colorDarkNeutralBorder,
+        text: AppTokens.colorDarkNeutralText,
+      ),
+    };
+  }
+
+  return switch (tone) {
+    StatusTone.good => (
+      bg: AppTokens.colorGoodBg,
+      border: AppTokens.colorGoodBorder,
+      text: AppTokens.colorGoodText,
+    ),
+    StatusTone.warn => (
+      bg: AppTokens.colorWarnBg,
+      border: AppTokens.colorWarnBorder,
+      text: AppTokens.colorWarnText,
+    ),
+    StatusTone.bad => (
+      bg: AppTokens.colorBadBg,
+      border: AppTokens.colorBadBorder,
+      text: AppTokens.colorBadText,
+    ),
+    StatusTone.neutral => (
+      bg: theme.colorScheme.surfaceContainerHighest,
+      border: theme.colorScheme.outline,
+      text: theme.colorScheme.onSurfaceVariant,
+    ),
+  };
 }
 
 class _DashboardActions extends StatelessWidget {
@@ -824,39 +1009,42 @@ class _AutoRefreshButton extends StatelessWidget {
       StatusStore.defaultAutoRefreshInterval.inSeconds,
     );
 
-    return OutlinedButton.icon(
-      key: const Key('auto-refresh-toggle'),
-      onPressed: daemonBusy
-          ? null
-          : () => onAutoRefreshChanged(!autoRefreshEnabled),
-      icon: AnimatedSwitcher(
-        duration: AppTokens.durationMedium,
-        switchInCurve: AppTokens.curveEase,
-        switchOutCurve: Curves.easeIn,
-        transitionBuilder: (child, animation) {
-          return FadeTransition(
-            opacity: animation,
-            child: ScaleTransition(scale: animation, child: child),
-          );
-        },
-        child: Icon(
-          autoRefreshEnabled ? Icons.timer_rounded : Icons.timer_off_outlined,
-          key: ValueKey(autoRefreshEnabled),
-          size: 17,
+    return Tooltip(
+      message: strings.autoRefreshTooltip,
+      child: OutlinedButton.icon(
+        key: const Key('auto-refresh-toggle'),
+        onPressed: daemonBusy
+            ? null
+            : () => onAutoRefreshChanged(!autoRefreshEnabled),
+        icon: AnimatedSwitcher(
+          duration: AppTokens.durationMedium,
+          switchInCurve: AppTokens.curveEase,
+          switchOutCurve: Curves.easeIn,
+          transitionBuilder: (child, animation) {
+            return FadeTransition(
+              opacity: animation,
+              child: ScaleTransition(scale: animation, child: child),
+            );
+          },
+          child: Icon(
+            autoRefreshEnabled ? Icons.timer_rounded : Icons.timer_off_outlined,
+            key: ValueKey(autoRefreshEnabled),
+            size: 17,
+          ),
         ),
-      ),
-      label: Text(label),
-      style: OutlinedButton.styleFrom(
-        foregroundColor: autoRefreshEnabled
-            ? colorScheme.primary
-            : colorScheme.onSurfaceVariant,
-        backgroundColor: autoRefreshEnabled
-            ? colorScheme.surfaceContainerHighest
-            : Colors.transparent,
-        side: BorderSide(
-          color: autoRefreshEnabled
-              ? colorScheme.primary.withValues(alpha: 0.34)
-              : colorScheme.outline,
+        label: Text(label),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: autoRefreshEnabled
+              ? colorScheme.primary
+              : colorScheme.onSurfaceVariant,
+          backgroundColor: autoRefreshEnabled
+              ? colorScheme.surfaceContainerHighest
+              : Colors.transparent,
+          side: BorderSide(
+            color: autoRefreshEnabled
+                ? colorScheme.primary.withValues(alpha: 0.34)
+                : colorScheme.outline,
+          ),
         ),
       ),
     );

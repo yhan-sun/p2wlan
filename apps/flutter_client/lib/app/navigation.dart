@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
-import '../app/app_constants.dart';
 import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
 import '../core/state/settings_store.dart';
@@ -48,9 +47,31 @@ class _P2WlanShellState extends State<P2WlanShell> {
   var _section = P2WlanSection.dashboard;
 
   @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
+  void initState() {
+    super.initState();
+    widget.settingsStore.addListener(_handleSettingsChanged);
+  }
 
+  @override
+  void didUpdateWidget(covariant P2WlanShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settingsStore != widget.settingsStore) {
+      oldWidget.settingsStore.removeListener(_handleSettingsChanged);
+      widget.settingsStore.addListener(_handleSettingsChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.settingsStore.removeListener(_handleSettingsChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStrings.fromCode(
+      widget.settingsStore.settings.languageCode,
+    );
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 900;
@@ -63,20 +84,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
           appBar: AppBar(
             leading: macosChrome ? const SizedBox.shrink() : null,
             leadingWidth: macosChrome ? 76 : null,
-            title: const Text(p2wlanAppName),
-            centerTitle: false,
+            title: Text(strings.sectionLabel(_section.name)),
+            centerTitle: true,
             flexibleSpace: hiddenNativeTitleBar
                 ? const DragToMoveArea(child: SizedBox.expand())
                 : null,
             actions: [
               _ShellStatusActions(statusStore: widget.statusStore),
-              if (widget.onLogout != null)
-                IconButton(
-                  tooltip: strings.isZh ? '退出登录' : 'Sign out',
-                  icon: const Icon(Icons.logout_outlined),
-                  onPressed: widget.onLogout,
-                ),
-              SizedBox(width: windowsChrome ? 140 : 8),
+              SizedBox(width: windowsChrome ? 148 : 8),
             ],
           ),
           body: wide
@@ -109,27 +124,38 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
   }
 
+  void _handleSettingsChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
   Widget _buildBody() {
     return switch (_section) {
       P2WlanSection.dashboard => DashboardPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        showHeader: false,
       ),
       P2WlanSection.nodes => NodesPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        showHeader: false,
       ),
       P2WlanSection.tunnels => TunnelsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        showHeader: false,
       ),
       P2WlanSection.diagnostics => DiagnosticsPage(
         statusStore: widget.statusStore,
+        showHeader: false,
       ),
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         onLogout: widget.onLogout,
+        showHeader: false,
       ),
     };
   }
@@ -242,7 +268,7 @@ class _ShellStatusActions extends StatelessWidget {
   }
 
   StatusTone _statusTone() {
-    if (!statusStore.daemonReachable) return StatusTone.bad;
+    if (!statusStore.daemonReachable) return StatusTone.neutral;
     return switch (statusStore.snapshot?.health.status.toLowerCase()) {
       'healthy' => StatusTone.good,
       'degraded' => StatusTone.warn,
