@@ -78,6 +78,22 @@ class _P2WlanAppState extends State<P2WlanApp> {
     }
   }
 
+  Future<void> _logout() async {
+    final settings = _settingsStore.settings;
+    await _settingsStore.updateSettings(
+      settings.copyWith(
+        authToken: '',
+        manualMode: false,
+      ),
+    );
+    await _statusStore.refresh();
+    if (mounted) {
+      setState(() {
+        _authenticated = false;
+      });
+    }
+  }
+
   @override
   void dispose() {
     unawaited(_desktopTrayController?.dispose());
@@ -114,6 +130,7 @@ class _P2WlanAppState extends State<P2WlanApp> {
                 ? P2WlanShell(
                     settingsStore: _settingsStore,
                     statusStore: _statusStore,
+                    onLogout: _logout,
                   )
                 : LoginPage(
                     settingsStore: _settingsStore,
