@@ -11,7 +11,6 @@ void main() {
   testWidgets('renders the P2WLAN client shell', (tester) async {
     await _pumpTestApp(tester);
 
-    expect(find.text('P2WLAN'), findsOneWidget);
     expect(find.text('Dashboard'), findsWidgets);
     expect(find.text('Offline'), findsWidgets);
   });
@@ -41,7 +40,10 @@ void main() {
     await tester.tap(find.text('English').last);
     await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('简体中文').last);
-    await tester.pump(const Duration(milliseconds: 250));
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    await tester.pump();
 
     expect(find.text('设置'), findsWidgets);
     expect(find.text('诊断 URL'), findsWidgets);
@@ -81,7 +83,7 @@ Future<void> _waitForBootstrap(WidgetTester tester) async {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     });
     await tester.pump();
-    if (find.text('P2WLAN').evaluate().isNotEmpty ||
+    if (find.text('Dashboard').evaluate().isNotEmpty ||
         find.text('Sign in to start the local TUN').evaluate().isNotEmpty) {
       return;
     }

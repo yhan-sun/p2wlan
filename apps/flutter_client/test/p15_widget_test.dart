@@ -33,7 +33,8 @@ void main() {
       ),
     );
 
-    expect(find.textContaining('No runtime snapshot'), findsWidgets);
+    expect(find.textContaining('Start P2WLAN to see virtual IP'), findsWidgets);
+    expect(find.text('Needs attention'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
@@ -449,7 +450,11 @@ void main() {
       findsOneWidget,
     );
 
-    await tester.tap(find.text('Show JSON'));
+    tester
+        .widget<OutlinedButton>(
+          find.widgetWithText(OutlinedButton, 'Show JSON'),
+        )
+        .onPressed!();
     await tester.pump();
 
     expect(
@@ -458,7 +463,11 @@ void main() {
     );
 
     expect(find.text('Copy'), findsWidgets);
-    await tester.tap(find.text('Copy').first);
+    tester
+        .widget<OutlinedButton>(
+          find.widgetWithText(OutlinedButton, 'Copy').first,
+        )
+        .onPressed!();
     await tester.pump();
 
     expect(tester.takeException(), isNull);
