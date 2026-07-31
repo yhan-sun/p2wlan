@@ -2518,6 +2518,12 @@ async fn poll_peers(
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list nodes decode failed: {e}")))?;
 
+    info!(
+        "poll_peers: received {} nodes from control plane (self_node_id={})",
+        body.nodes.len(),
+        self_node_id
+    );
+
     let mut seen = HashMap::new();
     let mut joined = Vec::new();
     let mut updated = Vec::new();
@@ -2564,6 +2570,13 @@ async fn poll_peers(
             let _ = event_tx.send(ControlEvent::PeerLeft(node_id));
         }
     }
+
+    info!(
+        "poll_peers: {} joined, {} updated, {} total known peers",
+        joined.len(),
+        updated.len(),
+        seen.len()
+    );
 
     for peer in joined {
         let _ = event_tx.send(ControlEvent::PeerJoined(peer));
