@@ -33,10 +33,12 @@ class P2WlanShell extends StatefulWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.onLogout,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final VoidCallback? onLogout;
 
   @override
   State<P2WlanShell> createState() => _P2WlanShellState();
@@ -68,6 +70,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
                 : null,
             actions: [
               _ShellStatusActions(statusStore: widget.statusStore),
+              if (widget.onLogout != null)
+                IconButton(
+                  tooltip: strings.isZh ? '退出登录' : 'Sign out',
+                  icon: const Icon(Icons.logout_outlined),
+                  onPressed: widget.onLogout,
+                ),
               SizedBox(width: windowsChrome ? 140 : 8),
             ],
           ),
@@ -121,6 +129,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        onLogout: widget.onLogout,
       ),
     };
   }

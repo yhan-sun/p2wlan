@@ -13,10 +13,12 @@ class SettingsPage extends StatefulWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.onLogout,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final VoidCallback? onLogout;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -27,6 +29,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _controlServerController;
   late final TextEditingController _authTokenController;
   late final TextEditingController _networkIdController;
+  late final TextEditingController _virtualIpController;
   late final TextEditingController _deviceNameController;
   late final TextEditingController _overlayCidrController;
   late final TextEditingController _tunInterfaceController;
@@ -54,6 +57,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     _authTokenController = TextEditingController(text: settings.authToken);
     _networkIdController = TextEditingController(text: settings.networkId);
+    _virtualIpController = TextEditingController(text: settings.virtualIp);
     _deviceNameController = TextEditingController(text: settings.deviceName);
     _overlayCidrController = TextEditingController(text: settings.overlayCidr);
     _tunInterfaceController = TextEditingController(
@@ -78,6 +82,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _controlServerController.dispose();
     _authTokenController.dispose();
     _networkIdController.dispose();
+    _virtualIpController.dispose();
     _deviceNameController.dispose();
     _overlayCidrController.dispose();
     _tunInterfaceController.dispose();
@@ -169,6 +174,14 @@ class _SettingsPageState extends State<SettingsPage> {
                     helper: strings.isZh
                         ? '加入的专用虚拟内网标识。'
                         : 'Virtual network identifier to join.',
+                  ),
+                  _gap,
+                  _SettingsTextField(
+                    controller: _virtualIpController,
+                    label: strings.isZh ? '期望虚拟 IP' : 'Requested virtual IP',
+                    helper: strings.isZh
+                        ? '可选；留空由控制面自动分配，例如 10.20.0.42。保存后重启 P2WLAN 生效。'
+                        : 'Optional; leave blank for control-plane assignment, e.g. 10.20.0.42. Restart P2WLAN after saving.',
                   ),
                   _gap,
                   _SettingsTextField(
@@ -413,19 +426,32 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
             const SizedBox(height: 16),
-            Align(
-              alignment: Alignment.centerRight,
-              child: FilledButton.icon(
-                key: const Key('settings-save-button'),
-                onPressed: _saving ? null : _saveAll,
-                icon: _saving
-                    ? const SizedBox.square(
-                        dimension: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.save_outlined, size: 16),
-                label: Text(strings.save),
-              ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                if (widget.onLogout != null)
+                  OutlinedButton.icon(
+                    onPressed: _saving ? null : widget.onLogout,
+                    icon: const Icon(Icons.logout_outlined, size: 16),
+                    label: Text(strings.isZh ? '退出登录' : 'Sign out'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppTokens.colorBadText,
+                    ),
+                  )
+                else
+                  const SizedBox.shrink(),
+                FilledButton.icon(
+                  key: const Key('settings-save-button'),
+                  onPressed: _saving ? null : _saveAll,
+                  icon: _saving
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.save_outlined, size: 16),
+                  label: Text(strings.save),
+                ),
+              ],
             ),
           ],
         );
@@ -454,6 +480,7 @@ class _SettingsPageState extends State<SettingsPage> {
         controlServer: _controlServerController.text,
         authToken: _authTokenController.text,
         networkId: _networkIdController.text,
+        virtualIp: _virtualIpController.text,
         deviceName: deviceName,
         manualMode: _manualMode,
         overlayCidr: _overlayCidrController.text,

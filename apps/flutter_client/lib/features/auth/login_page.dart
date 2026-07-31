@@ -126,6 +126,8 @@ class _LoginPageState extends State<LoginPage> {
                             prefixIcon: const Icon(Icons.dns_outlined),
                           ),
                           keyboardType: TextInputType.url,
+                          textInputAction: TextInputAction.next,
+                          onSubmitted: (_) => _submitting ? null : _submit(),
                         ),
                         const SizedBox(height: 12),
                         TextField(
@@ -136,6 +138,8 @@ class _LoginPageState extends State<LoginPage> {
                           ),
                           keyboardType: TextInputType.emailAddress,
                           autofillHints: const [AutofillHints.email],
+                          textInputAction: TextInputAction.next,
+                          onSubmitted: (_) => _submitting ? null : _submit(),
                         ),
                         const SizedBox(height: 12),
                         TextField(
@@ -150,6 +154,8 @@ class _LoginPageState extends State<LoginPage> {
                                 ? AutofillHints.newPassword
                                 : AutofillHints.password,
                           ],
+                          textInputAction: TextInputAction.done,
+                          onSubmitted: (_) => _submitting ? null : _submit(),
                         ),
                         if (_error != null) ...[
                           const SizedBox(height: 12),
