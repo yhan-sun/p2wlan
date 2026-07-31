@@ -74,11 +74,12 @@ func migrate(db *sql.DB) error {
 		public_key  TEXT NOT NULL,
 		device_name TEXT NOT NULL,
 		platform    TEXT NOT NULL DEFAULT '',
-		virtual_ip  TEXT NOT NULL DEFAULT '',
-		nat_type    TEXT NOT NULL DEFAULT '',
-		endpoint    TEXT NOT NULL DEFAULT '',
-		last_seen   INTEGER NOT NULL DEFAULT 0,
-		app_version TEXT NOT NULL DEFAULT '',
+			virtual_ip  TEXT NOT NULL DEFAULT '',
+			nat_type    TEXT NOT NULL DEFAULT '',
+			endpoint    TEXT NOT NULL DEFAULT '',
+			relay_rtt_ms INTEGER,
+			last_seen   INTEGER NOT NULL DEFAULT 0,
+			app_version TEXT NOT NULL DEFAULT '',
 		online      INTEGER NOT NULL DEFAULT 0,
 		created_at  INTEGER NOT NULL
 	);
@@ -173,6 +174,7 @@ func migrate(db *sql.DB) error {
 
 	_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN ed25519_public_key TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE devices ADD COLUMN relay_rtt_ms INTEGER`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidate_sources TEXT NOT NULL DEFAULT '{}'`)
 	_, _ = db.Exec(`ALTER TABLE signals ADD COLUMN candidate_generation INTEGER NOT NULL DEFAULT 0`)
@@ -567,14 +569,16 @@ func (db *DB) DeviceAccessibleByUser(deviceID, userID string) (bool, error) {
 func (db *DB) GetDevice(deviceID string) (*Device, error) {
 	var d Device
 	var online int
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, '')
+	var relayRTTMS sql.NullInt64
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, '')
 		FROM devices WHERE id = ?`, deviceID).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey)
 	if err != nil {
 		return nil, err
 	}
 	d.Online = online == 1
+	d.RelayRTTMS = nullInt64Ptr(relayRTTMS)
 	return &d, nil
 }
 
@@ -615,11 +619,20 @@ type Device struct {
 	VirtualIP        string `json:"virtual_ip"`
 	NATType          string `json:"nat_type"`
 	Endpoint         string `json:"endpoint"`
+	RelayRTTMS       *int64 `json:"relay_rtt_ms,omitempty"`
 	LastSeen         int64  `json:"last_seen"`
 	AppVersion       string `json:"app_version"`
 	Online           bool   `json:"online"`
 	Ed25519PublicKey string `json:"ed25519_public_key,omitempty"`
 	CreatedAt        int64  `json:"created_at"`
+}
+
+func nullInt64Ptr(value sql.NullInt64) *int64 {
+	if !value.Valid {
+		return nil
+	}
+	result := value.Int64
+	return &result
 }
 
 // CreateDevice inserts a new device and assigns a virtual IP.
@@ -637,10 +650,11 @@ func (db *DB) CreateDeviceWithOptions(userID, networkID, publicKey, deviceName, 
 
 	var existing Device
 	var online int
-	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, COALESCE(app_version, ''), online, created_at
+	var existingRelayRTTMS sql.NullInt64
+	err = tx.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at
 		FROM devices WHERE public_key = ? LIMIT 1`, publicKey).
 		Scan(&existing.ID, &existing.UserID, &existing.NetworkID, &existing.PublicKey, &existing.DeviceName, &existing.Platform,
-			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt)
+			&existing.VirtualIP, &existing.NATType, &existing.Endpoint, &existingRelayRTTMS, &existing.LastSeen, &existing.AppVersion, &online, &existing.CreatedAt)
 	if err == nil {
 		if existing.UserID != userID {
 			return nil, fmt.Errorf("public key is already registered by another user")
@@ -673,6 +687,7 @@ func (db *DB) CreateDeviceWithOptions(userID, networkID, publicKey, deviceName, 
 		if appVersion != "" {
 			existing.AppVersion = appVersion
 		}
+		existing.RelayRTTMS = nullInt64Ptr(existingRelayRTTMS)
 		existing.LastSeen = now
 		existing.Online = true
 		return &existing, nil
@@ -715,14 +730,16 @@ func (db *DB) CreateDeviceWithOptions(userID, networkID, publicKey, deviceName, 
 func (db *DB) GetDeviceByPublicKey(networkID, publicKey string) (*Device, error) {
 	var d Device
 	var online int
-	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, '')
+	var relayRTTMS sql.NullInt64
+	err := db.QueryRow(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at, COALESCE(ed25519_public_key, '')
 		FROM devices WHERE network_id = ? AND public_key = ? LIMIT 1`, networkID, publicKey).
 		Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey)
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt, &d.Ed25519PublicKey)
 	if err != nil {
 		return nil, err
 	}
 	d.Online = online == 1
+	d.RelayRTTMS = nullInt64Ptr(relayRTTMS)
 	return &d, nil
 }
 
@@ -841,7 +858,7 @@ const DeviceOnlineTTL = 90
 func (db *DB) ListDevicesByNetwork(networkID string) ([]Device, error) {
 	now := time.Now().Unix()
 
-	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, last_seen, COALESCE(app_version, ''), online, created_at
+	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at
 		FROM devices WHERE network_id = ?`, networkID)
 	if err != nil {
 		return nil, err
@@ -852,10 +869,12 @@ func (db *DB) ListDevicesByNetwork(networkID string) ([]Device, error) {
 	for rows.Next() {
 		var d Device
 		var online int
+		var relayRTTMS sql.NullInt64
 		if err := rows.Scan(&d.ID, &d.UserID, &d.NetworkID, &d.PublicKey, &d.DeviceName, &d.Platform,
-			&d.VirtualIP, &d.NATType, &d.Endpoint, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt); err != nil {
+			&d.VirtualIP, &d.NATType, &d.Endpoint, &relayRTTMS, &d.LastSeen, &d.AppVersion, &online, &d.CreatedAt); err != nil {
 			return nil, err
 		}
+		d.RelayRTTMS = nullInt64Ptr(relayRTTMS)
 		// Lease semantics: last_seen older than TTL or never seen (0) => offline.
 		if online == 1 && d.LastSeen > 0 && now-d.LastSeen <= DeviceOnlineTTL {
 			d.Online = true
@@ -875,9 +894,9 @@ func (db *DB) MarkStaleDevicesOffline(ttlSeconds int64) error {
 }
 
 // UpdateDeviceEndpoint updates a device's endpoint and NAT type.
-func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string) error {
-	_, err := db.Exec(`UPDATE devices SET endpoint = ?, nat_type = ?, last_seen = ?, online = 1 WHERE id = ?`,
-		endpoint, natType, time.Now().Unix(), deviceID)
+func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string, relayRTTMS *int64) error {
+	_, err := db.Exec(`UPDATE devices SET endpoint = ?, nat_type = ?, relay_rtt_ms = ?, last_seen = ?, online = 1 WHERE id = ?`,
+		endpoint, natType, relayRTTMS, time.Now().Unix(), deviceID)
 	return err
 }
 

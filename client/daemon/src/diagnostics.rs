@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -26,6 +26,7 @@ const IPV6_SAFE_MIN_MTU: u32 = 1280;
 const RELAY_SAFE_MTU: u32 = 1380;
 const WIREGUARD_STYLE_MTU: u32 = 1420;
 const COMMON_ETHERNET_MTU: u32 = 1500;
+const DIAGNOSTICS_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Static protocol boundary advertised by diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +262,47 @@ pub async fn run_diagnostics_server(
     info!("Diagnostics endpoint listening at http://{local_addr}/status");
 
     serve_diagnostics(listener, context, shutdown_rx).await
+}
+
+/// Run the diagnostics endpoint, retrying transient bind failures.
+///
+/// During app-driven restarts the replacement daemon can start before the old
+/// process has released the loopback diagnostics port. A single bind failure
+/// should not leave the new daemon permanently invisible to the UI.
+pub async fn run_diagnostics_server_with_retry(
+    bind: String,
+    context: DiagnosticsContext,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut attempt = 0usize;
+    loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        match run_diagnostics_server(bind.clone(), context.clone(), shutdown_rx.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+                warn!(
+                    "Diagnostics endpoint start failed on {bind} (attempt {attempt}); retrying in {} ms: {err}",
+                    DIAGNOSTICS_BIND_RETRY_INTERVAL.as_millis()
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = sleep(DIAGNOSTICS_BIND_RETRY_INTERVAL) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 async fn serve_diagnostics(
@@ -517,6 +559,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         peers.record_direct_failure("node-b", "probe timeout").await;

@@ -58,7 +58,12 @@ const MAPPING_LIFETIME_PROBE_DELAY: Duration = Duration::from_millis(250);
 const HAIRPIN_PROBE_PREFIX: &[u8] = b"P2WLAN_HAIRPIN_V1";
 
 /// Maximum bounded predicted server-reflexive candidates to advertise.
-const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 4;
+///
+/// Linear symmetric NATs often advance by one or two ports per outbound
+/// destination, but TURN/ICE checks can consume several mappings before the
+/// peer-reflexive path is nominated. Keep this window small enough for
+/// signaling, while covering the short linear run WebRTC-style ICE relies on.
+const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 12;
 
 /// Configuration for ICE candidate gathering.
 #[derive(Debug, Clone)]
@@ -975,7 +980,27 @@ fn stable_port_delta(mapped: &[SocketAddr]) -> Option<i32> {
         .map(|pair| pair[1].port() as i32 - pair[0].port() as i32)
         .collect::<Vec<_>>();
     let first = deltas[0];
-    deltas.iter().all(|delta| *delta == first).then_some(first)
+    if deltas.iter().all(|delta| *delta == first) {
+        return Some(first);
+    }
+
+    // WebRTC/UU classifies this case as linear symmetric even when one STUN
+    // query slips between two adjacent allocations. Treat a same-direction,
+    // tiny-delta run as predictable and use the median step.
+    if deltas
+        .iter()
+        .all(|delta| *delta != 0 && (-8..=8).contains(delta))
+    {
+        let positive = deltas.iter().all(|delta| *delta > 0);
+        let negative = deltas.iter().all(|delta| *delta < 0);
+        if positive || negative {
+            let mut sorted = deltas;
+            sorted.sort_unstable();
+            return sorted.get(sorted.len() / 2).copied();
+        }
+    }
+
+    None
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -1302,15 +1327,56 @@ mod tests {
         assert!(profile.prediction_candidate);
         assert_eq!(
             profile.predicted_endpoints,
-            vec![
-                "203.0.113.10:40007".to_string(),
-                "203.0.113.10:40009".to_string(),
-                "203.0.113.10:40011".to_string(),
-                "203.0.113.10:40013".to_string(),
-            ]
+            (1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES)
+                .map(|step| format!("203.0.113.10:{}", 40005 + 2 * step))
+                .collect::<Vec<_>>()
         );
         assert!(profile.birthday_candidate);
         assert_eq!(profile.confidence, 90);
+    }
+
+    #[test]
+    fn test_build_nat_profile_detects_jittered_linear_symmetric_mapping() {
+        let profile = build_nat_profile(
+            "192.168.1.2:5000".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:32794".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:32796".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:32797".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-d.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:32798".to_string()),
+                    rtt_ms: Some(13),
+                    error: None,
+                },
+            ],
+        );
+
+        assert_eq!(profile.port_delta, Some(1));
+        assert!(profile.prediction_candidate);
+        assert_eq!(
+            profile.predicted_endpoints.first().map(String::as_str),
+            Some("203.0.113.10:32799")
+        );
+        assert_eq!(
+            profile.predicted_endpoints.last().map(String::as_str),
+            Some("203.0.113.10:32810")
+        );
     }
 
     #[test]

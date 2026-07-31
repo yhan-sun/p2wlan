@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,6 +71,7 @@ var (
 
 type RelayConfig struct {
 	Bind              string
+	UDPObserverBind   string
 	SendQueueCapacity int
 	RegisterTimeout   time.Duration
 	IdleTimeout       time.Duration
@@ -190,6 +192,7 @@ func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayl
 type RelayServer struct {
 	config            *RelayConfig
 	listener          net.Listener
+	udpObserverConn   *net.UDPConn
 	hub               *hub
 	activeConnections int64
 	stats             relayStats
@@ -220,6 +223,8 @@ type relayStats struct {
 	acceptedConnectionsTotal        uint64
 	rejectedConnectionsTotal        uint64
 	frameErrorsTotal                uint64
+	udpObserverRequestsTotal        uint64
+	udpObserverErrorsTotal          uint64
 	authFailuresTotal               uint64
 	authRateLimitedTotal            uint64
 	legacyRegistrationsTotal        uint64
@@ -236,6 +241,8 @@ type RelayStatsSnapshot struct {
 	AcceptedConnectionsTotal        uint64                      `json:"accepted_connections_total"`
 	RejectedConnectionsTotal        uint64                      `json:"rejected_connections_total"`
 	FrameErrorsTotal                uint64                      `json:"frame_errors_total"`
+	UDPObserverRequestsTotal        uint64                      `json:"udp_observer_requests_total"`
+	UDPObserverErrorsTotal          uint64                      `json:"udp_observer_errors_total"`
 	AuthFailuresTotal               uint64                      `json:"auth_failures_total"`
 	AuthRateLimitedTotal            uint64                      `json:"auth_rate_limited_total"`
 	LegacyRegistrationsTotal        uint64                      `json:"legacy_registrations_total"`
@@ -325,9 +332,25 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		log.Printf("WARNING: plaintext mode enabled on %s (development only)", config.Bind)
 	}
 
+	var udpObserverConn *net.UDPConn
+	if strings.TrimSpace(config.UDPObserverBind) != "" {
+		udpAddr, err := net.ResolveUDPAddr("udp", config.UDPObserverBind)
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("invalid UDP observer bind %q: %w", config.UDPObserverBind, err)
+		}
+		udpObserverConn, err = net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("failed to listen for UDP observer on %s: %w", config.UDPObserverBind, err)
+		}
+		log.Printf("UDP observer enabled on %s", udpObserverConn.LocalAddr())
+	}
+
 	server := &RelayServer{
 		config:            config,
 		listener:          listener,
+		udpObserverConn:   udpObserverConn,
 		hub:               newHub(),
 		shutdownChan:      make(chan struct{}),
 		connections:       make(map[net.Conn]struct{}),
@@ -776,6 +799,13 @@ func (s *RelayServer) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
+func (s *RelayServer) UDPObserverAddr() net.Addr {
+	if s == nil || s.udpObserverConn == nil {
+		return nil
+	}
+	return s.udpObserverConn.LocalAddr()
+}
+
 func (s *RelayServer) Stats() RelayStatsSnapshot {
 	if s == nil {
 		return RelayStatsSnapshot{}
@@ -790,6 +820,8 @@ func (s *RelayServer) Stats() RelayStatsSnapshot {
 		AcceptedConnectionsTotal:        atomic.LoadUint64(&s.stats.acceptedConnectionsTotal),
 		RejectedConnectionsTotal:        atomic.LoadUint64(&s.stats.rejectedConnectionsTotal),
 		FrameErrorsTotal:                atomic.LoadUint64(&s.stats.frameErrorsTotal),
+		UDPObserverRequestsTotal:        atomic.LoadUint64(&s.stats.udpObserverRequestsTotal),
+		UDPObserverErrorsTotal:          atomic.LoadUint64(&s.stats.udpObserverErrorsTotal),
 		AuthFailuresTotal:               atomic.LoadUint64(&s.stats.authFailuresTotal),
 		AuthRateLimitedTotal:            atomic.LoadUint64(&s.stats.authRateLimitedTotal),
 		LegacyRegistrationsTotal:        atomic.LoadUint64(&s.stats.legacyRegistrationsTotal),
@@ -803,6 +835,11 @@ func (s *RelayServer) Stats() RelayStatsSnapshot {
 }
 
 func (s *RelayServer) Serve() {
+	if s.udpObserverConn != nil {
+		s.wg.Add(1)
+		go s.serveUDPObserver()
+	}
+
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -852,6 +889,107 @@ func (s *RelayServer) Serve() {
 	}
 }
 
+const (
+	stunBindingRequest  uint16 = 0x0001
+	stunBindingResponse uint16 = 0x0101
+	stunXorMappedAddr   uint16 = 0x0020
+	stunMagicCookie     uint32 = 0x2112A442
+	stunHeaderLen              = 20
+)
+
+func (s *RelayServer) serveUDPObserver() {
+	defer s.wg.Done()
+
+	buf := make([]byte, 1500)
+	for {
+		n, addr, err := s.udpObserverConn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-s.shutdownChan:
+				return
+			default:
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
+				continue
+			}
+		}
+
+		response, ok := buildUDPObserverSTUNResponse(buf[:n], addr)
+		if !ok {
+			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
+			continue
+		}
+		if _, err := s.udpObserverConn.WriteToUDP(response, addr); err != nil {
+			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
+			continue
+		}
+		atomic.AddUint64(&s.stats.udpObserverRequestsTotal, 1)
+	}
+}
+
+func buildUDPObserverSTUNResponse(request []byte, clientAddr *net.UDPAddr) ([]byte, bool) {
+	if len(request) < stunHeaderLen || clientAddr == nil || clientAddr.IP == nil {
+		return nil, false
+	}
+	if binary.BigEndian.Uint16(request[0:2]) != stunBindingRequest {
+		return nil, false
+	}
+	if binary.BigEndian.Uint32(request[4:8]) != stunMagicCookie {
+		return nil, false
+	}
+
+	transactionID := request[8:20]
+	value, ok := xorMappedAddressValue(clientAddr, transactionID)
+	if !ok {
+		return nil, false
+	}
+
+	attrs := make([]byte, 4+len(value))
+	binary.BigEndian.PutUint16(attrs[0:2], stunXorMappedAddr)
+	binary.BigEndian.PutUint16(attrs[2:4], uint16(len(value)))
+	copy(attrs[4:], value)
+
+	response := make([]byte, stunHeaderLen+len(attrs))
+	binary.BigEndian.PutUint16(response[0:2], stunBindingResponse)
+	binary.BigEndian.PutUint16(response[2:4], uint16(len(attrs)))
+	binary.BigEndian.PutUint32(response[4:8], stunMagicCookie)
+	copy(response[8:20], transactionID)
+	copy(response[20:], attrs)
+	return response, true
+}
+
+func xorMappedAddressValue(clientAddr *net.UDPAddr, transactionID []byte) ([]byte, bool) {
+	xorPort := uint16(clientAddr.Port) ^ uint16(stunMagicCookie>>16)
+	if ip4 := clientAddr.IP.To4(); ip4 != nil {
+		value := make([]byte, 8)
+		value[1] = 0x01
+		binary.BigEndian.PutUint16(value[2:4], xorPort)
+		cookie := make([]byte, 4)
+		binary.BigEndian.PutUint32(cookie, stunMagicCookie)
+		for i := 0; i < 4; i++ {
+			value[4+i] = ip4[i] ^ cookie[i]
+		}
+		return value, true
+	}
+
+	ip16 := clientAddr.IP.To16()
+	if ip16 == nil || len(transactionID) != 12 {
+		return nil, false
+	}
+	value := make([]byte, 20)
+	value[1] = 0x02
+	binary.BigEndian.PutUint16(value[2:4], xorPort)
+	cookieAndTransaction := make([]byte, 16)
+	binary.BigEndian.PutUint32(cookieAndTransaction[0:4], stunMagicCookie)
+	copy(cookieAndTransaction[4:], transactionID)
+	for i := 0; i < 16; i++ {
+		value[4+i] = ip16[i] ^ cookieAndTransaction[i]
+	}
+	return value, true
+}
+
 func (s *RelayServer) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
@@ -859,6 +997,9 @@ func (s *RelayServer) Close() error {
 		s.closing = true
 		close(s.shutdownChan)
 		err = s.listener.Close()
+		if s.udpObserverConn != nil {
+			_ = s.udpObserverConn.Close()
+		}
 
 		for c := range s.connections {
 			_ = c.Close()
@@ -881,7 +1022,11 @@ func main() {
 		log.Fatalf("listen error: %v", err)
 	}
 
-	log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", server.Addr(), config.MaxConnections, config.MaxFramePayload)
+	if observerAddr := server.UDPObserverAddr(); observerAddr != nil {
+		log.Printf("p2wlan relay listening on %s; UDP observer on %s (limits: connections=%d, payload=%d)", server.Addr(), observerAddr, config.MaxConnections, config.MaxFramePayload)
+	} else {
+		log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", server.Addr(), config.MaxConnections, config.MaxFramePayload)
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -961,6 +1106,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	}
 
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
+	udpObserverBind := fs.String("udp-observer-bind", getenv("RELAY_UDP_OBSERVER_BIND", ""), "Optional UDP observer/STUN bind address")
 	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
 	registerTimeout := fs.Duration("register-timeout", envRegisterTimeout, "Register timeout")
 	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
@@ -989,6 +1135,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 
 	config := &RelayConfig{
 		Bind:                       *bind,
+		UDPObserverBind:            strings.TrimSpace(*udpObserverBind),
 		SendQueueCapacity:          *sendQueue,
 		RegisterTimeout:            *registerTimeout,
 		IdleTimeout:                *idleTimeout,

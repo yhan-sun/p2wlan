@@ -546,7 +546,7 @@ class PeerSnapshot {
   }
 
   String? get lastError {
-    return warning ?? direct.lastError ?? relay.lastError;
+    return warning ?? direct.visibleLastError ?? relay.visibleLastError;
   }
 }
 
@@ -556,6 +556,7 @@ class PathHealthSnapshot {
     required this.lastFailureAgeMs,
     required this.consecutiveFailures,
     required this.lastError,
+    required this.lastErrorCode,
     required this.latencyMs,
     required this.rttEwmaMs,
   });
@@ -564,10 +565,16 @@ class PathHealthSnapshot {
   final int? lastFailureAgeMs;
   final int consecutiveFailures;
   final String? lastError;
+  final String? lastErrorCode;
   final int? latencyMs;
   final int? rttEwmaMs;
 
   int? get displayLatencyMs => rttEwmaMs ?? latencyMs;
+
+  String? get visibleLastError {
+    if (_isNetworkGenerationRefresh(lastErrorCode, lastError)) return null;
+    return lastError;
+  }
 
   factory PathHealthSnapshot.fromJson(JsonMap json) {
     return PathHealthSnapshot(
@@ -575,10 +582,20 @@ class PathHealthSnapshot {
       lastFailureAgeMs: _intOrNull(json['last_failure_age_ms']),
       consecutiveFailures: _int(json['consecutive_failures']),
       lastError: _nullableString(json['last_error']),
+      lastErrorCode: _nullableString(json['last_error_code']),
       latencyMs: _intOrNull(json['latency_ms']),
       rttEwmaMs: _intOrNull(json['rtt_ewma_ms']),
     );
   }
+}
+
+bool _isNetworkGenerationRefresh(String? code, String? reason) {
+  const networkGenerationChanged = 'network_generation_changed';
+  final normalizedCode = code?.trim();
+  final normalizedReason = reason?.trim();
+  return normalizedCode == networkGenerationChanged ||
+      normalizedReason == networkGenerationChanged ||
+      normalizedReason?.startsWith('$networkGenerationChanged:') == true;
 }
 
 class PathSelectionSnapshot {

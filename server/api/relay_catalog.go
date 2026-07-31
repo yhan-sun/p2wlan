@@ -17,9 +17,11 @@ import (
 
 // RelayDescriptor describes a single relay server.
 type RelayDescriptor struct {
-	Region   string `json:"region"`
-	Audience string `json:"audience"`
-	Endpoint string `json:"endpoint"`
+	Region               string   `json:"region"`
+	Audience             string   `json:"audience"`
+	Endpoint             string   `json:"endpoint"`
+	UDPObserverEndpoint  string   `json:"udp_observer_endpoint,omitempty"`
+	UDPObserverEndpoints []string `json:"udp_observer_endpoints,omitempty"`
 }
 
 // RelayCatalog is a collection of relay descriptors keyed by audience.
@@ -61,6 +63,29 @@ func (d *RelayDescriptor) Validate() error {
 		}
 	}
 
+	if err := validateUDPObserverEndpoint("udp_observer_endpoint", d.UDPObserverEndpoint); err != nil {
+		return err
+	}
+	for i, observer := range d.UDPObserverEndpoints {
+		if err := validateUDPObserverEndpoint(fmt.Sprintf("udp_observer_endpoints[%d]", i), observer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateUDPObserverEndpoint(field string, endpoint string) error {
+	observer := strings.TrimSpace(endpoint)
+	if observer == "" {
+		return nil
+	}
+	if strings.HasPrefix(observer, "udp://") {
+		observer = strings.TrimPrefix(observer, "udp://")
+	}
+	if _, _, err := net.SplitHostPort(observer); err != nil {
+		return fmt.Errorf("relay descriptor %s %q: invalid host:port: %w", field, endpoint, err)
+	}
 	return nil
 }
 
@@ -71,6 +96,22 @@ func (d *RelayDescriptor) NormalizeEndpoint() {
 	if !strings.HasPrefix(ep, "tls://") && !strings.HasPrefix(ep, "tcp://") {
 		d.Endpoint = "tcp://" + ep
 	}
+	observer := strings.TrimSpace(d.UDPObserverEndpoint)
+	if strings.HasPrefix(observer, "udp://") {
+		observer = strings.TrimPrefix(observer, "udp://")
+	}
+	d.UDPObserverEndpoint = observer
+	normalized := make([]string, 0, len(d.UDPObserverEndpoints))
+	for _, observer := range d.UDPObserverEndpoints {
+		observer = strings.TrimSpace(observer)
+		if strings.HasPrefix(observer, "udp://") {
+			observer = strings.TrimPrefix(observer, "udp://")
+		}
+		if observer != "" {
+			normalized = append(normalized, observer)
+		}
+	}
+	d.UDPObserverEndpoints = normalized
 }
 
 // Scheme returns "tls" or "tcp".

@@ -522,7 +522,7 @@ func TestDeviceOnlineTTL(t *testing.T) {
 	}
 
 	// Now touch endpoint to refresh last_seen and online.
-	if err := db.UpdateDeviceEndpoint(dev.ID, "127.0.0.1:51820", "FullCone"); err != nil {
+	if err := db.UpdateDeviceEndpoint(dev.ID, "127.0.0.1:51820", "FullCone", nil); err != nil {
 		t.Fatalf("UpdateDeviceEndpoint failed: %v", err)
 	}
 	devices, err = db.ListDevicesByNetwork("default")
@@ -537,7 +537,7 @@ func TestDeviceOnlineTTL(t *testing.T) {
 
 	// Empty endpoint is a valid lease heartbeat when the client has no public
 	// UDP endpoint to advertise.
-	if err := db.UpdateDeviceEndpoint(dev.ID, "", "unknown"); err != nil {
+	if err := db.UpdateDeviceEndpoint(dev.ID, "", "unknown", nil); err != nil {
 		t.Fatalf("UpdateDeviceEndpoint empty heartbeat failed: %v", err)
 	}
 	refreshed, err := db.GetDevice(dev.ID)

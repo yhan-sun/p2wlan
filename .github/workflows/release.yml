@@ -114,8 +114,10 @@ jobs:
         include:
           - arch: arm64
             lipo_arch: arm64
+            rust_target: aarch64-apple-darwin
           - arch: x64
             lipo_arch: x86_64
+            rust_target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +126,11 @@ jobs:
         with:
           channel: stable
           cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Enable macOS desktop
         working-directory: apps/flutter_client
@@ -140,6 +147,9 @@ jobs:
           --release
           --split-debug-info build/symbols/macos
 
+      - name: Build macOS daemon for ${{ matrix.arch }}
+        run: cargo build -p p2wlan-daemon --release --target ${{ matrix.rust_target }}
+
       - name: Create architecture-specific DMG
         run: |
           set -euo pipefail
@@ -151,6 +161,9 @@ jobs:
           mkdir -p "$work"
           ditto "$src" "$app"
           ln -s /Applications "$work/Applications"
+          install -m 0755 \
+            "target/${{ matrix.rust_target }}/release/p2wlan-daemon" \
+            "$app/Contents/Resources/p2wlan-daemon"
           for binary in \
             "$app/Contents/MacOS/P2WLAN" \
             "$app/Contents/Frameworks/App.framework/Versions/A/App" \

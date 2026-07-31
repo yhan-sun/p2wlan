@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
+use crate::relay::RelaySelectionDiagnostics;
 use futures_util::{SinkExt, StreamExt};
 use p2pnet_crypto::Ed25519KeyPair;
 use rand::Rng;
@@ -213,6 +214,9 @@ pub struct PeerInfo {
     pub online: bool,
     /// Last seen timestamp.
     pub last_seen: u64,
+    /// Peer-reported RTT to its selected relay server, in milliseconds.
+    #[serde(default)]
+    pub relay_rtt_ms: Option<u64>,
 }
 
 // ============================================================
@@ -317,6 +321,10 @@ pub struct RelayCatalogEntry {
     pub region: String,
     pub audience: String,
     pub endpoint: String,
+    #[serde(default)]
+    pub udp_observer_endpoint: Option<String>,
+    #[serde(default)]
+    pub udp_observer_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +337,11 @@ struct RegisterDeviceResponse {
     relay_servers: Vec<String>,
     #[serde(default)]
     relay_catalog: Vec<RelayCatalogEntry>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlErrorResponse {
     error: Option<String>,
 }
 
@@ -355,6 +368,8 @@ struct DeviceResponse {
     online: bool,
     #[serde(default)]
     last_seen: u64,
+    #[serde(default)]
+    relay_rtt_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,6 +524,7 @@ impl ControlClient {
         config: &Config,
         enabled: bool,
         config_path: Option<PathBuf>,
+        relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -531,7 +547,15 @@ impl ControlClient {
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
             tokio::spawn(async move {
-                run_control_loop(config, &event_tx, state, &mut cmd_rx, cfg_path).await;
+                run_control_loop(
+                    config,
+                    &event_tx,
+                    state,
+                    &mut cmd_rx,
+                    cfg_path,
+                    relay_selection,
+                )
+                .await;
             });
         }
 
@@ -884,6 +908,7 @@ impl ControlClient {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
+                    relay_rtt_ms: None,
                 };
 
                 self.state
@@ -1317,12 +1342,24 @@ fn is_permanent_auth_error(err: &str) -> bool {
         || err.contains("permanent auth")
 }
 
+async fn current_relay_rtt_ms(
+    relay_selection: Option<&Arc<RwLock<RelaySelectionDiagnostics>>>,
+) -> Option<u64> {
+    let relay_selection = relay_selection?;
+    let diagnostics = relay_selection.read().await;
+    diagnostics
+        .selected_rtt_ewma_ms
+        .or(diagnostics.selected_last_pong_rtt_ms)
+        .or(diagnostics.selected_connect_latency_ms)
+}
+
 async fn run_control_loop(
     mut config: Config,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     state: Arc<RwLock<ClientState>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
     config_path: Option<PathBuf>,
+    relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
 ) {
     let http = reqwest::Client::new();
     let base_url = normalize_http_base_url(&config.control.server_url);
@@ -1358,6 +1395,24 @@ async fn run_control_loop(
                         if !server_relay_servers.is_empty() {
                             config.relay.servers = server_relay_servers.clone();
                         }
+                        let mut config_changed = false;
+                        if !config.network.manual {
+                            if config.network.virtual_ip != virtual_ip {
+                                config.network.virtual_ip = virtual_ip.clone();
+                                config_changed = true;
+                            }
+                            if config.network.cidr != cidr {
+                                config.network.cidr = cidr.clone();
+                                config_changed = true;
+                            }
+                        }
+                        if config_changed {
+                            if let Some(ref path) = config_path {
+                                if let Err(e) = config.save_to_file(path) {
+                                    warn!("Failed to save control-assigned network config: {e}");
+                                }
+                            }
+                        }
                         let relay_servers = if server_relay_servers.is_empty() {
                             config.relay.servers.clone()
                         } else {
@@ -1367,7 +1422,7 @@ async fn run_control_loop(
                         let _ = event_tx.send(ControlEvent::Registered {
                             node_id: Some(node_id.clone()),
                             virtual_ip: virtual_ip.clone(),
-                            cidr: Some(cidr),
+                            cidr: Some(cidr.clone()),
                             relay_servers,
                             relay_catalog,
                         });
@@ -1530,6 +1585,7 @@ async fn run_control_loop(
         loop {
             tokio::select! {
                 _ = peer_tick.tick() => {
+                    let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
                     if let Err(err) = update_endpoint(
                         &http,
                         &base_url,
@@ -1537,6 +1593,7 @@ async fn run_control_loop(
                         &self_node_id,
                         &advertised_endpoint,
                         &advertised_nat_type,
+                        relay_rtt_ms,
                     )
                     .await
                     {
@@ -1683,7 +1740,17 @@ async fn run_control_loop(
                             }
                         }
                         ControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
-                            let res = update_endpoint(&http, &base_url, &token, &self_node_id, &endpoint, &nat_type).await;
+                            let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
+                            let res = update_endpoint(
+                                &http,
+                                &base_url,
+                                &token,
+                                &self_node_id,
+                                &endpoint,
+                                &nat_type,
+                                relay_rtt_ms,
+                            )
+                            .await;
                             match &res {
                                 Ok(()) => {
                                     advertised_endpoint = endpoint;
@@ -1966,23 +2033,16 @@ async fn register_device(
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .bearer_auth(token)
-        .json(&serde_json::json!({
-            "public_key": config.node.public_key,
-            "ed25519_public_key": config.node.ed25519_public_key,
-            "device_name": config.node.device_name,
-            "platform": config.node.platform,
-            "virtual_ip": config.network.virtual_ip,
-            "app_version": env!("CARGO_PKG_VERSION"),
-            "network_id": config.network.network_id,
-        }))
+        .json(&register_device_payload(config))
         .send()
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("register request failed: {e}")))?;
 
     if !res.status().is_success() {
+        let status = res.status();
+        let detail = control_error_detail(res).await;
         return Err(DaemonError::ControlPlane(format!(
-            "register request returned HTTP {}",
-            res.status()
+            "register request returned HTTP {status}: {detail}"
         )));
     }
 
@@ -2015,6 +2075,38 @@ async fn register_device(
     ))
 }
 
+fn register_device_payload(config: &Config) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "public_key": config.node.public_key,
+        "ed25519_public_key": config.node.ed25519_public_key,
+        "device_name": config.node.device_name,
+        "platform": config.node.platform,
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "network_id": config.network.network_id,
+    });
+
+    if config.network.manual {
+        let virtual_ip = config.network.virtual_ip.trim();
+        if !virtual_ip.is_empty() {
+            payload["virtual_ip"] = serde_json::Value::String(virtual_ip.to_string());
+        }
+    }
+
+    payload
+}
+
+async fn control_error_detail(res: reqwest::Response) -> String {
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if text.trim().is_empty() {
+        return status.to_string();
+    }
+    match serde_json::from_str::<ControlErrorResponse>(&text) {
+        Ok(body) => body.error.unwrap_or(text),
+        Err(_) => text,
+    }
+}
+
 async fn update_endpoint(
     http: &reqwest::Client,
     base_url: &str,
@@ -2022,6 +2114,7 @@ async fn update_endpoint(
     device_id: &str,
     endpoint: &str,
     nat_type: &str,
+    relay_rtt_ms: Option<u64>,
 ) -> Result<()> {
     let res = http
         .patch(format!("{base_url}/api/v1/devices/{device_id}/endpoint"))
@@ -2029,6 +2122,7 @@ async fn update_endpoint(
         .json(&serde_json::json!({
             "endpoint": endpoint,
             "nat_type": nat_type,
+            "relay_rtt_ms": relay_rtt_ms,
         }))
         .send()
         .await
@@ -2446,6 +2540,7 @@ async fn poll_peers(
                 virtual_ip: node.virtual_ip,
                 online: node.online,
                 last_seen: node.last_seen,
+                relay_rtt_ms: node.relay_rtt_ms,
             };
 
             seen.insert(peer.node_id.clone(), peer.clone());
@@ -2488,6 +2583,7 @@ fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
         || known.nat_type != peer.nat_type
         || known.virtual_ip != peer.virtual_ip
         || known.online != peer.online
+        || known.relay_rtt_ms != peer.relay_rtt_ms
 }
 
 async fn create_tunnel(
@@ -2552,6 +2648,30 @@ mod tests {
 
     fn test_config() -> Config {
         Config::generate_default("https://ctrl.test", "net1").unwrap()
+    }
+
+    #[test]
+    fn managed_register_payload_omits_stale_virtual_ip() {
+        let mut config = test_config();
+        config.network.manual = false;
+        config.network.virtual_ip = "10.20.0.1".to_string();
+
+        let payload = register_device_payload(&config);
+
+        assert!(payload.get("virtual_ip").is_none());
+        assert_eq!(payload["network_id"], "net1");
+        assert_eq!(payload["app_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn manual_register_payload_keeps_requested_virtual_ip() {
+        let mut config = test_config();
+        config.network.manual = true;
+        config.network.virtual_ip = "10.20.0.44".to_string();
+
+        let payload = register_device_payload(&config);
+
+        assert_eq!(payload["virtual_ip"], "10.20.0.44");
     }
 
     #[test]
@@ -2733,6 +2853,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 1,
+            relay_rtt_ms: None,
         };
         let mut updated = known.clone();
         updated.endpoint = "203.0.113.10:62000".to_string();
@@ -2933,7 +3054,7 @@ mod tests {
     #[test]
     fn test_control_client_creation() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config, true, None);
+        let (client, _rx) = ControlClient::new(&config, true, None, None);
         // Client created successfully, no events yet
         drop(client);
     }
@@ -2943,7 +3064,7 @@ mod tests {
         let mut config = test_config();
         config.control.auth_token = "test-token".to_string();
         // When disabled, no background control loop is spawned
-        let (client, _rx) = ControlClient::new(&config, false, None);
+        let (client, _rx) = ControlClient::new(&config, false, None, None);
         drop(client);
     }
 
@@ -2966,7 +3087,7 @@ mod tests {
         config.control.auth_token = "test-token".to_string();
         config.control.server_url = "http://127.0.0.1:1".to_string(); // unreachable
 
-        let (client, mut rx) = ControlClient::new(&config, false, None);
+        let (client, mut rx) = ControlClient::new(&config, false, None, None);
 
         // Give any accidental background task a moment to fire events.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2980,7 +3101,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_client_handle_registered() {
         let config = test_config();
-        let (client, mut rx) = ControlClient::new(&config, true, None);
+        let (client, mut rx) = ControlClient::new(&config, true, None, None);
 
         client
             .handle_message(ControlMessage::Registered {
@@ -3011,7 +3132,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_client_handle_peer_join_leave() {
         let config = test_config();
-        let (client, _rx) = ControlClient::new(&config, true, None);
+        let (client, _rx) = ControlClient::new(&config, true, None, None);
 
         client
             .handle_message(ControlMessage::PeerJoin {

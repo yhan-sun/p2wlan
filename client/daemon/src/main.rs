@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long)]
     stun: Option<String>,
 
+    /// Override UDP observer endpoints (comma-separated, STUN-compatible)
+    #[arg(long, name = "udp-observer")]
+    udp_observer: Option<String>,
+
     /// Override STUN timeout (ms)
     #[arg(long, name = "stun-timeout-ms")]
     stun_timeout_ms: Option<u64>,
@@ -223,6 +227,20 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
                 return Err(format!(
                     "Invalid STUN server in --stun (expected host:port or IP:port): {}",
                     s
+                ));
+            }
+        }
+    }
+    if let Some(ref observers) = cli.udp_observer {
+        for observer in observers
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+        {
+            if !is_valid_stun_server_spec(observer) {
+                return Err(format!(
+                    "Invalid UDP observer in --udp-observer (expected host:port or IP:port): {}",
+                    observer
                 ));
             }
         }
@@ -571,6 +589,14 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
             .map(ToString::to_string)
             .collect();
     }
+    if let Some(ref observers) = cli.udp_observer {
+        config.network.udp_observers = observers
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
     if let Some(timeout_ms) = cli.stun_timeout_ms {
         config.network.stun_timeout_ms = timeout_ms;
     }
@@ -651,6 +677,7 @@ mod tests {
             udp_bind: None,
             udp_advertise: None,
             stun: None,
+            udp_observer: None,
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,
@@ -712,6 +739,7 @@ mod tests {
             udp_bind: None,
             udp_advertise: None,
             stun: None,
+            udp_observer: None,
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,
@@ -766,6 +794,7 @@ mod tests {
             udp_bind: None,
             udp_advertise: None,
             stun: None,
+            udp_observer: None,
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,
@@ -842,6 +871,7 @@ mod tests {
         cli.udp_bind = Some("0.0.0.0:51820".to_string());
         cli.udp_advertise = Some("203.0.113.10:51820".to_string());
         cli.stun = Some("stun.l.google.com:19302,stun.example.com:19302".to_string());
+        cli.udp_observer = Some("127.0.0.1:18082".to_string());
         cli.relay = Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string());
         assert!(validate_cli(&cli).is_ok());
 
@@ -849,6 +879,10 @@ mod tests {
         assert!(validate_cli(&cli).is_err());
 
         cli.stun = None;
+        cli.udp_observer = Some("bad-observer".to_string());
+        assert!(validate_cli(&cli).is_err());
+
+        cli.udp_observer = None;
         cli.socket_pool = Some("4".to_string());
         assert!(validate_cli(&cli).is_ok());
         cli.socket_pool = Some("5".to_string());
@@ -882,6 +916,7 @@ mod tests {
             udp_bind: None,
             udp_advertise: None,
             stun: None,
+            udp_observer: None,
             stun_timeout_ms: None,
             punch_interval_ms: None,
             punch_attempts: None,

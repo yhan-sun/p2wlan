@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use p2pnet_tun::{Ipv4Packet, Protocol};
 use p2pnet_wireguard::{MessageTransport, TransportSession};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
@@ -16,6 +18,52 @@ use tracing::{debug, warn};
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
+
+const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
+const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
+const RELAY_VALIDATION_MAX_RTT: Duration = Duration::from_secs(600);
+
+pub(crate) fn build_relay_validation_payload(sent_at_ms: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        RELAY_VALIDATION_PAYLOAD_PREFIX.len() + RELAY_VALIDATION_TIMESTAMP_BYTES,
+    );
+    payload.extend_from_slice(RELAY_VALIDATION_PAYLOAD_PREFIX);
+    payload.extend_from_slice(&sent_at_ms.to_be_bytes());
+    payload
+}
+
+fn relay_validation_rtt(packet: &[u8]) -> Option<Duration> {
+    let ip = Ipv4Packet::new(packet).ok()?;
+    if ip.protocol() != Protocol::Icmp {
+        return None;
+    }
+    let icmp = ip.payload();
+    if icmp.len() < 8 + RELAY_VALIDATION_PAYLOAD_PREFIX.len() + RELAY_VALIDATION_TIMESTAMP_BYTES {
+        return None;
+    }
+    if icmp[0] != 0 || icmp[1] != 0 {
+        return None;
+    }
+    let payload = &icmp[8..];
+    let timestamp = payload
+        .strip_prefix(RELAY_VALIDATION_PAYLOAD_PREFIX)?
+        .get(..RELAY_VALIDATION_TIMESTAMP_BYTES)?;
+    let sent_at_ms = u64::from_be_bytes(timestamp.try_into().ok()?);
+    let now_ms = unix_time_millis();
+    if sent_at_ms > now_ms {
+        return None;
+    }
+    let rtt = Duration::from_millis(now_ms.saturating_sub(sent_at_ms));
+    (rtt <= RELAY_VALIDATION_MAX_RTT).then_some(rtt)
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 /// A WireGuard transport packet addressed to a peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,9 +305,20 @@ impl WireGuardTransport {
                                 inbound.peer_id
                             );
                         } else if let Some(relay_endpoint) = relay_endpoint {
-                            peers
-                                .record_relay_success(&inbound.peer_id, &relay_endpoint, true)
-                                .await;
+                            if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
+                                peers
+                                    .record_relay_success_with_latency(
+                                        &inbound.peer_id,
+                                        &relay_endpoint,
+                                        true,
+                                        rtt,
+                                    )
+                                    .await;
+                            } else {
+                                peers
+                                    .record_relay_success(&inbound.peer_id, &relay_endpoint, true)
+                                    .await;
+                            }
                             debug!(
                                 "Confirmed relay data path through {relay_endpoint} for peer {}",
                                 inbound.peer_id
@@ -521,6 +580,68 @@ mod tests {
         assert_eq!(conn.state, ConnectionState::Relay);
         assert_eq!(conn.active_path(), Some(NetworkPath::Relay));
         assert_eq!(conn.relay_server.as_deref(), Some("tls://relay.test:443"));
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_validation_echo_reply_records_peer_rtt() {
+        let (mut remote_session, local_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.1".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+
+        let payload = build_relay_validation_payload(unix_time_millis().saturating_sub(42));
+        let mut packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x1234,
+            1,
+            &payload,
+        );
+        packet[20] = 0;
+        let wire_bytes = remote_session.encrypt_to_bytes(&packet).unwrap();
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .await
+            }
+        });
+
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: None,
+                local_endpoint: None,
+                relay_endpoint: Some("tls://relay.test:443".to_string()),
+                relay_peer_id: Some("peer-a".to_string()),
+                wire_bytes,
+            })
+            .await
+            .unwrap();
+        assert_eq!(inbound_rx.recv().await.unwrap().peer_id, "peer-a");
+
+        let conn = peers.get_connection("peer-a").await.unwrap();
+        let latency = conn.relay_health.latency_ms.unwrap();
+        assert!(latency >= 42);
+        assert!(latency < 1_000);
+        assert_eq!(conn.relay_health.rtt_ewma_ms, Some(latency));
 
         drop(encrypted_tx);
         worker.await.unwrap().unwrap();

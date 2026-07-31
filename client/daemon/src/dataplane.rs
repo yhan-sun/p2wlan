@@ -606,6 +606,7 @@ mod tests {
             virtual_ip: virtual_ip.to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         }
     }
 
