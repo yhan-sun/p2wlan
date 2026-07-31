@@ -18,6 +18,13 @@ class AuthSession {
   final Map<String, dynamic>? user;
 }
 
+class DeviceUpdateResult {
+  const DeviceUpdateResult({required this.deviceName, required this.virtualIp});
+
+  final String deviceName;
+  final String virtualIp;
+}
+
 class ControlApi {
   ControlApi({HttpClient? client}) : _client = client ?? HttpClient();
 
@@ -64,12 +71,39 @@ class ControlApi {
     required String deviceId,
     required String deviceName,
   }) async {
-    final name = deviceName.trim();
-    if (name.isEmpty) {
-      throw const ControlApiException('设备名称不能为空');
+    final result = await updateDevice(
+      controlServer: controlServer,
+      authToken: authToken,
+      deviceId: deviceId,
+      deviceName: deviceName,
+    );
+    return result.deviceName;
+  }
+
+  Future<DeviceUpdateResult> updateDevice({
+    required String controlServer,
+    required String authToken,
+    required String deviceId,
+    String? deviceName,
+    String? virtualIp,
+  }) async {
+    final name = deviceName?.trim() ?? '';
+    final ip = virtualIp?.trim() ?? '';
+    if (name.isEmpty && ip.isEmpty) {
+      throw const ControlApiException('设备名称或虚拟 IP 至少需要填写一项');
     }
-    if (name.runes.length > 128) {
+    if (ip.isNotEmpty &&
+        InternetAddress.tryParse(ip)?.type != InternetAddressType.IPv4) {
+      throw const ControlApiException('虚拟 IP 格式不正确，例如 10.20.0.42');
+    }
+    if (deviceId.trim().isEmpty) {
+      throw const ControlApiException('设备标识不能为空');
+    }
+    if (name.isNotEmpty && name.runes.length > 128) {
       throw const ControlApiException('设备名称不能超过 128 个字符');
+    }
+    if (ip.length > 64) {
+      throw const ControlApiException('虚拟 IP 不能超过 64 个字符');
     }
     if (authToken.trim().isEmpty) {
       throw const ControlApiException('登录状态已失效，请重新登录');
@@ -81,7 +115,10 @@ class ControlApi {
     final body = await _sendJson(
       method: 'PATCH',
       uri: endpoint,
-      payload: {'device_name': name},
+      payload: {
+        if (name.isNotEmpty) 'device_name': name,
+        if (ip.isNotEmpty) 'virtual_ip': ip,
+      },
       authToken: authToken,
       unauthorizedMessage: '登录状态已过期或无权修改该设备，请重新登录后再试',
     );
@@ -90,7 +127,19 @@ class ControlApi {
         _zhAuthError(body['error']?.toString() ?? '设备名称保存失败'),
       );
     }
-    return body['device_name']?.toString() ?? name;
+    final device = body['device'] is Map
+        ? Map<String, dynamic>.from(body['device'] as Map)
+        : const <String, dynamic>{};
+    return DeviceUpdateResult(
+      deviceName:
+          body['device_name']?.toString() ??
+          device['device_name']?.toString() ??
+          name,
+      virtualIp:
+          body['virtual_ip']?.toString() ??
+          device['virtual_ip']?.toString() ??
+          ip,
+    );
   }
 
   Future<void> deleteDevice({

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -298,6 +299,117 @@ func TestUpdateDeviceName(t *testing.T) {
 	}
 	if updated.DeviceName != "studio-mac" {
 		t.Fatalf("expected updated name, got %q", updated.DeviceName)
+	}
+}
+
+func TestCreateDeviceWithOptionsStoresRequestedIPAndVersion(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "p2wlan.db"))
+	if err != nil {
+		t.Fatalf("New database: %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("versioned-device@p2wlan.local", "pwd")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	device, err := db.CreateDeviceWithOptions(
+		user.ID,
+		"default",
+		"versioned-device-pubkey",
+		"studio",
+		"macos",
+		"",
+		"10.20.0.42",
+		"0.1.68",
+	)
+	if err != nil {
+		t.Fatalf("CreateDeviceWithOptions failed: %v", err)
+	}
+	if device.VirtualIP != "10.20.0.42" {
+		t.Fatalf("expected requested IP, got %q", device.VirtualIP)
+	}
+	if device.AppVersion != "0.1.68" {
+		t.Fatalf("expected app version, got %q", device.AppVersion)
+	}
+
+	updated, err := db.CreateDeviceWithOptions(
+		user.ID,
+		"default",
+		"versioned-device-pubkey",
+		"studio-renamed",
+		"macos",
+		"",
+		"10.20.0.43",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("CreateDeviceWithOptions update failed: %v", err)
+	}
+	if updated.ID != device.ID {
+		t.Fatalf("expected existing device update, got %q want %q", updated.ID, device.ID)
+	}
+	if updated.VirtualIP != "10.20.0.43" {
+		t.Fatalf("expected updated requested IP, got %q", updated.VirtualIP)
+	}
+	if updated.AppVersion != "0.1.68" {
+		t.Fatalf("empty app_version should preserve previous value, got %q", updated.AppVersion)
+	}
+}
+
+func TestUpdateDeviceVirtualIPValidatesNetworkPool(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "p2wlan.db"))
+	if err != nil {
+		t.Fatalf("New database: %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("custom-ip@p2wlan.local", "pwd")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	first, err := db.CreateDevice(user.ID, "default", "custom-ip-a", "device-a", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice first failed: %v", err)
+	}
+	second, err := db.CreateDevice(user.ID, "default", "custom-ip-b", "device-b", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice second failed: %v", err)
+	}
+
+	if err := db.UpdateDeviceVirtualIP(first.ID, "10.20.0.50"); err != nil {
+		t.Fatalf("UpdateDeviceVirtualIP valid IP failed: %v", err)
+	}
+	updated, err := db.GetDevice(first.ID)
+	if err != nil {
+		t.Fatalf("GetDevice first failed: %v", err)
+	}
+	if updated.VirtualIP != "10.20.0.50" {
+		t.Fatalf("expected custom virtual IP, got %q", updated.VirtualIP)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		deviceID  string
+		virtualIP string
+		wantError string
+	}{
+		{name: "duplicate", deviceID: second.ID, virtualIP: "10.20.0.50", wantError: "already assigned"},
+		{name: "outside cidr", deviceID: first.ID, virtualIP: "10.30.0.50", wantError: "outside network CIDR"},
+		{name: "network address", deviceID: first.ID, virtualIP: "10.20.0.0", wantError: "network or broadcast"},
+		{name: "broadcast address", deviceID: first.ID, virtualIP: "10.20.255.255", wantError: "network or broadcast"},
+		{name: "not ipv4", deviceID: first.ID, virtualIP: "not-an-ip", wantError: "IPv4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := db.UpdateDeviceVirtualIP(tc.deviceID, tc.virtualIP)
+			if err == nil {
+				t.Fatalf("expected %q to fail", tc.virtualIP)
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantError, err)
+			}
+		})
 	}
 }
 

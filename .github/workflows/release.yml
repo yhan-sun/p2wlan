@@ -150,6 +150,7 @@ jobs:
           rm -rf "$work"
           mkdir -p "$work"
           ditto "$src" "$app"
+          ln -s /Applications "$work/Applications"
           for binary in \
             "$app/Contents/MacOS/P2WLAN" \
             "$app/Contents/Frameworks/App.framework/Versions/A/App" \
@@ -160,7 +161,7 @@ jobs:
           codesign --force --deep --sign - "$app"
           hdiutil create \
             -volname "P2WLAN" \
-            -srcfolder "$app" \
+            -srcfolder "$work" \
             -ov \
             -format UDZO \
             "dist-release/p2wlan-flutter-macos-${{ matrix.arch }}.dmg"

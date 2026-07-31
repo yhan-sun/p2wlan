@@ -63,6 +63,7 @@ class AppSettings {
     this.controlServer = defaultControlServer,
     this.authToken = '',
     this.networkId = defaultNetworkId,
+    this.virtualIp = '',
     this.deviceName = '',
     this.manualMode = false,
     this.overlayCidr = defaultOverlayCidr,
@@ -81,6 +82,7 @@ class AppSettings {
   final String controlServer;
   final String authToken;
   final String networkId;
+  final String virtualIp;
   final String deviceName;
   final bool manualMode;
   final String overlayCidr;
@@ -104,6 +106,7 @@ class AppSettings {
     String? controlServer,
     String? authToken,
     String? networkId,
+    String? virtualIp,
     String? deviceName,
     bool? manualMode,
     String? overlayCidr,
@@ -122,6 +125,7 @@ class AppSettings {
       controlServer: controlServer ?? this.controlServer,
       authToken: authToken ?? this.authToken,
       networkId: networkId ?? this.networkId,
+      virtualIp: virtualIp ?? this.virtualIp,
       deviceName: deviceName ?? this.deviceName,
       manualMode: manualMode ?? this.manualMode,
       overlayCidr: overlayCidr ?? this.overlayCidr,
@@ -149,6 +153,7 @@ class AppSettings {
       controlServer: _string(json['controlServer'], defaultControlServer),
       authToken: _string(json['authToken']),
       networkId: _string(json['networkId'], defaultNetworkId),
+      virtualIp: _string(json['virtualIp']),
       deviceName: _string(json['deviceName']),
       manualMode: _bool(json['manualMode']),
       overlayCidr: _string(json['overlayCidr'], defaultOverlayCidr),
@@ -173,6 +178,7 @@ class AppSettings {
     'controlServer': controlServer,
     'authToken': authToken,
     'networkId': networkId,
+    'virtualIp': virtualIp,
     'deviceName': deviceName,
     'manualMode': manualMode,
     'overlayCidr': overlayCidr,
@@ -404,6 +410,7 @@ class PeerSnapshot {
   PeerSnapshot({
     required this.nodeId,
     required this.deviceName,
+    required this.appVersion,
     required this.virtualIp,
     required this.endpoint,
     required this.natType,
@@ -425,6 +432,7 @@ class PeerSnapshot {
 
   final String nodeId;
   final String deviceName;
+  final String appVersion;
   final String virtualIp;
   final String? endpoint;
   final String natType;
@@ -448,6 +456,7 @@ class PeerSnapshot {
     return PeerSnapshot(
       nodeId: _string(json['node_id']),
       deviceName: _string(json['device_name']),
+      appVersion: _string(json['app_version']),
       virtualIp: _string(json['virtual_ip']),
       endpoint: _nullableString(json['endpoint']),
       natType: _string(json['nat_type'], 'unknown'),

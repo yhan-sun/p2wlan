@@ -510,6 +510,7 @@ mod tests {
             .add_peer(&PeerInfo {
                 node_id: "node-b".to_string(),
                 device_name: "Office Mac".to_string(),
+                app_version: String::new(),
                 public_key: "pk".to_string(),
                 endpoint: "127.0.0.1:51820".to_string(),
                 nat_type: "Unknown".to_string(),

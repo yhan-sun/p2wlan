@@ -2125,6 +2125,7 @@ mod tests {
         PeerInfo {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key: "pk".to_string(),
             endpoint: endpoint.map(|addr| addr.to_string()).unwrap_or_default(),
             nat_type: "FullCone".to_string(),
@@ -2143,6 +2144,7 @@ mod tests {
         PeerInfo {
             node_id: node_id.to_string(),
             device_name: String::new(),
+            app_version: String::new(),
             public_key,
             endpoint: endpoint.map(|addr| addr.to_string()).unwrap_or_default(),
             nat_type: "Unknown".to_string(),
