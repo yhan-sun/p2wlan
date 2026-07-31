@@ -14,9 +14,14 @@ import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
 class DiagnosticsPage extends StatelessWidget {
-  const DiagnosticsPage({super.key, required this.statusStore});
+  const DiagnosticsPage({
+    super.key,
+    required this.statusStore,
+    this.showHeader = true,
+  });
 
   final StatusStore statusStore;
+  final bool showHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -28,12 +33,13 @@ class DiagnosticsPage extends StatelessWidget {
         return PageScaffold(
           title: strings.diagnostics,
           subtitle: strings.diagnosticsSubtitle,
+          showHeader: showHeader,
           children: [
             _DiagnosticsActions(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 14),
             _Summary(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 14),
-            _RawJson(statusStore: statusStore, snapshot: snapshot),
+            _IssuesPanel(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 14),
             _PlatformPanel(),
             const SizedBox(height: 14),
@@ -42,6 +48,8 @@ class DiagnosticsPage extends StatelessWidget {
             _TaskPanel(snapshot: snapshot),
             const SizedBox(height: 14),
             _RecentLogsPanel(),
+            const SizedBox(height: 14),
+            _RawJson(statusStore: statusStore, snapshot: snapshot),
           ],
         );
       },
@@ -176,7 +184,7 @@ class _PlatformPanelState extends State<_PlatformPanel> {
             ? (strings.isZh ? '需确认' : 'Review')
             : strings.loaded;
         return AppPanel(
-          title: strings.isZh ? '平台特权状态' : 'Platform permissions',
+          title: strings.platformPermissions,
           trailing: Wrap(
             spacing: 8,
             crossAxisAlignment: WrapCrossAlignment.center,
@@ -366,7 +374,7 @@ class _BoundaryPanel extends StatelessWidget {
     final mtu = _map(snapshot?.raw['mtu']);
     if (protocol.isEmpty && mtu.isEmpty) {
       return AppPanel(
-        title: strings.isZh ? '协议与 MTU' : 'Protocol and MTU',
+        title: strings.protocolAndMtu,
         child: Text(
           strings.isZh
               ? '当前快照未上报协议边界或 MTU 策略。'
@@ -379,7 +387,7 @@ class _BoundaryPanel extends StatelessWidget {
       );
     }
     return AppPanel(
-      title: strings.isZh ? '协议与 MTU' : 'Protocol and MTU',
+      title: strings.protocolAndMtu,
       child: Wrap(
         spacing: 24,
         runSpacing: 12,
@@ -434,7 +442,7 @@ class _TaskPanel extends StatelessWidget {
     final tasks =
         snapshot?.health.criticalTasks ?? const <TaskStatusSnapshot>[];
     return AppPanel(
-      title: strings.isZh ? '关键任务' : 'Critical tasks',
+      title: strings.criticalTasks,
       child: tasks.isEmpty
           ? Text(
               strings.isZh
@@ -607,6 +615,222 @@ class _Summary extends StatelessWidget {
   }
 }
 
+class _IssuesPanel extends StatelessWidget {
+  const _IssuesPanel({required this.statusStore, required this.snapshot});
+
+  final StatusStore statusStore;
+  final DiagnosticsSnapshot? snapshot;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final issues = _collectIssues(strings);
+    return AppPanel(
+      title: strings.diagnosticIssues,
+      trailing: StatusBadge(
+        label: issues.isEmpty ? strings.noActionNeeded : strings.needsAttention,
+        tone: issues.isEmpty ? StatusTone.good : StatusTone.warn,
+      ),
+      child: issues.isEmpty
+          ? _IssueRow(
+              title: strings.noActionNeeded,
+              detail: strings.diagnosticNoIssues,
+              tone: StatusTone.good,
+            )
+          : Column(
+              children: [
+                for (var index = 0; index < issues.length; index++) ...[
+                  issues[index],
+                  if (index != issues.length - 1)
+                    Divider(
+                      color: Theme.of(context).colorScheme.outlineVariant,
+                    ),
+                ],
+              ],
+            ),
+    );
+  }
+
+  List<_IssueRow> _collectIssues(AppStrings strings) {
+    final issues = <_IssueRow>[];
+    if (!statusStore.healthReachable) {
+      issues.add(
+        _IssueRow(
+          title: 'GET /health',
+          detail:
+              strings.statusMessage(statusStore.lastHealthError) ??
+              statusStore.lastHealthError ??
+              strings.offline,
+          tone: StatusTone.bad,
+        ),
+      );
+    }
+    if (statusStore.healthReachable && !statusStore.statusReachable) {
+      issues.add(
+        _IssueRow(
+          title: 'GET /status',
+          detail:
+              strings.statusMessage(statusStore.lastStatusError) ??
+              statusStore.lastStatusError ??
+              strings.unavailable,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+
+    final health = snapshot?.health;
+    if (health?.reauthRequired == true) {
+      issues.add(
+        _IssueRow(
+          title: strings.reauthRequired,
+          detail: strings.issueReauthRequired,
+          tone: StatusTone.bad,
+        ),
+      );
+    }
+    if (health != null && !health.controlConnected) {
+      issues.add(
+        _IssueRow(
+          title: strings.controlPlane,
+          detail: strings.issueControlDisconnected,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+    final reason = health?.reason?.trim();
+    if (reason != null && reason.isNotEmpty) {
+      issues.add(
+        _IssueRow(
+          title: strings.healthReason,
+          detail: reason,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+    if (snapshot != null && !snapshot!.relayConnected) {
+      issues.add(
+        _IssueRow(
+          title: strings.relay,
+          detail: strings.issueRelayDisconnected,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+    final failedTasks =
+        health?.criticalTasks
+            .where((task) => task.error != null && task.error!.isNotEmpty)
+            .toList(growable: false) ??
+        const <TaskStatusSnapshot>[];
+    for (final task in failedTasks.take(3)) {
+      issues.add(
+        _IssueRow(
+          title: '${strings.criticalTasks}: ${task.name}',
+          detail: task.error!,
+          tone: StatusTone.bad,
+        ),
+      );
+    }
+    final peerWarnings =
+        snapshot?.peers.where((peer) => peer.lastError != null).length ?? 0;
+    if (peerWarnings > 0) {
+      issues.add(
+        _IssueRow(
+          title: strings.attentionDevices,
+          detail: strings.peerWarnings(peerWarnings),
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+    if (statusStore.lastError != null && issues.isEmpty) {
+      issues.add(
+        _IssueRow(
+          title: strings.lastError,
+          detail:
+              strings.statusMessage(statusStore.lastError) ??
+              statusStore.lastError!,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
+    return issues;
+  }
+}
+
+class _IssueRow extends StatelessWidget {
+  const _IssueRow({
+    required this.title,
+    required this.detail,
+    required this.tone,
+  });
+
+  final String title;
+  final String detail;
+  final StatusTone tone;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final iconColor = switch (tone) {
+      StatusTone.good =>
+        theme.brightness == Brightness.dark
+            ? AppTokens.colorDarkGoodText
+            : AppTokens.colorGoodText,
+      StatusTone.warn =>
+        theme.brightness == Brightness.dark
+            ? AppTokens.colorDarkWarnText
+            : AppTokens.colorWarnText,
+      StatusTone.bad =>
+        theme.brightness == Brightness.dark
+            ? AppTokens.colorDarkBadText
+            : AppTokens.colorBadText,
+      StatusTone.neutral => theme.colorScheme.onSurfaceVariant,
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 1),
+            child: Icon(
+              tone == StatusTone.good
+                  ? Icons.check_circle_outline
+                  : Icons.info_outline_rounded,
+              color: iconColor,
+              size: 18,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  detail,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _RawJson extends StatefulWidget {
   const _RawJson({required this.statusStore, required this.snapshot});
 
@@ -770,7 +994,7 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: strings.isZh ? '最近 daemon 日志' : 'Recent daemon logs',
+      title: strings.recentDaemonLogs,
       trailing: OutlinedButton.icon(
         onPressed: _refresh,
         icon: const Icon(Icons.refresh_rounded, size: 16),

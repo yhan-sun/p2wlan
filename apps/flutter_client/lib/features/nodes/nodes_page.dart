@@ -19,10 +19,12 @@ class NodesPage extends StatefulWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.showHeader = true,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final bool showHeader;
 
   @override
   State<NodesPage> createState() => _NodesPageState();
@@ -84,6 +86,7 @@ class _NodesPageState extends State<NodesPage> {
         return PageScaffold(
           title: strings.nodes,
           subtitle: strings.nodesSubtitle,
+          showHeader: widget.showHeader,
           children: [
             _LocalNodePanel(
               snapshot: snapshot,
@@ -472,6 +475,7 @@ class _LocalNodePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
     final deviceName = settings.deviceName.trim();
     final nodeId = snapshot?.nodeId.trim() ?? '';
     final virtualIp = snapshot?.virtualIp.trim() ?? '';
@@ -501,14 +505,14 @@ class _LocalNodePanel extends StatelessWidget {
                 width: 38,
                 height: 38,
                 decoration: BoxDecoration(
-                  color: AppTokens.colorNeutralBg,
+                  color: theme.colorScheme.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  border: Border.all(color: AppTokens.colorNeutralBorder),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
                 ),
-                child: const Icon(
+                child: Icon(
                   Icons.computer_rounded,
                   size: 20,
-                  color: AppTokens.colorAccent,
+                  color: theme.colorScheme.primary,
                 ),
               ),
               const SizedBox(width: 12),
@@ -520,10 +524,10 @@ class _LocalNodePanel extends StatelessWidget {
                       dash(deviceName),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w700,
-                        color: AppTokens.colorTextPrimary,
+                        color: theme.colorScheme.onSurface,
                       ),
                     ),
                     const SizedBox(height: 3),
@@ -533,9 +537,9 @@ class _LocalNodePanel extends StatelessWidget {
                           : 'Renames sync to the control plane and appear on other devices after refresh.',
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
-                        color: AppTokens.colorTextSecondary,
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ],
@@ -858,8 +862,8 @@ class _RemoveDeviceMetaRow extends StatelessWidget {
               value,
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: AppTokens.colorTextPrimary,
+              style: TextStyle(
+                color: theme.colorScheme.onSurface,
                 fontSize: 12,
                 fontFeatures: AppTokens.tabularFontFeatures,
               ),
@@ -881,6 +885,9 @@ class _PeerSummary extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final directCount = peers.where((peer) => peer.path == 'direct').length;
     final relayCount = peers.where((peer) => peer.path == 'relay').length;
+    final onlineCount = peers.where((peer) => peer.online).length;
+    final offlineCount = peers.where((peer) => !peer.online).length;
+    final attentionCount = peers.where(_peerNeedsAttention).length;
     return AppPanel(
       title: strings.peerSummary,
       child: Wrap(
@@ -888,8 +895,20 @@ class _PeerSummary extends StatelessWidget {
         runSpacing: 4,
         children: [
           MetricTile(label: strings.peerCount, value: formatInt(peers.length)),
+          MetricTile(
+            label: strings.onlineDevices,
+            value: formatInt(onlineCount),
+          ),
           MetricTile(label: strings.directPaths, value: formatInt(directCount)),
           MetricTile(label: strings.relayPaths, value: formatInt(relayCount)),
+          MetricTile(
+            label: strings.offlineDevices,
+            value: formatInt(offlineCount),
+          ),
+          MetricTile(
+            label: strings.attentionDevices,
+            value: formatInt(attentionCount),
+          ),
         ],
       ),
     );
@@ -1250,8 +1269,17 @@ class _PeerList extends StatelessWidget {
           final maxBodyHeight = compact
               ? _compactMaxBodyHeight
               : _maxBodyHeight;
-          final bodyHeight = (peers.length * rowHeight)
-              .clamp(rowHeight, maxBodyHeight)
+          final groups = _buildPeerGroups(peers, strings);
+          final items = <_PeerListItem>[
+            for (final group in groups) ...[
+              _PeerListItem.group(group),
+              for (final peer in group.peers) _PeerListItem.peer(peer),
+            ],
+          ];
+          final contentHeight =
+              (groups.length * _groupHeaderHeight) + (peers.length * rowHeight);
+          final bodyHeight = contentHeight
+              .clamp(rowHeight + _groupHeaderHeight, maxBodyHeight)
               .toDouble();
           return ClipRRect(
             borderRadius: const BorderRadius.only(
@@ -1263,21 +1291,32 @@ class _PeerList extends StatelessWidget {
               child: ListView.builder(
                 padding: EdgeInsets.zero,
                 primary: false,
-                itemExtent: rowHeight,
-                itemCount: peers.length,
+                itemCount: items.length,
                 itemBuilder: (context, index) {
-                  return _PeerListRow(
-                    peer: peers[index],
-                    strings: strings,
-                    shaded: index.isOdd,
-                    compact: compact,
-                    copiedKey: copiedKey,
-                    busy: busyPeerId == peers[index].nodeId,
-                    relayFallbackLatencyMs: relayFallbackLatencyMs,
-                    onCopy: onCopy,
-                    onDetails: onDetails,
-                    onEdit: onEdit,
-                    onDelete: onDelete,
+                  final item = items[index];
+                  final group = item.group;
+                  if (group != null) {
+                    return SizedBox(
+                      height: _groupHeaderHeight,
+                      child: _PeerGroupHeader(group: group),
+                    );
+                  }
+                  final peer = item.peer!;
+                  return SizedBox(
+                    height: rowHeight,
+                    child: _PeerListRow(
+                      peer: peer,
+                      strings: strings,
+                      shaded: index.isOdd,
+                      compact: compact,
+                      copiedKey: copiedKey,
+                      busy: busyPeerId == peer.nodeId,
+                      relayFallbackLatencyMs: relayFallbackLatencyMs,
+                      onCopy: onCopy,
+                      onDetails: onDetails,
+                      onEdit: onEdit,
+                      onDelete: onDelete,
+                    ),
                   );
                 },
               ),
@@ -1290,8 +1329,67 @@ class _PeerList extends StatelessWidget {
 
   static const _rowHeight = 68.0;
   static const _maxBodyHeight = 456.0;
-  static const _compactRowHeight = 90.0;
+  static const _compactRowHeight = 96.0;
   static const _compactMaxBodyHeight = 520.0;
+  static const _groupHeaderHeight = 34.0;
+}
+
+class _PeerListItem {
+  const _PeerListItem.group(this.group) : peer = null;
+  const _PeerListItem.peer(this.peer) : group = null;
+
+  final _PeerGroup? group;
+  final PeerSnapshot? peer;
+}
+
+class _PeerGroup {
+  const _PeerGroup({
+    required this.title,
+    required this.tone,
+    required this.peers,
+  });
+
+  final String title;
+  final StatusTone tone;
+  final List<PeerSnapshot> peers;
+}
+
+class _PeerGroupHeader extends StatelessWidget {
+  const _PeerGroupHeader({required this.group});
+
+  final _PeerGroup group;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        border: Border(
+          bottom: BorderSide(color: theme.colorScheme.outlineVariant),
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              group.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          StatusBadge(label: formatInt(group.peers.length), tone: group.tone),
+        ],
+      ),
+    );
+  }
 }
 
 class _PeerListRow extends StatelessWidget {
@@ -1323,11 +1421,15 @@ class _PeerListRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final ipKey = '${peer.nodeId}:ip';
     final pingKey = '${peer.nodeId}:ping';
     final menu = _actionsMenu(ipKey, pingKey);
+    final rowColor = shaded
+        ? theme.colorScheme.surfaceContainerHighest
+        : theme.colorScheme.surface;
     return Material(
-      color: shaded ? AppTokens.colorSurfaceSubtle : AppTokens.colorSurface,
+      color: rowColor,
       child: InkWell(
         onTap: () => onDetails(peer),
         child: Container(
@@ -1335,9 +1437,9 @@ class _PeerListRow extends StatelessWidget {
             horizontal: 14,
             vertical: compact ? 8 : 0,
           ),
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             border: Border(
-              bottom: BorderSide(color: AppTokens.colorBorderSubtle),
+              bottom: BorderSide(color: theme.colorScheme.outlineVariant),
             ),
           ),
           child: compact
@@ -1404,12 +1506,12 @@ class _PeerListRow extends StatelessWidget {
   Widget _actionsMenu(String ipKey, String pingKey) {
     if (busy) {
       return SizedBox.square(
-        dimension: compact ? 36 : 40,
+        dimension: AppTokens.minTouchTarget,
         child: const Center(child: _TinySpinner()),
       );
     }
     return SizedBox.square(
-      dimension: compact ? 36 : 40,
+      dimension: AppTokens.minTouchTarget,
       child: PopupMenuButton<String>(
         padding: EdgeInsets.zero,
         iconSize: 20,
@@ -1475,15 +1577,16 @@ class _LatencyText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Text(
       formatLatency(_displayLatencyMs(peer, relayFallbackLatencyMs)),
       textAlign: TextAlign.right,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: const TextStyle(
+      style: TextStyle(
         fontSize: 12,
         fontWeight: FontWeight.w700,
-        color: AppTokens.colorTextSecondary,
+        color: theme.colorScheme.onSurfaceVariant,
         fontFeatures: AppTokens.tabularFontFeatures,
       ),
     );
@@ -1516,6 +1619,13 @@ class _PeerPrimaryText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final error = peer.lastError?.trim();
+    final detail = error != null && error.isNotEmpty
+        ? error
+        : peer.appVersion.trim().isEmpty
+        ? dash(peer.virtualIp)
+        : '${dash(peer.virtualIp)} · v${peer.appVersion.trim()}';
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1524,23 +1634,23 @@ class _PeerPrimaryText extends StatelessWidget {
           dash(peer.displayName),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 13.5,
             fontWeight: FontWeight.w700,
-            color: AppTokens.colorTextPrimary,
+            color: theme.colorScheme.onSurface,
           ),
         ),
         const SizedBox(height: 4),
         Text(
-          peer.appVersion.trim().isEmpty
-              ? dash(peer.virtualIp)
-              : '${dash(peer.virtualIp)} · v${peer.appVersion.trim()}',
+          detail,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 12,
             fontWeight: FontWeight.w600,
-            color: AppTokens.colorTextSecondary,
+            color: error != null && error.isNotEmpty
+                ? theme.colorScheme.error
+                : theme.colorScheme.onSurfaceVariant,
             fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
@@ -1576,7 +1686,6 @@ class _PeerActions extends StatelessWidget {
           tooltip: ipCopied
               ? (strings.isZh ? '已复制' : 'Copied')
               : (strings.isZh ? '复制虚拟 IP' : 'Copy virtual IP'),
-          visualDensity: VisualDensity.compact,
           onPressed: () => onCopy(peer.virtualIp, ipKey),
           icon: Icon(
             ipCopied ? Icons.check_circle_outline : Icons.copy_outlined,
@@ -1587,7 +1696,6 @@ class _PeerActions extends StatelessWidget {
           tooltip: pingCopied
               ? (strings.isZh ? '已复制' : 'Copied')
               : (strings.isZh ? '复制 ping 命令' : 'Copy ping command'),
-          visualDensity: VisualDensity.compact,
           onPressed: () => onCopy('ping ${peer.virtualIp}', pingKey),
           icon: Icon(
             pingCopied ? Icons.check_circle_outline : Icons.terminal_outlined,
@@ -1596,7 +1704,6 @@ class _PeerActions extends StatelessWidget {
         ),
         IconButton(
           tooltip: strings.isZh ? '编辑设备' : 'Edit device',
-          visualDensity: VisualDensity.compact,
           onPressed: () => onEdit(peer),
           icon: const Icon(Icons.edit_outlined, size: 18),
         ),
@@ -1607,6 +1714,55 @@ class _PeerActions extends StatelessWidget {
 
 String _routeLabel(AppStrings strings, PeerSnapshot peer) =>
     strings.routeLabel(peer.path, peer.isRelay);
+
+List<_PeerGroup> _buildPeerGroups(
+  List<PeerSnapshot> peers,
+  AppStrings strings,
+) {
+  final attention = <PeerSnapshot>[];
+  final direct = <PeerSnapshot>[];
+  final relay = <PeerSnapshot>[];
+  final offline = <PeerSnapshot>[];
+
+  for (final peer in peers) {
+    if (_peerNeedsAttention(peer)) {
+      attention.add(peer);
+    } else if (peer.path == 'direct') {
+      direct.add(peer);
+    } else if (peer.path == 'relay') {
+      relay.add(peer);
+    } else {
+      offline.add(peer);
+    }
+  }
+
+  return [
+    if (attention.isNotEmpty)
+      _PeerGroup(
+        title: strings.attentionDevices,
+        tone: StatusTone.bad,
+        peers: attention,
+      ),
+    if (direct.isNotEmpty)
+      _PeerGroup(
+        title: strings.directDevices,
+        tone: StatusTone.good,
+        peers: direct,
+      ),
+    if (relay.isNotEmpty)
+      _PeerGroup(
+        title: strings.relayDevices,
+        tone: StatusTone.warn,
+        peers: relay,
+      ),
+    if (offline.isNotEmpty)
+      _PeerGroup(
+        title: strings.offlineDevices,
+        tone: StatusTone.neutral,
+        peers: offline,
+      ),
+  ];
+}
 
 List<PeerSnapshot> _dedupeAndSortPeers(List<PeerSnapshot> peers) {
   final byKey = <String, PeerSnapshot>{};
@@ -1629,10 +1785,23 @@ String _peerDedupeKey(PeerSnapshot peer) {
 }
 
 int _comparePeers(PeerSnapshot left, PeerSnapshot right) {
-  if (left.online != right.online) return left.online ? -1 : 1;
+  final rank = _peerSortRank(left).compareTo(_peerSortRank(right));
+  if (rank != 0) return rank;
   final recent = right.sortTimestampMs.compareTo(left.sortTimestampMs);
   if (recent != 0) return recent;
   return left.displayName.compareTo(right.displayName);
+}
+
+int _peerSortRank(PeerSnapshot peer) {
+  if (_peerNeedsAttention(peer)) return 0;
+  if (peer.path == 'direct') return 1;
+  if (peer.path == 'relay') return 2;
+  return 3;
+}
+
+bool _peerNeedsAttention(PeerSnapshot peer) {
+  if (peer.lastError != null) return true;
+  return peer.online && (peer.path == 'probing' || peer.path == 'direct_trial');
 }
 
 String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
@@ -1668,23 +1837,24 @@ class _DetailLine extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final labelText = Text(
             label,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w600,
-              color: AppTokens.colorTextSecondary,
+              color: theme.colorScheme.onSurfaceVariant,
             ),
           );
           final valueText = SelectableText(
             value,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12,
-              color: AppTokens.colorTextPrimary,
+              color: theme.colorScheme.onSurface,
               fontFeatures: AppTokens.tabularFontFeatures,
             ),
           );
@@ -1714,11 +1884,14 @@ class _PathBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final tone = switch (peer.path) {
-      'direct' => StatusTone.good,
-      'relay' => StatusTone.warn,
-      _ => StatusTone.neutral,
-    };
+    final tone = _peerNeedsAttention(peer)
+        ? StatusTone.bad
+        : switch (peer.path) {
+            'direct' => StatusTone.good,
+            'relay' => StatusTone.warn,
+            'direct_trial' || 'probing' => StatusTone.warn,
+            _ => StatusTone.neutral,
+          };
     return StatusBadge(
       label: _connectionLabel(AppStringsScope.of(context), peer),
       tone: tone,

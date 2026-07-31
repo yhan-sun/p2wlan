@@ -148,6 +148,7 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> updateLanguageCode(String languageCode) async {
     _settings = _settings.copyWith(languageCode: languageCode);
+    notifyListeners();
     await _save();
     notifyListeners();
   }

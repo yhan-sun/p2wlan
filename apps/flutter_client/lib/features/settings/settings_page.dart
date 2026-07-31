@@ -14,11 +14,13 @@ class SettingsPage extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.onLogout,
+    this.showHeader = true,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final VoidCallback? onLogout;
+  final bool showHeader;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -104,6 +106,7 @@ class _SettingsPageState extends State<SettingsPage> {
         return PageScaffold(
           title: strings.settings,
           subtitle: strings.settingsSubtitle,
+          showHeader: widget.showHeader,
           children: [
             if (_formError != null) ...[
               _ErrorBanner(message: _formError!),

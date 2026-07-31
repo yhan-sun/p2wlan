@@ -14,10 +14,12 @@ class TunnelsPage extends StatefulWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.showHeader = true,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final bool showHeader;
 
   @override
   State<TunnelsPage> createState() => _TunnelsPageState();
@@ -41,6 +43,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
           subtitle: strings.isZh
               ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
               : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.',
+          showHeader: widget.showHeader,
           children: [
             if (_message != null) ...[
               _InfoBanner(message: _message!),
