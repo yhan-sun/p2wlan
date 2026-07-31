@@ -74,7 +74,7 @@ use tracing::{debug, error, info, warn};
 use acl::AclEngine;
 use control::{ControlClient, ControlEvent, RelayCatalogEntry};
 use dataplane::{DataPlane, InboundPacket, OutboundPacket};
-use diagnostics::{run_diagnostics_server, DiagnosticsContext};
+use diagnostics::{run_diagnostics_server_with_retry, DiagnosticsContext};
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
@@ -84,14 +84,14 @@ use p2pnet_wireguard::{
 use peer::{
     ConnectionState, NetworkPath, PeerManager, DIRECT_RETRY_BASE_INTERVAL,
     REASON_DIRECT_PROBE_FAILED, REASON_DIRECT_SEND_FAILED, REASON_HANDSHAKE_TIMEOUT,
-    REASON_NETWORK_GENERATION_CHANGED, REASON_PATH_DIRECT_TRIAL,
+    REASON_PATH_DIRECT_TRIAL,
 };
 use port_mapping::PortMappingManager;
 use relay::{
     select_relay_with_cooldowns, RelayCandidateConfig, RelaySelectionDiagnostics,
     RelaySelectionOutcome, RelayTicketCache, RelayTransport,
 };
-use transport::{EncryptedPeerPacket, WireGuardTransport};
+use transport::{build_relay_validation_payload, EncryptedPeerPacket, WireGuardTransport};
 use udp::{PeerReflexiveObservation, UdpTransport};
 
 /// Shared pending-handshake state (timeout-safe).
@@ -212,6 +212,12 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Server-side signaling currently rejects candidate lists above this size.
 const MAX_SIGNAL_CANDIDATES: usize = 20;
+/// A bounded public candidate group preserves ICE-style linear NAT coverage.
+///
+/// Air-like linear symmetric NATs need the STUN group plus a short predicted
+/// run. Keep this below the overall signaling cap so host/manual candidates can
+/// still fit, and rely on local birthday rotation for wider coverage.
+const MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP: usize = 16;
 /// Keep UPnP discovery short so unsupported gateways never delay startup much.
 const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Short UPnP lease; refreshed by the regular candidate refresh loop.
@@ -256,7 +262,6 @@ const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
 /// Confirm relay peer reachability proactively instead of waiting for user traffic.
 const RELAY_PEER_VALIDATION_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_PEER_VALIDATION_MAX_AGE: Duration = Duration::from_secs(15);
-const RELAY_PEER_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-relay-validation";
 /// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.
@@ -357,7 +362,13 @@ impl Daemon {
     pub fn new(config: Config) -> Self {
         let control_enabled = !config.network.manual;
         let config_path = config.config_path.clone();
-        let (control, control_rx) = ControlClient::new(&config, control_enabled, config_path);
+        let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
+        let (control, control_rx) = ControlClient::new(
+            &config,
+            control_enabled,
+            config_path,
+            Some(relay_selection.clone()),
+        );
         let (transport, encrypted_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
@@ -386,7 +397,7 @@ impl Daemon {
             punch_attempts: PunchAttemptDeduplicator::default(),
             udp_transport: Arc::new(RwLock::new(None)),
             relay_transport: Arc::new(RwLock::new(None)),
-            relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
+            relay_selection,
             port_mappings: Arc::new(PortMappingManager::new()),
             dns: Arc::new(DnsResolver::new(config.dns.clone())),
             acl: Arc::new(RwLock::new(acl_engine)),
@@ -524,6 +535,8 @@ impl Daemon {
         resolved_config.node.node_id = assigned_node_id.clone();
         resolved_config.relay.servers = relay_servers.clone();
         resolved_config.relay.allow_insecure_plaintext = relay_allow_insecure_plaintext;
+        resolved_config.network.udp_observers =
+            udp_observers_from_sources(&relay_catalog, &resolved_config.network.udp_observers);
         self.config = Arc::new(resolved_config);
 
         // Initialize TUN using the resolved IP details
@@ -548,12 +561,24 @@ impl Daemon {
         })?;
         let udp_advertise = self.config.network.udp_advertise.clone();
         let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
-        let stun_servers =
+        let mut stun_servers =
             parse_stun_servers(&self.config.network.stun_servers, stun_timeout).await?;
-        if stun_servers.is_empty() {
-            info!("STUN candidate gathering is disabled");
+        let udp_observers = if self.config.network.udp_observers.is_empty() {
+            Vec::new()
         } else {
+            parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await?
+        };
+        for observer in &udp_observers {
+            if !stun_servers.contains(observer) {
+                stun_servers.push(*observer);
+            }
+        }
+        if stun_servers.is_empty() {
+            info!("STUN/UDP-observer candidate gathering is disabled");
+        } else if udp_observers.is_empty() {
             info!("Using STUN endpoints: {stun_servers:?}");
+        } else {
+            info!("Using STUN/UDP observer endpoints: stun_and_observers={stun_servers:?} observers={udp_observers:?}");
         }
         let configured_keepalive = Duration::from_secs(self.config.network.keepalive_interval_secs);
         let keepalive_interval = if configured_keepalive.is_zero() {
@@ -627,9 +652,12 @@ impl Daemon {
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager
                 .spawn("diagnostics", false, async move {
-                    if let Err(err) =
-                        run_diagnostics_server(diagnostics_bind, diagnostics_context, shutdown_rx)
-                            .await
+                    if let Err(err) = run_diagnostics_server_with_retry(
+                        diagnostics_bind,
+                        diagnostics_context,
+                        shutdown_rx,
+                    )
+                    .await
                     {
                         warn!("Diagnostics endpoint stopped: {err}");
                     }
@@ -824,12 +852,15 @@ impl Daemon {
                             &mut candidate_endpoints,
                             &mut candidate_sources,
                         );
+                        let mut published_endpoint = None;
                         if let Some(endpoint) = control_udp_endpoint_from_candidates(
                             &candidate_endpoints,
                             &candidate_sources,
                         ) {
                             if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
                                 warn!("Failed to queue UDP endpoint update '{endpoint}': {err}");
+                            } else {
+                                published_endpoint = Some(endpoint);
                             }
                         }
 
@@ -863,6 +894,7 @@ impl Daemon {
                                     stun_timeout,
                                     udp_advertise,
                                     upnp_enabled,
+                                    published_endpoint,
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
@@ -887,6 +919,7 @@ impl Daemon {
                                     stun_timeout,
                                     udp_advertise,
                                     upnp_enabled,
+                                    published_endpoint,
                                     local_candidates,
                                     local_candidate_sources: udp_local_candidate_sources.clone(),
                                     nat_profile,
@@ -1299,8 +1332,10 @@ impl Daemon {
                     self.peers.add_peer(&peer_info).await;
 
                     if peer_info.online {
+                        let mut sent_handshake_offer = false;
                         match self.maybe_initiate_handshake(&peer_info).await {
                             Ok(punch_at_ms) => {
+                                sent_handshake_offer = punch_at_ms.is_some();
                                 self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
                             }
                             Err(err) => {
@@ -1310,6 +1345,13 @@ impl Daemon {
                                 );
                                 self.start_hole_punch(&peer_info.node_id).await;
                             }
+                        }
+                        if !sent_handshake_offer {
+                            self.publish_current_candidates_to_peer(
+                                &peer_info.node_id,
+                                "peer joined",
+                            )
+                            .await;
                         }
 
                         if self.dns.is_enabled() {
@@ -1375,8 +1417,10 @@ impl Daemon {
                             )
                             .await;
                     }
+                    let mut sent_handshake_offer = false;
                     match self.maybe_initiate_handshake(&peer_info).await {
                         Ok(punch_at_ms) => {
+                            sent_handshake_offer = punch_at_ms.is_some();
                             self.start_hole_punch_at(&peer_info.node_id, punch_at_ms).await;
                         }
                         Err(err) => {
@@ -1386,6 +1430,13 @@ impl Daemon {
                             );
                             self.start_hole_punch(&peer_info.node_id).await;
                         }
+                    }
+                    if !sent_handshake_offer {
+                        self.publish_current_candidates_to_peer(
+                            &peer_info.node_id,
+                            "peer updated",
+                        )
+                        .await;
                     }
                 }
 
@@ -1871,6 +1922,56 @@ impl Daemon {
         }
     }
 
+    async fn publish_current_candidates_to_peer(&self, node_id: &str, reason: &str) {
+        let Some(udp) = self.udp_transport.read().await.clone() else {
+            debug!(
+                "UDP transport is not ready; skipping {reason} candidate publication to {node_id}"
+            );
+            return;
+        };
+        let candidates = self.local_candidates.read().await.clone();
+        if candidates.is_empty() {
+            debug!("Local UDP candidates are not ready; skipping {reason} candidate publication to {node_id}");
+            return;
+        }
+        let candidate_sources = self.local_candidate_sources.read().await.clone();
+        let punch_at_ms = Some(relay_assisted_punch_at_ms());
+
+        if let Err(error) = self
+            .control
+            .send_peer_offer_with_sources_and_punch_at(
+                node_id,
+                &candidates,
+                &candidate_sources,
+                &[],
+                punch_at_ms,
+            )
+            .await
+        {
+            warn!("Failed to publish {reason} UDP candidates to peer {node_id}: {error}");
+            return;
+        }
+
+        info!(
+            "Published {reason} UDP candidates to peer {node_id} ({} candidates) punch_at_ms={punch_at_ms:?}",
+            candidates.len()
+        );
+        let attempts = self
+            .peers
+            .recommended_punch_attempts(self.config.network.punch_attempts)
+            .await;
+        spawn_hole_punch_task(
+            udp,
+            self.peers.clone(),
+            self.punch_attempts.clone(),
+            node_id.to_string(),
+            Duration::from_millis(self.config.network.punch_interval_ms),
+            attempts,
+            punch_at_ms,
+        )
+        .await;
+    }
+
     async fn start_hole_punch(&self, node_id: &str) {
         self.start_hole_punch_at(node_id, None).await;
     }
@@ -2254,6 +2355,37 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
     }
 }
 
+fn should_update_stable_control_endpoint(
+    published_endpoint: Option<&str>,
+    next_endpoint: &str,
+) -> bool {
+    let next_endpoint = next_endpoint.trim();
+    if next_endpoint.is_empty() {
+        return false;
+    }
+    let Some(published_endpoint) = published_endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        return true;
+    };
+    if published_endpoint == next_endpoint {
+        return false;
+    }
+
+    let published_addr = published_endpoint.parse::<SocketAddr>().ok();
+    let next_addr = next_endpoint.parse::<SocketAddr>().ok();
+    match (published_addr, next_addr) {
+        (Some(published_addr), Some(next_addr)) if is_public_udp_candidate(next_addr) => {
+            !is_public_udp_candidate(published_addr) || published_addr.ip() != next_addr.ip()
+        }
+        (Some(published_addr), Some(next_addr)) => {
+            !is_public_udp_candidate(published_addr) && published_addr != next_addr
+        }
+        _ => true,
+    }
+}
+
 fn candidate_endpoints_from_report(
     report: &CandidateGatherReport,
 ) -> (Vec<String>, HashMap<String, String>) {
@@ -2269,8 +2401,42 @@ fn candidate_endpoints_from_report(
             candidate_source_label(candidate.source).to_string(),
         );
     }
+    compact_volatile_public_signal_candidates(&mut endpoints, &mut sources);
     truncate_signal_candidates(&mut endpoints, &mut sources);
     (endpoints, sources)
+}
+
+fn compact_volatile_public_signal_candidates(
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) {
+    let mut volatile_public_by_ip: HashMap<IpAddr, usize> = HashMap::new();
+    candidates.retain(|endpoint| {
+        let Some(source) = candidate_sources.get(endpoint).map(String::as_str) else {
+            return true;
+        };
+        if !is_volatile_public_signal_source(source) {
+            return true;
+        }
+        let Ok(addr) = endpoint.parse::<SocketAddr>() else {
+            return true;
+        };
+        if !is_public_udp_candidate(addr) {
+            return true;
+        }
+        let count = volatile_public_by_ip.entry(addr.ip()).or_default();
+        *count += 1;
+        *count <= MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
+    });
+    let retained = candidates.iter().cloned().collect::<HashSet<_>>();
+    candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
+}
+
+fn is_volatile_public_signal_source(source: &str) -> bool {
+    matches!(
+        source,
+        "stun_observed" | "peer_reflexive" | "learned" | "predicted"
+    )
 }
 
 fn truncate_signal_candidates(
@@ -2392,6 +2558,7 @@ fn add_peer_reflexive_candidate_to_set(
         candidates.insert(0, endpoint.clone());
     }
     candidate_sources.insert(endpoint, "peer_reflexive".to_string());
+    compact_volatile_public_signal_candidates(candidates, candidate_sources);
     truncate_signal_candidates(candidates, candidate_sources);
 
     Ok(!already_present || source_changed)
@@ -3048,6 +3215,7 @@ struct UdpCandidateRefreshContext {
     stun_timeout: Duration,
     udp_advertise: Option<String>,
     upnp_enabled: bool,
+    published_endpoint: Option<String>,
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
@@ -3067,6 +3235,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
         stun_timeout,
         udp_advertise,
         upnp_enabled,
+        mut published_endpoint,
         local_candidates,
         local_candidate_sources,
         nat_profile,
@@ -3146,6 +3315,7 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             &mut candidates,
             &mut candidate_sources,
         );
+        compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
         truncate_signal_candidates(&mut candidates, &mut candidate_sources);
         let should_advance_generation = candidate_refresh_requires_network_generation_advance(
             &previous_candidates,
@@ -3182,22 +3352,30 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
             report.nat_profile.mapping_behavior,
             report.nat_profile.public_endpoint
         );
-        if should_advance_generation {
-            peers
-                .advance_candidate_refresh_generation(format!(
-                    "{REASON_NETWORK_GENERATION_CHANGED}: refreshed UDP candidates"
-                ))
-                .await;
-        } else {
-            debug!(
-                "UDP candidate refresh changed only volatile reflexive ports; keeping network generation stable"
-            );
-        }
         let endpoint = control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
             .or(advertised_endpoint)
             .unwrap_or_default();
+        if should_advance_generation {
+            peers
+                .advance_candidate_refresh_generation("refreshed UDP candidates")
+                .await;
+        } else {
+            debug!(
+                "UDP candidate refresh changed only volatile reflexive ports; keeping network generation and signaling stable"
+            );
+            if should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint) {
+                if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+                    warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
+                } else {
+                    published_endpoint = Some(endpoint);
+                }
+            }
+            continue;
+        }
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
             warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
+        } else if !endpoint.is_empty() {
+            published_endpoint = Some(endpoint.clone());
         }
 
         publish_local_candidates_to_known_peers(
@@ -3381,6 +3559,51 @@ fn relay_candidates_from_sources(
         .cloned()
         .map(RelayCandidateConfig::legacy)
         .collect()
+}
+
+fn udp_observers_from_sources(
+    relay_catalog: &[RelayCatalogEntry],
+    configured_observers: &[String],
+) -> Vec<String> {
+    let configured = configured_observers
+        .iter()
+        .map(|observer| observer.trim())
+        .filter(|observer| !observer.is_empty())
+        .collect::<Vec<_>>();
+    if configured
+        .iter()
+        .any(|observer| is_stun_clear_value(observer))
+    {
+        return configured.into_iter().map(ToString::to_string).collect();
+    }
+
+    let mut observers = Vec::new();
+    for observer in configured {
+        push_unique_udp_observer(&mut observers, observer);
+    }
+    for entry in relay_catalog {
+        if let Some(observer) = entry.udp_observer_endpoint.as_deref() {
+            push_unique_udp_observer(&mut observers, observer);
+        }
+        for observer in &entry.udp_observer_endpoints {
+            push_unique_udp_observer(&mut observers, observer);
+        }
+    }
+    observers
+}
+
+fn push_unique_udp_observer(observers: &mut Vec<String>, observer: &str) {
+    let observer = observer
+        .trim()
+        .strip_prefix("udp://")
+        .unwrap_or_else(|| observer.trim())
+        .trim();
+    if observer.is_empty() {
+        return;
+    }
+    if !observers.iter().any(|existing| existing == observer) {
+        observers.push(observer.to_string());
+    }
 }
 
 struct RelaySupervisor {
@@ -3625,12 +3848,13 @@ async fn send_relay_validation_packet(
     transport: &WireGuardTransport,
     relay: &RelayTransport,
 ) -> Result<()> {
+    let payload = build_relay_validation_payload(unix_time_millis());
     let packet = Ipv4Packet::build_icmp_echo_request(
         validation.local_ip,
         validation.peer_ip,
         validation.validation_id,
         validation.sequence,
-        RELAY_PEER_VALIDATION_PAYLOAD,
+        &payload,
     );
     let encrypted = transport
         .encrypt_outbound(OutboundPacket {
@@ -4578,6 +4802,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -4641,6 +4866,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -4704,6 +4930,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -4783,6 +5010,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -4826,7 +5054,12 @@ mod tests {
         let packet = Ipv4Packet::new(&decrypted).unwrap();
         assert_eq!(packet.src_addr(), Ipv4Addr::new(10, 20, 0, 1));
         assert_eq!(packet.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
-        assert!(packet.payload().ends_with(RELAY_PEER_VALIDATION_PAYLOAD));
+        let icmp_payload = packet.payload();
+        assert!(icmp_payload[8..].starts_with(b"p2wlan-relay-validation"));
+        assert_eq!(
+            icmp_payload[8 + b"p2wlan-relay-validation".len()..].len(),
+            8
+        );
 
         server.shutdown().await;
     }
@@ -4850,6 +5083,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         peers
@@ -4909,6 +5143,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         peers.record_direct_success("node-b", Some(endpoint)).await;
@@ -5027,6 +5262,52 @@ mod tests {
             control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
             Some("8.8.8.8:41000")
         );
+    }
+
+    #[test]
+    fn stable_control_endpoint_refresh_promotes_private_to_public() {
+        assert!(should_update_stable_control_endpoint(
+            Some("192.168.0.239:52633"),
+            "8.8.8.8:41000"
+        ));
+    }
+
+    #[test]
+    fn stable_control_endpoint_refresh_ignores_same_public_ip_port_churn() {
+        assert!(!should_update_stable_control_endpoint(
+            Some("8.8.8.8:41000"),
+            "8.8.8.8:41037"
+        ));
+    }
+
+    #[test]
+    fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
+        let mut candidates = vec!["192.168.1.10:51820".to_string()];
+        candidates.extend((0..18).map(|index| format!("8.8.8.8:{}", 41000 + index)));
+        candidates.extend(["1.1.1.1:42000".to_string(), "1.1.1.1:42009".to_string()]);
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint, "stun_observed".to_string()))
+            .collect::<HashMap<_, _>>();
+        sources.insert("192.168.1.10:51820".to_string(), "host".to_string());
+
+        compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
+
+        assert_eq!(candidates.len(), 19);
+        assert!(candidates.contains(&"192.168.1.10:51820".to_string()));
+        assert!(candidates.contains(&"1.1.1.1:42000".to_string()));
+        assert!(candidates.contains(&"1.1.1.1:42009".to_string()));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|endpoint| endpoint.starts_with("8.8.8.8:"))
+                .count(),
+            MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
+        );
+        assert!(!candidates.contains(&"8.8.8.8:41016".to_string()));
+        assert!(!candidates.contains(&"8.8.8.8:41017".to_string()));
+        assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
     }
 
     #[test]
@@ -5491,6 +5772,8 @@ mod tests {
             region: "cn".to_string(),
             audience: "relay-cn-1".to_string(),
             endpoint: "tls://relay.example.com:18081".to_string(),
+            udp_observer_endpoint: None,
+            udp_observer_endpoints: Vec::new(),
         }];
         assert!(!effective_relay_allow_insecure_plaintext(
             "http://47.109.40.237:18080",
@@ -5513,6 +5796,8 @@ mod tests {
             region: "sg".to_string(),
             audience: "relay-sg-1".to_string(),
             endpoint: "tls://relay.example.com:18081".to_string(),
+            udp_observer_endpoint: Some("udp://relay.example.com:18082".to_string()),
+            udp_observer_endpoints: Vec::new(),
         }];
         let legacy = vec!["default@127.0.0.1:18081".to_string()];
 
@@ -5522,6 +5807,48 @@ mod tests {
         assert_eq!(candidates[0].region, "sg");
         assert_eq!(candidates[0].audience.as_deref(), Some("relay-sg-1"));
         assert_eq!(candidates[0].endpoint, "tls://relay.example.com:18081");
+    }
+
+    #[test]
+    fn relay_catalog_udp_observers_are_merged_with_local_config() {
+        let catalog = vec![RelayCatalogEntry {
+            region: "sg".to_string(),
+            audience: "relay-sg-1".to_string(),
+            endpoint: "tls://relay.example.com:18081".to_string(),
+            udp_observer_endpoint: Some("udp://relay.example.com:18082".to_string()),
+            udp_observer_endpoints: vec![
+                "udp://stun.l.google.com:19302".to_string(),
+                "relay.example.com:18082".to_string(),
+            ],
+        }];
+        let configured = vec!["203.0.113.10:18082".to_string()];
+
+        let observers = udp_observers_from_sources(&catalog, &configured);
+
+        assert_eq!(
+            observers,
+            vec![
+                "203.0.113.10:18082".to_string(),
+                "relay.example.com:18082".to_string(),
+                "stun.l.google.com:19302".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_catalog_udp_observers_respect_explicit_disable() {
+        let catalog = vec![RelayCatalogEntry {
+            region: "sg".to_string(),
+            audience: "relay-sg-1".to_string(),
+            endpoint: "tls://relay.example.com:18081".to_string(),
+            udp_observer_endpoint: Some("relay.example.com:18082".to_string()),
+            udp_observer_endpoints: vec!["stun.l.google.com:19302".to_string()],
+        }];
+        let configured = vec!["off".to_string()];
+
+        let observers = udp_observers_from_sources(&catalog, &configured);
+
+        assert_eq!(observers, vec!["off".to_string()]);
     }
 
     #[test]
@@ -5815,6 +6142,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -5882,6 +6210,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 

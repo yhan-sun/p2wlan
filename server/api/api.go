@@ -611,8 +611,9 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Endpoint string `json:"endpoint"`
-		NATType  string `json:"nat_type"`
+		Endpoint   string `json:"endpoint"`
+		NATType    string `json:"nat_type"`
+		RelayRTTMS *int64 `json:"relay_rtt_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -632,8 +633,12 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"nat_type too long"}`, http.StatusBadRequest)
 		return
 	}
+	if req.RelayRTTMS != nil && (*req.RelayRTTMS < 0 || *req.RelayRTTMS > 600000) {
+		http.Error(w, `{"error":"relay_rtt_ms out of range"}`, http.StatusBadRequest)
+		return
+	}
 
-	if err := s.db.UpdateDeviceEndpoint(pathDeviceID, req.Endpoint, req.NATType); err != nil {
+	if err := s.db.UpdateDeviceEndpoint(pathDeviceID, req.Endpoint, req.NATType, req.RelayRTTMS); err != nil {
 		http.Error(w, `{"error":"endpoint update failed"}`, http.StatusInternalServerError)
 		return
 	}

@@ -533,6 +533,61 @@ func TestUpdateDeviceChangesVirtualIP(t *testing.T) {
 	}
 }
 
+func TestUpdateDeviceEndpointStoresRelayRTT(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("relay-rtt@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "relay-rtt-key", "relay-device", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/devices/"+device.ID+"/endpoint",
+		strings.NewReader(`{"endpoint":"198.51.100.10:52100","nat_type":"symmetric","relay_rtt_ms":42}`),
+	)
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+
+	server.UpdateDeviceEndpoint(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	updated, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if updated.RelayRTTMS == nil || *updated.RelayRTTMS != 42 {
+		t.Fatalf("expected relay RTT 42, got %+v", updated.RelayRTTMS)
+	}
+
+	nodesReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes?network_id=default", nil)
+	nodesReq = nodesReq.WithContext(context.WithValue(nodesReq.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	nodesRecorder := httptest.NewRecorder()
+	server.ListNodes(nodesRecorder, nodesReq)
+	if nodesRecorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", nodesRecorder.Code, nodesRecorder.Body.String())
+	}
+	var response struct {
+		Nodes []database.Device `json:"nodes"`
+	}
+	if err := json.Unmarshal(nodesRecorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode nodes: %v", err)
+	}
+	if len(response.Nodes) != 1 || response.Nodes[0].RelayRTTMS == nil || *response.Nodes[0].RelayRTTMS != 42 {
+		t.Fatalf("expected listed relay RTT 42, got %+v", response.Nodes)
+	}
+}
+
 func TestUpdateDeviceRejectsDuplicateVirtualIP(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

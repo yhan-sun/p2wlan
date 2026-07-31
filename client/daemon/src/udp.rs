@@ -2132,6 +2132,7 @@ mod tests {
             virtual_ip: virtual_ip.to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         }
     }
 
@@ -2151,6 +2152,7 @@ mod tests {
             virtual_ip: virtual_ip.to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         }
     }
 
@@ -2276,14 +2278,12 @@ mod tests {
             .with_global_probe_budget_path(path.clone());
         let peer_id = "peer-global";
         let endpoint: SocketAddr = "203.0.113.1:49999".parse().unwrap();
-        let peer_key = global_probe_peer_key(peer_id);
         let remote_ip_key = global_probe_remote_ip_key(peer_id, endpoint.ip());
-        let now_ms = unix_time_millis();
+        let now_ms =
+            unix_time_millis().saturating_add(OUTBOUND_PROBE_BUDGET_WINDOW.as_millis() as u64);
         let mut entries = Vec::new();
 
         for _ in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
-            entries.push((now_ms, "network".to_string()));
-            entries.push((now_ms, peer_key.clone()));
             entries.push((now_ms, remote_ip_key.clone()));
         }
         let mut file = OpenOptions::new()
@@ -2308,21 +2308,14 @@ mod tests {
             .await
             .unwrap();
 
-        for index in 0..OUTBOUND_PROBE_BUDGET_PER_NETWORK {
-            let peer_id = format!("peer-{}", index % 8);
-            let endpoint = format!(
-                "127.0.{}.{}:{}",
-                (index / 240) + 1,
-                (index % 240) + 1,
-                40_000 + index
-            )
-            .parse()
-            .unwrap();
-            assert_eq!(
-                transport
-                    .admit_outbound_connectivity_probe(&peer_id, endpoint)
-                    .await,
-                OutboundProbeAdmission::Accepted
+        {
+            let now = Instant::now();
+            let mut budget = transport.outbound_probe_budget.lock().await;
+            budget.insert(
+                OutboundProbeBudgetKey::Network,
+                std::iter::repeat(now)
+                    .take(OUTBOUND_PROBE_BUDGET_PER_NETWORK)
+                    .collect(),
             );
         }
 
@@ -2463,7 +2456,21 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
             .await
             .unwrap();
-        let candidates = (0..30)
+        {
+            let now = Instant::now();
+            let mut budget = transport.outbound_probe_budget.lock().await;
+            budget.insert(
+                OutboundProbeBudgetKey::PeerRemoteIp(
+                    "peer-b".to_string(),
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ),
+                std::iter::repeat(now)
+                    .take(OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP - 8)
+                    .collect(),
+            );
+        }
+
+        let candidates = (0..16)
             .map(|offset| format!("127.0.0.1:{}", 30_000 + offset).parse().unwrap())
             .collect::<Vec<SocketAddr>>();
 
@@ -2472,7 +2479,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(sent as usize, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+        assert_eq!(sent as usize, 8);
         let diagnostics = peers.diagnostics().await;
         let event = diagnostics[0]
             .direct_events

@@ -136,6 +136,11 @@ pub struct NetworkConfig {
     /// STUN servers used to discover server-reflexive UDP candidates.
     #[serde(default)]
     pub stun_servers: Vec<String>,
+    /// UDP observer endpoints. These speak STUN Binding and are queried alongside
+    /// public STUN servers so relay/VM-side observers can expose destination-side
+    /// mappings for linear symmetric NAT prediction.
+    #[serde(default)]
+    pub udp_observers: Vec<String>,
     /// Timeout for each STUN query in milliseconds.
     #[serde(default = "default_stun_timeout_ms")]
     pub stun_timeout_ms: u64,
@@ -502,6 +507,7 @@ impl Config {
                 udp_bind: default_udp_bind(),
                 udp_advertise: None,
                 stun_servers: Vec::new(),
+                udp_observers: Vec::new(),
                 stun_timeout_ms: default_stun_timeout_ms(),
                 punch_interval_ms: default_punch_interval_ms(),
                 punch_attempts: default_punch_attempts(),
@@ -596,6 +602,7 @@ mod tests {
         assert_eq!(decoded.network.udp_bind, config.network.udp_bind);
         assert_eq!(decoded.network.udp_advertise, config.network.udp_advertise);
         assert_eq!(decoded.network.stun_servers, config.network.stun_servers);
+        assert_eq!(decoded.network.udp_observers, config.network.udp_observers);
         assert_eq!(
             decoded.network.stun_timeout_ms,
             config.network.stun_timeout_ms
@@ -690,6 +697,7 @@ mod tests {
         assert_eq!(decoded.network.udp_bind, "0.0.0.0:0");
         assert_eq!(decoded.network.udp_advertise, None);
         assert!(decoded.network.stun_servers.is_empty());
+        assert!(decoded.network.udp_observers.is_empty());
         assert_eq!(decoded.network.stun_timeout_ms, 1500);
         assert_eq!(decoded.network.punch_interval_ms, 200);
         assert_eq!(decoded.network.punch_attempts, 10);
@@ -765,6 +773,7 @@ mod tests {
         assert_eq!(config.network.udp_bind, "0.0.0.0:0");
         assert_eq!(config.network.udp_advertise, None);
         assert!(config.network.stun_servers.is_empty());
+        assert!(config.network.udp_observers.is_empty());
         assert_eq!(config.network.stun_timeout_ms, 1500);
         assert_eq!(config.network.punch_interval_ms, 200);
         assert_eq!(config.network.punch_attempts, 10);

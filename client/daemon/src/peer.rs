@@ -55,12 +55,16 @@ const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 6;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 12;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 2;
-const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 24;
-const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 48;
-const BIRTHDAY_PROBE_DELTAS: [i32; 30] = [
-    1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12, 16, -16, 20, -20, 24, -24,
-    32, -32, 48, -48, 64, -64,
+const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 64;
+const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 128;
+const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
+const BIRTHDAY_PROBE_DELTAS: [i32; 54] = [
+    1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13,
+    -13, 14, -14, 15, -15, 16, -16, 17, -17, 18, -18, 19, -19, 20, -20, 21, -21, 22, -22, 23, -23,
+    24, -24, 32, -32, 48, -48, 64, -64,
 ];
+const BIRTHDAY_PROBE_WIDE_MAX_DELTA: i32 = 32_768;
+const BIRTHDAY_PROBE_WIDE_STRIDE: i32 = 251;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
 const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
@@ -94,7 +98,7 @@ impl ProbeTargetMode {
     }
 
     fn allows_local_nat_birthday(self) -> bool {
-        matches!(self, Self::Background | Self::Reclaim)
+        matches!(self, Self::Synchronized | Self::Background | Self::Reclaim)
     }
 }
 
@@ -867,6 +871,8 @@ pub struct PeerConnection {
     pub online: bool,
     /// Last seen timestamp reported by the control plane.
     pub last_seen: u64,
+    /// Peer-reported RTT to its selected relay server, in milliseconds.
+    pub remote_relay_rtt_ms: Option<u64>,
     /// Current connection state.
     pub state: ConnectionState,
     /// When the connection was established.
@@ -923,6 +929,7 @@ impl PeerConnection {
             nat_type: String::new(),
             online: true,
             last_seen: 0,
+            remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
             connected_at: None,
             bytes_sent: 0,
@@ -1081,6 +1088,30 @@ impl PeerConnection {
         }
     }
 
+    fn prune_candidate_pairs_outside_targets(
+        &mut self,
+        local_generation: u64,
+        endpoints: &[SocketAddr],
+    ) -> usize {
+        let target_endpoints = endpoints.iter().copied().collect::<HashSet<_>>();
+        let before = self.candidate_pairs.len();
+        self.candidate_pairs.retain(|pair| {
+            if pair.local_generation != local_generation {
+                return true;
+            }
+            if target_endpoints.contains(&pair.remote_endpoint) {
+                return true;
+            }
+            matches!(
+                pair.state,
+                CandidatePairState::Selected | CandidatePairState::Succeeded
+            ) && pair
+                .last_success_at
+                .is_some_and(|at| at.elapsed() < DIRECT_TRIAL_WINDOW)
+        });
+        before.saturating_sub(self.candidate_pairs.len())
+    }
+
     fn candidate_probe_endpoints(
         &mut self,
         local_generation: u64,
@@ -1097,6 +1128,7 @@ impl PeerConnection {
             mode.allows_local_nat_birthday(),
             &mut endpoints,
         );
+        self.prune_candidate_pairs_outside_targets(local_generation, &endpoints);
         let source_stats =
             candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
         let mut pairs = self
@@ -1120,6 +1152,9 @@ impl PeerConnection {
                 .then_with(|| {
                     discovered_endpoint_probe_rank(a.source)
                         .cmp(&discovered_endpoint_probe_rank(b.source))
+                })
+                .then_with(|| {
+                    speculative_probe_rotation_rank(a).cmp(&speculative_probe_rotation_rank(b))
                 })
                 .then_with(|| {
                     endpoint_probe_rank(a.remote_endpoint)
@@ -1173,6 +1208,7 @@ impl PeerConnection {
                         | CandidatePairSource::NatPmp
                 )
             })
+            .take(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE)
             .collect::<Vec<_>>();
 
         let local_needs_birthday = allow_local_nat_trigger
@@ -1182,13 +1218,29 @@ impl PeerConnection {
             return;
         }
 
-        let budget = birthday_probe_budget(history);
+        let per_base_budget = birthday_probe_budget(history);
+        let budget =
+            per_base_budget.saturating_mul(bases.len().min(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE));
         if budget == 0 {
             return;
         }
 
         let mut generated = 0usize;
-        for endpoint in birthday_probe_endpoints_for_bases(&bases, budget) {
+        let rotation_start_rank = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| {
+                pair.local_generation == local_generation
+                    && pair.source == CandidatePairSource::Birthday
+            })
+            .map(|pair| pair.probe_count as usize)
+            .min()
+            .unwrap_or(0)
+            .saturating_mul(per_base_budget)
+            % birthday_probe_wide_rank_count();
+        for endpoint in
+            birthday_probe_endpoints_for_bases_from_rank(&bases, budget, rotation_start_rank)
+        {
             if endpoints.contains(&endpoint) {
                 continue;
             }
@@ -2493,6 +2545,7 @@ impl PeerManager {
         conn.nat_type = info.nat_type.clone();
         conn.online = info.online;
         conn.last_seen = info.last_seen;
+        conn.remote_relay_rtt_ms = info.relay_rtt_ms;
 
         let signaled_endpoint = if info.endpoint.trim().is_empty() {
             None
@@ -3841,9 +3894,36 @@ impl PeerManager {
         relay_server: &str,
         switch_to_relay: bool,
     ) {
+        self.record_relay_success_inner(node_id, relay_server, switch_to_relay, None)
+            .await;
+    }
+
+    /// Record a successful relay-path event with measured peer round-trip latency.
+    pub async fn record_relay_success_with_latency(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+        latency: Duration,
+    ) {
+        self.record_relay_success_inner(node_id, relay_server, switch_to_relay, Some(latency))
+            .await;
+    }
+
+    async fn record_relay_success_inner(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+        latency: Option<Duration>,
+    ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.relay_server = Some(relay_server.to_string());
-            conn.relay_health.record_success();
+            if let Some(latency) = latency {
+                conn.relay_health.record_success_with_latency(latency);
+            } else {
+                conn.relay_health.record_success();
+            }
             if switch_to_relay || conn.state != ConnectionState::Direct {
                 conn.transition(ConnectionState::Relay);
                 info!(
@@ -4116,6 +4196,8 @@ pub struct PeerDiagnostics {
     pub nat_type: String,
     pub online: bool,
     pub last_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_relay_latency_ms: Option<u64>,
     pub state: ConnectionState,
     pub active_path: Option<NetworkPath>,
     pub direct_type: DirectPathType,
@@ -4249,6 +4331,7 @@ impl PeerDiagnostics {
             nat_type: conn.nat_type.clone(),
             online: conn.online,
             last_seen: conn.last_seen,
+            remote_relay_latency_ms: conn.remote_relay_rtt_ms,
             state: conn.state,
             active_path,
             direct_type,
@@ -4623,7 +4706,7 @@ fn apply_adaptive_probe_budgets<'a>(
     history: &TraversalHistory,
 ) -> Vec<&'a CandidatePair> {
     let predicted_budget = predicted_probe_budget(stats, history);
-    let birthday_budget = birthday_probe_budget(history);
+    let birthday_budget = birthday_probe_budget_for_pairs(history, &pairs);
     let mut predicted_used = 0usize;
     let mut birthday_used = 0usize;
 
@@ -4757,6 +4840,26 @@ fn predicted_probe_budget_with_reason(
 
 fn birthday_probe_budget(history: &TraversalHistory) -> usize {
     birthday_probe_budget_with_reason(history).0
+}
+
+fn birthday_probe_budget_for_base_count(history: &TraversalHistory, base_count: usize) -> usize {
+    if base_count == 0 {
+        return 0;
+    }
+    birthday_probe_budget(history)
+        .saturating_mul(base_count.min(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE))
+}
+
+fn birthday_probe_budget_for_pairs(history: &TraversalHistory, pairs: &[&CandidatePair]) -> usize {
+    let birthday_pair_count = pairs
+        .iter()
+        .filter(|pair| pair.source == CandidatePairSource::Birthday)
+        .count();
+    if birthday_pair_count == 0 {
+        return 0;
+    }
+    let base_count = birthday_pair_count.div_ceil(BIRTHDAY_PROBE_DELTAS.len());
+    birthday_probe_budget_for_base_count(history, base_count)
 }
 
 fn birthday_probe_budget_with_reason(history: &TraversalHistory) -> (usize, &'static str) {
@@ -4896,6 +4999,15 @@ fn discovered_endpoint_probe_rank(source: CandidatePairSource) -> u8 {
     }
 }
 
+fn speculative_probe_rotation_rank(pair: &CandidatePair) -> u64 {
+    if is_speculative_probe_source(pair.source) {
+        pair.probe_count
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
 fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
     BIRTHDAY_PROBE_DELTAS
         .into_iter()
@@ -4903,24 +5015,61 @@ fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn birthday_probe_endpoints_for_bases(bases: &[SocketAddr], budget: usize) -> Vec<SocketAddr> {
-    if let [base] = bases {
-        return birthday_probe_endpoints(*base)
-            .into_iter()
-            .take(budget)
-            .collect();
+fn birthday_probe_endpoint_for_rank(base: SocketAddr, rank: usize) -> Option<SocketAddr> {
+    if let Some(delta) = BIRTHDAY_PROBE_DELTAS.get(rank).copied() {
+        return birthday_probe_endpoint(base, delta);
     }
 
+    let wide_rank = rank.saturating_sub(BIRTHDAY_PROBE_DELTAS.len());
+    let bounded_rank = wide_rank % birthday_probe_wide_rank_count();
+    let magnitude = (((bounded_rank / 2) as i32 + 1) * BIRTHDAY_PROBE_WIDE_STRIDE)
+        % BIRTHDAY_PROBE_WIDE_MAX_DELTA;
+    let magnitude = if magnitude == 0 {
+        BIRTHDAY_PROBE_WIDE_MAX_DELTA
+    } else {
+        magnitude
+    };
+    let delta = if bounded_rank % 2 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    };
+    birthday_probe_endpoint(base, delta)
+}
+
+fn birthday_probe_wide_rank_count() -> usize {
+    (BIRTHDAY_PROBE_WIDE_MAX_DELTA as usize).saturating_mul(2)
+}
+
+#[cfg(test)]
+fn birthday_probe_endpoints_for_bases(bases: &[SocketAddr], budget: usize) -> Vec<SocketAddr> {
+    birthday_probe_endpoints_for_bases_from_rank(bases, budget, 0)
+}
+
+fn birthday_probe_endpoints_for_bases_from_rank(
+    bases: &[SocketAddr],
+    budget: usize,
+    start_rank: usize,
+) -> Vec<SocketAddr> {
     let mut endpoints = Vec::new();
-    for delta in BIRTHDAY_PROBE_DELTAS {
+    if bases.is_empty() || budget == 0 {
+        return endpoints;
+    }
+
+    let mut seen = HashSet::new();
+    let max_rank = BIRTHDAY_PROBE_DELTAS
+        .len()
+        .saturating_add(birthday_probe_wide_rank_count());
+    for offset in 0..max_rank {
+        let rank = start_rank.saturating_add(offset);
         for base in bases {
             if endpoints.len() >= budget {
                 return endpoints;
             }
-            let Some(endpoint) = birthday_probe_endpoint(*base, delta) else {
+            let Some(endpoint) = birthday_probe_endpoint_for_rank(*base, rank) else {
                 continue;
             };
-            if !endpoints.contains(&endpoint) {
+            if seen.insert(endpoint) {
                 endpoints.push(endpoint);
             }
         }
@@ -5428,6 +5577,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         }
     }
 
@@ -6061,6 +6211,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
 
         manager.add_peer(&peer_info).await;
@@ -6092,6 +6243,7 @@ mod tests {
                 virtual_ip: "10.20.0.9".to_string(),
                 online: false,
                 last_seen: 1_785_320_000,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -6218,6 +6370,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
 
         manager.add_peer(&peer_info).await;
@@ -6254,6 +6407,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -6330,6 +6484,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         manager
@@ -6770,9 +6925,10 @@ mod tests {
             .map(SocketAddr::port)
             .collect::<HashSet<_>>();
 
-        assert_eq!(endpoints.len(), 30);
+        assert_eq!(endpoints.len(), 54);
         for port in [
-            39999, 40001, 39996, 40004, 39990, 40010, 39968, 40032, 39936, 40064,
+            39999, 40001, 39996, 40004, 39990, 40010, 39983, 40017, 39981, 40019, 39968, 40032,
+            39936, 40064,
         ] {
             assert!(ports.contains(&port), "missing birthday port {port}");
         }
@@ -6801,6 +6957,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn birthday_probe_endpoints_for_bases_spreads_beyond_near_window() {
+        let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let endpoints =
+            birthday_probe_endpoints_for_bases(&[base], BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        let ports = endpoints
+            .iter()
+            .map(SocketAddr::port)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(endpoints.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        assert!(ports.contains(&39936));
+        assert!(ports.contains(&40064));
+        assert!(ports.contains(&40251));
+        assert!(ports.contains(&39749));
+        assert!(ports
+            .iter()
+            .all(|port| port.abs_diff(40000) <= BIRTHDAY_PROBE_WIDE_MAX_DELTA as u16));
+        assert!(ports.iter().any(|port| port.abs_diff(40000) > 64));
+    }
+
+    #[test]
+    fn birthday_probe_endpoints_for_bases_rotates_bounded_window() {
+        let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let first = birthday_probe_endpoints_for_bases_from_rank(&[base], 64, 0);
+        let second = birthday_probe_endpoints_for_bases_from_rank(
+            &[base],
+            64,
+            BIRTHDAY_PROBE_BUDGET_PER_CYCLE,
+        );
+        let first_ports = first.iter().map(SocketAddr::port).collect::<HashSet<_>>();
+        let second_ports = second.iter().map(SocketAddr::port).collect::<HashSet<_>>();
+
+        assert_eq!(first.len(), 64);
+        assert_eq!(second.len(), 64);
+        assert!(first_ports.is_disjoint(&second_ports));
+    }
+
     #[tokio::test]
     async fn birthday_candidates_use_wider_default_probe_budget() {
         let config = test_config();
@@ -6811,7 +7005,12 @@ mod tests {
         manager.update_nat_profile(birthday_nat_profile()).await;
 
         let initial_targets = manager.direct_probe_targets_for("peer1").await;
-        assert_eq!(initial_targets, vec![endpoint]);
+        let initial_birthday_count = initial_targets
+            .iter()
+            .filter(|target| **target != endpoint && target.ip() == endpoint.ip())
+            .count();
+        assert!(initial_targets.contains(&endpoint));
+        assert_eq!(initial_birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
 
         let background_targets = manager.direct_probe_targets().await;
         assert_eq!(background_targets.len(), 1);
@@ -6858,9 +7057,25 @@ mod tests {
                     && **target != registry_endpoint
             })
             .collect::<Vec<_>>();
+        let bases = candidates
+            .iter()
+            .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+            .chain(std::iter::once(registry_endpoint))
+            .collect::<Vec<_>>();
+        let expected_birthday_targets = birthday_probe_endpoints_for_bases(
+            &bases,
+            birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len()),
+        )
+        .into_iter()
+        .filter(|target| {
+            target.ip().to_string() == "203.0.113.10"
+                && !candidates.contains(&target.to_string())
+                && *target != registry_endpoint
+        })
+        .count();
 
         assert!(targets.contains(&registry_endpoint));
-        assert_eq!(birthday_targets.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        assert_eq!(birthday_targets.len(), expected_birthday_targets);
         assert!(birthday_targets
             .iter()
             .any(|target| target.port().abs_diff(41001) <= 2));
@@ -6903,9 +7118,25 @@ mod tests {
                     && **target != registry_endpoint
             })
             .collect::<Vec<_>>();
+        let bases = candidates
+            .iter()
+            .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+            .chain(std::iter::once(registry_endpoint))
+            .collect::<Vec<_>>();
+        let expected_birthday_targets = birthday_probe_endpoints_for_bases(
+            &bases,
+            birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len()),
+        )
+        .into_iter()
+        .filter(|target| {
+            target.ip().to_string() == "203.0.113.10"
+                && !candidates.contains(&target.to_string())
+                && *target != registry_endpoint
+        })
+        .count();
 
         assert!(targets.contains(&registry_endpoint));
-        assert_eq!(birthday_targets.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        assert_eq!(birthday_targets.len(), expected_birthday_targets);
         assert!(birthday_targets
             .iter()
             .any(|target| target.port().abs_diff(41001) <= 2));
@@ -6915,6 +7146,45 @@ mod tests {
         assert!(birthday_targets
             .iter()
             .any(|target| target.port().abs_diff(41113) <= 2));
+    }
+
+    #[tokio::test]
+    async fn stale_birthday_pairs_are_pruned_when_signaled_ports_move() {
+        let manager = PeerManager::new(test_config());
+        manager
+            .add_peer(&test_peer("peer1", "127.0.0.1:51820".parse().unwrap()))
+            .await;
+
+        let first_candidates = vec!["8.8.8.8:41000".to_string(), "8.8.8.8:41037".to_string()];
+        let first_sources = first_candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
+            .collect::<HashMap<_, _>>();
+        manager
+            .add_candidates_with_sources("peer1", &first_candidates, &first_sources)
+            .await;
+
+        let first_targets = manager.direct_probe_targets_for("peer1").await;
+        let stale_birthday: SocketAddr = "8.8.8.8:41001".parse().unwrap();
+        assert!(first_targets.contains(&stale_birthday));
+
+        let next_candidates = vec!["8.8.8.8:42000".to_string(), "8.8.8.8:42037".to_string()];
+        let next_sources = next_candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
+            .collect::<HashMap<_, _>>();
+        manager
+            .add_candidates_with_sources("peer1", &next_candidates, &next_sources)
+            .await;
+
+        let next_targets = manager.direct_probe_targets_for("peer1").await;
+        assert!(!next_targets.contains(&stale_birthday));
+
+        let diagnostics = manager.diagnostics().await;
+        assert!(!diagnostics[0]
+            .candidate_pairs
+            .iter()
+            .any(|pair| pair.remote_endpoint == stale_birthday.to_string()));
     }
 
     #[tokio::test]
@@ -6941,10 +7211,7 @@ mod tests {
 
         assert_eq!(targets.first().copied(), Some(stable_endpoint));
         assert!(targets.contains(&stable_endpoint));
-        assert_eq!(
-            birthday_count,
-            birthday_probe_endpoints(stable_endpoint).len()
-        );
+        assert_eq!(birthday_count, BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE);
     }
 
     #[tokio::test]
@@ -6961,6 +7228,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
 
         manager.add_peer(&peer).await;
@@ -7009,6 +7277,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
 
         manager.add_peer(&peer).await;
@@ -7105,6 +7374,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
         manager
@@ -7398,6 +7668,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -7481,6 +7752,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
 
         manager.add_peer(&peer_info).await;
@@ -7514,6 +7786,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
         let selected_endpoint: SocketAddr = "127.0.0.1:51821".parse().unwrap();
 
@@ -8549,6 +8822,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -8647,6 +8921,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -8747,6 +9022,7 @@ mod tests {
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             })
             .await;
 
@@ -8776,6 +9052,7 @@ mod tests {
                 virtual_ip: ip.to_string(),
                 online: true,
                 last_seen: 0,
+                relay_rtt_ms: None,
             };
             manager.add_peer(&peer_info).await;
         }
@@ -8809,6 +9086,7 @@ mod tests {
             virtual_ip: "10.20.0.2".to_string(),
             online: true,
             last_seen: 0,
+            relay_rtt_ms: None,
         };
         manager.add_peer(&peer_info).await;
 

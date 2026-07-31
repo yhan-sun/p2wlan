@@ -42,7 +42,7 @@ pub use stun::{
     BINDING_REQUEST, BINDING_RESPONSE, MAGIC_COOKIE,
 };
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// NAT type classification (RFC 3489).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +109,10 @@ impl Endpoint {
 
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.ip, self.port)
+        match self.ip.parse::<IpAddr>() {
+            Ok(ip) => write!(f, "{}", SocketAddr::new(ip, self.port)),
+            Err(_) => write!(f, "{}:{}", self.ip, self.port),
+        }
     }
 }
 
@@ -272,6 +275,17 @@ mod tests {
         let ep = Endpoint::parse("1.2.3.4:5678").unwrap();
         assert_eq!(ep.ip, "1.2.3.4");
         assert_eq!(ep.port, 5678);
+    }
+
+    #[test]
+    fn endpoint_display_formats_ipv6_socket_addr() {
+        let ep = Endpoint::new("2001:db8::1", 5678);
+
+        assert_eq!(ep.to_string(), "[2001:db8::1]:5678");
+        assert_eq!(
+            ep.to_socket_addr().unwrap(),
+            "[2001:db8::1]:5678".parse().unwrap()
+        );
     }
 
     #[test]

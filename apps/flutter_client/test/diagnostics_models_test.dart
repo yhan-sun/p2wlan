@@ -84,6 +84,27 @@ void main() {
     },
   );
 
+  test('network generation refresh is not surfaced as peer error', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'relay-peer',
+      'device_name': 'travel-mac',
+      'virtual_ip': '10.20.0.40',
+      'online': true,
+      'state': 'relay',
+      'active_path': 'relay',
+      'direct_type': 'relay',
+      'is_relay': true,
+      'direct': {
+        'last_error_code': 'network_generation_changed',
+        'last_error': 'network_generation_changed: refreshed UDP candidates',
+      },
+      'relay': {'latency_ms': 33},
+    });
+
+    expect(peer.path, 'relay');
+    expect(peer.lastError, isNull);
+  });
+
   test('offline peers stay offline even when path selection says relay', () {
     final peer = PeerSnapshot.fromJson({
       'node_id': 'offline-peer',

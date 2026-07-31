@@ -79,9 +79,6 @@ class _NodesPageState extends State<NodesPage> {
         final peers = _dedupeAndSortPeers(
           snapshot?.peers ?? const <PeerSnapshot>[],
         ).where((peer) => !_hiddenPeerIds.contains(peer.nodeId)).toList();
-        final relayFallbackLatencyMs = snapshot?.relayConnected == true
-            ? snapshot?.relaySelection.latencyMs
-            : null;
         final settings = widget.settingsStore.settings;
         return PageScaffold(
           title: strings.nodes,
@@ -113,11 +110,7 @@ class _NodesPageState extends State<NodesPage> {
                 copiedKey: _copiedKey,
                 busyPeerId: _busyPeerId,
                 onCopy: _copy,
-                relayFallbackLatencyMs: relayFallbackLatencyMs,
-                onDetails: (peer) => _showPeerDetails(
-                  peer,
-                  relayFallbackLatencyMs: relayFallbackLatencyMs,
-                ),
+                onDetails: _showPeerDetails,
                 onEdit: _editPeer,
                 onDelete: _deletePeer,
               ),
@@ -287,18 +280,12 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 
-  Future<void> _showPeerDetails(
-    PeerSnapshot peer, {
-    required int? relayFallbackLatencyMs,
-  }) async {
+  Future<void> _showPeerDetails(PeerSnapshot peer) async {
     final strings = AppStringsScope.of(context);
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) => _PeerDetailsDialog(
-        peer: peer,
-        strings: strings,
-        relayFallbackLatencyMs: relayFallbackLatencyMs,
-      ),
+      builder: (dialogContext) =>
+          _PeerDetailsDialog(peer: peer, strings: strings),
     );
   }
 
@@ -309,52 +296,58 @@ class _NodesPageState extends State<NodesPage> {
     final strings = AppStringsScope.of(context);
     final controller = TextEditingController(text: initialName);
     String? error;
-    final result = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: Text(title),
-              content: TextField(
-                controller: controller,
-                autofocus: true,
-                decoration: InputDecoration(
-                  labelText: strings.deviceName,
-                  errorText: error,
+    try {
+      final result = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return AlertDialog(
+                title: Text(title),
+                content: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  decoration: InputDecoration(
+                    labelText: strings.deviceName,
+                    errorText: error,
+                  ),
+                  onSubmitted: (value) =>
+                      Navigator.of(dialogContext).pop(value),
                 ),
-                onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: Text(strings.cancel),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final name = controller.text.trim();
-                    if (name.isEmpty) {
-                      setDialogState(() {
-                        error = strings.isZh
-                            ? '设备名称不能为空'
-                            : 'Device name is required';
-                      });
-                      return;
-                    }
-                    Navigator.of(dialogContext).pop(name);
-                  },
-                  child: Text(strings.save),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-    controller.dispose();
-    final name = result?.trim();
-    if (name == null || name.isEmpty) return null;
-    return name;
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    child: Text(strings.cancel),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      final name = controller.text.trim();
+                      if (name.isEmpty) {
+                        setDialogState(() {
+                          error = strings.isZh
+                              ? '设备名称不能为空'
+                              : 'Device name is required';
+                        });
+                        return;
+                      }
+                      Navigator.of(dialogContext).pop(name);
+                    },
+                    child: Text(strings.save),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+      final name = result?.trim();
+      if (name == null || name.isEmpty) return null;
+      return name;
+    } finally {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        controller.dispose();
+      });
+    }
   }
 
   Future<_LocalNodeProfileResult?> _promptLocalNodeProfile({
@@ -365,89 +358,94 @@ class _NodesPageState extends State<NodesPage> {
     final nameController = TextEditingController(text: initialName);
     final ipController = TextEditingController(text: initialVirtualIp);
     String? error;
-    final result = await showDialog<_LocalNodeProfileResult>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: Text(strings.isZh ? '编辑本机节点' : 'Edit this device'),
-              content: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: nameController,
-                      autofocus: true,
-                      decoration: InputDecoration(
-                        labelText: strings.deviceName,
+    try {
+      final result = await showDialog<_LocalNodeProfileResult>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return AlertDialog(
+                title: Text(strings.isZh ? '编辑本机节点' : 'Edit this device'),
+                content: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: nameController,
+                        autofocus: true,
+                        decoration: InputDecoration(
+                          labelText: strings.deviceName,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: ipController,
-                      decoration: InputDecoration(
-                        labelText: strings.isZh
-                            ? '期望虚拟 IP'
-                            : 'Requested virtual IP',
-                        helperText: strings.isZh
-                            ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
-                            : 'Leave blank for automatic assignment; restart P2WLAN after changing it.',
-                        errorText: error,
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: ipController,
+                        decoration: InputDecoration(
+                          labelText: strings.isZh
+                              ? '期望虚拟 IP'
+                              : 'Requested virtual IP',
+                          helperText: strings.isZh
+                              ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
+                              : 'Leave blank for automatic assignment; restart P2WLAN after changing it.',
+                          errorText: error,
+                        ),
+                        keyboardType: TextInputType.number,
                       ),
-                      keyboardType: TextInputType.number,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: Text(strings.cancel),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final name = nameController.text.trim();
-                    final virtualIp = ipController.text.trim();
-                    if (name.isEmpty) {
-                      setDialogState(() {
-                        error = strings.isZh
-                            ? '设备名称不能为空'
-                            : 'Device name is required';
-                      });
-                      return;
-                    }
-                    final parsedIp = virtualIp.isEmpty
-                        ? null
-                        : InternetAddress.tryParse(virtualIp);
-                    if (virtualIp.isNotEmpty &&
-                        parsedIp?.type != InternetAddressType.IPv4) {
-                      setDialogState(() {
-                        error = strings.isZh
-                            ? '虚拟 IP 格式不正确，例如 10.20.0.42'
-                            : 'Virtual IP must look like 10.20.0.42';
-                      });
-                      return;
-                    }
-                    Navigator.of(dialogContext).pop(
-                      _LocalNodeProfileResult(
-                        deviceName: name,
-                        virtualIp: virtualIp,
-                      ),
-                    );
-                  },
-                  child: Text(strings.save),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-    nameController.dispose();
-    ipController.dispose();
-    return result;
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    child: Text(strings.cancel),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      final name = nameController.text.trim();
+                      final virtualIp = ipController.text.trim();
+                      if (name.isEmpty) {
+                        setDialogState(() {
+                          error = strings.isZh
+                              ? '设备名称不能为空'
+                              : 'Device name is required';
+                        });
+                        return;
+                      }
+                      final parsedIp = virtualIp.isEmpty
+                          ? null
+                          : InternetAddress.tryParse(virtualIp);
+                      if (virtualIp.isNotEmpty &&
+                          parsedIp?.type != InternetAddressType.IPv4) {
+                        setDialogState(() {
+                          error = strings.isZh
+                              ? '虚拟 IP 格式不正确，例如 10.20.0.42'
+                              : 'Virtual IP must look like 10.20.0.42';
+                        });
+                        return;
+                      }
+                      Navigator.of(dialogContext).pop(
+                        _LocalNodeProfileResult(
+                          deviceName: name,
+                          virtualIp: virtualIp,
+                        ),
+                      );
+                    },
+                    child: Text(strings.save),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+      return result;
+    } finally {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        nameController.dispose();
+        ipController.dispose();
+      });
+    }
   }
 }
 
@@ -578,15 +576,10 @@ class _LocalNodePanel extends StatelessWidget {
 }
 
 class _PeerDetailsDialog extends StatelessWidget {
-  const _PeerDetailsDialog({
-    required this.peer,
-    required this.strings,
-    required this.relayFallbackLatencyMs,
-  });
+  const _PeerDetailsDialog({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
   final AppStrings strings;
-  final int? relayFallbackLatencyMs;
 
   @override
   Widget build(BuildContext context) {
@@ -689,9 +682,7 @@ class _PeerDetailsDialog extends StatelessWidget {
                         ),
                         _DetailLine(
                           label: strings.latency,
-                          value: formatLatency(
-                            _displayLatencyMs(peer, relayFallbackLatencyMs),
-                          ),
+                          value: formatLatency(peer.latencyMs),
                         ),
                         _DetailLine(
                           label: strings.isZh ? '在线状态' : 'Online state',
@@ -919,7 +910,6 @@ class _PeerTable extends StatelessWidget {
   const _PeerTable({
     required this.peers,
     required this.copiedKey,
-    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -928,7 +918,6 @@ class _PeerTable extends StatelessWidget {
 
   final List<PeerSnapshot> peers;
   final String? copiedKey;
-  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -969,7 +958,6 @@ class _PeerTable extends StatelessWidget {
                         strings: strings,
                         shaded: index.isOdd,
                         copiedKey: copiedKey,
-                        relayFallbackLatencyMs: relayFallbackLatencyMs,
                         onCopy: onCopy,
                         onEdit: onEdit,
                       );
@@ -1105,7 +1093,6 @@ class _PeerRow extends StatelessWidget {
     required this.strings,
     required this.shaded,
     required this.copiedKey,
-    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onEdit,
   });
@@ -1114,7 +1101,6 @@ class _PeerRow extends StatelessWidget {
   final AppStrings strings;
   final bool shaded;
   final String? copiedKey;
-  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onEdit;
 
@@ -1188,9 +1174,9 @@ class _PeerRow extends StatelessWidget {
           ),
           _PeerCell(
             width: _PeerTable._latencyWidth,
-            child: Text(
-              formatLatency(_displayLatencyMs(peer, relayFallbackLatencyMs)),
-              style: _PeerTable._cellMonoStyle,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: _LatencyText(peer: peer),
             ),
           ),
           _PeerCell(
@@ -1240,7 +1226,6 @@ class _PeerList extends StatelessWidget {
     required this.peers,
     required this.copiedKey,
     required this.busyPeerId,
-    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -1250,7 +1235,6 @@ class _PeerList extends StatelessWidget {
   final List<PeerSnapshot> peers;
   final String? copiedKey;
   final String? busyPeerId;
-  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -1311,7 +1295,6 @@ class _PeerList extends StatelessWidget {
                       compact: compact,
                       copiedKey: copiedKey,
                       busy: busyPeerId == peer.nodeId,
-                      relayFallbackLatencyMs: relayFallbackLatencyMs,
                       onCopy: onCopy,
                       onDetails: onDetails,
                       onEdit: onEdit,
@@ -1400,7 +1383,6 @@ class _PeerListRow extends StatelessWidget {
     required this.compact,
     required this.copiedKey,
     required this.busy,
-    required this.relayFallbackLatencyMs,
     required this.onCopy,
     required this.onDetails,
     required this.onEdit,
@@ -1413,7 +1395,6 @@ class _PeerListRow extends StatelessWidget {
   final bool compact;
   final String? copiedKey;
   final bool busy;
-  final int? relayFallbackLatencyMs;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
@@ -1457,10 +1438,7 @@ class _PeerListRow extends StatelessWidget {
                     const SizedBox(height: 6),
                     Row(
                       children: [
-                        _LatencyText(
-                          peer: peer,
-                          relayFallbackLatencyMs: relayFallbackLatencyMs,
-                        ),
+                        _LatencyText(peer: peer),
                         const SizedBox(width: 10),
                         Expanded(
                           child: Align(
@@ -1480,10 +1458,7 @@ class _PeerListRow extends StatelessWidget {
                       width: 92,
                       child: Align(
                         alignment: Alignment.centerRight,
-                        child: _LatencyText(
-                          peer: peer,
-                          relayFallbackLatencyMs: relayFallbackLatencyMs,
-                        ),
+                        child: _LatencyText(peer: peer),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -1567,19 +1542,15 @@ class _PeerListRow extends StatelessWidget {
 }
 
 class _LatencyText extends StatelessWidget {
-  const _LatencyText({
-    required this.peer,
-    required this.relayFallbackLatencyMs,
-  });
+  const _LatencyText({required this.peer});
 
   final PeerSnapshot peer;
-  final int? relayFallbackLatencyMs;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Text(
-      formatLatency(_displayLatencyMs(peer, relayFallbackLatencyMs)),
+      formatLatency(peer.latencyMs),
       textAlign: TextAlign.right,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
@@ -1591,13 +1562,6 @@ class _LatencyText extends StatelessWidget {
       ),
     );
   }
-}
-
-int? _displayLatencyMs(PeerSnapshot peer, int? relayFallbackLatencyMs) {
-  final peerLatency = peer.latencyMs;
-  if (peerLatency != null) return peerLatency;
-  if (peer.online && peer.path == 'relay') return relayFallbackLatencyMs;
-  return null;
 }
 
 class _TinySpinner extends StatelessWidget {
@@ -1725,7 +1689,9 @@ List<_PeerGroup> _buildPeerGroups(
   final offline = <PeerSnapshot>[];
 
   for (final peer in peers) {
-    if (_peerNeedsAttention(peer)) {
+    if (_peerIsOffline(peer)) {
+      offline.add(peer);
+    } else if (_peerNeedsAttention(peer)) {
       attention.add(peer);
     } else if (peer.path == 'direct') {
       direct.add(peer);
@@ -1793,6 +1759,7 @@ int _comparePeers(PeerSnapshot left, PeerSnapshot right) {
 }
 
 int _peerSortRank(PeerSnapshot peer) {
+  if (_peerIsOffline(peer)) return 3;
   if (_peerNeedsAttention(peer)) return 0;
   if (peer.path == 'direct') return 1;
   if (peer.path == 'relay') return 2;
@@ -1800,12 +1767,16 @@ int _peerSortRank(PeerSnapshot peer) {
 }
 
 bool _peerNeedsAttention(PeerSnapshot peer) {
+  if (_peerIsOffline(peer)) return false;
   if (peer.lastError != null) return true;
   return peer.online && (peer.path == 'probing' || peer.path == 'direct_trial');
 }
 
+bool _peerIsOffline(PeerSnapshot peer) =>
+    !peer.online || peer.path == 'offline';
+
 String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
-  if (!peer.online || peer.path == 'offline') return strings.offline;
+  if (_peerIsOffline(peer)) return strings.offline;
   if (peer.path == 'relay') return strings.relay;
   if (peer.path == 'direct_trial' || peer.path == 'probing') {
     return strings.probing;
