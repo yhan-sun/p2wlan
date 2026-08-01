@@ -22,6 +22,8 @@ import (
 
 var signalLongPollFallbackInterval = 100 * time.Millisecond
 
+const maxSignalCandidates = 32
+
 // Server handles API requests.
 type Server struct {
 	auth                     *auth.Service
@@ -803,8 +805,8 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.Candidates) > 20 {
-		http.Error(w, `{"error":"too many candidates (max 20)"}`, http.StatusBadRequest)
+	if len(req.Candidates) > maxSignalCandidates {
+		http.Error(w, fmt.Sprintf(`{"error":"too many candidates (max %d)"}`, maxSignalCandidates), http.StatusBadRequest)
 		return
 	}
 	if req.Type == "peer_reflexive" && len(req.Candidates) == 0 {

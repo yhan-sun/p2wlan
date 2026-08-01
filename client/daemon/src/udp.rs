@@ -40,7 +40,7 @@ type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 type PeerReflexiveNotificationState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
-type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
+type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr, usize), Instant>>>;
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
@@ -716,7 +716,7 @@ impl UdpTransport {
         peer_id: &str,
         observed_endpoint: SocketAddr,
     ) {
-        let key = (peer_id.to_string(), observed_endpoint);
+        let key = (peer_id.to_string(), observed_endpoint, socket_index);
         {
             let mut checks = self.triggered_checks.lock().await;
             checks.retain(|_, sent_at| sent_at.elapsed() < TRIGGERED_CHECK_COOLDOWN);
