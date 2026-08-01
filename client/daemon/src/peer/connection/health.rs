@@ -41,10 +41,14 @@ impl PeerConnection {
         latency: Option<Duration>,
         selected: bool,
         local_endpoint: Option<SocketAddr>,
-    ) -> CandidatePairSource {
+    ) -> (CandidatePairSource, bool) {
         let peer_id = self.node_id.clone();
         let pair = self.ensure_candidate_pair(endpoint, local_generation);
         let old_state = pair.state;
+        let became_reachable = !matches!(
+            old_state,
+            CandidatePairState::Succeeded | CandidatePairState::Selected
+        );
         pair.record_success(latency, selected, local_endpoint);
         log_candidate_pair_state_changed(
             &peer_id,
@@ -56,7 +60,7 @@ impl PeerConnection {
                 "received UDP punch ACK"
             },
         );
-        pair.source
+        (pair.source, became_reachable)
     }
 
     fn mark_candidate_pair_nominated(

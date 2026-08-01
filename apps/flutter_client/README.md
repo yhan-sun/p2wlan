@@ -56,6 +56,14 @@ apps/flutter_client/scripts/bundle_daemon_macos.sh
 It builds `p2wlan-daemon` for Debug/Release when missing and copies it into the
 app bundle Resources directory.
 
+Build the release Flutter DMG, including a freshly compiled Rust daemon, with:
+
+```bash
+apps/flutter_client/scripts/package_macos.sh
+```
+
+The artifact is written under `target/flutter/release/`.
+
 ## Diagnostics
 
 The default diagnostics URL is:

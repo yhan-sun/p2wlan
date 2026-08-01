@@ -276,3 +276,60 @@ async fn candidate_pair_stats_aggregate_real_outcomes_by_source() {
     let json = serde_json::to_value(&diagnostics[0]).unwrap();
     assert_eq!(json["candidate_pair_stats"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn repeated_probe_acks_record_one_traversal_success_transition() {
+    let manager = PeerManager::new(test_config());
+    let signaled_endpoint: SocketAddr = "127.0.0.1:51856".parse().unwrap();
+    let peer_reflexive_endpoint: SocketAddr = "127.0.0.1:51857".parse().unwrap();
+    manager
+        .add_peer(&test_peer("peer1", signaled_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[peer_reflexive_endpoint.to_string()],
+            &HashMap::from([(
+                peer_reflexive_endpoint.to_string(),
+                "peer_reflexive".to_string(),
+            )]),
+        )
+        .await;
+
+    for latency_ms in [9, 7] {
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer1",
+                    peer_reflexive_endpoint,
+                    Some(Duration::from_millis(latency_ms)),
+                    0,
+                )
+                .await
+        );
+    }
+
+    let history = manager.traversal_history_diagnostics().await;
+    let peer_reflexive_history = history
+        .sources
+        .iter()
+        .find(|source| source.source == "peer_reflexive")
+        .unwrap();
+    assert_eq!(peer_reflexive_history.success_count, 1);
+
+    let diagnostics = manager.diagnostics().await;
+    let pair = diagnostics[0]
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == peer_reflexive_endpoint.to_string())
+        .unwrap();
+    assert_eq!(pair.success_count, 2);
+    assert_eq!(
+        diagnostics[0]
+            .direct_events
+            .iter()
+            .filter(|event| event.stage == "probe_ack_received")
+            .count(),
+        1
+    );
+}

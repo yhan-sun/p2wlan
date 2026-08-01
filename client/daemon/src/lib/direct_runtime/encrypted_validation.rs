@@ -53,26 +53,34 @@ async fn run_direct_encrypted_validation(
     }
 
     let validation_id = unix_time_millis() as u16;
-    let mut sent = 0u32;
-    for (sequence, delay) in DIRECT_ENCRYPTED_VALIDATION_DELAYS.into_iter().enumerate() {
-        if !delay.is_zero() {
-            sleep(delay).await;
-        }
+    let session_wait_started = Instant::now();
+    let mut waiting_for_session = false;
+    let first_encrypted = loop {
         if peers
             .is_direct_for_generation(&observation.peer_id, generation)
             .await
         {
-            break;
+            peers
+                .record_direct_event(
+                    &observation.peer_id,
+                    "encrypted_trial_skipped",
+                    Some(observation.observed_endpoint),
+                    None,
+                    Some(0),
+                    "skipped bounded WireGuard validation because Direct became confirmed while waiting for the WireGuard session",
+                )
+                .await;
+            return;
         }
 
         let packet = Ipv4Packet::build_icmp_echo_request(
             local_ip,
             peer_ip,
             validation_id,
-            sequence as u16,
+            0,
             DIRECT_ENCRYPTED_VALIDATION_PAYLOAD,
         );
-        let encrypted = match transport
+        match transport
             .encrypt_outbound(OutboundPacket {
                 peer_id: observation.peer_id.clone(),
                 dst_ip: connection.virtual_ip.clone(),
@@ -80,23 +88,68 @@ async fn run_direct_encrypted_validation(
             })
             .await
         {
-            Ok(Some(encrypted)) => encrypted,
+            Ok(Some(encrypted)) => {
+                if waiting_for_session {
+                    peers
+                        .record_direct_event(
+                            &observation.peer_id,
+                            "encrypted_trial_session_ready",
+                            Some(observation.observed_endpoint),
+                            None,
+                            Some(0),
+                            format!(
+                                "WireGuard session became ready after {}ms",
+                                session_wait_started.elapsed().as_millis()
+                            ),
+                        )
+                        .await;
+                }
+                break encrypted;
+            }
             Ok(None) => {
-                debug!(
-                    "Skipping encrypted Direct validation for {}; WireGuard session is not ready",
-                    observation.peer_id
-                );
-                peers
-                    .record_direct_event(
-                        &observation.peer_id,
-                        "encrypted_trial_skipped",
-                        Some(observation.observed_endpoint),
-                        None,
-                        Some(sent),
-                        "skipped bounded WireGuard validation because WireGuard session is not ready",
-                    )
-                    .await;
-                return;
+                if !waiting_for_session {
+                    waiting_for_session = true;
+                    peers
+                        .record_direct_event(
+                            &observation.peer_id,
+                            "encrypted_trial_waiting_for_session",
+                            Some(observation.observed_endpoint),
+                            None,
+                            Some(0),
+                            "peer-reflexive endpoint arrived before the WireGuard session; waiting for the handshake",
+                        )
+                        .await;
+                }
+
+                let elapsed = session_wait_started.elapsed();
+                if elapsed >= DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT {
+                    debug!(
+                        "Skipping encrypted Direct validation for {}; WireGuard session was not ready within {}ms",
+                        observation.peer_id,
+                        DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
+                    );
+                    peers
+                        .record_direct_event(
+                            &observation.peer_id,
+                            "encrypted_trial_skipped",
+                            Some(observation.observed_endpoint),
+                            None,
+                            Some(0),
+                            format!(
+                                "timed out after {}ms waiting for the WireGuard session",
+                                DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+
+                sleep(
+                    DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL.min(
+                        DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.saturating_sub(elapsed),
+                    ),
+                )
+                .await;
             }
             Err(err) => {
                 warn!(
@@ -109,11 +162,85 @@ async fn run_direct_encrypted_validation(
                         "encrypted_trial_failed",
                         Some(observation.observed_endpoint),
                         None,
-                        Some(sent),
+                        Some(0),
                         format!("failed to encrypt bounded WireGuard validation packet: {err}"),
                     )
                     .await;
                 return;
+            }
+        }
+    };
+
+    let mut first_encrypted = Some(first_encrypted);
+    let mut sent = 0u32;
+    for (sequence, delay) in DIRECT_ENCRYPTED_VALIDATION_DELAYS.into_iter().enumerate() {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        if peers
+            .is_direct_for_generation(&observation.peer_id, generation)
+            .await
+        {
+            break;
+        }
+
+        let encrypted = if sequence == 0 {
+            first_encrypted
+                .take()
+                .expect("first encrypted validation packet must be available")
+        } else {
+            let packet = Ipv4Packet::build_icmp_echo_request(
+                local_ip,
+                peer_ip,
+                validation_id,
+                sequence as u16,
+                DIRECT_ENCRYPTED_VALIDATION_PAYLOAD,
+            );
+            match transport
+                .encrypt_outbound(OutboundPacket {
+                    peer_id: observation.peer_id.clone(),
+                    dst_ip: connection.virtual_ip.clone(),
+                    packet,
+                })
+                .await
+            {
+                Ok(Some(encrypted)) => encrypted,
+                Ok(None) => {
+                    debug!(
+                        "Stopping encrypted Direct validation for {}; WireGuard session is no longer ready",
+                        observation.peer_id
+                    );
+                    peers
+                        .record_direct_event(
+                            &observation.peer_id,
+                            "encrypted_trial_skipped",
+                            Some(observation.observed_endpoint),
+                            None,
+                            Some(sent),
+                            "stopped bounded WireGuard validation because the WireGuard session became unavailable",
+                        )
+                        .await;
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to encrypt Direct validation packet for {}: {err}",
+                        observation.peer_id
+                    );
+                    peers
+                        .record_direct_event(
+                            &observation.peer_id,
+                            "encrypted_trial_failed",
+                            Some(observation.observed_endpoint),
+                            None,
+                            Some(sent),
+                            format!(
+                                "failed to encrypt bounded WireGuard validation packet: {err}"
+                            ),
+                        )
+                        .await;
+                    return;
+                }
             }
         };
 

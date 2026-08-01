@@ -51,6 +51,11 @@ impl UdpTransport {
                 continue;
             }
 
+            self.update_socket_diagnostics(socket_index, |metrics| {
+                metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
+            })
+            .await;
+
             let data = &buf[..n];
 
             if let Some(transaction_id) = stun_transaction_id(data) {
@@ -64,7 +69,18 @@ impl UdpTransport {
             }
 
             if is_authenticated_punch_candidate(data) {
+                self.update_socket_diagnostics(socket_index, |metrics| {
+                    metrics.authenticated_probe_packets_received = metrics
+                        .authenticated_probe_packets_received
+                        .saturating_add(1)
+                })
+                .await;
                 let Some(identity) = peek_authenticated_punch_identity(data) else {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.authenticated_probe_malformed =
+                            metrics.authenticated_probe_malformed.saturating_add(1)
+                    })
+                    .await;
                     trace!("Ignored malformed authenticated UDP probe from {source}");
                     continue;
                 };
@@ -75,6 +91,11 @@ impl UdpTransport {
                     continue;
                 };
                 if identity.target_node_id != local_node_id {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.authenticated_probe_wrong_target =
+                            metrics.authenticated_probe_wrong_target.saturating_add(1)
+                    })
+                    .await;
                     trace!(
                         "Ignored authenticated UDP probe from {} for target {}",
                         identity.source_node_id,
@@ -87,6 +108,11 @@ impl UdpTransport {
                     .probe_keys_for_peer(&identity.source_node_id)
                     .await;
                 if keys.is_empty() {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.authenticated_probe_no_key =
+                            metrics.authenticated_probe_no_key.saturating_add(1)
+                    })
+                    .await;
                     trace!(
                         "Ignored authenticated UDP probe from {}; no Probe v2 MAC key",
                         identity.source_node_id
@@ -96,6 +122,11 @@ impl UdpTransport {
                 let Some((packet, key)) = keys.into_iter().find_map(|key| {
                     decode_authenticated_punch_packet(data, &key).map(|packet| (packet, key))
                 }) else {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.authenticated_probe_invalid_mac =
+                            metrics.authenticated_probe_invalid_mac.saturating_add(1)
+                    })
+                    .await;
                     trace!(
                         "Ignored authenticated UDP probe from {}; invalid MAC",
                         identity.source_node_id

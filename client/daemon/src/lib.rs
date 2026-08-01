@@ -186,6 +186,11 @@ const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
     Duration::from_millis(80),
     Duration::from_millis(250),
 ];
+/// A peer-reflexive ACK can arrive before the offer/answer handler installs the
+/// WireGuard session. Keep the observed NAT mapping alive while waiting for the
+/// handshake instead of permanently discarding the only useful endpoint.
+const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(8);
+const DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL: Duration = Duration::from_millis(50);
 const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
 /// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
 /// Competing bursts can create distinct NAT mappings and reduce, rather than

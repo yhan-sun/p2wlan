@@ -319,3 +319,29 @@ use super::*;
             clap::error::ErrorKind::DisplayVersion
         );
     }
+
+    #[test]
+    fn daemon_instance_lock_rejects_second_owner_for_same_config() {
+        let unique = format!(
+            "p2wlan-instance-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("p2wlan-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+
+        let first = DaemonInstanceLock::acquire(&config_path).unwrap();
+        let error = DaemonInstanceLock::acquire(&config_path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("another P2WLAN daemon is already running"));
+
+        drop(first);
+        assert!(DaemonInstanceLock::acquire(&config_path).is_ok());
+        let _ = std::fs::remove_dir_all(directory);
+    }

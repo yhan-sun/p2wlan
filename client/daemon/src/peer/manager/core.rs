@@ -63,12 +63,9 @@ impl PeerManager {
         if !source.is_persisted_history_source() {
             return;
         }
-        let snapshot = {
-            let mut history = self.traversal_history.write().await;
-            history.record_success(source);
-            history.clone()
-        };
-        self.persist_traversal_history(&snapshot);
+        let mut history = self.traversal_history.write().await;
+        history.record_success(source);
+        self.persist_traversal_history(&history);
     }
 
     async fn record_traversal_failures(&self, sources: Vec<CandidatePairSource>) {
@@ -82,14 +79,11 @@ impl PeerManager {
             return;
         }
 
-        let snapshot = {
-            let mut history = self.traversal_history.write().await;
-            for source in unique_sources {
-                history.record_failure(source);
-            }
-            history.clone()
-        };
-        self.persist_traversal_history(&snapshot);
+        let mut history = self.traversal_history.write().await;
+        for source in unique_sources {
+            history.record_failure(source);
+        }
+        self.persist_traversal_history(&history);
     }
 
     fn persist_traversal_history(&self, history: &TraversalHistory) {

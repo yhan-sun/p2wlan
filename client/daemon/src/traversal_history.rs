@@ -15,7 +15,9 @@ use crate::config::Config;
 use crate::peer::CandidatePairSource;
 
 pub const TRAVERSAL_HISTORY_FILE_NAME: &str = "traversal-history.json";
-const TRAVERSAL_HISTORY_VERSION: u8 = 1;
+// Version 1 counted every repeated ACK as an independent traversal success.
+// Reset those biased aggregates now that history tracks state transitions.
+const TRAVERSAL_HISTORY_VERSION: u8 = 2;
 const MAX_HISTORY_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const SHORT_COOLDOWN_MS: u64 = 60 * 1000;
 const LONG_COOLDOWN_MS: u64 = 5 * 60 * 1000;
@@ -50,7 +52,9 @@ impl TraversalHistory {
         let Ok(mut history) = serde_json::from_str::<Self>(&content) else {
             return Self::default();
         };
-        history.version = TRAVERSAL_HISTORY_VERSION;
+        if history.version != TRAVERSAL_HISTORY_VERSION {
+            return Self::default();
+        }
         history.prune_expired(now_ms());
         history
     }
@@ -61,7 +65,7 @@ impl TraversalHistory {
         }
 
         let content = serde_json::to_vec_pretty(self)?;
-        let tmp_path = path.with_extension("json.tmp");
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         fs::write(&tmp_path, content)?;
         fs::rename(tmp_path, path)
     }
@@ -272,6 +276,26 @@ mod tests {
                 .success_count,
             1
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn discards_v1_history_with_per_ack_counters() {
+        let path = std::env::temp_dir().join(format!(
+            "p2wlan-traversal-history-v1-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        let mut history = TraversalHistory::default();
+        history.version = 1;
+        history.record_success(CandidatePairSource::PeerReflexive);
+        history.save(&path).unwrap();
+
+        let loaded = TraversalHistory::load(Some(&path));
+        assert_eq!(loaded.version, TRAVERSAL_HISTORY_VERSION);
+        assert!(loaded.sources.is_empty());
 
         let _ = fs::remove_file(path);
     }

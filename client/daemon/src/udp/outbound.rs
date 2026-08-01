@@ -115,6 +115,9 @@ impl UdpTransport {
                                 peer_id,
                                 candidate
                             );
+                            if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
+                                sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
+                            }
                         }
                         Err(err) => {
                             debug!(
