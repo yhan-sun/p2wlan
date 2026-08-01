@@ -5,17 +5,13 @@
 //! `PeerManager` and sends the encrypted datagram to that socket address.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use p2pnet_crypto::hash as crypto_hash;
 use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet_with_nomination,
     build_punch_ack, build_punch_packet, build_punch_packet_with_nonce,
@@ -34,6 +30,24 @@ use crate::error::{DaemonError, Result};
 use crate::peer::{PeerManager, REASON_DIRECT_SEND_FAILED};
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
+mod probe_budget;
+use probe_budget::{
+    default_global_outbound_probe_budget, GlobalOutboundProbeBudget, OutboundProbeAdmission,
+    OutboundProbeBudgetKey, OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK,
+    OUTBOUND_PROBE_BUDGET_PER_PEER, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
+    OUTBOUND_PROBE_BUDGET_WINDOW,
+};
+#[cfg(test)]
+use probe_budget::{
+    global_probe_remote_ip_key, unix_time_millis, write_global_probe_budget_entries,
+};
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::net::IpAddr;
+#[cfg(test)]
+use std::path::PathBuf;
+
 type ProbeNonce = [u8; 8];
 type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
 type StunTransactionId = [u8; 12];
@@ -44,76 +58,6 @@ type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr, usize), Instan
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum OutboundProbeBudgetKey {
-    Network,
-    Peer(String),
-    PeerRemoteIp(String, IpAddr),
-}
-
-type OutboundProbeBudgetState = Arc<Mutex<HashMap<OutboundProbeBudgetKey, VecDeque<Instant>>>>;
-
-#[derive(Debug, Clone)]
-struct GlobalOutboundProbeBudget {
-    path: PathBuf,
-}
-
-impl GlobalOutboundProbeBudget {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn admit(
-        &self,
-        peer_id: &str,
-        peer_addr: SocketAddr,
-    ) -> std::io::Result<OutboundProbeAdmission> {
-        let now_ms = unix_time_millis();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        lock_budget_file(&file)?;
-
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let mut entries = parse_global_probe_budget_entries(&contents, now_ms);
-        let peer_key = global_probe_peer_key(peer_id);
-        let remote_ip_key = global_probe_remote_ip_key(peer_id, peer_addr.ip());
-
-        if entries.iter().filter(|(_, key)| key == "network").count()
-            >= OUTBOUND_PROBE_BUDGET_PER_NETWORK
-        {
-            return Ok(OutboundProbeAdmission::GlobalNetworkRateLimited);
-        }
-        if entries.iter().filter(|(_, key)| key == &peer_key).count()
-            >= OUTBOUND_PROBE_BUDGET_PER_PEER
-        {
-            return Ok(OutboundProbeAdmission::GlobalPeerRateLimited);
-        }
-        if entries
-            .iter()
-            .filter(|(_, key)| key == &remote_ip_key)
-            .count()
-            >= OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP
-        {
-            return Ok(OutboundProbeAdmission::GlobalRemoteIpRateLimited);
-        }
-
-        entries.push((now_ms, "network".to_string()));
-        entries.push((now_ms, peer_key));
-        entries.push((now_ms, remote_ip_key));
-        write_global_probe_budget_entries(&mut file, &entries)?;
-        unlock_budget_file(&file)?;
-        Ok(OutboundProbeAdmission::Accepted)
-    }
-}
 
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
@@ -125,13 +69,6 @@ const AUTH_PUNCH_REPLAY_MAX_ENTRIES: usize = 4096;
 const AUTH_PUNCH_REPLAY_TARGET_ENTRIES: usize = 3072;
 const AUTH_PUNCH_RATE_WINDOW: Duration = Duration::from_secs(1);
 const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
-const OUTBOUND_PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
-const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 768;
-const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 256;
-// Symmetric NAT traversal often needs to sweep a short predicted port window
-// against one public IP. Keep this bounded, but wide enough that the first
-// synchronized punch is not cut off before the predicted window is covered.
-const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 192;
 /// Two STUN observers per experimental socket are enough to publish that
 /// socket's observed mapping and infer a small per-socket port-delta prediction
 /// window without turning the bounded traversal experiment into a large STUN
@@ -195,121 +132,11 @@ enum AuthenticatedPunchAdmission {
     RateLimited,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundProbeAdmission {
-    Accepted,
-    NetworkRateLimited,
-    PeerRateLimited,
-    RemoteIpRateLimited,
-    GlobalNetworkRateLimited,
-    GlobalPeerRateLimited,
-    GlobalRemoteIpRateLimited,
-}
-
 fn punch_kind_code(kind: PunchPacketKind) -> u8 {
     match kind {
         PunchPacketKind::Punch => 1,
         PunchPacketKind::Ack => 2,
     }
-}
-
-fn default_global_outbound_probe_budget() -> Option<Arc<GlobalOutboundProbeBudget>> {
-    if std::env::var("P2WLAN_DISABLE_GLOBAL_PROBE_BUDGET").as_deref() == Ok("1") {
-        return None;
-    }
-    #[cfg(test)]
-    {
-        None
-    }
-    #[cfg(not(test))]
-    {
-        Some(Arc::new(GlobalOutboundProbeBudget::new(
-            default_global_probe_budget_path(),
-        )))
-    }
-}
-
-#[cfg(not(test))]
-fn default_global_probe_budget_path() -> PathBuf {
-    std::env::var_os("P2WLAN_GLOBAL_PROBE_BUDGET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("p2wlan-outbound-probe-budget-v1.tsv"))
-}
-
-fn unix_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn parse_global_probe_budget_entries(contents: &str, now_ms: u64) -> Vec<(u64, String)> {
-    let window_ms = OUTBOUND_PROBE_BUDGET_WINDOW.as_millis() as u64;
-    contents
-        .lines()
-        .filter_map(|line| {
-            let (timestamp, key) = line.split_once('\t')?;
-            let timestamp = timestamp.parse::<u64>().ok()?;
-            (now_ms.saturating_sub(timestamp) < window_ms).then(|| (timestamp, key.to_string()))
-        })
-        .collect()
-}
-
-fn write_global_probe_budget_entries(
-    file: &mut File,
-    entries: &[(u64, String)],
-) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    for (timestamp, key) in entries {
-        writeln!(file, "{timestamp}	{key}")?;
-    }
-    file.sync_data()?;
-    Ok(())
-}
-
-fn global_probe_peer_key(peer_id: &str) -> String {
-    format!("peer:{}", short_hash(peer_id.as_bytes()))
-}
-
-fn global_probe_remote_ip_key(peer_id: &str, ip: IpAddr) -> String {
-    format!("peer_remote_ip:{}:{ip}", short_hash(peer_id.as_bytes()))
-}
-
-fn short_hash(data: &[u8]) -> String {
-    hex::encode(&crypto_hash(data)[..8])
-}
-
-#[cfg(unix)]
-fn lock_budget_file(file: &File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn unlock_budget_file(file: &File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_budget_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn unlock_budget_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn legacy_ack_matches_pending(
