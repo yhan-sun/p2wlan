@@ -209,7 +209,11 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
 /// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Server-side signaling currently rejects candidate lists above this size.
-const MAX_SIGNAL_CANDIDATES: usize = 20;
+///
+/// Keep this large enough for a linear symmetric NAT to publish its observed
+/// STUN group plus the full predicted successor run. Air-like NATs can need
+/// the high-teens successor ports before a peer-reflexive path appears.
+const MAX_SIGNAL_CANDIDATES: usize = 32;
 /// A bounded public candidate group preserves ICE-style linear NAT coverage.
 ///
 /// Air-like linear symmetric NATs need the STUN group plus a predicted run
@@ -5339,7 +5343,7 @@ mod tests {
     #[test]
     fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
         let mut candidates = vec!["192.168.1.10:51820".to_string()];
-        candidates.extend((0..24).map(|index| format!("8.8.8.8:{}", 41000 + index)));
+        candidates.extend((0..40).map(|index| format!("8.8.8.8:{}", 41000 + index)));
         candidates.extend(["1.1.1.1:42000".to_string(), "1.1.1.1:42009".to_string()]);
         let mut sources = candidates
             .iter()
@@ -5350,7 +5354,7 @@ mod tests {
 
         compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
 
-        assert_eq!(candidates.len(), 23);
+        assert_eq!(candidates.len(), 35);
         assert!(candidates.contains(&"192.168.1.10:51820".to_string()));
         assert!(candidates.contains(&"1.1.1.1:42000".to_string()));
         assert!(candidates.contains(&"1.1.1.1:42009".to_string()));
@@ -5361,8 +5365,9 @@ mod tests {
                 .count(),
             MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
         );
-        assert!(!candidates.contains(&"8.8.8.8:41020".to_string()));
-        assert!(!candidates.contains(&"8.8.8.8:41023".to_string()));
+        assert!(candidates.contains(&"8.8.8.8:41031".to_string()));
+        assert!(!candidates.contains(&"8.8.8.8:41032".to_string()));
+        assert!(!candidates.contains(&"8.8.8.8:41039".to_string()));
         assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
     }
 
@@ -5382,8 +5387,9 @@ mod tests {
         compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
         truncate_signal_candidates(&mut candidates, &mut sources);
 
-        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert_eq!(candidates.len(), 28);
         assert!(candidates.contains(&"220.163.6.190:8154".to_string()));
+        assert!(candidates.contains(&"220.163.6.190:8161".to_string()));
         assert_eq!(
             sources.get("220.163.6.190:8154").map(String::as_str),
             Some("predicted")
@@ -5401,7 +5407,7 @@ mod tests {
             tailscale_v6.clone(),
             p2wlan_overlay.clone(),
         ];
-        candidates.extend((8135..=8161).map(|port| format!("220.163.6.190:{port}")));
+        candidates.extend((8135..=8170).map(|port| format!("220.163.6.190:{port}")));
 
         let mut sources = candidates
             .iter()

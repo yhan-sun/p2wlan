@@ -191,6 +191,73 @@ func TestCreateSignalRejectsUnsupportedProtocolVersion(t *testing.T) {
 	}
 }
 
+func TestCreateSignalCandidateLimitAllowsLinearPredictionWindow(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-candidate-limit@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "candidate-limit-source-key", "source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "candidate-limit-target-key", "target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+	apiServer := NewServer(nil, nil, db)
+	claims := &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    source.UserID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	candidates := make([]string, maxSignalCandidates)
+	for i := range candidates {
+		candidates[i] = "203.0.113.10:" + strconv.Itoa(41000+i)
+	}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"to_node_id": target.ID,
+		"type":       "peer_offer",
+		"candidates": candidates,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", strings.NewReader(string(body)))
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, claims))
+	recorder := httptest.NewRecorder()
+	apiServer.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("CreateSignal with max candidates: HTTP %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	candidates = append(candidates, "203.0.113.10:42000")
+	body, err = json.Marshal(map[string]interface{}{
+		"to_node_id": target.ID,
+		"type":       "peer_offer",
+		"candidates": candidates,
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized request: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/signals", strings.NewReader(string(body)))
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, claims))
+	recorder = httptest.NewRecorder()
+	apiServer.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("CreateSignal with too many candidates: HTTP %d %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "max 32") {
+		t.Fatalf("expected max 32 error, got %s", recorder.Body.String())
+	}
+}
+
 func TestCreateSignalVerifiesProbeEphemeralSignature(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {
