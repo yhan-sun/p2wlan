@@ -152,6 +152,38 @@ impl UdpTransport {
                             }
                         }
 
+                        // Reply on the receiving socket before doing any peer
+                        // learning or candidate bookkeeping. NAT filters keep
+                        // the return window short, and the sender's nonce is
+                        // only pending for this punch session.
+                        let generation = self.peers.current_network_generation().await;
+                        let ack = build_authenticated_punch_ack(
+                            packet.nonce,
+                            local_node_id,
+                            &identity.source_node_id,
+                            generation,
+                            &key,
+                        );
+                        let ack_sent = match self
+                            .send_punch_ack_burst(
+                                socket_index,
+                                socket.clone(),
+                                ack,
+                                source,
+                                identity.source_node_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(()) => true,
+                            Err(err) => {
+                                warn!(
+                                    "Failed to immediately ACK authenticated UDP punch from peer {} at {}: {}",
+                                    identity.source_node_id, source, err
+                                );
+                                false
+                            }
+                        };
+
                         let learned = self
                             .peers
                             .learn_authenticated_endpoint(&identity.source_node_id, source)
@@ -184,40 +216,22 @@ impl UdpTransport {
                         self.notify_peer_reflexive_observation(&identity.source_node_id, source)
                             .await;
 
-                        let generation = self.peers.current_network_generation().await;
-                        let ack = build_authenticated_punch_ack(
-                            packet.nonce,
-                            local_node_id,
-                            &identity.source_node_id,
-                            generation,
-                            &key,
-                        );
-                        match self
-                            .send_punch_ack_burst(
+                        if ack_sent {
+                            debug!(
+                                "Received authenticated UDP punch from peer {} at {}; sent immediate ACK burst",
+                                identity.source_node_id, source
+                            );
+                            self.trigger_peer_reflexive_check(
                                 socket_index,
-                                socket.clone(),
-                                ack,
+                                &identity.source_node_id,
                                 source,
-                                identity.source_node_id.clone(),
                             )
-                            .await
-                        {
-                            Ok(()) => {
-                                debug!(
-                                    "Received authenticated UDP punch from peer {} at {}; sent ACK burst",
-                                    identity.source_node_id, source
-                                );
-                                self.trigger_peer_reflexive_check(
-                                    socket_index,
-                                    &identity.source_node_id,
-                                    source,
-                                )
-                                .await;
-                            }
-                            Err(err) => warn!(
-                                "Failed to ACK authenticated UDP punch from peer {} at {}: {}",
-                                identity.source_node_id, source, err
-                            ),
+                            .await;
+                        } else {
+                            debug!(
+                                "Received authenticated UDP punch from peer {} at {} without an ACK",
+                                identity.source_node_id, source
+                            );
                         }
                     }
                     PunchPacketKind::Ack => {

@@ -143,14 +143,6 @@ async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
     );
 }
 
-fn unique_global_probe_budget_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "p2wlan-{name}-{}-{}.tsv",
-        std::process::id(),
-        unix_time_millis()
-    ))
-}
-
 fn hard_nat_candidate_report(
     filtering_behavior: p2pnet_nat::FilteringBehavior,
 ) -> CandidateGatherReport {
@@ -195,27 +187,20 @@ fn socket_pool_rejects_udp_blocked_nat_profile() {
 
 #[tokio::test]
 async fn global_outbound_probe_budget_limits_across_transports() {
-    let path = unique_global_probe_budget_path("global-probe-budget");
+    let global_budget = Arc::new(GlobalOutboundProbeBudget::new());
     let transport_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
         .await
         .unwrap()
-        .with_global_probe_budget_path(path.clone());
+        .with_global_probe_budget(global_budget.clone());
     let peer_id = "peer-global";
     let endpoint: SocketAddr = "203.0.113.1:49999".parse().unwrap();
-    let remote_ip_key = global_probe_remote_ip_key(peer_id, endpoint.ip());
-    let now_ms = unix_time_millis().saturating_add(OUTBOUND_PROBE_BUDGET_WINDOW.as_millis() as u64);
-    let mut entries = Vec::new();
 
     for _ in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
-        entries.push((now_ms, remote_ip_key.clone()));
+        assert_eq!(
+            global_budget.admit(peer_id, endpoint).await,
+            OutboundProbeAdmission::Accepted
+        );
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .unwrap();
-    write_global_probe_budget_entries(&mut file, &entries).unwrap();
 
     assert_eq!(
         transport_b

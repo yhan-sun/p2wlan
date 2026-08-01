@@ -18,33 +18,51 @@ fn test_daemon_creation_manual_mode() {
     let _daemon = Daemon::new(config);
 }
 
+#[test]
+fn candidate_only_offer_preserves_the_active_probe_session() {
+    assert!(!peer_offer_updates_probe_session(&[], None));
+    assert!(peer_offer_updates_probe_session(&[1], None));
+    assert!(peer_offer_updates_probe_session(&[], Some("session-1")));
+}
+
 #[tokio::test]
 async fn punch_attempt_deduplicator_allows_only_one_short_window_per_peer() {
     let deduplicator = PunchAttemptDeduplicator::default();
-    assert!(deduplicator.claim("peer-a").await);
-    assert!(!deduplicator.claim("peer-a").await);
-    assert!(deduplicator.claim("peer-b").await);
+    let peer_a = deduplicator.claim("peer-a").await.unwrap();
+    assert!(deduplicator.claim("peer-a").await.is_none());
+    let _peer_b = deduplicator.claim("peer-b").await.unwrap();
+    assert_eq!(deduplicator.active_session_count(), 2);
+
+    drop(peer_a);
+    let _peer_a_replacement = deduplicator.claim("peer-a").await.unwrap();
 }
 
 #[tokio::test]
 async fn punch_attempt_deduplicator_lets_synchronized_punch_override_background() {
     let deduplicator = PunchAttemptDeduplicator::default();
+    let background = deduplicator
+        .claim_with_window("peer-a", DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW)
+        .await
+        .unwrap();
+    let synchronized = deduplicator
+        .claim("peer-a")
+        .await
+        .expect("synchronized punch should preempt a background retry");
+    assert!(background.is_cancelled());
     assert!(
         deduplicator
             .claim_with_window("peer-a", DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW)
             .await
+            .is_none(),
+        "background retry should not preempt an active synchronized punch"
     );
-    assert!(
-        deduplicator.claim("peer-a").await,
-        "synchronized punch should preempt a recent background retry"
-    );
-    assert!(
-        !deduplicator
-            .claim_with_window("peer-a", DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW)
-            .await,
-        "background retry should not preempt a recent synchronized punch"
-    );
-    assert!(!deduplicator.claim("peer-a").await);
+    assert!(deduplicator.claim("peer-a").await.is_none());
+    assert_eq!(deduplicator.active_session_count(), 1);
+
+    drop(background);
+    assert_eq!(deduplicator.active_session_count(), 1);
+    drop(synchronized);
+    assert_eq!(deduplicator.active_session_count(), 0);
 }
 
 #[tokio::test]

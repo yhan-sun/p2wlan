@@ -7,6 +7,7 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) published_endpoint: Option<String>,
     pub(super) local_candidates: Arc<RwLock<Vec<String>>>,
     pub(super) local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    pub(super) local_network_identity: Arc<RwLock<Vec<String>>>,
     pub(super) nat_profile: Arc<RwLock<Option<NatProfile>>>,
     pub(super) gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
     pub(super) gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
@@ -27,6 +28,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         mut published_endpoint,
         local_candidates,
         local_candidate_sources,
+        local_network_identity,
         nat_profile,
         gateway_mapping_runtime,
         gateway_mapping_diagnostics,
@@ -53,6 +55,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         };
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+        let next_network_identity = stable_network_candidate_signature(
+            &candidates,
+            &candidate_sources,
+        );
         peers.update_nat_profile(report.nat_profile.clone()).await;
         let profile_changed = {
             let mut current_profile = nat_profile.write().await;
@@ -94,8 +100,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             )
             .await;
         }
-        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
-
         let previous_candidates = local_candidates.read().await.clone();
         let previous_candidate_sources = local_candidate_sources.read().await.clone();
         preserve_peer_reflexive_candidates(
@@ -106,21 +110,21 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         );
         compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
         truncate_signal_candidates(&mut candidates, &mut candidate_sources);
-        let should_advance_generation = candidate_refresh_requires_network_generation_advance(
-            &previous_candidates,
-            &previous_candidate_sources,
-            &candidates,
-            &candidate_sources,
-        );
+        let previous_network_identity = local_network_identity.read().await.clone();
+        let should_advance_generation = !previous_network_identity.is_empty()
+            && previous_network_identity != next_network_identity;
 
         let changed = {
             let mut current = local_candidates.write().await;
-            if previous_candidates == candidates && previous_candidate_sources == candidate_sources
+            if previous_candidates == candidates
+                && previous_candidate_sources == candidate_sources
+                && previous_network_identity == next_network_identity
             {
                 false
             } else {
                 *current = candidates.clone();
                 *local_candidate_sources.write().await = candidate_sources.clone();
+                *local_network_identity.write().await = next_network_identity.clone();
                 true
             }
         };

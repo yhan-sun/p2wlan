@@ -232,28 +232,49 @@ impl UdpTransport {
         candidates: Vec<p2pnet_nat::IceCandidate>,
         socket_index: usize,
     ) {
-        let mut added_stun_observed = 0u64;
-        for candidate in candidates {
-            let is_stun_observed = candidate.source == p2pnet_nat::CandidateSource::StunObserved;
-            let endpoint = candidate.endpoint.to_string();
-            if report
-                .candidates
-                .iter()
-                .all(|existing| existing.endpoint.to_string() != endpoint)
-            {
-                report.candidates.push(candidate);
-                if is_stun_observed {
-                    added_stun_observed += 1;
-                }
-            }
-        }
-        if added_stun_observed > 0 {
+        let discovered_stun_mappings = merge_pool_candidates(report, candidates);
+        if discovered_stun_mappings > 0 {
             self.update_socket_diagnostics(socket_index, |metrics| {
                 metrics.stun_mappings_discovered = metrics
                     .stun_mappings_discovered
-                    .saturating_add(added_stun_observed)
+                    .saturating_add(discovered_stun_mappings)
             })
             .await;
         }
     }
+}
+
+fn merge_pool_candidates(
+    report: &mut CandidateGatherReport,
+    candidates: Vec<p2pnet_nat::IceCandidate>,
+) -> u64 {
+    let mut discovered_stun_mappings = 0u64;
+    for candidate in candidates {
+        let is_stun_observed =
+            candidate.source == p2pnet_nat::CandidateSource::StunObserved;
+        if is_stun_observed {
+            discovered_stun_mappings = discovered_stun_mappings.saturating_add(1);
+        }
+
+        let endpoint = candidate.endpoint.to_string();
+        if let Some(existing) = report
+            .candidates
+            .iter_mut()
+            .find(|existing| existing.endpoint.to_string() == endpoint)
+        {
+            // A later pool socket can observe a port that an earlier socket
+            // merely predicted. Keep the endpoint once, but promote the
+            // evidence so signaling and probe ranking treat it as real.
+            if is_stun_observed
+                && existing.source == p2pnet_nat::CandidateSource::Predicted
+            {
+                existing.source = p2pnet_nat::CandidateSource::StunObserved;
+                existing.candidate_type = candidate.candidate_type;
+                existing.priority = existing.priority.max(candidate.priority);
+            }
+            continue;
+        }
+        report.candidates.push(candidate);
+    }
+    discovered_stun_mappings
 }

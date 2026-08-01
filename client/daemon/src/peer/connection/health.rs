@@ -97,7 +97,7 @@ impl PeerConnection {
             if pair.expire_stale_nomination(DIRECT_TRIAL_WINDOW, reason.clone(), local_endpoint) {
                 expired += 1;
                 log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
-                info!(
+                debug!(
                     event = "candidate_pair_nomination_expired",
                     peer_id = %peer_id,
                     local_endpoint = %format_log_endpoint(pair.local_endpoint),
@@ -145,7 +145,7 @@ impl PeerConnection {
             let old_state = pair.state;
             pair.record_failure(code.clone(), reason.clone(), local_endpoint);
             log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
-            info!(
+            debug!(
                 event = "candidate_pair_probe_failed",
                 peer_id = %peer_id,
                 local_endpoint = %local_endpoint_text,

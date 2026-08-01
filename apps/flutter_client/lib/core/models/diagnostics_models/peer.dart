@@ -140,7 +140,12 @@ class PeerSnapshot {
   }
 
   String? get lastError {
-    return warning ?? direct.visibleLastError ?? relay.visibleLastError;
+    if (warning case final warning?) return warning;
+    return switch (path) {
+      'direct' => direct.visibleLastError,
+      'relay' => relay.visibleLastError ?? direct.visibleLastError,
+      _ => direct.visibleLastError ?? relay.visibleLastError,
+    };
   }
 }
 

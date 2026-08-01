@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn send_probe_retransmits_punch_burst() {
+async fn connectivity_scan_probe_is_not_retransmitted() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
 
@@ -11,15 +11,16 @@ async fn send_probe_retransmits_punch_burst() {
     let nonce = transport.send_probe(None, receiver_addr).await.unwrap();
 
     let mut buf = [0u8; 64];
-    for _ in 0..=PUNCH_PROBE_RETRANSMIT_DELAYS_MS.len() {
-        let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let packet = decode_punch_packet(&buf[..n]).unwrap();
-        assert_eq!(packet.kind, PunchPacketKind::Punch);
-        assert_eq!(packet.nonce, nonce);
-    }
+    let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let packet = decode_punch_packet(&buf[..n]).unwrap();
+    assert_eq!(packet.kind, PunchPacketKind::Punch);
+    assert_eq!(packet.nonce, nonce);
+    assert!(timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -122,14 +123,14 @@ async fn send_nomination_probe_sets_use_candidate_flag() {
         &local_identity,
         "peer-a",
     )));
-    peers
-        .add_peer(&peer_with_public_key(
-            "peer-b",
-            "10.20.0.2",
-            hex::encode(peer_identity.public_key()),
-            Some(receiver_addr),
-        ))
-        .await;
+    let mut peer = peer_with_public_key(
+        "peer-b",
+        "10.20.0.2",
+        hex::encode(peer_identity.public_key()),
+        Some(receiver_addr),
+    );
+    peer.app_version = "0.1.70".to_string();
+    peers.add_peer(&peer).await;
 
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
@@ -151,6 +152,59 @@ async fn send_nomination_probe_sets_use_candidate_flag() {
     assert_eq!(packet.kind, PunchPacketKind::Punch);
     assert!(packet.use_candidate);
     assert!(packet.authenticated);
+
+    for _ in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
+        let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let retransmission = decode_authenticated_punch_packet(&buf[..n], &key).unwrap();
+        assert_eq!(retransmission.nonce, packet.nonce);
+        assert!(retransmission.use_candidate);
+    }
+    assert_eq!(
+        transport.socket_pool_diagnostics().await[0].probe_retransmissions_sent,
+        PUNCH_PROBE_RETRANSMIT_DELAYS_MS.len() as u64
+    );
+}
+
+#[tokio::test]
+async fn modern_authenticated_peer_does_not_receive_legacy_probe_copy() {
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    let mut peer = peer_with_public_key(
+        "peer-b",
+        "10.20.0.2",
+        hex::encode(peer_identity.public_key()),
+        Some(receiver_addr),
+    );
+    peer.app_version = "0.1.70".to_string();
+    peers.add_peer(&peer).await;
+
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    transport
+        .send_probe(Some("peer-b"), receiver_addr)
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 512];
+    let (n, _from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(peek_authenticated_punch_identity(&buf[..n]).is_some());
+    assert!(timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
+        .await
+        .is_err());
 }
 
 #[tokio::test]

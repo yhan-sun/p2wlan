@@ -252,6 +252,7 @@ let udp_direct_context = UdpDirectTaskContext {
     control: self.control.clone(),
     local_candidates: self.local_candidates.clone(),
     local_candidate_sources: local_candidate_sources.clone(),
+    local_network_identity: self.local_network_identity.clone(),
     nat_profile: self.nat_profile.clone(),
     gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
     gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),

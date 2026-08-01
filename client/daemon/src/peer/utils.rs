@@ -128,7 +128,7 @@ fn log_candidate_pair_state_changed(
         return;
     }
 
-    info!(
+    debug!(
         event = "candidate_pair_state_changed",
         peer_id = %peer_id,
         local_endpoint = %format_log_endpoint(pair.local_endpoint),
@@ -173,7 +173,7 @@ fn log_candidate_pair_state_changed(
             pair.remote_endpoint,
             reason
         ),
-        CandidatePairState::Failed => info!(
+        CandidatePairState::Failed => debug!(
             event = "candidate_pair_failed",
             peer_id = %peer_id,
             local_endpoint = %format_log_endpoint(pair.local_endpoint),

@@ -32,22 +32,13 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 mod probe_budget;
 use probe_budget::{
-    default_global_outbound_probe_budget, GlobalOutboundProbeBudget, OutboundProbeAdmission,
-    OutboundProbeBudgetKey, OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK,
-    OUTBOUND_PROBE_BUDGET_PER_PEER, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
-    OUTBOUND_PROBE_BUDGET_WINDOW,
+    default_global_outbound_probe_budget, retain_live_budget_entries, GlobalOutboundProbeBudget,
+    OutboundProbeAdmission, OutboundProbeBudgetKey, OutboundProbeBudgetState,
+    OUTBOUND_PROBE_BUDGET_PER_NETWORK, OUTBOUND_PROBE_BUDGET_PER_PEER,
+    OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
 };
-#[cfg(test)]
-use probe_budget::{
-    global_probe_remote_ip_key, unix_time_millis, write_global_probe_budget_entries,
-};
-#[cfg(test)]
-use std::fs::OpenOptions;
 #[cfg(test)]
 use std::net::IpAddr;
-#[cfg(test)]
-use std::path::PathBuf;
-
 include!("udp/state.rs");
 include!("udp/core.rs");
 include!("udp/admission.rs");

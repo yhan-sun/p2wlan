@@ -23,7 +23,10 @@ pub async fn gather_candidate_report(
     // 1. Host candidates
     if config.gather_host {
         let local_ips = gather_local_addresses();
-        for ip in local_ips {
+        for ip in local_ips
+            .into_iter()
+            .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
+        {
             let candidate = IceCandidate {
                 candidate_type: CandidateType::Host,
                 endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),
@@ -51,7 +54,9 @@ pub async fn gather_candidate_report(
             match stun_client.binding_request(socket, server).await {
                 Ok(response) => {
                     let rtt_ms = duration_millis(started.elapsed());
-                    let reflexive = response.reflexive_address;
+                    let reflexive = response.reflexive_address.filter(|address| {
+                        address.is_ipv4() == local_addr.ip().is_ipv4()
+                    });
                     observations.push(StunObservation {
                         server: server.to_string(),
                         mapped_address: reflexive.map(|addr| addr.to_string()),
@@ -134,9 +139,28 @@ pub fn candidate_report_from_observations(
     gather_host: bool,
     observations: Vec<StunObservation>,
 ) -> CandidateGatherReport {
+    let socket_is_ipv4 = local_addr.ip().is_ipv4();
+    let observations = observations
+        .into_iter()
+        .map(|mut observation| {
+            let wrong_family = observation
+                .mapped_address
+                .as_deref()
+                .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+                .is_some_and(|address| address.is_ipv4() != socket_is_ipv4);
+            if wrong_family {
+                observation.mapped_address = None;
+                observation.error = Some("STUN mapping address family did not match socket".into());
+            }
+            observation
+        })
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     if gather_host {
-        for ip in gather_local_addresses() {
+        for ip in gather_local_addresses()
+            .into_iter()
+            .filter(|ip| ip.is_ipv4() == socket_is_ipv4)
+        {
             candidates.push(IceCandidate {
                 candidate_type: CandidateType::Host,
                 endpoint: crate::Endpoint::new(&ip.to_string(), local_addr.port()),
@@ -150,6 +174,7 @@ pub fn candidate_report_from_observations(
             .mapped_address
             .as_deref()
             .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+            .filter(|address| address.is_ipv4() == socket_is_ipv4)
         else {
             continue;
         };

@@ -6,7 +6,7 @@ async fn hard_local_and_scattered_peer_without_history_skip_background_retry() {
 
     manager.add_peer(&test_peer("peer1", endpoint_a)).await;
     manager
-        .add_candidates("peer1", &[endpoint_b.to_string()])
+        .add_candidates("peer1", &[endpoint_a.to_string(), endpoint_b.to_string()])
         .await;
     manager.update_nat_profile(birthday_nat_profile()).await;
 

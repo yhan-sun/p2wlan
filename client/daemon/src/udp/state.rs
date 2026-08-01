@@ -19,6 +19,9 @@ const AUTH_PUNCH_REPLAY_MAX_ENTRIES: usize = 4096;
 const AUTH_PUNCH_REPLAY_TARGET_ENTRIES: usize = 3072;
 const AUTH_PUNCH_RATE_WINDOW: Duration = Duration::from_secs(1);
 const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
+/// Hard bound on primary connectivity-check datagrams emitted by one punch
+/// session. Retransmissions are reserved for nomination and consent checks.
+const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
 /// Two STUN observers per experimental socket are enough to publish that
 /// socket's observed mapping and infer a small per-socket port-delta prediction
 /// window without turning the bounded traversal experiment into a large STUN
@@ -35,8 +38,12 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub socket_index: usize,
     /// Successful UDP punch probes sent from this socket.
     pub probes_sent: u64,
+    /// Nomination/consent probe retransmissions sent from this socket.
+    pub probe_retransmissions_sent: u64,
     /// Punch ACKs sent from this socket after receiving a probe.
     pub probe_acks_sent: u64,
+    /// Punch ACK retransmissions sent from this socket.
+    pub probe_ack_retransmissions_sent: u64,
     /// Matching punch ACKs received on this socket.
     pub probe_acks_received: u64,
     /// Encrypted direct datagrams sent from this socket.
