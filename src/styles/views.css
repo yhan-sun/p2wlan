@@ -1,0 +1,306 @@
+/* Route Info Card */
+.route-entry-card {
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+
+.route-entry-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.route-dest {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.route-entry-body {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.route-detail-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 0.25rem;
+}
+
+.route-detail-row .lbl {
+  color: var(--text-muted);
+}
+
+.route-detail-row .val-mono {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+
+.route-desc-text {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin-top: 0.375rem;
+}
+
+.sudo-command-box {
+  background: oklch(0.12 0.008 190);
+  padding: 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+}
+
+.sudo-command-text {
+  color: var(--accent);
+  word-break: break-all;
+}
+
+/* Console & Logging Output */
+.console-log-buffer {
+  background: oklch(0.12 0.008 190);
+  font-family: var(--font-mono);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  overflow: hidden;
+  height: 480px;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-pre {
+  margin: 0;
+  padding: 1rem;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.log-line {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--success);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+/* Micro animations */
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Login Page UI overrides */
+.login-page {
+  background:
+    linear-gradient(180deg, color-mix(in oklch, var(--bg-secondary) 64%, var(--bg-primary)), var(--bg-primary));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1.25rem;
+}
+
+.login-shell {
+  width: 100%;
+  max-width: 390px;
+  background: color-mix(in oklch, var(--bg-secondary) 88%, var(--bg-primary));
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  box-shadow: 0 24px 80px color-mix(in oklch, var(--bg-primary) 70%, transparent);
+}
+
+.login-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.login-mark {
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: var(--radius-md);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-light);
+  border: 1px solid color-mix(in oklch, var(--accent) 24%, transparent);
+}
+
+.login-title {
+  font-size: 1.25rem;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.login-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.2rem;
+  letter-spacing: 0;
+}
+
+.login-primary-action,
+.login-secondary-action {
+  width: 100%;
+}
+
+.login-primary-action {
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.login-secondary-action {
+  margin-top: 0.15rem;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.login-form .form-group {
+  gap: 0.3rem;
+}
+
+.control-auth-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 720px;
+}
+
+.control-auth-panel.compact {
+  max-width: none;
+}
+
+.control-auth-panel.compact .form-group-row {
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+}
+
+.control-auth-panel .banner {
+  margin: 0.1rem 0 0;
+}
+
+.control-auth-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.control-auth-actions .btn {
+  min-width: 8.75rem;
+}
+
+.control-auth-actions .login-link-button {
+  margin: 0;
+}
+
+.onboarding-container {
+  max-width: 780px;
+  margin: 1.5rem auto;
+}
+
+.onboarding-header {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.onboarding-header .page-subtitle {
+  max-width: 62ch;
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  margin: 1rem 0;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: "";
+  height: 1px;
+  background: var(--border-light);
+  flex: 1;
+}
+
+.input-with-icon {
+  position: relative;
+}
+
+.input-with-icon svg {
+  position: absolute;
+  left: 0.7rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.input-with-icon .form-input {
+  padding-left: 2rem;
+}
+
+.login-error {
+  color: var(--danger);
+  background: var(--danger-light);
+  border: 1px solid color-mix(in oklch, var(--danger) 26%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.7rem;
+  font-size: 0.8rem;
+  margin: 0.85rem 0;
+}
+
+.login-link-button {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  display: block;
+  margin: 0.85rem auto 0;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.login-link-button:hover {
+  color: var(--text-primary);
+}
+
+@media (max-width: 700px) {
+  .form-group-row,
+  .simple-status-grid,
+  .control-auth-panel.compact .form-group-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .control-auth-actions,
+  .control-auth-actions .btn {
+    width: 100%;
+  }
+
+  .control-auth-actions {
+    align-items: stretch;
+  }
+
+  .simple-action-row {
+    grid-template-columns: 1fr;
+  }
+}
