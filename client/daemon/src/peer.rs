@@ -51,18 +51,17 @@ const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
+const PEER_REFLEXIVE_SAME_IP_RETAINED_PORTS: usize = 3;
 const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 24;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 24;
-const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
+const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 8;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 2;
-const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 64;
+const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 96;
 const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 128;
+const BIRTHDAY_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 32;
+const BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 32;
 const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
-const BIRTHDAY_PROBE_DELTAS: [i32; 54] = [
-    1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13,
-    -13, 14, -14, 15, -15, 16, -16, 17, -17, 18, -18, 19, -19, 20, -20, 21, -21, 22, -22, 23, -23,
-    24, -24, 32, -32, 48, -48, 64, -64,
-];
+const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
 const BIRTHDAY_PROBE_WIDE_MAX_DELTA: i32 = 32_768;
 const BIRTHDAY_PROBE_WIDE_STRIDE: i32 = 251;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
@@ -507,6 +506,9 @@ pub struct CandidatePair {
     pub remote_endpoint: SocketAddr,
     /// Endpoint source used for probe ranking and diagnostics.
     pub source: CandidatePairSource,
+    /// When this source/endpoint combination was last refreshed by a real
+    /// signal or authenticated observation, not merely by scheduler reuse.
+    pub source_observed_at: Option<Instant>,
     /// Local network generation this pair belongs to.
     pub local_generation: u64,
     /// Current reachability state.
@@ -555,6 +557,7 @@ impl CandidatePair {
             local_endpoint: None,
             remote_endpoint,
             source,
+            source_observed_at: Some(Instant::now()),
             local_generation,
             state: CandidatePairState::Waiting,
             nominated: false,
@@ -579,6 +582,13 @@ impl CandidatePair {
     fn promote_source(&mut self, source: CandidatePairSource) {
         if candidate_pair_source_rank(source) < candidate_pair_source_rank(self.source) {
             self.source = source;
+        }
+    }
+
+    fn observe_source(&mut self, source: CandidatePairSource) {
+        if candidate_pair_source_rank(source) <= candidate_pair_source_rank(self.source) {
+            self.source = source;
+            self.source_observed_at = Some(Instant::now());
         }
     }
 
@@ -1089,6 +1099,28 @@ impl PeerConnection {
             .expect("candidate pair inserted")
     }
 
+    fn ensure_candidate_pair_with_observed_source(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        source: CandidatePairSource,
+    ) -> &mut CandidatePair {
+        if let Some(index) = self.candidate_pairs.iter().position(|pair| {
+            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+        }) {
+            self.candidate_pairs[index].observe_source(source);
+            return &mut self.candidate_pairs[index];
+        }
+        self.candidate_pairs.push(CandidatePair::new_with_source(
+            endpoint,
+            local_generation,
+            source,
+        ));
+        self.candidate_pairs
+            .last_mut()
+            .expect("candidate pair inserted")
+    }
+
     fn ensure_current_candidate_pairs(&mut self, local_generation: u64) {
         for endpoint in self.candidate_endpoints() {
             let source = self.candidate_source_for_endpoint(endpoint);
@@ -1139,6 +1171,7 @@ impl PeerConnection {
         self.prune_candidate_pairs_outside_targets(local_generation, &endpoints);
         let source_stats =
             candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
+        let active_endpoint = self.endpoint;
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -1163,6 +1196,10 @@ impl PeerConnection {
                     candidate_pair_source_quality_rank(&source_stats, history, a.source).cmp(
                         &candidate_pair_source_quality_rank(&source_stats, history, b.source),
                     )
+                })
+                .then_with(|| {
+                    candidate_pair_dynamic_probe_rank(a, active_endpoint)
+                        .cmp(&candidate_pair_dynamic_probe_rank(b, active_endpoint))
                 })
                 .then_with(|| {
                     discovered_endpoint_probe_rank(a.source)
@@ -1208,23 +1245,7 @@ impl PeerConnection {
         allow_local_nat_trigger: bool,
         endpoints: &mut Vec<SocketAddr>,
     ) {
-        let bases = endpoints
-            .iter()
-            .copied()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-            .filter(|endpoint| {
-                !matches!(
-                    self.candidate_source_for_endpoint(*endpoint),
-                    CandidatePairSource::Host
-                        | CandidatePairSource::Predicted
-                        | CandidatePairSource::Birthday
-                        | CandidatePairSource::Upnp
-                        | CandidatePairSource::Pcp
-                        | CandidatePairSource::NatPmp
-                )
-            })
-            .take(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE)
-            .collect::<Vec<_>>();
+        let bases = self.birthday_probe_bases(endpoints, local_generation);
 
         let local_needs_birthday = allow_local_nat_trigger
             && local_nat_profile.is_some_and(|profile| profile.birthday_candidate);
@@ -1270,6 +1291,117 @@ impl PeerConnection {
                 return;
             }
         }
+    }
+
+    fn birthday_probe_bases(
+        &self,
+        endpoints: &[SocketAddr],
+        local_generation: u64,
+    ) -> Vec<SocketAddr> {
+        let mut bases = endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                !matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Host
+                        | CandidatePairSource::Predicted
+                        | CandidatePairSource::Birthday
+                        | CandidatePairSource::Upnp
+                        | CandidatePairSource::Pcp
+                        | CandidatePairSource::NatPmp
+                )
+            })
+            .collect::<Vec<_>>();
+
+        bases.sort_by(|a, b| {
+            birthday_base_rank(self, *a, local_generation)
+                .cmp(&birthday_base_rank(self, *b, local_generation))
+                .then_with(|| a.cmp(b))
+        });
+        bases.dedup();
+        bases.truncate(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE);
+        bases
+    }
+
+    fn prune_stale_peer_reflexive_candidates_for_ip(
+        &mut self,
+        fresh_endpoint: SocketAddr,
+        local_generation: u64,
+    ) -> usize {
+        if !is_public_probe_endpoint(fresh_endpoint) {
+            return 0;
+        }
+
+        let mut peer_reflexive = self
+            .candidate_sources
+            .iter()
+            .filter_map(|(candidate, source)| {
+                (*source == CandidatePairSource::PeerReflexive)
+                    .then(|| candidate.parse::<SocketAddr>().ok())
+                    .flatten()
+            })
+            .filter(|endpoint| {
+                endpoint.ip() == fresh_endpoint.ip() && is_public_probe_endpoint(*endpoint)
+            })
+            .collect::<Vec<_>>();
+
+        if peer_reflexive.len() <= PEER_REFLEXIVE_SAME_IP_RETAINED_PORTS {
+            return 0;
+        }
+
+        peer_reflexive.sort_by(|a, b| {
+            peer_reflexive_retention_rank(self, *a, fresh_endpoint, local_generation)
+                .cmp(&peer_reflexive_retention_rank(
+                    self,
+                    *b,
+                    fresh_endpoint,
+                    local_generation,
+                ))
+                .then_with(|| a.cmp(b))
+        });
+
+        let mut retained = peer_reflexive
+            .iter()
+            .take(PEER_REFLEXIVE_SAME_IP_RETAINED_PORTS)
+            .copied()
+            .collect::<HashSet<_>>();
+
+        for pair in &self.candidate_pairs {
+            if pair.local_generation == local_generation
+                && pair.source == CandidatePairSource::PeerReflexive
+                && pair.remote_endpoint.ip() == fresh_endpoint.ip()
+                && should_retain_peer_reflexive_pair(pair)
+            {
+                retained.insert(pair.remote_endpoint);
+            }
+        }
+
+        let removed = peer_reflexive
+            .into_iter()
+            .filter(|endpoint| !retained.contains(endpoint))
+            .collect::<HashSet<_>>();
+        if removed.is_empty() {
+            return 0;
+        }
+
+        self.candidates.retain(|candidate| {
+            candidate
+                .parse::<SocketAddr>()
+                .map_or(true, |endpoint| !removed.contains(&endpoint))
+        });
+        for endpoint in &removed {
+            self.candidate_sources.remove(&endpoint.to_string());
+        }
+        self.candidate_pairs.retain(|pair| {
+            !(pair.local_generation == local_generation
+                && pair.source == CandidatePairSource::PeerReflexive
+                && removed.contains(&pair.remote_endpoint)
+                && !should_retain_peer_reflexive_pair(pair))
+        });
+
+        removed.len()
     }
 
     fn candidate_pairs_for_send(&self, local_generation: u64) -> Vec<&CandidatePair> {
@@ -1750,7 +1882,8 @@ impl PeerConnection {
         source: CandidatePairSource,
     ) {
         let peer_id = self.node_id.clone();
-        let pair = self.ensure_candidate_pair_with_source(endpoint, local_generation, source);
+        let pair =
+            self.ensure_candidate_pair_with_observed_source(endpoint, local_generation, source);
         let old_state = pair.state;
         pair.record_probing(None);
         log_candidate_pair_state_changed(&peer_id, pair, old_state, "probe scheduled");
@@ -2865,7 +2998,7 @@ impl PeerManager {
                     .unwrap_or_else(|| infer_unlabeled_candidate_source(c));
                 conn.candidate_sources.insert(c.clone(), source);
                 if let Ok(endpoint) = c.parse::<SocketAddr>() {
-                    conn.ensure_candidate_pair_with_source(endpoint, generation, source);
+                    conn.ensure_candidate_pair_with_observed_source(endpoint, generation, source);
                 }
             }
 
@@ -2971,6 +3104,20 @@ impl PeerManager {
             generation,
             CandidatePairSource::PeerReflexive,
         );
+        let pruned = conn.prune_stale_peer_reflexive_candidates_for_ip(endpoint, generation);
+        if pruned > 0 {
+            conn.record_direct_event(
+                generation,
+                "peer_reflexive_window_pruned",
+                Some(endpoint),
+                Some(conn.candidates.len()),
+                None,
+                format!(
+                    "pruned {pruned} stale peer-reflexive UDP ports for {}",
+                    endpoint.ip()
+                ),
+            );
+        }
         true
     }
 
@@ -4515,6 +4662,7 @@ pub struct CandidatePairDiagnostics {
     pub selected: bool,
     pub nominated_age_ms: Option<u64>,
     pub selected_age_ms: Option<u64>,
+    pub source_observed_age_ms: Option<u64>,
     pub last_probe_age_ms: Option<u64>,
     pub probe_count: u64,
     pub probe_due: bool,
@@ -4572,6 +4720,7 @@ impl CandidatePairDiagnostics {
             selected,
             nominated_age_ms: pair.nominated_at.map(|at| duration_millis(at.elapsed())),
             selected_age_ms: pair.selected_at.map(|at| duration_millis(at.elapsed())),
+            source_observed_age_ms: candidate_pair_source_observed_age_ms(pair),
             last_probe_age_ms: pair.last_probe_at.map(|at| duration_millis(at.elapsed())),
             probe_count: pair.probe_count,
             probe_due,
@@ -4912,19 +5061,20 @@ fn birthday_probe_budget_for_pairs(history: &TraversalHistory, pairs: &[&Candida
     if birthday_pair_count == 0 {
         return 0;
     }
-    let base_count = birthday_pair_count.div_ceil(BIRTHDAY_PROBE_DELTAS.len());
+    let per_base_budget = birthday_probe_budget(history).max(1);
+    let base_count = birthday_pair_count.div_ceil(per_base_budget);
     birthday_probe_budget_for_base_count(history, base_count)
 }
 
 fn birthday_probe_budget_with_reason(history: &TraversalHistory) -> (usize, &'static str) {
     if history.source_in_cooldown(CandidatePairSource::Birthday) {
-        return (0, "history_cooldown");
+        return (BIRTHDAY_PROBE_COOLDOWN_BUDGET_PER_CYCLE, "history_cooldown");
     }
     if history
         .source(CandidatePairSource::Birthday)
         .is_some_and(|entry| entry.consecutive_failures >= 3)
     {
-        return (0, "history_failures");
+        return (BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE, "history_failures");
     }
     if history
         .source(CandidatePairSource::Birthday)
@@ -5053,6 +5203,111 @@ fn discovered_endpoint_probe_rank(source: CandidatePairSource) -> u8 {
     }
 }
 
+fn candidate_pair_source_observed_age_ms(pair: &CandidatePair) -> Option<u64> {
+    pair.source_observed_at
+        .map(|observed_at| duration_millis(observed_at.elapsed()))
+}
+
+fn candidate_pair_source_observed_sort_key(
+    pair: &CandidatePair,
+) -> std::cmp::Reverse<Option<Instant>> {
+    std::cmp::Reverse(pair.source_observed_at)
+}
+
+fn candidate_pair_dynamic_probe_rank(
+    pair: &CandidatePair,
+    active_endpoint: Option<SocketAddr>,
+) -> (u8, u64, std::cmp::Reverse<Option<Instant>>) {
+    if active_endpoint == Some(pair.remote_endpoint)
+        && is_public_probe_endpoint(pair.remote_endpoint)
+        && matches!(
+            pair.source,
+            CandidatePairSource::PeerReflexive
+                | CandidatePairSource::Learned
+                | CandidatePairSource::StunObserved
+                | CandidatePairSource::Signaled
+        )
+    {
+        return (0, 0, candidate_pair_source_observed_sort_key(pair));
+    }
+
+    match pair.source {
+        CandidatePairSource::PeerReflexive => (1, 0, candidate_pair_source_observed_sort_key(pair)),
+        CandidatePairSource::Learned => (2, 0, candidate_pair_source_observed_sort_key(pair)),
+        CandidatePairSource::StunObserved => (3, 0, candidate_pair_source_observed_sort_key(pair)),
+        CandidatePairSource::Signaled => (4, 0, candidate_pair_source_observed_sort_key(pair)),
+        CandidatePairSource::Birthday => {
+            if let Some(active_endpoint) = active_endpoint {
+                if active_endpoint.ip() == pair.remote_endpoint.ip()
+                    && is_public_probe_endpoint(active_endpoint)
+                {
+                    return (
+                        5,
+                        u64::from(pair.remote_endpoint.port().abs_diff(active_endpoint.port())),
+                        candidate_pair_source_observed_sort_key(pair),
+                    );
+                }
+            }
+            (5, u64::MAX, candidate_pair_source_observed_sort_key(pair))
+        }
+        _ => (6, 0, candidate_pair_source_observed_sort_key(pair)),
+    }
+}
+
+fn birthday_base_rank(
+    conn: &PeerConnection,
+    endpoint: SocketAddr,
+    local_generation: u64,
+) -> (u8, u8, std::cmp::Reverse<Option<Instant>>, u64) {
+    let pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.local_generation == local_generation && pair.remote_endpoint == endpoint);
+    let source = conn.candidate_source_for_endpoint(endpoint);
+    let active_rank = if conn.endpoint == Some(endpoint) {
+        0
+    } else {
+        1
+    };
+    let source_rank = match source {
+        CandidatePairSource::PeerReflexive => 0,
+        CandidatePairSource::Learned => 1,
+        CandidatePairSource::StunObserved => 2,
+        CandidatePairSource::Signaled => 3,
+        _ => 4,
+    };
+    let observed_key = pair
+        .map(candidate_pair_source_observed_sort_key)
+        .unwrap_or(std::cmp::Reverse(None));
+    let probe_count = pair.map(|pair| pair.probe_count).unwrap_or(0);
+    (active_rank, source_rank, observed_key, probe_count)
+}
+
+fn peer_reflexive_retention_rank(
+    conn: &PeerConnection,
+    endpoint: SocketAddr,
+    fresh_endpoint: SocketAddr,
+    local_generation: u64,
+) -> (u8, std::cmp::Reverse<Option<Instant>>, u64) {
+    let pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.local_generation == local_generation && pair.remote_endpoint == endpoint);
+    let fresh_rank = if endpoint == fresh_endpoint { 0 } else { 1 };
+    let observed_key = pair
+        .map(candidate_pair_source_observed_sort_key)
+        .unwrap_or(std::cmp::Reverse(None));
+    let probe_count = pair.map(|pair| pair.probe_count).unwrap_or(0);
+    (fresh_rank, observed_key, probe_count)
+}
+
+fn should_retain_peer_reflexive_pair(pair: &CandidatePair) -> bool {
+    matches!(
+        pair.state,
+        CandidatePairState::Selected | CandidatePairState::Succeeded
+    ) || is_recent_successful_direct_trial_pair(pair)
+}
+
 fn speculative_probe_rotation_rank(pair: &CandidatePair) -> u64 {
     if is_speculative_probe_source(pair.source) {
         pair.probe_count
@@ -5077,18 +5332,18 @@ fn speculative_probe_source_rank_for_mode(
 
 #[cfg(test)]
 fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
-    BIRTHDAY_PROBE_DELTAS
-        .into_iter()
+    (0..birthday_probe_near_rank_count())
+        .filter_map(|rank| birthday_probe_near_delta(rank))
         .filter_map(|delta| birthday_probe_endpoint(base, delta))
         .collect()
 }
 
 fn birthday_probe_endpoint_for_rank(base: SocketAddr, rank: usize) -> Option<SocketAddr> {
-    if let Some(delta) = BIRTHDAY_PROBE_DELTAS.get(rank).copied() {
+    if let Some(delta) = birthday_probe_near_delta(rank) {
         return birthday_probe_endpoint(base, delta);
     }
 
-    let wide_rank = rank.saturating_sub(BIRTHDAY_PROBE_DELTAS.len());
+    let wide_rank = rank.saturating_sub(birthday_probe_near_rank_count());
     let bounded_rank = wide_rank % birthday_probe_wide_rank_count();
     let magnitude = (((bounded_rank / 2) as i32 + 1) * BIRTHDAY_PROBE_WIDE_STRIDE)
         % BIRTHDAY_PROBE_WIDE_MAX_DELTA;
@@ -5109,6 +5364,18 @@ fn birthday_probe_wide_rank_count() -> usize {
     (BIRTHDAY_PROBE_WIDE_MAX_DELTA as usize).saturating_mul(2)
 }
 
+fn birthday_probe_near_rank_count() -> usize {
+    (BIRTHDAY_PROBE_NEAR_MAX_DELTA as usize).saturating_mul(2)
+}
+
+fn birthday_probe_near_delta(rank: usize) -> Option<i32> {
+    if rank >= birthday_probe_near_rank_count() {
+        return None;
+    }
+    let magnitude = (rank / 2 + 1) as i32;
+    Some(if rank % 2 == 0 { magnitude } else { -magnitude })
+}
+
 #[cfg(test)]
 fn birthday_probe_endpoints_for_bases(bases: &[SocketAddr], budget: usize) -> Vec<SocketAddr> {
     birthday_probe_endpoints_for_bases_from_rank(bases, budget, 0)
@@ -5125,9 +5392,8 @@ fn birthday_probe_endpoints_for_bases_from_rank(
     }
 
     let mut seen = HashSet::new();
-    let max_rank = BIRTHDAY_PROBE_DELTAS
-        .len()
-        .saturating_add(birthday_probe_wide_rank_count());
+    let max_rank =
+        birthday_probe_near_rank_count().saturating_add(birthday_probe_wide_rank_count());
     for offset in 0..max_rank {
         let rank = start_rank.saturating_add(offset);
         for base in bases {
@@ -7236,10 +7502,10 @@ mod tests {
             .map(SocketAddr::port)
             .collect::<HashSet<_>>();
 
-        assert_eq!(endpoints.len(), 54);
+        assert_eq!(endpoints.len(), birthday_probe_near_rank_count());
         for port in [
             39999, 40001, 39996, 40004, 39990, 40010, 39983, 40017, 39981, 40019, 39968, 40032,
-            39936, 40064,
+            39904, 40096,
         ] {
             assert!(ports.contains(&port), "missing birthday port {port}");
         }
@@ -7271,16 +7537,16 @@ mod tests {
     #[test]
     fn birthday_probe_endpoints_for_bases_spreads_beyond_near_window() {
         let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
-        let endpoints =
-            birthday_probe_endpoints_for_bases(&[base], BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        let budget = birthday_probe_near_rank_count() + 4;
+        let endpoints = birthday_probe_endpoints_for_bases(&[base], budget);
         let ports = endpoints
             .iter()
             .map(SocketAddr::port)
             .collect::<HashSet<_>>();
 
-        assert_eq!(endpoints.len(), BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
-        assert!(ports.contains(&39936));
-        assert!(ports.contains(&40064));
+        assert_eq!(endpoints.len(), budget);
+        assert!(ports.contains(&39904));
+        assert!(ports.contains(&40096));
         assert!(ports.contains(&40251));
         assert!(ports.contains(&39749));
         assert!(ports
