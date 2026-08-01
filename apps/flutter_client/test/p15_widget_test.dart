@@ -67,6 +67,38 @@ void main() {
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
   });
 
+  testWidgets('StatusStore settles peer catalog after daemon start', (
+    tester,
+  ) async {
+    final fullSnapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final partialSnapshot = _snapshotWithPeerCount(fullSnapshot, 1);
+    final api = _FakeDiagnosticsApi(
+      health: true,
+      snapshots: [partialSnapshot, fullSnapshot, fullSnapshot],
+    );
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: api,
+        startupCatalogRefreshInterval: Duration.zero,
+        startupCatalogRefreshTimeout: const Duration(seconds: 1),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          authToken: 'token',
+          manualMode: false,
+        ),
+      ),
+    );
+    await tester.runAsync(stores.statusStore.startDaemon);
+
+    expect(stores.statusStore.snapshot?.peers, hasLength(2));
+    expect(api.statusFetchCount, greaterThanOrEqualTo(3));
+  });
+
   testWidgets('Dashboard separates status endpoint errors from health', (
     tester,
   ) async {
@@ -570,7 +602,23 @@ Future<DiagnosticsSnapshot> _loadFixtureSnapshot() async {
   return DiagnosticsSnapshot.fromJson(jsonDecode(raw) as Map<String, dynamic>);
 }
 
-Future<_Stores> _makeStores({required DiagnosticsApi api}) async {
+DiagnosticsSnapshot _snapshotWithPeerCount(
+  DiagnosticsSnapshot snapshot,
+  int peerCount,
+) {
+  final raw = jsonDecode(jsonEncode(snapshot.raw)) as Map<String, dynamic>;
+  raw['peers'] = (raw['peers'] as List<dynamic>).take(peerCount).toList();
+  (raw['stats'] as Map<String, dynamic>)['total_peers'] = peerCount;
+  return DiagnosticsSnapshot.fromJson(raw);
+}
+
+Future<_Stores> _makeStores({
+  required DiagnosticsApi api,
+  Duration startupCatalogRefreshInterval =
+      StatusStore.defaultStartupCatalogRefreshInterval,
+  Duration startupCatalogRefreshTimeout =
+      StatusStore.defaultStartupCatalogRefreshTimeout,
+}) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
@@ -581,6 +629,8 @@ Future<_Stores> _makeStores({required DiagnosticsApi api}) async {
     diagnosticsApi: api,
     daemonController: _FakeDaemonController(api),
     autoRefreshInterval: const Duration(minutes: 5),
+    startupCatalogRefreshInterval: startupCatalogRefreshInterval,
+    startupCatalogRefreshTimeout: startupCatalogRefreshTimeout,
   );
   return _Stores(tempDir, settingsStore, statusStore);
 }
@@ -600,11 +650,18 @@ class _Stores {
 }
 
 class _FakeDiagnosticsApi implements DiagnosticsApi {
-  _FakeDiagnosticsApi({required this.health, this.snapshot, this.statusError});
+  _FakeDiagnosticsApi({
+    required this.health,
+    this.snapshot,
+    this.snapshots,
+    this.statusError,
+  });
 
   final bool health;
   final DiagnosticsSnapshot? snapshot;
+  final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
+  var statusFetchCount = 0;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => health;
@@ -614,8 +671,15 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
 
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
+    statusFetchCount += 1;
     final error = statusError;
     if (error != null) throw error;
+    final sequence = snapshots;
+    if (sequence != null && sequence.isNotEmpty) {
+      final index = statusFetchCount - 1;
+      if (index < sequence.length) return sequence[index];
+      return sequence.last;
+    }
     final value = snapshot;
     if (value == null) {
       throw const DiagnosticsApiException('missing fixture snapshot');

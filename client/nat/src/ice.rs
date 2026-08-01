@@ -636,9 +636,8 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
         mapping_behavior,
         port_delta,
     );
-    let latest = mapped.last().copied().unwrap_or(first);
     let predicted_endpoints =
-        predicted_reflexive_endpoints(latest, port_delta, prediction_candidate);
+        predicted_reflexive_endpoints_for_mappings(&mapped, port_delta, prediction_candidate);
     let birthday_candidate = is_birthday_candidate(
         false,
         mapping_behavior,
@@ -692,6 +691,79 @@ fn predicted_reflexive_endpoints(
             Some(SocketAddr::new(base_endpoint.ip(), port).to_string())
         })
         .collect()
+}
+
+fn predicted_reflexive_endpoints_for_mappings(
+    mapped: &[SocketAddr],
+    port_delta: Option<i32>,
+    prediction_candidate: bool,
+) -> Vec<String> {
+    if !prediction_candidate {
+        return Vec::new();
+    }
+
+    if let Some(endpoints) = linear_successor_reflexive_endpoints(mapped) {
+        return endpoints;
+    }
+
+    mapped
+        .last()
+        .copied()
+        .map(|base| predicted_reflexive_endpoints(base, port_delta, true))
+        .unwrap_or_default()
+}
+
+fn linear_successor_reflexive_endpoints(mapped: &[SocketAddr]) -> Option<Vec<String>> {
+    if mapped.len() < 3 {
+        return None;
+    }
+    let first_ip = mapped[0].ip();
+    if !mapped.iter().all(|endpoint| endpoint.ip() == first_ip) {
+        return None;
+    }
+
+    let deltas = mapped
+        .windows(2)
+        .map(|pair| pair[1].port() as i32 - pair[0].port() as i32)
+        .collect::<Vec<_>>();
+    if !deltas
+        .iter()
+        .all(|delta| *delta != 0 && (-8..=8).contains(delta))
+    {
+        return None;
+    }
+
+    let positive = deltas.iter().all(|delta| *delta > 0);
+    let negative = deltas.iter().all(|delta| *delta < 0);
+    if deltas.iter().all(|delta| *delta == deltas[0]) && deltas[0].abs() != 1 {
+        return None;
+    }
+    let direction = match (positive, negative) {
+        (true, false) => 1,
+        (false, true) => -1,
+        _ => return None,
+    };
+
+    let observed_ports = mapped.iter().map(SocketAddr::port).collect::<HashSet<_>>();
+    let edge_port = if direction > 0 {
+        *observed_ports.iter().max()?
+    } else {
+        *observed_ports.iter().min()?
+    };
+
+    let mut endpoints = Vec::with_capacity(MAX_PREDICTED_REFLEXIVE_CANDIDATES);
+    for step in 1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES {
+        let predicted = edge_port as i32 + direction * step as i32;
+        let Ok(port) = u16::try_from(predicted) else {
+            continue;
+        };
+        if port == 0 || observed_ports.contains(&port) {
+            continue;
+        }
+        endpoints.push(SocketAddr::new(first_ip, port).to_string());
+    }
+
+    (!endpoints.is_empty()).then_some(endpoints)
 }
 
 fn add_predicted_reflexive_candidates(candidates: &mut Vec<IceCandidate>, profile: &NatProfile) {
@@ -1136,6 +1208,29 @@ mod tests {
     }
 
     #[test]
+    fn overlay_utun_addresses_are_filtered_from_host_candidates() {
+        let tailscale_v4 = IpAddr::V4(Ipv4Addr::new(100, 84, 190, 40));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::e136:be29".parse().unwrap());
+        let p2wlan_overlay = IpAddr::V4(Ipv4Addr::new(10, 20, 0, 13));
+        let generic_vpn = IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2));
+
+        let selected = select_local_addresses(
+            &[
+                ("utun4".to_string(), tailscale_v4),
+                ("utun4".to_string(), tailscale_v6),
+                ("utun5".to_string(), p2wlan_overlay),
+                ("utun6".to_string(), generic_vpn),
+            ],
+            &[],
+        );
+
+        assert!(!selected.contains(&tailscale_v4));
+        assert!(!selected.contains(&tailscale_v6));
+        assert!(!selected.contains(&p2wlan_overlay));
+        assert!(!selected.contains(&generic_vpn));
+    }
+
+    #[test]
     fn test_candidate_host_ip_filter() {
         assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
         assert!(!is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
@@ -1408,6 +1503,55 @@ mod tests {
 
         assert_eq!(profile.port_delta, Some(1));
         assert!(profile.prediction_candidate);
+        assert!(profile
+            .predicted_endpoints
+            .contains(&"220.163.6.190:8154".to_string()));
+    }
+
+    #[test]
+    fn test_predicted_reflexive_window_follows_air_linear_successor_group() {
+        let profile = build_nat_profile(
+            "192.168.0.239:59458".parse().unwrap(),
+            vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8126".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8127".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8128".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-d.example:3478".to_string(),
+                    mapped_address: Some("220.163.6.190:8130".to_string()),
+                    rtt_ms: Some(13),
+                    error: None,
+                },
+                StunObservation {
+                    server: "observer.example:18082".to_string(),
+                    mapped_address: Some("220.163.6.190:8133".to_string()),
+                    rtt_ms: Some(14),
+                    error: None,
+                },
+            ],
+        );
+
+        assert_eq!(profile.port_delta, Some(2));
+        assert!(profile.prediction_candidate);
+        assert_eq!(
+            profile.predicted_endpoints.first().map(String::as_str),
+            Some("220.163.6.190:8134")
+        );
         assert!(profile
             .predicted_endpoints
             .contains(&"220.163.6.190:8154".to_string()));
