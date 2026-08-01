@@ -127,14 +127,6 @@ async fn spawn_hole_punch_task(
                             format!("no UDP punch ACK after {sent} probes"),
                         )
                         .await;
-                    peers
-                        .record_direct_failure_for_generation(
-                            &peer_id,
-                            generation,
-                            REASON_DIRECT_PROBE_FAILED,
-                            format!("no UDP punch ACK after {sent} probes"),
-                        )
-                        .await;
                 }
             }
             Err(err) => {
