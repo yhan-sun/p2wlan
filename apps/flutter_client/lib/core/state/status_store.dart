@@ -13,6 +13,8 @@ class StatusStore extends ChangeNotifier {
     required this.diagnosticsApi,
     DaemonController? daemonController,
     this.autoRefreshInterval = defaultAutoRefreshInterval,
+    this.startupCatalogRefreshTimeout = defaultStartupCatalogRefreshTimeout,
+    this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
   }) : daemonController =
            daemonController ??
            DaemonController(diagnosticsApi: diagnosticsApi) {
@@ -20,11 +22,19 @@ class StatusStore extends ChangeNotifier {
   }
 
   static const defaultAutoRefreshInterval = Duration(seconds: 30);
+  static const defaultStartupCatalogRefreshTimeout = Duration(seconds: 6);
+  static const defaultStartupCatalogRefreshInterval = Duration(
+    milliseconds: 500,
+  );
+  static const _startupCatalogMaxRefreshes = 14;
+  static const _startupCatalogMinRefreshes = 12;
 
   final SettingsStore settingsStore;
   final DiagnosticsApi diagnosticsApi;
   final DaemonController daemonController;
   final Duration autoRefreshInterval;
+  final Duration startupCatalogRefreshTimeout;
+  final Duration startupCatalogRefreshInterval;
 
   Timer? _timer;
   DiagnosticsSnapshot? _snapshot;
@@ -66,7 +76,9 @@ class StatusStore extends ChangeNotifier {
     bool refreshImmediately = false,
   }) {
     if (_autoRefreshEnabled == enabled) {
-      if (enabled && refreshImmediately) unawaited(refresh());
+      if (enabled && refreshImmediately) {
+        unawaited(refreshUntilPeerCatalogSettled());
+      }
       return;
     }
     _autoRefreshEnabled = enabled;
@@ -74,7 +86,7 @@ class StatusStore extends ChangeNotifier {
     _timer = null;
     if (enabled) {
       _timer = Timer.periodic(autoRefreshInterval, (_) => unawaited(refresh()));
-      if (refreshImmediately) unawaited(refresh());
+      if (refreshImmediately) unawaited(refreshUntilPeerCatalogSettled());
     }
     notifyListeners();
   }
@@ -121,9 +133,62 @@ class StatusStore extends ChangeNotifier {
     }
   }
 
+  Future<void> refreshUntilPeerCatalogSettled({
+    bool skipInitialRefresh = false,
+  }) async {
+    if (!skipInitialRefresh) {
+      await refresh();
+    }
+    if (!_shouldSettlePeerCatalog()) return;
+
+    final deadline = DateTime.now().add(startupCatalogRefreshTimeout);
+    var refreshCount = 1;
+    var stableCatalogCount = 0;
+    var previousSignature = _peerCatalogSignature(_snapshot);
+    var bestSnapshot = _snapshot;
+
+    while (refreshCount < _startupCatalogMaxRefreshes &&
+        DateTime.now().isBefore(deadline)) {
+      if (startupCatalogRefreshInterval > Duration.zero) {
+        await Future<void>.delayed(startupCatalogRefreshInterval);
+      } else {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      await refresh();
+      refreshCount += 1;
+
+      final currentSnapshot = _snapshot;
+      if (_isPeerCatalogMoreComplete(currentSnapshot, bestSnapshot)) {
+        bestSnapshot = currentSnapshot;
+      }
+
+      final currentSignature = _peerCatalogSignature(currentSnapshot);
+      if (currentSignature == previousSignature) {
+        stableCatalogCount += 1;
+      } else {
+        stableCatalogCount = 0;
+      }
+      previousSignature = currentSignature;
+
+      if (!_shouldSettlePeerCatalog()) break;
+      if (currentSnapshot?.health.controlConnected == true &&
+          refreshCount >= _startupCatalogMinRefreshes &&
+          stableCatalogCount >= 1) {
+        break;
+      }
+    }
+
+    if (_isPeerCatalogMoreComplete(bestSnapshot, _snapshot)) {
+      _snapshot = bestSnapshot;
+      notifyListeners();
+    }
+  }
+
   Future<DaemonCommandResult> startDaemon() async {
     return _runDaemonCommand(
       () => daemonController.start(settingsStore.settings),
+      settlePeerCatalog: true,
     );
   }
 
@@ -134,8 +199,9 @@ class StatusStore extends ChangeNotifier {
   }
 
   Future<DaemonCommandResult> _runDaemonCommand(
-    Future<DaemonCommandResult> Function() command,
-  ) async {
+    Future<DaemonCommandResult> Function() command, {
+    bool settlePeerCatalog = false,
+  }) async {
     if (_daemonBusy) {
       return const DaemonCommandResult(
         ok: false,
@@ -153,7 +219,11 @@ class StatusStore extends ChangeNotifier {
       if (!result.ok) {
         _lastError = result.message;
       }
-      await refresh();
+      if (result.ok && settlePeerCatalog) {
+        await refreshUntilPeerCatalogSettled();
+      } else {
+        await refresh();
+      }
       return result;
     } catch (error) {
       final result = DaemonCommandResult(
@@ -168,6 +238,45 @@ class StatusStore extends ChangeNotifier {
       _daemonBusy = false;
       notifyListeners();
     }
+  }
+
+  bool _shouldSettlePeerCatalog() {
+    final settings = settingsStore.settings;
+    return !settings.manualMode &&
+        settings.authToken.trim().isNotEmpty &&
+        _healthReachable;
+  }
+
+  static String _peerCatalogSignature(DiagnosticsSnapshot? snapshot) {
+    if (snapshot == null) return '';
+    final peerKeys = [
+      for (final peer in snapshot.peers)
+        '${peer.nodeId.trim()}|${peer.virtualIp.trim()}',
+    ]..sort();
+    return peerKeys.join('\n');
+  }
+
+  static bool _isPeerCatalogMoreComplete(
+    DiagnosticsSnapshot? candidate,
+    DiagnosticsSnapshot? current,
+  ) {
+    if (candidate == null) return false;
+    if (current == null) return true;
+    if (candidate.health.controlConnected != current.health.controlConnected) {
+      return candidate.health.controlConnected;
+    }
+    if (candidate.peers.length != current.peers.length) {
+      return candidate.peers.length > current.peers.length;
+    }
+    final candidateLastSuccess = candidate.health.lastControlSuccessSecsAgo;
+    final currentLastSuccess = current.health.lastControlSuccessSecsAgo;
+    if (candidateLastSuccess != null && currentLastSuccess == null) {
+      return true;
+    }
+    if (candidateLastSuccess == null || currentLastSuccess == null) {
+      return false;
+    }
+    return candidateLastSuccess < currentLastSuccess;
   }
 
   void _handleSettingsChanged() {

@@ -62,9 +62,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 use p2pnet_crypto::{DhKeyPair, NodeIdentity};
-use p2pnet_nat::{
-    CandidateGatherReport, CandidateSource, FilteringBehavior, MappingBehavior, NatProfile,
-};
+use p2pnet_nat::{CandidateGatherReport, CandidateSource, MappingBehavior, NatProfile};
 use rand::RngCore;
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
@@ -270,23 +268,47 @@ const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Default)]
 struct PunchAttemptDeduplicator {
-    recent_starts: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    recent_starts: Arc<tokio::sync::Mutex<HashMap<String, PunchAttemptRecord>>>,
+}
+
+#[derive(Clone, Copy)]
+struct PunchAttemptRecord {
+    started_at: Instant,
+    priority: u8,
 }
 
 impl PunchAttemptDeduplicator {
     async fn claim(&self, peer_id: &str) -> bool {
-        self.claim_with_window(peer_id, PUNCH_SESSION_DEDUP_WINDOW)
+        self.claim_with_window_and_priority(peer_id, PUNCH_SESSION_DEDUP_WINDOW, 1)
             .await
     }
 
     async fn claim_with_window(&self, peer_id: &str, window: Duration) -> bool {
+        self.claim_with_window_and_priority(peer_id, window, 0)
+            .await
+    }
+
+    async fn claim_with_window_and_priority(
+        &self,
+        peer_id: &str,
+        window: Duration,
+        priority: u8,
+    ) -> bool {
         let now = Instant::now();
         let mut starts = self.recent_starts.lock().await;
-        starts.retain(|_, started| now.duration_since(*started) < window);
-        if starts.contains_key(peer_id) {
-            return false;
+        starts.retain(|_, record| now.duration_since(record.started_at) < window);
+        if let Some(record) = starts.get(peer_id) {
+            if record.priority >= priority {
+                return false;
+            }
         }
-        starts.insert(peer_id.to_string(), now);
+        starts.insert(
+            peer_id.to_string(),
+            PunchAttemptRecord {
+                started_at: now,
+                priority,
+            },
+        );
         true
     }
 }
@@ -781,8 +803,7 @@ impl Daemon {
                                     let pool_eligible = socket_pool_enabled
                                         && report.nat_profile.mapping_behavior
                                             == MappingBehavior::AddressOrPortDependent
-                                        && report.nat_profile.filtering_behavior
-                                            == FilteringBehavior::AddressOrPortDependent;
+                                        && !report.nat_profile.udp_blocked;
                                     udp.set_socket_pool_active(pool_eligible);
                                     if udp.socket_count() > 1 {
                                         info!(
@@ -790,7 +811,7 @@ impl Daemon {
                                             udp.socket_count(),
                                             udp.socket_pool_active(),
                                             if pool_eligible {
-                                                "address/port-dependent mapping and filtering"
+                                                "address/port-dependent mapping"
                                             } else {
                                                 "NAT profile did not qualify"
                                             }
@@ -2480,16 +2501,10 @@ fn signal_candidate_rank(endpoint: &str, source: Option<&str>) -> u8 {
         Some("manual") => 2,
         Some("stun_observed") => 3,
         Some("predicted") => 4,
-        Some("host") => {
-            if endpoint
-                .parse::<SocketAddr>()
-                .is_ok_and(is_public_udp_candidate)
-            {
-                5
-            } else {
-                8
-            }
-        }
+        Some("host") => match endpoint.parse::<SocketAddr>() {
+            Ok(endpoint) if is_public_udp_candidate(endpoint) => 5,
+            _ => 8,
+        },
         Some("relay") => 9,
         Some(_) | None => {
             if endpoint
@@ -2585,6 +2600,7 @@ fn stable_network_candidate_signature(
             .map(String::as_str)
             .unwrap_or("signaled");
         match endpoint.parse::<SocketAddr>() {
+            Ok(addr) if is_external_overlay_udp_candidate(addr) => {}
             Ok(addr) if is_public_udp_candidate(addr) => match source {
                 "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
                     signature.push(format!("public-ip:{}", addr.ip()));
@@ -2642,6 +2658,13 @@ fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
                 && !ip.is_unique_local()
                 && (ip.segments()[0] & 0xffc0) != 0xfe80
         }
+    }
+}
+
+fn is_external_overlay_udp_candidate(candidate: SocketAddr) -> bool {
+    match candidate.ip() {
+        IpAddr::V4(ip) => is_shared_ipv4(ip),
+        IpAddr::V6(ip) => ip.is_unique_local(),
     }
 }
 
@@ -3370,6 +3393,18 @@ async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
                     published_endpoint = Some(endpoint);
                 }
             }
+            publish_local_candidates_to_known_peers(
+                &control,
+                peers.clone(),
+                udp.clone(),
+                punch_deduplicator.clone(),
+                &candidates,
+                &candidate_sources,
+                probe_interval,
+                punch_attempts,
+                "UDP volatile candidate refresh",
+            )
+            .await;
             continue;
         }
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
@@ -4786,6 +4821,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn punch_attempt_deduplicator_lets_synchronized_punch_override_background() {
+        let deduplicator = PunchAttemptDeduplicator::default();
+        assert!(
+            deduplicator
+                .claim_with_window("peer-a", DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW)
+                .await
+        );
+        assert!(
+            deduplicator.claim("peer-a").await,
+            "synchronized punch should preempt a recent background retry"
+        );
+        assert!(
+            !deduplicator
+                .claim_with_window("peer-a", DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW)
+                .await,
+            "background retry should not preempt a recent synchronized punch"
+        );
+        assert!(!deduplicator.claim("peer-a").await);
+    }
+
+    #[tokio::test]
     async fn start_hole_punch_waits_for_local_candidates_before_state_change() {
         let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
         let daemon = Daemon::new(config);
@@ -5336,6 +5392,39 @@ mod tests {
     }
 
     #[test]
+    fn signal_candidate_cap_does_not_preserve_external_overlay_hosts_over_public_predictions() {
+        let tailscale_v4 = "100.84.190.40:51820".to_string();
+        let tailscale_v6 = "[fd7a:115c:a1e0::e136:be29]:51820".to_string();
+        let p2wlan_overlay = "10.20.0.13:51820".to_string();
+        let mut candidates = vec![
+            tailscale_v4.clone(),
+            tailscale_v6.clone(),
+            p2wlan_overlay.clone(),
+        ];
+        candidates.extend((8135..=8161).map(|port| format!("220.163.6.190:{port}")));
+
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint, "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+        sources.insert(tailscale_v4.clone(), "host".to_string());
+        sources.insert(tailscale_v6.clone(), "host".to_string());
+        sources.insert(p2wlan_overlay.clone(), "host".to_string());
+
+        truncate_signal_candidates(&mut candidates, &mut sources);
+
+        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert!(!candidates.contains(&tailscale_v4));
+        assert!(!candidates.contains(&tailscale_v6));
+        assert!(!candidates.contains(&p2wlan_overlay));
+        assert!(candidates
+            .iter()
+            .all(|endpoint| endpoint.starts_with("220.163.6.190:")));
+        assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    }
+
+    #[test]
     fn signal_candidate_cap_keeps_priority_prefix_and_source_map_aligned() {
         let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 3)
             .map(|index| format!("192.0.2.{index}:51820"))
@@ -5494,6 +5583,67 @@ mod tests {
                 "93.184.216.34:31999".to_string(),
                 "stun_observed".to_string(),
             ),
+        ]);
+
+        assert!(!candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
+        ));
+    }
+
+    #[test]
+    fn candidate_refresh_generation_ignores_external_overlay_and_public_port_churn() {
+        let previous = vec![
+            "tailscale.example.com:60155".to_string(),
+            "tailscale.example.com:58770".to_string(),
+            "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+            "220.163.6.190:6979".to_string(),
+            "220.163.6.190:6980".to_string(),
+            "220.163.6.190:6984".to_string(),
+        ];
+        let previous_sources = HashMap::from([
+            ("tailscale.example.com:60155".to_string(), "host".to_string()),
+            ("tailscale.example.com:58770".to_string(), "host".to_string()),
+            (
+                "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+                "host".to_string(),
+            ),
+            (
+                "220.163.6.190:6979".to_string(),
+                "stun_observed".to_string(),
+            ),
+            (
+                "220.163.6.190:6980".to_string(),
+                "stun_observed".to_string(),
+            ),
+            ("220.163.6.190:6984".to_string(), "predicted".to_string()),
+        ]);
+        let next = vec![
+            "tailscale.example.com:59581".to_string(),
+            "tailscale.example.com:60155".to_string(),
+            "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+            "220.163.6.190:6981".to_string(),
+            "220.163.6.190:6983".to_string(),
+            "220.163.6.190:6995".to_string(),
+        ];
+        let next_sources = HashMap::from([
+            ("tailscale.example.com:59581".to_string(), "host".to_string()),
+            ("tailscale.example.com:60155".to_string(), "host".to_string()),
+            (
+                "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+                "host".to_string(),
+            ),
+            (
+                "220.163.6.190:6981".to_string(),
+                "stun_observed".to_string(),
+            ),
+            (
+                "220.163.6.190:6983".to_string(),
+                "stun_observed".to_string(),
+            ),
+            ("220.163.6.190:6995".to_string(), "predicted".to_string()),
         ]);
 
         assert!(!candidate_refresh_requires_network_generation_advance(

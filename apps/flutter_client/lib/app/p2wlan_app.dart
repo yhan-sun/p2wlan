@@ -69,6 +69,9 @@ class _P2WlanAppState extends State<P2WlanApp> {
     }
     if (widget.initialRefresh) {
       await _statusStore.refresh();
+      unawaited(
+        _statusStore.refreshUntilPeerCatalogSettled(skipInitialRefresh: true),
+      );
     }
     if (widget.autoStartPolling) {
       _statusStore.startPolling();
@@ -81,10 +84,7 @@ class _P2WlanAppState extends State<P2WlanApp> {
   Future<void> _logout() async {
     final settings = _settingsStore.settings;
     await _settingsStore.updateSettings(
-      settings.copyWith(
-        authToken: '',
-        manualMode: false,
-      ),
+      settings.copyWith(authToken: '', manualMode: false),
     );
     await _statusStore.refresh();
     if (mounted) {

@@ -20,9 +20,9 @@ use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet_with_nomination,
     build_punch_ack, build_punch_packet, build_punch_packet_with_nonce,
     candidate_report_from_observations, decode_authenticated_punch_packet, decode_punch_packet,
-    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport,
-    FilteringBehavior, IceConfig, MappingBehavior, PunchPacketKind, StunAttribute, StunClient,
-    StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
+    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport, IceConfig,
+    MappingBehavior, PunchPacketKind, StunAttribute, StunClient, StunMessage, StunObservation,
+    BINDING_RESPONSE, MAGIC_COOKIE,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -126,9 +126,12 @@ const AUTH_PUNCH_REPLAY_TARGET_ENTRIES: usize = 3072;
 const AUTH_PUNCH_RATE_WINDOW: Duration = Duration::from_secs(1);
 const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
 const OUTBOUND_PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
-const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 192;
-const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 64;
-const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 24;
+const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 768;
+const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 256;
+// Symmetric NAT traversal often needs to sweep a short predicted port window
+// against one public IP. Keep this bounded, but wide enough that the first
+// synchronized punch is not cut off before the predicted window is covered.
+const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 192;
 /// Two STUN observers per experimental socket are enough to publish that
 /// socket's observed mapping and infer a small per-socket port-delta prediction
 /// window without turning the bounded traversal experiment into a large STUN
@@ -357,9 +360,8 @@ fn build_probe_schedule(
                 unique.len()
             } else {
                 match round {
-                    0 => unique.len().min(8),
-                    1 => unique.len().min(16),
-                    2 => unique.len().min(24),
+                    0 | 1 => unique.len().min(24),
+                    2 => unique.len().min(48),
                     _ => unique.len(),
                 }
             };
@@ -1343,6 +1345,9 @@ impl UdpTransport {
                     {
                         Ok(_) => {
                             packets_sent += 1;
+                            self.peers
+                                .record_direct_probe_sent(peer_id, candidate)
+                                .await;
                             trace!(
                                 "Sent adaptive punch probe round {} from socket {} to peer {} candidate {}",
                                 round_index + 1,
@@ -2053,7 +2058,7 @@ impl UdpTransport {
 
 fn socket_pool_is_eligible(report: &CandidateGatherReport) -> bool {
     report.nat_profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
-        && report.nat_profile.filtering_behavior == FilteringBehavior::AddressOrPortDependent
+        && !report.nat_profile.udp_blocked
 }
 
 fn pool_stun_servers(
@@ -2269,6 +2274,48 @@ mod tests {
         ))
     }
 
+    fn hard_nat_candidate_report(
+        filtering_behavior: p2pnet_nat::FilteringBehavior,
+    ) -> CandidateGatherReport {
+        CandidateGatherReport {
+            candidates: Vec::new(),
+            nat_profile: p2pnet_nat::NatProfile {
+                local_addr: "0.0.0.0:0".to_string(),
+                observations: Vec::new(),
+                udp_blocked: false,
+                public_endpoint: Some("203.0.113.10:40000".to_string()),
+                public_ip_stable: Some(true),
+                public_port_stable: Some(false),
+                port_preserved: Some(false),
+                port_delta: Some(1),
+                likely_symmetric: Some(true),
+                mapping_behavior: MappingBehavior::AddressOrPortDependent,
+                filtering_behavior,
+                hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+                mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+                prediction_candidate: true,
+                predicted_endpoints: vec!["203.0.113.10:40001".to_string()],
+                birthday_candidate: true,
+                confidence: 90,
+            },
+        }
+    }
+
+    #[test]
+    fn socket_pool_activates_for_mapping_dependent_nat_with_unknown_filtering() {
+        let report = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+
+        assert!(socket_pool_is_eligible(&report));
+    }
+
+    #[test]
+    fn socket_pool_rejects_udp_blocked_nat_profile() {
+        let mut report = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::UdpBlocked);
+        report.nat_profile.udp_blocked = true;
+
+        assert!(!socket_pool_is_eligible(&report));
+    }
+
     #[tokio::test]
     async fn global_outbound_probe_budget_limits_across_transports() {
         let path = unique_global_probe_budget_path("global-probe-budget");
@@ -2353,17 +2400,17 @@ mod tests {
 
     #[test]
     fn adaptive_probe_schedule_expands_large_candidate_sets_quickly() {
-        let candidates = (0..20)
+        let candidates = (0..48)
             .map(|i| format!("127.0.0.1:{}", 12_000 + i).parse().unwrap())
             .collect::<Vec<SocketAddr>>();
 
         let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 4);
 
         assert_eq!(schedule.len(), 4);
-        assert_eq!(schedule[0].endpoints.len(), 8);
-        assert_eq!(schedule[1].endpoints.len(), 16);
-        assert_eq!(schedule[2].endpoints.len(), 20);
-        assert_eq!(schedule[3].endpoints.len(), 20);
+        assert_eq!(schedule[0].endpoints.len(), 24);
+        assert_eq!(schedule[1].endpoints.len(), 24);
+        assert_eq!(schedule[2].endpoints.len(), 48);
+        assert_eq!(schedule[3].endpoints.len(), 48);
     }
 
     #[test]

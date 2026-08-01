@@ -51,8 +51,8 @@ const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
-const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 18;
-const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 20;
+const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 24;
+const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 24;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 0;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 2;
 const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 64;
@@ -94,6 +94,14 @@ enum ProbeTargetMode {
 
 impl ProbeTargetMode {
     fn bypasses_pair_cooldown(self) -> bool {
+        matches!(self, Self::Synchronized | Self::Reclaim)
+    }
+
+    fn refreshes_speculative_budget(self) -> bool {
+        matches!(self, Self::Synchronized | Self::Reclaim)
+    }
+
+    fn prioritizes_predicted(self) -> bool {
         matches!(self, Self::Synchronized | Self::Reclaim)
     }
 
@@ -1141,9 +1149,16 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_probe_rank(a.state)
-                .cmp(&candidate_pair_probe_rank(b.state))
-                .then_with(|| outbound_probe_priority_rank(a).cmp(&outbound_probe_priority_rank(b)))
+            outbound_probe_priority_rank(a)
+                .cmp(&outbound_probe_priority_rank(b))
+                .then_with(|| {
+                    speculative_probe_source_rank_for_mode(a.source, mode)
+                        .cmp(&speculative_probe_source_rank_for_mode(b.source, mode))
+                })
+                .then_with(|| {
+                    candidate_pair_probe_rank_for_mode(a.state, a.source, mode)
+                        .cmp(&candidate_pair_probe_rank_for_mode(b.state, b.source, mode))
+                })
                 .then_with(|| {
                     candidate_pair_source_quality_rank(&source_stats, history, a.source).cmp(
                         &candidate_pair_source_quality_rank(&source_stats, history, b.source),
@@ -1179,7 +1194,7 @@ impl PeerConnection {
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
-        apply_adaptive_probe_budgets(pairs, &source_stats, history)
+        apply_adaptive_probe_budgets(pairs, &source_stats, history, mode)
             .into_iter()
             .map(|pair| pair.remote_endpoint)
             .collect()
@@ -1263,6 +1278,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && !is_overlay_endpoint(pair.remote_endpoint)
                     && (matches!(
                         pair.state,
                         CandidatePairState::Selected
@@ -1310,16 +1326,15 @@ impl PeerConnection {
             return true;
         }
 
-        let selected_private = self
-            .selected_candidate_pair_for_diagnostics(local_generation)
-            .is_some_and(|pair| is_private_direct_endpoint(pair.remote_endpoint));
-        if selected_private {
+        let selected_pair = self.selected_candidate_pair_for_diagnostics(local_generation);
+        if selected_pair.is_some_and(|pair| is_low_latency_direct_endpoint(pair.remote_endpoint)) {
             return false;
         }
 
         self.candidate_pairs.iter().any(|pair| {
             pair.local_generation == local_generation
-                && is_private_direct_endpoint(pair.remote_endpoint)
+                && (is_low_latency_direct_endpoint(pair.remote_endpoint)
+                    || is_public_probe_endpoint(pair.remote_endpoint))
                 && !matches!(
                     pair.state,
                     CandidatePairState::Selected | CandidatePairState::Succeeded
@@ -1331,7 +1346,10 @@ impl PeerConnection {
     fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
         self.best_candidate_pair_for_send(local_generation)
             .map(|pair| pair.remote_endpoint)
-            .or(self.endpoint)
+            .or_else(|| {
+                self.endpoint
+                    .filter(|endpoint| !is_overlay_endpoint(*endpoint))
+            })
     }
 
     fn selected_direct_endpoint_for_consent(&self, local_generation: u64) -> Option<SocketAddr> {
@@ -1339,6 +1357,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && !is_overlay_endpoint(pair.remote_endpoint)
                     && pair.selected_at.is_some()
                     && pair.state != CandidatePairState::Frozen
             })
@@ -1843,8 +1862,16 @@ impl PeerConnection {
         let local_endpoint_text = format_log_endpoint(local_endpoint);
         let peer_id = self.node_id.clone();
         let mut probed_sources = Vec::new();
-        for endpoint in self.candidate_endpoints() {
+        let current_endpoints = self.candidate_endpoints();
+        let has_probed_pair = current_endpoints.iter().copied().any(|endpoint| {
             let pair = self.ensure_candidate_pair(endpoint, local_generation);
+            pair.last_probe_at.is_some()
+        });
+        for endpoint in current_endpoints {
+            let pair = self.ensure_candidate_pair(endpoint, local_generation);
+            if has_probed_pair && pair.last_probe_at.is_none() {
+                continue;
+            }
             if pair.last_probe_at.is_some() && !probed_sources.contains(&pair.source) {
                 probed_sources.push(pair.source);
             }
@@ -1991,7 +2018,7 @@ impl PeerConnection {
     fn has_private_direct_candidate(&self) -> bool {
         self.candidate_endpoints()
             .into_iter()
-            .any(|endpoint| is_private_direct_endpoint(endpoint) || is_overlay_endpoint(endpoint))
+            .any(is_low_latency_direct_endpoint)
     }
 
     fn has_mapping_assisted_candidate(&self) -> bool {
@@ -3081,6 +3108,9 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return Vec::new();
         };
+        if !conn.online {
+            return Vec::new();
+        }
         if conn.state == ConnectionState::Direct
             && !conn.should_probe_private_alternates_while_direct(generation)
         {
@@ -3092,9 +3122,6 @@ impl PeerManager {
             local_nat_profile.as_ref(),
             ProbeTargetMode::Synchronized,
         );
-        for endpoint in &endpoints {
-            conn.mark_candidate_pair_probing(*endpoint, generation);
-        }
         if !endpoints.is_empty() {
             conn.record_direct_event(
                 generation,
@@ -3121,6 +3148,9 @@ impl PeerManager {
             .await
             .values_mut()
             .filter_map(|conn| {
+                if !conn.online {
+                    return None;
+                }
                 if conn.state == ConnectionState::Direct
                     && !conn.should_probe_private_alternates_while_direct(generation)
                 {
@@ -3158,9 +3188,6 @@ impl PeerManager {
                 if endpoints.is_empty() {
                     None
                 } else {
-                    for endpoint in &endpoints {
-                        conn.mark_candidate_pair_probing(*endpoint, generation);
-                    }
                     conn.record_direct_event(
                         generation,
                         "probe_targets_due",
@@ -3196,6 +3223,9 @@ impl PeerManager {
             .await
             .values_mut()
             .filter_map(|conn| {
+                if !conn.online {
+                    return None;
+                }
                 if conn.state == ConnectionState::Direct {
                     return None;
                 }
@@ -3237,9 +3267,6 @@ impl PeerManager {
                 if endpoints.is_empty() {
                     None
                 } else {
-                    for endpoint in &endpoints {
-                        conn.mark_candidate_pair_probing(*endpoint, generation);
-                    }
                     if reclaim_active {
                         conn.record_direct_event(
                             generation,
@@ -3257,6 +3284,20 @@ impl PeerManager {
                 }
             })
             .collect()
+    }
+
+    /// Record that a UDP probe datagram was actually sent to a candidate.
+    ///
+    /// Candidate selection can be broader than the outbound rate-limit budget;
+    /// mark pairs as probing only once the UDP layer confirms a packet left.
+    pub async fn record_direct_probe_sent(&self, node_id: &str, endpoint: SocketAddr) -> bool {
+        let generation = self.current_network_generation().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        conn.mark_candidate_pair_probing(endpoint, generation);
+        true
     }
 
     /// Select the data path for one outbound encrypted packet.
@@ -4704,8 +4745,9 @@ fn apply_adaptive_probe_budgets<'a>(
     pairs: Vec<&'a CandidatePair>,
     stats: &[CandidatePairSourceStats],
     history: &TraversalHistory,
+    mode: ProbeTargetMode,
 ) -> Vec<&'a CandidatePair> {
-    let predicted_budget = predicted_probe_budget(stats, history);
+    let predicted_budget = predicted_probe_budget_for_mode(stats, history, mode);
     let birthday_budget = birthday_probe_budget_for_pairs(history, &pairs);
     let mut predicted_used = 0usize;
     let mut birthday_used = 0usize;
@@ -4802,6 +4844,18 @@ fn apply_speculative_probe_budget(
 
 fn predicted_probe_budget(stats: &[CandidatePairSourceStats], history: &TraversalHistory) -> usize {
     predicted_probe_budget_with_reason(stats, history).0
+}
+
+fn predicted_probe_budget_for_mode(
+    stats: &[CandidatePairSourceStats],
+    history: &TraversalHistory,
+    mode: ProbeTargetMode,
+) -> usize {
+    let budget = predicted_probe_budget(stats, history);
+    if mode.refreshes_speculative_budget() {
+        return budget.max(PREDICTED_PROBE_BUDGET_PER_CYCLE);
+    }
+    budget
 }
 
 fn predicted_probe_budget_with_reason(
@@ -5007,6 +5061,20 @@ fn speculative_probe_rotation_rank(pair: &CandidatePair) -> u64 {
     }
 }
 
+fn speculative_probe_source_rank_for_mode(
+    source: CandidatePairSource,
+    mode: ProbeTargetMode,
+) -> u8 {
+    if !mode.prioritizes_predicted() {
+        return 0;
+    }
+    match source {
+        CandidatePairSource::Predicted => 0,
+        CandidatePairSource::Birthday => 1,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 fn birthday_probe_endpoints(base: SocketAddr) -> Vec<SocketAddr> {
     BIRTHDAY_PROBE_DELTAS
@@ -5132,7 +5200,7 @@ fn is_private_direct_endpoint(endpoint: SocketAddr) -> bool {
 
 fn should_retain_private_direct_pair(pair: &CandidatePair) -> bool {
     if pair.state != CandidatePairState::Selected
-        || !is_private_direct_endpoint(pair.remote_endpoint)
+        || !is_low_latency_direct_endpoint(pair.remote_endpoint)
         || pair.consecutive_failures > 0
         || pair
             .success_age()
@@ -5146,13 +5214,20 @@ fn should_retain_private_direct_pair(pair: &CandidatePair) -> bool {
         .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
 }
 
+fn is_low_latency_direct_endpoint(endpoint: SocketAddr) -> bool {
+    is_private_direct_endpoint(endpoint) && !is_overlay_endpoint(endpoint)
+}
+
 fn is_overlay_endpoint(endpoint: SocketAddr) -> bool {
     match endpoint.ip() {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
-            octets[0] == 10 && octets[1] == 20
+            (octets[0] == 10 && octets[1] == 20) || is_shared_ipv4(ip)
         }
-        IpAddr::V6(_) => false,
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            (first_segment & 0xfe00) == 0xfc00
+        }
     }
 }
 
@@ -5238,6 +5313,10 @@ fn is_shared_ipv4(ip: std::net::Ipv4Addr) -> bool {
 }
 
 fn endpoint_probe_rank(endpoint: SocketAddr) -> u8 {
+    if is_overlay_endpoint(endpoint) {
+        return 3;
+    }
+
     match endpoint.ip() {
         IpAddr::V4(ip) => {
             if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
@@ -5273,6 +5352,23 @@ fn candidate_pair_probe_rank(state: CandidatePairState) -> u8 {
         CandidatePairState::Degraded => 5,
         CandidatePairState::Frozen => 6,
     }
+}
+
+fn candidate_pair_probe_rank_for_mode(
+    state: CandidatePairState,
+    source: CandidatePairSource,
+    mode: ProbeTargetMode,
+) -> u8 {
+    if mode.prioritizes_predicted()
+        && source == CandidatePairSource::Predicted
+        && matches!(
+            state,
+            CandidatePairState::Failed | CandidatePairState::Degraded
+        )
+    {
+        return 0;
+    }
+    candidate_pair_probe_rank(state)
 }
 
 fn candidate_pair_probe_due(pair: &CandidatePair) -> bool {
@@ -5359,7 +5455,7 @@ fn is_successful_low_latency_private_pair(pair: &CandidatePair) -> bool {
     matches!(
         pair.state,
         CandidatePairState::Selected | CandidatePairState::Succeeded
-    ) && is_private_direct_endpoint(pair.remote_endpoint)
+    ) && is_low_latency_direct_endpoint(pair.remote_endpoint)
         && pair.consecutive_failures == 0
         && pair
             .success_age()
@@ -5962,7 +6058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostics_classifies_overlay_direct_for_10_20_remote_endpoint() {
+    async fn diagnostics_does_not_report_overlay_endpoint_as_active_direct() {
         let manager = PeerManager::new(test_config());
         let remote: SocketAddr = "10.20.0.5:51820".parse().unwrap();
         let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
@@ -5985,18 +6081,34 @@ mod tests {
             .await;
         let peer = &diagnostics[0];
 
-        assert_eq!(peer.active_path, Some(NetworkPath::Direct));
-        assert_eq!(peer.direct_type, DirectPathType::Overlay);
+        assert_eq!(peer.active_path, None);
+        assert_eq!(peer.direct_type, DirectPathType::Probing);
         assert!(!peer.is_public_udp_direct);
-        assert!(peer.is_overlay_direct);
+        assert!(!peer.is_overlay_direct);
         assert!(!peer.is_relay);
-        assert_eq!(
-            peer.warning.as_deref(),
-            Some("direct path is overlay/utun, not public NAT traversal")
-        );
+        assert_eq!(peer.warning, None);
         assert_eq!(
             peer.selected_pair.as_ref().unwrap().direct_type,
-            DirectPathType::Overlay
+            DirectPathType::Probing
+        );
+    }
+
+    #[test]
+    fn shared_cgn_and_ula_endpoints_are_overlay_direct() {
+        for endpoint in ["tailscale.example.com:63169", "[fd7a:115c:a1e0::b936:4102]:63167"] {
+            let endpoint: SocketAddr = endpoint.parse().unwrap();
+            assert!(is_overlay_endpoint(endpoint));
+            assert_eq!(
+                classify_confirmed_direct_endpoint(endpoint, CandidatePairSource::Host),
+                DirectPathType::Overlay
+            );
+        }
+
+        let lan: SocketAddr = "192.168.2.11:56250".parse().unwrap();
+        assert!(!is_overlay_endpoint(lan));
+        assert_eq!(
+            classify_confirmed_direct_endpoint(lan, CandidatePairSource::Host),
+            DirectPathType::Lan
         );
     }
 
@@ -6255,6 +6367,15 @@ mod tests {
         assert_eq!(diagnostics[0].last_seen, 1_785_320_000);
         assert_eq!(diagnostics[0].state, ConnectionState::Closed);
         assert_eq!(diagnostics[0].active_path, None);
+        assert!(manager
+            .direct_probe_targets_for("peer-offline")
+            .await
+            .is_empty());
+        assert!(manager.direct_probe_targets().await.is_empty());
+        assert!(manager
+            .direct_probe_targets_due(Duration::ZERO)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
@@ -6413,6 +6534,7 @@ mod tests {
 
         let targets = manager.direct_probe_targets().await;
         assert_eq!(targets, vec![("peer1".to_string(), vec![endpoint])]);
+        assert!(manager.record_direct_probe_sent("peer1", endpoint).await);
         let conn = manager.get_connection("peer1").await.unwrap();
         assert_eq!(conn.candidate_pairs.len(), 1);
         assert_eq!(conn.candidate_pairs[0].state, CandidatePairState::Probing);
@@ -6464,6 +6586,78 @@ mod tests {
                 && pair.state == CandidatePairState::Failed
                 && pair.last_error.as_deref() == Some("no ACK")
         }));
+    }
+
+    #[tokio::test]
+    async fn direct_failure_only_marks_sent_probe_candidates_when_some_were_sent() {
+        let manager = PeerManager::new(test_config());
+        let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+        let predicted_endpoint: SocketAddr = "8.8.8.8:40001".parse().unwrap();
+        let birthday_endpoint: SocketAddr = "8.8.8.8:40002".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        let candidates = vec![
+            predicted_endpoint.to_string(),
+            birthday_endpoint.to_string(),
+        ];
+        manager
+            .add_candidates_with_sources(
+                "peer1",
+                &candidates,
+                &HashMap::from([
+                    (predicted_endpoint.to_string(), "predicted".to_string()),
+                    (birthday_endpoint.to_string(), "birthday".to_string()),
+                ]),
+            )
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        assert!(targets.contains(&predicted_endpoint));
+        assert!(targets.contains(&birthday_endpoint));
+        assert!(
+            manager
+                .record_direct_probe_sent("peer1", predicted_endpoint)
+                .await
+        );
+
+        assert!(
+            manager
+                .record_direct_failure_for_generation(
+                    "peer1",
+                    0,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no ACK",
+                )
+                .await
+        );
+
+        let conn = manager.get_connection("peer1").await.unwrap();
+        let predicted_pair = conn
+            .candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == predicted_endpoint)
+            .unwrap();
+        let birthday_pair = conn
+            .candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == birthday_endpoint)
+            .unwrap();
+
+        assert_eq!(predicted_pair.state, CandidatePairState::Failed);
+        assert_eq!(predicted_pair.failure_count, 1);
+        assert_eq!(birthday_pair.state, CandidatePairState::Waiting);
+        assert_eq!(birthday_pair.failure_count, 0);
+        assert!(birthday_pair.last_error_code.is_none());
+
+        let history = manager.traversal_history_diagnostics().await;
+        assert!(history
+            .sources
+            .iter()
+            .any(|source| source.source == "predicted" && source.failure_count == 1));
+        assert!(!history
+            .sources
+            .iter()
+            .any(|source| source.source == "birthday"));
     }
 
     #[tokio::test]
@@ -6883,7 +7077,7 @@ mod tests {
         let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
 
         manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
-        let candidates = (0..20)
+        let candidates = (0..24)
             .map(|index| format!("8.8.8.8:{}", 41_000 + index))
             .collect::<Vec<_>>();
         let sources = candidates
@@ -6907,6 +7101,130 @@ mod tests {
         assert_eq!(targets.first().copied(), Some(stable_endpoint));
         assert!(targets.contains(&stable_endpoint));
         assert_eq!(predicted_count, PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE);
+    }
+
+    #[tokio::test]
+    async fn synchronized_punch_keeps_predicted_budget_during_history_cooldown() {
+        let mut history = TraversalHistory::default();
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        history.record_failure(CandidatePairSource::Predicted);
+        let manager = PeerManager::new_with_history(test_config(), None, history);
+        let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+
+        let predicted_candidates = (0..24)
+            .map(|index| format!("8.8.8.8:{}", 41_000 + index))
+            .collect::<Vec<_>>();
+        let predicted_endpoints = predicted_candidates
+            .iter()
+            .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+            .collect::<HashSet<_>>();
+        let sources = predicted_candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+        manager
+            .add_candidates_with_sources("peer1", &predicted_candidates, &sources)
+            .await;
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        let predicted_positions = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| predicted_endpoints.contains(target).then_some(index))
+            .collect::<Vec<_>>();
+        let first_birthday_position = targets
+            .iter()
+            .position(|target| {
+                target.ip() == stable_endpoint.ip()
+                    && !predicted_endpoints.contains(target)
+                    && *target != stable_endpoint
+            })
+            .expect("birthday target should still be present");
+
+        assert_eq!(predicted_positions.len(), PREDICTED_PROBE_BUDGET_PER_CYCLE);
+        assert!(predicted_positions
+            .iter()
+            .all(|position| *position < first_birthday_position));
+
+        let diagnostics = manager.diagnostics().await;
+        let predicted = diagnostics[0]
+            .candidate_pair_stats
+            .iter()
+            .find(|stats| stats.source == CandidatePairSource::Predicted)
+            .unwrap();
+        assert_eq!(
+            predicted.probe_budget_per_cycle,
+            Some(PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE)
+        );
+        assert_eq!(
+            predicted.probe_budget_reason.as_deref(),
+            Some("history_cooldown")
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronized_punch_prioritizes_failed_predicted_before_birthday() {
+        let manager = PeerManager::new(test_config());
+        let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+
+        manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+        manager.update_nat_profile(birthday_nat_profile()).await;
+
+        let predicted_candidates = (0..24)
+            .map(|index| format!("8.8.8.8:{}", 41_000 + index))
+            .collect::<Vec<_>>();
+        let predicted_endpoints = predicted_candidates
+            .iter()
+            .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+            .collect::<HashSet<_>>();
+        let sources = predicted_candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+        manager
+            .add_candidates_with_sources("peer1", &predicted_candidates, &sources)
+            .await;
+
+        {
+            let mut conns = manager.connections.write().await;
+            let conn = conns.get_mut("peer1").unwrap();
+            for endpoint in &predicted_endpoints {
+                conn.ensure_candidate_pair_with_source(
+                    *endpoint,
+                    0,
+                    CandidatePairSource::Predicted,
+                )
+                .record_failure(
+                    REASON_DIRECT_PROBE_FAILED,
+                    "recent predicted miss",
+                    None,
+                );
+            }
+        }
+
+        let targets = manager.direct_probe_targets_for("peer1").await;
+        let predicted_positions = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| predicted_endpoints.contains(target).then_some(index))
+            .collect::<Vec<_>>();
+        let first_birthday_position = targets
+            .iter()
+            .position(|target| {
+                target.ip() == stable_endpoint.ip()
+                    && !predicted_endpoints.contains(target)
+                    && *target != stable_endpoint
+            })
+            .expect("birthday target should still be present");
+
+        assert_eq!(predicted_positions.len(), PREDICTED_PROBE_BUDGET_PER_CYCLE);
+        assert!(predicted_positions
+            .iter()
+            .all(|position| *position < first_birthday_position));
     }
 
     #[test]
@@ -7677,6 +7995,9 @@ mod tests {
             targets[0].1,
             vec![peer_reflexive_endpoint, signaled_endpoint]
         );
+        for endpoint in &targets[0].1 {
+            assert!(manager.record_direct_probe_sent("peer1", *endpoint).await);
+        }
 
         let conn = manager.get_connection("peer1").await.unwrap();
         let peer_reflexive_pair = conn
@@ -7877,6 +8198,8 @@ mod tests {
         let degraded = manager.select_path_for_data("peer1", true, true).await;
         assert_eq!(degraded.path, Some(NetworkPath::Relay));
         assert_eq!(degraded.reason_code, REASON_PATH_DIRECT_DEGRADED);
+        assert!(!degraded.direct_confirmed);
+        assert!(!degraded.relay_hedged);
         assert!(
             degraded.direct_score.as_ref().unwrap().score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN
                 < degraded.relay_score.as_ref().unwrap().score
@@ -8035,6 +8358,8 @@ mod tests {
         let selected = manager.select_path_for_data("peer1", true, true).await;
         assert_eq!(selected.path, Some(NetworkPath::Relay));
         assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
+        assert!(!selected.direct_confirmed);
+        assert!(!selected.relay_hedged);
         let direct_score = selected.direct_score.as_ref().unwrap().score;
         let relay_score = selected.relay_score.as_ref().unwrap().score;
         assert!(direct_score < DIRECT_CONFIRMED_MIN_SCORE);
