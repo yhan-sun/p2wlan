@@ -4,6 +4,7 @@ struct UdpDirectTaskContext {
     control: ControlClient,
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    local_network_identity: Arc<RwLock<Vec<String>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
     gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
@@ -31,6 +32,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
         control,
         local_candidates,
         local_candidate_sources: udp_local_candidate_sources,
+        local_network_identity,
         nat_profile,
         gateway_mapping_runtime,
         gateway_mapping_diagnostics,
@@ -116,6 +118,8 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                                 }
                             );
                         }
+                        *local_network_identity.write().await =
+                            stable_network_candidate_signature(&endpoints, &sources);
                         *nat_profile.write().await = Some(report.nat_profile);
                         (endpoints, sources)
                     }
@@ -217,6 +221,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         published_endpoint,
                         local_candidates,
                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                        local_network_identity: local_network_identity.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
                         gateway_mapping_diagnostics,
@@ -242,6 +247,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         published_endpoint,
                         local_candidates,
                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                        local_network_identity: local_network_identity.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
                         gateway_mapping_diagnostics,

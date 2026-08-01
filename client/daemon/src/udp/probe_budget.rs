@@ -1,18 +1,16 @@
-//! Global outbound probe budget for UDP connectivity probes.
+//! Outbound probe budgets for UDP connectivity checks.
 //!
-//! Bounds how many punch/connectivity-check probes a single daemon may
-//! emit per second, both in-memory (per network/peer/remote-IP) and with a
-//! cross-process TSV file budget on the local filesystem. Split out of `udp.rs`.
+//! The process-wide budget deliberately lives only in memory. Probe admission
+//! is part of the async packet path, so file locking, rewriting, and fsync here
+//! would stall traversal sessions on the daemon's Tokio workers.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(test))]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
-use p2pnet_crypto::hash as crypto_hash;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,65 +23,46 @@ pub(super) enum OutboundProbeBudgetKey {
 pub(super) type OutboundProbeBudgetState =
     Arc<Mutex<HashMap<OutboundProbeBudgetKey, VecDeque<Instant>>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub(super) struct GlobalOutboundProbeBudget {
-    path: PathBuf,
+    state: Mutex<HashMap<OutboundProbeBudgetKey, VecDeque<Instant>>>,
 }
 
 impl GlobalOutboundProbeBudget {
-    pub(super) fn new(path: PathBuf) -> Self {
-        Self { path }
+    #[cfg(test)]
+    pub(super) fn new() -> Self {
+        Self::default()
     }
 
-    pub(super) fn admit(
+    pub(super) async fn admit(
         &self,
         peer_id: &str,
         peer_addr: SocketAddr,
-    ) -> std::io::Result<OutboundProbeAdmission> {
-        let now_ms = unix_time_millis();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    ) -> OutboundProbeAdmission {
+        let now = Instant::now();
+        let network_key = OutboundProbeBudgetKey::Network;
+        let peer_key = OutboundProbeBudgetKey::Peer(peer_id.to_string());
+        let remote_ip_key =
+            OutboundProbeBudgetKey::PeerRemoteIp(peer_id.to_string(), peer_addr.ip());
+        let mut budget = self.state.lock().await;
+        retain_live_budget_entries(&mut budget, now);
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        lock_budget_file(&file)?;
-
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let mut entries = parse_global_probe_budget_entries(&contents, now_ms);
-        let peer_key = global_probe_peer_key(peer_id);
-        let remote_ip_key = global_probe_remote_ip_key(peer_id, peer_addr.ip());
-
-        if entries.iter().filter(|(_, key)| key == "network").count()
-            >= OUTBOUND_PROBE_BUDGET_PER_NETWORK
-        {
-            return Ok(OutboundProbeAdmission::GlobalNetworkRateLimited);
+        if budget.get(&network_key).map_or(0, VecDeque::len) >= OUTBOUND_PROBE_BUDGET_PER_NETWORK {
+            return OutboundProbeAdmission::GlobalNetworkRateLimited;
         }
-        if entries.iter().filter(|(_, key)| key == &peer_key).count()
-            >= OUTBOUND_PROBE_BUDGET_PER_PEER
-        {
-            return Ok(OutboundProbeAdmission::GlobalPeerRateLimited);
+        if budget.get(&peer_key).map_or(0, VecDeque::len) >= OUTBOUND_PROBE_BUDGET_PER_PEER {
+            return OutboundProbeAdmission::GlobalPeerRateLimited;
         }
-        if entries
-            .iter()
-            .filter(|(_, key)| key == &remote_ip_key)
-            .count()
+        if budget.get(&remote_ip_key).map_or(0, VecDeque::len)
             >= OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP
         {
-            return Ok(OutboundProbeAdmission::GlobalRemoteIpRateLimited);
+            return OutboundProbeAdmission::GlobalRemoteIpRateLimited;
         }
 
-        entries.push((now_ms, "network".to_string()));
-        entries.push((now_ms, peer_key));
-        entries.push((now_ms, remote_ip_key));
-        write_global_probe_budget_entries(&mut file, &entries)?;
-        unlock_budget_file(&file)?;
-        Ok(OutboundProbeAdmission::Accepted)
+        budget.entry(network_key).or_default().push_back(now);
+        budget.entry(peer_key).or_default().push_back(now);
+        budget.entry(remote_ip_key).or_default().push_back(now);
+        OutboundProbeAdmission::Accepted
     }
 }
 
@@ -116,91 +95,26 @@ pub(super) fn default_global_outbound_probe_budget() -> Option<Arc<GlobalOutboun
     }
     #[cfg(not(test))]
     {
-        Some(Arc::new(GlobalOutboundProbeBudget::new(
-            default_global_probe_budget_path(),
-        )))
+        static PROCESS_BUDGET: OnceLock<Arc<GlobalOutboundProbeBudget>> = OnceLock::new();
+        Some(
+            PROCESS_BUDGET
+                .get_or_init(|| Arc::new(GlobalOutboundProbeBudget::default()))
+                .clone(),
+        )
     }
 }
 
-#[cfg(not(test))]
-fn default_global_probe_budget_path() -> PathBuf {
-    std::env::var_os("P2WLAN_GLOBAL_PROBE_BUDGET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("p2wlan-outbound-probe-budget-v1.tsv"))
-}
-
-pub(super) fn unix_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn parse_global_probe_budget_entries(contents: &str, now_ms: u64) -> Vec<(u64, String)> {
-    let window_ms = OUTBOUND_PROBE_BUDGET_WINDOW.as_millis() as u64;
-    contents
-        .lines()
-        .filter_map(|line| {
-            let (timestamp, key) = line.split_once('\t')?;
-            let timestamp = timestamp.parse::<u64>().ok()?;
-            (now_ms.saturating_sub(timestamp) < window_ms).then(|| (timestamp, key.to_string()))
-        })
-        .collect()
-}
-
-pub(super) fn write_global_probe_budget_entries(
-    file: &mut File,
-    entries: &[(u64, String)],
-) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    for (timestamp, key) in entries {
-        writeln!(file, "{timestamp}	{key}")?;
-    }
-    file.sync_data()?;
-    Ok(())
-}
-
-fn global_probe_peer_key(peer_id: &str) -> String {
-    format!("peer:{}", short_hash(peer_id.as_bytes()))
-}
-
-pub(super) fn global_probe_remote_ip_key(peer_id: &str, ip: IpAddr) -> String {
-    format!("peer_remote_ip:{}:{ip}", short_hash(peer_id.as_bytes()))
-}
-
-fn short_hash(data: &[u8]) -> String {
-    hex::encode(&crypto_hash(data)[..8])
-}
-
-#[cfg(unix)]
-fn lock_budget_file(file: &File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn unlock_budget_file(file: &File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_budget_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn unlock_budget_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
+pub(super) fn retain_live_budget_entries(
+    budget: &mut HashMap<OutboundProbeBudgetKey, VecDeque<Instant>>,
+    now: Instant,
+) {
+    budget.retain(|_, sent| {
+        while sent
+            .front()
+            .is_some_and(|sent_at| now.duration_since(*sent_at) >= OUTBOUND_PROBE_BUDGET_WINDOW)
+        {
+            sent.pop_front();
+        }
+        !sent.is_empty()
+    });
 }

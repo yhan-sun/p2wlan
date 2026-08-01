@@ -53,8 +53,8 @@ impl UdpTransport {
     }
 
     #[cfg(test)]
-    fn with_global_probe_budget_path(mut self, path: PathBuf) -> Self {
-        self.global_outbound_probe_budget = Some(Arc::new(GlobalOutboundProbeBudget::new(path)));
+    fn with_global_probe_budget(mut self, budget: Arc<GlobalOutboundProbeBudget>) -> Self {
+        self.global_outbound_probe_budget = Some(budget);
         self
     }
 

@@ -22,7 +22,8 @@ impl UdpTransport {
         let mut packets_sent = 0;
         let mut budget_skipped = 0u32;
         let mut last_budget_reason = None;
-        for (round_index, round) in schedule.iter().enumerate() {
+        let mut session_capped = false;
+        'schedule: for (round_index, round) in schedule.iter().enumerate() {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
             }
@@ -33,6 +34,10 @@ impl UdpTransport {
                 // candidate. Once a peer has an affinity, normal sends use
                 // that socket rather than changing its NAT mapping.
                 for socket_index in 0..self.punch_socket_count() {
+                    if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
+                        session_capped = true;
+                        break 'schedule;
+                    }
                     match self
                         .admit_outbound_connectivity_probe(peer_id, candidate)
                         .await
@@ -120,6 +125,21 @@ impl UdpTransport {
                     }
                 }
             }
+        }
+
+        if session_capped {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "probe_session_capped",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "stopped UDP punch after the {MAX_PUNCH_PROBES_PER_SESSION}-probe session cap"
+                    ),
+                )
+                .await;
         }
 
         if budget_skipped > 0 {

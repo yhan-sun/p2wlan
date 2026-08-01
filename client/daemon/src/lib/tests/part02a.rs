@@ -56,6 +56,41 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
 }
 
 #[test]
+fn signal_candidate_cap_balances_disjoint_prediction_windows() {
+    let mut candidates =
+        (40_000..40_007).map(|port| format!("203.0.113.10:{port}")).collect::<Vec<_>>();
+    candidates.extend((41_000..41_024).map(|port| format!("203.0.113.10:{port}")));
+    candidates.extend((42_000..42_024).map(|port| format!("203.0.113.10:{port}")));
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    for port in 40_000..40_007 {
+        sources.insert(
+            format!("203.0.113.10:{port}"),
+            "stun_observed".to_string(),
+        );
+    }
+
+    compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    let first_window = candidates
+        .iter()
+        .filter(|endpoint| endpoint.starts_with("203.0.113.10:41"))
+        .count();
+    let second_window = candidates
+        .iter()
+        .filter(|endpoint| endpoint.starts_with("203.0.113.10:42"))
+        .count();
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert!(first_window >= 12, "first window retained {first_window}");
+    assert!(second_window >= 12, "second window retained {second_window}");
+    assert!(candidates.contains(&"203.0.113.10:42001".to_string()));
+}
+
+#[test]
 fn candidate_refresh_generation_ignores_stun_port_churn_on_same_public_ip() {
     let previous = vec![
         "192.168.1.10:59288".to_string(),
@@ -86,6 +121,43 @@ fn candidate_refresh_generation_ignores_stun_port_churn_on_same_public_ip() {
         &next,
         &next_sources,
     ));
+}
+
+#[test]
+fn full_network_identity_ignores_signal_candidate_count_churn() {
+    let mut previous = vec!["192.168.0.239:51820".to_string()];
+    previous.extend((16_807..16_836).map(|port| format!("220.163.6.190:{port}")));
+    let mut next = vec!["192.168.0.239:51820".to_string()];
+    next.extend((16_809..16_841).map(|port| format!("220.163.6.190:{port}")));
+    let previous_sources = previous
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let source = if endpoint.starts_with("192.168.") {
+                "host"
+            } else {
+                "predicted"
+            };
+            (endpoint, source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+    let next_sources = next
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let source = if endpoint.starts_with("192.168.") {
+                "host"
+            } else {
+                "predicted"
+            };
+            (endpoint, source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        stable_network_candidate_signature(&previous, &previous_sources),
+        stable_network_candidate_signature(&next, &next_sources)
+    );
 }
 
 #[test]

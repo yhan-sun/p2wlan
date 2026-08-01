@@ -107,6 +107,10 @@ impl ProbeTargetMode {
     fn allows_local_nat_birthday(self) -> bool {
         matches!(self, Self::Synchronized | Self::Background | Self::Reclaim)
     }
+
+    fn allows_failed_prediction_fallback(self) -> bool {
+        matches!(self, Self::Background | Self::Reclaim)
+    }
 }
 
 /// Stable reason code emitted when a local network generation changes.

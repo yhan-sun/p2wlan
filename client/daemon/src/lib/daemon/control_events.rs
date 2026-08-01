@@ -1,3 +1,10 @@
+fn peer_offer_updates_probe_session(
+    handshake_init: &[u8],
+    session_id: Option<&str>,
+) -> bool {
+    !handshake_init.is_empty() || session_id.is_some()
+}
+
 impl Daemon {
     async fn run_control_event_loop(
         &mut self,
@@ -228,9 +235,17 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
-                    self.peers
-                        .set_probe_session_id(&from_node_id, session_id.clone())
-                        .await;
+                    // Candidate-only trickle offers intentionally omit session
+                    // metadata. They must not clear the MAC key negotiated by
+                    // the current WireGuard handshake.
+                    if peer_offer_updates_probe_session(
+                        &handshake_init,
+                        session_id.as_deref(),
+                    ) {
+                        self.peers
+                            .set_probe_session_id(&from_node_id, session_id.clone())
+                            .await;
+                    }
                     self.peers
                         .record_direct_event(
                             &from_node_id,

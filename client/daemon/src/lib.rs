@@ -76,8 +76,8 @@ use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
     control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
-    publish_local_candidates_to_known_peers, run_udp_candidate_refresh, truncate_signal_candidates,
-    UdpCandidateRefreshContext,
+    publish_local_candidates_to_known_peers, run_udp_candidate_refresh,
+    stable_network_candidate_signature, truncate_signal_candidates, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
@@ -192,6 +192,9 @@ const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
 /// improve, the chance that both peers hit the same opening window.
 const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
 const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
+/// A traversal task must release its per-peer lease even if a transport call
+/// stalls or an unexpectedly large candidate set reaches the scheduler.
+const PUNCH_SESSION_HARD_DEADLINE: Duration = Duration::from_secs(8);
 
 include!("lib/punch_dedup.rs");
 include!("lib/daemon/core.rs");

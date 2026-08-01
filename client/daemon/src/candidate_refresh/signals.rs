@@ -131,8 +131,6 @@ pub(super) fn candidate_endpoints_from_report(
             candidate_source_label(candidate.source).to_string(),
         );
     }
-    compact_volatile_public_signal_candidates(&mut endpoints, &mut sources);
-    truncate_signal_candidates(&mut endpoints, &mut sources);
     (endpoints, sources)
 }
 
@@ -140,23 +138,56 @@ pub(super) fn compact_volatile_public_signal_candidates(
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
 ) {
-    let mut volatile_public_by_ip: HashMap<IpAddr, usize> = HashMap::new();
-    candidates.retain(|endpoint| {
+    let original_order = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| (endpoint.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let predicted_order = balanced_predicted_signal_order(candidates, candidate_sources);
+    let mut volatile_public_by_ip: HashMap<IpAddr, Vec<String>> = HashMap::new();
+    for endpoint in candidates.iter() {
         let Some(source) = candidate_sources.get(endpoint).map(String::as_str) else {
-            return true;
+            continue;
         };
         if !is_volatile_public_signal_source(source) {
-            return true;
+            continue;
         }
         let Ok(addr) = endpoint.parse::<SocketAddr>() else {
-            return true;
+            continue;
         };
         if !is_public_udp_candidate(addr) {
-            return true;
+            continue;
         }
-        let count = volatile_public_by_ip.entry(addr.ip()).or_default();
-        *count += 1;
-        *count <= MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
+        volatile_public_by_ip
+            .entry(addr.ip())
+            .or_default()
+            .push(endpoint.clone());
+    }
+
+    let mut retained_volatile = HashSet::new();
+    for endpoints in volatile_public_by_ip.values_mut() {
+        endpoints.sort_by(|left, right| {
+            compare_signal_candidates(
+                left,
+                right,
+                candidate_sources,
+                &original_order,
+                &predicted_order,
+            )
+        });
+        endpoints.truncate(MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP);
+        retained_volatile.extend(endpoints.iter().cloned());
+    }
+
+    candidates.retain(|endpoint| {
+        let is_volatile_public = candidate_sources
+            .get(endpoint)
+            .map(String::as_str)
+            .is_some_and(is_volatile_public_signal_source)
+            && endpoint
+                .parse::<SocketAddr>()
+                .is_ok_and(is_public_udp_candidate);
+        !is_volatile_public || retained_volatile.contains(endpoint)
     });
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
@@ -179,18 +210,15 @@ pub(super) fn truncate_signal_candidates(
             .enumerate()
             .map(|(index, endpoint)| (endpoint.clone(), index))
             .collect::<HashMap<_, _>>();
+        let predicted_order = balanced_predicted_signal_order(candidates, candidate_sources);
         candidates.sort_by(|left, right| {
-            signal_candidate_rank(left, candidate_sources.get(left).map(String::as_str))
-                .cmp(&signal_candidate_rank(
-                    right,
-                    candidate_sources.get(right).map(String::as_str),
-                ))
-                .then_with(|| {
-                    original_order
-                        .get(left)
-                        .unwrap_or(&usize::MAX)
-                        .cmp(original_order.get(right).unwrap_or(&usize::MAX))
-                })
+            compare_signal_candidates(
+                left,
+                right,
+                candidate_sources,
+                &original_order,
+                &predicted_order,
+            )
         });
         warn!(
             "Truncating {} gathered UDP candidates to the signaling limit of {}",
@@ -201,6 +229,99 @@ pub(super) fn truncate_signal_candidates(
     }
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
+}
+
+fn compare_signal_candidates(
+    left: &str,
+    right: &str,
+    candidate_sources: &HashMap<String, String>,
+    original_order: &HashMap<String, usize>,
+    predicted_order: &HashMap<String, usize>,
+) -> std::cmp::Ordering {
+    let left_rank =
+        signal_candidate_rank(left, candidate_sources.get(left).map(String::as_str));
+    let right_rank =
+        signal_candidate_rank(right, candidate_sources.get(right).map(String::as_str));
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| {
+            if left_rank == 4 && right_rank == 4 {
+                predicted_order
+                    .get(left)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(predicted_order.get(right).unwrap_or(&usize::MAX))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .then_with(|| {
+            original_order
+                .get(left)
+                .unwrap_or(&usize::MAX)
+                .cmp(original_order.get(right).unwrap_or(&usize::MAX))
+        })
+}
+
+fn balanced_predicted_signal_order(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> HashMap<String, usize> {
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    let mut previous: Option<(SocketAddr, i32)> = None;
+
+    for endpoint in candidates.iter().filter(|endpoint| {
+        candidate_sources.get(*endpoint).map(String::as_str) == Some("predicted")
+    }) {
+        let Ok(address) = endpoint.parse::<SocketAddr>() else {
+            runs.push(vec![endpoint.clone()]);
+            previous = None;
+            continue;
+        };
+
+        let mut append_to_current = false;
+        let mut next_direction = 0;
+        if let Some((previous_address, direction)) = previous {
+            let delta = address.port() as i32 - previous_address.port() as i32;
+            if address.ip() == previous_address.ip()
+                && delta.abs() == 1
+                && (direction == 0 || direction == delta)
+            {
+                append_to_current = true;
+                next_direction = delta;
+            }
+        }
+
+        if append_to_current {
+            if let Some(run) = runs.last_mut() {
+                run.push(endpoint.clone());
+            }
+        } else {
+            runs.push(vec![endpoint.clone()]);
+        }
+        previous = Some((address, next_direction));
+    }
+
+    let mut balanced = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let mut added = false;
+        for run in &runs {
+            if let Some(endpoint) = run.get(offset) {
+                balanced.push(endpoint.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+        offset += 1;
+    }
+
+    balanced
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoint)| (endpoint, index))
+        .collect()
 }
 
 fn signal_candidate_rank(endpoint: &str, source: Option<&str>) -> u8 {
@@ -288,6 +409,7 @@ pub(super) fn add_peer_reflexive_candidate_to_set(
     Ok(!already_present || source_changed)
 }
 
+#[cfg(test)]
 pub(super) fn candidate_refresh_requires_network_generation_advance(
     previous_candidates: &[String],
     previous_candidate_sources: &HashMap<String, String>,
@@ -298,7 +420,7 @@ pub(super) fn candidate_refresh_requires_network_generation_advance(
         != stable_network_candidate_signature(candidates, candidate_sources)
 }
 
-fn stable_network_candidate_signature(
+pub(super) fn stable_network_candidate_signature(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
 ) -> Vec<String> {
@@ -310,25 +432,17 @@ fn stable_network_candidate_signature(
             .unwrap_or("signaled");
         match endpoint.parse::<SocketAddr>() {
             Ok(addr) if is_external_overlay_udp_candidate(addr) => {}
-            Ok(addr) if is_public_udp_candidate(addr) => match source {
-                "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
-                    signature.push(format!("public-ip:{}", addr.ip()));
-                }
-                "host" | "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
-                    signature.push(format!("{source}:{addr}"));
-                }
-                _ => {}
-            },
+            Ok(addr) if is_public_udp_candidate(addr) => {
+                // Port churn and candidate-source promotion do not mean the
+                // host changed networks. A public IP change does.
+                signature.push(format!("public-ip:{}", addr.ip()));
+            }
             Ok(addr) => match source {
-                // A LAN endpoint can be reported as either a gathered host candidate
-                // or a peer-reflexive observation from another machine on the same
-                // LAN. Treat the endpoint itself as stable so source-label churn
-                // does not invalidate healthy direct paths every refresh.
                 "host" | "peer_reflexive" | "learned" => {
-                    signature.push(format!("private-endpoint:{addr}"));
+                    signature.push(format!("physical-host-ip:{}", addr.ip()));
                 }
                 "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
-                    signature.push(format!("{source}:{addr}"));
+                    signature.push(format!("mapped-ip:{}", addr.ip()));
                 }
                 _ => {}
             },

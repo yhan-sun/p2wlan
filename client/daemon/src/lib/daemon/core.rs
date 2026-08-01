@@ -20,6 +20,8 @@ pub struct Daemon {
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Local-only source metadata keyed by candidate endpoint string.
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    /// Stable physical/public identity used for network-generation changes.
+    local_network_identity: Arc<RwLock<Vec<String>>>,
     /// Latest local NAT behavior profile inferred from STUN observations.
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Cached gateway mapping lifecycle and structured diagnostics.
@@ -81,6 +83,7 @@ impl Daemon {
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
+            local_network_identity: Arc::new(RwLock::new(Vec::new())),
             nat_profile: Arc::new(RwLock::new(None)),
             gateway_mapping_runtime: Arc::new(RwLock::new(GatewayMappingRuntime::default())),
             gateway_mapping_diagnostics: Arc::new(RwLock::new(GatewayMappingDiagnostics {

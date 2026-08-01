@@ -111,3 +111,39 @@ fn test_dedup_candidates() {
 
     assert_eq!(candidates.len(), 2);
 }
+
+#[test]
+fn candidate_report_excludes_addresses_from_the_wrong_socket_family() {
+    let report = candidate_report_from_observations(
+        "0.0.0.0:51820".parse().unwrap(),
+        true,
+        vec![
+            StunObservation {
+                server: "192.0.2.1:3478".to_string(),
+                mapped_address: Some("[2001:db8::10]:41000".to_string()),
+                rtt_ms: Some(10),
+                error: None,
+            },
+            StunObservation {
+                server: "192.0.2.2:3478".to_string(),
+                mapped_address: Some("198.51.100.10:41001".to_string()),
+                rtt_ms: Some(10),
+                error: None,
+            },
+        ],
+    );
+
+    assert!(report.candidates.iter().all(|candidate| candidate
+        .endpoint
+        .to_socket_addr()
+        .unwrap()
+        .is_ipv4()));
+    assert!(report
+        .candidates
+        .iter()
+        .any(|candidate| candidate.endpoint.to_string() == "198.51.100.10:41001"));
+    assert!(!report
+        .candidates
+        .iter()
+        .any(|candidate| candidate.endpoint.ip == "2001:db8::10"));
+}

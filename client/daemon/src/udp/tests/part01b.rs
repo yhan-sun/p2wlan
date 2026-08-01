@@ -85,6 +85,42 @@ async fn punch_candidates_respects_outbound_probe_budget_per_remote_ip() {
 }
 
 #[tokio::test]
+async fn punch_candidates_stops_at_hard_session_probe_cap() {
+    let peers = peer_manager();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", None))
+        .await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let candidates = (0..600)
+        .map(|index| {
+            format!(
+                "127.{}.{}.{}:{}",
+                1 + (index % 4),
+                1 + ((index / 4) % 200),
+                1 + ((index / 800) % 200),
+                20_000 + index
+            )
+            .parse()
+            .unwrap()
+        })
+        .collect::<Vec<SocketAddr>>();
+
+    let sent = transport
+        .punch_candidates(
+            "peer-b",
+            candidates,
+            Duration::from_secs(1),
+            5,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sent, MAX_PUNCH_PROBES_PER_SESSION);
+}
+
+#[tokio::test]
 async fn qualified_socket_pool_probes_from_each_bound_socket() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
@@ -219,6 +255,36 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
     first_worker.await.unwrap();
     second_worker.await.unwrap();
     inbound_worker.abort();
+}
+
+#[test]
+fn pool_stun_observation_promotes_an_overlapping_prediction() {
+    let mut predicted = p2pnet_nat::IceCandidate::server_reflexive(
+        "203.0.113.7",
+        42_001,
+    );
+    predicted.source = p2pnet_nat::CandidateSource::Predicted;
+    let mut report = candidate_report_from_observations(
+        "0.0.0.0:50000".parse().unwrap(),
+        false,
+        Vec::new(),
+    );
+    report.candidates = vec![predicted];
+
+    let discovered = merge_pool_candidates(
+        &mut report,
+        vec![p2pnet_nat::IceCandidate::server_reflexive(
+            "203.0.113.7",
+            42_001,
+        )],
+    );
+
+    assert_eq!(discovered, 1);
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(
+        report.candidates[0].source,
+        p2pnet_nat::CandidateSource::StunObserved
+    );
 }
 
 #[tokio::test]

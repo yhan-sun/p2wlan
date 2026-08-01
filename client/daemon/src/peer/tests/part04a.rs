@@ -2,11 +2,22 @@
 async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
     let mut history = TraversalHistory::default();
     history.record_success(CandidatePairSource::Birthday);
+    let birthday_budget = birthday_probe_budget_for_base_count(&history, 2);
     let manager = PeerManager::new_with_history(test_config(), None, history);
     let stable_endpoint: SocketAddr = "8.8.4.4:40000".parse().unwrap();
+    let second_observed: SocketAddr = "8.8.4.4:40037".parse().unwrap();
 
     manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
-    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[stable_endpoint.to_string(), second_observed.to_string()],
+            &HashMap::from([
+                (stable_endpoint.to_string(), "stun_observed".to_string()),
+                (second_observed.to_string(), "stun_observed".to_string()),
+            ]),
+        )
+        .await;
 
     let due_targets = manager
         .direct_probe_targets_due(Duration::from_secs(0))
@@ -17,12 +28,23 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
     let targets = &due_targets[0].1;
     let birthday_count = targets
         .iter()
-        .filter(|target| **target != stable_endpoint && target.ip() == stable_endpoint.ip())
+        .filter(|target| {
+            **target != stable_endpoint
+                && **target != second_observed
+                && target.ip() == stable_endpoint.ip()
+        })
         .count();
+    let expected_birthday_count = birthday_probe_endpoints_for_bases(
+        &[stable_endpoint, second_observed],
+        birthday_budget,
+    )
+    .into_iter()
+    .filter(|target| *target != stable_endpoint && *target != second_observed)
+    .count();
 
     assert_eq!(targets.first().copied(), Some(stable_endpoint));
     assert!(targets.contains(&stable_endpoint));
-    assert_eq!(birthday_count, BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE);
+    assert_eq!(birthday_count, expected_birthday_count);
 }
 
 #[tokio::test]

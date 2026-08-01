@@ -75,32 +75,113 @@ fn birthday_probe_endpoints_for_bases_rotates_bounded_window() {
 }
 
 #[tokio::test]
-async fn birthday_candidates_use_wider_default_probe_budget() {
+async fn hard_local_easy_remote_uses_only_the_fresh_stable_public_target() {
     let config = test_config();
     let manager = PeerManager::new(config);
-    let endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let stale_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "203.0.113.10:40037".parse().unwrap();
 
-    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .add_peer(&test_peer("peer1", stale_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[fresh_endpoint.to_string()],
+            &HashMap::from([(
+                fresh_endpoint.to_string(),
+                "stun_observed".to_string(),
+            )]),
+        )
+        .await;
     manager.update_nat_profile(birthday_nat_profile()).await;
 
     let initial_targets = manager.direct_probe_targets_for("peer1").await;
-    let initial_birthday_count = initial_targets
-        .iter()
-        .filter(|target| **target != endpoint && target.ip() == endpoint.ip())
-        .count();
-    assert!(initial_targets.contains(&endpoint));
-    assert_eq!(initial_birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+    assert_eq!(initial_targets, vec![fresh_endpoint]);
 
     let background_targets = manager.direct_probe_targets().await;
     assert_eq!(background_targets.len(), 1);
-    let targets = &background_targets[0].1;
-    let birthday_count = targets
-        .iter()
-        .filter(|target| **target != endpoint && target.ip() == endpoint.ip())
-        .count();
+    assert_eq!(background_targets[0].1, vec![fresh_endpoint]);
+}
 
-    assert!(targets.contains(&endpoint));
-    assert_eq!(birthday_count, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+#[tokio::test]
+async fn easy_local_scans_explicit_predicted_window_without_birthday_expansion() {
+    let manager = PeerManager::new(test_config());
+    let stale_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let observed = "203.0.113.10:41000".to_string();
+    let mut candidates = vec![observed.clone()];
+    candidates.extend((41_001..=41_024).map(|port| format!("203.0.113.10:{port}")));
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate, "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed, "stun_observed".to_string());
+
+    manager
+        .add_peer(&test_peer("peer1", stale_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+
+    assert_eq!(targets.len(), candidates.len());
+    assert!(targets
+        .iter()
+        .all(|target| candidates.contains(&target.to_string())));
+    assert!(!targets.contains(&stale_endpoint));
+}
+
+#[tokio::test]
+async fn easy_local_expands_after_the_explicit_prediction_window_fails() {
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let observed: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_024)
+        .map(|port| SocketAddr::new(observed.ip(), port))
+        .collect::<HashSet<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+
+    manager
+        .add_peer(&test_peer("peer1", registry_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    let mut easy_profile = birthday_nat_profile();
+    easy_profile.mapping_behavior = p2pnet_nat::MappingBehavior::EndpointIndependent;
+    easy_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
+    easy_profile.birthday_candidate = false;
+    manager.update_nat_profile(easy_profile).await;
+
+    let initial_targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(initial_targets
+        .iter()
+        .all(|target| *target == observed || predicted.contains(target)));
+
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        for endpoint in &predicted {
+            conn.ensure_candidate_pair_with_source(*endpoint, 0, CandidatePairSource::Predicted)
+                .record_failure(REASON_DIRECT_PROBE_FAILED, "predicted window miss", None);
+        }
+    }
+
+    let retries = manager.direct_probe_targets().await;
+    assert_eq!(retries.len(), 1);
+    let expanded = &retries[0].1;
+    assert!(expanded.iter().any(|target| {
+        target.ip() == observed.ip() && *target != observed && !predicted.contains(target)
+    }));
 }
 
 #[tokio::test]
@@ -139,7 +220,6 @@ async fn remote_port_churn_triggers_birthday_probe_targets() {
     let bases = candidates
         .iter()
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
-        .chain(std::iter::once(registry_endpoint))
         .collect::<Vec<_>>();
     let expected_birthday_targets = birthday_probe_endpoints_for_bases(
         &bases,
@@ -153,7 +233,7 @@ async fn remote_port_churn_triggers_birthday_probe_targets() {
     })
     .count();
 
-    assert!(targets.contains(&registry_endpoint));
+    assert!(!targets.contains(&registry_endpoint));
     assert_eq!(birthday_targets.len(), expected_birthday_targets);
     assert!(birthday_targets
         .iter()
@@ -200,7 +280,6 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
     let bases = candidates
         .iter()
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
-        .chain(std::iter::once(registry_endpoint))
         .collect::<Vec<_>>();
     let expected_birthday_targets = birthday_probe_endpoints_for_bases(
         &bases,
@@ -214,7 +293,7 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
     })
     .count();
 
-    assert!(targets.contains(&registry_endpoint));
+    assert!(!targets.contains(&registry_endpoint));
     assert_eq!(birthday_targets.len(), expected_birthday_targets);
     assert!(birthday_targets
         .iter()
@@ -228,7 +307,7 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
 }
 
 #[tokio::test]
-async fn stale_birthday_pairs_are_pruned_when_signaled_ports_move() {
+async fn stale_birthday_pairs_are_pruned_when_signaled_window_moves() {
     let manager = PeerManager::new(test_config());
     manager
         .add_peer(&test_peer("peer1", "127.0.0.1:51820".parse().unwrap()))
@@ -247,7 +326,7 @@ async fn stale_birthday_pairs_are_pruned_when_signaled_ports_move() {
     let stale_birthday: SocketAddr = "8.8.8.8:41001".parse().unwrap();
     assert!(first_targets.contains(&stale_birthday));
 
-    let next_candidates = vec!["8.8.8.8:42000".to_string(), "8.8.8.8:42037".to_string()];
+    let next_candidates = vec!["9.9.9.9:42000".to_string(), "9.9.9.9:42037".to_string()];
     let next_sources = next_candidates
         .iter()
         .map(|candidate| (candidate.clone(), "stun_observed".to_string()))

@@ -74,15 +74,7 @@ impl UdpTransport {
         let remote_ip_key =
             OutboundProbeBudgetKey::PeerRemoteIp(peer_id.to_string(), peer_addr.ip());
         let mut budget = self.outbound_probe_budget.lock().await;
-        budget.retain(|_, sent| {
-            while sent
-                .front()
-                .is_some_and(|sent_at| now.duration_since(*sent_at) >= OUTBOUND_PROBE_BUDGET_WINDOW)
-            {
-                sent.pop_front();
-            }
-            !sent.is_empty()
-        });
+        retain_live_budget_entries(&mut budget, now);
 
         if budget.get(&network_key).map_or(0, VecDeque::len) >= OUTBOUND_PROBE_BUDGET_PER_NETWORK {
             return OutboundProbeAdmission::NetworkRateLimited;
@@ -97,14 +89,9 @@ impl UdpTransport {
         }
 
         if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
-            match global_budget.admit(peer_id, peer_addr) {
-                Ok(OutboundProbeAdmission::Accepted) => {}
-                Ok(limited) => return limited,
-                Err(err) => {
-                    debug!(
-                        "Global outbound UDP probe budget unavailable; continuing with in-process budget only: {err}"
-                    );
-                }
+            match global_budget.admit(peer_id, peer_addr).await {
+                OutboundProbeAdmission::Accepted => {}
+                limited => return limited,
             }
         }
 
@@ -230,6 +217,11 @@ impl UdpTransport {
                 ))
             })?;
         let generation = self.peers.current_network_generation().await;
+        let requires_legacy_probe = match peer_id {
+            Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
+            None => true,
+        };
+        let should_retransmit = use_candidate || purpose == PendingProbePurpose::ConsentCheck;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
             (Some(peer_id), Some(local_node_id))
                 if local_node_id.len() <= u8::MAX as usize && peer_id.len() <= u8::MAX as usize =>
@@ -248,7 +240,13 @@ impl UdpTransport {
             _ => None,
         };
 
-        let (bytes, nonce, accepts_authenticated_ack, compat_legacy_probe) =
+        let (
+            bytes,
+            nonce,
+            accepts_authenticated_ack,
+            accepts_legacy_ack,
+            compat_legacy_probe,
+        ) =
             if let Some((bytes, nonce)) = authenticated_probe {
                 // Compatibility bridge for pre-v2 peers. v0.1.24 and older only
                 // understand PNCH v1 and otherwise forward PNCH v2 into the
@@ -260,7 +258,9 @@ impl UdpTransport {
                     bytes,
                     nonce,
                     true,
-                    Some(build_punch_packet_with_nonce(nonce).to_vec()),
+                    requires_legacy_probe,
+                    requires_legacy_probe
+                        .then(|| build_punch_packet_with_nonce(nonce).to_vec()),
                 )
             } else {
                 let bytes = build_punch_packet();
@@ -269,7 +269,7 @@ impl UdpTransport {
                     .ok_or_else(|| {
                         DaemonError::Network("failed to create UDP probe".to_string())
                     })?;
-                (bytes.to_vec(), nonce, false, None)
+                (bytes.to_vec(), nonce, false, true, None)
             };
 
         {
@@ -289,7 +289,7 @@ impl UdpTransport {
                     peer_id: peer_id.map(str::to_string),
                     purpose,
                     accepts_authenticated_ack,
-                    accepts_legacy_ack: true,
+                    accepts_legacy_ack,
                 },
             );
         }
@@ -316,12 +316,15 @@ impl UdpTransport {
                         peer_id.unwrap_or("unknown"),
                         peer_addr
                     );
-                    self.retransmit_probe_burst(
-                        socket.clone(),
-                        legacy_probe,
-                        peer_addr,
-                        peer_id.map(str::to_string),
-                    );
+                    if should_retransmit {
+                        self.retransmit_probe_burst(
+                            socket.clone(),
+                            socket_index,
+                            legacy_probe,
+                            peer_addr,
+                            peer_id.map(str::to_string),
+                        );
+                    }
                 }
                 Err(err) => {
                     debug!(
@@ -334,7 +337,15 @@ impl UdpTransport {
             }
         }
 
-        self.retransmit_probe_burst(socket, bytes, peer_addr, peer_id.map(str::to_string));
+        if should_retransmit {
+            self.retransmit_probe_burst(
+                socket,
+                socket_index,
+                bytes,
+                peer_addr,
+                peer_id.map(str::to_string),
+            );
+        }
         Ok(nonce)
     }
 
@@ -355,21 +366,28 @@ impl UdpTransport {
     fn retransmit_probe_burst(
         &self,
         socket: Arc<UdpSocket>,
+        socket_index: usize,
         probe: Vec<u8>,
         peer_addr: SocketAddr,
         peer_id: Option<String>,
     ) {
         let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
+        let diagnostics = self.socket_pool_diagnostics.clone();
         tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
                 match socket.send_to(&probe, peer_addr).await {
-                    Ok(_) => trace!(
-                        "Retransmitted UDP punch probe to peer {} at {} after {}ms",
-                        peer_label,
-                        peer_addr,
-                        delay_ms
-                    ),
+                    Ok(_) => {
+                        if let Some(metrics) = diagnostics.lock().await.get_mut(socket_index) {
+                            metrics.probe_retransmissions_sent += 1;
+                        }
+                        trace!(
+                            "Retransmitted UDP punch probe to peer {} at {} after {}ms",
+                            peer_label,
+                            peer_addr,
+                            delay_ms
+                        );
+                    }
                     Err(err) => {
                         debug!(
                             "Failed to retransmit UDP punch probe to peer {} at {} after {}ms: {}",
@@ -395,16 +413,22 @@ impl UdpTransport {
             .await;
 
         let peer_label = peer_label.into();
+        let diagnostics = self.socket_pool_diagnostics.clone();
         tokio::spawn(async move {
             for delay_ms in PUNCH_ACK_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
                 match socket.send_to(&ack, source).await {
-                    Ok(_) => trace!(
-                        "Retransmitted UDP punch ACK to peer {} at {} after {}ms",
-                        peer_label,
-                        source,
-                        delay_ms
-                    ),
+                    Ok(_) => {
+                        if let Some(metrics) = diagnostics.lock().await.get_mut(socket_index) {
+                            metrics.probe_ack_retransmissions_sent += 1;
+                        }
+                        trace!(
+                            "Retransmitted UDP punch ACK to peer {} at {} after {}ms",
+                            peer_label,
+                            source,
+                            delay_ms
+                        );
+                    }
                     Err(err) => {
                         debug!(
                             "Failed to retransmit UDP punch ACK to peer {} at {} after {}ms: {}",

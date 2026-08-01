@@ -105,6 +105,53 @@ void main() {
     expect(peer.lastError, isNull);
   });
 
+  test('direct peer ignores a historical relay transport failure', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'direct-peer',
+      'device_name': 'studio-mac',
+      'virtual_ip': '10.20.0.41',
+      'online': true,
+      'state': 'direct',
+      'active_path': 'direct',
+      'direct_type': 'public_udp',
+      'is_relay': false,
+      'direct': {'last_success_age_ms': 250, 'consecutive_failures': 0},
+      'relay': {
+        'last_failure_age_ms': 120000,
+        'consecutive_failures': 1,
+        'last_error_code': 'relay_transport_failed',
+        'last_error': 'relay connection closed',
+      },
+    });
+
+    expect(peer.path, 'direct');
+    expect(peer.connectionType, 'public_udp');
+    expect(peer.lastError, isNull);
+  });
+
+  test('active path errors take precedence over fallback path errors', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'relay-peer',
+      'device_name': 'travel-mac',
+      'virtual_ip': '10.20.0.42',
+      'online': true,
+      'state': 'relay',
+      'active_path': 'relay',
+      'direct_type': 'relay',
+      'is_relay': true,
+      'direct': {
+        'last_error_code': 'direct_probe_failed',
+        'last_error': 'direct probe timed out',
+      },
+      'relay': {
+        'last_error_code': 'relay_transport_failed',
+        'last_error': 'relay connection closed',
+      },
+    });
+
+    expect(peer.lastError, 'relay connection closed');
+  });
+
   test('offline peers stay offline even when path selection says relay', () {
     final peer = PeerSnapshot.fromJson({
       'node_id': 'offline-peer',

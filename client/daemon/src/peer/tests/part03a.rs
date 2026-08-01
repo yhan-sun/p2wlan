@@ -199,15 +199,24 @@ async fn stable_public_candidate_precedes_predicted_budget_in_synchronized_punch
     let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
 
     manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
-    let candidates = (0..24)
+    let mut candidates = vec![stable_endpoint.to_string()];
+    candidates.extend((0..24)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
-        .collect::<Vec<_>>();
+    );
     let sources = candidates
         .iter()
-        .map(|candidate| (candidate.clone(), "predicted".to_string()))
+        .map(|candidate| {
+            let source = if candidate == &stable_endpoint.to_string() {
+                "stun_observed"
+            } else {
+                "predicted"
+            };
+            (candidate.clone(), source.to_string())
+        })
         .collect::<HashMap<_, _>>();
     let predicted_endpoints = candidates
         .iter()
+        .filter(|candidate| **candidate != stable_endpoint.to_string())
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
         .collect::<HashSet<_>>();
     manager
@@ -226,7 +235,7 @@ async fn stable_public_candidate_precedes_predicted_budget_in_synchronized_punch
 }
 
 #[tokio::test]
-async fn synchronized_punch_keeps_predicted_budget_during_history_cooldown() {
+async fn synchronized_punch_uses_only_predicted_window_during_history_cooldown() {
     let mut history = TraversalHistory::default();
     history.record_failure(CandidatePairSource::Predicted);
     history.record_failure(CandidatePairSource::Predicted);
@@ -237,16 +246,25 @@ async fn synchronized_punch_keeps_predicted_budget_during_history_cooldown() {
     manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager.update_nat_profile(birthday_nat_profile()).await;
 
-    let predicted_candidates = (0..24)
+    let mut predicted_candidates = vec![stable_endpoint.to_string()];
+    predicted_candidates.extend((0..24)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
-        .collect::<Vec<_>>();
+    );
     let predicted_endpoints = predicted_candidates
         .iter()
+        .filter(|candidate| **candidate != stable_endpoint.to_string())
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
         .collect::<HashSet<_>>();
     let sources = predicted_candidates
         .iter()
-        .map(|candidate| (candidate.clone(), "predicted".to_string()))
+        .map(|candidate| {
+            let source = if candidate == &stable_endpoint.to_string() {
+                "stun_observed"
+            } else {
+                "predicted"
+            };
+            (candidate.clone(), source.to_string())
+        })
         .collect::<HashMap<_, _>>();
     manager
         .add_candidates_with_sources("peer1", &predicted_candidates, &sources)
@@ -258,19 +276,11 @@ async fn synchronized_punch_keeps_predicted_budget_during_history_cooldown() {
         .enumerate()
         .filter_map(|(index, target)| predicted_endpoints.contains(target).then_some(index))
         .collect::<Vec<_>>();
-    let first_birthday_position = targets
-        .iter()
-        .position(|target| {
-            target.ip() == stable_endpoint.ip()
-                && !predicted_endpoints.contains(target)
-                && *target != stable_endpoint
-        })
-        .expect("birthday target should still be present");
-
     assert_eq!(predicted_positions.len(), PREDICTED_PROBE_BUDGET_PER_CYCLE);
-    assert!(predicted_positions
-        .iter()
-        .all(|position| *position < first_birthday_position));
+    assert_eq!(targets.len(), 1 + PREDICTED_PROBE_BUDGET_PER_CYCLE);
+    assert!(targets.iter().all(|target| {
+        *target == stable_endpoint || predicted_endpoints.contains(target)
+    }));
 
     let diagnostics = manager.diagnostics().await;
     let predicted = diagnostics[0]
@@ -289,23 +299,32 @@ async fn synchronized_punch_keeps_predicted_budget_during_history_cooldown() {
 }
 
 #[tokio::test]
-async fn synchronized_punch_prioritizes_failed_predicted_before_birthday() {
+async fn synchronized_punch_retries_failed_predicted_without_birthday_expansion() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "8.8.8.8:40000".parse().unwrap();
 
     manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager.update_nat_profile(birthday_nat_profile()).await;
 
-    let predicted_candidates = (0..24)
+    let mut predicted_candidates = vec![stable_endpoint.to_string()];
+    predicted_candidates.extend((0..24)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
-        .collect::<Vec<_>>();
+    );
     let predicted_endpoints = predicted_candidates
         .iter()
+        .filter(|candidate| **candidate != stable_endpoint.to_string())
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
         .collect::<HashSet<_>>();
     let sources = predicted_candidates
         .iter()
-        .map(|candidate| (candidate.clone(), "predicted".to_string()))
+        .map(|candidate| {
+            let source = if candidate == &stable_endpoint.to_string() {
+                "stun_observed"
+            } else {
+                "predicted"
+            };
+            (candidate.clone(), source.to_string())
+        })
         .collect::<HashMap<_, _>>();
     manager
         .add_candidates_with_sources("peer1", &predicted_candidates, &sources)
@@ -326,17 +345,15 @@ async fn synchronized_punch_prioritizes_failed_predicted_before_birthday() {
         .enumerate()
         .filter_map(|(index, target)| predicted_endpoints.contains(target).then_some(index))
         .collect::<Vec<_>>();
-    let first_birthday_position = targets
-        .iter()
-        .position(|target| {
-            target.ip() == stable_endpoint.ip()
-                && !predicted_endpoints.contains(target)
-                && *target != stable_endpoint
-        })
-        .expect("birthday target should still be present");
-
     assert_eq!(predicted_positions.len(), PREDICTED_PROBE_BUDGET_PER_CYCLE);
-    assert!(predicted_positions
-        .iter()
-        .all(|position| *position < first_birthday_position));
+    assert_eq!(targets.len(), 1 + PREDICTED_PROBE_BUDGET_PER_CYCLE);
+    assert!(targets.iter().all(|target| {
+        *target == stable_endpoint || predicted_endpoints.contains(target)
+    }));
+
+    let background = manager.direct_probe_targets().await;
+    assert_eq!(background.len(), 1);
+    assert!(background[0].1.iter().all(|target| {
+        *target == stable_endpoint || predicted_endpoints.contains(target)
+    }));
 }

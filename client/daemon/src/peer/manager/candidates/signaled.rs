@@ -72,7 +72,9 @@ impl PeerManager {
             conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
             let old_signaled_endpoint = conn.signaled_endpoint;
             let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
-            let had_previous_signaled = !previous_signaled.is_empty();
+            let endpoint_was_previous_signaled = conn.endpoint.is_some_and(|endpoint| {
+                previous_signaled.contains(&endpoint.to_string())
+            });
             for candidate in previous_signaled {
                 let learned = matches!(
                     conn.candidate_sources.get(&candidate),
@@ -84,10 +86,20 @@ impl PeerManager {
                 }
             }
 
+            if endpoint_was_previous_signaled
+                && conn.endpoint.is_some_and(|endpoint| {
+                    !candidates
+                        .iter()
+                        .any(|candidate| candidate == &endpoint.to_string())
+                })
+            {
+                conn.endpoint = None;
+            }
+
             // A current trickled signal is authoritative.  Keeping the node
             // registry's old endpoint forever causes port churn to accumulate
             // stale public targets and wastes each synchronized punch window.
-            if had_previous_signaled {
+            if !candidates.is_empty() {
                 if let Some(endpoint) = old_signaled_endpoint {
                     if !candidates
                         .iter()

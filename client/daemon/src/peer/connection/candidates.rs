@@ -123,12 +123,19 @@ impl PeerConnection {
         mode: ProbeTargetMode,
     ) -> Vec<SocketAddr> {
         self.ensure_current_candidate_pairs(local_generation);
-        let mut endpoints = self.candidate_endpoints();
+        let use_asymmetric_stable_role =
+            self.should_use_asymmetric_stable_remote_role(local_nat_profile);
+        let mut endpoints = if use_asymmetric_stable_role {
+            self.asymmetric_stable_remote_endpoints(local_generation)
+        } else {
+            self.candidate_endpoints()
+        };
         self.ensure_birthday_candidate_pairs(
             local_generation,
             history,
             local_nat_profile,
-            mode.allows_local_nat_birthday(),
+            mode.allows_local_nat_birthday() && !use_asymmetric_stable_role,
+            mode.allows_failed_prediction_fallback() && !use_asymmetric_stable_role,
             &mut endpoints,
         );
         self.prune_candidate_pairs_outside_targets(local_generation, &endpoints);
@@ -200,19 +207,112 @@ impl PeerConnection {
             .collect()
     }
 
+    /// A mapping-dependent local NAT should create only a few mappings toward
+    /// an easy peer's stable public endpoint. The easy peer can then scan this
+    /// side's explicit predicted ports without both sides destroying their
+    /// useful NAT windows through simultaneous birthday sweeps.
+    fn should_use_asymmetric_stable_remote_role(
+        &self,
+        local_nat_profile: Option<&NatProfile>,
+    ) -> bool {
+        if !local_nat_profile.is_some_and(is_hard_nat_profile) {
+            return false;
+        }
+
+        let public_endpoints = self
+            .candidate_endpoints()
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .collect::<Vec<_>>();
+        !public_endpoints.is_empty()
+            && !self.has_explicit_predicted_window()
+            && !peer_candidates_need_port_scatter(&public_endpoints)
+    }
+
+    fn has_explicit_predicted_window(&self) -> bool {
+        self.candidate_sources
+            .values()
+            .any(|source| *source == CandidatePairSource::Predicted)
+    }
+
+    fn explicit_predicted_window_failed(&self, local_generation: u64) -> bool {
+        let mut found_predicted = false;
+        for endpoint in self.candidate_sources.iter().filter_map(|(candidate, source)| {
+            (*source == CandidatePairSource::Predicted)
+                .then(|| candidate.parse::<SocketAddr>().ok())
+                .flatten()
+        }) {
+            found_predicted = true;
+            if !self.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == local_generation
+                    && pair.remote_endpoint == endpoint
+                    && pair.failure_count > 0
+            }) {
+                return false;
+            }
+        }
+        found_predicted
+    }
+
+    fn asymmetric_stable_remote_endpoints(
+        &self,
+        local_generation: u64,
+    ) -> Vec<SocketAddr> {
+        let mut endpoints = self
+            .candidate_endpoints()
+            .into_iter()
+            .filter(|endpoint| is_low_latency_direct_endpoint(*endpoint))
+            .collect::<Vec<_>>();
+        let mut public = self
+            .candidate_endpoints()
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                !matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Predicted | CandidatePairSource::Birthday
+                )
+            })
+            .collect::<Vec<_>>();
+        public.sort_by(|left, right| {
+            birthday_base_rank(self, *left, local_generation)
+                .cmp(&birthday_base_rank(self, *right, local_generation))
+                .then_with(|| left.cmp(right))
+        });
+        if let Some(endpoint) = public.first().copied() {
+            endpoints.push(endpoint);
+        }
+        endpoints
+    }
+
     fn ensure_birthday_candidate_pairs(
         &mut self,
         local_generation: u64,
         history: &TraversalHistory,
         local_nat_profile: Option<&NatProfile>,
         allow_local_nat_trigger: bool,
+        allow_failed_prediction_fallback: bool,
         endpoints: &mut Vec<SocketAddr>,
     ) {
         let bases = self.birthday_probe_bases(endpoints, local_generation);
 
+        let has_explicit_predicted_window = self.has_explicit_predicted_window();
+        // Keep the first synchronized attempt compact. If every advertised
+        // prediction has missed, an easy local NAT can safely rotate a wider
+        // remote-port window while the mapping-dependent peer keeps probing
+        // this side's stable endpoint. This is the asymmetric full-punch
+        // fallback used when the peer's destination-specific mapping moved
+        // beyond its signaled prediction window.
+        let failed_prediction_fallback = allow_failed_prediction_fallback
+            && has_explicit_predicted_window
+            && local_nat_profile.is_none_or(|profile| !is_hard_nat_profile(profile))
+            && self.explicit_predicted_window_failed(local_generation);
         let local_needs_birthday = allow_local_nat_trigger
-            && local_nat_profile.is_some_and(|profile| profile.birthday_candidate);
-        let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases);
+            && ((!has_explicit_predicted_window
+                && local_nat_profile.is_some_and(|profile| profile.birthday_candidate))
+                || failed_prediction_fallback);
+        let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases)
+            && (!has_explicit_predicted_window || failed_prediction_fallback);
         if !local_needs_birthday && !peer_looks_port_dependent {
             return;
         }

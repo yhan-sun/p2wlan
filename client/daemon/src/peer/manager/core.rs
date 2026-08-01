@@ -44,6 +44,16 @@ impl PeerManager {
         }
     }
 
+    /// Whether this peer still needs the unauthenticated PNCH v1 compatibility
+    /// datagram alongside an authenticated Probe v2 packet.
+    pub(crate) async fn peer_requires_legacy_probe(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_none_or(|conn| !app_version_at_least(&conn.app_version, (0, 1, 25)))
+    }
+
     /// Serializable local traversal history diagnostics.
     pub async fn traversal_history_diagnostics(&self) -> TraversalHistoryDiagnostics {
         self.traversal_history.read().await.diagnostics()
@@ -177,4 +187,26 @@ impl PeerManager {
         );
         generation
     }
+}
+
+fn app_version_at_least(version: &str, minimum: (u64, u64, u64)) -> bool {
+    let mut components = version.trim().trim_start_matches(['v', 'V']).split('.');
+    let parse_component = |component: Option<&str>| {
+        component?
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+    };
+    let Some(major) = parse_component(components.next()) else {
+        return false;
+    };
+    let Some(minor) = parse_component(components.next()) else {
+        return false;
+    };
+    let Some(patch) = parse_component(components.next()) else {
+        return false;
+    };
+    (major, minor, patch) >= minimum
 }
