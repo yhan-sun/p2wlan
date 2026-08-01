@@ -8,6 +8,9 @@ import '../../core/state/status_store.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 
+part 'settings_page/widgets.dart';
+part 'settings_page/actions.dart';
+
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
     super.key,
@@ -46,6 +49,8 @@ class _SettingsPageState extends State<SettingsPage> {
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
   var _closeBehavior = defaultCloseBehavior;
+
+  void _updateState(VoidCallback fn) => setState(fn);
 
   @override
   void initState() {
@@ -463,176 +468,4 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   static const _gap = SizedBox(height: 12);
-
-  Future<void> _saveAll() async {
-    final strings = AppStrings.fromCode(
-      widget.settingsStore.settings.languageCode,
-    );
-    setState(() {
-      _saving = true;
-      _diagnosticsError = null;
-      _formError = null;
-    });
-    try {
-      final mtu = int.tryParse(_mtuController.text.trim()) ?? defaultMtu;
-      final deviceName = _deviceNameController.text.trim().isEmpty
-          ? await resolveDefaultDeviceName()
-          : _deviceNameController.text.trim();
-      await widget.settingsStore.updateConnectionSettings(
-        diagnosticsUrl: _diagnosticsUrlController.text,
-        controlServer: _controlServerController.text,
-        authToken: _authTokenController.text,
-        networkId: _networkIdController.text,
-        virtualIp: _virtualIpController.text,
-        deviceName: deviceName,
-        manualMode: _manualMode,
-        overlayCidr: _overlayCidrController.text,
-        tunInterface: _tunInterfaceController.text,
-        mtu: mtu,
-        udpBind: _udpBindController.text,
-        udpAdvertise: _udpAdvertiseController.text,
-        socketPool: _socketPool,
-        relayServers: _relayServersController.text,
-        closeBehavior: _closeBehavior,
-      );
-      await widget.statusStore.refresh();
-      _showSnackBar(strings.diagnosticsUrlSaved);
-    } on FormatException catch (error) {
-      final message = error.message;
-      setState(() {
-        if (message.startsWith('Diagnostics URL')) {
-          _diagnosticsError = strings.diagnosticsUrlError(message);
-        } else {
-          _formError = message;
-        }
-      });
-      _showSnackBar(
-        message.startsWith('Diagnostics URL')
-            ? strings.diagnosticsUrlNotSaved
-            : strings.failedToSaveLocalSettings,
-      );
-    } catch (error) {
-      setState(() => _formError = error.toString());
-      _showSnackBar(strings.failedToSaveLocalSettings);
-    } finally {
-      if (mounted) {
-        setState(() => _saving = false);
-      }
-    }
-  }
-
-  Future<void> _resetDiagnosticsUrl() async {
-    _diagnosticsUrlController.text = defaultDiagnosticsUrl;
-    await _saveAll();
-  }
-
-  Future<void> _saveLanguage(String languageCode) async {
-    setState(() => _saving = true);
-    try {
-      await widget.settingsStore.updateLanguageCode(languageCode);
-      _showSnackBar(AppStrings.fromCode(languageCode).languageSaved);
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  Future<void> _saveThemeMode(String themeMode) async {
-    final strings = AppStrings.fromCode(
-      widget.settingsStore.settings.languageCode,
-    );
-    setState(() => _saving = true);
-    try {
-      await widget.settingsStore.updateThemeMode(themeMode);
-      _showSnackBar(strings.themeSaved);
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  void _showSnackBar(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
-  }
-}
-
-class _ResponsiveFieldRow extends StatelessWidget {
-  const _ResponsiveFieldRow({required this.first, required this.second});
-
-  final Widget first;
-  final Widget second;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (constraints.maxWidth < 560) {
-          return Column(children: [first, const SizedBox(height: 12), second]);
-        }
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(child: first),
-            const SizedBox(width: 12),
-            Expanded(child: second),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class _SettingsTextField extends StatelessWidget {
-  const _SettingsTextField({
-    required this.controller,
-    required this.label,
-    required this.helper,
-    this.keyboardType,
-    this.obscureText = false,
-  });
-
-  final TextEditingController controller;
-  final String label;
-  final String helper;
-  final TextInputType? keyboardType;
-  final bool obscureText;
-
-  @override
-  Widget build(BuildContext context) {
-    return TextField(
-      controller: controller,
-      keyboardType: keyboardType,
-      obscureText: obscureText,
-      decoration: InputDecoration(labelText: label, helperText: helper),
-    );
-  }
-}
-
-class _ErrorBanner extends StatelessWidget {
-  const _ErrorBanner({required this.message});
-
-  final String message;
-
-  @override
-  Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: AppTokens.colorBadBg,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: AppTokens.colorBadBorder),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Text(
-          message,
-          style: const TextStyle(
-            color: AppTokens.colorBadText,
-            fontSize: 13,
-            height: 1.35,
-          ),
-        ),
-      ),
-    );
-  }
 }

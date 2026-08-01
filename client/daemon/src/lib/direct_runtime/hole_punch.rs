@@ -1,0 +1,163 @@
+async fn spawn_hole_punch_task(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
+    peer_id: String,
+    probe_interval: Duration,
+    attempts: u32,
+    punch_at_ms: Option<u64>,
+) {
+    if !punch_deduplicator.claim(&peer_id).await {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_suppressed",
+                None,
+                None,
+                None,
+                "suppressed overlapping UDP punch session for this peer",
+            )
+            .await;
+        debug!("Suppressing overlapping UDP punch session for {peer_id}");
+        return;
+    }
+    let punch_delay = relay_assisted_punch_delay(punch_at_ms);
+    if !punch_delay.is_zero() {
+        debug!(
+            "Scheduling relay-assisted UDP punch to peer {peer_id} in {}ms",
+            punch_delay.as_millis()
+        );
+    }
+
+    tokio::spawn(async move {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_scheduled",
+                None,
+                None,
+                None,
+                format!(
+                    "scheduled relay-assisted UDP punch delay_ms={} punch_at_ms={punch_at_ms:?}",
+                    punch_delay.as_millis()
+                ),
+            )
+            .await;
+        if !punch_delay.is_zero() {
+            sleep(punch_delay).await;
+        }
+
+        let generation = peers.current_network_generation().await;
+        let candidates = peers.direct_probe_targets_for(&peer_id).await;
+        if candidates.is_empty() {
+            if peers.is_direct(&peer_id).await {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_skipped_already_direct",
+                        None,
+                        None,
+                        None,
+                        "skipped UDP punch because Direct path is already confirmed",
+                    )
+                    .await;
+                debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+                return;
+            }
+            debug!("No UDP candidates for {peer_id}; skipping hole punch");
+            peers
+                .record_direct_failure_for_generation(
+                    &peer_id,
+                    generation,
+                    REASON_DIRECT_PROBE_FAILED,
+                    "no UDP candidates for hole punching",
+                )
+                .await;
+            return;
+        }
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_started",
+                candidates.first().copied(),
+                Some(candidates.len()),
+                None,
+                format!(
+                    "starting synchronized UDP punch across {} candidates",
+                    candidates.len()
+                ),
+            )
+            .await;
+
+        let success_count_before = peers
+            .direct_probe_success_count_for_generation(&peer_id, generation)
+            .await;
+
+        match udp
+            .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
+            .await
+        {
+            Ok(sent) => {
+                info!("Sent {sent} UDP punch probes to peer {peer_id}");
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_probes_sent",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        Some(sent),
+                        format!(
+                            "sent {sent} UDP punch probes across {} candidates",
+                            candidates.len()
+                        ),
+                    )
+                    .await;
+                sleep(direct_probe_ack_grace(probe_interval)).await;
+                let success_count_after = peers
+                    .direct_probe_success_count_for_generation(&peer_id, generation)
+                    .await;
+                if sent > 0 && success_count_after == success_count_before {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_ack_timeout",
+                            candidates.first().copied(),
+                            Some(candidates.len()),
+                            Some(sent),
+                            format!("no UDP punch ACK after {sent} probes"),
+                        )
+                        .await;
+                    peers
+                        .record_direct_failure_for_generation(
+                            &peer_id,
+                            generation,
+                            REASON_DIRECT_PROBE_FAILED,
+                            format!("no UDP punch ACK after {sent} probes"),
+                        )
+                        .await;
+                }
+            }
+            Err(err) => {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "punch_send_error",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        None,
+                        format!("hole punch failed: {err}"),
+                    )
+                    .await;
+                peers
+                    .record_direct_failure_for_generation(
+                        &peer_id,
+                        generation,
+                        REASON_DIRECT_PROBE_FAILED,
+                        format!("hole punch failed: {err}"),
+                    )
+                    .await;
+                warn!("Failed to punch peer {peer_id}: {err}");
+            }
+        }
+    });
+}

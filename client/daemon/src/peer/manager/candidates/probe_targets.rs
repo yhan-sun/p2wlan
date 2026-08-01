@@ -1,0 +1,227 @@
+impl PeerManager {
+    /// Return the best current direct endpoint for encrypted UDP data.
+    pub async fn direct_endpoint_for_send(&self, node_id: &str) -> Option<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| conn.direct_endpoint_for_send(generation))
+    }
+
+    /// Return direct UDP endpoints for NAT keepalive probes.
+    pub async fn direct_endpoints(&self) -> Vec<(String, SocketAddr)> {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| conn.state == ConnectionState::Direct)
+            .filter_map(|conn| {
+                conn.selected_direct_endpoint_for_consent(generation)
+                    .map(|endpoint| (conn.node_id.clone(), endpoint))
+            })
+            .collect()
+    }
+
+    /// Return candidate endpoints for a specific peer using the adaptive probe scheduler.
+    pub async fn direct_probe_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Vec::new();
+        };
+        if !conn.online {
+            return Vec::new();
+        }
+        if conn.state == ConnectionState::Direct
+            && !conn.should_probe_private_alternates_while_direct(generation)
+        {
+            return Vec::new();
+        }
+        let endpoints = conn.candidate_probe_endpoints(
+            generation,
+            &history,
+            local_nat_profile.as_ref(),
+            ProbeTargetMode::Synchronized,
+        );
+        if !endpoints.is_empty() {
+            conn.record_direct_event(
+                generation,
+                "probe_targets_selected",
+                endpoints.first().copied(),
+                Some(endpoints.len()),
+                None,
+                format!(
+                    "selected {} UDP candidates for synchronized punching",
+                    endpoints.len()
+                ),
+            );
+        }
+        endpoints
+    }
+
+    /// Return candidate endpoints that should continue receiving direct-path probes.
+    pub async fn direct_probe_targets(&self) -> Vec<(String, Vec<SocketAddr>)> {
+        let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        self.connections
+            .write()
+            .await
+            .values_mut()
+            .filter_map(|conn| {
+                if !conn.online {
+                    return None;
+                }
+                if conn.state == ConnectionState::Direct
+                    && !conn.should_probe_private_alternates_while_direct(generation)
+                {
+                    return None;
+                }
+                if conn.state != ConnectionState::Direct
+                    && !conn.has_direct_retry_opportunity(local_nat_profile.as_ref())
+                {
+                    if conn
+                        .direct_events
+                        .last()
+                        .is_none_or(|event| {
+                            event.network_generation != generation
+                                || event.stage != "retry_skipped_no_viable_nat_window"
+                        })
+                    {
+                        conn.record_direct_event(
+                            generation,
+                            "retry_skipped_no_viable_nat_window",
+                            conn.endpoint,
+                            None,
+                            None,
+                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                        );
+                    }
+                    return None;
+                }
+                let endpoints = conn.candidate_probe_endpoints(
+                    generation,
+                    &history,
+                    local_nat_profile.as_ref(),
+                    ProbeTargetMode::Background,
+                );
+
+                if endpoints.is_empty() {
+                    None
+                } else {
+                    conn.record_direct_event(
+                        generation,
+                        "probe_targets_due",
+                        endpoints.first().copied(),
+                        Some(endpoints.len()),
+                        None,
+                        format!(
+                            "selected {} UDP candidates for background retry",
+                            endpoints.len()
+                        ),
+                    );
+                    Some((conn.node_id.clone(), endpoints))
+                }
+            })
+            .collect()
+    }
+
+    /// Return candidate endpoints that are due for direct-path reprobe.
+    ///
+    /// Unlike `direct_probe_targets`, this only transitions pairs to Probing
+    /// after the peer-level retry cooldown has elapsed, except during the
+    /// short generation-change reclaim window for peers with previous Direct
+    /// success.
+    pub async fn direct_probe_targets_due(
+        &self,
+        base_retry_after: Duration,
+    ) -> Vec<(String, Vec<SocketAddr>)> {
+        let generation = self.current_network_generation().await;
+        let history = self.traversal_history.read().await.clone();
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        self.connections
+            .write()
+            .await
+            .values_mut()
+            .filter_map(|conn| {
+                if !conn.online {
+                    return None;
+                }
+                if conn.state == ConnectionState::Direct {
+                    return None;
+                }
+                let reclaim_active = conn.direct_reclaim_active();
+                if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
+                    return None;
+                }
+                if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
+                    if conn
+                        .direct_events
+                        .last()
+                        .is_none_or(|event| {
+                            event.network_generation != generation
+                                || event.stage != "retry_skipped_no_viable_nat_window"
+                        })
+                    {
+                        conn.record_direct_event(
+                            generation,
+                            "retry_skipped_no_viable_nat_window",
+                            conn.endpoint,
+                            None,
+                            None,
+                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                        );
+                    }
+                    return None;
+                }
+                let endpoints = conn.candidate_probe_endpoints(
+                    generation,
+                    &history,
+                    local_nat_profile.as_ref(),
+                    if reclaim_active {
+                        ProbeTargetMode::Reclaim
+                    } else {
+                        ProbeTargetMode::Background
+                    },
+                );
+
+                if endpoints.is_empty() {
+                    None
+                } else {
+                    if reclaim_active {
+                        conn.record_direct_event(
+                            generation,
+                            "direct_reclaim_targets_due",
+                            endpoints.first().copied(),
+                            Some(endpoints.len()),
+                            None,
+                            format!(
+                                "selected {} UDP candidates for generation-change Direct reclaim",
+                                endpoints.len()
+                            ),
+                        );
+                    }
+                    Some((conn.node_id.clone(), endpoints))
+                }
+            })
+            .collect()
+    }
+
+    /// Record that a UDP probe datagram was actually sent to a candidate.
+    ///
+    /// Candidate selection can be broader than the outbound rate-limit budget;
+    /// mark pairs as probing only once the UDP layer confirms a packet left.
+    pub async fn record_direct_probe_sent(&self, node_id: &str, endpoint: SocketAddr) -> bool {
+        let generation = self.current_network_generation().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        conn.mark_candidate_pair_probing(endpoint, generation);
+        true
+    }
+}
