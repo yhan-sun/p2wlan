@@ -1,0 +1,98 @@
+/* Panels */
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 0.9rem 1rem;
+}
+
+.panel-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.panel-value-mono {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stat-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.stat-panel > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.panel-section {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-header {
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.panel-header h3 {
+  font-size: 0.875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  color: var(--text-primary);
+}
+
+.panel-body {
+  padding: 1rem;
+}
+
+/* Status Lines */
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.875rem;
+  padding: 0.375rem 0;
+  gap: 1rem;
+}
+
+.status-label-text {
+  color: var(--text-secondary);
+}
+
+.status-label-text-mono {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.status-value-text {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.status-value-text-mono {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

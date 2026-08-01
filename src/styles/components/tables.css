@@ -1,0 +1,141 @@
+/* Tables */
+.table-wrapper {
+  overflow-x: auto;
+  border-radius: var(--radius-md);
+  max-width: 100%;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.table th {
+  padding: 0.75rem 1rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border-color);
+  letter-spacing: 0;
+}
+
+.table td {
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border-light);
+  white-space: nowrap;
+}
+
+.table tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.empty-panel {
+  min-height: 18rem;
+}
+
+.empty-title {
+  color: var(--text-primary);
+}
+
+.empty-desc {
+  line-height: 1.45;
+}
+
+/* Compact Tables */
+.small-table-wrapper {
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+
+.small-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.small-table th {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  padding: 0.375rem 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.small-table td {
+  padding: 0.375rem 0.5rem;
+  font-size: 0.8rem;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.mono-label {
+  font-family: var(--font-mono);
+}
+
+/* Metric cards in dashboard */
+.peer-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.metric-box {
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  text-align: center;
+}
+
+.metric-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  display: block;
+}
+
+.metric-lbl {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.recent-peers-list .list-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.empty-state-text {
+  font-size: 0.825rem;
+  color: var(--text-muted);
+  padding: 1rem 0;
+  text-align: center;
+}
+
+.simple-dashboard {
+  max-width: 1040px;
+}
+
+.simple-status-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.simple-action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
