@@ -176,6 +176,46 @@ async fn diagnostics_classifies_public_udp_direct_selected_pair() {
     assert_eq!(peer.warning, None);
 }
 
+#[test]
+fn diagnostics_keeps_non_current_selected_public_pair_public_udp() {
+    let selected_remote: SocketAddr = "8.8.8.8:32794".parse().unwrap();
+    let current_remote: SocketAddr = "8.8.8.8:32798".parse().unwrap();
+    let local: SocketAddr = "192.168.1.10:54006".parse().unwrap();
+    let mut conn = PeerConnection::new("peer1", "10.20.0.2");
+    conn.state = ConnectionState::Direct;
+    conn.endpoint = Some(current_remote);
+
+    let mut selected_pair =
+        CandidatePair::new_with_source(selected_remote, 0, CandidatePairSource::PeerReflexive);
+    selected_pair.record_success(Some(Duration::from_millis(3)), true, Some(local));
+
+    let mut current_pair =
+        CandidatePair::new_with_source(current_remote, 0, CandidatePairSource::PeerReflexive);
+    current_pair.record_success(Some(Duration::from_millis(10)), true, Some(local));
+
+    conn.candidate_pairs = vec![current_pair, selected_pair];
+
+    let current_selection =
+        PathSelection::direct(current_remote, "test_direct", "test direct", true);
+    let diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+        &conn,
+        Some(&current_selection),
+        None,
+        0,
+        Some(local),
+        None,
+    );
+    let selected = diagnostics.selected_pair.as_ref().unwrap();
+    let current = diagnostics.current_direct_pair.as_ref().unwrap();
+
+    assert_eq!(diagnostics.direct_type, DirectPathType::PublicUdp);
+    assert!(diagnostics.is_public_udp_direct);
+    assert_eq!(selected.remote_endpoint, selected_remote.to_string());
+    assert_eq!(current.remote_endpoint, current_remote.to_string());
+    assert_eq!(selected.direct_type, DirectPathType::PublicUdp);
+    assert!(selected.is_public_udp_direct);
+}
+
 #[tokio::test]
 async fn diagnostics_keeps_probe_success_as_probing_until_direct_confirmed() {
     let manager = PeerManager::new(test_config());

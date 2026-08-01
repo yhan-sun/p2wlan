@@ -92,19 +92,27 @@ impl PeerDiagnostics {
             conn.current_direct_pair_for_diagnostics(local_generation, current_selection);
         let current_pair_endpoint = current_pair.map(|pair| pair.remote_endpoint);
         let consent_endpoint = conn.selected_direct_endpoint_for_consent(local_generation);
-        let direct_confirmed = active_path == Some(NetworkPath::Direct)
-            && current_pair.is_some_and(|pair| pair.state == CandidatePairState::Selected)
+        let direct_selection_confirmed = active_path == Some(NetworkPath::Direct)
             && current_selection
                 .map(|selection| selection.direct_confirmed)
                 .unwrap_or(conn.state == ConnectionState::Direct);
+        let direct_confirmed = direct_selection_confirmed
+            && current_pair.is_some_and(|pair| pair.state == CandidatePairState::Selected);
         let direct_type = classify_candidate_pair_path(active_path, current_pair, direct_confirmed);
         let selected_pair = selected_pair.map(|pair| {
             let is_current = Some(pair.remote_endpoint) == current_pair_endpoint;
+            let pair_direct_confirmed =
+                direct_selection_confirmed && (is_current || pair.state == CandidatePairState::Selected);
+            let pair_active_path = if pair_direct_confirmed {
+                Some(NetworkPath::Direct)
+            } else {
+                is_current.then_some(active_path).flatten()
+            };
             CandidatePairDiagnostics::from_pair(
                 pair,
                 local_endpoint,
-                is_current.then_some(active_path).flatten(),
-                direct_confirmed && is_current,
+                pair_active_path,
+                pair_direct_confirmed,
             )
         });
         let current_direct_pair = current_pair.map(|pair| {
@@ -115,11 +123,18 @@ impl PeerDiagnostics {
             .iter()
             .map(|pair| {
                 let is_current = Some(pair.remote_endpoint) == current_pair_endpoint;
+                let pair_direct_confirmed = direct_selection_confirmed
+                    && (is_current || pair.state == CandidatePairState::Selected);
+                let pair_active_path = if pair_direct_confirmed {
+                    Some(NetworkPath::Direct)
+                } else {
+                    is_current.then_some(active_path).flatten()
+                };
                 CandidatePairDiagnostics::from_pair(
                     pair,
                     local_endpoint,
-                    is_current.then_some(active_path).flatten(),
-                    direct_confirmed && is_current,
+                    pair_active_path,
+                    pair_direct_confirmed,
                 )
             })
             .collect::<Vec<_>>();
