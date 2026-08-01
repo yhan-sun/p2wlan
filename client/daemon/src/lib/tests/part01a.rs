@@ -445,3 +445,69 @@ async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
         .iter()
         .any(|event| event.stage == REASON_DIRECT_PROBE_FAILED));
 }
+
+#[tokio::test]
+async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let unused_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = unused_socket.local_addr().unwrap();
+    drop(unused_socket);
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .update_state("node-b", ConnectionState::HolePunching)
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        PunchAttemptDeduplicator::default(),
+        "node-b".to_string(),
+        Duration::from_millis(10),
+        1,
+        None,
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let conn = peers.get_connection("node-b").await.unwrap();
+            if conn
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "punch_ack_timeout")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("scheduled hole punch did not record ACK timeout");
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::HolePunching);
+    assert_eq!(conn.direct_health.failure_count, 0);
+    assert!(conn.direct_health.last_error.is_none());
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == REASON_DIRECT_PROBE_FAILED));
+}
