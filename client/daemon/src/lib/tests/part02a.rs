@@ -1,0 +1,279 @@
+#[test]
+fn signal_candidate_cap_keeps_priority_prefix_and_source_map_aligned() {
+    let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 3)
+        .map(|index| format!("192.0.2.{index}:51820"))
+        .collect::<Vec<_>>();
+    let mapped = "198.51.100.10:42000".to_string();
+    candidates.insert(0, mapped.clone());
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "host".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(mapped.clone(), "upnp".to_string());
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert_eq!(candidates[0], mapped);
+    assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    assert_eq!(sources.get(&mapped).map(String::as_str), Some("upnp"));
+}
+
+#[test]
+fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts() {
+    let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 4)
+        .map(|index| format!("192.168.1.{index}:51820"))
+        .collect::<Vec<_>>();
+    let stun = "203.0.113.10:42000".to_string();
+    let predicted = "203.0.113.10:42004".to_string();
+    candidates.push(stun.clone());
+    candidates.push(predicted.clone());
+
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "host".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(stun.clone(), "stun_observed".to_string());
+    sources.insert(predicted.clone(), "predicted".to_string());
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert!(candidates.contains(&stun));
+    assert!(candidates.contains(&predicted));
+    assert_eq!(
+        sources.get(&stun).map(String::as_str),
+        Some("stun_observed")
+    );
+    assert_eq!(
+        sources.get(&predicted).map(String::as_str),
+        Some("predicted")
+    );
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+}
+
+#[test]
+fn candidate_refresh_generation_ignores_stun_port_churn_on_same_public_ip() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let next = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:31999".to_string(),
+    ];
+    let next_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:31999".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+
+    assert!(!candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &next,
+        &next_sources,
+    ));
+}
+
+#[test]
+fn candidate_refresh_generation_ignores_public_source_label_churn() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "peer_reflexive".to_string(),
+        ),
+    ]);
+    let next = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:31999".to_string(),
+    ];
+    let next_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:31999".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let learned_next_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        ("93.184.216.34:31999".to_string(), "learned".to_string()),
+    ]);
+
+    assert!(!candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &next,
+        &next_sources,
+    ));
+    assert!(!candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &next,
+        &learned_next_sources,
+    ));
+}
+
+#[test]
+fn candidate_refresh_generation_ignores_private_source_label_churn() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        (
+            "192.168.1.10:59288".to_string(),
+            "peer_reflexive".to_string(),
+        ),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let next = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:31999".to_string(),
+    ];
+    let next_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:31999".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+
+    assert!(!candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &next,
+        &next_sources,
+    ));
+}
+
+#[test]
+fn candidate_refresh_generation_ignores_external_overlay_and_public_port_churn() {
+    let previous = vec![
+        "tailscale.example.com:60155".to_string(),
+        "tailscale.example.com:58770".to_string(),
+        "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+        "220.163.6.190:6979".to_string(),
+        "220.163.6.190:6980".to_string(),
+        "220.163.6.190:6984".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("tailscale.example.com:60155".to_string(), "host".to_string()),
+        ("tailscale.example.com:58770".to_string(), "host".to_string()),
+        (
+            "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+            "host".to_string(),
+        ),
+        (
+            "220.163.6.190:6979".to_string(),
+            "stun_observed".to_string(),
+        ),
+        (
+            "220.163.6.190:6980".to_string(),
+            "stun_observed".to_string(),
+        ),
+        ("220.163.6.190:6984".to_string(), "predicted".to_string()),
+    ]);
+    let next = vec![
+        "tailscale.example.com:59581".to_string(),
+        "tailscale.example.com:60155".to_string(),
+        "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+        "220.163.6.190:6981".to_string(),
+        "220.163.6.190:6983".to_string(),
+        "220.163.6.190:6995".to_string(),
+    ];
+    let next_sources = HashMap::from([
+        ("tailscale.example.com:59581".to_string(), "host".to_string()),
+        ("tailscale.example.com:60155".to_string(), "host".to_string()),
+        (
+            "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
+            "host".to_string(),
+        ),
+        (
+            "220.163.6.190:6981".to_string(),
+            "stun_observed".to_string(),
+        ),
+        (
+            "220.163.6.190:6983".to_string(),
+            "stun_observed".to_string(),
+        ),
+        ("220.163.6.190:6995".to_string(), "predicted".to_string()),
+    ]);
+
+    assert!(!candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &next,
+        &next_sources,
+    ));
+}
+
+#[test]
+fn candidate_refresh_generation_advances_on_host_or_public_ip_change() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let host_changed = vec![
+        "192.168.2.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let host_changed_sources = HashMap::from([
+        ("192.168.2.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let public_ip_changed = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.35:27106".to_string(),
+    ];
+    let public_ip_changed_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.35:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+
+    assert!(candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &host_changed,
+        &host_changed_sources,
+    ));
+    assert!(candidate_refresh_requires_network_generation_advance(
+        &previous,
+        &previous_sources,
+        &public_ip_changed,
+        &public_ip_changed_sources,
+    ));
+}

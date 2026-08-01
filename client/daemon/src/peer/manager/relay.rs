@@ -1,0 +1,117 @@
+impl PeerManager {
+    /// Whether the peer is direct in a specific generation.
+    pub async fn is_direct_for_generation(&self, node_id: &str, generation: u64) -> bool {
+        generation == self.current_network_generation().await && self.is_direct(node_id).await
+    }
+
+    /// Set the relay server for a peer.
+    pub async fn set_relay(&self, node_id: &str, relay_server: &str) {
+        self.record_relay_success(node_id, relay_server, true).await;
+    }
+
+    /// Record a successful relay-path event.
+    pub async fn record_relay_success(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+    ) {
+        self.record_relay_success_inner(node_id, relay_server, switch_to_relay, None)
+            .await;
+    }
+
+    /// Record a successful relay-path event with measured peer round-trip latency.
+    pub async fn record_relay_success_with_latency(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+        latency: Duration,
+    ) {
+        self.record_relay_success_inner(node_id, relay_server, switch_to_relay, Some(latency))
+            .await;
+    }
+
+    async fn record_relay_success_inner(
+        &self,
+        node_id: &str,
+        relay_server: &str,
+        switch_to_relay: bool,
+        latency: Option<Duration>,
+    ) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.relay_server = Some(relay_server.to_string());
+            if let Some(latency) = latency {
+                conn.relay_health.record_success_with_latency(latency);
+            } else {
+                conn.relay_health.record_success();
+            }
+            if switch_to_relay || conn.state != ConnectionState::Direct {
+                conn.transition(ConnectionState::Relay);
+                info!(
+                    event = "relay_fallback_selected",
+                    peer_id = %node_id,
+                    local_endpoint = "relay",
+                    remote_endpoint = %relay_server,
+                    direct_endpoint = ?conn.endpoint,
+                    relay_server = %relay_server,
+                    candidate_source = ?conn.endpoint.and_then(|endpoint| {
+                        conn.candidate_pairs
+                            .iter()
+                            .find(|pair| pair.remote_endpoint == endpoint)
+                            .map(|pair| pair.source)
+                    }),
+                    rtt_ms = ?conn.relay_health.rtt_ewma_ms.or(conn.relay_health.latency_ms),
+                    reason = %format!("relay {relay_server} selected"),
+                    "relay_fallback_selected peer_id={} relay_server={}",
+                    node_id,
+                    relay_server
+                );
+            }
+        }
+    }
+
+    /// Record that a relay path was attempted without treating TCP write success as delivery.
+    pub async fn record_relay_attempt(&self, node_id: &str, relay_server: &str) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.relay_server = Some(relay_server.to_string());
+        }
+    }
+
+    /// Record a relay-path failure for a specific peer.
+    pub async fn record_relay_failure(
+        &self,
+        node_id: &str,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.relay_health.record_failure(code, reason);
+            if conn.state == ConnectionState::Relay {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+    }
+
+    /// Invalidate every peer confirmation associated with a relay transport.
+    pub async fn invalidate_relay_transport(
+        &self,
+        relay_server: &str,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let code = code.into();
+        let reason = reason.into();
+        for conn in self.connections.write().await.values_mut() {
+            if conn.relay_server.as_deref() != Some(relay_server) {
+                continue;
+            }
+            conn.relay_health
+                .record_failure(code.clone(), reason.clone());
+            conn.relay_server = None;
+            if conn.state == ConnectionState::Relay {
+                conn.transition(ConnectionState::FallbackToRelay);
+            }
+        }
+    }
+}
