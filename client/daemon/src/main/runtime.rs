@@ -94,6 +94,15 @@ async fn main() -> p2pnet_daemon::Result<()> {
         return Ok(());
     }
 
+    // Keep one owner for the TUN, control session, and UDP socket set associated
+    // with this device identity. A duplicate daemon can consume the other
+    // process's offer/answer signals and invalidate authenticated probe MACs.
+    let instance_lock = DaemonInstanceLock::acquire(config_path)?;
+    info!(
+        "Acquired daemon instance lock at {}",
+        instance_lock.path.display()
+    );
+
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);
 

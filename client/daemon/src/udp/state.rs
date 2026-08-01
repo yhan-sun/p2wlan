@@ -19,6 +19,13 @@ const AUTH_PUNCH_REPLAY_MAX_ENTRIES: usize = 4096;
 const AUTH_PUNCH_REPLAY_TARGET_ENTRIES: usize = 3072;
 const AUTH_PUNCH_RATE_WINDOW: Duration = Duration::from_secs(1);
 const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
+/// Pace connectivity checks below the per-peer/public-IP admission ceiling.
+/// A large symmetric-NAT sweep must cover the full candidate window instead
+/// of consuming its one-second budget in one burst and dropping the tail.
+#[cfg(not(test))]
+const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::from_millis(6);
+#[cfg(test)]
+const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::ZERO;
 /// Hard bound on primary connectivity-check datagrams emitted by one punch
 /// session. Retransmissions are reserved for nomination and consent checks.
 const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
@@ -46,6 +53,18 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub probe_ack_retransmissions_sent: u64,
     /// Matching punch ACKs received on this socket.
     pub probe_acks_received: u64,
+    /// UDP datagrams received on this socket, including STUN and data traffic.
+    pub datagrams_received: u64,
+    /// Datagrams carrying the authenticated Probe v2 framing.
+    pub authenticated_probe_packets_received: u64,
+    /// Probe v2 frames rejected because their MAC did not match.
+    pub authenticated_probe_invalid_mac: u64,
+    /// Probe v2 frames addressed to another local node ID.
+    pub authenticated_probe_wrong_target: u64,
+    /// Probe v2 frames rejected before a peer key was available.
+    pub authenticated_probe_no_key: u64,
+    /// Probe v2-looking datagrams whose authenticated header was malformed.
+    pub authenticated_probe_malformed: u64,
     /// Encrypted direct datagrams sent from this socket.
     pub encrypted_packets_sent: u64,
     /// Encrypted direct datagrams received on this socket.
@@ -140,11 +159,11 @@ fn build_probe_schedule(
     (0..attempts)
         .map(|round| {
             let is_final_round = round + 1 == attempts;
-            let width = if attempts == 1 || is_final_round {
+            let width = if round == 0 || attempts == 1 || is_final_round {
                 unique.len()
             } else {
                 match round {
-                    0 | 1 => unique.len().min(24),
+                    1 => unique.len().min(24),
                     2 => unique.len().min(48),
                     _ => unique.len(),
                 }

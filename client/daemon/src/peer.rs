@@ -43,10 +43,11 @@ pub const DIRECT_RECLAIM_WINDOW: Duration = Duration::from_secs(10);
 /// Base cadence for relay-backed Direct reconnection.
 ///
 /// Relay already provides the data-plane safety net, so peers with a plausible
-/// punch window should retry quickly after a Direct path falls apart.  The
-/// peer-level backoff below yields 1s, 2s, 4s, then 8s retries.
+/// punch window should retry quickly after a Direct path falls apart. The
+/// peer-level backoff below yields 1s through 64s retries; generation-change
+/// reclaim still bypasses this cooldown for a recently working Direct path.
 pub const DIRECT_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(1);
-const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
+const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 6;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
@@ -78,9 +79,9 @@ const PROBE_MAC_EPHEMERAL_SESSION_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 ephe
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeTargetMode {
-    /// The synchronized offer/answer punch window. Keep this compact so
-    /// address/port-dependent NATs are not forced to create many competing
-    /// mappings before the peer can answer.
+    /// The synchronized offer/answer punch window. Keep the first attempt
+    /// compact, then permit a wider fallback after every explicit prediction
+    /// has failed so both peers probe during the same NAT mapping window.
     Synchronized,
     /// Background retries after relay is already available. These may spend a
     /// wider budget on birthday probes without delaying initial connectivity.
@@ -109,7 +110,7 @@ impl ProbeTargetMode {
     }
 
     fn allows_failed_prediction_fallback(self) -> bool {
-        matches!(self, Self::Background | Self::Reclaim)
+        matches!(self, Self::Synchronized | Self::Background | Self::Reclaim)
     }
 }
 

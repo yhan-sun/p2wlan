@@ -176,10 +176,14 @@ async fn easy_local_expands_after_the_explicit_prediction_window_fails() {
         }
     }
 
-    let retries = manager.direct_probe_targets().await;
-    assert_eq!(retries.len(), 1);
-    let expanded = &retries[0].1;
-    assert!(expanded.iter().any(|target| {
+    let synchronized_retry = manager.direct_probe_targets_for("peer1").await;
+    assert!(synchronized_retry.iter().any(|target| {
+        target.ip() == observed.ip() && *target != observed && !predicted.contains(target)
+    }));
+
+    let background_retries = manager.direct_probe_targets().await;
+    assert_eq!(background_retries.len(), 1);
+    assert!(background_retries[0].1.iter().any(|target| {
         target.ip() == observed.ip() && *target != observed && !predicted.contains(target)
     }));
 }

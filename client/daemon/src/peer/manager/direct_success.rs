@@ -48,7 +48,7 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
-        let source = {
+        let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
@@ -57,28 +57,30 @@ impl PeerManager {
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
             let selected_endpoint = endpoint.or(conn.endpoint);
-            let source = selected_endpoint.map(|endpoint| {
+            let pair_success = selected_endpoint.map(|endpoint| {
                 conn.endpoint = Some(endpoint);
                 conn.mark_candidate_pair_success(endpoint, generation, None, true, local_endpoint)
             });
+            let direct_confirmation_changed = !was_direct
+                || previous_endpoint != selected_endpoint
+                || previous_generation != generation;
             conn.direct_generation = generation;
             conn.direct_health.record_success();
             conn.clear_direct_reclaim_window();
-            conn.record_direct_event(
-                generation,
-                "direct_confirmed",
-                selected_endpoint,
-                selected_endpoint.map(|_| 1),
-                None,
-                "encrypted data path confirmed Direct UDP",
-            );
+            if direct_confirmation_changed {
+                conn.record_direct_event(
+                    generation,
+                    "direct_confirmed",
+                    selected_endpoint,
+                    selected_endpoint.map(|_| 1),
+                    None,
+                    "encrypted data path confirmed Direct UDP",
+                );
+            }
             conn.transition(ConnectionState::Direct);
-            if let (Some(endpoint), Some(source)) = (selected_endpoint, source) {
+            if let (Some(endpoint), Some((source, _))) = (selected_endpoint, pair_success) {
                 let direct_type = classify_confirmed_direct_endpoint(endpoint, source);
                 let local_endpoint_text = format_log_endpoint(local_endpoint);
-                let direct_confirmation_changed = !was_direct
-                    || previous_endpoint != Some(endpoint)
-                    || previous_generation != generation;
                 if direct_confirmation_changed {
                     info!(
                         event = "candidate_pair_selected",
@@ -149,9 +151,9 @@ impl PeerManager {
                     }
                 }
             }
-            source
+            pair_success
         };
-        if let Some(source) = source {
+        if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }
         true
@@ -240,14 +242,14 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
-        let source = {
+        let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
             conn.endpoint = Some(endpoint);
             let ack_confirmed = latency.is_some();
-            let source = if ack_confirmed {
+            let pair_success = if ack_confirmed {
                 Some(conn.mark_candidate_pair_success(
                     endpoint,
                     generation,
@@ -265,19 +267,19 @@ impl PeerManager {
             };
             match latency {
                 Some(latency) => {
-                    conn.record_direct_event(
-                        generation,
-                        "probe_ack_received",
-                        Some(endpoint),
-                        Some(1),
-                        None,
-                        format!(
-                            "received UDP punch ACK from {endpoint} rtt={}ms",
-                            duration_millis(latency)
-                        ),
-                    );
                     conn.direct_health.record_success_with_latency(latency);
-                    if let Some(source) = source {
+                    if let Some((source, true)) = pair_success {
+                        conn.record_direct_event(
+                            generation,
+                            "probe_ack_received",
+                            Some(endpoint),
+                            Some(1),
+                            None,
+                            format!(
+                                "received UDP punch ACK from {endpoint} rtt={}ms",
+                                duration_millis(latency)
+                            ),
+                        );
                         let local_endpoint_text = format_log_endpoint(local_endpoint);
                         info!(
                             event = "candidate_pair_probe_succeeded",
@@ -316,9 +318,9 @@ impl PeerManager {
             {
                 conn.transition(ConnectionState::HolePunching);
             }
-            source
+            pair_success
         };
-        if let Some(source) = source {
+        if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }
         true

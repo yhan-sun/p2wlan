@@ -265,10 +265,22 @@ fn adaptive_probe_schedule_expands_large_candidate_sets_quickly() {
     let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 4);
 
     assert_eq!(schedule.len(), 4);
-    assert_eq!(schedule[0].endpoints.len(), 24);
+    assert_eq!(schedule[0].endpoints.len(), 48);
     assert_eq!(schedule[1].endpoints.len(), 24);
     assert_eq!(schedule[2].endpoints.len(), 48);
     assert_eq!(schedule[3].endpoints.len(), 48);
+}
+
+#[test]
+fn adaptive_probe_schedule_covers_large_candidate_tail_before_retries() {
+    let candidates = (0..384)
+        .map(|i| format!("127.0.0.1:{}", 20_000 + i).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 10);
+
+    assert_eq!(schedule[0].endpoints, candidates);
+    assert_eq!(schedule[1].endpoints, candidates[..24]);
 }
 
 #[test]

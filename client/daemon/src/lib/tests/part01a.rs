@@ -190,6 +190,92 @@ async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_sessio
 }
 
 #[tokio::test]
+async fn encrypted_direct_validation_waits_for_delayed_wireguard_session() {
+    let local_identity = NodeIdentity::generate();
+    let remote_identity = NodeIdentity::generate();
+    let mut initiator = HandshakeInitiator::new(local_identity, remote_identity.public_key(), None);
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(remote_identity, None);
+    let (response, remote_keys) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    let local_keys = initiator.consume_response(&response).unwrap();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let observed_endpoint = remote_socket.local_addr().unwrap();
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(responder.initiator_public_key().unwrap()),
+            endpoint: observed_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let (transport, _encrypted_rx) = WireGuardTransport::new();
+    let session_transport = transport.clone();
+    let validation_peers = peers.clone();
+
+    let validation = tokio::spawn(async move {
+        run_direct_encrypted_validation(
+            PeerReflexiveObservation {
+                peer_id: "node-b".to_string(),
+                observed_endpoint,
+            },
+            udp,
+            validation_peers,
+            transport,
+            "10.20.0.1",
+        )
+        .await;
+    });
+    sleep(Duration::from_millis(125)).await;
+    session_transport
+        .add_session("node-b", TransportSession::new(local_keys))
+        .await;
+    validation.await.unwrap();
+
+    let mut datagram = vec![0u8; 2048];
+    let (len, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        remote_socket.recv_from(&mut datagram),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut remote_session = TransportSession::new(remote_keys);
+    let decrypted = remote_session.decrypt_from_bytes(&datagram[..len]).unwrap();
+    let packet = Ipv4Packet::new(&decrypted).unwrap();
+    assert_eq!(packet.src_addr(), Ipv4Addr::new(10, 20, 0, 1));
+    assert_eq!(packet.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
+
+    let diagnostics = peers.diagnostics().await;
+    assert!(diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "encrypted_trial_waiting_for_session"));
+    assert!(diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "encrypted_trial_session_ready"));
+    assert!(diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(3)));
+}
+
+#[tokio::test]
 async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

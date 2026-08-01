@@ -22,6 +22,7 @@ async fn run_inbound_rejects_authenticated_probe_with_invalid_mac() {
         .with_local_node_id("peer-a");
     let local_addr = transport.local_addr().unwrap();
     let (tx, mut rx) = mpsc::channel(4);
+    let diagnostics_transport = transport.clone();
     let worker = tokio::spawn(transport.run_inbound(tx));
 
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -43,6 +44,9 @@ async fn run_inbound_rejects_authenticated_probe_with_invalid_mac() {
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.endpoint, None);
     assert!(conn.candidates.is_empty());
+    let diagnostics = diagnostics_transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].authenticated_probe_packets_received, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_invalid_mac, 1);
 
     worker.abort();
 }
