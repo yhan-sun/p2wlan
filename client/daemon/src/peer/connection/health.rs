@@ -303,11 +303,7 @@ impl PeerConnection {
     }
 
     fn peer_public_candidates_need_scatter(&self) -> bool {
-        let bases = self
-            .candidate_endpoints()
-            .into_iter()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-            .collect::<Vec<_>>();
+        let bases = self.asymmetric_stable_public_endpoints(self.candidate_endpoints());
         peer_candidates_need_port_scatter(&bases)
     }
 

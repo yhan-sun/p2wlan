@@ -248,14 +248,39 @@ impl PeerConnection {
             return false;
         }
 
-        let public_endpoints = self
-            .probe_candidate_endpoints()
-            .into_iter()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-            .collect::<Vec<_>>();
+        let public_endpoints =
+            self.asymmetric_stable_public_endpoints(self.probe_candidate_endpoints());
         !public_endpoints.is_empty()
             && !self.has_explicit_predicted_window()
             && !peer_candidates_need_port_scatter(&public_endpoints)
+    }
+
+    fn asymmetric_stable_public_endpoints(&self, endpoints: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        let mut authoritative = endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                is_authoritative_stable_public_source(self.candidate_source_for_endpoint(*endpoint))
+            })
+            .collect::<Vec<_>>();
+        authoritative.dedup();
+        if !authoritative.is_empty() {
+            return authoritative;
+        }
+
+        let mut reclaim = endpoints
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
+                )
+            })
+            .collect::<Vec<_>>();
+        reclaim.dedup();
+        reclaim
     }
 
     fn has_explicit_predicted_window(&self) -> bool {
@@ -292,17 +317,7 @@ impl PeerConnection {
             .into_iter()
             .filter(|endpoint| is_low_latency_direct_endpoint(*endpoint))
             .collect::<Vec<_>>();
-        let mut public = self
-            .probe_candidate_endpoints()
-            .into_iter()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-            .filter(|endpoint| {
-                !matches!(
-                    self.candidate_source_for_endpoint(*endpoint),
-                    CandidatePairSource::Predicted | CandidatePairSource::Birthday
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut public = self.asymmetric_stable_public_endpoints(self.probe_candidate_endpoints());
         public.sort_by(|left, right| {
             birthday_base_rank(self, *left, local_generation)
                 .cmp(&birthday_base_rank(self, *right, local_generation))
@@ -495,4 +510,15 @@ impl PeerConnection {
 
         removed.len()
     }
+}
+
+fn is_authoritative_stable_public_source(source: CandidatePairSource) -> bool {
+    matches!(
+        source,
+        CandidatePairSource::StunObserved
+            | CandidatePairSource::Signaled
+            | CandidatePairSource::Upnp
+            | CandidatePairSource::Pcp
+            | CandidatePairSource::NatPmp
+    )
 }

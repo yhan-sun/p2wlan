@@ -342,6 +342,77 @@ async fn hard_local_nat_uses_single_public_peer_candidate_without_scatter() {
 }
 
 #[tokio::test]
+async fn hard_local_nat_prefers_fresh_public_candidate_over_stale_peer_reflexive_without_scatter() {
+    let manager = PeerManager::new(test_config());
+    let stale_peer_reflexive: SocketAddr = "8.8.8.8:1414".parse().unwrap();
+    let fresh_stable: SocketAddr = "8.8.8.8:2778".parse().unwrap();
+    let host_candidate: SocketAddr = "192.168.2.16:53765".parse().unwrap();
+    let candidates = vec![host_candidate.to_string(), fresh_stable.to_string()];
+    let sources = HashMap::from([
+        (host_candidate.to_string(), "host".to_string()),
+        (fresh_stable.to_string(), "stun_observed".to_string()),
+    ]);
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", stale_peer_reflexive))
+        .await;
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", stale_peer_reflexive)
+            .await
+    );
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    let same_public_ip_targets = targets
+        .iter()
+        .copied()
+        .filter(|target| target.ip() == fresh_stable.ip())
+        .collect::<Vec<_>>();
+
+    assert_eq!(same_public_ip_targets, vec![fresh_stable]);
+    assert!(!targets.contains(&stale_peer_reflexive));
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert!(!conn
+        .candidate_pairs
+        .iter()
+        .any(|pair| pair.source == CandidatePairSource::Birthday));
+}
+
+#[tokio::test]
+async fn hard_local_nat_uses_single_peer_reflexive_public_candidate_without_scatter() {
+    let manager = PeerManager::new(test_config());
+    let peer_reflexive: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let peer = PeerInfo {
+        node_id: "peer1".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: "pk".to_string(),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager.add_peer(&peer).await;
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", peer_reflexive)
+            .await
+    );
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert_eq!(targets, vec![peer_reflexive]);
+}
+
+#[tokio::test]
 async fn stale_birthday_pairs_are_pruned_when_signaled_window_moves() {
     let manager = PeerManager::new(test_config());
     manager
