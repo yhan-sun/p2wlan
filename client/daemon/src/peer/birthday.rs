@@ -22,7 +22,7 @@ fn birthday_probe_endpoint_for_rank(base: SocketAddr, rank: usize) -> Option<Soc
     } else {
         magnitude
     };
-    let delta = if bounded_rank % 2 == 0 {
+    let delta = if bounded_rank.is_multiple_of(2) {
         magnitude
     } else {
         -magnitude
@@ -43,7 +43,11 @@ fn birthday_probe_near_delta(rank: usize) -> Option<i32> {
         return None;
     }
     let magnitude = (rank / 2 + 1) as i32;
-    Some(if rank % 2 == 0 { magnitude } else { -magnitude })
+    Some(if rank.is_multiple_of(2) {
+        magnitude
+    } else {
+        -magnitude
+    })
 }
 
 #[cfg(test)]
@@ -65,10 +69,23 @@ pub(super) fn birthday_probe_endpoints_for_bases_from_rank(
     }
 
     let mut seen = HashSet::new();
-    let max_rank =
-        birthday_probe_near_rank_count().saturating_add(birthday_probe_wide_rank_count());
-    for offset in 0..max_rank {
-        let rank = start_rank.saturating_add(offset);
+    for rank in 0..birthday_probe_near_rank_count() {
+        for base in bases {
+            if endpoints.len() >= budget {
+                return endpoints;
+            }
+            let Some(endpoint) = birthday_probe_endpoint_for_rank(*base, rank) else {
+                continue;
+            };
+            if seen.insert(endpoint) {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+
+    for offset in 0..birthday_probe_wide_rank_count() {
+        let wide_rank = start_rank.saturating_add(offset) % birthday_probe_wide_rank_count();
+        let rank = birthday_probe_near_rank_count().saturating_add(wide_rank);
         for base in bases {
             if endpoints.len() >= budget {
                 return endpoints;

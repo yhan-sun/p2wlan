@@ -288,8 +288,10 @@ mod tests {
         ));
         let _ = fs::remove_file(&path);
 
-        let mut history = TraversalHistory::default();
-        history.version = 1;
+        let mut history = TraversalHistory {
+            version: 1,
+            ..Default::default()
+        };
         history.record_success(CandidatePairSource::PeerReflexive);
         history.save(&path).unwrap();
 

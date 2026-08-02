@@ -16,6 +16,35 @@ impl PeerConnection {
         endpoints
     }
 
+    fn probe_candidate_endpoints(&self) -> Vec<SocketAddr> {
+        let mut endpoints = Vec::new();
+        for candidate in &self.candidates {
+            if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+        if endpoints.is_empty() {
+            if let Some(endpoint) = self.endpoint {
+                endpoints.push(endpoint);
+            }
+        } else if let Some(endpoint) = self.endpoint {
+            let has_current_or_recent_success = self.candidate_pairs.iter().any(|pair| {
+                pair.remote_endpoint == endpoint
+                    && (pair.last_success_at.is_some()
+                        || matches!(
+                            pair.state,
+                            CandidatePairState::Selected | CandidatePairState::Succeeded
+                        ))
+            });
+            if has_current_or_recent_success && !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
+        }
+        endpoints
+    }
+
     fn candidate_source_for_endpoint(&self, endpoint: SocketAddr) -> CandidatePairSource {
         self.candidate_sources
             .get(&endpoint.to_string())
@@ -128,7 +157,7 @@ impl PeerConnection {
         let mut endpoints = if use_asymmetric_stable_role {
             self.asymmetric_stable_remote_endpoints(local_generation)
         } else {
-            self.candidate_endpoints()
+            self.probe_candidate_endpoints()
         };
         self.ensure_birthday_candidate_pairs(
             local_generation,
@@ -220,7 +249,7 @@ impl PeerConnection {
         }
 
         let public_endpoints = self
-            .candidate_endpoints()
+            .probe_candidate_endpoints()
             .into_iter()
             .filter(|endpoint| is_public_probe_endpoint(*endpoint))
             .collect::<Vec<_>>();
@@ -259,12 +288,12 @@ impl PeerConnection {
         local_generation: u64,
     ) -> Vec<SocketAddr> {
         let mut endpoints = self
-            .candidate_endpoints()
+            .probe_candidate_endpoints()
             .into_iter()
             .filter(|endpoint| is_low_latency_direct_endpoint(*endpoint))
             .collect::<Vec<_>>();
         let mut public = self
-            .candidate_endpoints()
+            .probe_candidate_endpoints()
             .into_iter()
             .filter(|endpoint| is_public_probe_endpoint(*endpoint))
             .filter(|endpoint| {
