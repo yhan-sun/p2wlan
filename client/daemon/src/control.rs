@@ -63,8 +63,6 @@ include!("control/client.rs");
 include!("control/client/test_handlers.rs");
 include!("control/runtime.rs");
 
-/// Obtain a device credential via challenge-response.
-
 // ============================================================
 // Tests
 // ============================================================

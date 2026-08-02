@@ -64,7 +64,7 @@ const HAIRPIN_PROBE_PREFIX: &[u8] = b"P2WLAN_HAIRPIN_V1";
 /// peer-reflexive path is nominated. Keep this window bounded for signaling,
 /// while covering the observed 15-20 port jumps produced by WebRTC-style
 /// relay-first / direct-chase ICE checks on hard NATs.
-const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 24;
+const MAX_PREDICTED_REFLEXIVE_CANDIDATES: usize = 96;
 
 /// Configuration for ICE candidate gathering.
 #[derive(Debug, Clone)]

@@ -171,7 +171,7 @@ async fn predicted_candidates_have_independent_probe_budget() {
     let endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
-    let candidates = (0..24)
+    let candidates = (0..PREDICTED_PROBE_BUDGET_PER_CYCLE)
         .map(|index| format!("203.0.113.10:{}", 40_007 + index * 2))
         .collect::<Vec<_>>();
     let sources = candidates
@@ -200,7 +200,7 @@ async fn stable_public_candidate_precedes_predicted_budget_in_synchronized_punch
 
     manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     let mut candidates = vec![stable_endpoint.to_string()];
-    candidates.extend((0..24)
+    candidates.extend((0..PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
     );
     let sources = candidates
@@ -247,7 +247,7 @@ async fn synchronized_punch_uses_only_predicted_window_during_history_cooldown()
     manager.update_nat_profile(birthday_nat_profile()).await;
 
     let mut predicted_candidates = vec![stable_endpoint.to_string()];
-    predicted_candidates.extend((0..24)
+    predicted_candidates.extend((0..PREDICTED_PROBE_BUDGET_PER_CYCLE)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
     );
     let predicted_endpoints = predicted_candidates
@@ -307,7 +307,7 @@ async fn synchronized_punch_retries_failed_predicted_without_birthday_expansion(
     manager.update_nat_profile(birthday_nat_profile()).await;
 
     let mut predicted_candidates = vec![stable_endpoint.to_string()];
-    predicted_candidates.extend((0..24)
+    predicted_candidates.extend((0..PREDICTED_PROBE_BUDGET_PER_CYCLE)
         .map(|index| format!("8.8.8.8:{}", 41_000 + index))
     );
     let predicted_endpoints = predicted_candidates

@@ -221,9 +221,7 @@ async fn outbound_probe_budget_limits_across_peers_on_same_network() {
         let mut budget = transport.outbound_probe_budget.lock().await;
         budget.insert(
             OutboundProbeBudgetKey::Network,
-            std::iter::repeat(now)
-                .take(OUTBOUND_PROBE_BUDGET_PER_NETWORK)
-                .collect(),
+            std::iter::repeat_n(now, OUTBOUND_PROBE_BUDGET_PER_NETWORK).collect(),
         );
     }
 

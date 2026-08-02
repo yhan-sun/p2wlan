@@ -252,8 +252,8 @@ func TestCreateSignalCandidateLimitAllowsLinearPredictionWindow(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("CreateSignal with too many candidates: HTTP %d %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "max 32") {
-		t.Fatalf("expected max 32 error, got %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "max 96") {
+		t.Fatalf("expected max 96 error, got %s", recorder.Body.String())
 	}
 }
 

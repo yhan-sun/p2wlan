@@ -93,7 +93,7 @@ fn stable_control_endpoint_refresh_ignores_same_public_ip_port_churn() {
 #[test]
 fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
     let mut candidates = vec!["192.168.1.10:51820".to_string()];
-    candidates.extend((0..40).map(|index| format!("8.8.8.8:{}", 41000 + index)));
+    candidates.extend((0..120).map(|index| format!("8.8.8.8:{}", 41000 + index)));
     candidates.extend(["1.1.1.1:42000".to_string(), "1.1.1.1:42009".to_string()]);
     let mut sources = candidates
         .iter()
@@ -104,7 +104,7 @@ fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
 
     compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
 
-    assert_eq!(candidates.len(), 35);
+    assert_eq!(candidates.len(), 1 + MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP + 2);
     assert!(candidates.contains(&"192.168.1.10:51820".to_string()));
     assert!(candidates.contains(&"1.1.1.1:42000".to_string()));
     assert!(candidates.contains(&"1.1.1.1:42009".to_string()));
@@ -115,9 +115,9 @@ fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
             .count(),
         MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP
     );
-    assert!(candidates.contains(&"8.8.8.8:41031".to_string()));
-    assert!(!candidates.contains(&"8.8.8.8:41032".to_string()));
-    assert!(!candidates.contains(&"8.8.8.8:41039".to_string()));
+    assert!(candidates.contains(&"8.8.8.8:41095".to_string()));
+    assert!(!candidates.contains(&"8.8.8.8:41096".to_string()));
+    assert!(!candidates.contains(&"8.8.8.8:41119".to_string()));
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
 }
 
@@ -157,7 +157,7 @@ fn signal_candidate_cap_does_not_preserve_external_overlay_hosts_over_public_pre
         tailscale_v6.clone(),
         p2wlan_overlay.clone(),
     ];
-    candidates.extend((8135..=8170).map(|port| format!("220.163.6.190:{port}")));
+    candidates.extend((8135..=8240).map(|port| format!("220.163.6.190:{port}")));
 
     let mut sources = candidates
         .iter()

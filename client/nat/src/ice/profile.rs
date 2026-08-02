@@ -75,15 +75,21 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
     let filtering_behavior = infer_filtering_behavior(false, mapping_behavior);
     let hairpin_behavior = infer_hairpin_behavior(mapping_behavior);
     let port_delta = stable_port_delta(&mapped);
-    let prediction_candidate = is_prediction_candidate(
+    let linear_successor_predictions = linear_successor_reflexive_endpoints(&mapped);
+    let prediction_candidate = linear_successor_predictions.is_some()
+        || is_prediction_candidate(
         false,
         public_ip_stable,
         public_port_stable,
         mapping_behavior,
         port_delta,
     );
-    let predicted_endpoints =
-        predicted_reflexive_endpoints_for_mappings(&mapped, port_delta, prediction_candidate);
+    let predicted_endpoints = predicted_reflexive_endpoints_for_mappings(
+        &mapped,
+        port_delta,
+        prediction_candidate,
+        linear_successor_predictions,
+    );
     let birthday_candidate = is_birthday_candidate(
         false,
         mapping_behavior,
@@ -143,12 +149,13 @@ fn predicted_reflexive_endpoints_for_mappings(
     mapped: &[SocketAddr],
     port_delta: Option<i32>,
     prediction_candidate: bool,
+    linear_successor_predictions: Option<Vec<String>>,
 ) -> Vec<String> {
     if !prediction_candidate {
         return Vec::new();
     }
 
-    if let Some(endpoints) = linear_successor_reflexive_endpoints(mapped) {
+    if let Some(endpoints) = linear_successor_predictions {
         return endpoints;
     }
 
@@ -160,6 +167,20 @@ fn predicted_reflexive_endpoints_for_mappings(
 }
 
 fn linear_successor_reflexive_endpoints(mapped: &[SocketAddr]) -> Option<Vec<String>> {
+    if mapped.len() < 3 {
+        return None;
+    }
+
+    for start in 0..=mapped.len().saturating_sub(3) {
+        if let Some(endpoints) = linear_successor_reflexive_endpoints_for_run(&mapped[start..]) {
+            return Some(endpoints);
+        }
+    }
+
+    None
+}
+
+fn linear_successor_reflexive_endpoints_for_run(mapped: &[SocketAddr]) -> Option<Vec<String>> {
     if mapped.len() < 3 {
         return None;
     }

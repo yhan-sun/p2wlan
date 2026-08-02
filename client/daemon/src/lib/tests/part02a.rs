@@ -59,8 +59,8 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
 fn signal_candidate_cap_balances_disjoint_prediction_windows() {
     let mut candidates =
         (40_000..40_007).map(|port| format!("203.0.113.10:{port}")).collect::<Vec<_>>();
-    candidates.extend((41_000..41_024).map(|port| format!("203.0.113.10:{port}")));
-    candidates.extend((42_000..42_024).map(|port| format!("203.0.113.10:{port}")));
+    candidates.extend((41_000..41_080).map(|port| format!("203.0.113.10:{port}")));
+    candidates.extend((42_000..42_080).map(|port| format!("203.0.113.10:{port}")));
     let mut sources = candidates
         .iter()
         .cloned()
@@ -85,8 +85,8 @@ fn signal_candidate_cap_balances_disjoint_prediction_windows() {
         .filter(|endpoint| endpoint.starts_with("203.0.113.10:42"))
         .count();
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
-    assert!(first_window >= 12, "first window retained {first_window}");
-    assert!(second_window >= 12, "second window retained {second_window}");
+    assert!(first_window >= 40, "first window retained {first_window}");
+    assert!(second_window >= 40, "second window retained {second_window}");
     assert!(candidates.contains(&"203.0.113.10:42001".to_string()));
 }
 

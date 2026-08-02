@@ -58,9 +58,7 @@ async fn punch_candidates_respects_outbound_probe_budget_per_remote_ip() {
                 "peer-b".to_string(),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ),
-            std::iter::repeat(now)
-                .take(OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP - 8)
-                .collect(),
+            std::iter::repeat_n(now, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP - 8).collect(),
         );
     }
 

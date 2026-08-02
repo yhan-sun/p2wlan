@@ -16,7 +16,7 @@ import (
 
 var signalLongPollFallbackInterval = 100 * time.Millisecond
 
-const maxSignalCandidates = 32
+const maxSignalCandidates = 96
 
 func probeEphemeralTranscript(signalType, fromNodeID, toNodeID, sessionID, probeEphemeralPublicKey string, candidateGeneration, candidatesExpiresAtMS int64) []byte {
 	var b strings.Builder

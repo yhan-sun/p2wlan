@@ -141,7 +141,7 @@ const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Keep this large enough for a linear symmetric NAT to publish its observed
 /// STUN group plus the full predicted successor run. Air-like NATs can need
 /// the high-teens successor ports before a peer-reflexive path appears.
-const MAX_SIGNAL_CANDIDATES: usize = 32;
+const MAX_SIGNAL_CANDIDATES: usize = 96;
 /// A bounded public candidate group preserves ICE-style linear NAT coverage.
 ///
 /// Air-like linear symmetric NATs need the STUN group plus a predicted run

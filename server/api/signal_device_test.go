@@ -309,6 +309,70 @@ func TestCreateSignalNormalizesCandidateExpiryWithClientClockSkew(t *testing.T) 
 	}
 }
 
+func TestCreateSignalAcceptsExpandedCandidateWindow(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-expanded-candidates@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-expanded-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-expanded-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	candidateArrayJSON := func(count int) string {
+		var b strings.Builder
+		for i := 0; i < count; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('"')
+			b.WriteString("203.0.113.10:")
+			b.WriteString(fmtInt64(int64(40000 + i)))
+			b.WriteByte('"')
+		}
+		return b.String()
+	}
+
+	server := NewServer(nil, nil, db)
+	body := strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":[` + candidateArrayJSON(96) + `]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID: source.ID, NetworkID: source.NetworkID, UserID: user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+	server.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 96 candidates, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 1 || len(signals[0].Candidates) != 96 {
+		t.Fatalf("expected one signal with 96 candidates, got %#v", signals)
+	}
+
+	body = strings.NewReader(`{"to_node_id":"` + target.ID + `","type":"peer_offer","candidates":[` + candidateArrayJSON(97) + `]}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID: source.ID, NetworkID: source.NetworkID, UserID: user.ID,
+	}))
+	recorder = httptest.NewRecorder()
+	server.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for 97 candidates, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

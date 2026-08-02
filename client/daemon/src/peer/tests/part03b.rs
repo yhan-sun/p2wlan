@@ -61,24 +61,34 @@ fn birthday_probe_endpoints_for_bases_spreads_beyond_near_window() {
 }
 
 #[test]
-fn birthday_probe_endpoints_for_bases_rotates_bounded_window() {
+fn birthday_probe_endpoints_for_bases_keeps_near_window_when_wide_window_rotates() {
     let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
-    let first = birthday_probe_endpoints_for_bases_from_rank(&[base], 64, 0);
+    let budget = birthday_probe_near_rank_count() + 8;
+    let first = birthday_probe_endpoints_for_bases_from_rank(&[base], budget, 0);
     let second =
-        birthday_probe_endpoints_for_bases_from_rank(&[base], 64, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+        birthday_probe_endpoints_for_bases_from_rank(&[base], budget, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
     let first_ports = first.iter().map(SocketAddr::port).collect::<HashSet<_>>();
     let second_ports = second.iter().map(SocketAddr::port).collect::<HashSet<_>>();
 
-    assert_eq!(first.len(), 64);
-    assert_eq!(second.len(), 64);
-    assert!(first_ports.is_disjoint(&second_ports));
+    assert_eq!(first.len(), budget);
+    assert_eq!(second.len(), budget);
+    for port in [39999, 40001, 39904, 40096] {
+        assert!(first_ports.contains(&port), "first pass missing near port {port}");
+        assert!(second_ports.contains(&port), "second pass missing near port {port}");
+    }
+    assert!(
+        first_ports
+            .difference(&second_ports)
+            .any(|port| port.abs_diff(40000) > BIRTHDAY_PROBE_NEAR_MAX_DELTA as u16),
+        "wide positive/negative tail should still rotate"
+    );
 }
 
 #[tokio::test]
 async fn hard_local_easy_remote_uses_only_the_fresh_stable_public_target() {
     let config = test_config();
     let manager = PeerManager::new(config);
-    let stale_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let stale_endpoint: SocketAddr = "203.0.113.10:39000".parse().unwrap();
     let fresh_endpoint: SocketAddr = "203.0.113.10:40037".parse().unwrap();
 
     manager
@@ -98,10 +108,12 @@ async fn hard_local_easy_remote_uses_only_the_fresh_stable_public_target() {
 
     let initial_targets = manager.direct_probe_targets_for("peer1").await;
     assert_eq!(initial_targets, vec![fresh_endpoint]);
+    assert!(!initial_targets.contains(&stale_endpoint));
 
     let background_targets = manager.direct_probe_targets().await;
     assert_eq!(background_targets.len(), 1);
     assert_eq!(background_targets[0].1, vec![fresh_endpoint]);
+    assert!(!background_targets[0].1.contains(&stale_endpoint));
 }
 
 #[tokio::test]
@@ -308,6 +320,25 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
     assert!(birthday_targets
         .iter()
         .any(|target| target.port().abs_diff(41113) <= 2));
+}
+
+#[tokio::test]
+async fn hard_local_nat_uses_single_public_peer_candidate_without_scatter() {
+    let manager = PeerManager::new(test_config());
+    let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let candidates = vec![stable_endpoint.to_string()];
+    let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", stable_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert_eq!(targets, vec![stable_endpoint]);
 }
 
 #[tokio::test]

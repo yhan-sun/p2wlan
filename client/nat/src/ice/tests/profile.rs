@@ -189,8 +189,56 @@ fn test_build_nat_profile_detects_jittered_linear_symmetric_mapping() {
     );
     assert_eq!(
         profile.predicted_endpoints.last().map(String::as_str),
-        Some("203.0.113.10:32822")
+        Some("203.0.113.10:32894")
     );
+}
+
+#[test]
+fn test_predicted_reflexive_window_uses_stable_suffix_after_outlier() {
+    let profile = build_nat_profile(
+        "192.168.1.2:5000".parse().unwrap(),
+        vec![
+            StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: Some("220.163.6.190:23801".to_string()),
+                rtt_ms: Some(180),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-b.example:3478".to_string(),
+                mapped_address: Some("220.163.6.190:23855".to_string()),
+                rtt_ms: Some(80),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-c.example:3478".to_string(),
+                mapped_address: Some("220.163.6.190:23856".to_string()),
+                rtt_ms: Some(78),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-d.example:3478".to_string(),
+                mapped_address: Some("220.163.6.190:23857".to_string()),
+                rtt_ms: Some(170),
+                error: None,
+            },
+            StunObservation {
+                server: "observer.example:18082".to_string(),
+                mapped_address: Some("220.163.6.190:23858".to_string()),
+                rtt_ms: Some(14),
+                error: None,
+            },
+        ],
+    );
+
+    assert!(profile.prediction_candidate);
+    assert_eq!(
+        profile.predicted_endpoints.first().map(String::as_str),
+        Some("220.163.6.190:23859")
+    );
+    assert!(profile
+        .predicted_endpoints
+        .contains(&"220.163.6.190:23920".to_string()));
 }
 
 #[test]
