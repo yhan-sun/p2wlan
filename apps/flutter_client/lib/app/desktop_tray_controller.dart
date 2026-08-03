@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../core/daemon/daemon_controller.dart';
 import '../core/models/diagnostics_models.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
@@ -34,6 +35,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   bool _quitting = false;
   bool _menuUpdateQueued = false;
   String? _lastTrayIconAsset;
+  Future<DaemonCommandResult>? _stopDaemonFuture;
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -255,8 +257,30 @@ class DesktopTrayController with TrayListener, WindowListener {
     await statusStore.startDaemon();
   }
 
-  Future<void> _stopDaemon() async {
-    await statusStore.stopDaemon();
+  Future<DaemonCommandResult> _stopDaemon() {
+    final existing = _stopDaemonFuture;
+    if (existing != null) return existing;
+
+    final future = statusStore.stopDaemon();
+    _stopDaemonFuture = future;
+    future.whenComplete(() {
+      if (identical(_stopDaemonFuture, future)) {
+        _stopDaemonFuture = null;
+      }
+    });
+    return future;
+  }
+
+  Future<DaemonCommandResult> _stopDaemonForQuit() {
+    return _stopDaemonFuture ?? _stopDaemon();
+  }
+
+  @visibleForTesting
+  Future<DaemonCommandResult> stopDaemonForTesting() => _stopDaemon();
+
+  @visibleForTesting
+  Future<DaemonCommandResult> stopDaemonForQuitForTesting() {
+    return _stopDaemonForQuit();
   }
 
   Future<void> _copyPeerIp(String virtualIp) async {
@@ -280,7 +304,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _quitApp() async {
     if (_quitting) return;
     _quitting = true;
-    final stopResult = await statusStore.stopDaemon();
+    final stopResult = await _stopDaemonForQuit();
     if (!stopResult.ok) {
       _quitting = false;
       await _showWindow();
