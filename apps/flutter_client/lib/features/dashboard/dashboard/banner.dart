@@ -15,9 +15,14 @@ class _ConnectionBanner extends StatelessWidget {
     required this.daemonManualCommand,
     required this.lastFetchedAt,
     required this.requestDuration,
+    required this.speedTestRunning,
+    required this.speedTestResult,
+    required this.speedTestError,
+    required this.speedTestPeerVirtualIp,
     required this.onStartDaemon,
     required this.onStopDaemon,
     required this.onRefresh,
+    required this.onRunSpeedTest,
     required this.onAutoRefreshChanged,
   });
 
@@ -34,9 +39,14 @@ class _ConnectionBanner extends StatelessWidget {
   final String? daemonManualCommand;
   final DateTime? lastFetchedAt;
   final Duration? requestDuration;
+  final bool speedTestRunning;
+  final SpeedTestResult? speedTestResult;
+  final String? speedTestError;
+  final String? speedTestPeerVirtualIp;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
   final Future<void> Function() onRefresh;
+  final Future<void> Function(PeerSnapshot peer) onRunSpeedTest;
   final ValueChanged<bool> onAutoRefreshChanged;
 
   @override
@@ -70,6 +80,14 @@ class _ConnectionBanner extends StatelessWidget {
             onStopDaemon: onStopDaemon,
             onRefresh: onRefresh,
             onAutoRefreshChanged: onAutoRefreshChanged,
+          ),
+          _SpeedTestPanel(
+            snapshot: snapshot,
+            running: speedTestRunning,
+            result: speedTestResult,
+            error: speedTestError,
+            runningPeerVirtualIp: speedTestPeerVirtualIp,
+            onRun: onRunSpeedTest,
           ),
           if (daemonAvailable) ...[
             const SizedBox(height: 16),
@@ -124,12 +142,6 @@ class _ConnectionBanner extends StatelessWidget {
     }
     final reason = health?.reason?.trim();
     if (reason != null && reason.isNotEmpty) return reason;
-    if (snapshot != null && !snapshot!.relayConnected) {
-      return strings.issueRelayDisconnected;
-    }
-    final warningCount =
-        snapshot?.peers.where((peer) => peer.lastError != null).length ?? 0;
-    if (warningCount > 0) return strings.peerWarnings(warningCount);
     return null;
   }
 

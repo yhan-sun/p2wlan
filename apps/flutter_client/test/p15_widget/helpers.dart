@@ -61,19 +61,44 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     this.snapshot,
     this.snapshots,
     this.statusError,
+    this.speedTestResult,
+    this.speedTestError,
   });
 
   final bool health;
   final DiagnosticsSnapshot? snapshot;
   final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
+  final SpeedTestResult? speedTestResult;
+  final Object? speedTestError;
   var statusFetchCount = 0;
+  var speedTestCount = 0;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => health;
 
   @override
   Future<bool> requestShutdown(String diagnosticsUrl) async => true;
+
+  @override
+  Future<SpeedTestResult> runSpeedTest(
+    String diagnosticsUrl, {
+    required String peerVirtualIp,
+    Duration duration = const Duration(seconds: 10),
+  }) async {
+    speedTestCount += 1;
+    final error = speedTestError;
+    if (error != null) throw error;
+    return speedTestResult ??
+        SpeedTestResult(
+          peerVirtualIp: peerVirtualIp,
+          durationMs: duration.inMilliseconds,
+          downloadMbps: 123.4,
+          uploadMbps: 56.7,
+          downloadBytes: 154250000,
+          uploadBytes: 70875000,
+        );
+  }
 
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {

@@ -242,6 +242,23 @@ impl Daemon {
                     }
                 })
                 .await;
+
+            if tun.is_some() {
+                let speed_test_virtual_ip = self.config.network.virtual_ip.clone();
+                let speed_test_shutdown_rx = self.shutdown_rx.clone();
+                self.task_manager
+                    .spawn("speed-test", false, async move {
+                        if let Err(err) = run_speedtest_server_with_retry(
+                            speed_test_virtual_ip,
+                            speed_test_shutdown_rx,
+                        )
+                        .await
+                        {
+                            warn!("Speed-test endpoint stopped: {err}");
+                        }
+                    })
+                    .await;
+            }
         }
         self.spawn_dataplane_tasks(tun, network_inbound_rx).await;
 

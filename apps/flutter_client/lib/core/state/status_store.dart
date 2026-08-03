@@ -49,6 +49,10 @@ class StatusStore extends ChangeNotifier {
   String? _lastDaemonManualCommand;
   DateTime? _lastFetchedAt;
   Duration? _lastRequestDuration;
+  var _speedTestRunning = false;
+  SpeedTestResult? _lastSpeedTestResult;
+  String? _lastSpeedTestError;
+  String? _speedTestPeerVirtualIp;
   late String _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
@@ -66,6 +70,10 @@ class StatusStore extends ChangeNotifier {
   String? get lastDaemonManualCommand => _lastDaemonManualCommand;
   DateTime? get lastFetchedAt => _lastFetchedAt;
   Duration? get lastRequestDuration => _lastRequestDuration;
+  bool get speedTestRunning => _speedTestRunning;
+  SpeedTestResult? get lastSpeedTestResult => _lastSpeedTestResult;
+  String? get lastSpeedTestError => _lastSpeedTestError;
+  String? get speedTestPeerVirtualIp => _speedTestPeerVirtualIp;
 
   void startPolling() {
     setAutoRefresh(enabled: true, refreshImmediately: true);
@@ -198,6 +206,29 @@ class StatusStore extends ChangeNotifier {
     );
   }
 
+  Future<void> runSpeedTest(PeerSnapshot peer) async {
+    if (_speedTestRunning) return;
+    final peerVirtualIp = peer.virtualIp.trim();
+    if (peerVirtualIp.isEmpty) return;
+    _speedTestRunning = true;
+    _speedTestPeerVirtualIp = peerVirtualIp;
+    _lastSpeedTestResult = null;
+    _lastSpeedTestError = null;
+    notifyListeners();
+    try {
+      _lastSpeedTestResult = await diagnosticsApi.runSpeedTest(
+        settingsStore.settings.diagnosticsUrl,
+        peerVirtualIp: peerVirtualIp,
+        duration: const Duration(seconds: 10),
+      );
+    } catch (error) {
+      _lastSpeedTestError = error.toString();
+    } finally {
+      _speedTestRunning = false;
+      notifyListeners();
+    }
+  }
+
   Future<DaemonCommandResult> _runDaemonCommand(
     Future<DaemonCommandResult> Function() command, {
     bool settlePeerCatalog = false,
@@ -283,6 +314,9 @@ class StatusStore extends ChangeNotifier {
     final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     if (nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
+    _speedTestPeerVirtualIp = null;
+    _lastSpeedTestResult = null;
+    _lastSpeedTestError = null;
     unawaited(refresh());
   }
 

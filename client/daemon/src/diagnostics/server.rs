@@ -97,7 +97,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
 
     let request = String::from_utf8_lossy(&buffer[..n]);
     let cors_origin = allowed_cors_origin(&request);
-    let (method, path) = request
+    let (method, target) = request
         .lines()
         .next()
         .and_then(|line| {
@@ -108,6 +108,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             }
         })
         .unwrap_or(("GET", "/"));
+    let (path, query) = split_request_target(target);
 
     match (method, path) {
         ("GET", "/health") => {
@@ -117,6 +118,21 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let snapshot = build_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("POST", "/speedtest") => {
+            match run_speedtest_from_query(context, query).await {
+                Ok(result) => {
+                    let body = serde_json::to_string_pretty(&result)?;
+                    write_response(&mut stream, 200, "application/json", &body, cors_origin)
+                        .await?;
+                }
+                Err(message) => {
+                    let status = speedtest_error_status(&message);
+                    let body = serde_json::json!({ "error": message }).to_string();
+                    write_response(&mut stream, status, "application/json", &body, cors_origin)
+                        .await?;
+                }
+            }
         }
         ("POST", "/shutdown") => {
             write_response(
@@ -136,6 +152,26 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
     }
 
     Ok(())
+}
+
+fn split_request_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    }
+}
+
+fn speedtest_error_status(message: &str) -> u16 {
+    if message.contains("missing") || message.contains("invalid") || message.contains("local virtual IP") {
+        400
+    } else if message.contains("offline")
+        || message.contains("confirmed direct")
+        || message.contains("current catalog")
+    {
+        409
+    } else {
+        503
+    }
 }
 
 fn allowed_cors_origin(request: &str) -> Option<&str> {

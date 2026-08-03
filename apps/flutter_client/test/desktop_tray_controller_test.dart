@@ -298,6 +298,22 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   Future<bool> requestShutdown(String diagnosticsUrl) async => snapshot != null;
 
   @override
+  Future<SpeedTestResult> runSpeedTest(
+    String diagnosticsUrl, {
+    required String peerVirtualIp,
+    Duration duration = const Duration(seconds: 10),
+  }) async {
+    return SpeedTestResult(
+      peerVirtualIp: peerVirtualIp,
+      durationMs: duration.inMilliseconds,
+      downloadMbps: 0,
+      uploadMbps: 0,
+      downloadBytes: 0,
+      uploadBytes: 0,
+    );
+  }
+
+  @override
   void close() {}
 }
 

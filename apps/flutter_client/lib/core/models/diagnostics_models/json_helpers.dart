@@ -28,6 +28,10 @@ double? _doubleOrNull(dynamic value) {
   return null;
 }
 
+double _double(dynamic value, [double fallback = 0]) {
+  return _doubleOrNull(value) ?? fallback;
+}
+
 bool _bool(dynamic value, [bool fallback = false]) {
   if (value is bool) return value;
   if (value is String) return value.toLowerCase() == 'true';
