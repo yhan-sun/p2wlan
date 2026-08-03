@@ -77,12 +77,23 @@ pub(super) fn effective_relay_allow_insecure_plaintext(
     relay_servers: &[String],
     configured: bool,
 ) -> bool {
-    configured
-        || (relay_catalog.is_empty()
-            && control_server_uses_plaintext_http(control_server_url)
-            && relay_servers
-                .iter()
-                .any(|server| relay_spec_is_plaintext(server)))
+    if configured {
+        return true;
+    }
+
+    if !control_server_uses_plaintext_http(control_server_url) {
+        return false;
+    }
+
+    if !relay_catalog.is_empty() {
+        return relay_catalog
+            .iter()
+            .any(|entry| relay_spec_is_plaintext(&entry.endpoint));
+    }
+
+    relay_servers
+        .iter()
+        .any(|server| relay_spec_is_plaintext(server))
 }
 
 fn control_server_uses_plaintext_http(control_server_url: &str) -> bool {
