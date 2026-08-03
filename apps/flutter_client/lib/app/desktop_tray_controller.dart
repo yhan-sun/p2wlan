@@ -21,7 +21,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   final SettingsStore settingsStore;
   final StatusStore statusStore;
 
-  static const _macosTrayIconSize = 18;
+  static const _macosTrayIconSize = 22;
   static const _windowsTrayIconAsset = 'assets/tray_icon.ico';
   static const _linuxTrayIconAsset = 'assets/tray_icon.png';
   static const _macosBusyIconAsset = 'assets/tray_icon_macos_busy.png';
@@ -198,10 +198,9 @@ class DesktopTrayController with TrayListener, WindowListener {
     if (!Platform.isMacOS) {
       return Platform.isWindows ? _windowsTrayIconAsset : _linuxTrayIconAsset;
     }
-    if (statusStore.daemonBusy) return _macosBusyIconAsset;
     if (!statusStore.daemonReachable) return _macosOffIconAsset;
     final health = statusStore.snapshot?.health.status.toLowerCase();
-    if (health == 'healthy') return _macosOnIconAsset;
+    if (health == 'healthy' || statusStore.daemonBusy) return _macosOnIconAsset;
     return _macosAttentionIconAsset;
   }
 
