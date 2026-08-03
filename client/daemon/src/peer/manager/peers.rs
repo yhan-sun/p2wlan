@@ -133,6 +133,7 @@ impl PeerManager {
     }
 
     /// Record a direct traversal event with structured probe coverage counters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_direct_event_with_probe_coverage(
         &self,
         node_id: &str,
