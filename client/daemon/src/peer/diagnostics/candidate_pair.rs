@@ -101,15 +101,8 @@ impl CandidatePairDiagnostics {
             public_mapping_stable,
             is_overlay_direct,
             is_relay,
-            warning: if is_peer_reflexive_direct {
-                Some(
-                    "direct pair is peer-reflexive/provisional, not a stable public mapping"
-                        .to_string(),
-                )
-            } else {
-                is_overlay_direct
-                    .then(|| "direct path is overlay/utun, not public NAT traversal".to_string())
-            },
+            warning: is_overlay_direct
+                .then(|| "direct path is overlay/utun, not public NAT traversal".to_string()),
         }
     }
 }

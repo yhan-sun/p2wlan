@@ -5,9 +5,10 @@ fn open_flutter_client() -> Result<(), Box<dyn Error>> {
             .ok_or("未找到 Flutter 版 P2WLAN.app；请先运行 flutter build macos --debug")?;
         let status = Command::new("open").arg(app).status()?;
         if status.success() {
-            return Ok(());
+            Ok(())
+        } else {
+            Err("open command failed".into())
         }
-        return Err("open command failed".into());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -69,9 +70,10 @@ fn open_log_directory() -> Result<(), Box<dyn Error>> {
     {
         let status = Command::new("open").arg(&dir).status()?;
         if status.success() {
-            return Ok(());
+            Ok(())
+        } else {
+            Err("open logs command failed".into())
         }
-        return Err("open logs command failed".into());
     }
 
     #[cfg(target_os = "windows")]
@@ -106,7 +108,7 @@ fn tray_icon_image(running: bool) -> Result<Icon, Box<dyn Error>> {
             let dx = x as i32 - 16;
             let dy = y as i32 - 16;
             let distance_sq = dx * dx + dy * dy;
-            let pixel = if distance_sq <= 12 * 12 && distance_sq >= 7 * 7 {
+            let pixel = if (7 * 7..=12 * 12).contains(&distance_sq) {
                 primary
             } else if (12..=20).contains(&x) && (12..=20).contains(&y) {
                 [0x0f, 0x17, 0x2a, 0xff]

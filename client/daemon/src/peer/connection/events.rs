@@ -201,6 +201,7 @@ impl PeerConnection {
         ));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_direct_event_with_probe_coverage(
         &mut self,
         local_generation: u64,

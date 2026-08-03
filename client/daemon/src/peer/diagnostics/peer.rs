@@ -151,15 +151,8 @@ impl PeerDiagnostics {
         let public_mapping_stable = direct_type == DirectPathType::PublicUdp;
         let is_overlay_direct = direct_type == DirectPathType::Overlay;
         let is_relay = direct_type == DirectPathType::Relay;
-        let warning = if is_peer_reflexive_direct {
-            Some(
-                "direct path is peer-reflexive/provisional, not a stable public mapping"
-                    .to_string(),
-            )
-        } else {
-            is_overlay_direct
-                .then(|| "direct path is overlay/utun, not public NAT traversal".to_string())
-        };
+        let warning = is_overlay_direct
+            .then(|| "direct path is overlay/utun, not public NAT traversal".to_string());
 
         Self {
             node_id: conn.node_id.clone(),
