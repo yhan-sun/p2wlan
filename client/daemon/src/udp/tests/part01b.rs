@@ -85,9 +85,7 @@ async fn punch_candidates_respects_outbound_probe_budget_per_remote_ip() {
 #[tokio::test]
 async fn punch_candidates_stops_at_hard_session_probe_cap() {
     let peers = peer_manager();
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.9", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
         .await
         .unwrap();
@@ -106,12 +104,7 @@ async fn punch_candidates_stops_at_hard_session_probe_cap() {
         .collect::<Vec<SocketAddr>>();
 
     let sent = transport
-        .punch_candidates(
-            "peer-b",
-            candidates,
-            Duration::from_secs(1),
-            5,
-        )
+        .punch_candidates("peer-b", candidates, Duration::from_secs(1), 5)
         .await
         .unwrap();
 
@@ -122,7 +115,9 @@ async fn punch_candidates_stops_at_hard_session_probe_cap() {
 async fn qualified_socket_pool_probes_from_each_bound_socket() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
-    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
         .with_socket_pool(3)
@@ -162,18 +157,32 @@ async fn qualified_socket_pool_probes_from_each_bound_socket() {
             .collect::<Vec<_>>(),
         vec![1, 1, 1]
     );
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "active_pool_scan_completed")
+        .expect("active-pool scan should emit coverage diagnostics");
+    assert_eq!(event.sent_probes, Some(sent));
+    assert_eq!(event.probe_tx_socket0_count, Some(1));
+    assert_eq!(event.probe_tx_alt_socket_count, Some(2));
+    assert_eq!(event.probe_tx_unique_target_ports, Some(1));
+    assert_eq!(event.probe_tx_repeated_target_ports, Some(2));
+    assert!(event.detail.contains("scan_socket_policy=active_pool"));
+    assert!(event
+        .detail
+        .contains(&format!("punch_sockets={}", transport.socket_count())));
 }
 
 #[tokio::test]
-async fn large_punch_window_prioritizes_remote_port_coverage_before_extra_sockets() {
+async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted() {
     let peers = peer_manager();
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.9", None))
-        .await;
-    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
-        .with_socket_pool(3)
+        .with_socket_pool(4)
         .await
         .unwrap();
     transport.set_socket_pool_active(true);
@@ -196,19 +205,52 @@ async fn large_punch_window_prioritizes_remote_port_coverage_before_extra_socket
     endpoints.sort_unstable();
     endpoints.dedup();
 
-    assert_eq!(endpoints.len(), OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+    assert_eq!(
+        endpoints.len(),
+        OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP / transport.socket_count()
+    );
     assert!(endpoints
         .iter()
-        .all(|endpoint| candidates[..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP].contains(endpoint)));
-    assert!(pending.values().all(|probe| probe.socket_index == 0));
+        .all(|endpoint| candidates[..endpoints.len()].contains(endpoint)));
+    let mut per_socket = vec![0usize; transport.socket_count()];
+    for probe in pending.values() {
+        per_socket[probe.socket_index] += 1;
+    }
+    let expected_per_socket = OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP / transport.socket_count();
+    assert_eq!(
+        per_socket,
+        vec![expected_per_socket; transport.socket_count()]
+    );
+    drop(pending);
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "active_pool_scan_completed")
+        .expect("active-pool scan should emit coverage diagnostics");
+    assert_eq!(event.sent_probes, Some(sent));
+    assert_eq!(
+        event.probe_tx_socket0_count,
+        Some(u32::try_from(expected_per_socket).unwrap())
+    );
+    assert_eq!(
+        event.probe_tx_alt_socket_count,
+        Some(u32::try_from(expected_per_socket * (transport.socket_count() - 1)).unwrap())
+    );
+    assert_eq!(
+        event.probe_tx_unique_target_ports,
+        Some(u32::try_from(expected_per_socket).unwrap())
+    );
+    assert!(event
+        .detail
+        .contains(&format!("punch_sockets={}", transport.socket_count())));
 }
 
 #[tokio::test]
 async fn primary_socket_punch_never_uses_alternate_pool_sockets() {
     let peers = peer_manager();
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.9", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
@@ -263,9 +305,7 @@ async fn nat_binding_maintainer_uses_only_primary_socket() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
     let peers = peer_manager();
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.9", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
@@ -431,16 +471,10 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
 
 #[test]
 fn pool_stun_observation_promotes_an_overlapping_prediction() {
-    let mut predicted = p2pnet_nat::IceCandidate::server_reflexive(
-        "203.0.113.7",
-        42_001,
-    );
+    let mut predicted = p2pnet_nat::IceCandidate::server_reflexive("203.0.113.7", 42_001);
     predicted.source = p2pnet_nat::CandidateSource::Predicted;
-    let mut report = candidate_report_from_observations(
-        "0.0.0.0:50000".parse().unwrap(),
-        false,
-        Vec::new(),
-    );
+    let mut report =
+        candidate_report_from_observations("0.0.0.0:50000".parse().unwrap(), false, Vec::new());
     report.candidates = vec![predicted];
 
     let discovered = merge_pool_candidates(

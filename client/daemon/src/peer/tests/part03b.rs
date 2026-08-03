@@ -65,16 +65,25 @@ fn birthday_probe_endpoints_for_bases_keeps_near_window_when_wide_window_rotates
     let base: SocketAddr = "203.0.113.10:40000".parse().unwrap();
     let budget = birthday_probe_near_rank_count() + 8;
     let first = birthday_probe_endpoints_for_bases_from_rank(&[base], budget, 0);
-    let second =
-        birthday_probe_endpoints_for_bases_from_rank(&[base], budget, BIRTHDAY_PROBE_BUDGET_PER_CYCLE);
+    let second = birthday_probe_endpoints_for_bases_from_rank(
+        &[base],
+        budget,
+        BIRTHDAY_PROBE_BUDGET_PER_CYCLE,
+    );
     let first_ports = first.iter().map(SocketAddr::port).collect::<HashSet<_>>();
     let second_ports = second.iter().map(SocketAddr::port).collect::<HashSet<_>>();
 
     assert_eq!(first.len(), budget);
     assert_eq!(second.len(), budget);
     for port in [39999, 40001, 39904, 40096] {
-        assert!(first_ports.contains(&port), "first pass missing near port {port}");
-        assert!(second_ports.contains(&port), "second pass missing near port {port}");
+        assert!(
+            first_ports.contains(&port),
+            "first pass missing near port {port}"
+        );
+        assert!(
+            second_ports.contains(&port),
+            "second pass missing near port {port}"
+        );
     }
     assert!(
         first_ports
@@ -91,17 +100,12 @@ async fn hard_local_easy_remote_uses_only_the_fresh_stable_public_target() {
     let stale_endpoint: SocketAddr = "203.0.113.10:39000".parse().unwrap();
     let fresh_endpoint: SocketAddr = "203.0.113.10:40037".parse().unwrap();
 
-    manager
-        .add_peer(&test_peer("peer1", stale_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stale_endpoint)).await;
     manager
         .add_candidates_with_sources(
             "peer1",
             &[fresh_endpoint.to_string()],
-            &HashMap::from([(
-                fresh_endpoint.to_string(),
-                "stun_observed".to_string(),
-            )]),
+            &HashMap::from([(fresh_endpoint.to_string(), "stun_observed".to_string())]),
         )
         .await;
     manager.update_nat_profile(birthday_nat_profile()).await;
@@ -130,9 +134,7 @@ async fn easy_local_scans_explicit_predicted_window_without_birthday_expansion()
         .collect::<HashMap<_, _>>();
     sources.insert(observed, "stun_observed".to_string());
 
-    manager
-        .add_peer(&test_peer("peer1", stale_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stale_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -330,9 +332,7 @@ async fn hard_local_nat_uses_single_public_peer_candidate_without_scatter() {
     let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
 
     manager.update_nat_profile(birthday_nat_profile()).await;
-    manager
-        .add_peer(&test_peer("peer1", stable_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -349,9 +349,7 @@ async fn hard_local_nat_maintainer_targets_stable_public_endpoint() {
     let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
 
     manager.update_nat_profile(birthday_nat_profile()).await;
-    manager
-        .add_peer(&test_peer("peer1", stable_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -361,7 +359,7 @@ async fn hard_local_nat_maintainer_targets_stable_public_endpoint() {
 }
 
 #[tokio::test]
-async fn predicted_or_birthday_window_requires_primary_socket_scan() {
+async fn predicted_window_remains_in_synchronized_active_pool_scan() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
     let predicted = (41_001..=41_008)
@@ -375,43 +373,30 @@ async fn predicted_or_birthday_window_requires_primary_socket_scan() {
         .collect::<HashMap<_, _>>();
     sources.insert(stable_endpoint.to_string(), "stun_observed".to_string());
 
-    manager
-        .add_peer(&test_peer("peer1", stable_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
 
     let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(targets.contains(&stable_endpoint));
     assert!(predicted.iter().any(|endpoint| targets.contains(endpoint)));
-    assert!(
-        manager
-            .direct_probe_uses_primary_socket_only("peer1", &targets)
-            .await
-    );
 }
 
 #[tokio::test]
-async fn ordinary_stable_public_probe_can_use_active_socket_pool() {
+async fn ordinary_stable_public_probe_remains_single_target() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
     let candidates = vec![stable_endpoint.to_string()];
     let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
 
-    manager
-        .add_peer(&test_peer("peer1", stable_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
 
     let targets = manager.direct_probe_targets_for("peer1").await;
     assert_eq!(targets, vec![stable_endpoint]);
-    assert!(
-        !manager
-            .direct_probe_uses_primary_socket_only("peer1", &targets)
-            .await
-    );
 }
 
 #[tokio::test]
@@ -498,9 +483,7 @@ async fn hard_local_nat_keeps_previously_successful_private_candidate_for_reclai
     ]);
 
     manager.update_nat_profile(birthday_nat_profile()).await;
-    manager
-        .add_peer(&test_peer("peer1", stable_public))
-        .await;
+    manager.add_peer(&test_peer("peer1", stable_public)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -516,9 +499,9 @@ async fn hard_local_nat_keeps_previously_successful_private_candidate_for_reclai
     let targets = manager.direct_probe_targets_for("peer1").await;
     assert!(targets.contains(&host_candidate));
     assert!(targets.contains(&stable_public));
-    assert!(!targets.iter().any(|target| {
-        target.ip() == stable_public.ip() && *target != stable_public
-    }));
+    assert!(!targets
+        .iter()
+        .any(|target| { target.ip() == stable_public.ip() && *target != stable_public }));
 }
 
 #[tokio::test]

@@ -578,7 +578,11 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
 
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
         .unwrap();
+    udp.set_socket_pool_active(true);
     spawn_hole_punch_task(
         udp,
         peers.clone(),
@@ -610,6 +614,29 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
     assert_eq!(conn.state, ConnectionState::HolePunching);
     assert_eq!(conn.direct_health.failure_count, 0);
     assert!(conn.direct_health.last_error.is_none());
+    let active_pool_scan = conn
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "active_pool_scan_completed")
+        .expect("scheduled hole punch should use the active socket pool");
+    assert_eq!(active_pool_scan.probe_tx_socket0_count, Some(1));
+    assert_eq!(active_pool_scan.probe_tx_alt_socket_count, Some(2));
+    assert!(active_pool_scan
+        .detail
+        .contains("scan_socket_policy=active_pool"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "primary_socket_scan_completed"));
+    let timeout = conn
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "punch_ack_timeout")
+        .expect("scheduled hole punch should record ACK timeout");
+    assert!(timeout
+        .detail
+        .contains("local_authenticated_probe_rx_delta="));
+    assert!(timeout.detail.contains("local_probe_ack_rx_delta="));
     assert!(!conn
         .direct_events
         .iter()

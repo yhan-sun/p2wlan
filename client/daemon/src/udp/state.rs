@@ -128,6 +128,25 @@ impl PunchSocketPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UdpProbeRxSnapshot {
+    pub authenticated_probe_packets_received: u64,
+    pub probe_acks_received: u64,
+}
+
+impl UdpProbeRxSnapshot {
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            authenticated_probe_packets_received: self
+                .authenticated_probe_packets_received
+                .saturating_sub(earlier.authenticated_probe_packets_received),
+            probe_acks_received: self
+                .probe_acks_received
+                .saturating_sub(earlier.probe_acks_received),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthenticatedPunchAdmission {
     Accepted,
