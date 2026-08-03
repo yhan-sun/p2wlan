@@ -28,12 +28,14 @@ impl UdpTransport {
                 sleep(round.delay_before).await;
             }
 
-            for &candidate in &round.endpoints {
-                // Before a direct path is authenticated, each bounded pool
-                // member gets one independently mapped chance at the remote
-                // candidate. Once a peer has an affinity, normal sends use
-                // that socket rather than changing its NAT mapping.
-                for socket_index in 0..self.punch_socket_count() {
+            // For large symmetric-NAT windows, remote port coverage matters
+            // more than exhausting every local socket for the first few
+            // endpoints.  Socket-major ordering lets the primary/stable
+            // socket sweep as many remote candidates as possible before the
+            // hard per-session cap is reached, then spends any remaining
+            // budget on alternate local sockets.
+            for socket_index in 0..self.punch_socket_count() {
+                for &candidate in &round.endpoints {
                     if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
                         session_capped = true;
                         break 'schedule;
