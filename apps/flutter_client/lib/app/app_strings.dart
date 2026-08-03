@@ -69,6 +69,7 @@ class AppStrings {
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
   String get cancel => isZh ? '取消' : 'Cancel';
   String get close => isZh ? '关闭' : 'Close';
+  String get closeWindow => isZh ? '退出应用' : 'Close window';
   String get continueAction => isZh ? '继续' : 'Continue';
   String get lastDaemonAction => isZh ? '最近操作' : 'Last action';
   String get openConsole => isZh ? '打开控制台' : 'Open console';
@@ -160,11 +161,14 @@ class AppStrings {
   String get natPublicEndpoint => isZh ? '公网端点' : 'Public endpoint';
   String get natMappingBehavior => isZh ? '映射行为' : 'Mapping';
   String get natFilteringBehavior => isZh ? '过滤行为' : 'Filtering';
-  String get natConfidence => isZh ? '置信度' : 'Confidence';
+  String get natConfidence => isZh ? '探测置信度' : 'Probe confidence';
+  String get natProbabilityTotal => isZh ? '概率合计' : 'Probability total';
+  String get natMaxProbability => isZh ? '最大概率' : 'Max probability';
+  String get natTypeProbabilities => isZh ? '四类 NAT 概率' : 'NAT probabilities';
   String get natGuideTitle => isZh ? 'NAT 类型说明' : 'NAT type guide';
   String get natGuideAction => isZh ? '查看说明' : 'View guide';
   String get natGuideIntro => isZh
-      ? 'P2WLAN 根据本机 UDP/STUN 观测自动分类。类型越靠前，直连越容易；越靠后，越可能需要精确打洞或中继。'
+      ? 'P2WLAN 根据本机 UDP/STUN 观测自动分类。下方概率合计会归一为 100%；最大概率表示当前最可能的 NAT 类型。类型越靠前，直连越容易。'
       : 'P2WLAN classifies the local network from UDP/STUN observations. Earlier types are easier for direct paths; later types may need coordinated punching or relay.';
 
   String get diagnosticsSubtitle => isZh
@@ -325,13 +329,13 @@ class AppStrings {
 
   String natTraversalTypeLabel(NatTraversalType type) {
     return switch (type) {
-      NatTraversalType.fullCone => isZh ? 'FullCone NAT（全锥形）' : 'FullCone NAT',
+      NatTraversalType.fullCone => isZh ? '全锥形 NAT（FullCone）' : 'FullCone NAT',
       NatTraversalType.restrictedCone =>
-        isZh ? 'Restricted Cone NAT（受限锥形）' : 'Restricted Cone NAT',
+        isZh ? '受限锥形 NAT（Restricted Cone）' : 'Restricted Cone NAT',
       NatTraversalType.portRestrictedCone =>
-        isZh ? 'Port Restricted Cone NAT（端口受限锥形）' : 'Port Restricted Cone NAT',
+        isZh ? '端口受限锥形 NAT（Port Restricted Cone）' : 'Port Restricted Cone NAT',
       NatTraversalType.symmetric =>
-        isZh ? 'Symmetric NAT（对称形）' : 'Symmetric NAT',
+        isZh ? '对称型 NAT（Symmetric）' : 'Symmetric NAT',
       NatTraversalType.openInternet => isZh ? '公网直连' : 'Open Internet',
       NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
       NatTraversalType.unknown => isZh ? '未确认' : 'Unknown',
@@ -418,6 +422,30 @@ class AppStrings {
       '' => '—',
       _ => value,
     };
+  }
+
+  String natTraversalShortLabel(NatTraversalType type) {
+    return switch (type) {
+      NatTraversalType.fullCone => isZh ? '全锥形' : 'FullCone',
+      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted',
+      NatTraversalType.portRestrictedCone => isZh ? '端口受限' : 'Port restricted',
+      NatTraversalType.symmetric => isZh ? '对称型' : 'Symmetric',
+      NatTraversalType.openInternet => isZh ? '公网' : 'Open',
+      NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
+      NatTraversalType.unknown => isZh ? '未知' : 'Unknown',
+    };
+  }
+
+  String natMostLikelyTitle(List<NatTraversalType> types, String probability) {
+    final labels = types.map(natTraversalShortLabel).join(isZh ? ' / ' : ' / ');
+    if (types.length > 1) {
+      return isZh
+          ? '最大概率并列：$labels（各 $probability）'
+          : 'Max probability tie: $labels ($probability each)';
+    }
+    return isZh
+        ? '最大概率：$labels（$probability）'
+        : 'Max probability: $labels ($probability)';
   }
 
   String diagnosticsUrlError(String message) {

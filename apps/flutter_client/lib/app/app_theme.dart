@@ -6,6 +6,7 @@ abstract final class AppTheme {
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
+      fontFamilyFallback: AppTokens.fontFamilyFallback,
       scaffoldBackgroundColor: AppTokens.colorBg,
       colorScheme: const ColorScheme.light(
         surface: AppTokens.colorSurface,
@@ -205,6 +206,7 @@ abstract final class AppTheme {
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
+      fontFamilyFallback: AppTokens.fontFamilyFallback,
       scaffoldBackgroundColor: AppTokens.colorDarkBg,
       colorScheme: const ColorScheme.dark(
         surface: AppTokens.colorDarkSurface,

@@ -1,4 +1,9 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
@@ -63,171 +68,199 @@ class _LoginPageState extends State<LoginPage> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     return Scaffold(
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 520),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
+      body: Stack(
+        children: [
+          if (_usesWindowsWindowControls)
+            const Positioned(
+              top: 0,
+              left: 0,
+              right: 56,
+              height: 52,
+              child: DragToMoveArea(child: SizedBox.expand()),
+            ),
+          Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Container(
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surfaceContainerHighest,
-                        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                        border: Border.all(color: theme.colorScheme.outline),
-                      ),
-                      child: Icon(
-                        Icons.network_check_rounded,
-                        color: theme.colorScheme.primary,
+                    Row(
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(
+                              AppTokens.radiusMd,
+                            ),
+                            border: Border.all(
+                              color: theme.colorScheme.outline,
+                            ),
+                          ),
+                          child: Icon(
+                            Icons.network_check_rounded,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Text(
+                            p2wlanAppName,
+                            style: TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w800,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 22),
+                    Text(
+                      strings.isZh
+                          ? '登录控制面后启动本机 TUN'
+                          : 'Sign in to start the local TUN',
+                      style: TextStyle(
+                        fontSize: 15,
+                        height: 1.35,
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Text(
-                        p2wlanAppName,
-                        style: TextStyle(
-                          fontSize: 24,
-                          fontWeight: FontWeight.w800,
-                          color: theme.colorScheme.onSurface,
+                    const SizedBox(height: 20),
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.surface,
+                        border: Border.all(
+                          color: isDark
+                              ? theme.colorScheme.outline
+                              : theme.colorScheme.outlineVariant,
+                        ),
+                        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+                        boxShadow: isDark ? const [] : AppTokens.shadowBorder,
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            TextField(
+                              controller: _controlServerController,
+                              decoration: InputDecoration(
+                                labelText: strings.controlServer,
+                                prefixIcon: const Icon(Icons.dns_outlined),
+                              ),
+                              keyboardType: TextInputType.url,
+                              textInputAction: TextInputAction.next,
+                              onSubmitted: (_) =>
+                                  _submitting ? null : _submit(),
+                            ),
+                            const SizedBox(height: 12),
+                            TextField(
+                              controller: _emailController,
+                              decoration: InputDecoration(
+                                labelText: strings.isZh ? '邮箱' : 'Email',
+                                prefixIcon: const Icon(Icons.mail_outline),
+                              ),
+                              keyboardType: TextInputType.emailAddress,
+                              autofillHints: const [AutofillHints.email],
+                              textInputAction: TextInputAction.next,
+                              onSubmitted: (_) =>
+                                  _submitting ? null : _submit(),
+                            ),
+                            const SizedBox(height: 12),
+                            TextField(
+                              controller: _passwordController,
+                              decoration: InputDecoration(
+                                labelText: strings.isZh ? '密码' : 'Password',
+                                prefixIcon: const Icon(Icons.key_outlined),
+                              ),
+                              obscureText: true,
+                              autofillHints: [
+                                _register
+                                    ? AutofillHints.newPassword
+                                    : AutofillHints.password,
+                              ],
+                              textInputAction: TextInputAction.done,
+                              onSubmitted: (_) =>
+                                  _submitting ? null : _submit(),
+                            ),
+                            if (_error != null) ...[
+                              const SizedBox(height: 12),
+                              _InlineMessage(message: _error!, error: true),
+                            ],
+                            if (_message != null) ...[
+                              const SizedBox(height: 12),
+                              _InlineMessage(message: _message!, error: false),
+                            ],
+                            const SizedBox(height: 16),
+                            FilledButton.icon(
+                              onPressed: _submitting ? null : _submit,
+                              icon: _submitting
+                                  ? const SizedBox.square(
+                                      dimension: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.login_rounded),
+                              label: Text(
+                                _submitting
+                                    ? (strings.isZh
+                                          ? '认证中...'
+                                          : 'Signing in...')
+                                    : _register
+                                    ? (strings.isZh
+                                          ? '注册并继续'
+                                          : 'Register and continue')
+                                    : (strings.isZh
+                                          ? '登录并继续'
+                                          : 'Sign in and continue'),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: _submitting
+                                  ? null
+                                  : () =>
+                                        setState(() => _register = !_register),
+                              child: Text(
+                                _register
+                                    ? (strings.isZh
+                                          ? '已有账号，去登录'
+                                          : 'I already have an account')
+                                    : (strings.isZh
+                                          ? '没有账号，创建一个'
+                                          : 'Create an account'),
+                              ),
+                            ),
+                            const Divider(height: 24),
+                            OutlinedButton.icon(
+                              onPressed: _submitting ? null : _continueOffline,
+                              icon: const Icon(Icons.offline_bolt_outlined),
+                              label: Text(
+                                strings.isZh
+                                    ? '继续使用手动/离线模式'
+                                    : 'Continue in manual/offline mode',
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 22),
-                Text(
-                  strings.isZh
-                      ? '登录控制面后启动本机 TUN'
-                      : 'Sign in to start the local TUN',
-                  style: TextStyle(
-                    fontSize: 15,
-                    height: 1.35,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 20),
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surface,
-                    border: Border.all(
-                      color: isDark
-                          ? theme.colorScheme.outline
-                          : theme.colorScheme.outlineVariant,
-                    ),
-                    borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-                    boxShadow: isDark ? const [] : AppTokens.shadowBorder,
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(18),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        TextField(
-                          controller: _controlServerController,
-                          decoration: InputDecoration(
-                            labelText: strings.controlServer,
-                            prefixIcon: const Icon(Icons.dns_outlined),
-                          ),
-                          keyboardType: TextInputType.url,
-                          textInputAction: TextInputAction.next,
-                          onSubmitted: (_) => _submitting ? null : _submit(),
-                        ),
-                        const SizedBox(height: 12),
-                        TextField(
-                          controller: _emailController,
-                          decoration: InputDecoration(
-                            labelText: strings.isZh ? '邮箱' : 'Email',
-                            prefixIcon: const Icon(Icons.mail_outline),
-                          ),
-                          keyboardType: TextInputType.emailAddress,
-                          autofillHints: const [AutofillHints.email],
-                          textInputAction: TextInputAction.next,
-                          onSubmitted: (_) => _submitting ? null : _submit(),
-                        ),
-                        const SizedBox(height: 12),
-                        TextField(
-                          controller: _passwordController,
-                          decoration: InputDecoration(
-                            labelText: strings.isZh ? '密码' : 'Password',
-                            prefixIcon: const Icon(Icons.key_outlined),
-                          ),
-                          obscureText: true,
-                          autofillHints: [
-                            _register
-                                ? AutofillHints.newPassword
-                                : AutofillHints.password,
-                          ],
-                          textInputAction: TextInputAction.done,
-                          onSubmitted: (_) => _submitting ? null : _submit(),
-                        ),
-                        if (_error != null) ...[
-                          const SizedBox(height: 12),
-                          _InlineMessage(message: _error!, error: true),
-                        ],
-                        if (_message != null) ...[
-                          const SizedBox(height: 12),
-                          _InlineMessage(message: _message!, error: false),
-                        ],
-                        const SizedBox(height: 16),
-                        FilledButton.icon(
-                          onPressed: _submitting ? null : _submit,
-                          icon: _submitting
-                              ? const SizedBox.square(
-                                  dimension: 16,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : const Icon(Icons.login_rounded),
-                          label: Text(
-                            _submitting
-                                ? (strings.isZh ? '认证中...' : 'Signing in...')
-                                : _register
-                                ? (strings.isZh
-                                      ? '注册并继续'
-                                      : 'Register and continue')
-                                : (strings.isZh
-                                      ? '登录并继续'
-                                      : 'Sign in and continue'),
-                          ),
-                        ),
-                        TextButton(
-                          onPressed: _submitting
-                              ? null
-                              : () => setState(() => _register = !_register),
-                          child: Text(
-                            _register
-                                ? (strings.isZh
-                                      ? '已有账号，去登录'
-                                      : 'I already have an account')
-                                : (strings.isZh
-                                      ? '没有账号，创建一个'
-                                      : 'Create an account'),
-                          ),
-                        ),
-                        const Divider(height: 24),
-                        OutlinedButton.icon(
-                          onPressed: _submitting ? null : _continueOffline,
-                          icon: const Icon(Icons.offline_bolt_outlined),
-                          label: Text(
-                            strings.isZh
-                                ? '继续使用手动/离线模式'
-                                : 'Continue in manual/offline mode',
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
-        ),
+          if (_usesWindowsWindowControls)
+            const Positioned(
+              top: 6,
+              right: 8,
+              child: SafeArea(child: _LoginWindowCloseButton()),
+            ),
+        ],
       ),
     );
   }
@@ -287,6 +320,33 @@ class _LoginPageState extends State<LoginPage> {
     );
     await widget.statusStore.refresh();
     widget.onAuthenticated();
+  }
+}
+
+bool get _usesWindowsWindowControls => !kIsWeb && Platform.isWindows;
+
+Future<void> _destroyWindow() async {
+  await windowManager.setPreventClose(false);
+  await windowManager.destroy();
+}
+
+class _LoginWindowCloseButton extends StatelessWidget {
+  const _LoginWindowCloseButton();
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    return IconButton(
+      tooltip: strings.closeWindow,
+      style: IconButton.styleFrom(
+        backgroundColor: theme.colorScheme.surface,
+        foregroundColor: theme.colorScheme.onSurfaceVariant,
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
+      ),
+      onPressed: () => unawaited(_destroyWindow()),
+      icon: const Icon(Icons.close_rounded),
+    );
   }
 }
 

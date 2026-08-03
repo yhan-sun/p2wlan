@@ -22,6 +22,12 @@ int? _intOrNull(dynamic value) {
   return null;
 }
 
+double? _doubleOrNull(dynamic value) {
+  if (value is num) return value.toDouble();
+  if (value is String) return double.tryParse(value);
+  return null;
+}
+
 bool _bool(dynamic value, [bool fallback = false]) {
   if (value is bool) return value;
   if (value is String) return value.toLowerCase() == 'true';

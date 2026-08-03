@@ -22,11 +22,11 @@ void main() {
       ),
     );
 
-    expect(labels, contains('Open console'));
-    expect(labels, contains('Start P2WLAN'));
-    expect(labels, isNot(contains('Stop P2WLAN')));
-    expect(labels, contains('Open logs'));
-    expect(labels, contains('Quit P2WLAN'));
+    expect(labels, contains('打开控制台'));
+    expect(labels, contains('启动 P2WLAN'));
+    expect(labels, isNot(contains('停止 P2WLAN')));
+    expect(labels, contains('打开日志'));
+    expect(labels, contains('退出 P2WLAN'));
   });
 
   test('desktop tray shows stop as the reachable primary control', () async {
@@ -45,8 +45,8 @@ void main() {
       ),
     );
 
-    expect(labels, contains('Stop P2WLAN'));
-    expect(labels, isNot(contains('Start P2WLAN')));
+    expect(labels, contains('停止 P2WLAN'));
+    expect(labels, isNot(contains('启动 P2WLAN')));
   });
 
   test(

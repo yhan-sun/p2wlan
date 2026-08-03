@@ -27,6 +27,9 @@ Future<_Stores> _makeStores({
     settingsFile: File('${tempDir.path}/settings.json'),
   );
   await settingsStore.load();
+  await settingsStore.updateSettings(
+    settingsStore.settings.copyWith(languageCode: AppLanguage.english.code),
+  );
   final statusStore = StatusStore(
     settingsStore: settingsStore,
     diagnosticsApi: api,
@@ -116,7 +119,10 @@ class _TestApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      home: ScaffoldMessenger(child: Scaffold(body: child)),
+      home: AppStringsScope(
+        strings: AppStrings.fromCode(AppLanguage.english.code),
+        child: ScaffoldMessenger(child: Scaffold(body: child)),
+      ),
     );
   }
 }

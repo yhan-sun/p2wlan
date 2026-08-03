@@ -49,8 +49,17 @@ void _registerDashboardTests() {
     );
 
     expect(find.text('10.20.0.10'), findsOneWidget);
-    expect(find.text('Restricted Cone NAT'), findsOneWidget);
+    expect(find.text('Max probability: Restricted (70%)'), findsOneWidget);
     expect(find.text('Network type'), findsOneWidget);
+    expect(
+      find.text('Probability total 100%', findRichText: true),
+      findsOneWidget,
+    );
+    expect(
+      find.text('Max probability Restricted 70%', findRichText: true),
+      findsOneWidget,
+    );
+    expect(find.text('NAT probabilities'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
 

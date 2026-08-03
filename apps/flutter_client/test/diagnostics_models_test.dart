@@ -41,6 +41,16 @@ void main() {
     expect(snapshot.natProfile?.filteringBehavior, 'address_dependent');
     expect(snapshot.natProfile?.publicEndpoint, '198.51.100.20:62000');
     expect(snapshot.natProfile?.traversalType, NatTraversalType.restrictedCone);
+    expect(snapshot.natProfile?.probabilityTotal, closeTo(100, 0.01));
+    expect(snapshot.natProfile?.maxTypeProbabilities, hasLength(1));
+    expect(
+      snapshot.natProfile?.maxTypeProbabilities.single.type,
+      NatTraversalType.restrictedCone,
+    );
+    expect(
+      snapshot.natProfile?.maxTypeProbabilities.single.probability,
+      closeTo(70, 0.01),
+    );
 
     final directPeer = snapshot.peers.firstWhere(
       (peer) => peer.nodeId == 'peer-direct-001',
@@ -83,6 +93,58 @@ void main() {
     expect(
       classify('address_or_port_dependent', 'address_or_port_dependent'),
       NatTraversalType.symmetric,
+    );
+  });
+
+  test('infers probabilities when filtering behavior is still unknown', () {
+    final profile = NatProfileSnapshot.fromJson({
+      'mapping_behavior': 'endpoint_independent',
+      'filtering_behavior': 'unknown',
+      'confidence': 90,
+    });
+    final probabilities = {
+      for (final item in profile.typeProbabilities) item.type: item.probability,
+    };
+
+    expect(profile.traversalType, NatTraversalType.unknown);
+    expect(profile.probabilityTotal, closeTo(100, 0.01));
+    expect(probabilities[NatTraversalType.fullCone], closeTo(30, 0.01));
+    expect(probabilities[NatTraversalType.restrictedCone], closeTo(30, 0.01));
+    expect(
+      probabilities[NatTraversalType.portRestrictedCone],
+      closeTo(30, 0.01),
+    );
+    expect(probabilities[NatTraversalType.symmetric], closeTo(10, 0.01));
+    expect(
+      profile.maxTypeProbabilities.map((item) => item.type),
+      orderedEquals([
+        NatTraversalType.fullCone,
+        NatTraversalType.restrictedCone,
+        NatTraversalType.portRestrictedCone,
+      ]),
+    );
+  });
+
+  test('normalizes explicit NAT probability payloads', () {
+    final profile = NatProfileSnapshot.fromJson({
+      'mapping_behavior': 'endpoint_independent',
+      'filtering_behavior': 'address_dependent',
+      'type_probabilities': {
+        'full_cone': 0.1,
+        'restricted_cone': 0.7,
+        'port_restricted_cone': 0.1,
+        'symmetric': 0.1,
+      },
+    });
+    final probabilities = {
+      for (final item in profile.typeProbabilities) item.type: item.probability,
+    };
+
+    expect(profile.probabilityTotal, closeTo(100, 0.01));
+    expect(probabilities[NatTraversalType.restrictedCone], closeTo(70, 0.01));
+    expect(
+      profile.maxTypeProbabilities.single.type,
+      NatTraversalType.restrictedCone,
     );
   });
 

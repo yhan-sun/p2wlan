@@ -109,4 +109,19 @@ abstract final class AppTokens {
 
   // --- Tabular Figures TextStyle modifier ---
   static const tabularFontFeatures = [FontFeature.tabularFigures()];
+
+  // Prefer modern, readable CJK UI fonts before generic platform fallbacks.
+  // This avoids Windows falling back to older serif-style Chinese glyphs.
+  static const fontFamilyFallback = [
+    'Microsoft YaHei UI',
+    'Microsoft YaHei',
+    'PingFang SC',
+    'Noto Sans CJK SC',
+    'Source Han Sans SC',
+    'Hiragino Sans GB',
+    'WenQuanYi Micro Hei',
+    'Segoe UI',
+    'Arial',
+    'sans-serif',
+  ];
 }

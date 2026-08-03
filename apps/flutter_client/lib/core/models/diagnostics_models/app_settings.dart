@@ -7,7 +7,7 @@ const defaultControlServer = String.fromEnvironment(
   defaultValue: 'http://control.example.com:18080',
 );
 const defaultNetworkId = 'default';
-const defaultLanguageCode = 'en';
+const defaultLanguageCode = 'zh-Hans';
 const defaultOverlayCidr = '10.20.0.0/16';
 const defaultMtu = 1420;
 const defaultUdpBind = '0.0.0.0:0';
@@ -45,10 +45,11 @@ enum AppLanguage {
   final String code;
 
   static AppLanguage fromCode(String? code) {
-    final normalized = (code ?? defaultLanguageCode)
-        .trim()
-        .replaceAll('_', '-')
-        .toLowerCase();
+    final trimmed = code?.trim();
+    final normalized =
+        (trimmed == null || trimmed.isEmpty ? defaultLanguageCode : trimmed)
+            .replaceAll('_', '-')
+            .toLowerCase();
     return switch (normalized) {
       'zh' || 'zh-cn' || 'zh-hans' || 'zh-hans-cn' => simplifiedChinese,
       _ => english,
@@ -167,7 +168,9 @@ class AppSettings {
       closeBehavior: _normalizeCloseBehavior(
         _string(json['closeBehavior'], defaultCloseBehavior),
       ),
-      languageCode: AppLanguage.fromCode(_string(json['languageCode'])).code,
+      languageCode: AppLanguage.fromCode(
+        json.containsKey('languageCode') ? _string(json['languageCode']) : null,
+      ).code,
       themeMode: AppThemeMode.fromCode(_string(json['themeMode'])).code,
     );
   }
