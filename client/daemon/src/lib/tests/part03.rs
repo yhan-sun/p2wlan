@@ -373,6 +373,90 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
 }
 
 #[tokio::test]
+async fn test_network_outbound_waits_for_relay_when_direct_is_unconfirmed() {
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+    let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = direct_sink.local_addr().unwrap();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: direct_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .record_direct_probe_success_with_latency(
+            "node-b",
+            direct_endpoint,
+            Some(Duration::from_millis(8)),
+        )
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let udp_transport = Arc::new(RwLock::new(Some(udp)));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (encrypted_tx, encrypted_rx) = mpsc::channel(4);
+    let worker = tokio::spawn(run_network_outbound(
+        encrypted_rx,
+        peers,
+        true,
+        udp_transport,
+        relay_transport.clone(),
+    ));
+
+    let payload = vec![1, 2, 3, 5, 8, 13];
+    encrypted_tx
+        .send(EncryptedPeerPacket {
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            wire_bytes: payload.clone(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(150), rx_b.recv())
+        .await
+        .expect_err("relay should not receive before relay transport is published");
+
+    *relay_transport.write().await = Some(relay_a);
+
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let RelayMessage::Data { from_node, data } = received {
+        assert_eq!(from_node, "node-a");
+        assert_eq!(data, payload);
+    } else {
+        panic!("Expected Data message, got {:?}", received);
+    }
+
+    worker.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_daemon_acl_check() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let daemon = Daemon::new(config);
