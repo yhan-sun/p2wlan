@@ -35,6 +35,8 @@ pub struct CandidatePairDiagnostics {
     pub failure_count: u64,
     pub direct_type: DirectPathType,
     pub is_public_udp_direct: bool,
+    pub is_peer_reflexive_direct: bool,
+    pub public_mapping_stable: bool,
     pub is_overlay_direct: bool,
     pub is_relay: bool,
     pub warning: Option<String>,
@@ -51,6 +53,8 @@ impl CandidatePairDiagnostics {
         let selected = pair.state == CandidatePairState::Selected;
         let nominated = pair.nominated || selected;
         let is_public_udp_direct = direct_type == DirectPathType::PublicUdp;
+        let is_peer_reflexive_direct = direct_type == DirectPathType::PeerReflexive;
+        let public_mapping_stable = direct_type == DirectPathType::PublicUdp;
         let is_overlay_direct = direct_type == DirectPathType::Overlay;
         let is_relay = direct_type == DirectPathType::Relay;
         let local_endpoint = pair.local_endpoint.or(local_endpoint);
@@ -93,10 +97,19 @@ impl CandidatePairDiagnostics {
             failure_count: pair.failure_count,
             direct_type,
             is_public_udp_direct,
+            is_peer_reflexive_direct,
+            public_mapping_stable,
             is_overlay_direct,
             is_relay,
-            warning: is_overlay_direct
-                .then(|| "direct path is overlay/utun, not public NAT traversal".to_string()),
+            warning: if is_peer_reflexive_direct {
+                Some(
+                    "direct pair is peer-reflexive/provisional, not a stable public mapping"
+                        .to_string(),
+                )
+            } else {
+                is_overlay_direct
+                    .then(|| "direct path is overlay/utun, not public NAT traversal".to_string())
+            },
         }
     }
 }

@@ -57,6 +57,8 @@ pub enum DirectPathType {
     Lan,
     /// Confirmed direct UDP over a public Internet endpoint.
     PublicUdp,
+    /// Confirmed peer-reflexive UDP reachability; not proof of a stable public mapping.
+    PeerReflexive,
     /// Direct packets are using the overlay/TUN address space, not NAT traversal.
     Overlay,
     /// Relay is the active data path.
