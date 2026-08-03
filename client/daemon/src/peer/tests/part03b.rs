@@ -413,6 +413,36 @@ async fn hard_local_nat_uses_single_peer_reflexive_public_candidate_without_scat
 }
 
 #[tokio::test]
+async fn peer_reflexive_public_candidates_do_not_become_birthday_bases_for_easy_local_nat() {
+    let manager = PeerManager::new(test_config());
+    let first_peer_reflexive: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let fresh_peer_reflexive: SocketAddr = "8.8.8.8:41037".parse().unwrap();
+
+    manager
+        .add_peer(&test_peer("peer1", first_peer_reflexive))
+        .await;
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", first_peer_reflexive)
+            .await
+    );
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", fresh_peer_reflexive)
+            .await
+    );
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert_eq!(targets, vec![fresh_peer_reflexive, first_peer_reflexive]);
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert!(!conn
+        .candidate_pairs
+        .iter()
+        .any(|pair| pair.source == CandidatePairSource::Birthday));
+}
+
+#[tokio::test]
 async fn stale_birthday_pairs_are_pruned_when_signaled_window_moves() {
     let manager = PeerManager::new(test_config());
     manager

@@ -31,6 +31,7 @@ use super::{is_stun_clear_value, unix_time_millis};
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Confirm relay peer reachability proactively instead of waiting for user traffic.
 const RELAY_PEER_VALIDATION_INTERVAL: Duration = Duration::from_secs(5);
+const RELAY_PEER_VALIDATION_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RELAY_PEER_VALIDATION_MAX_AGE: Duration = Duration::from_secs(15);
 
 pub(super) fn infer_default_relay_servers(control_server_url: &str) -> Vec<String> {
@@ -381,23 +382,36 @@ pub(super) async fn run_relay_peer_validation_loop(
         debug!("Skipping relay peer validation; local virtual IP '{local_virtual_ip}' is not IPv4");
         return;
     };
-    let mut ticker = interval(RELAY_PEER_VALIDATION_INTERVAL);
+    let mut ticker = interval(RELAY_PEER_VALIDATION_READY_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_validation_at: Option<Instant> = None;
+    let mut last_relay_endpoint: Option<String> = None;
 
     loop {
         ticker.tick().await;
         let Some(relay) = relay_transport.read().await.clone() else {
+            last_relay_endpoint = None;
             continue;
         };
+        let relay_endpoint = relay.endpoint().to_string();
+        let relay_changed = last_relay_endpoint.as_deref() != Some(relay_endpoint.as_str());
+        if !relay_changed
+            && last_validation_at.is_some_and(|at| at.elapsed() < RELAY_PEER_VALIDATION_INTERVAL)
+        {
+            continue;
+        }
 
         let targets = peers
             .relay_validation_targets(RELAY_PEER_VALIDATION_MAX_AGE)
             .await;
         if targets.is_empty() {
+            last_relay_endpoint = Some(relay_endpoint);
             continue;
         }
+        last_relay_endpoint = Some(relay_endpoint);
 
         let validation_id = unix_time_millis() as u16;
+        let mut sent_count = 0usize;
         for (sequence, (peer_id, peer_virtual_ip)) in targets.into_iter().enumerate() {
             let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
                 debug!(
@@ -413,9 +427,13 @@ pub(super) async fn run_relay_peer_validation_loop(
                 validation_id,
                 sequence: sequence as u16,
             };
-            if let Err(err) = send_relay_validation_packet(packet, &transport, &relay).await {
-                debug!("Relay peer validation skipped for {peer_id}: {err}");
+            match send_relay_validation_packet(packet, &transport, &relay).await {
+                Ok(()) => sent_count = sent_count.saturating_add(1),
+                Err(err) => debug!("Relay peer validation skipped for {peer_id}: {err}"),
             }
+        }
+        if sent_count > 0 {
+            last_validation_at = Some(Instant::now());
         }
     }
 }

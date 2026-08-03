@@ -5,10 +5,10 @@
 //! WireGuard transport session, and emits encrypted wire bytes for the UDP or
 //! relay transport layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_tun::{Ipv4Packet, Protocol};
 use p2pnet_wireguard::{MessageTransport, TransportSession};
@@ -22,6 +22,16 @@ use crate::peer::PeerManager;
 const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
 const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
 const RELAY_VALIDATION_MAX_RTT: Duration = Duration::from_secs(600);
+/// Keep a short startup/rekey cushion for user traffic that reaches the TUN
+/// before the WireGuard session is installed. The queue is deliberately small
+/// and per-peer so a not-ready peer cannot build unbounded memory pressure.
+const PENDING_OUTBOUND_TTL: Duration = Duration::from_secs(8);
+const MAX_PENDING_OUTBOUND_PER_PEER: usize = 256;
+
+struct PendingOutboundPacket {
+    queued_at: Instant,
+    packet: OutboundPacket,
+}
 
 pub(crate) fn build_relay_validation_payload(sent_at_ms: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(
@@ -95,6 +105,7 @@ pub struct ReceivedEncryptedPacket {
 #[derive(Clone)]
 pub struct WireGuardTransport {
     sessions: Arc<Mutex<HashMap<String, TransportSession>>>,
+    pending_outbound: Arc<Mutex<HashMap<String, VecDeque<PendingOutboundPacket>>>>,
     encrypted_tx: mpsc::Sender<EncryptedPeerPacket>,
 }
 
@@ -105,6 +116,7 @@ impl WireGuardTransport {
         (
             Self {
                 sessions: Arc::new(Mutex::new(HashMap::new())),
+                pending_outbound: Arc::new(Mutex::new(HashMap::new())),
                 encrypted_tx,
             },
             encrypted_rx,
@@ -113,7 +125,9 @@ impl WireGuardTransport {
 
     /// Install or replace an established transport session for a peer.
     pub async fn add_session(&self, peer_id: impl Into<String>, session: TransportSession) {
-        self.sessions.lock().await.insert(peer_id.into(), session);
+        let peer_id = peer_id.into();
+        self.sessions.lock().await.insert(peer_id.clone(), session);
+        self.flush_pending_outbound_for_peer(&peer_id).await;
     }
 
     /// Replace a session and return the previous value for transactional rollback.
@@ -127,17 +141,23 @@ impl WireGuardTransport {
 
     /// Restore the session state captured before a transactional replacement.
     pub async fn restore_session(&self, peer_id: &str, previous: Option<TransportSession>) {
+        let restored_previous = previous.is_some();
         let mut sessions = self.sessions.lock().await;
         if let Some(previous) = previous {
             sessions.insert(peer_id.to_string(), previous);
         } else {
             sessions.remove(peer_id);
         }
+        drop(sessions);
+        if restored_previous {
+            self.flush_pending_outbound_for_peer(peer_id).await;
+        }
     }
 
     /// Remove a peer session.
     pub async fn remove_session(&self, peer_id: &str) {
         self.sessions.lock().await.remove(peer_id);
+        self.pending_outbound.lock().await.remove(peer_id);
     }
 
     /// Return whether a peer has an encrypting session.
@@ -170,6 +190,25 @@ impl WireGuardTransport {
         &self,
         packet: OutboundPacket,
     ) -> Result<Option<EncryptedPeerPacket>> {
+        self.encrypt_outbound_inner(packet, false).await
+    }
+
+    /// Encrypt one outbound user packet, or queue it briefly if the session is
+    /// not installed yet. This is used only by the TUN data path; synthetic
+    /// validation/probe packets continue to use encrypt_outbound so they do not
+    /// fill the startup queue while polling for readiness.
+    pub async fn encrypt_or_queue_outbound(
+        &self,
+        packet: OutboundPacket,
+    ) -> Result<Option<EncryptedPeerPacket>> {
+        self.encrypt_outbound_inner(packet, true).await
+    }
+
+    async fn encrypt_outbound_inner(
+        &self,
+        packet: OutboundPacket,
+        queue_if_unavailable: bool,
+    ) -> Result<Option<EncryptedPeerPacket>> {
         let mut sessions = self.sessions.lock().await;
         // Session expiry is an expected boundary during a rekey.  It must not
         // terminate the long-lived TUN-to-WireGuard worker: the handshake
@@ -182,19 +221,31 @@ impl WireGuardTransport {
             .is_some_and(TransportSession::is_expired)
         {
             sessions.remove(&packet.peer_id);
-            debug!(
-                "WireGuard session for peer {} expired; dropping {} byte packet until rekey completes",
-                packet.peer_id,
-                packet.packet.len()
-            );
+            drop(sessions);
+            if queue_if_unavailable {
+                self.queue_pending_outbound(packet, "session expired before rekey")
+                    .await;
+            } else {
+                debug!(
+                    "WireGuard session for peer {} expired; dropping {} byte packet until rekey completes",
+                    packet.peer_id,
+                    packet.packet.len()
+                );
+            }
             return Ok(None);
         }
         let Some(session) = sessions.get_mut(&packet.peer_id) else {
-            debug!(
-                "No WireGuard session for peer {}; dropping {} byte packet",
-                packet.peer_id,
-                packet.packet.len()
-            );
+            drop(sessions);
+            if queue_if_unavailable {
+                self.queue_pending_outbound(packet, "session not ready")
+                    .await;
+            } else {
+                debug!(
+                    "No WireGuard session for peer {}; dropping {} byte packet",
+                    packet.peer_id,
+                    packet.packet.len()
+                );
+            }
             return Ok(None);
         };
 
@@ -207,6 +258,120 @@ impl WireGuardTransport {
             dst_ip: packet.dst_ip,
             wire_bytes,
         }))
+    }
+
+    async fn queue_pending_outbound(&self, packet: OutboundPacket, reason: &'static str) {
+        let now = Instant::now();
+        let peer_id = packet.peer_id.clone();
+        let packet_len = packet.packet.len();
+        let mut pending = self.pending_outbound.lock().await;
+        let queue = pending.entry(peer_id.clone()).or_default();
+        let stale_before = queue.len();
+        queue.retain(|queued| {
+            now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL
+        });
+        let stale_dropped = stale_before.saturating_sub(queue.len());
+        let mut overflow_dropped = 0usize;
+        while queue.len() >= MAX_PENDING_OUTBOUND_PER_PEER {
+            queue.pop_front();
+            overflow_dropped = overflow_dropped.saturating_add(1);
+        }
+        queue.push_back(PendingOutboundPacket {
+            queued_at: now,
+            packet,
+        });
+        debug!(
+            "Queued outbound packet for peer {} until WireGuard session is ready ({} bytes, reason={}, depth={}, stale_dropped={}, overflow_dropped={})",
+            peer_id,
+            packet_len,
+            reason,
+            queue.len(),
+            stale_dropped,
+            overflow_dropped
+        );
+    }
+
+    pub(crate) async fn flush_pending_outbound_for_peer(&self, peer_id: &str) {
+        let now = Instant::now();
+        let (packets, expired_count) = {
+            let mut pending = self.pending_outbound.lock().await;
+            let Some(queue) = pending.get_mut(peer_id) else {
+                return;
+            };
+            let mut packets = Vec::with_capacity(queue.len());
+            let mut expired_count = 0usize;
+            while let Some(queued) = queue.pop_front() {
+                if now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL {
+                    packets.push(queued.packet);
+                } else {
+                    expired_count = expired_count.saturating_add(1);
+                }
+            }
+            pending.remove(peer_id);
+            (packets, expired_count)
+        };
+
+        if packets.is_empty() {
+            if expired_count > 0 {
+                debug!(
+                    "Discarded {} expired pending outbound packets for peer {}",
+                    expired_count, peer_id
+                );
+            }
+            return;
+        }
+
+        let mut encrypted_packets = Vec::with_capacity(packets.len());
+        let mut encrypt_failed = 0usize;
+        {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(peer_id) else {
+                debug!(
+                    "WireGuard session for peer {} disappeared before pending packet flush; re-queueing {} packets",
+                    peer_id,
+                    packets.len()
+                );
+                drop(sessions);
+                for packet in packets {
+                    self.queue_pending_outbound(packet, "session disappeared before flush")
+                        .await;
+                }
+                return;
+            };
+
+            for packet in packets {
+                match session.encrypt_to_bytes(&packet.packet) {
+                    Ok(wire_bytes) => encrypted_packets.push(EncryptedPeerPacket {
+                        peer_id: packet.peer_id,
+                        dst_ip: packet.dst_ip,
+                        wire_bytes,
+                    }),
+                    Err(err) => {
+                        encrypt_failed = encrypt_failed.saturating_add(1);
+                        warn!(
+                            "Dropping pending outbound packet for peer {} after WireGuard encrypt failed: {err}",
+                            peer_id
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut sent_count = 0usize;
+        for encrypted in encrypted_packets {
+            if let Err(err) = self.encrypted_tx.send(encrypted).await {
+                warn!(
+                    "Pending outbound packet channel closed while flushing peer {}: {err}",
+                    peer_id
+                );
+                break;
+            }
+            sent_count = sent_count.saturating_add(1);
+        }
+        debug!(
+            "Flushed pending outbound packets for peer {} (sent={}, expired={}, encrypt_failed={})",
+            peer_id, sent_count, expired_count, encrypt_failed
+        );
     }
 
     /// Decrypt one inbound WireGuard transport packet.
@@ -243,7 +408,7 @@ impl WireGuardTransport {
         mut outbound_rx: mpsc::Receiver<OutboundPacket>,
     ) -> Result<()> {
         while let Some(packet) = outbound_rx.recv().await {
-            if let Some(encrypted) = self.encrypt_outbound(packet).await? {
+            if let Some(encrypted) = self.encrypt_or_queue_outbound(packet).await? {
                 self.encrypted_tx.send(encrypted).await.map_err(|_| {
                     DaemonError::Network("encrypted packet channel closed".to_string())
                 })?;
