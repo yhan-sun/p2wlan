@@ -30,6 +30,12 @@ class DesktopTrayController with TrayListener, WindowListener {
   static const _macosOffIconAsset = 'assets/tray_icon_macos_off.png';
   static const _macosAttentionIconAsset =
       'assets/tray_icon_macos_attention.png';
+  static const _quitBusyPollInterval = Duration(milliseconds: 100);
+  static const _quitBusyTimeout = Duration(seconds: 20);
+  static const _alreadyStoppedResult = DaemonCommandResult(
+    ok: true,
+    message: 'p2wlan-daemon is already stopped.',
+  );
 
   bool _initialized = false;
   bool _quitting = false;
@@ -200,9 +206,10 @@ class DesktopTrayController with TrayListener, WindowListener {
     if (!Platform.isMacOS) {
       return Platform.isWindows ? _windowsTrayIconAsset : _linuxTrayIconAsset;
     }
+    if (statusStore.daemonBusy) return _macosBusyIconAsset;
     if (!statusStore.daemonReachable) return _macosOffIconAsset;
     final health = statusStore.snapshot?.health.status.toLowerCase();
-    if (health == 'healthy' || statusStore.daemonBusy) return _macosOnIconAsset;
+    if (health == 'healthy') return _macosOnIconAsset;
     return _macosAttentionIconAsset;
   }
 
@@ -272,7 +279,32 @@ class DesktopTrayController with TrayListener, WindowListener {
   }
 
   Future<DaemonCommandResult> _stopDaemonForQuit() {
-    return _stopDaemonFuture ?? _stopDaemon();
+    final existing = _stopDaemonFuture;
+    if (existing != null) return existing;
+    return _stopDaemonForQuitAfterExternalCommand();
+  }
+
+  Future<DaemonCommandResult> _stopDaemonForQuitAfterExternalCommand() async {
+    await _waitForExternalDaemonCommand();
+    final existing = _stopDaemonFuture;
+    if (existing != null) return existing;
+    if (!statusStore.daemonBusy && !statusStore.daemonReachable) {
+      return _alreadyStoppedResult;
+    }
+
+    final result = await _stopDaemon();
+    if (!result.ok && !statusStore.daemonReachable) {
+      return _alreadyStoppedResult;
+    }
+    return result;
+  }
+
+  Future<void> _waitForExternalDaemonCommand() async {
+    if (!statusStore.daemonBusy) return;
+    final deadline = DateTime.now().add(_quitBusyTimeout);
+    while (statusStore.daemonBusy && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(_quitBusyPollInterval);
+    }
   }
 
   @visibleForTesting
@@ -311,13 +343,21 @@ class DesktopTrayController with TrayListener, WindowListener {
       await _updateMenu();
       return;
     }
+    await _destroyTrayWindowAndExit();
+  }
+
+  Future<void> _destroyTrayWindowAndExit() async {
     try {
       await trayManager.destroy();
     } catch (_) {
       // Ignore best effort tray teardown.
     }
-    await windowManager.setPreventClose(false);
-    await windowManager.destroy();
+    try {
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+    } finally {
+      Timer(const Duration(milliseconds: 400), () => exit(0));
+    }
   }
 
   Directory _defaultLogDir() {

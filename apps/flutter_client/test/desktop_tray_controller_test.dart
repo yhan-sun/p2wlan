@@ -168,6 +168,56 @@ void main() {
     expect(result.ok, isTrue);
     expect(daemonController.stopCalls, 1);
   });
+
+  test('desktop tray quit skips stop when daemon is already offline', () async {
+    final api = _FakeDiagnosticsApi(snapshot: null);
+    final daemonController = _CountingStopDaemonController(diagnosticsApi: api);
+    final stores = await _makeStores(
+      api: api,
+      daemonController: daemonController,
+    );
+    addTearDown(stores.dispose);
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    final result = await controller.stopDaemonForQuitForTesting();
+
+    expect(result.ok, isTrue);
+    expect(daemonController.stopCalls, 0);
+  });
+
+  test(
+    'desktop tray quit proceeds when redundant stop finds daemon offline',
+    () async {
+      final snapshot = await _loadFixtureSnapshot();
+      final api = _FakeDiagnosticsApi(snapshot: snapshot);
+      final daemonController = _OfflineAfterFailedStopDaemonController(
+        diagnosticsApi: api,
+        api: api,
+      );
+      final stores = await _makeStores(
+        api: api,
+        daemonController: daemonController,
+      );
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+
+      final controller = DesktopTrayController(
+        settingsStore: stores.settingsStore,
+        statusStore: stores.statusStore,
+      );
+
+      final result = await controller.stopDaemonForQuitForTesting();
+
+      expect(result.ok, isTrue);
+      expect(stores.statusStore.daemonReachable, isFalse);
+      expect(daemonController.stopCalls, 1);
+    },
+  );
 }
 
 String _expectedTrayIconAsset(String macosAsset) {
@@ -228,19 +278,24 @@ class _Stores {
 }
 
 class _FakeDiagnosticsApi implements DiagnosticsApi {
-  const _FakeDiagnosticsApi({required this.snapshot});
+  _FakeDiagnosticsApi({required this.snapshot});
 
-  final DiagnosticsSnapshot snapshot;
-
-  @override
-  Future<bool> fetchHealth(String diagnosticsUrl) async => true;
+  DiagnosticsSnapshot? snapshot;
 
   @override
-  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async =>
-      snapshot;
+  Future<bool> fetchHealth(String diagnosticsUrl) async => snapshot != null;
 
   @override
-  Future<bool> requestShutdown(String diagnosticsUrl) async => true;
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
+    final currentSnapshot = snapshot;
+    if (currentSnapshot == null) {
+      throw const DiagnosticsApiException('Diagnostics are offline');
+    }
+    return currentSnapshot;
+  }
+
+  @override
+  Future<bool> requestShutdown(String diagnosticsUrl) async => snapshot != null;
 
   @override
   void close() {}
@@ -248,9 +303,9 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
 
 class _DelayedStopDaemonController extends DaemonController {
   _DelayedStopDaemonController({
-    required DiagnosticsApi diagnosticsApi,
+    required super.diagnosticsApi,
     required this.stopCompleter,
-  }) : super(diagnosticsApi: diagnosticsApi);
+  });
 
   final Completer<DaemonCommandResult> stopCompleter;
   var stopCalls = 0;
@@ -259,5 +314,34 @@ class _DelayedStopDaemonController extends DaemonController {
   Future<DaemonCommandResult> stop(String diagnosticsUrl) {
     stopCalls += 1;
     return stopCompleter.future;
+  }
+}
+
+class _CountingStopDaemonController extends DaemonController {
+  _CountingStopDaemonController({required super.diagnosticsApi});
+
+  var stopCalls = 0;
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    stopCalls += 1;
+    return const DaemonCommandResult(ok: true, message: 'fake stop');
+  }
+}
+
+class _OfflineAfterFailedStopDaemonController extends DaemonController {
+  _OfflineAfterFailedStopDaemonController({
+    required super.diagnosticsApi,
+    required this.api,
+  });
+
+  final _FakeDiagnosticsApi api;
+  var stopCalls = 0;
+
+  @override
+  Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    stopCalls += 1;
+    api.snapshot = null;
+    return const DaemonCommandResult(ok: false, message: 'already stopped');
   }
 }
