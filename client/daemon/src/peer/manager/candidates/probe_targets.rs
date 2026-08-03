@@ -1,3 +1,10 @@
+#[derive(Debug, Clone)]
+pub(crate) struct DirectProbeTargetSet {
+    pub peer_id: String,
+    pub candidates: Vec<SocketAddr>,
+    pub remote_scatter_pool: bool,
+}
+
 impl PeerManager {
     /// Return the best current direct endpoint for encrypted UDP data.
     pub async fn direct_endpoint_for_send(&self, node_id: &str) -> Option<SocketAddr> {
@@ -26,20 +33,28 @@ impl PeerManager {
 
     /// Return candidate endpoints for a specific peer using the adaptive probe scheduler.
     pub async fn direct_probe_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
+        self.direct_probe_target_set_for(node_id)
+            .await
+            .map(|target| target.candidates)
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn direct_probe_target_set_for(
+        &self,
+        node_id: &str,
+    ) -> Option<DirectProbeTargetSet> {
         let generation = self.current_network_generation().await;
         let history = self.traversal_history.read().await.clone();
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
         let mut conns = self.connections.write().await;
-        let Some(conn) = conns.get_mut(node_id) else {
-            return Vec::new();
-        };
+        let conn = conns.get_mut(node_id)?;
         if !conn.online {
-            return Vec::new();
+            return None;
         }
         if conn.state == ConnectionState::Direct
             && !conn.should_probe_private_alternates_while_direct(generation)
         {
-            return Vec::new();
+            return None;
         }
         let endpoints = conn.candidate_probe_endpoints(
             generation,
@@ -60,7 +75,15 @@ impl PeerManager {
                 ),
             );
         }
-        endpoints
+        if endpoints.is_empty() {
+            None
+        } else {
+            Some(DirectProbeTargetSet {
+                peer_id: conn.node_id.clone(),
+                remote_scatter_pool: conn.candidate_targets_need_remote_scatter_pool(&endpoints),
+                candidates: endpoints,
+            })
+        }
     }
 
     /// Return stable public endpoints that a hard local NAT should continuously
@@ -167,10 +190,10 @@ impl PeerManager {
     /// after the peer-level retry cooldown has elapsed, except during the
     /// short generation-change reclaim window for peers with previous Direct
     /// success.
-    pub async fn direct_probe_targets_due(
+    pub(crate) async fn direct_probe_targets_due(
         &self,
         base_retry_after: Duration,
-    ) -> Vec<(String, Vec<SocketAddr>)> {
+    ) -> Vec<DirectProbeTargetSet> {
         let generation = self.current_network_generation().await;
         let history = self.traversal_history.read().await.clone();
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
@@ -236,7 +259,12 @@ impl PeerManager {
                             ),
                         );
                     }
-                    Some((conn.node_id.clone(), endpoints))
+                    Some(DirectProbeTargetSet {
+                        peer_id: conn.node_id.clone(),
+                        remote_scatter_pool: conn
+                            .candidate_targets_need_remote_scatter_pool(&endpoints),
+                        candidates: endpoints,
+                    })
                 }
             })
             .collect()

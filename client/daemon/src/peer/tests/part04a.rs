@@ -23,9 +23,9 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
         .direct_probe_targets_due(Duration::from_secs(0))
         .await;
     assert_eq!(due_targets.len(), 1);
-    assert_eq!(due_targets[0].0, "peer1");
+    assert_eq!(due_targets[0].peer_id, "peer1");
 
-    let targets = &due_targets[0].1;
+    let targets = &due_targets[0].candidates;
     let birthday_count = targets
         .iter()
         .filter(|target| {
@@ -93,7 +93,7 @@ async fn failed_stable_public_candidate_gets_short_background_retry() {
         .direct_probe_targets_due(Duration::from_secs(5))
         .await;
     assert_eq!(due_targets.len(), 1);
-    assert_eq!(due_targets[0].1, vec![stable_endpoint]);
+    assert_eq!(due_targets[0].candidates, vec![stable_endpoint]);
 }
 
 #[tokio::test]

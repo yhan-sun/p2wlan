@@ -59,6 +59,32 @@ impl PeerConnection {
             .unwrap_or(CandidatePairSource::Signaled)
     }
 
+    fn candidate_targets_need_remote_scatter_pool(&self, endpoints: &[SocketAddr]) -> bool {
+        if endpoints.iter().any(|endpoint| {
+            matches!(
+                self.candidate_source_for_endpoint(*endpoint),
+                CandidatePairSource::Predicted | CandidatePairSource::Birthday
+            )
+        }) {
+            return true;
+        }
+
+        let mut ports_by_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+        for endpoint in endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+        {
+            ports_by_ip
+                .entry(endpoint.ip())
+                .or_default()
+                .insert(endpoint.port());
+        }
+        ports_by_ip
+            .values()
+            .any(|ports| ports.len() >= REMOTE_SCATTER_POOL_MIN_PUBLIC_PORTS)
+    }
+
     fn ensure_candidate_pair(
         &mut self,
         endpoint: SocketAddr,

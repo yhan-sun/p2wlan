@@ -381,6 +381,12 @@ async fn predicted_window_remains_in_synchronized_active_pool_scan() {
     let targets = manager.direct_probe_targets_for("peer1").await;
     assert!(targets.contains(&stable_endpoint));
     assert!(predicted.iter().any(|endpoint| targets.contains(endpoint)));
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("predicted window should produce synchronized targets");
+    assert!(target_set.remote_scatter_pool);
 }
 
 #[tokio::test]
@@ -397,6 +403,12 @@ async fn ordinary_stable_public_probe_remains_single_target() {
 
     let targets = manager.direct_probe_targets_for("peer1").await;
     assert_eq!(targets, vec![stable_endpoint]);
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("stable candidate should produce targets");
+    assert!(!target_set.remote_scatter_pool);
 }
 
 #[tokio::test]

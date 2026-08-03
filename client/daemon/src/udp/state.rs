@@ -109,6 +109,7 @@ enum PendingProbePurpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PunchSocketPolicy {
     ActivePool,
+    RemoteScatterPool,
     PrimaryOnly,
 }
 
@@ -116,6 +117,7 @@ impl PunchSocketPolicy {
     fn socket_count(self, transport: &UdpTransport) -> usize {
         match self {
             Self::ActivePool => transport.punch_socket_count(),
+            Self::RemoteScatterPool => transport.socket_count(),
             Self::PrimaryOnly => 1,
         }
     }
@@ -123,6 +125,7 @@ impl PunchSocketPolicy {
     fn label(self) -> &'static str {
         match self {
             Self::ActivePool => "active_pool",
+            Self::RemoteScatterPool => "remote_scatter_pool",
             Self::PrimaryOnly => "primary_only",
         }
     }

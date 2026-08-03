@@ -248,6 +248,64 @@ async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted
 }
 
 #[tokio::test]
+async fn remote_scatter_pool_uses_all_bound_sockets_even_when_local_pool_inactive() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(4)
+        .await
+        .unwrap();
+    assert_eq!(transport.socket_count(), 4);
+    assert!(!transport.socket_pool_active());
+
+    let candidates = (0..200)
+        .map(|offset| format!("127.0.0.1:{}", 22_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let sent = transport
+        .punch_candidates_remote_scatter_pool("peer-b", candidates, Duration::ZERO, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(sent as usize, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+    let pending = transport.pending_probes.lock().await;
+    let mut per_socket = vec![0usize; transport.socket_count()];
+    for probe in pending.values() {
+        per_socket[probe.socket_index] += 1;
+    }
+    let expected_per_socket = OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP / transport.socket_count();
+    assert_eq!(
+        per_socket,
+        vec![expected_per_socket; transport.socket_count()]
+    );
+    drop(pending);
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "active_pool_scan_completed")
+        .expect("remote scatter scan should emit coverage diagnostics");
+    assert_eq!(event.sent_probes, Some(sent));
+    assert_eq!(
+        event.probe_tx_socket0_count,
+        Some(u32::try_from(expected_per_socket).unwrap())
+    );
+    assert_eq!(
+        event.probe_tx_alt_socket_count,
+        Some(u32::try_from(expected_per_socket * (transport.socket_count() - 1)).unwrap())
+    );
+    assert!(event
+        .detail
+        .contains("scan_socket_policy=remote_scatter_pool"));
+    assert!(event
+        .detail
+        .contains(&format!("punch_sockets={}", transport.socket_count())));
+}
+
+#[tokio::test]
 async fn primary_socket_punch_never_uses_alternate_pool_sockets() {
     let peers = peer_manager();
     peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;

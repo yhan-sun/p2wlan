@@ -168,6 +168,26 @@ impl UdpTransport {
         .await
     }
 
+    /// Send active UDP probes from every bound socket for a remote hard-NAT
+    /// scatter window even when this local NAT profile did not require the
+    /// socket pool for candidate gathering.
+    pub async fn punch_candidates_remote_scatter_pool(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<u32> {
+        self.punch_candidates_with_socket_policy(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::RemoteScatterPool,
+        )
+        .await
+    }
+
     /// Send active UDP probes only from the primary socket.
     ///
     /// This is reserved for explicit single-socket diagnostics and tests. The
@@ -227,7 +247,9 @@ impl UdpTransport {
             }
 
             let probe_order = match socket_policy {
-                PunchSocketPolicy::ActivePool if socket_count > 1 => {
+                PunchSocketPolicy::ActivePool | PunchSocketPolicy::RemoteScatterPool
+                    if socket_count > 1 =>
+                {
                     // Hard NAT traversal needs the alternate sockets to send real
                     // peer-directed traffic, not just STUN probes. Candidate-major
                     // ordering gives every high-priority remote port a chance from
@@ -392,7 +414,11 @@ impl UdpTransport {
         let repeated_target_ports = packets_sent.saturating_sub(unique_target_ports);
         let stage = match socket_policy {
             PunchSocketPolicy::ActivePool if socket_count > 1 => "active_pool_scan_completed",
+            PunchSocketPolicy::RemoteScatterPool if socket_count > 1 => {
+                "active_pool_scan_completed"
+            }
             PunchSocketPolicy::ActivePool => "single_socket_scan_completed",
+            PunchSocketPolicy::RemoteScatterPool => "single_socket_scan_completed",
             PunchSocketPolicy::PrimaryOnly => "primary_socket_scan_completed",
         };
         self.peers

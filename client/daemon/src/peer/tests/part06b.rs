@@ -9,7 +9,9 @@ async fn direct_probe_targets_due_respects_backoff_without_false_probing() {
     let first_targets = manager
         .direct_probe_targets_due(Duration::from_secs(5))
         .await;
-    assert_eq!(first_targets, vec![("peer1".to_string(), vec![endpoint])]);
+    assert_eq!(first_targets.len(), 1);
+    assert_eq!(first_targets[0].peer_id, "peer1");
+    assert_eq!(first_targets[0].candidates, vec![endpoint]);
 
     manager
         .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "no ACK")
