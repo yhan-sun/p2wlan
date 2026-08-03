@@ -85,6 +85,18 @@ pub(super) enum OutboundProbeAdmission {
     GlobalRemoteIpRateLimited,
 }
 
+pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission) -> &'static str {
+    match admission {
+        OutboundProbeAdmission::Accepted => "accepted",
+        OutboundProbeAdmission::NetworkRateLimited => "network_rate_limited",
+        OutboundProbeAdmission::PeerRateLimited => "peer_rate_limited",
+        OutboundProbeAdmission::RemoteIpRateLimited => "remote_ip_rate_limited",
+        OutboundProbeAdmission::GlobalNetworkRateLimited => "global_network_rate_limited",
+        OutboundProbeAdmission::GlobalPeerRateLimited => "global_peer_rate_limited",
+        OutboundProbeAdmission::GlobalRemoteIpRateLimited => "global_remote_ip_rate_limited",
+    }
+}
+
 pub(super) fn default_global_outbound_probe_budget() -> Option<Arc<GlobalOutboundProbeBudget>> {
     if std::env::var("P2WLAN_DISABLE_GLOBAL_PROBE_BUDGET").as_deref() == Ok("1") {
         return None;

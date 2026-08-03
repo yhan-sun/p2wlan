@@ -5,6 +5,7 @@ type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 type PeerReflexiveNotificationState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
 type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr, usize), Instant>>>;
+type NatMaintainerState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
@@ -45,6 +46,10 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub socket_index: usize,
     /// Successful UDP punch probes sent from this socket.
     pub probes_sent: u64,
+    /// Single-socket NAT-state maintainer probes sent from this socket.
+    pub nat_maintainer_probes_sent: u64,
+    /// NAT-state maintainer probes skipped by the outbound admission budget.
+    pub nat_maintainer_probe_skips: u64,
     /// Nomination/consent probe retransmissions sent from this socket.
     pub probe_retransmissions_sent: u64,
     /// Punch ACKs sent from this socket after receiving a probe.
@@ -99,6 +104,28 @@ struct PendingProbe {
 enum PendingProbePurpose {
     ConnectivityCheck,
     ConsentCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchSocketPolicy {
+    ActivePool,
+    PrimaryOnly,
+}
+
+impl PunchSocketPolicy {
+    fn socket_count(self, transport: &UdpTransport) -> usize {
+        match self {
+            Self::ActivePool => transport.punch_socket_count(),
+            Self::PrimaryOnly => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ActivePool => "active_pool",
+            Self::PrimaryOnly => "primary_only",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

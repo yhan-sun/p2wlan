@@ -1,4 +1,155 @@
 impl UdpTransport {
+    /// Keep a mapping-dependent local NAT binding warm toward one stable peer endpoint.
+    ///
+    /// This is intentionally separate from the bounded candidate punch: a
+    /// symmetric/hard NAT side should maintain one destination-specific binding
+    /// with the primary socket while the easier peer scans the hard side's
+    /// predicted/birthday window.
+    pub async fn spawn_nat_binding_maintainer(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+        interval: Duration,
+        duration: Duration,
+    ) -> bool {
+        if interval.is_zero() || duration.is_zero() {
+            return false;
+        }
+
+        let key = (peer_id.to_string(), endpoint);
+        let now = Instant::now();
+        let expires_at = now + duration;
+        {
+            let mut maintainers = self.nat_maintainers.lock().await;
+            maintainers.retain(|_, expires_at| *expires_at > now);
+            if maintainers.contains_key(&key) {
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "nat_maintainer_suppressed",
+                        Some(endpoint),
+                        Some(1),
+                        None,
+                        "suppressed overlapping NAT-state maintainer for this peer endpoint",
+                    )
+                    .await;
+                return false;
+            }
+            maintainers.insert(key.clone(), expires_at);
+        }
+
+        let transport = self.clone();
+        let peers = self.peers.clone();
+        let peer_id = peer_id.to_string();
+        tokio::spawn(async move {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "nat_maintainer_started",
+                    Some(endpoint),
+                    Some(1),
+                    None,
+                    format!(
+                        "maintaining hard-NAT binding toward stable endpoint for {}ms every {}ms",
+                        duration.as_millis(),
+                        interval.as_millis()
+                    ),
+                )
+                .await;
+
+            let started_at = Instant::now();
+            let deadline = started_at + duration;
+            let mut sent = 0u32;
+            let mut skipped = 0u32;
+            let mut last_skip_reason = None;
+            let mut stop_reason = "duration_elapsed";
+
+            loop {
+                if peers.is_direct(&peer_id).await {
+                    stop_reason = "direct_confirmed";
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+
+                match transport
+                    .admit_outbound_connectivity_probe(&peer_id, endpoint)
+                    .await
+                {
+                    OutboundProbeAdmission::Accepted => {
+                        match transport
+                            .send_probe_from_socket(0, Some(&peer_id), endpoint)
+                            .await
+                        {
+                            Ok(_) => {
+                                sent = sent.saturating_add(1);
+                                transport
+                                    .update_socket_diagnostics(0, |metrics| {
+                                        metrics.nat_maintainer_probes_sent =
+                                            metrics.nat_maintainer_probes_sent.saturating_add(1);
+                                    })
+                                    .await;
+                                peers.record_direct_probe_sent(&peer_id, endpoint).await;
+                            }
+                            Err(err) => {
+                                stop_reason = "send_error";
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "nat_maintainer_send_error",
+                                        Some(endpoint),
+                                        Some(1),
+                                        Some(sent),
+                                        format!("NAT-state maintainer send failed: {err}"),
+                                    )
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    limited => {
+                        skipped = skipped.saturating_add(1);
+                        last_skip_reason = Some(outbound_probe_admission_reason(limited));
+                        transport
+                            .update_socket_diagnostics(0, |metrics| {
+                                metrics.nat_maintainer_probe_skips =
+                                    metrics.nat_maintainer_probe_skips.saturating_add(1);
+                            })
+                            .await;
+                    }
+                }
+
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                sleep(interval.min(remaining)).await;
+            }
+
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "nat_maintainer_stopped",
+                    Some(endpoint),
+                    Some(1),
+                    Some(sent),
+                    format!(
+                        "stopped NAT-state maintainer reason={stop_reason} sent={sent} skipped={skipped} last_skip_reason={}",
+                        last_skip_reason.unwrap_or("none")
+                    ),
+                )
+                .await;
+
+            let mut maintainers = transport.nat_maintainers.lock().await;
+            if maintainers.get(&key).copied() == Some(expires_at) {
+                maintainers.remove(&key);
+            }
+        });
+
+        true
+    }
+
     /// Send active UDP probes to every candidate for a peer.
     pub async fn punch_candidates(
         &self,
@@ -6,6 +157,47 @@ impl UdpTransport {
         candidates: Vec<SocketAddr>,
         probe_interval: Duration,
         attempts: u32,
+    ) -> Result<u32> {
+        self.punch_candidates_with_socket_policy(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::ActivePool,
+        )
+        .await
+    }
+
+    /// Send active UDP probes only from the primary socket.
+    ///
+    /// This is used for predicted/birthday scans against a hard peer. The peer
+    /// is maintaining a destination-specific NAT binding toward our stable
+    /// public endpoint, so alternate local sockets would create different
+    /// public source ports and are usually not part of that peer's filter.
+    pub async fn punch_candidates_primary_socket(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<u32> {
+        self.punch_candidates_with_socket_policy(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::PrimaryOnly,
+        )
+        .await
+    }
+
+    async fn punch_candidates_with_socket_policy(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        socket_policy: PunchSocketPolicy,
     ) -> Result<u32> {
         if candidates.is_empty() || attempts == 0 {
             return Ok(0);
@@ -23,6 +215,11 @@ impl UdpTransport {
         let mut budget_skipped = 0u32;
         let mut last_budget_reason = None;
         let mut session_capped = false;
+        let mut sent_endpoints = HashSet::new();
+        let mut sent_ports = HashSet::new();
+        let mut socket0_sent = 0u32;
+        let mut alt_socket_sent = 0u32;
+        let socket_count = socket_policy.socket_count(self);
         'schedule: for (round_index, round) in schedule.iter().enumerate() {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
@@ -34,7 +231,7 @@ impl UdpTransport {
             // socket sweep as many remote candidates as possible before the
             // hard per-session cap is reached, then spends any remaining
             // budget on alternate local sockets.
-            for socket_index in 0..self.punch_socket_count() {
+            for socket_index in 0..socket_count {
                 for &candidate in &round.endpoints {
                     if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
                         session_capped = true;
@@ -107,6 +304,13 @@ impl UdpTransport {
                     {
                         Ok(_) => {
                             packets_sent += 1;
+                            if socket_index == 0 {
+                                socket0_sent = socket0_sent.saturating_add(1);
+                            } else {
+                                alt_socket_sent = alt_socket_sent.saturating_add(1);
+                            }
+                            sent_endpoints.insert(candidate);
+                            sent_ports.insert(candidate.port());
                             self.peers
                                 .record_direct_probe_sent(peer_id, candidate)
                                 .await;
@@ -159,6 +363,34 @@ impl UdpTransport {
                     format!(
                         "skipped {budget_skipped} UDP punch probes due to outbound {reason}; sent {packets_sent}"
                     ),
+                )
+                .await;
+        }
+
+        if socket_policy == PunchSocketPolicy::PrimaryOnly {
+            let unique_target_ports = u32::try_from(sent_ports.len()).unwrap_or(u32::MAX);
+            let repeated_target_ports = packets_sent.saturating_sub(unique_target_ports);
+            self.peers
+                .record_direct_event_with_probe_coverage(
+                    peer_id,
+                    "primary_socket_scan_completed",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "scan_socket_policy={} scan_socket_id=0 active_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={}",
+                        socket_policy.label(),
+                        self.socket_count(),
+                        candidates.len(),
+                        attempts,
+                        sent_endpoints.len(),
+                        sent_ports.len(),
+                        repeated_target_ports
+                    ),
+                    socket0_sent,
+                    alt_socket_sent,
+                    unique_target_ports,
+                    repeated_target_ports,
                 )
                 .await;
         }

@@ -263,6 +263,10 @@ pub struct DirectTraversalEvent {
     pub endpoint: Option<SocketAddr>,
     pub candidate_count: Option<usize>,
     pub sent_probes: Option<u32>,
+    pub probe_tx_socket0_count: Option<u32>,
+    pub probe_tx_alt_socket_count: Option<u32>,
+    pub probe_tx_unique_target_ports: Option<u32>,
+    pub probe_tx_repeated_target_ports: Option<u32>,
     pub detail: String,
 }
 
@@ -282,7 +286,25 @@ impl DirectTraversalEvent {
             endpoint,
             candidate_count,
             sent_probes,
+            probe_tx_socket0_count: None,
+            probe_tx_alt_socket_count: None,
+            probe_tx_unique_target_ports: None,
+            probe_tx_repeated_target_ports: None,
             detail: detail.into(),
         }
+    }
+
+    pub(super) fn with_probe_coverage(
+        mut self,
+        socket0_count: u32,
+        alt_socket_count: u32,
+        unique_target_ports: u32,
+        repeated_target_ports: u32,
+    ) -> Self {
+        self.probe_tx_socket0_count = Some(socket0_count);
+        self.probe_tx_alt_socket_count = Some(alt_socket_count);
+        self.probe_tx_unique_target_ports = Some(unique_target_ports);
+        self.probe_tx_repeated_target_ports = Some(repeated_target_ports);
+        self
     }
 }

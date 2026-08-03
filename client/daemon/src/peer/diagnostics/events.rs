@@ -41,6 +41,10 @@ pub struct DirectTraversalEventDiagnostics {
     pub endpoint: Option<String>,
     pub candidate_count: Option<usize>,
     pub sent_probes: Option<u32>,
+    pub probe_tx_socket0_count: Option<u32>,
+    pub probe_tx_alt_socket_count: Option<u32>,
+    pub probe_tx_unique_target_ports: Option<u32>,
+    pub probe_tx_repeated_target_ports: Option<u32>,
     pub detail: String,
 }
 
@@ -53,6 +57,10 @@ impl From<&DirectTraversalEvent> for DirectTraversalEventDiagnostics {
             endpoint: event.endpoint.map(|endpoint| endpoint.to_string()),
             candidate_count: event.candidate_count,
             sent_probes: event.sent_probes,
+            probe_tx_socket0_count: event.probe_tx_socket0_count,
+            probe_tx_alt_socket_count: event.probe_tx_alt_socket_count,
+            probe_tx_unique_target_ports: event.probe_tx_unique_target_ports,
+            probe_tx_repeated_target_ports: event.probe_tx_repeated_target_ports,
             detail: event.detail.clone(),
         }
     }

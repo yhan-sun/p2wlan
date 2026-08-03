@@ -90,14 +90,37 @@ async fn spawn_hole_punch_task(
                 )
                 .await;
 
+            for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
+                udp.spawn_nat_binding_maintainer(
+                    &peer_id,
+                    endpoint,
+                    HARD_NAT_MAINTAINER_CONNECTING_INTERVAL,
+                    HARD_NAT_MAINTAINER_CONNECTING_DURATION,
+                )
+                .await;
+            }
+
             let success_count_before = peers
                 .direct_probe_success_count_for_generation(&peer_id, generation)
                 .await;
 
-            match udp
-                .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
+            let primary_socket_only = peers
+                .direct_probe_uses_primary_socket_only(&peer_id, &candidates)
+                .await;
+            let punch_result = if primary_socket_only {
+                udp.punch_candidates_primary_socket(
+                    &peer_id,
+                    candidates.clone(),
+                    probe_interval,
+                    attempts,
+                )
                 .await
-            {
+            } else {
+                udp.punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
+                    .await
+            };
+
+            match punch_result {
                 Ok(sent) => {
                     info!("Sent {sent} UDP punch probes to peer {peer_id}");
                     peers
