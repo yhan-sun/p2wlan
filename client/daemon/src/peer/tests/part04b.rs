@@ -55,8 +55,8 @@ async fn previous_direct_success_fast_retries_even_when_nat_now_looks_hard() {
         .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
         .await;
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].0, "peer1");
-    assert!(targets[0].1.contains(&endpoint_a));
+    assert_eq!(targets[0].peer_id, "peer1");
+    assert!(targets[0].candidates.contains(&endpoint_a));
 }
 
 #[tokio::test]
@@ -86,8 +86,8 @@ async fn generation_change_opens_immediate_direct_reclaim_window() {
         .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
         .await;
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].0, "peer1");
-    assert!(targets[0].1.contains(&endpoint));
+    assert_eq!(targets[0].peer_id, "peer1");
+    assert!(targets[0].candidates.contains(&endpoint));
 }
 
 #[tokio::test]
@@ -119,8 +119,8 @@ async fn direct_reclaim_window_bypasses_retry_and_pair_cooldowns() {
         .direct_probe_targets_due(DIRECT_RETRY_BASE_INTERVAL)
         .await;
     assert_eq!(second_targets.len(), 1);
-    assert_eq!(second_targets[0].0, "peer1");
-    assert!(second_targets[0].1.contains(&endpoint));
+    assert_eq!(second_targets[0].peer_id, "peer1");
+    assert!(second_targets[0].candidates.contains(&endpoint));
 
     let conn = manager.get_connection("peer1").await.unwrap();
     assert!(conn

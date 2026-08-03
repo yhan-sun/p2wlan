@@ -49,7 +49,35 @@ async fn spawn_hole_punch_task(
             }
 
             let generation = peers.current_network_generation().await;
-            let candidates = peers.direct_probe_targets_for(&peer_id).await;
+            let Some(target) = peers.direct_probe_target_set_for(&peer_id).await else {
+                let generation = peers.current_network_generation().await;
+                if peers.is_direct(&peer_id).await {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_skipped_already_direct",
+                            None,
+                            None,
+                            None,
+                            "skipped UDP punch because Direct path is already confirmed",
+                        )
+                        .await;
+                    debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+                    return;
+                }
+                debug!("No UDP candidates for {peer_id}; skipping hole punch");
+                peers
+                    .record_direct_failure_for_generation(
+                        &peer_id,
+                        generation,
+                        REASON_DIRECT_PROBE_FAILED,
+                        "no UDP candidates for hole punching",
+                    )
+                    .await;
+                return;
+            };
+            let candidates = target.candidates;
+            let remote_scatter_pool = target.remote_scatter_pool;
             if candidates.is_empty() {
                 if peers.is_direct(&peer_id).await {
                     peers
@@ -105,9 +133,18 @@ async fn spawn_hole_punch_task(
                 .await;
 
             let rx_before = udp.probe_rx_snapshot().await;
-            let punch_result = udp
-                .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
-                .await;
+            let punch_result = if remote_scatter_pool {
+                udp.punch_candidates_remote_scatter_pool(
+                    &peer_id,
+                    candidates.clone(),
+                    probe_interval,
+                    attempts,
+                )
+                .await
+            } else {
+                udp.punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
+                    .await
+            };
 
             match punch_result {
                 Ok(sent) => {

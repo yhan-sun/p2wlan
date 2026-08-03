@@ -24,7 +24,10 @@ async fn run_direct_probe_loop(
             continue;
         }
 
-        for (peer_id, candidates) in peers.direct_probe_targets_due(retry_after).await {
+        for target in peers.direct_probe_targets_due(retry_after).await {
+            let peer_id = target.peer_id;
+            let candidates = target.candidates;
+            let remote_scatter_pool = target.remote_scatter_pool;
             let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
             let dedup_window = if reclaim_active {
                 DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW
@@ -117,14 +120,23 @@ async fn run_direct_probe_loop(
                         .await;
                     }
                     let rx_before = udp.probe_rx_snapshot().await;
-                    let punch_result = udp
-                        .punch_candidates(
+                    let punch_result = if remote_scatter_pool {
+                        udp.punch_candidates_remote_scatter_pool(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
                             attempts,
                         )
-                        .await;
+                        .await
+                    } else {
+                        udp.punch_candidates(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
+                        .await
+                    };
 
                     match punch_result {
                         Ok(0) => {}

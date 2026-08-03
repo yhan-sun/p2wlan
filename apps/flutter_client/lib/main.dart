@@ -44,9 +44,12 @@ bool get _supportsDesktopHost {
 
 bool get _enableFlutterTray {
   if (!_supportsDesktopHost) return false;
-  final value = Platform.environment['P2WLAN_ENABLE_FLUTTER_TRAY']
-      ?.trim()
-      .toLowerCase();
-  if (value == null || value.isEmpty) return false;
-  return value != '0' && value != 'false' && value != 'no';
+  return enableFlutterTrayForEnvironment(Platform.environment);
+}
+
+@visibleForTesting
+bool enableFlutterTrayForEnvironment(Map<String, String> environment) {
+  final value = environment['P2WLAN_ENABLE_FLUTTER_TRAY']?.trim().toLowerCase();
+  if (value == null || value.isEmpty) return true;
+  return value != '0' && value != 'false' && value != 'no' && value != 'off';
 }
