@@ -68,6 +68,7 @@ class AppStrings {
   String get stopP2wlan => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
   String get cancel => isZh ? '取消' : 'Cancel';
+  String get close => isZh ? '关闭' : 'Close';
   String get continueAction => isZh ? '继续' : 'Continue';
   String get lastDaemonAction => isZh ? '最近操作' : 'Last action';
   String get openConsole => isZh ? '打开控制台' : 'Open console';
@@ -149,6 +150,22 @@ class AppStrings {
   String get relayPaths => isZh ? '中继路径' : 'Relay paths';
   String get bytesSent => isZh ? '已发送' : 'Bytes sent';
   String get bytesReceived => isZh ? '已接收' : 'Bytes received';
+  String get natNetworkType => isZh ? '网络类型' : 'Network type';
+  String get natAutoDetected => isZh ? '自动检测' : 'Auto detected';
+  String get natDetectionUnavailable =>
+      isZh ? '等待 NAT 探测' : 'Waiting for NAT probe';
+  String get natDetectionUnavailableDetail => isZh
+      ? '启动并刷新后，P2WLAN 会通过 STUN 观测自动判断本机 NAT 类型。'
+      : 'Start and refresh P2WLAN to classify this network from STUN observations.';
+  String get natPublicEndpoint => isZh ? '公网端点' : 'Public endpoint';
+  String get natMappingBehavior => isZh ? '映射行为' : 'Mapping';
+  String get natFilteringBehavior => isZh ? '过滤行为' : 'Filtering';
+  String get natConfidence => isZh ? '置信度' : 'Confidence';
+  String get natGuideTitle => isZh ? 'NAT 类型说明' : 'NAT type guide';
+  String get natGuideAction => isZh ? '查看说明' : 'View guide';
+  String get natGuideIntro => isZh
+      ? 'P2WLAN 根据本机 UDP/STUN 观测自动分类。类型越靠前，直连越容易；越靠后，越可能需要精确打洞或中继。'
+      : 'P2WLAN classifies the local network from UDP/STUN observations. Earlier types are easier for direct paths; later types may need coordinated punching or relay.';
 
   String get diagnosticsSubtitle => isZh
       ? 'GET /status 的摘要和原始 JSON。'
@@ -304,6 +321,103 @@ class AppStrings {
     if (path == 'direct') return direct;
     if (path == 'relay' || isRelay) return relay;
     return '—';
+  }
+
+  String natTraversalTypeLabel(NatTraversalType type) {
+    return switch (type) {
+      NatTraversalType.fullCone => isZh ? 'FullCone NAT（全锥形）' : 'FullCone NAT',
+      NatTraversalType.restrictedCone =>
+        isZh ? 'Restricted Cone NAT（受限锥形）' : 'Restricted Cone NAT',
+      NatTraversalType.portRestrictedCone =>
+        isZh ? 'Port Restricted Cone NAT（端口受限锥形）' : 'Port Restricted Cone NAT',
+      NatTraversalType.symmetric =>
+        isZh ? 'Symmetric NAT（对称形）' : 'Symmetric NAT',
+      NatTraversalType.openInternet => isZh ? '公网直连' : 'Open Internet',
+      NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
+      NatTraversalType.unknown => isZh ? '未确认' : 'Unknown',
+    };
+  }
+
+  String natTraversalTypeDescription(NatTraversalType type) {
+    return switch (type) {
+      NatTraversalType.fullCone =>
+        isZh
+            ? '公网 IP:Port 稳定，外部任意地址通常都能从该映射回包，直连成功率最高。'
+            : 'The public IP:port is stable and replies from any external address are usually accepted, so direct paths are easiest.',
+      NatTraversalType.restrictedCone =>
+        isZh
+            ? '公网端口稳定，但只接受已联系过的外部 IP 回包；同步探测通常可以建立直连。'
+            : 'The public port is stable, but replies are accepted only from contacted external IPs; coordinated probing usually works.',
+      NatTraversalType.portRestrictedCone =>
+        isZh
+            ? '公网端口稳定，但外部 IP 和端口都必须先被本机联系过；打洞时序更敏感。'
+            : 'The public port is stable, but the remote IP and port must be contacted first; punch timing matters more.',
+      NatTraversalType.symmetric =>
+        isZh
+            ? '访问不同外部地址会产生不同公网端点，是最难直连的类型，常需要预测端口或回退中继。'
+            : 'Different destinations create different public endpoints, making direct paths hardest and often requiring prediction or relay.',
+      NatTraversalType.openInternet =>
+        isZh
+            ? '本机 UDP 端点看起来可被公网直接访问，通常不需要 NAT 打洞。'
+            : 'The local UDP endpoint appears directly reachable from the public network, so NAT punching is usually unnecessary.',
+      NatTraversalType.udpBlocked =>
+        isZh
+            ? 'STUN/UDP 探测没有可用响应，直连可能不可用，建议优先检查防火墙或使用中继。'
+            : 'STUN/UDP probing did not receive usable responses; direct paths may be unavailable, so check firewalls or use relay.',
+      NatTraversalType.unknown =>
+        isZh
+            ? '当前观测不足以精确区分 NAT 类型，可刷新或换网络后再确认。'
+            : 'Current observations are not enough to classify the NAT precisely; refresh or retry on another network.',
+    };
+  }
+
+  String natTraversalTypeAdvice(NatTraversalType type) {
+    return switch (type) {
+      NatTraversalType.fullCone =>
+        isZh
+            ? '提示：这是最友好的直连环境，P2WLAN 通常可以优先尝试 Direct。'
+            : 'Tip: this is the friendliest direct-path environment, so P2WLAN can usually prefer Direct.',
+      NatTraversalType.restrictedCone =>
+        isZh
+            ? '提示：保持双端在线并让双方同时探测，有助于快速建立直连。'
+            : 'Tip: keep both peers online and probing at the same time to establish Direct quickly.',
+      NatTraversalType.portRestrictedCone =>
+        isZh
+            ? '提示：如果直连不稳定，保留中继作为兜底，并尽量避免频繁切换网络。'
+            : 'Tip: keep relay as a fallback if Direct is unstable, and avoid frequent network switching.',
+      NatTraversalType.symmetric =>
+        isZh
+            ? '提示：这是困难 NAT。P2WLAN 会尝试预测/生日探测，但中继可能更稳定。'
+            : 'Tip: this is a hard NAT. P2WLAN will try prediction/birthday probing, but relay may be more stable.',
+      NatTraversalType.openInternet =>
+        isZh
+            ? '提示：请确认系统防火墙允许 P2WLAN UDP 入站。'
+            : 'Tip: confirm that the system firewall allows inbound P2WLAN UDP.',
+      NatTraversalType.udpBlocked =>
+        isZh
+            ? '提示：检查路由器、系统防火墙或公司网络策略是否阻断 UDP。'
+            : 'Tip: check whether the router, system firewall, or corporate policy blocks UDP.',
+      NatTraversalType.unknown =>
+        isZh
+            ? '提示：保持自动轮询或手动刷新，等待更多 STUN 观测。'
+            : 'Tip: keep auto sync on or refresh manually to collect more STUN observations.',
+    };
+  }
+
+  String natBehaviorLabel(String value) {
+    return switch (value.toLowerCase()) {
+      'open_internet' => isZh ? '公网直连' : 'Open Internet',
+      'endpoint_independent' => isZh ? '端点无关' : 'Endpoint independent',
+      'likely_endpoint_independent' =>
+        isZh ? '可能端点无关' : 'Likely endpoint independent',
+      'address_dependent' => isZh ? '地址相关' : 'Address dependent',
+      'address_or_port_dependent' =>
+        isZh ? '地址/端口相关' : 'Address/port dependent',
+      'udp_blocked' => isZh ? 'UDP 受阻' : 'UDP blocked',
+      'unknown' => isZh ? '未知' : 'Unknown',
+      '' => '—',
+      _ => value,
+    };
   }
 
   String diagnosticsUrlError(String message) {

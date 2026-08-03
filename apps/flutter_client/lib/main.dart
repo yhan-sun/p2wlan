@@ -20,7 +20,7 @@ Future<void> main() async {
 }
 
 Future<void> _configureDesktopWindowChrome() async {
-  if (Platform.isMacOS || Platform.isWindows) {
+  if (Platform.isMacOS) {
     await windowManager.setTitleBarStyle(
       TitleBarStyle.hidden,
       windowButtonVisibility: true,

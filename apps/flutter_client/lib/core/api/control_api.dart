@@ -26,7 +26,9 @@ class DeviceUpdateResult {
 }
 
 class ControlApi {
-  ControlApi({HttpClient? client}) : _client = client ?? HttpClient();
+  ControlApi({HttpClient? client}) : _client = client ?? HttpClient() {
+    _client.connectionTimeout = const Duration(seconds: 8);
+  }
 
   final HttpClient _client;
 
@@ -182,6 +184,7 @@ class ControlApi {
       final request = await _client
           .openUrl(method, uri)
           .timeout(const Duration(seconds: 8));
+      request.persistentConnection = false;
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (authToken != null && authToken.trim().isNotEmpty) {
         request.headers.set(
@@ -281,6 +284,18 @@ String _zhNetworkError(SocketException error, Uri uri) {
   if (osMessage.contains('connection refused') ||
       message.contains('connection refused')) {
     return '无法连接控制服务器：${uri.origin}。请确认服务端已启动且地址/端口正确。';
+  }
+  if (osMessage.contains('socket is not connected') ||
+      osMessage.contains('no address') ||
+      osMessage.contains('sendto') ||
+      osMessage.contains('套接字没有连接') ||
+      osMessage.contains('没有提供地址') ||
+      message.contains('socket is not connected') ||
+      message.contains('no address') ||
+      message.contains('sendto') ||
+      message.contains('套接字没有连接') ||
+      message.contains('没有提供地址')) {
+    return 'Windows 无法建立到控制服务器的连接：${uri.origin}。请检查代理/VPN/防火墙，或在浏览器打开 ${uri.origin}/health 验证是否返回 ok。';
   }
   return '控制服务器网络请求失败：${error.message}';
 }

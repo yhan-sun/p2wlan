@@ -93,6 +93,31 @@ void main() {
     },
   );
 
+  test('authenticate explains Windows sendto socket failures', () async {
+    const socketError = SocketException(
+      '由于套接字没有连接并且没有提供地址，发送或接收数据的请求没有被接受。sendto failed',
+      osError: OSError('socket is not connected', 10057),
+    );
+    final api = ControlApi(client: _ThrowingHttpClient(socketError));
+    addTearDown(api.close);
+
+    await expectLater(
+      () => api.authenticate(
+        mode: AuthMode.login,
+        controlServer: defaultControlServer,
+        email: 'user@example.com',
+        password: 'password',
+      ),
+      throwsA(
+        isA<ControlApiException>().having(
+          (error) => error.message,
+          'message',
+          allOf(contains('Windows 无法建立到控制服务器的连接'), contains('/health')),
+        ),
+      ),
+    );
+  });
+
   test('deleteDevice sends a bearer-authenticated DELETE request', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));
@@ -214,4 +239,24 @@ void main() {
       );
     },
   );
+}
+
+class _ThrowingHttpClient implements HttpClient {
+  _ThrowingHttpClient(this.error);
+
+  final Object error;
+
+  @override
+  Duration? connectionTimeout;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) {
+    return Future<HttpClientRequest>.error(error);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

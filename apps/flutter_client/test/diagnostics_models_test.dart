@@ -37,6 +37,10 @@ void main() {
     expect(snapshot.stats.totalPeers, 2);
     expect(snapshot.stats.directConnections, 1);
     expect(snapshot.stats.relayConnections, 1);
+    expect(snapshot.natProfile?.mappingBehavior, 'endpoint_independent');
+    expect(snapshot.natProfile?.filteringBehavior, 'address_dependent');
+    expect(snapshot.natProfile?.publicEndpoint, '198.51.100.20:62000');
+    expect(snapshot.natProfile?.traversalType, NatTraversalType.restrictedCone);
 
     final directPeer = snapshot.peers.firstWhere(
       (peer) => peer.nodeId == 'peer-direct-001',
@@ -54,6 +58,32 @@ void main() {
     expect(relayPeer.connectionType, 'relay');
     expect(relayPeer.latencyMs, 43);
     expect(relayPeer.lastError, 'direct probe timed out');
+  });
+
+  test('classifies NAT traversal types from mapping and filtering', () {
+    NatTraversalType classify(String mapping, String filtering) {
+      return NatProfileSnapshot.fromJson({
+        'mapping_behavior': mapping,
+        'filtering_behavior': filtering,
+      }).traversalType;
+    }
+
+    expect(
+      classify('endpoint_independent', 'endpoint_independent'),
+      NatTraversalType.fullCone,
+    );
+    expect(
+      classify('endpoint_independent', 'address_dependent'),
+      NatTraversalType.restrictedCone,
+    );
+    expect(
+      classify('endpoint_independent', 'address_or_port_dependent'),
+      NatTraversalType.portRestrictedCone,
+    );
+    expect(
+      classify('address_or_port_dependent', 'address_or_port_dependent'),
+      NatTraversalType.symmetric,
+    );
   });
 
   test(

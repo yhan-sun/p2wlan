@@ -12,6 +12,7 @@ class DiagnosticsSnapshot {
     required this.udpSocketCount,
     required this.udpSocketPoolActive,
     required this.localCandidates,
+    required this.natProfile,
     required this.relayServers,
     required this.relayConnected,
     required this.relaySelection,
@@ -30,6 +31,7 @@ class DiagnosticsSnapshot {
   final int udpSocketCount;
   final bool udpSocketPoolActive;
   final List<String> localCandidates;
+  final NatProfileSnapshot? natProfile;
   final List<String> relayServers;
   final bool relayConnected;
   final RelaySelectionSnapshot relaySelection;
@@ -49,6 +51,7 @@ class DiagnosticsSnapshot {
       udpSocketCount: _int(json['udp_socket_count']),
       udpSocketPoolActive: _bool(json['udp_socket_pool_active']),
       localCandidates: _stringList(json['local_candidates']),
+      natProfile: _natProfileOrNull(json['nat_profile']),
       relayServers: _stringList(json['relay_servers']),
       relayConnected: _bool(json['relay_connected']),
       relaySelection: RelaySelectionSnapshot.fromJson(
@@ -66,6 +69,73 @@ class DiagnosticsSnapshot {
   String get prettyJson {
     const encoder = JsonEncoder.withIndent('  ');
     return encoder.convert(raw);
+  }
+}
+
+NatProfileSnapshot? _natProfileOrNull(dynamic value) {
+  final json = _mapOrNull(value);
+  return json == null ? null : NatProfileSnapshot.fromJson(json);
+}
+
+enum NatTraversalType {
+  fullCone,
+  restrictedCone,
+  portRestrictedCone,
+  symmetric,
+  openInternet,
+  udpBlocked,
+  unknown,
+}
+
+class NatProfileSnapshot {
+  NatProfileSnapshot({
+    required this.mappingBehavior,
+    required this.filteringBehavior,
+    required this.publicEndpoint,
+    required this.confidence,
+    required this.udpBlocked,
+  });
+
+  final String mappingBehavior;
+  final String filteringBehavior;
+  final String? publicEndpoint;
+  final int? confidence;
+  final bool udpBlocked;
+
+  factory NatProfileSnapshot.fromJson(JsonMap json) {
+    return NatProfileSnapshot(
+      mappingBehavior: _string(json['mapping_behavior'], 'unknown'),
+      filteringBehavior: _string(json['filtering_behavior'], 'unknown'),
+      publicEndpoint: _nullableString(json['public_endpoint']),
+      confidence: _intOrNull(json['confidence']),
+      udpBlocked: _bool(json['udp_blocked']),
+    );
+  }
+
+  NatTraversalType get traversalType {
+    final mapping = mappingBehavior.toLowerCase();
+    final filtering = filteringBehavior.toLowerCase();
+
+    if (udpBlocked || mapping == 'udp_blocked' || filtering == 'udp_blocked') {
+      return NatTraversalType.udpBlocked;
+    }
+    if (mapping == 'open_internet') {
+      return NatTraversalType.openInternet;
+    }
+    if (mapping == 'address_or_port_dependent') {
+      return NatTraversalType.symmetric;
+    }
+    if (mapping != 'endpoint_independent') {
+      return NatTraversalType.unknown;
+    }
+
+    return switch (filtering) {
+      'endpoint_independent' ||
+      'likely_endpoint_independent' => NatTraversalType.fullCone,
+      'address_dependent' => NatTraversalType.restrictedCone,
+      'address_or_port_dependent' => NatTraversalType.portRestrictedCone,
+      _ => NatTraversalType.unknown,
+    };
   }
 }
 

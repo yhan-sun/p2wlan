@@ -80,6 +80,8 @@ class _ConnectionBanner extends StatelessWidget {
               lastFetchedAt: lastFetchedAt,
               requestDuration: requestDuration,
             ),
+            const SizedBox(height: 16),
+            _NatProfilePanel(snapshot: snapshot),
           ],
           if (showIssueNote) ...[
             const SizedBox(height: 12),
