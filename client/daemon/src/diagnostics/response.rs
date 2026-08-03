@@ -7,7 +7,11 @@ async fn write_response(
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
+        409 => "Conflict",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let cors_header = cors_origin

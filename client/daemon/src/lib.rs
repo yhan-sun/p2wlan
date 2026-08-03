@@ -91,7 +91,9 @@ use candidate_refresh::{
 use control::RelayCatalogEntry;
 use control::{ControlClient, ControlEvent};
 use dataplane::{DataPlane, InboundPacket, OutboundPacket};
-use diagnostics::{run_diagnostics_server_with_retry, DiagnosticsContext};
+use diagnostics::{
+    run_diagnostics_server_with_retry, run_speedtest_server_with_retry, DiagnosticsContext,
+};
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
 use network_outbound::run_network_outbound;

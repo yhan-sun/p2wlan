@@ -27,6 +27,48 @@ mod tests {
     }
 
     #[test]
+    fn split_request_target_separates_query_string() {
+        assert_eq!(split_request_target("/status"), ("/status", None));
+        assert_eq!(
+            split_request_target("/speedtest?peer=10.20.0.2&duration_ms=10000"),
+            ("/speedtest", Some("peer=10.20.0.2&duration_ms=10000"))
+        );
+    }
+
+    #[test]
+    fn speedtest_error_status_maps_expected_client_states() {
+        assert_eq!(speedtest_error_status("missing peer virtual IP"), 400);
+        assert_eq!(
+            speedtest_error_status("peer 10.20.0.2 is not using a confirmed direct path"),
+            409
+        );
+        assert_eq!(speedtest_error_status("download speedtest failed"), 503);
+    }
+
+    #[tokio::test]
+    async fn speedtest_protocol_measures_loopback_download_and_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(serve_speedtest(listener, shutdown_rx));
+
+        let result = run_speedtest_client(
+            addr,
+            "127.0.0.1".to_string(),
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.download_bytes > 0);
+        assert!(result.upload_bytes > 0);
+        assert!(result.download_mbps > 0.0);
+        assert!(result.upload_mbps > 0.0);
+        let _ = shutdown_tx.send(true);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[test]
     fn mtu_diagnostics_explain_relay_high_mtu_risk() {
         let default_direct = MtuDiagnostics::from_runtime(1420, false);
         assert_eq!(default_direct.profile, "default");

@@ -170,6 +170,21 @@ class AppStrings {
   String get natGuideIntro => isZh
       ? 'P2WLAN 根据本机 UDP/STUN 观测自动分类。下方概率合计会归一为 100%；最大概率表示当前最可能的 NAT 类型。类型越靠前，直连越容易。'
       : 'P2WLAN classifies the local network from UDP/STUN observations. Earlier types are easier for direct paths; later types may need coordinated punching or relay.';
+  String get speedTest => isZh ? '测速' : 'Speed test';
+  String get speedTesting => isZh ? '测速中 10s...' : 'Testing 10s...';
+  String get speedTestReady => isZh ? '直连已就绪，可测试链路速度' : 'Direct path ready';
+  String speedTestPeer(String peer) =>
+      isZh ? '直连测速 · $peer' : 'Direct speed test · $peer';
+  String speedTestResult(double downloadMbps, double uploadMbps) {
+    final down = downloadMbps.toStringAsFixed(1);
+    final up = uploadMbps.toStringAsFixed(1);
+    return isZh
+        ? '下行 $down Mbps · 上行 $up Mbps'
+        : 'Down $down Mbps · Up $up Mbps';
+  }
+
+  String speedTestFailed(String message) =>
+      isZh ? '测速失败：$message' : 'Speed test failed: $message';
 
   String get diagnosticsSubtitle => isZh
       ? 'GET /status 的摘要和原始 JSON。'
@@ -446,6 +461,17 @@ class AppStrings {
     return isZh
         ? '最大概率：$labels（$probability）'
         : 'Max probability: $labels ($probability)';
+  }
+
+  String natCurrentTypeWithProbability(
+    List<NatTraversalType> types,
+    String probability,
+  ) {
+    final labels = types.map(natTraversalShortLabel).join(' / ');
+    if (types.length > 1) {
+      return isZh ? '$labels（各 $probability）' : '$labels ($probability each)';
+    }
+    return isZh ? '$labels（$probability）' : '$labels ($probability)';
   }
 
   String diagnosticsUrlError(String message) {

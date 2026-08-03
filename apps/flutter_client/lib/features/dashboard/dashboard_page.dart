@@ -16,6 +16,7 @@ part 'dashboard/surface.dart';
 part 'dashboard/overview.dart';
 part 'dashboard/metrics.dart';
 part 'dashboard/nat_profile.dart';
+part 'dashboard/speed_test.dart';
 part 'dashboard/actions.dart';
 
 class DashboardPage extends StatelessWidget {
@@ -56,9 +57,14 @@ class DashboardPage extends StatelessWidget {
               daemonManualCommand: statusStore.lastDaemonManualCommand,
               lastFetchedAt: statusStore.lastFetchedAt,
               requestDuration: statusStore.lastRequestDuration,
+              speedTestRunning: statusStore.speedTestRunning,
+              speedTestResult: statusStore.lastSpeedTestResult,
+              speedTestError: statusStore.lastSpeedTestError,
+              speedTestPeerVirtualIp: statusStore.speedTestPeerVirtualIp,
               onStartDaemon: statusStore.startDaemon,
               onStopDaemon: statusStore.stopDaemon,
               onRefresh: statusStore.refresh,
+              onRunSpeedTest: statusStore.runSpeedTest,
               onAutoRefreshChanged: (value) => statusStore.setAutoRefresh(
                 enabled: value,
                 refreshImmediately: value,

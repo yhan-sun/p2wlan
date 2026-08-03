@@ -51,7 +51,9 @@ class PageScaffold extends StatelessWidget {
                                 style: TextStyle(
                                   fontSize: isNarrow ? 20 : 22,
                                   fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurface,
                                   letterSpacing: 0,
                                 ),
                               ),

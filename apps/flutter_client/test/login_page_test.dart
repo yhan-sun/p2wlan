@@ -97,5 +97,14 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
   Future<bool> requestShutdown(String diagnosticsUrl) async => false;
 
   @override
+  Future<SpeedTestResult> runSpeedTest(
+    String diagnosticsUrl, {
+    required String peerVirtualIp,
+    Duration duration = const Duration(seconds: 10),
+  }) {
+    throw const DiagnosticsApiException('offline');
+  }
+
+  @override
   void close() {}
 }
