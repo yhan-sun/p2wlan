@@ -258,17 +258,31 @@ async fn diagnostics_json_contains_direct_candidate_pair_fields() {
     let pair = &json["selected_pair"];
 
     assert_eq!(json["active_path"], "direct");
-    assert_eq!(json["direct_type"], "public_udp");
+    assert_eq!(json["direct_type"], "peer_reflexive");
     assert_eq!(json["consent_endpoint"], "8.8.8.8:12293");
-    assert_eq!(json["is_public_udp_direct"], true);
+    assert_eq!(json["is_public_udp_direct"], false);
+    assert_eq!(json["is_peer_reflexive_direct"], true);
+    assert_eq!(json["public_mapping_stable"], false);
     assert_eq!(json["is_overlay_direct"], false);
     assert_eq!(json["is_relay"], false);
+    assert_eq!(
+        json["warning"],
+        "direct path is peer-reflexive/provisional, not a stable public mapping"
+    );
     assert_eq!(pair["local_endpoint"], "192.168.1.10:51820");
     assert_eq!(pair["remote_endpoint"], "8.8.8.8:12293");
     assert_eq!(pair["local_candidate_type"], "host");
     assert_eq!(pair["remote_candidate_type"], "peer_reflexive");
     assert_eq!(pair["remote_source"], "peer_reflexive");
     assert_eq!(pair["pair_state"], "selected");
+    assert_eq!(pair["direct_type"], "peer_reflexive");
+    assert_eq!(pair["is_public_udp_direct"], false);
+    assert_eq!(pair["is_peer_reflexive_direct"], true);
+    assert_eq!(pair["public_mapping_stable"], false);
+    assert_eq!(
+        pair["warning"],
+        "direct pair is peer-reflexive/provisional, not a stable public mapping"
+    );
     assert_eq!(pair["nominated"], true);
     assert_eq!(pair["selected"], true);
     assert_eq!(pair["probe_due"], true);

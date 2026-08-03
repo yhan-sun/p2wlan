@@ -108,7 +108,13 @@ pub(super) fn classify_candidate_pair_path(
         return DirectPathType::Lan;
     }
 
-    if is_public_probe_endpoint(pair.remote_endpoint) && is_public_udp_direct_source(pair.source) {
+    if is_public_probe_endpoint(pair.remote_endpoint)
+        && pair.source == CandidatePairSource::PeerReflexive
+    {
+        DirectPathType::PeerReflexive
+    } else if is_public_probe_endpoint(pair.remote_endpoint)
+        && is_public_udp_direct_source(pair.source)
+    {
         DirectPathType::PublicUdp
     } else {
         DirectPathType::Unknown
@@ -123,6 +129,8 @@ pub(super) fn classify_confirmed_direct_endpoint(
         DirectPathType::Overlay
     } else if is_private_direct_endpoint(endpoint) {
         DirectPathType::Lan
+    } else if is_public_probe_endpoint(endpoint) && source == CandidatePairSource::PeerReflexive {
+        DirectPathType::PeerReflexive
     } else if is_public_probe_endpoint(endpoint) && is_public_udp_direct_source(source) {
         DirectPathType::PublicUdp
     } else {
@@ -141,7 +149,6 @@ fn is_public_udp_direct_source(source: CandidatePairSource) -> bool {
             | CandidatePairSource::Predicted
             | CandidatePairSource::Birthday
             | CandidatePairSource::Learned
-            | CandidatePairSource::PeerReflexive
     )
 }
 

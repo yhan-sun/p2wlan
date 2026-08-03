@@ -123,6 +123,18 @@ impl PeerManager {
                             node_id,
                             endpoint
                         ),
+                        DirectPathType::PeerReflexive => info!(
+                            event = "peer_reflexive_direct_selected",
+                            peer_id = %node_id,
+                            local_endpoint = %local_endpoint_text,
+                            remote_endpoint = %endpoint,
+                            candidate_source = ?source,
+                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                            reason = "encrypted data path confirmed Direct UDP",
+                            "peer_reflexive_direct_selected peer_id={} remote_endpoint={}",
+                            node_id,
+                            endpoint
+                        ),
                         DirectPathType::Overlay => info!(
                             event = "overlay_direct_selected",
                             peer_id = %node_id,

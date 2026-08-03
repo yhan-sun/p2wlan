@@ -70,6 +70,19 @@ impl PeerConnection {
                     remote_endpoint,
                     selection.reason
                 ),
+                DirectPathType::PeerReflexive => info!(
+                    event = "peer_reflexive_direct_selected",
+                    peer_id = %self.node_id,
+                    local_endpoint = %local_endpoint_text,
+                    remote_endpoint = %remote_endpoint_text,
+                    candidate_source = ?candidate_source,
+                    rtt_ms = ?rtt_ms,
+                    reason = %selection.reason,
+                    "peer_reflexive_direct_selected peer_id={} remote_endpoint={:?} reason={}",
+                    self.node_id,
+                    remote_endpoint,
+                    selection.reason
+                ),
                 DirectPathType::Overlay => info!(
                     event = "overlay_direct_selected",
                     peer_id = %self.node_id,

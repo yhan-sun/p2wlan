@@ -153,6 +153,8 @@ async fn diagnostics_classifies_public_udp_direct_selected_pair() {
     assert_eq!(peer.active_path, Some(NetworkPath::Direct));
     assert_eq!(peer.direct_type, DirectPathType::PublicUdp);
     assert!(peer.is_public_udp_direct);
+    assert!(!peer.is_peer_reflexive_direct);
+    assert!(peer.public_mapping_stable);
     assert!(!peer.is_overlay_direct);
     assert!(!peer.is_relay);
     assert_eq!(peer.consent_endpoint.as_deref(), Some("8.8.8.8:12293"));
@@ -177,7 +179,7 @@ async fn diagnostics_classifies_public_udp_direct_selected_pair() {
 }
 
 #[test]
-fn diagnostics_keeps_non_current_selected_public_pair_public_udp() {
+fn diagnostics_keeps_non_current_peer_reflexive_pair_provisional() {
     let selected_remote: SocketAddr = "8.8.8.8:32794".parse().unwrap();
     let current_remote: SocketAddr = "8.8.8.8:32798".parse().unwrap();
     let local: SocketAddr = "192.168.1.10:54006".parse().unwrap();
@@ -208,12 +210,24 @@ fn diagnostics_keeps_non_current_selected_public_pair_public_udp() {
     let selected = diagnostics.selected_pair.as_ref().unwrap();
     let current = diagnostics.current_direct_pair.as_ref().unwrap();
 
-    assert_eq!(diagnostics.direct_type, DirectPathType::PublicUdp);
-    assert!(diagnostics.is_public_udp_direct);
+    assert_eq!(diagnostics.direct_type, DirectPathType::PeerReflexive);
+    assert!(!diagnostics.is_public_udp_direct);
+    assert!(diagnostics.is_peer_reflexive_direct);
+    assert!(!diagnostics.public_mapping_stable);
+    assert_eq!(
+        diagnostics.warning.as_deref(),
+        Some("direct path is peer-reflexive/provisional, not a stable public mapping")
+    );
     assert_eq!(selected.remote_endpoint, selected_remote.to_string());
     assert_eq!(current.remote_endpoint, current_remote.to_string());
-    assert_eq!(selected.direct_type, DirectPathType::PublicUdp);
-    assert!(selected.is_public_udp_direct);
+    assert_eq!(selected.direct_type, DirectPathType::PeerReflexive);
+    assert!(!selected.is_public_udp_direct);
+    assert!(selected.is_peer_reflexive_direct);
+    assert!(!selected.public_mapping_stable);
+    assert_eq!(
+        selected.warning.as_deref(),
+        Some("direct pair is peer-reflexive/provisional, not a stable public mapping")
+    );
 }
 
 #[tokio::test]
