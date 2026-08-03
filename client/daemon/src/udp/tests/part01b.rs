@@ -165,6 +165,45 @@ async fn qualified_socket_pool_probes_from_each_bound_socket() {
 }
 
 #[tokio::test]
+async fn large_punch_window_prioritizes_remote_port_coverage_before_extra_sockets() {
+    let peers = peer_manager();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", None))
+        .await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+
+    let candidates = (0..200)
+        .map(|offset| format!("127.0.0.1:{}", 20_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let sent = transport
+        .punch_candidates("peer-b", candidates.clone(), Duration::ZERO, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(sent as usize, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+    let pending = transport.pending_probes.lock().await;
+    let mut endpoints = pending
+        .values()
+        .map(|probe| probe.endpoint)
+        .collect::<Vec<_>>();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+
+    assert_eq!(endpoints.len(), OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+    assert!(endpoints
+        .iter()
+        .all(|endpoint| candidates[..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP].contains(endpoint)));
+    assert!(pending.values().all(|probe| probe.socket_index == 0));
+}
+
+#[tokio::test]
 async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
     let peers = peer_manager();
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)

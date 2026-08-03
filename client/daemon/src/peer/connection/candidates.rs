@@ -322,7 +322,18 @@ impl PeerConnection {
         let mut endpoints = self
             .probe_candidate_endpoints()
             .into_iter()
-            .filter(|endpoint| is_low_latency_direct_endpoint(*endpoint))
+            .filter(|endpoint| {
+                is_low_latency_direct_endpoint(*endpoint)
+                    && self.candidate_pairs.iter().any(|pair| {
+                        pair.local_generation == local_generation
+                            && pair.remote_endpoint == *endpoint
+                            && (pair.last_success_at.is_some()
+                                || matches!(
+                                    pair.state,
+                                    CandidatePairState::Selected | CandidatePairState::Succeeded
+                                ))
+                    })
+            })
             .collect::<Vec<_>>();
         let mut public = self.asymmetric_stable_public_endpoints(self.probe_candidate_endpoints());
         public.sort_by(|left, right| {

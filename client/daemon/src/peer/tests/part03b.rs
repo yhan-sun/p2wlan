@@ -367,13 +367,8 @@ async fn hard_local_nat_prefers_fresh_public_candidate_over_stale_peer_reflexive
         .await;
 
     let targets = manager.direct_probe_targets_for("peer1").await;
-    let same_public_ip_targets = targets
-        .iter()
-        .copied()
-        .filter(|target| target.ip() == fresh_stable.ip())
-        .collect::<Vec<_>>();
-
-    assert_eq!(same_public_ip_targets, vec![fresh_stable]);
+    assert_eq!(targets, vec![fresh_stable]);
+    assert!(!targets.contains(&host_candidate));
     assert!(!targets.contains(&stale_peer_reflexive));
 
     let conn = manager.get_connection("peer1").await.unwrap();
@@ -381,6 +376,41 @@ async fn hard_local_nat_prefers_fresh_public_candidate_over_stale_peer_reflexive
         .candidate_pairs
         .iter()
         .any(|pair| pair.source == CandidatePairSource::Birthday));
+}
+
+#[tokio::test]
+async fn hard_local_nat_keeps_previously_successful_private_candidate_for_reclaim() {
+    let manager = PeerManager::new(test_config());
+    let host_candidate: SocketAddr = "192.168.2.16:53765".parse().unwrap();
+    let stable_public: SocketAddr = "8.8.8.8:2778".parse().unwrap();
+    let candidates = vec![host_candidate.to_string(), stable_public.to_string()];
+    let sources = HashMap::from([
+        (host_candidate.to_string(), "host".to_string()),
+        (stable_public.to_string(), "stun_observed".to_string()),
+    ]);
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", stable_public))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    {
+        let mut conns = manager.connections.write().await;
+        conns
+            .get_mut("peer1")
+            .unwrap()
+            .ensure_candidate_pair_with_source(host_candidate, 0, CandidatePairSource::Host)
+            .record_success(Some(Duration::from_millis(4)), false, None);
+    }
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(targets.contains(&host_candidate));
+    assert!(targets.contains(&stable_public));
+    assert!(!targets.iter().any(|target| {
+        target.ip() == stable_public.ip() && *target != stable_public
+    }));
 }
 
 #[tokio::test]
