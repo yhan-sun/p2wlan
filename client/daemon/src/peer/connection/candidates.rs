@@ -49,6 +49,13 @@ impl PeerConnection {
         self.candidate_sources
             .get(&endpoint.to_string())
             .copied()
+            .or_else(|| {
+                self.candidate_pairs
+                    .iter()
+                    .filter(|pair| pair.remote_endpoint == endpoint)
+                    .min_by_key(|pair| candidate_pair_source_rank(pair.source))
+                    .map(|pair| pair.source)
+            })
             .unwrap_or(CandidatePairSource::Signaled)
     }
 
@@ -415,6 +422,8 @@ impl PeerConnection {
                     CandidatePairSource::Host
                         | CandidatePairSource::Predicted
                         | CandidatePairSource::Birthday
+                        | CandidatePairSource::Learned
+                        | CandidatePairSource::PeerReflexive
                         | CandidatePairSource::Upnp
                         | CandidatePairSource::Pcp
                         | CandidatePairSource::NatPmp
