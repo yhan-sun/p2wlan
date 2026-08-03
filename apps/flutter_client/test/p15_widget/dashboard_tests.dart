@@ -49,8 +49,19 @@ void _registerDashboardTests() {
     );
 
     expect(find.text('10.20.0.10'), findsOneWidget);
+    expect(find.text('Restricted Cone NAT'), findsOneWidget);
+    expect(find.text('Network type'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+
+    await tester.ensureVisible(find.byIcon(Icons.info_outline_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.info_outline_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('FullCone NAT'), findsOneWidget);
+    expect(find.text('Port Restricted Cone NAT'), findsOneWidget);
+    expect(find.text('Symmetric NAT'), findsOneWidget);
   });
 
   testWidgets('StatusStore settles peer catalog after daemon start', (

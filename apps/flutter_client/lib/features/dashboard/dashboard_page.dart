@@ -15,6 +15,7 @@ part 'dashboard/banner.dart';
 part 'dashboard/surface.dart';
 part 'dashboard/overview.dart';
 part 'dashboard/metrics.dart';
+part 'dashboard/nat_profile.dart';
 part 'dashboard/actions.dart';
 
 class DashboardPage extends StatelessWidget {

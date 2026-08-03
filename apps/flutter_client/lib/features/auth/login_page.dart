@@ -60,6 +60,8 @@ class _LoginPageState extends State<LoginPage> {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
     return Scaffold(
       body: Center(
         child: SingleChildScrollView(
@@ -75,22 +77,23 @@ class _LoginPageState extends State<LoginPage> {
                       width: 44,
                       height: 44,
                       decoration: BoxDecoration(
-                        color: AppTokens.colorNeutralBg,
+                        color: theme.colorScheme.surfaceContainerHighest,
                         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                        border: Border.all(color: theme.colorScheme.outline),
                       ),
-                      child: const Icon(
+                      child: Icon(
                         Icons.network_check_rounded,
-                        color: AppTokens.colorAccent,
+                        color: theme.colorScheme.primary,
                       ),
                     ),
                     const SizedBox(width: 14),
-                    const Expanded(
+                    Expanded(
                       child: Text(
                         p2wlanAppName,
                         style: TextStyle(
                           fontSize: 24,
                           fontWeight: FontWeight.w800,
-                          color: AppTokens.colorTextPrimary,
+                          color: theme.colorScheme.onSurface,
                         ),
                       ),
                     ),
@@ -101,18 +104,23 @@ class _LoginPageState extends State<LoginPage> {
                   strings.isZh
                       ? '登录控制面后启动本机 TUN'
                       : 'Sign in to start the local TUN',
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 15,
                     height: 1.35,
-                    color: AppTokens.colorTextSecondary,
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
                 const SizedBox(height: 20),
                 DecoratedBox(
                   decoration: BoxDecoration(
-                    color: AppTokens.colorSurface,
-                    border: Border.all(color: AppTokens.colorBorderSubtle),
+                    color: theme.colorScheme.surface,
+                    border: Border.all(
+                      color: isDark
+                          ? theme.colorScheme.outline
+                          : theme.colorScheme.outlineVariant,
+                    ),
                     borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+                    boxShadow: isDark ? const [] : AppTokens.shadowBorder,
                   ),
                   child: Padding(
                     padding: const EdgeInsets.all(18),
@@ -290,23 +298,28 @@ class _InlineMessage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bg = error
+        ? (isDark ? AppTokens.colorDarkBadBg : AppTokens.colorBadBg)
+        : (isDark ? AppTokens.colorDarkGoodBg : AppTokens.colorGoodBg);
+    final border = error
+        ? (isDark ? AppTokens.colorDarkBadBorder : AppTokens.colorBadBorder)
+        : (isDark ? AppTokens.colorDarkGoodBorder : AppTokens.colorGoodBorder);
+    final text = error
+        ? (isDark ? AppTokens.colorDarkBadText : AppTokens.colorBadText)
+        : (isDark ? AppTokens.colorDarkGoodText : AppTokens.colorGoodText);
+
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: error ? AppTokens.colorBadBg : AppTokens.colorGoodBg,
+        color: bg,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-        border: Border.all(
-          color: error ? AppTokens.colorBadBorder : AppTokens.colorGoodBorder,
-        ),
+        border: Border.all(color: border),
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
         child: Text(
           message,
-          style: TextStyle(
-            fontSize: 12,
-            height: 1.35,
-            color: error ? AppTokens.colorBadText : AppTokens.colorGoodText,
-          ),
+          style: TextStyle(fontSize: 12, height: 1.35, color: text),
         ),
       ),
     );

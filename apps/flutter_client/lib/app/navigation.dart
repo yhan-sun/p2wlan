@@ -168,12 +168,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
 }
 
 bool get _usesHiddenNativeTitleBar {
-  return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
+  return !kIsWeb && Platform.isMacOS;
 }
 
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
-bool get _usesWindowsChrome => !kIsWeb && Platform.isWindows;
+bool get _usesWindowsChrome => false;
 
 class _WideShell extends StatelessWidget {
   const _WideShell({
