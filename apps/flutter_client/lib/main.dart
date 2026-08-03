@@ -25,6 +25,15 @@ Future<void> _configureDesktopWindowChrome() async {
       TitleBarStyle.hidden,
       windowButtonVisibility: true,
     );
+  } else if (Platform.isWindows) {
+    await windowManager.setTitle('P2WLAN');
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.normal,
+      windowButtonVisibility: true,
+    );
+    await windowManager.setResizable(true);
+    await windowManager.setMinimizable(true);
+    await windowManager.setMaximizable(true);
   }
 }
 
@@ -38,6 +47,6 @@ bool get _enableFlutterTray {
   final value = Platform.environment['P2WLAN_ENABLE_FLUTTER_TRAY']
       ?.trim()
       .toLowerCase();
-  if (value == null || value.isEmpty) return true;
+  if (value == null || value.isEmpty) return false;
   return value != '0' && value != 'false' && value != 'no';
 }

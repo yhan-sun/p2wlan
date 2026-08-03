@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';

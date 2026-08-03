@@ -8,24 +8,26 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
 
 void main() {
-  testWidgets('renders the P2WLAN client shell', (tester) async {
+  testWidgets('renders the P2WLAN client shell in Chinese by default', (
+    tester,
+  ) async {
     await _pumpTestApp(tester);
 
-    expect(find.text('Dashboard'), findsWidgets);
-    expect(find.text('Offline'), findsWidgets);
+    expect(find.text('仪表盘'), findsWidgets);
+    expect(find.text('离线'), findsWidgets);
   });
 
   testWidgets('opens settings and shows diagnostics URL field', (tester) async {
     await _pumpTestApp(tester);
 
-    await tester.tap(find.text('Settings').last);
+    await tester.tap(find.text('设置').last);
     await tester.pump();
 
-    expect(find.text('Diagnostics URL'), findsWidgets);
-    expect(find.text('Daemon control'), findsOneWidget);
+    expect(find.text('诊断端点'), findsWidgets);
+    expect(find.text('守护进程控制'), findsOneWidget);
   });
 
-  testWidgets('switches the shell language to simplified Chinese', (
+  testWidgets('switches the shell language from Chinese to English', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(800, 2400);
@@ -35,19 +37,19 @@ void main() {
 
     await _pumpTestApp(tester);
 
-    await tester.tap(find.text('Settings').last);
-    await tester.pump(const Duration(milliseconds: 250));
-    await tester.tap(find.text('English').last);
+    await tester.tap(find.text('设置').last);
     await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('简体中文').last);
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.tap(find.text('English').last);
     await tester.runAsync(() async {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     });
     await tester.pump();
 
-    expect(find.text('设置'), findsWidgets);
-    expect(find.text('诊断 URL'), findsWidgets);
-    expect(find.text('守护进程控制'), findsOneWidget);
+    expect(find.text('Settings'), findsWidgets);
+    expect(find.text('Diagnostics endpoint'), findsWidgets);
+    expect(find.text('Daemon control'), findsOneWidget);
   });
 }
 
@@ -83,8 +85,8 @@ Future<void> _waitForBootstrap(WidgetTester tester) async {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     });
     await tester.pump();
-    if (find.text('Dashboard').evaluate().isNotEmpty ||
-        find.text('Sign in to start the local TUN').evaluate().isNotEmpty) {
+    if (find.text('仪表盘').evaluate().isNotEmpty ||
+        find.text('登录控制面后启动本机 TUN').evaluate().isNotEmpty) {
       return;
     }
   }

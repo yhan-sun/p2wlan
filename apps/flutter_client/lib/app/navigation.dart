@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -75,8 +76,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 900;
+        final desktop = _usesDesktopNavigation;
         final body = _buildBody();
-        final hiddenNativeTitleBar = _usesHiddenNativeTitleBar;
+        final dragWindowFromAppBar = _canDragWindowFromAppBar;
         final macosChrome = _usesMacosChrome;
         final windowsChrome = _usesWindowsChrome;
 
@@ -86,15 +88,16 @@ class _P2WlanShellState extends State<P2WlanShell> {
             leadingWidth: macosChrome ? 76 : null,
             title: Text(strings.sectionLabel(_section.name)),
             centerTitle: true,
-            flexibleSpace: hiddenNativeTitleBar
+            flexibleSpace: dragWindowFromAppBar
                 ? const DragToMoveArea(child: SizedBox.expand())
                 : null,
             actions: [
               _ShellStatusActions(statusStore: widget.statusStore),
+              if (_showsInAppCloseButton) const _WindowsCloseButton(),
               SizedBox(width: windowsChrome ? 148 : 8),
             ],
           ),
-          body: wide
+          body: desktop || wide
               ? _WideShell(
                   body: body,
                   selected: _section,
@@ -102,7 +105,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
                   onSelect: _select,
                 )
               : body,
-          bottomNavigationBar: wide
+          bottomNavigationBar: desktop || wide
               ? null
               : NavigationBar(
                   selectedIndex: _section.index,
@@ -167,13 +170,20 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 }
 
-bool get _usesHiddenNativeTitleBar {
-  return !kIsWeb && Platform.isMacOS;
-}
-
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
 bool get _usesWindowsChrome => false;
+
+bool get _usesDesktopNavigation {
+  return !kIsWeb &&
+      (Platform.isMacOS || Platform.isLinux || Platform.isWindows);
+}
+
+bool get _canDragWindowFromAppBar {
+  return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
+}
+
+bool get _showsInAppCloseButton => !kIsWeb && Platform.isWindows;
 
 class _WideShell extends StatelessWidget {
   const _WideShell({
@@ -214,6 +224,25 @@ class _WideShell extends StatelessWidget {
       ],
     );
   }
+}
+
+class _WindowsCloseButton extends StatelessWidget {
+  const _WindowsCloseButton();
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    return IconButton(
+      tooltip: strings.closeWindow,
+      onPressed: () => unawaited(_destroyWindow()),
+      icon: const Icon(Icons.close_rounded),
+    );
+  }
+}
+
+Future<void> _destroyWindow() async {
+  await windowManager.setPreventClose(false);
+  await windowManager.destroy();
 }
 
 class _ShellStatusActions extends StatelessWidget {

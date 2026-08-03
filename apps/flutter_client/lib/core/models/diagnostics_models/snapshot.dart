@@ -87,6 +87,13 @@ enum NatTraversalType {
   unknown,
 }
 
+class NatTypeProbability {
+  const NatTypeProbability({required this.type, required this.probability});
+
+  final NatTraversalType type;
+  final double probability;
+}
+
 class NatProfileSnapshot {
   NatProfileSnapshot({
     required this.mappingBehavior,
@@ -94,6 +101,7 @@ class NatProfileSnapshot {
     required this.publicEndpoint,
     required this.confidence,
     required this.udpBlocked,
+    required this.typeProbabilities,
   });
 
   final String mappingBehavior;
@@ -101,14 +109,26 @@ class NatProfileSnapshot {
   final String? publicEndpoint;
   final int? confidence;
   final bool udpBlocked;
+  final List<NatTypeProbability> typeProbabilities;
 
   factory NatProfileSnapshot.fromJson(JsonMap json) {
+    final mappingBehavior = _string(json['mapping_behavior'], 'unknown');
+    final filteringBehavior = _string(json['filtering_behavior'], 'unknown');
+    final confidence = _intOrNull(json['confidence']);
+    final udpBlocked = _bool(json['udp_blocked']);
     return NatProfileSnapshot(
-      mappingBehavior: _string(json['mapping_behavior'], 'unknown'),
-      filteringBehavior: _string(json['filtering_behavior'], 'unknown'),
+      mappingBehavior: mappingBehavior,
+      filteringBehavior: filteringBehavior,
       publicEndpoint: _nullableString(json['public_endpoint']),
-      confidence: _intOrNull(json['confidence']),
-      udpBlocked: _bool(json['udp_blocked']),
+      confidence: confidence,
+      udpBlocked: udpBlocked,
+      typeProbabilities: _natTypeProbabilities(
+        json: json,
+        mappingBehavior: mappingBehavior,
+        filteringBehavior: filteringBehavior,
+        confidence: confidence,
+        udpBlocked: udpBlocked,
+      ),
     );
   }
 
@@ -137,6 +157,186 @@ class NatProfileSnapshot {
       _ => NatTraversalType.unknown,
     };
   }
+
+  double get probabilityTotal {
+    return typeProbabilities.fold<double>(
+      0,
+      (sum, item) => sum + item.probability,
+    );
+  }
+
+  List<NatTypeProbability> get maxTypeProbabilities {
+    if (typeProbabilities.isEmpty) return const [];
+    final maxProbability = typeProbabilities
+        .map((item) => item.probability)
+        .reduce((a, b) => a > b ? a : b);
+    return [
+      for (final item in typeProbabilities)
+        if ((item.probability - maxProbability).abs() < 0.05) item,
+    ];
+  }
+}
+
+const _fourNatTraversalTypes = [
+  NatTraversalType.fullCone,
+  NatTraversalType.restrictedCone,
+  NatTraversalType.portRestrictedCone,
+  NatTraversalType.symmetric,
+];
+
+List<NatTypeProbability> _natTypeProbabilities({
+  required JsonMap json,
+  required String mappingBehavior,
+  required String filteringBehavior,
+  required int? confidence,
+  required bool udpBlocked,
+}) {
+  final explicit = _explicitNatTypeProbabilities(
+    json['type_probabilities'] ??
+        json['nat_type_probabilities'] ??
+        json['probabilities'],
+  );
+  if (explicit.isNotEmpty) return _normalizeNatTypeProbabilities(explicit);
+  return _inferNatTypeProbabilities(
+    mappingBehavior: mappingBehavior,
+    filteringBehavior: filteringBehavior,
+    confidence: confidence,
+    udpBlocked: udpBlocked,
+  );
+}
+
+List<NatTypeProbability> _explicitNatTypeProbabilities(dynamic value) {
+  final items = <NatTypeProbability>[];
+  if (value is Map) {
+    for (final entry in value.entries) {
+      final type = _natTypeFromProbabilityKey(entry.key.toString());
+      final probability = _doubleOrNull(entry.value);
+      if (type != null && probability != null) {
+        items.add(NatTypeProbability(type: type, probability: probability));
+      }
+    }
+  } else if (value is List) {
+    for (final item in value) {
+      final json = _map(item);
+      final type = _natTypeFromProbabilityKey(
+        _string(json['type'] ?? json['name'] ?? json['key']),
+      );
+      final probability = _doubleOrNull(
+        json['probability'] ?? json['confidence'] ?? json['value'],
+      );
+      if (type != null && probability != null) {
+        items.add(NatTypeProbability(type: type, probability: probability));
+      }
+    }
+  }
+  return items;
+}
+
+NatTraversalType? _natTypeFromProbabilityKey(String value) {
+  final normalized = value.trim().toLowerCase().replaceAll(
+    RegExp(r'[\s-]+'),
+    '_',
+  );
+  return switch (normalized) {
+    'full_cone' || 'fullcone' => NatTraversalType.fullCone,
+    'restricted_cone' || 'restricted' => NatTraversalType.restrictedCone,
+    'port_restricted_cone' ||
+    'port_restricted' ||
+    'portrestricted' => NatTraversalType.portRestrictedCone,
+    'symmetric' || 'symmetric_nat' => NatTraversalType.symmetric,
+    _ => null,
+  };
+}
+
+List<NatTypeProbability> _inferNatTypeProbabilities({
+  required String mappingBehavior,
+  required String filteringBehavior,
+  required int? confidence,
+  required bool udpBlocked,
+}) {
+  final mapping = mappingBehavior.toLowerCase();
+  final filtering = filteringBehavior.toLowerCase();
+  if (udpBlocked || mapping == 'udp_blocked' || filtering == 'udp_blocked') {
+    return const [];
+  }
+  if (mapping == 'open_internet') {
+    return const [];
+  }
+
+  final signal = ((confidence ?? 70).clamp(1, 100)).toDouble();
+  if (mapping == 'address_or_port_dependent') {
+    return _probabilityForSingleType(NatTraversalType.symmetric, signal);
+  }
+  if (mapping == 'endpoint_independent') {
+    final selected = switch (filtering) {
+      'endpoint_independent' ||
+      'likely_endpoint_independent' => NatTraversalType.fullCone,
+      'address_dependent' => NatTraversalType.restrictedCone,
+      'address_or_port_dependent' => NatTraversalType.portRestrictedCone,
+      _ => null,
+    };
+    if (selected != null) return _probabilityForSingleType(selected, signal);
+    final coneProbability = signal / 3;
+    return _normalizeNatTypeProbabilities([
+      NatTypeProbability(
+        type: NatTraversalType.fullCone,
+        probability: coneProbability,
+      ),
+      NatTypeProbability(
+        type: NatTraversalType.restrictedCone,
+        probability: coneProbability,
+      ),
+      NatTypeProbability(
+        type: NatTraversalType.portRestrictedCone,
+        probability: coneProbability,
+      ),
+      NatTypeProbability(
+        type: NatTraversalType.symmetric,
+        probability: 100 - signal,
+      ),
+    ]);
+  }
+  return const [
+    NatTypeProbability(type: NatTraversalType.fullCone, probability: 25),
+    NatTypeProbability(type: NatTraversalType.restrictedCone, probability: 25),
+    NatTypeProbability(
+      type: NatTraversalType.portRestrictedCone,
+      probability: 25,
+    ),
+    NatTypeProbability(type: NatTraversalType.symmetric, probability: 25),
+  ];
+}
+
+List<NatTypeProbability> _probabilityForSingleType(
+  NatTraversalType selected,
+  double confidence,
+) {
+  final remainder = 100 - confidence;
+  final otherProbability = remainder / (_fourNatTraversalTypes.length - 1);
+  return [
+    for (final type in _fourNatTraversalTypes)
+      NatTypeProbability(
+        type: type,
+        probability: type == selected ? confidence : otherProbability,
+      ),
+  ];
+}
+
+List<NatTypeProbability> _normalizeNatTypeProbabilities(
+  List<NatTypeProbability> values,
+) {
+  final byType = {for (final type in _fourNatTraversalTypes) type: 0.0};
+  for (final value in values) {
+    if (!byType.containsKey(value.type)) continue;
+    byType[value.type] = byType[value.type]! + value.probability;
+  }
+  final rawTotal = byType.values.fold<double>(0, (sum, value) => sum + value);
+  if (rawTotal <= 0) return const [];
+  final scale = rawTotal <= 1.0001 ? 100 : 100 / rawTotal;
+  return [
+    for (final type in _fourNatTraversalTypes)
+      NatTypeProbability(type: type, probability: byType[type]! * scale),
+  ];
 }
 
 class HealthSnapshot {
