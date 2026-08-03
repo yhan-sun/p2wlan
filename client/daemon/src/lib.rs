@@ -183,6 +183,11 @@ const PEER_REFLEXIVE_SIGNAL_DELAYS: [Duration; 4] = [
 /// mapping warm without waiting behind the peer-wide synchronized punch lease.
 const PEER_REFLEXIVE_FAST_PUNCH_INTERVAL: Duration = Duration::from_millis(10);
 const PEER_REFLEXIVE_FAST_PUNCH_ATTEMPTS: u32 = 2;
+/// During an asymmetric hard-NAT punch, the hard side keeps exactly one
+/// destination-specific binding warm while the stable side sweeps predicted
+/// public ports. This is a NAT-state maintainer, not a data-path keepalive.
+const HARD_NAT_MAINTAINER_CONNECTING_INTERVAL: Duration = Duration::from_millis(150);
+const HARD_NAT_MAINTAINER_CONNECTING_DURATION: Duration = Duration::from_secs(60);
 /// Send a few real encrypted packets over a freshly observed UDP path. The
 /// packets are valid ICMP echo requests, so the remote TUN can answer and both
 /// sides can confirm the WireGuard data path without waiting for user traffic.

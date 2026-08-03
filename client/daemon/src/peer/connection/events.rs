@@ -178,7 +178,7 @@ impl PeerConnection {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
-        self.direct_events.push(DirectTraversalEvent::new(
+        self.push_direct_event(DirectTraversalEvent::new(
             local_generation,
             stage,
             endpoint,
@@ -186,6 +186,41 @@ impl PeerConnection {
             sent_probes,
             detail,
         ));
+    }
+
+    fn record_direct_event_with_probe_coverage(
+        &mut self,
+        local_generation: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+        socket0_count: u32,
+        alt_socket_count: u32,
+        unique_target_ports: u32,
+        repeated_target_ports: u32,
+    ) {
+        self.push_direct_event(
+            DirectTraversalEvent::new(
+                local_generation,
+                stage,
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+            )
+            .with_probe_coverage(
+                socket0_count,
+                alt_socket_count,
+                unique_target_ports,
+                repeated_target_ports,
+            ),
+        );
+    }
+
+    fn push_direct_event(&mut self, event: DirectTraversalEvent) {
+        self.direct_events.push(event);
 
         if self.direct_events.len() > DIRECT_TRAVERSAL_EVENT_LIMIT {
             let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;

@@ -4,7 +4,7 @@
 //! ID. This module is the direct UDP sink: it resolves each peer endpoint from
 //! `PeerManager` and sends the encrypted datagram to that socket address.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -32,10 +32,10 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 mod probe_budget;
 use probe_budget::{
-    default_global_outbound_probe_budget, retain_live_budget_entries, GlobalOutboundProbeBudget,
-    OutboundProbeAdmission, OutboundProbeBudgetKey, OutboundProbeBudgetState,
-    OUTBOUND_PROBE_BUDGET_PER_NETWORK, OUTBOUND_PROBE_BUDGET_PER_PEER,
-    OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
+    default_global_outbound_probe_budget, outbound_probe_admission_reason,
+    retain_live_budget_entries, GlobalOutboundProbeBudget, OutboundProbeAdmission,
+    OutboundProbeBudgetKey, OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK,
+    OUTBOUND_PROBE_BUDGET_PER_PEER, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
 };
 #[cfg(test)]
 use std::net::IpAddr;

@@ -204,6 +204,141 @@ async fn large_punch_window_prioritizes_remote_port_coverage_before_extra_socket
 }
 
 #[tokio::test]
+async fn primary_socket_punch_never_uses_alternate_pool_sockets() {
+    let peers = peer_manager();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", None))
+        .await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+
+    let candidates = (0..64)
+        .map(|offset| format!("127.0.0.1:{}", 21_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let sent = transport
+        .punch_candidates_primary_socket("peer-b", candidates.clone(), Duration::ZERO, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(sent as usize, candidates.len());
+    let pending = transport.pending_probes.lock().await;
+    assert_eq!(pending.len(), candidates.len());
+    assert!(pending.values().all(|probe| probe.socket_index == 0));
+    drop(pending);
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].probes_sent, candidates.len() as u64);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .skip(1)
+            .map(|member| member.probes_sent)
+            .sum::<u64>(),
+        0
+    );
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "primary_socket_scan_completed")
+        .expect("primary-only scan should emit coverage diagnostics");
+    assert_eq!(event.sent_probes, Some(sent));
+    assert_eq!(event.probe_tx_socket0_count, Some(sent));
+    assert_eq!(event.probe_tx_alt_socket_count, Some(0));
+    assert_eq!(event.probe_tx_unique_target_ports, Some(64));
+    assert_eq!(event.probe_tx_repeated_target_ports, Some(0));
+    assert!(event.detail.contains("scan_socket_policy=primary_only"));
+    assert!(event.detail.contains("unique_target_ports=64"));
+}
+
+#[tokio::test]
+async fn nat_binding_maintainer_uses_only_primary_socket() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let peers = peer_manager();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", None))
+        .await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+    let primary_addr = transport.active_sockets()[0].local_addr().unwrap();
+
+    assert!(
+        transport
+            .spawn_nat_binding_maintainer(
+                "peer-b",
+                receiver_addr,
+                Duration::from_millis(5),
+                Duration::from_millis(35),
+            )
+            .await
+    );
+    assert!(
+        !transport
+            .spawn_nat_binding_maintainer(
+                "peer-b",
+                receiver_addr,
+                Duration::from_millis(5),
+                Duration::from_millis(35),
+            )
+            .await,
+        "overlapping maintainer for the same peer/endpoint should be suppressed"
+    );
+
+    let mut buf = [0u8; 64];
+    let mut sources = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let (n, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_punch_packet(&buf[..n]).unwrap().kind,
+            PunchPacketKind::Punch
+        );
+        sources.insert(source);
+    }
+
+    assert_eq!(sources, std::collections::HashSet::from([primary_addr]));
+    sleep(Duration::from_millis(50)).await;
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert!(diagnostics[0].nat_maintainer_probes_sent >= 3);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .skip(1)
+            .map(|member| member.nat_maintainer_probes_sent)
+            .sum::<u64>(),
+        0
+    );
+    let peer_diagnostics = peers.diagnostics().await;
+    assert!(peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "nat_maintainer_started"));
+    assert!(peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "nat_maintainer_suppressed"));
+    assert!(peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "nat_maintainer_stopped"));
+}
+
+#[tokio::test]
 async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
     let peers = peer_manager();
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)

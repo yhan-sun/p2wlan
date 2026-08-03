@@ -63,6 +63,77 @@ impl PeerManager {
         endpoints
     }
 
+    /// Return stable public endpoints that a hard local NAT should continuously
+    /// probe with one socket while the easier peer scans this side's moving
+    /// public-port window.
+    pub async fn direct_nat_maintainer_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        if !local_nat_profile.as_ref().is_some_and(is_hard_nat_profile) {
+            return Vec::new();
+        }
+
+        let conns = self.connections.read().await;
+        let Some(conn) = conns.get(node_id) else {
+            return Vec::new();
+        };
+        if !conn.online || conn.state == ConnectionState::Direct {
+            return Vec::new();
+        }
+        if !conn.should_use_asymmetric_stable_remote_role(local_nat_profile.as_ref()) {
+            return Vec::new();
+        }
+
+        let mut endpoints = conn
+            .asymmetric_stable_remote_endpoints(generation)
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .collect::<Vec<_>>();
+        endpoints.dedup();
+        endpoints.truncate(1);
+        endpoints
+    }
+
+    /// Whether the current direct probe pass must keep a stable local UDP
+    /// source by using only socket 0.
+    pub async fn direct_probe_uses_primary_socket_only(
+        &self,
+        node_id: &str,
+        endpoints: &[SocketAddr],
+    ) -> bool {
+        if endpoints.is_empty() {
+            return false;
+        }
+
+        let generation = self.current_network_generation().await;
+        let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        let conns = self.connections.read().await;
+        let Some(conn) = conns.get(node_id) else {
+            return false;
+        };
+        if !conn.online {
+            return false;
+        }
+
+        if local_nat_profile.as_ref().is_some_and(is_hard_nat_profile)
+            && conn.should_use_asymmetric_stable_remote_role(local_nat_profile.as_ref())
+        {
+            return true;
+        }
+
+        endpoints.iter().any(|endpoint| {
+            is_public_probe_endpoint(*endpoint)
+                && (matches!(
+                    conn.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Predicted | CandidatePairSource::Birthday
+                ) || conn.candidate_pairs.iter().any(|pair| {
+                    pair.local_generation == generation
+                        && pair.remote_endpoint == *endpoint
+                        && is_speculative_probe_source(pair.source)
+                }))
+        })
+    }
+
     /// Return candidate endpoints that should continue receiving direct-path probes.
     pub async fn direct_probe_targets(&self) -> Vec<(String, Vec<SocketAddr>)> {
         let generation = self.current_network_generation().await;

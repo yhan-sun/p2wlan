@@ -158,9 +158,10 @@ use birthday::{
     peer_candidates_need_port_scatter,
 };
 use candidate_ranking::{
-    birthday_base_rank, candidate_pair_dynamic_probe_rank, candidate_pair_source_observed_age_ms,
-    candidate_pair_source_quality_rank, candidate_pair_source_rank, discovered_endpoint_probe_rank,
-    is_hard_nat_profile, peer_reflexive_retention_rank, should_retain_peer_reflexive_pair,
+    birthday_base_rank, candidate_pair_dynamic_probe_rank, candidate_pair_freshness_rank,
+    candidate_pair_source_observed_age_ms, candidate_pair_source_quality_rank,
+    candidate_pair_source_rank, discovered_endpoint_probe_rank, is_hard_nat_profile,
+    peer_reflexive_retention_rank, should_retain_peer_reflexive_pair,
     speculative_probe_rotation_rank, speculative_probe_source_rank_for_mode,
 };
 use diagnostics::candidate_pair_source_stats;

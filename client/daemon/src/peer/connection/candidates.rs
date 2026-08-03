@@ -204,6 +204,9 @@ impl PeerConnection {
                     )
                 })
                 .then_with(|| {
+                    candidate_pair_freshness_rank(a).cmp(&candidate_pair_freshness_rank(b))
+                })
+                .then_with(|| {
                     candidate_pair_dynamic_probe_rank(a, active_endpoint)
                         .cmp(&candidate_pair_dynamic_probe_rank(b, active_endpoint))
                 })

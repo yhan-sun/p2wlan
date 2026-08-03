@@ -342,6 +342,114 @@ async fn hard_local_nat_uses_single_public_peer_candidate_without_scatter() {
 }
 
 #[tokio::test]
+async fn hard_local_nat_maintainer_targets_stable_public_endpoint() {
+    let manager = PeerManager::new(test_config());
+    let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let candidates = vec![stable_endpoint.to_string()];
+    let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", stable_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_nat_maintainer_targets_for("peer1").await;
+    assert_eq!(targets, vec![stable_endpoint]);
+}
+
+#[tokio::test]
+async fn predicted_or_birthday_window_requires_primary_socket_scan() {
+    let manager = PeerManager::new(test_config());
+    let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_008)
+        .map(|port| SocketAddr::new(stable_endpoint.ip(), port))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![stable_endpoint.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(stable_endpoint.to_string(), "stun_observed".to_string());
+
+    manager
+        .add_peer(&test_peer("peer1", stable_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(predicted.iter().any(|endpoint| targets.contains(endpoint)));
+    assert!(
+        manager
+            .direct_probe_uses_primary_socket_only("peer1", &targets)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn ordinary_stable_public_probe_can_use_active_socket_pool() {
+    let manager = PeerManager::new(test_config());
+    let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let candidates = vec![stable_endpoint.to_string()];
+    let sources = HashMap::from([(stable_endpoint.to_string(), "stun_observed".to_string())]);
+
+    manager
+        .add_peer(&test_peer("peer1", stable_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert_eq!(targets, vec![stable_endpoint]);
+    assert!(
+        !manager
+            .direct_probe_uses_primary_socket_only("peer1", &targets)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn fresh_public_candidate_ranks_before_stale_peer_reflexive_without_success() {
+    let manager = PeerManager::new(test_config());
+    let stale_peer_reflexive: SocketAddr = "8.8.8.8:1414".parse().unwrap();
+    let fresh_stable: SocketAddr = "8.8.8.8:2778".parse().unwrap();
+    let candidates = vec![fresh_stable.to_string()];
+    let sources = HashMap::from([(fresh_stable.to_string(), "stun_observed".to_string())]);
+
+    manager
+        .add_peer(&test_peer("peer1", stale_peer_reflexive))
+        .await;
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", stale_peer_reflexive)
+            .await
+    );
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        for pair in &mut conn.candidate_pairs {
+            if pair.remote_endpoint == stale_peer_reflexive {
+                pair.source_observed_at = Some(Instant::now() - Duration::from_secs(45));
+            }
+        }
+    }
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(targets.len() >= 2);
+    assert_eq!(targets[0], fresh_stable);
+    assert_eq!(targets[1], stale_peer_reflexive);
+}
+
+#[tokio::test]
 async fn hard_local_nat_prefers_fresh_public_candidate_over_stale_peer_reflexive_without_scatter() {
     let manager = PeerManager::new(test_config());
     let stale_peer_reflexive: SocketAddr = "8.8.8.8:1414".parse().unwrap();

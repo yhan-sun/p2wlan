@@ -57,6 +57,28 @@ pub(super) fn candidate_pair_source_observed_age_ms(pair: &CandidatePair) -> Opt
         .map(|observed_at| duration_millis(observed_at.elapsed()))
 }
 
+pub(super) fn candidate_pair_freshness_rank(pair: &CandidatePair) -> u8 {
+    if pair.last_success_at.is_some()
+        || matches!(
+            pair.state,
+            CandidatePairState::Selected | CandidatePairState::Succeeded
+        )
+    {
+        return 0;
+    }
+
+    match pair
+        .source_observed_at
+        .map(|observed_at| observed_at.elapsed())
+    {
+        Some(age) if age <= Duration::from_secs(3) => 0,
+        Some(age) if age <= Duration::from_secs(10) => 1,
+        Some(age) if age <= Duration::from_secs(30) => 2,
+        Some(_) => 3,
+        None => 4,
+    }
+}
+
 fn candidate_pair_source_observed_sort_key(
     pair: &CandidatePair,
 ) -> std::cmp::Reverse<Option<Instant>> {

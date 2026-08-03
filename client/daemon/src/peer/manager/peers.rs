@@ -132,6 +132,37 @@ impl PeerManager {
         }
     }
 
+    /// Record a direct traversal event with structured probe coverage counters.
+    pub async fn record_direct_event_with_probe_coverage(
+        &self,
+        node_id: &str,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+        socket0_count: u32,
+        alt_socket_count: u32,
+        unique_target_ports: u32,
+        repeated_target_ports: u32,
+    ) {
+        let generation = self.current_network_generation().await;
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.record_direct_event_with_probe_coverage(
+                generation,
+                stage,
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+                socket0_count,
+                alt_socket_count,
+                unique_target_ports,
+                repeated_target_ports,
+            );
+        }
+    }
+
     /// Set the explicit control-plane session ID used to bind Probe v2 MAC keys.
     pub async fn set_probe_session_id(&self, node_id: &str, session_id: Option<String>) -> bool {
         let normalized = session_id.and_then(|value| {

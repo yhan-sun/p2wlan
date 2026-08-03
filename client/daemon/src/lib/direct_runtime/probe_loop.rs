@@ -107,10 +107,37 @@ async fn run_direct_probe_loop(
                             ),
                         )
                         .await;
-                    match udp
-                        .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
+                    for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
+                        udp.spawn_nat_binding_maintainer(
+                            &peer_id,
+                            endpoint,
+                            HARD_NAT_MAINTAINER_CONNECTING_INTERVAL,
+                            HARD_NAT_MAINTAINER_CONNECTING_DURATION,
+                        )
+                        .await;
+                    }
+                    let primary_socket_only = peers
+                        .direct_probe_uses_primary_socket_only(&peer_id, &candidates)
+                        .await;
+                    let punch_result = if primary_socket_only {
+                        udp.punch_candidates_primary_socket(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
                         .await
-                    {
+                    } else {
+                        udp.punch_candidates(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
+                        .await
+                    };
+
+                    match punch_result {
                         Ok(0) => {}
                         Ok(sent) => {
                             peers
