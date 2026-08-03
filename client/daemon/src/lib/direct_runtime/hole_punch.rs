@@ -104,21 +104,10 @@ async fn spawn_hole_punch_task(
                 .direct_probe_success_count_for_generation(&peer_id, generation)
                 .await;
 
-            let primary_socket_only = peers
-                .direct_probe_uses_primary_socket_only(&peer_id, &candidates)
+            let rx_before = udp.probe_rx_snapshot().await;
+            let punch_result = udp
+                .punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
                 .await;
-            let punch_result = if primary_socket_only {
-                udp.punch_candidates_primary_socket(
-                    &peer_id,
-                    candidates.clone(),
-                    probe_interval,
-                    attempts,
-                )
-                .await
-            } else {
-                udp.punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
-                    .await
-            };
 
             match punch_result {
                 Ok(sent) => {
@@ -140,6 +129,7 @@ async fn spawn_hole_punch_task(
                     let success_count_after = peers
                         .direct_probe_success_count_for_generation(&peer_id, generation)
                         .await;
+                    let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
                     if sent > 0 && success_count_after == success_count_before {
                         peers
                             .record_direct_event(
@@ -148,7 +138,11 @@ async fn spawn_hole_punch_task(
                                 candidates.first().copied(),
                                 Some(candidates.len()),
                                 Some(sent),
-                                format!("no UDP punch ACK after {sent} probes"),
+                                format!(
+                                    "no matched UDP punch ACK after {sent} probes; local_authenticated_probe_rx_delta={} local_probe_ack_rx_delta={}",
+                                    rx_delta.authenticated_probe_packets_received,
+                                    rx_delta.probe_acks_received
+                                ),
                             )
                             .await;
                     }

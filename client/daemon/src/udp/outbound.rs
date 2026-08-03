@@ -170,10 +170,11 @@ impl UdpTransport {
 
     /// Send active UDP probes only from the primary socket.
     ///
-    /// This is used for predicted/birthday scans against a hard peer. The peer
-    /// is maintaining a destination-specific NAT binding toward our stable
-    /// public endpoint, so alternate local sockets would create different
-    /// public source ports and are usually not part of that peer's filter.
+    /// This is reserved for explicit single-socket diagnostics and tests. The
+    /// hard-NAT binding maintainer sends on socket 0 directly, while normal
+    /// synchronized/retry punching uses the active pool so alternate sockets
+    /// can open peer-specific NAT filter state instead of only publishing
+    /// STUN-observed mappings.
     pub async fn punch_candidates_primary_socket(
         &self,
         peer_id: &str,
@@ -225,112 +226,132 @@ impl UdpTransport {
                 sleep(round.delay_before).await;
             }
 
-            // For large symmetric-NAT windows, remote port coverage matters
-            // more than exhausting every local socket for the first few
-            // endpoints.  Socket-major ordering lets the primary/stable
-            // socket sweep as many remote candidates as possible before the
-            // hard per-session cap is reached, then spends any remaining
-            // budget on alternate local sockets.
-            for socket_index in 0..socket_count {
-                for &candidate in &round.endpoints {
-                    if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
-                        session_capped = true;
-                        break 'schedule;
-                    }
-                    match self
-                        .admit_outbound_connectivity_probe(peer_id, candidate)
-                        .await
-                    {
-                        OutboundProbeAdmission::Accepted => {}
-                        OutboundProbeAdmission::NetworkRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("network_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: network probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
-                        }
-                        OutboundProbeAdmission::PeerRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("peer_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: peer probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
-                        }
-                        OutboundProbeAdmission::RemoteIpRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("remote_ip_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: remote IP probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
-                        }
-                        OutboundProbeAdmission::GlobalNetworkRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("global_network_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: global network probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
-                        }
-                        OutboundProbeAdmission::GlobalPeerRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("global_peer_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: global peer probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
-                        }
-                        OutboundProbeAdmission::GlobalRemoteIpRateLimited => {
-                            budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("global_remote_ip_rate_limited");
-                            trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: global remote IP probe budget exhausted",
-                                socket_index, peer_id, candidate
-                            );
-                            continue;
+            let probe_order = match socket_policy {
+                PunchSocketPolicy::ActivePool if socket_count > 1 => {
+                    // Hard NAT traversal needs the alternate sockets to send real
+                    // peer-directed traffic, not just STUN probes. Candidate-major
+                    // ordering gives every high-priority remote port a chance from
+                    // each active local socket before the per-peer/IP budget or
+                    // session cap is exhausted.
+                    let mut order = Vec::with_capacity(round.endpoints.len() * socket_count);
+                    for &candidate in &round.endpoints {
+                        for socket_index in 0..socket_count {
+                            order.push((socket_index, candidate));
                         }
                     }
+                    order
+                }
+                _ => {
+                    // Primary-only scans and single-socket fallback keep the
+                    // original stable source-port sweep semantics.
+                    let mut order = Vec::with_capacity(round.endpoints.len() * socket_count);
+                    for socket_index in 0..socket_count {
+                        for &candidate in &round.endpoints {
+                            order.push((socket_index, candidate));
+                        }
+                    }
+                    order
+                }
+            };
 
-                    match self
-                        .send_probe_from_socket(socket_index, Some(peer_id), candidate)
-                        .await
-                    {
-                        Ok(_) => {
-                            packets_sent += 1;
-                            if socket_index == 0 {
-                                socket0_sent = socket0_sent.saturating_add(1);
-                            } else {
-                                alt_socket_sent = alt_socket_sent.saturating_add(1);
-                            }
-                            sent_endpoints.insert(candidate);
-                            sent_ports.insert(candidate.port());
-                            self.peers
-                                .record_direct_probe_sent(peer_id, candidate)
-                                .await;
-                            trace!(
-                                "Sent adaptive punch probe round {} from socket {} to peer {} candidate {}",
-                                round_index + 1,
-                                socket_index,
-                                peer_id,
-                                candidate
-                            );
-                            if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
-                                sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
-                            }
+            for (socket_index, candidate) in probe_order {
+                if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
+                    session_capped = true;
+                    break 'schedule;
+                }
+                match self
+                    .admit_outbound_connectivity_probe(peer_id, candidate)
+                    .await
+                {
+                    OutboundProbeAdmission::Accepted => {}
+                    OutboundProbeAdmission::NetworkRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("network_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: network probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                    OutboundProbeAdmission::PeerRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("peer_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: peer probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                    OutboundProbeAdmission::RemoteIpRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("remote_ip_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: remote IP probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                    OutboundProbeAdmission::GlobalNetworkRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("global_network_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: global network probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                    OutboundProbeAdmission::GlobalPeerRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("global_peer_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: global peer probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                    OutboundProbeAdmission::GlobalRemoteIpRateLimited => {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("global_remote_ip_rate_limited");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: global remote IP probe budget exhausted",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
+                }
+
+                match self
+                    .send_probe_from_socket(socket_index, Some(peer_id), candidate)
+                    .await
+                {
+                    Ok(_) => {
+                        packets_sent += 1;
+                        if socket_index == 0 {
+                            socket0_sent = socket0_sent.saturating_add(1);
+                        } else {
+                            alt_socket_sent = alt_socket_sent.saturating_add(1);
                         }
-                        Err(err) => {
-                            debug!(
-                                "Failed to send punch probe from socket {} to peer {} candidate {}: {}",
-                                socket_index, peer_id, candidate, err
-                            );
+                        sent_endpoints.insert(candidate);
+                        sent_ports.insert(candidate.port());
+                        self.peers
+                            .record_direct_probe_sent(peer_id, candidate)
+                            .await;
+                        trace!(
+                            "Sent adaptive punch probe round {} from socket {} to peer {} candidate {}",
+                            round_index + 1,
+                            socket_index,
+                            peer_id,
+                            candidate
+                        );
+                        if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
+                            sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
                         }
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to send punch probe from socket {} to peer {} candidate {}: {}",
+                            socket_index, peer_id, candidate, err
+                        );
                     }
                 }
             }
@@ -367,33 +388,37 @@ impl UdpTransport {
                 .await;
         }
 
-        if socket_policy == PunchSocketPolicy::PrimaryOnly {
-            let unique_target_ports = u32::try_from(sent_ports.len()).unwrap_or(u32::MAX);
-            let repeated_target_ports = packets_sent.saturating_sub(unique_target_ports);
-            self.peers
-                .record_direct_event_with_probe_coverage(
-                    peer_id,
-                    "primary_socket_scan_completed",
-                    candidates.first().copied(),
-                    Some(candidates.len()),
-                    Some(packets_sent),
-                    format!(
-                        "scan_socket_policy={} scan_socket_id=0 active_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={}",
-                        socket_policy.label(),
-                        self.socket_count(),
-                        candidates.len(),
-                        attempts,
-                        sent_endpoints.len(),
-                        sent_ports.len(),
-                        repeated_target_ports
-                    ),
-                    socket0_sent,
-                    alt_socket_sent,
-                    unique_target_ports,
-                    repeated_target_ports,
-                )
-                .await;
-        }
+        let unique_target_ports = u32::try_from(sent_ports.len()).unwrap_or(u32::MAX);
+        let repeated_target_ports = packets_sent.saturating_sub(unique_target_ports);
+        let stage = match socket_policy {
+            PunchSocketPolicy::ActivePool if socket_count > 1 => "active_pool_scan_completed",
+            PunchSocketPolicy::ActivePool => "single_socket_scan_completed",
+            PunchSocketPolicy::PrimaryOnly => "primary_socket_scan_completed",
+        };
+        self.peers
+            .record_direct_event_with_probe_coverage(
+                peer_id,
+                stage,
+                candidates.first().copied(),
+                Some(candidates.len()),
+                Some(packets_sent),
+                format!(
+                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={}",
+                    socket_policy.label(),
+                    self.socket_count(),
+                    socket_count,
+                    candidates.len(),
+                    attempts,
+                    sent_endpoints.len(),
+                    sent_ports.len(),
+                    repeated_target_ports
+                ),
+                socket0_sent,
+                alt_socket_sent,
+                unique_target_ports,
+                repeated_target_ports,
+            )
+            .await;
 
         Ok(packets_sent)
     }

@@ -103,6 +103,26 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
     ));
 }
 
+#[test]
+fn probe_rx_snapshot_delta_is_saturating() {
+    let newer = UdpProbeRxSnapshot {
+        authenticated_probe_packets_received: 10,
+        probe_acks_received: 3,
+    };
+    let older = UdpProbeRxSnapshot {
+        authenticated_probe_packets_received: 7,
+        probe_acks_received: 9,
+    };
+
+    assert_eq!(
+        newer.delta_since(older),
+        UdpProbeRxSnapshot {
+            authenticated_probe_packets_received: 3,
+            probe_acks_received: 0,
+        }
+    );
+}
+
 #[tokio::test]
 async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())

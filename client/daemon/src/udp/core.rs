@@ -117,6 +117,26 @@ impl UdpTransport {
         self.socket_pool_diagnostics.lock().await.clone()
     }
 
+    /// Aggregate receive-side probe counters across every bound UDP socket.
+    ///
+    /// The direct probe loops use this around a punch burst to distinguish
+    /// "ACK was not matched" from the more useful runtime signal
+    /// "no authenticated probe/ACK datagram reached this daemon at all".
+    pub async fn probe_rx_snapshot(&self) -> UdpProbeRxSnapshot {
+        self.socket_pool_diagnostics.lock().await.iter().fold(
+            UdpProbeRxSnapshot::default(),
+            |mut snapshot, member| {
+                snapshot.authenticated_probe_packets_received = snapshot
+                    .authenticated_probe_packets_received
+                    .saturating_add(member.authenticated_probe_packets_received);
+                snapshot.probe_acks_received = snapshot
+                    .probe_acks_received
+                    .saturating_add(member.probe_acks_received);
+                snapshot
+            },
+        )
+    }
+
     async fn update_socket_diagnostics(
         &self,
         socket_index: usize,

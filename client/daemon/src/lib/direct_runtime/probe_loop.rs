@@ -116,26 +116,15 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
-                    let primary_socket_only = peers
-                        .direct_probe_uses_primary_socket_only(&peer_id, &candidates)
+                    let rx_before = udp.probe_rx_snapshot().await;
+                    let punch_result = udp
+                        .punch_candidates(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
                         .await;
-                    let punch_result = if primary_socket_only {
-                        udp.punch_candidates_primary_socket(
-                            &peer_id,
-                            candidates.clone(),
-                            probe_interval,
-                            attempts,
-                        )
-                        .await
-                    } else {
-                        udp.punch_candidates(
-                            &peer_id,
-                            candidates.clone(),
-                            probe_interval,
-                            attempts,
-                        )
-                        .await
-                    };
 
                     match punch_result {
                         Ok(0) => {}
@@ -154,7 +143,13 @@ async fn run_direct_probe_loop(
                             let success_count_after = peers
                                 .direct_probe_success_count_for_generation(&peer_id, generation)
                                 .await;
+                            let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
                             if success_count_after == success_count_before {
+                                let timeout_detail = format!(
+                                    "no matched direct probe ACK after {sent} {retry_label} probes; local_authenticated_probe_rx_delta={} local_probe_ack_rx_delta={}",
+                                    rx_delta.authenticated_probe_packets_received,
+                                    rx_delta.probe_acks_received
+                                );
                                 peers
                                     .record_direct_event(
                                         &peer_id,
@@ -162,9 +157,7 @@ async fn run_direct_probe_loop(
                                         candidates.first().copied(),
                                         Some(candidates.len()),
                                         Some(sent),
-                                        format!(
-                                            "no direct probe ACK after {sent} {retry_label} probes"
-                                        ),
+                                        timeout_detail.clone(),
                                     )
                                     .await;
                                 peers
@@ -172,9 +165,7 @@ async fn run_direct_probe_loop(
                                         &peer_id,
                                         generation,
                                         REASON_DIRECT_PROBE_FAILED,
-                                        format!(
-                                            "no direct probe ACK after {sent} {retry_label} probes"
-                                        ),
+                                        timeout_detail,
                                     )
                                     .await;
                                 debug!(

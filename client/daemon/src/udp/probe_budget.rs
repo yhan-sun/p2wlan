@@ -67,12 +67,13 @@ impl GlobalOutboundProbeBudget {
 }
 
 pub(super) const OUTBOUND_PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 768;
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 256;
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 1024;
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 512;
 // Symmetric NAT traversal often needs to sweep a short predicted port window
-// against one public IP. Keep this bounded, but wide enough that the first
-// synchronized punch is not cut off before the predicted window is covered.
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 192;
+// against one public IP from multiple local sockets. Keep this bounded, but
+// wide enough that a 96-port predicted/birthday window can be tried from a
+// four-socket pool during one synchronized punch.
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutboundProbeAdmission {
