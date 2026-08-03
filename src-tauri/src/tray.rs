@@ -74,14 +74,13 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
         ],
     )?;
 
-    let app_icon = app
-        .default_window_icon()
-        .ok_or_else(|| tauri::Error::FailedToReceiveMessage)?;
-    let tray_icon = tauri::image::Image::new(app_icon.rgba(), app_icon.width(), app_icon.height());
-
     let tray = TrayIconBuilder::with_id("p2wlan_tray")
         .tooltip("p2wlan：未启动")
-        .icon(tray_icon)
+        .icon(tauri::image::Image::new(
+            include_bytes!("../icons/tray-icon.rgba"),
+            64,
+            64,
+        ))
         .menu(&menu)
         .on_menu_event(
             |app_handle: &tauri::AppHandle, event| match event.id.as_ref() {
