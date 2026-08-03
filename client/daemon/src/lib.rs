@@ -122,12 +122,12 @@ include!("lib/pending_handshake.rs");
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Handshake timeout before pending entry is cleared.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
-/// Grace period for UDP/STUN/port-mapping candidate gathering before signaling a WireGuard offer.
+/// Short grace period for UDP/STUN/port-mapping candidates before WireGuard signaling.
 ///
-/// Real home gateways can take a little over 3s when STUN and short UPnP/PCP/NAT-PMP discovery
-/// race at startup.  Sending an offer with zero candidates is especially harmful for symmetric-like
-/// NATs because the peer starts its synchronized punch window without any usable destination for us.
-const CANDIDATE_READY_TIMEOUT_MS: u64 = 8_000;
+/// Startup traffic must be able to fall back to relay quickly.  Candidate
+/// refresh publishes/trickles UDP candidates later, so a slow STUN or gateway
+/// probe must not hold the WireGuard session hostage for several seconds.
+const CANDIDATE_READY_TIMEOUT_MS: u64 = 300;
 /// Public STUN fallbacks used when older configs do not specify STUN servers.
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
@@ -178,6 +178,11 @@ const PEER_REFLEXIVE_SIGNAL_DELAYS: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_millis(700),
 ];
+/// When an authenticated Probe v2 source address is observed, send a tiny
+/// endpoint-specific burst immediately.  This keeps the just-discovered NAT
+/// mapping warm without waiting behind the peer-wide synchronized punch lease.
+const PEER_REFLEXIVE_FAST_PUNCH_INTERVAL: Duration = Duration::from_millis(10);
+const PEER_REFLEXIVE_FAST_PUNCH_ATTEMPTS: u32 = 2;
 /// Send a few real encrypted packets over a freshly observed UDP path. The
 /// packets are valid ICMP echo requests, so the remote TUN can answer and both
 /// sides can confirm the WireGuard data path without waiting for user traffic.

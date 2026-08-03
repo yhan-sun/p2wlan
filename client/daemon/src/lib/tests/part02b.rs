@@ -234,6 +234,26 @@ fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
         &legacy_servers,
         false,
     ));
+
+    let plaintext_catalog = vec![RelayCatalogEntry {
+        region: "cn".to_string(),
+        audience: "relay-cn-1".to_string(),
+        endpoint: "tcp://control.example.com:18081".to_string(),
+        udp_observer_endpoint: None,
+        udp_observer_endpoints: Vec::new(),
+    }];
+    assert!(effective_relay_allow_insecure_plaintext(
+        "http://control.example.com:18080",
+        &plaintext_catalog,
+        &[],
+        false,
+    ));
+    assert!(!effective_relay_allow_insecure_plaintext(
+        "https://ctrl.example.com",
+        &plaintext_catalog,
+        &[],
+        false,
+    ));
 }
 
 #[test]
