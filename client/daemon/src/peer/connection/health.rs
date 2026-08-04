@@ -273,6 +273,23 @@ impl PeerConnection {
         self.direct_health.retry_after(base)
     }
 
+    /// Whether the peer is on a confirmed Direct path with recent success and
+    /// no consecutive failures, making relay-assisted punching unnecessary.
+    pub(super) fn direct_is_healthy_confirmed(&self) -> bool {
+        if self.state != ConnectionState::Direct
+            || self.direct_health.consecutive_failures != 0
+            || !self
+                .direct_health
+                .success_age()
+                .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        {
+            return false;
+        }
+        self.candidate_pairs.iter().any(|pair| {
+            pair.selected_at.is_some() && pair.state != CandidatePairState::Frozen
+        })
+    }
+
     fn direct_retry_remaining(&self, base: Duration) -> Duration {
         self.direct_health.retry_remaining(base)
     }

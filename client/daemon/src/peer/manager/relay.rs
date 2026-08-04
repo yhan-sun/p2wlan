@@ -40,6 +40,8 @@ impl PeerManager {
         latency: Option<Duration>,
     ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            let previous_relay = conn.relay_server.clone();
+            let previous_path = conn.active_path();
             conn.relay_server = Some(relay_server.to_string());
             if let Some(latency) = latency {
                 conn.relay_health.record_success_with_latency(latency);
@@ -47,26 +49,58 @@ impl PeerManager {
                 conn.relay_health.record_success();
             }
             if switch_to_relay || conn.state != ConnectionState::Direct {
+                let was_relay = conn.state == ConnectionState::Relay;
+                let relay_changed = previous_relay.as_deref() != Some(relay_server);
                 conn.transition(ConnectionState::Relay);
-                info!(
-                    event = "relay_fallback_selected",
-                    peer_id = %node_id,
-                    local_endpoint = "relay",
-                    remote_endpoint = %relay_server,
-                    direct_endpoint = ?conn.endpoint,
-                    relay_server = %relay_server,
-                    candidate_source = ?conn.endpoint.and_then(|endpoint| {
-                        conn.candidate_pairs
-                            .iter()
-                            .find(|pair| pair.remote_endpoint == endpoint)
-                            .map(|pair| pair.source)
-                    }),
-                    rtt_ms = ?conn.relay_health.rtt_ewma_ms.or(conn.relay_health.latency_ms),
-                    reason = %format!("relay {relay_server} selected"),
-                    "relay_fallback_selected peer_id={} relay_server={}",
-                    node_id,
-                    relay_server
-                );
+                let selected_path = conn.active_path();
+                let dedupe_key = format!("{node_id}:{relay_server}");
+                let deduped = was_relay && !relay_changed;
+                if deduped {
+                    debug!(
+                        event = "relay_fallback_selected",
+                        peer_id = %node_id,
+                        relay_server = %relay_server,
+                        previous_path = ?previous_path,
+                        selected_path = ?selected_path,
+                        event_deduped = true,
+                        dedupe_key = %dedupe_key,
+                        "relay_fallback_selected deduplicated peer_id={} relay_server={}",
+                        node_id,
+                        relay_server
+                    );
+                } else {
+                    conn.record_direct_event(
+                        conn.direct_generation,
+                        "relay_fallback_selected",
+                        conn.endpoint,
+                        None,
+                        None,
+                        format!("relay {relay_server} selected; dedupe_key={dedupe_key}"),
+                    );
+                    info!(
+                        event = "relay_fallback_selected",
+                        peer_id = %node_id,
+                        local_endpoint = "relay",
+                        remote_endpoint = %relay_server,
+                        direct_endpoint = ?conn.endpoint,
+                        relay_server = %relay_server,
+                        candidate_source = ?conn.endpoint.and_then(|endpoint| {
+                            conn.candidate_pairs
+                                .iter()
+                                .find(|pair| pair.remote_endpoint == endpoint)
+                                .map(|pair| pair.source)
+                        }),
+                        rtt_ms = ?conn.relay_health.rtt_ewma_ms.or(conn.relay_health.latency_ms),
+                        previous_path = ?previous_path,
+                        selected_path = ?selected_path,
+                        event_deduped = false,
+                        dedupe_key = %dedupe_key,
+                        reason = %format!("relay {relay_server} selected"),
+                        "relay_fallback_selected peer_id={} relay_server={}",
+                        node_id,
+                        relay_server
+                    );
+                }
             }
         }
     }

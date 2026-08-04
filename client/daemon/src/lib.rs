@@ -77,10 +77,11 @@ use tracing::{debug, error, info, warn};
 use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
-    compact_volatile_public_signal_candidates, control_udp_endpoint_from_candidates,
-    maybe_add_port_mapping_udp_candidate, preserve_peer_reflexive_candidates,
-    publish_local_candidates_to_known_peers, run_udp_candidate_refresh,
-    stable_network_candidate_signature, truncate_signal_candidates, UdpCandidateRefreshContext,
+    candidate_set_change_reason, candidate_set_hash, compact_volatile_public_signal_candidates,
+    control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
+    preserve_peer_reflexive_candidates, publish_local_candidates_to_known_peers,
+    run_udp_candidate_refresh, stable_network_candidate_signature, truncate_signal_candidates,
+    UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{

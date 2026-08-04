@@ -38,6 +38,8 @@ pub struct CandidatePairSourceStats {
     pub probing_count: u64,
     pub failed_count: u64,
     pub degraded_count: u64,
+    /// Pairs retired to Frozen while a confirmed Direct path is healthy.
+    pub frozen_count: u64,
     pub success_count: u64,
     pub failure_count: u64,
     pub success_rate_per_mille: Option<u16>,

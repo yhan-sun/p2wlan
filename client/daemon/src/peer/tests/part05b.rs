@@ -343,3 +343,83 @@ async fn path_selection_timeline_records_only_real_changes() {
     assert_eq!(json["path_events"].as_array().unwrap().len(), 2);
     assert!(json["path_events"][1]["direct_score"]["score"].is_i64());
 }
+
+#[tokio::test]
+async fn repeated_relay_fallback_selection_records_single_path_event() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager.set_relay("peer1", "relay.test:443").await;
+
+    for _ in 0..5 {
+        let selection = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selection.path, Some(NetworkPath::Relay));
+    }
+    let diagnostics = manager.diagnostics().await;
+    assert_eq!(diagnostics[0].path_events.len(), 1);
+    assert_eq!(
+        diagnostics[0].path_events[0].selected_path,
+        Some(NetworkPath::Relay)
+    );
+    assert_eq!(
+        diagnostics[0].path_events[0].relay_server.as_deref(),
+        Some("relay.test:443")
+    );
+
+    manager.set_relay("peer1", "relay2.test:443").await;
+    for _ in 0..3 {
+        let selection = manager.select_path_for_data("peer1", true, true).await;
+        assert_eq!(selection.path, Some(NetworkPath::Relay));
+    }
+    let diagnostics = manager.diagnostics().await;
+    assert_eq!(diagnostics[0].path_events.len(), 2);
+    assert_eq!(
+        diagnostics[0].path_events[1].relay_server.as_deref(),
+        Some("relay2.test:443")
+    );
+}
+
+#[tokio::test]
+async fn repeated_relay_success_records_relay_fallback_selected_once() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    manager
+        .record_relay_success("peer1", "relay.test:443", true)
+        .await;
+    manager
+        .record_relay_success("peer1", "relay.test:443", true)
+        .await;
+    manager
+        .record_relay_success("peer1", "relay.test:443", true)
+        .await;
+    {
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Relay);
+        assert_eq!(
+            conn.direct_events
+                .iter()
+                .filter(|event| event.stage == "relay_fallback_selected")
+                .count(),
+            1
+        );
+    }
+
+    manager
+        .record_relay_success("peer1", "relay2.test:443", true)
+        .await;
+    {
+        let conn = manager.get_connection("peer1").await.unwrap();
+        assert_eq!(conn.relay_server.as_deref(), Some("relay2.test:443"));
+        assert_eq!(
+            conn.direct_events
+                .iter()
+                .filter(|event| event.stage == "relay_fallback_selected")
+                .count(),
+            2
+        );
+    }
+}

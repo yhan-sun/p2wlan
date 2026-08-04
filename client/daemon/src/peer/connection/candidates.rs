@@ -177,6 +177,73 @@ impl PeerConnection {
         before.saturating_sub(self.candidate_pairs.len())
     }
 
+    /// Retire unsuccessful speculative probe pairs while a confirmed Direct
+    /// path is healthy, so diagnostics no longer present hundreds of stale
+    /// predicted/birthday/STUN sweep pairs as current probing state.
+    ///
+    /// Only the pair state is frozen; traversal history, cooldown counters and
+    /// the advertised candidate list are untouched. When the Direct path
+    /// fails, the network generation changes, or the selected pair ages out,
+    /// probing resumes and these pairs are re-expanded from the same
+    /// candidates. Returns the number of pairs retired.
+    pub(super) fn retire_speculative_pairs_when_direct_confirmed(
+        &mut self,
+        local_generation: u64,
+    ) -> usize {
+        if self.state != ConnectionState::Direct
+            || self.direct_health.consecutive_failures != 0
+            || !self
+                .direct_health
+                .success_age()
+                .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+            || !self.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == local_generation
+                    && pair.state == CandidatePairState::Selected
+                    && pair.consecutive_failures == 0
+                    && pair
+                        .success_age()
+                        .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+            })
+        {
+            return 0;
+        }
+
+        let mut pruned_predicted = 0usize;
+        let mut pruned_birthday = 0usize;
+        let mut pruned_stun = 0usize;
+        for pair in self.candidate_pairs.iter_mut() {
+            if pair.local_generation != local_generation
+                || pair.state == CandidatePairState::Frozen
+                || pair.state == CandidatePairState::Selected
+                || pair.last_success_at.is_some()
+                || is_low_latency_direct_endpoint(pair.remote_endpoint)
+            {
+                continue;
+            }
+            match pair.source {
+                CandidatePairSource::Predicted => pruned_predicted += 1,
+                CandidatePairSource::Birthday => pruned_birthday += 1,
+                CandidatePairSource::StunObserved => pruned_stun += 1,
+                _ => continue,
+            }
+            pair.state = CandidatePairState::Frozen;
+        }
+        let total = pruned_predicted + pruned_birthday + pruned_stun;
+        if total > 0 {
+            self.record_direct_event(
+                local_generation,
+                "speculative_pairs_retired",
+                self.endpoint,
+                Some(total),
+                None,
+                format!(
+                    "retired speculative probing pairs while Direct confirmed: pruned_predicted_count={pruned_predicted} pruned_birthday_count={pruned_birthday} pruned_stun_count={pruned_stun} retained_reason=selected_direct_healthy"
+                ),
+            );
+        }
+        total
+    }
+
     fn candidate_probe_endpoints(
         &mut self,
         local_generation: u64,

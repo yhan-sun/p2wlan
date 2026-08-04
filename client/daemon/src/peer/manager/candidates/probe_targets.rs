@@ -54,6 +54,7 @@ impl PeerManager {
         if conn.state == ConnectionState::Direct
             && !conn.should_probe_private_alternates_while_direct(generation)
         {
+            conn.retire_speculative_pairs_when_direct_confirmed(generation);
             return None;
         }
         let endpoints = conn.candidate_probe_endpoints(
@@ -130,6 +131,7 @@ impl PeerManager {
                 if conn.state == ConnectionState::Direct
                     && !conn.should_probe_private_alternates_while_direct(generation)
                 {
+                    conn.retire_speculative_pairs_when_direct_confirmed(generation);
                     return None;
                 }
                 if conn.state != ConnectionState::Direct
@@ -203,6 +205,7 @@ impl PeerManager {
                     return None;
                 }
                 if conn.state == ConnectionState::Direct {
+                    conn.retire_speculative_pairs_when_direct_confirmed(generation);
                     return None;
                 }
                 let reclaim_active = conn.direct_reclaim_active();

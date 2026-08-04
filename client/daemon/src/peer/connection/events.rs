@@ -12,6 +12,8 @@ impl PeerConnection {
                     || previous.reason_code != selection.reason_code
                     || previous.direct_endpoint != selection.direct_endpoint
                     || previous.relay_hedged != selection.relay_hedged
+                    || (selection.path == Some(NetworkPath::Relay)
+                        && previous.relay_server != selection.relay_server)
             })
             .unwrap_or(true);
         if !changed {
@@ -168,6 +170,7 @@ impl PeerConnection {
             previous_path,
             selected_path: selection.path,
             direct_endpoint: selection.direct_endpoint,
+            relay_server: selection.relay_server.clone(),
             reason_code: selection.reason_code.to_string(),
             reason: selection.reason.clone(),
             direct_confirmed: selection.direct_confirmed,

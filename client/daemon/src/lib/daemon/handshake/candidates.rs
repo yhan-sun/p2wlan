@@ -106,6 +106,12 @@ impl Daemon {
             "Published {reason} UDP candidates to peer {node_id} ({} candidates) punch_at_ms={punch_at_ms:?}",
             candidates.len()
         );
+        if self.peers.should_defer_relay_assisted_punch(node_id).await {
+            debug!(
+                "Skipping relay-assisted punch for {node_id}: healthy confirmed Direct path is active"
+            );
+            return;
+        }
         let attempts = self
             .peers
             .recommended_punch_attempts(self.config.network.punch_attempts)
@@ -190,11 +196,19 @@ impl Daemon {
         let previous_network_identity = self.local_network_identity.read().await.clone();
         let should_advance_generation =
             !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
-        let changed = previous_candidates != candidates
-            || previous_candidate_sources != candidate_sources
-            || previous_network_identity != next_network_identity;
+        let change_reason = candidate_set_change_reason(
+            &previous_candidates,
+            &candidates,
+            &previous_candidate_sources,
+            &candidate_sources,
+        );
+        let old_hash = candidate_set_hash(&previous_candidates, &previous_candidate_sources);
+        let new_hash = candidate_set_hash(&candidates, &candidate_sources);
+        let old_candidate_count = previous_candidates.len();
+        let new_candidate_count = candidates.len();
+        let real_change = change_reason != "no_change" && change_reason != "order_only";
 
-        if changed {
+        if real_change || should_advance_generation {
             *self.local_candidates.write().await = candidates.clone();
             *self.local_candidate_sources.write().await = candidate_sources.clone();
             *self.local_network_identity.write().await = next_network_identity;
@@ -204,14 +218,17 @@ impl Daemon {
                     .await;
             }
             info!(
-                "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?})",
+                "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?}, old_hash={old_hash}, new_hash={new_hash}, changed_reason={change_reason}, old_candidate_count={old_candidate_count}, new_candidate_count={new_candidate_count})",
                 candidates.len(),
                 report.nat_profile.mapping_behavior,
                 report.nat_profile.public_endpoint
             );
+            debug!(
+                "Pre-signal UDP candidate set diff for {reason}: changed_reason={change_reason} old_candidates={previous_candidates:?} new_candidates={candidates:?}"
+            );
         } else {
             debug!(
-                "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates",
+                "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates (old_hash={old_hash} new_hash={new_hash} changed_reason={change_reason})",
                 candidates.len()
             );
         }
@@ -241,6 +258,13 @@ impl Daemon {
             debug!("No peer connection for {node_id}; skipping hole punch");
             return;
         };
+
+        if self.peers.should_defer_relay_assisted_punch(node_id).await {
+            debug!(
+                "Skipping relay-assisted punch for {node_id}: healthy confirmed Direct path is active"
+            );
+            return;
+        }
 
         if self.local_candidates.read().await.is_empty() {
             self.peers

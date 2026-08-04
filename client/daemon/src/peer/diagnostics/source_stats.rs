@@ -50,6 +50,7 @@ fn candidate_pair_source_stats_for(
     let mut probing_count = 0u64;
     let mut failed_count = 0u64;
     let mut degraded_count = 0u64;
+    let mut frozen_count = 0u64;
     let mut success_count = 0u64;
     let mut failure_count = 0u64;
     let mut last_success_at: Option<Instant> = None;
@@ -66,7 +67,8 @@ fn candidate_pair_source_stats_for(
             CandidatePairState::Probing => probing_count = probing_count.saturating_add(1),
             CandidatePairState::Failed => failed_count = failed_count.saturating_add(1),
             CandidatePairState::Degraded => degraded_count = degraded_count.saturating_add(1),
-            CandidatePairState::Frozen | CandidatePairState::Waiting => {}
+            CandidatePairState::Frozen => frozen_count = frozen_count.saturating_add(1),
+            CandidatePairState::Waiting => {}
         }
         success_count = success_count.saturating_add(pair.success_count);
         failure_count = failure_count.saturating_add(pair.failure_count);
@@ -85,6 +87,7 @@ fn candidate_pair_source_stats_for(
         probing_count,
         failed_count,
         degraded_count,
+        frozen_count,
         success_count,
         failure_count,
         success_rate_per_mille: success_rate_per_mille(success_count, failure_count),

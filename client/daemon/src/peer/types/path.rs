@@ -85,6 +85,8 @@ pub struct PathSelection {
     pub path: Option<NetworkPath>,
     /// Direct UDP endpoint to use when `path == Direct`.
     pub direct_endpoint: Option<SocketAddr>,
+    /// Relay server backing a Relay selection, for diagnostics and deduplication.
+    pub relay_server: Option<String>,
     /// Stable machine-readable reason code.
     pub reason_code: &'static str,
     /// Human-readable reason for diagnostics and logs.
@@ -109,6 +111,7 @@ impl PathSelection {
         Self {
             path: Some(NetworkPath::Direct),
             direct_endpoint: Some(endpoint),
+            relay_server: None,
             reason_code,
             reason: reason.into(),
             direct_confirmed,
@@ -122,6 +125,7 @@ impl PathSelection {
         Self {
             path: Some(NetworkPath::Relay),
             direct_endpoint: None,
+            relay_server: None,
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
@@ -135,6 +139,7 @@ impl PathSelection {
         Self {
             path: None,
             direct_endpoint: None,
+            relay_server: None,
             reason_code,
             reason: reason.into(),
             direct_confirmed: false,
@@ -248,6 +253,7 @@ pub struct PathSelectionEvent {
     pub previous_path: Option<NetworkPath>,
     pub selected_path: Option<NetworkPath>,
     pub direct_endpoint: Option<SocketAddr>,
+    pub relay_server: Option<String>,
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
