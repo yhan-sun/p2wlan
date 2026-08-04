@@ -131,12 +131,27 @@ impl PeerConnection {
         let local_endpoint_text = format_log_endpoint(local_endpoint);
         let peer_id = self.node_id.clone();
         let mut probed_sources = Vec::new();
-        let current_endpoints = self.candidate_endpoints();
-        let has_probed_pair = current_endpoints.iter().copied().any(|endpoint| {
-            let pair = self.ensure_candidate_pair(endpoint, local_generation);
-            pair.last_probe_at.is_some()
-        });
-        for endpoint in current_endpoints {
+        let mut failure_endpoints = self.candidate_endpoints();
+        let has_probed_pair = self
+            .candidate_pairs
+            .iter()
+            .any(|pair| pair.local_generation == local_generation && pair.last_probe_at.is_some());
+        if has_probed_pair {
+            let probed_transient_endpoints = self
+                .candidate_pairs
+                .iter()
+                .filter(|pair| {
+                    pair.local_generation == local_generation && pair.last_probe_at.is_some()
+                })
+                .map(|pair| pair.remote_endpoint)
+                .collect::<Vec<_>>();
+            for endpoint in probed_transient_endpoints {
+                if !failure_endpoints.contains(&endpoint) {
+                    failure_endpoints.push(endpoint);
+                }
+            }
+        }
+        for endpoint in failure_endpoints {
             let pair = self.ensure_candidate_pair(endpoint, local_generation);
             if has_probed_pair && pair.last_probe_at.is_none() {
                 continue;

@@ -158,8 +158,13 @@ async fn run_direct_probe_loop(
                             let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
                             if success_count_after == success_count_before {
                                 let timeout_detail = format!(
-                                    "no matched direct probe ACK after {sent} {retry_label} probes; local_authenticated_probe_rx_delta={} local_probe_ack_rx_delta={}",
+                                    "no matched direct probe ACK after {sent} {retry_label} probes; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                                    rx_delta.known_peer_ip_datagrams_received,
                                     rx_delta.authenticated_probe_packets_received,
+                                    rx_delta.authenticated_probe_acks_observed,
+                                    rx_delta.authenticated_probe_acks_unmatched,
+                                    rx_delta.legacy_probe_acks_observed,
+                                    rx_delta.legacy_probe_acks_unmatched,
                                     rx_delta.probe_acks_received
                                 );
                                 peers

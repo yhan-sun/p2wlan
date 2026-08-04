@@ -56,6 +56,15 @@ impl UdpTransport {
             })
             .await;
 
+            if self.peers.has_known_public_candidate_ip(source.ip()).await {
+                self.update_socket_diagnostics(socket_index, |metrics| {
+                    metrics.known_peer_ip_datagrams_received = metrics
+                        .known_peer_ip_datagrams_received
+                        .saturating_add(1)
+                })
+                .await;
+            }
+
             let data = &buf[..n];
 
             if let Some(transaction_id) = stun_transaction_id(data) {
@@ -146,7 +155,14 @@ impl UdpTransport {
                             )
                             .await
                         {
-                            AuthenticatedPunchAdmission::Accepted => {}
+                            AuthenticatedPunchAdmission::Accepted => {
+                                self.update_socket_diagnostics(socket_index, |metrics| {
+                                    metrics.authenticated_probe_punches_received = metrics
+                                        .authenticated_probe_punches_received
+                                        .saturating_add(1)
+                                })
+                                .await;
+                            }
                             AuthenticatedPunchAdmission::Replay => {
                                 let generation = self.peers.current_network_generation().await;
                                 let ack = build_authenticated_punch_ack(
@@ -266,6 +282,12 @@ impl UdpTransport {
                         }
                     }
                     PunchPacketKind::Ack => {
+                        self.update_socket_diagnostics(socket_index, |metrics| {
+                            metrics.authenticated_probe_acks_observed = metrics
+                                .authenticated_probe_acks_observed
+                                .saturating_add(1)
+                        })
+                        .await;
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
                             let mut pending_probes = self.pending_probes.lock().await;
@@ -346,6 +368,12 @@ impl UdpTransport {
                                 );
                             }
                         } else {
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.authenticated_probe_acks_unmatched = metrics
+                                    .authenticated_probe_acks_unmatched
+                                    .saturating_add(1)
+                            })
+                            .await;
                             trace!(
                                 "Ignored unmatched authenticated UDP punch ACK from peer {} at {}",
                                 identity.source_node_id,
@@ -401,6 +429,12 @@ impl UdpTransport {
                         }
                     }
                     PunchPacketKind::Ack => {
+                        self.update_socket_diagnostics(socket_index, |metrics| {
+                            metrics.legacy_probe_acks_observed = metrics
+                                .legacy_probe_acks_observed
+                                .saturating_add(1)
+                        })
+                        .await;
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
                             let mut pending_probes = self.pending_probes.lock().await;
@@ -428,6 +462,7 @@ impl UdpTransport {
                             }
                             matched
                         };
+                        let ack_matched = ack_match.is_some();
                         let pending_peer_id = ack_match
                             .as_ref()
                             .and_then(|(_, _, peer_id, _, _)| peer_id.clone());
@@ -487,9 +522,23 @@ impl UdpTransport {
                                     );
                                 }
                             } else {
+                                self.update_socket_diagnostics(socket_index, |metrics| {
+                                    metrics.legacy_probe_acks_unmatched = metrics
+                                        .legacy_probe_acks_unmatched
+                                        .saturating_add(1)
+                                })
+                                .await;
                                 trace!("Ignored stale or unmatched UDP punch ACK from {source}");
                             }
                         } else {
+                            if !ack_matched {
+                                self.update_socket_diagnostics(socket_index, |metrics| {
+                                    metrics.legacy_probe_acks_unmatched = metrics
+                                        .legacy_probe_acks_unmatched
+                                        .saturating_add(1)
+                                })
+                                .await;
+                            }
                             trace!("Received UDP punch ACK from unknown candidate {source}");
                         }
                     }

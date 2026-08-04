@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use p2pnet_crypto::NodeIdentity;
+use p2pnet_nat::build_authenticated_punch_ack;
 use p2pnet_nat::build_authenticated_punch_packet;
 use p2pnet_tun::{Ipv4Packet, MockTunDevice};
 use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
@@ -106,18 +107,33 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
 #[test]
 fn probe_rx_snapshot_delta_is_saturating() {
     let newer = UdpProbeRxSnapshot {
+        known_peer_ip_datagrams_received: 12,
         authenticated_probe_packets_received: 10,
+        authenticated_probe_acks_observed: 5,
+        authenticated_probe_acks_unmatched: 2,
+        legacy_probe_acks_observed: 4,
+        legacy_probe_acks_unmatched: 1,
         probe_acks_received: 3,
     };
     let older = UdpProbeRxSnapshot {
+        known_peer_ip_datagrams_received: 9,
         authenticated_probe_packets_received: 7,
+        authenticated_probe_acks_observed: 9,
+        authenticated_probe_acks_unmatched: 1,
+        legacy_probe_acks_observed: 2,
+        legacy_probe_acks_unmatched: 5,
         probe_acks_received: 9,
     };
 
     assert_eq!(
         newer.delta_since(older),
         UdpProbeRxSnapshot {
+            known_peer_ip_datagrams_received: 3,
             authenticated_probe_packets_received: 3,
+            authenticated_probe_acks_observed: 0,
+            authenticated_probe_acks_unmatched: 1,
+            legacy_probe_acks_observed: 2,
+            legacy_probe_acks_unmatched: 0,
             probe_acks_received: 0,
         }
     );
@@ -161,6 +177,100 @@ async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
             .await,
         AuthenticatedPunchAdmission::RateLimited
     );
+}
+
+#[tokio::test]
+async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let known_candidate: SocketAddr = "127.0.0.1:50999".parse().unwrap();
+
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_identity.public_key()),
+            Some(known_candidate),
+        ))
+        .await;
+    assert!(
+        peers
+            .has_known_public_candidate_ip("127.0.0.1".parse().unwrap())
+            .await
+    );
+    assert!(
+        !peers
+            .has_known_public_candidate_ip("198.51.100.9".parse().unwrap())
+            .await
+    );
+
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let generation = peers.current_network_generation().await;
+
+    let ack = build_authenticated_punch_ack([42u8; 8], "peer-b", "peer-a", generation, &key);
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if transport.socket_pool_diagnostics().await[0]
+                .authenticated_probe_acks_unmatched
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].known_peer_ip_datagrams_received, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_packets_received, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
+    assert_eq!(diagnostics[0].probe_acks_received, 0);
+
+    // An invalid-MAC authenticated probe from the same known peer IP is counted
+    // at the raw-IP and Probe v2 framing layers, then fails MAC validation.
+    let (mut bad_probe, _nonce) =
+        build_authenticated_punch_packet("peer-b", "peer-a", generation, &key);
+    *bad_probe.last_mut().unwrap() ^= 0x01;
+    sender.send_to(&bad_probe, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if transport.socket_pool_diagnostics().await[0].authenticated_probe_invalid_mac >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].known_peer_ip_datagrams_received, 2);
+    assert_eq!(diagnostics[0].authenticated_probe_packets_received, 2);
+    assert_eq!(diagnostics[0].authenticated_probe_invalid_mac, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
+    assert_eq!(diagnostics[0].probe_acks_received, 0);
+
+    worker.abort();
 }
 
 fn hard_nat_candidate_report(

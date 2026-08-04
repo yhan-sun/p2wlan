@@ -635,8 +635,11 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         .expect("scheduled hole punch should record ACK timeout");
     assert!(timeout
         .detail
-        .contains("local_authenticated_probe_rx_delta="));
-    assert!(timeout.detail.contains("local_probe_ack_rx_delta="));
+        .contains("known_peer_ip_rx_delta="));
+    assert!(timeout
+        .detail
+        .contains("authenticated_probe_ack_observed_delta="));
+    assert!(timeout.detail.contains("matched_probe_ack_rx_delta="));
     assert!(!conn
         .direct_events
         .iter()

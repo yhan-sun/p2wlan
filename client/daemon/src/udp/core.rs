@@ -126,9 +126,24 @@ impl UdpTransport {
         self.socket_pool_diagnostics.lock().await.iter().fold(
             UdpProbeRxSnapshot::default(),
             |mut snapshot, member| {
+                snapshot.known_peer_ip_datagrams_received = snapshot
+                    .known_peer_ip_datagrams_received
+                    .saturating_add(member.known_peer_ip_datagrams_received);
                 snapshot.authenticated_probe_packets_received = snapshot
                     .authenticated_probe_packets_received
                     .saturating_add(member.authenticated_probe_packets_received);
+                snapshot.authenticated_probe_acks_observed = snapshot
+                    .authenticated_probe_acks_observed
+                    .saturating_add(member.authenticated_probe_acks_observed);
+                snapshot.authenticated_probe_acks_unmatched = snapshot
+                    .authenticated_probe_acks_unmatched
+                    .saturating_add(member.authenticated_probe_acks_unmatched);
+                snapshot.legacy_probe_acks_observed = snapshot
+                    .legacy_probe_acks_observed
+                    .saturating_add(member.legacy_probe_acks_observed);
+                snapshot.legacy_probe_acks_unmatched = snapshot
+                    .legacy_probe_acks_unmatched
+                    .saturating_add(member.legacy_probe_acks_unmatched);
                 snapshot.probe_acks_received = snapshot
                     .probe_acks_received
                     .saturating_add(member.probe_acks_received);
