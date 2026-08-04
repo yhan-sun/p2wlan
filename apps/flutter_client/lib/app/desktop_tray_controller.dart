@@ -59,7 +59,7 @@ class DesktopTrayController with TrayListener, WindowListener {
     try {
       await windowManager.setPreventClose(true);
       if (Platform.isMacOS) {
-        await trayManager.setTitle(p2wlanAppName);
+        await trayManager.setTitle(trayTitleForTesting());
       }
       await _updateTrayIcon(force: true);
       await _updateMenu();
@@ -128,7 +128,7 @@ class DesktopTrayController with TrayListener, WindowListener {
     await _updateTrayIcon();
     await trayManager.setToolTip('$p2wlanAppName - $statusLabel');
     if (Platform.isMacOS) {
-      await trayManager.setTitle(p2wlanAppName);
+      await trayManager.setTitle(trayTitleForTesting());
     }
 
     await trayManager.setContextMenu(buildMenuForTesting());
@@ -222,6 +222,9 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   @visibleForTesting
   bool trayIconUsesTemplateForTesting() => Platform.isMacOS;
+
+  @visibleForTesting
+  String trayTitleForTesting() => '';
 
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
     final virtualIp = snapshot?.virtualIp.trim();

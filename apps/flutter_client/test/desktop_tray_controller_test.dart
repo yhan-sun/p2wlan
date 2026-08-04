@@ -79,6 +79,18 @@ void main() {
     expect(controller.trayIconUsesTemplateForTesting(), Platform.isMacOS);
   });
 
+  test('desktop tray title stays empty so only the icon is visible', () async {
+    final stores = await _makeStores(api: DiagnosticsApi());
+    addTearDown(stores.dispose);
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    expect(controller.trayTitleForTesting(), isEmpty);
+  });
+
   test(
     'desktop tray icon exposes healthy state without opening the menu',
     () async {
