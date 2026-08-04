@@ -50,12 +50,12 @@ fn candidate_pair_probe_retry_remaining(pair: &CandidatePair) -> Option<Duration
     Some(retry_after.saturating_sub(failure_age))
 }
 
-fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
-    if is_successful_low_latency_private_pair(pair) {
+fn candidate_pair_send_rank_at(pair: &CandidatePair, now: Instant) -> u8 {
+    if is_successful_low_latency_private_pair_at(pair, now) {
         return 0;
     }
 
-    if is_recent_successful_direct_trial_pair(pair) {
+    if is_recent_successful_direct_trial_pair_at(pair, now) {
         return 2;
     }
 
@@ -64,7 +64,7 @@ fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
         CandidatePairState::Succeeded | CandidatePairState::Probing
             if pair.source == CandidatePairSource::PeerReflexive
                 && pair.last_probe_at.is_some_and(|last_probe| {
-                    last_probe.elapsed() <= PEER_REFLEXIVE_STICKY_WINDOW
+                    now.saturating_duration_since(last_probe) <= PEER_REFLEXIVE_STICKY_WINDOW
                 }) =>
         {
             2
@@ -79,6 +79,10 @@ fn candidate_pair_send_rank(pair: &CandidatePair) -> u8 {
 }
 
 fn is_recent_successful_direct_trial_pair(pair: &CandidatePair) -> bool {
+    is_recent_successful_direct_trial_pair_at(pair, Instant::now())
+}
+
+fn is_recent_successful_direct_trial_pair_at(pair: &CandidatePair, now: Instant) -> bool {
     if matches!(
         pair.source,
         CandidatePairSource::Predicted | CandidatePairSource::Birthday
@@ -89,23 +93,29 @@ fn is_recent_successful_direct_trial_pair(pair: &CandidatePair) -> bool {
         return false;
     }
 
-    pair.success_age()
-        .is_some_and(|age| age <= DIRECT_TRIAL_WINDOW)
+    pair.last_success_at
+        .is_some_and(|last_success| now.saturating_duration_since(last_success) <= DIRECT_TRIAL_WINDOW)
 }
 
-fn is_successful_low_latency_private_pair(pair: &CandidatePair) -> bool {
+fn is_successful_low_latency_private_pair_at(pair: &CandidatePair, now: Instant) -> bool {
     matches!(
         pair.state,
         CandidatePairState::Selected | CandidatePairState::Succeeded
     ) && is_low_latency_direct_endpoint(pair.remote_endpoint)
         && pair.consecutive_failures == 0
         && pair
-            .success_age()
-            .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+            .last_success_at
+            .is_some_and(|last_success| now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE)
         && pair
             .rtt_ewma_ms
             .or(pair.rtt_ms)
             .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
+}
+
+fn candidate_pair_last_success_sort_key(
+    pair: &CandidatePair,
+) -> (bool, std::cmp::Reverse<Option<Instant>>) {
+    (pair.last_success_at.is_none(), std::cmp::Reverse(pair.last_success_at))
 }
 
 fn duration_millis(duration: Duration) -> u64 {

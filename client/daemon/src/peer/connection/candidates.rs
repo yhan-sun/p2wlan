@@ -204,6 +204,7 @@ impl PeerConnection {
         let source_stats =
             candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
         let active_endpoint = self.endpoint;
+        let now = Instant::now();
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -230,7 +231,8 @@ impl PeerConnection {
                     )
                 })
                 .then_with(|| {
-                    candidate_pair_freshness_rank(a).cmp(&candidate_pair_freshness_rank(b))
+                    candidate_pair_freshness_rank_at(a, now)
+                        .cmp(&candidate_pair_freshness_rank_at(b, now))
                 })
                 .then_with(|| {
                     candidate_pair_dynamic_probe_rank(a, active_endpoint)

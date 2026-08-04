@@ -57,7 +57,7 @@ pub(super) fn candidate_pair_source_observed_age_ms(pair: &CandidatePair) -> Opt
         .map(|observed_at| duration_millis(observed_at.elapsed()))
 }
 
-pub(super) fn candidate_pair_freshness_rank(pair: &CandidatePair) -> u8 {
+pub(super) fn candidate_pair_freshness_rank_at(pair: &CandidatePair, now: Instant) -> u8 {
     if pair.last_success_at.is_some()
         || matches!(
             pair.state,
@@ -69,7 +69,7 @@ pub(super) fn candidate_pair_freshness_rank(pair: &CandidatePair) -> u8 {
 
     match pair
         .source_observed_at
-        .map(|observed_at| observed_at.elapsed())
+        .map(|observed_at| now.saturating_duration_since(observed_at))
     {
         Some(age) if age <= Duration::from_secs(3) => 0,
         Some(age) if age <= Duration::from_secs(10) => 1,

@@ -1,5 +1,6 @@
 impl PeerConnection {
     fn candidate_pairs_for_send(&self, local_generation: u64) -> Vec<&CandidatePair> {
+        let now = Instant::now();
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -12,17 +13,13 @@ impl PeerConnection {
                             | CandidatePairState::Succeeded
                             | CandidatePairState::Probing
                             | CandidatePairState::Waiting
-                    ) || is_recent_successful_direct_trial_pair(pair))
+                    ) || is_recent_successful_direct_trial_pair_at(pair, now))
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_send_rank(a)
-                .cmp(&candidate_pair_send_rank(b))
-                .then_with(|| {
-                    a.success_age()
-                        .unwrap_or(Duration::MAX)
-                        .cmp(&b.success_age().unwrap_or(Duration::MAX))
-                })
+            candidate_pair_send_rank_at(a, now)
+                .cmp(&candidate_pair_send_rank_at(b, now))
+                .then_with(|| candidate_pair_last_success_sort_key(a).cmp(&candidate_pair_last_success_sort_key(b)))
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
@@ -108,17 +105,12 @@ impl PeerConnection {
                     && pair.selected_at.is_some()
                     && pair.state != CandidatePairState::Frozen
             })
-            .min_by(|a, b| {
-                a.selected_at
-                    .unwrap_or_else(Instant::now)
-                    .cmp(&b.selected_at.unwrap_or_else(Instant::now))
-                    .then_with(|| {
-                        a.rtt_ewma_ms
-                            .or(a.rtt_ms)
-                            .unwrap_or(u64::MAX)
-                            .cmp(&b.rtt_ewma_ms.or(b.rtt_ms).unwrap_or(u64::MAX))
-                    })
-                    .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
+            .min_by_key(|pair| {
+                (
+                    std::cmp::Reverse(pair.selected_at.expect("filtered selected_at")),
+                    pair.rtt_ewma_ms.or(pair.rtt_ms).unwrap_or(u64::MAX),
+                    pair.remote_endpoint,
+                )
             })
             .map(|pair| pair.remote_endpoint)
     }
@@ -127,6 +119,7 @@ impl PeerConnection {
         &self,
         local_generation: u64,
     ) -> Option<&CandidatePair> {
+        let now = Instant::now();
         let mut pairs = self
             .candidate_pairs
             .iter()
@@ -136,8 +129,8 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_send_rank(a)
-                .cmp(&candidate_pair_send_rank(b))
+            candidate_pair_send_rank_at(a, now)
+                .cmp(&candidate_pair_send_rank_at(b, now))
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
