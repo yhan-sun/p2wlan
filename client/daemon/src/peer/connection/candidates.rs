@@ -291,6 +291,31 @@ impl PeerConnection {
             && public_endpoints_fit_stable_socket_pool(&public_endpoints)
     }
 
+    /// Widened trigger for the NAT-state binding maintainer.
+    ///
+    /// Probe-target selection keeps the strict asymmetric-role predicate above
+    /// so easy NATs still expand predicted/birthday windows, but the maintainer
+    /// only needs stable peer endpoints plus any hard-NAT risk signal. A
+    /// symmetric side whose explicit predicted window was advertised, or whose
+    /// local profile detection was imprecise, still keeps one destination-
+    /// specific binding warm toward the stable peer while that peer scans this
+    /// side's moving public-port window.
+    fn should_maintain_nat_binding_toward_stable_remote(
+        &self,
+        local_nat_profile: Option<&NatProfile>,
+    ) -> bool {
+        let local_hard_nat = local_nat_profile.is_some_and(is_hard_nat_profile);
+        let remote_scatter_risk = self
+            .candidate_targets_need_remote_scatter_pool(&self.probe_candidate_endpoints());
+        if !local_hard_nat && !remote_scatter_risk {
+            return false;
+        }
+
+        let public_endpoints =
+            self.asymmetric_stable_public_endpoints(self.probe_candidate_endpoints());
+        !public_endpoints.is_empty() && public_endpoints_fit_stable_socket_pool(&public_endpoints)
+    }
+
     fn asymmetric_stable_public_endpoints(&self, endpoints: Vec<SocketAddr>) -> Vec<SocketAddr> {
         let mut authoritative = endpoints
             .iter()

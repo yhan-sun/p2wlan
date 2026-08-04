@@ -53,6 +53,8 @@ pub mod udp;
 pub use config::Config;
 pub use error::{DaemonError, Result};
 
+use crate::udp::estimate_remote_scatter_punch_deadline;
+
 // ============================================================
 // Daemon
 // ============================================================

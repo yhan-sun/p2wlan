@@ -141,8 +141,15 @@ impl PunchAttemptDeduplicator {
     }
 }
 
-async fn run_owned_punch_session<F>(
+/// Run a punch session with a caller-chosen hard deadline.
+///
+/// Wide remote-scatter sweeps plan hundreds of ports across multiple sockets
+/// and need a deadline derived from the actual probe schedule instead of the
+/// fixed 24s bound, which kills them mid-scan before the tail of the birthday
+/// window has been covered.
+async fn run_owned_punch_session_with_deadline<F>(
     session: &PunchSessionPermit,
+    deadline: Duration,
     work: F,
 ) -> PunchSessionOutcome
 where
@@ -151,7 +158,7 @@ where
     tokio::select! {
         biased;
         _ = session.cancelled() => PunchSessionOutcome::Cancelled,
-        _ = sleep(PUNCH_SESSION_HARD_DEADLINE) => PunchSessionOutcome::DeadlineExceeded,
+        _ = sleep(deadline) => PunchSessionOutcome::DeadlineExceeded,
         _ = work => PunchSessionOutcome::Completed,
     }
 }

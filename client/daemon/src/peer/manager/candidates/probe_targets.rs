@@ -92,9 +92,6 @@ impl PeerManager {
     pub async fn direct_nat_maintainer_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
         let generation = self.current_network_generation().await;
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
-        if !local_nat_profile.as_ref().is_some_and(is_hard_nat_profile) {
-            return Vec::new();
-        }
 
         let conns = self.connections.read().await;
         let Some(conn) = conns.get(node_id) else {
@@ -103,7 +100,7 @@ impl PeerManager {
         if !conn.online || conn.state == ConnectionState::Direct {
             return Vec::new();
         }
-        if !conn.should_use_asymmetric_stable_remote_role(local_nat_profile.as_ref()) {
+        if !conn.should_maintain_nat_binding_toward_stable_remote(local_nat_profile.as_ref()) {
             return Vec::new();
         }
 

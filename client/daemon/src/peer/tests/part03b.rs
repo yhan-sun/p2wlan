@@ -444,6 +444,32 @@ async fn hard_local_nat_keeps_large_stun_churn_out_of_stable_remote_role() {
 }
 
 #[tokio::test]
+async fn easy_local_nat_starts_maintainer_for_peer_scatter_risk() {
+    let manager = PeerManager::new(test_config());
+    let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_008)
+        .map(|port| SocketAddr::new(stable_endpoint.ip(), port))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![stable_endpoint.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(stable_endpoint.to_string(), "stun_observed".to_string());
+
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    // No local NAT profile is set at all: the maintainer must still start
+    // because the peer's predicted/scatter candidate set is hard-NAT risk.
+    let targets = manager.direct_nat_maintainer_targets_for("peer1").await;
+    assert_eq!(targets, vec![stable_endpoint]);
+}
+
+#[tokio::test]
 async fn predicted_window_remains_in_synchronized_active_pool_scan() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
