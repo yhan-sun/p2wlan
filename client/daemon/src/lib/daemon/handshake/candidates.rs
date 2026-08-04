@@ -22,6 +22,21 @@ impl Daemon {
         }
     }
 
+    async fn local_candidate_set_for_signal(
+        &self,
+        reason: &str,
+    ) -> (Vec<String>, HashMap<String, String>) {
+        if let Some(udp) = self.udp_transport.read().await.clone() {
+            if let Some(refreshed) = self
+                .refresh_local_candidates_for_imminent_signal(&udp, reason)
+                .await
+            {
+                return refreshed;
+            }
+        }
+        self.wait_for_local_candidate_set().await
+    }
+
     async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) -> bool {
         let mut candidates = self.local_candidates.write().await;
         let mut candidate_sources = self.local_candidate_sources.write().await;
@@ -55,12 +70,21 @@ impl Daemon {
             );
             return;
         };
-        let candidates = self.local_candidates.read().await.clone();
+        let (candidates, candidate_sources) = if let Some(refreshed) = self
+            .refresh_local_candidates_for_imminent_signal(&udp, reason)
+            .await
+        {
+            refreshed
+        } else {
+            (
+                self.local_candidates.read().await.clone(),
+                self.local_candidate_sources.read().await.clone(),
+            )
+        };
         if candidates.is_empty() {
             debug!("Local UDP candidates are not ready; skipping {reason} candidate publication to {node_id}");
             return;
         }
-        let candidate_sources = self.local_candidate_sources.read().await.clone();
         let punch_at_ms = Some(relay_assisted_punch_at_ms());
 
         if let Err(error) = self
@@ -96,6 +120,111 @@ impl Daemon {
             punch_at_ms,
         )
         .await;
+    }
+
+    async fn refresh_local_candidates_for_imminent_signal(
+        &self,
+        udp: &UdpTransport,
+        reason: &str,
+    ) -> Option<(Vec<String>, HashMap<String, String>)> {
+        let stun_servers = self.runtime_stun_servers.read().await.clone();
+        if stun_servers.is_empty() {
+            return None;
+        }
+        let stun_timeout = *self.runtime_stun_timeout.read().await;
+        let report = match udp
+            .gather_candidate_report_live(stun_servers, stun_timeout)
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                warn!("Pre-signal UDP candidate refresh failed for {reason}: {err}");
+                return None;
+            }
+        };
+
+        self.peers.update_nat_profile(report.nat_profile.clone()).await;
+        *self.nat_profile.write().await = Some(report.nat_profile.clone());
+
+        let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+        if let Some(endpoint) = udp.local_addr().ok().and_then(|local_addr| {
+            advertised_udp_endpoint(
+                local_addr,
+                self.config.network.udp_advertise.as_deref(),
+                &candidates,
+            )
+        }) {
+            if !candidates.contains(&endpoint) {
+                candidates.insert(0, endpoint.clone());
+            }
+            candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
+                if self
+                    .config
+                    .network
+                    .udp_advertise
+                    .as_deref()
+                    .is_some_and(|configured| {
+                        !configured.trim().is_empty() && configured.trim() == endpoint
+                    })
+                {
+                    "manual".to_string()
+                } else {
+                    "host".to_string()
+                }
+            });
+        }
+
+        let previous_candidates = self.local_candidates.read().await.clone();
+        let previous_candidate_sources = self.local_candidate_sources.read().await.clone();
+        preserve_peer_reflexive_candidates(
+            &previous_candidates,
+            &previous_candidate_sources,
+            &mut candidates,
+            &mut candidate_sources,
+        );
+        compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
+        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
+
+        let next_network_identity =
+            stable_network_candidate_signature(&candidates, &candidate_sources);
+        let previous_network_identity = self.local_network_identity.read().await.clone();
+        let should_advance_generation =
+            !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
+        let changed = previous_candidates != candidates
+            || previous_candidate_sources != candidate_sources
+            || previous_network_identity != next_network_identity;
+
+        if changed {
+            *self.local_candidates.write().await = candidates.clone();
+            *self.local_candidate_sources.write().await = candidate_sources.clone();
+            *self.local_network_identity.write().await = next_network_identity;
+            if should_advance_generation {
+                self.peers
+                    .advance_candidate_refresh_generation("pre-signal UDP candidate refresh")
+                    .await;
+            }
+            info!(
+                "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?})",
+                candidates.len(),
+                report.nat_profile.mapping_behavior,
+                report.nat_profile.public_endpoint
+            );
+        } else {
+            debug!(
+                "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates",
+                candidates.len()
+            );
+        }
+
+        if let Some(endpoint) =
+            control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
+        {
+            if let Err(err) = self.control.update_endpoint(&endpoint, "unknown").await {
+                warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
+            }
+        }
+
+        Some((candidates, candidate_sources))
     }
 
     async fn start_hole_punch(&self, node_id: &str) {

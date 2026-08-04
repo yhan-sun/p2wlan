@@ -31,6 +31,10 @@ pub struct Daemon {
     punch_attempts: PunchAttemptDeduplicator,
     /// Bound UDP transport shared with control-plane-triggered punching.
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    /// Resolved STUN / observer endpoints used by live candidate refreshes.
+    runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
+    /// Timeout for runtime STUN refreshes.
+    runtime_stun_timeout: Arc<RwLock<Duration>>,
     /// Relay transport used when direct UDP is unavailable.
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     /// Latest relay candidate selection diagnostics.
@@ -93,6 +97,10 @@ impl Daemon {
             })),
             punch_attempts: PunchAttemptDeduplicator::default(),
             udp_transport: Arc::new(RwLock::new(None)),
+            runtime_stun_servers: Arc::new(RwLock::new(Vec::new())),
+            runtime_stun_timeout: Arc::new(RwLock::new(Duration::from_millis(
+                config.network.stun_timeout_ms,
+            ))),
             relay_transport: Arc::new(RwLock::new(None)),
             relay_selection,
             port_mappings: Arc::new(PortMappingManager::new()),

@@ -75,17 +75,16 @@ use tracing::{debug, error, info, warn};
 use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
-    control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
+    compact_volatile_public_signal_candidates, control_udp_endpoint_from_candidates,
+    maybe_add_port_mapping_udp_candidate, preserve_peer_reflexive_candidates,
     publish_local_candidates_to_known_peers, run_udp_candidate_refresh,
     stable_network_candidate_signature, truncate_signal_candidates, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
-    candidate_refresh_requires_network_generation_advance,
-    compact_volatile_public_signal_candidates, ipv4_mapped_octets, parse_first_ipv4,
+    candidate_refresh_requires_network_generation_advance, ipv4_mapped_octets, parse_first_ipv4,
     parse_nat_pmp_mapping_response, parse_nat_pmp_public_address_response,
-    parse_pcp_mapping_response, preserve_peer_reflexive_candidates,
-    should_update_stable_control_endpoint,
+    parse_pcp_mapping_response, should_update_stable_control_endpoint,
 };
 #[cfg(test)]
 use control::RelayCatalogEntry;
@@ -163,7 +162,12 @@ const PORT_MAPPING_FAILURE_RETRY: Duration = Duration::from_secs(60);
 /// Active-path liveness must react much faster than a typical NAT mapping lease.
 const DIRECT_LIVENESS_INTERVAL_MAX: Duration = Duration::from_secs(8);
 /// Delay advertised in signaling so both peers can align a short UDP punching burst.
-const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(1_500);
+///
+/// Hard carrier / campus NATs can expose very short UDP mapping lifetimes
+/// (the field logs show a 250ms lower bound).  We refresh candidates
+/// immediately before signaling and start slightly before the rendezvous
+/// timestamp, so the effective local wait should stay inside that lower bound.
+const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(500);
 /// Start slightly before the advertised punch timestamp to absorb clock skew,
 /// HTTP wake-up jitter, and scheduler latency while still keeping the packet
 /// budget bounded by the existing probe schedule.

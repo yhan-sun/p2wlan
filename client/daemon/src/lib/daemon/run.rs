@@ -159,6 +159,8 @@ impl Daemon {
         } else {
             info!("Using STUN/UDP observer endpoints: stun_and_observers={stun_servers:?} observers={udp_observers:?}");
         }
+        *self.runtime_stun_servers.write().await = stun_servers.clone();
+        *self.runtime_stun_timeout.write().await = stun_timeout;
         let configured_keepalive = Duration::from_secs(self.config.network.keepalive_interval_secs);
         let keepalive_interval = if configured_keepalive.is_zero() {
             Duration::ZERO
@@ -351,6 +353,12 @@ self.task_manager
             control: self.control.clone(),
             local_candidates: self.local_candidates.clone(),
             local_candidate_sources: local_candidate_sources.clone(),
+            local_network_identity: self.local_network_identity.clone(),
+            nat_profile: self.nat_profile.clone(),
+            udp_transport: self.udp_transport.clone(),
+            runtime_stun_servers: self.runtime_stun_servers.clone(),
+            runtime_stun_timeout: self.runtime_stun_timeout.clone(),
+            udp_advertise: self.config.network.udp_advertise.clone(),
             node_private_key: self.config.node.private_key.clone(),
             node_public_key: self.config.node.public_key.clone(),
         }),
