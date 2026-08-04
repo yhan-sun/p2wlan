@@ -215,7 +215,13 @@ const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
 const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 /// A traversal task must release its per-peer lease even if a transport call
 /// stalls or an unexpectedly large candidate set reaches the scheduler.
-const PUNCH_SESSION_HARD_DEADLINE: Duration = Duration::from_secs(8);
+///
+/// The remote-scatter path is intentionally wider than ordinary punching:
+/// 3,072 capped probes paced at 6ms take ~18.5s before round delays and the
+/// final ACK grace window.  Keep the deadline above that budget so the wide
+/// Hard-NAT sweep can finish and record coverage instead of being cancelled
+/// mid-scan.
+const PUNCH_SESSION_HARD_DEADLINE: Duration = Duration::from_secs(24);
 
 include!("lib/punch_dedup.rs");
 include!("lib/daemon/core.rs");
