@@ -142,6 +142,94 @@ async fn healthy_selected_peer_reflexive_direct_suppresses_background_full_scatt
 }
 
 #[tokio::test]
+async fn relay_assisted_punch_deferred_until_direct_stops_being_healthy() {
+    let manager = PeerManager::new(test_config());
+    let selected_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[selected_endpoint.to_string()],
+            &HashMap::from([(selected_endpoint.to_string(), "peer_reflexive".to_string())]),
+        )
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint("peer1", Some(selected_endpoint), Some(local))
+        .await;
+    assert!(manager.should_defer_relay_assisted_punch("peer1").await);
+
+    for _ in 0..DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+        manager
+            .record_direct_keepalive_timeout_for_generation("peer1", selected_endpoint, 0)
+            .await;
+    }
+    assert!(!manager.should_defer_relay_assisted_punch("peer1").await);
+}
+
+#[tokio::test]
+async fn direct_confirmed_retires_speculative_probing_pairs_from_stats() {
+    let manager = PeerManager::new(test_config());
+    let selected_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
+    let mut candidates = vec![selected_endpoint.to_string()];
+    candidates.extend((0..88).map(|index| format!("9.9.9.9:{}", 40_000 + index)));
+    candidates.extend((0..32).map(|index| format!("9.9.9.9:{}", 41_000 + index)));
+    let candidate_sources = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let source = if index == 0 {
+                "peer_reflexive"
+            } else if index <= 88 {
+                "predicted"
+            } else {
+                "stun_observed"
+            };
+            (candidate.clone(), source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &candidate_sources)
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint("peer1", Some(selected_endpoint), Some(local))
+        .await;
+
+    assert!(manager.direct_probe_targets().await.is_empty());
+
+    let diagnostics = manager.diagnostics().await;
+    let stats = &diagnostics[0].candidate_pair_stats;
+    let predicted = stats
+        .iter()
+        .find(|stats| stats.source == CandidatePairSource::Predicted)
+        .unwrap();
+    assert_eq!(predicted.pair_count, 88);
+    assert_eq!(predicted.probing_count, 0);
+    assert_eq!(predicted.frozen_count, 88);
+    let stun = stats
+        .iter()
+        .find(|stats| stats.source == CandidatePairSource::StunObserved)
+        .unwrap();
+    assert_eq!(stun.pair_count, 32);
+    assert_eq!(stun.probing_count, 0);
+    assert_eq!(stun.frozen_count, 32);
+    let peer_reflexive = stats
+        .iter()
+        .find(|stats| stats.source == CandidatePairSource::PeerReflexive)
+        .unwrap();
+    assert_eq!(peer_reflexive.selected_count, 1);
+
+    for _ in 0..DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+        manager
+            .record_direct_keepalive_timeout_for_generation("peer1", selected_endpoint, 0)
+            .await;
+    }
+    assert!(!manager.direct_probe_targets().await.is_empty());
+}
+
+#[tokio::test]
 async fn failed_stable_public_candidate_gets_short_background_retry() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "8.8.4.4:40000".parse().unwrap();

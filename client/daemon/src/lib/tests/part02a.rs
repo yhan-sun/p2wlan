@@ -349,3 +349,95 @@ fn candidate_refresh_generation_advances_on_host_or_public_ip_change() {
         &public_ip_changed_sources,
     ));
 }
+
+#[test]
+fn candidate_set_change_reason_ignores_order_only_reshuffles() {
+    let previous = vec![
+        "222.221.150.140:2073".to_string(),
+        "192.168.2.16:53387".to_string(),
+        "222.221.150.140:2076".to_string(),
+    ];
+    let mut shuffled = previous.clone();
+    shuffled.reverse();
+    let sources = previous
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    let shuffled_sources = shuffled
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        candidate_set_change_reason(&previous, &shuffled, &sources, &shuffled_sources),
+        "order_only"
+    );
+    assert_eq!(
+        candidate_set_change_reason(&previous, &previous, &sources, &sources.clone()),
+        "no_change"
+    );
+    assert_eq!(
+        candidate_set_hash(&previous, &sources),
+        candidate_set_hash(&shuffled, &shuffled_sources),
+        "order-only reshuffles must hash identically"
+    );
+}
+
+#[test]
+fn candidate_set_change_reason_detects_added_removed_and_port_changes() {
+    let previous = vec![
+        "222.221.150.140:2073".to_string(),
+        "222.221.150.140:2076".to_string(),
+    ];
+    let sources = previous
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    let added = vec![
+        "222.221.150.140:2073".to_string(),
+        "222.221.150.140:2076".to_string(),
+        "222.221.150.140:2077".to_string(),
+    ];
+    let added_sources = added
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    let removed = vec!["222.221.150.140:2073".to_string()];
+    let removed_sources = removed
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    let port_changed = vec![
+        "222.221.150.140:2073".to_string(),
+        "222.221.150.140:2079".to_string(),
+    ];
+    let port_changed_sources = port_changed
+        .iter()
+        .map(|endpoint| (endpoint.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        candidate_set_change_reason(&previous, &added, &sources, &added_sources),
+        "added"
+    );
+    assert_eq!(
+        candidate_set_change_reason(&previous, &removed, &sources, &removed_sources),
+        "removed"
+    );
+    assert_eq!(
+        candidate_set_change_reason(&previous, &port_changed, &sources, &port_changed_sources),
+        "port_changed"
+    );
+    assert_eq!(
+        candidate_set_change_reason(
+            &previous,
+            &previous,
+            &sources,
+            &previous
+                .iter()
+                .map(|endpoint| (endpoint.clone(), "peer_reflexive".to_string()))
+                .collect::<HashMap<_, _>>(),
+        ),
+        "source_changed"
+    );
+}

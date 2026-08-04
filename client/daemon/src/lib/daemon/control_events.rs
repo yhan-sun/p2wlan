@@ -347,6 +347,10 @@ impl Daemon {
                     observed_endpoint,
                     punch_at_ms,
                 } => {
+                    let already_direct = self
+                        .peers
+                        .should_defer_relay_assisted_punch(&from_node_id)
+                        .await;
                     let local_candidate_changed = self
                         .add_local_peer_reflexive_candidate(&observed_endpoint)
                         .await;
@@ -354,6 +358,16 @@ impl Daemon {
                         punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
                     let candidates = self.local_candidates.read().await.clone();
                     let candidate_sources = self.local_candidate_sources.read().await.clone();
+                    let selected_remote_endpoint = self
+                        .peers
+                        .selected_direct_endpoint_for_consent(&from_node_id)
+                        .await;
+                    let schedule_punch = !already_direct;
+                    let skip_reason = if already_direct {
+                        Some("direct_confirmed_healthy")
+                    } else {
+                        None
+                    };
                     self.peers
                         .record_direct_event(
                             &from_node_id,
@@ -362,10 +376,15 @@ impl Daemon {
                             Some(candidates.len()),
                             None,
                             format!(
-                                "peer observed our UDP source as {observed_endpoint}; punch_at_ms={punch_at_ms:?}"
+                                "peer observed our UDP source as {observed_endpoint}; already_advertised={} already_direct={already_direct} selected_remote_endpoint={:?} schedule_punch={schedule_punch} skip_reason={skip_reason:?}",
+                                !local_candidate_changed,
+                                selected_remote_endpoint,
                             ),
                         )
                         .await;
+                    if already_direct {
+                        continue;
+                    }
                     if local_candidate_changed && !candidates.is_empty() {
                         if let Err(err) = self
                             .control

@@ -645,3 +645,79 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         .iter()
         .any(|event| event.stage == REASON_DIRECT_PROBE_FAILED));
 }
+
+#[tokio::test]
+async fn start_hole_punch_skipped_for_healthy_confirmed_direct() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let remote_endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "peer-public-key".to_string(),
+            endpoint: remote_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    daemon
+        .peers
+        .add_candidates_with_sources(
+            "node-b",
+            &[remote_endpoint.to_string()],
+            &HashMap::from([(remote_endpoint.to_string(), "stun_observed".to_string())]),
+        )
+        .await;
+    daemon
+        .peers
+        .record_direct_success("node-b", Some(remote_endpoint))
+        .await;
+
+    daemon
+        .local_candidates
+        .write()
+        .await
+        .push(remote_endpoint.to_string());
+    daemon
+        .local_candidate_sources
+        .write()
+        .await
+        .insert(remote_endpoint.to_string(), "stun_observed".to_string());
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    *daemon.udp_transport.write().await = Some(udp);
+
+    assert!(daemon
+        .peers
+        .should_defer_relay_assisted_punch("node-b")
+        .await);
+    daemon.start_hole_punch_at("node-b", None).await;
+    daemon.start_hole_punch_at("node-b", None).await;
+
+    let conn = daemon.peers.get_connection("node-b").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_scheduled"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_suppressed"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_delayed_local_candidates_not_ready"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_skipped_already_direct"));
+}

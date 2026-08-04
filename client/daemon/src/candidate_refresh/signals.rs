@@ -420,6 +420,83 @@ pub(super) fn candidate_refresh_requires_network_generation_advance(
         != stable_network_candidate_signature(candidates, candidate_sources)
 }
 
+/// Order-insensitive change classification for a candidate set refresh.
+///
+/// Candidate reports frequently reorder endpoints (and re-promote sources)
+/// without any real NAT change. Refresh logic must compare sets, not vector
+/// order, and only publish/advance when the set actually changed.
+pub(super) fn candidate_set_change_reason(
+    previous_candidates: &[String],
+    next_candidates: &[String],
+    previous_sources: &HashMap<String, String>,
+    next_sources: &HashMap<String, String>,
+) -> &'static str {
+    let previous_set = previous_candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let next_set = next_candidates.iter().map(String::as_str).collect::<HashSet<_>>();
+    let added = next_set.difference(&previous_set).copied().collect::<Vec<_>>();
+    let removed = previous_set
+        .difference(&next_set)
+        .copied()
+        .collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() {
+        if previous_candidates == next_candidates && previous_sources == next_sources {
+            return "no_change";
+        }
+        if previous_sources != next_sources {
+            return "source_changed";
+        }
+        return "order_only";
+    }
+    if !added.is_empty() && !removed.is_empty() {
+        let ips = |entries: &[&str]| {
+            entries
+                .iter()
+                .filter_map(|endpoint| endpoint.parse::<SocketAddr>().ok())
+                .map(|endpoint| endpoint.ip())
+                .collect::<HashSet<_>>()
+        };
+        if !ips(&added).is_empty() && ips(&added) == ips(&removed) {
+            return "port_changed";
+        }
+        return "added_removed";
+    }
+    if !added.is_empty() {
+        "added"
+    } else {
+        "removed"
+    }
+}
+
+/// Order-insensitive hash of a candidate set for diagnostics diffs.
+pub(super) fn candidate_set_hash(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries = candidates
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "{}={}",
+                endpoint,
+                candidate_sources
+                    .get(endpoint)
+                    .map(String::as_str)
+                    .unwrap_or("signaled")
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in &entries {
+        entry.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub(super) fn stable_network_candidate_signature(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,

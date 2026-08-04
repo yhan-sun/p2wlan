@@ -23,8 +23,11 @@ impl PeerManager {
         match conns.get_mut(node_id) {
             Some(conn) => {
                 conn.expire_stale_trial_nominations(generation, local_endpoint);
-                let selection =
+                let mut selection =
                     conn.select_path_for_data(generation, prefer_direct, relay_available);
+                if selection.path == Some(NetworkPath::Relay) {
+                    selection.relay_server = conn.relay_server.clone();
+                }
                 if selection.path == Some(NetworkPath::Direct)
                     && !selection.direct_confirmed
                     && selection.reason_code == REASON_PATH_DIRECT_TRIAL
@@ -97,6 +100,34 @@ impl PeerManager {
             .get(node_id)
             .map(|conn| conn.state == ConnectionState::Direct)
             .unwrap_or(false)
+    }
+
+    /// Whether relay-assisted punching should be deferred for a peer that is
+    /// already on a healthy confirmed Direct path.
+    ///
+    /// While the selected Direct pair has recent success and zero consecutive
+    /// failures, repeated peer-reflexive observations and peer offers must not
+    /// schedule new relay-assisted punch sessions, full offer re-advertisements,
+    /// or speculative candidate sweeps. Consent keepalive continues separately.
+    pub async fn should_defer_relay_assisted_punch(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(PeerConnection::direct_is_healthy_confirmed)
+    }
+
+    /// The currently selected direct endpoint for consent keepalive, if any.
+    pub async fn selected_direct_endpoint_for_consent(
+        &self,
+        node_id: &str,
+    ) -> Option<SocketAddr> {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| conn.selected_direct_endpoint_for_consent(generation))
     }
 
     /// Whether the peer is currently in Relay state.

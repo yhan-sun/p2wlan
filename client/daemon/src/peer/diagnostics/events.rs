@@ -6,6 +6,8 @@ pub struct PathSelectionEventDiagnostics {
     pub previous_path: Option<NetworkPath>,
     pub selected_path: Option<NetworkPath>,
     pub direct_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_server: Option<String>,
     pub reason_code: String,
     pub reason: String,
     pub direct_confirmed: bool,
@@ -22,6 +24,7 @@ impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
             previous_path: event.previous_path,
             selected_path: event.selected_path,
             direct_endpoint: event.direct_endpoint.map(|endpoint| endpoint.to_string()),
+            relay_server: event.relay_server.clone(),
             reason_code: event.reason_code.clone(),
             reason: event.reason.clone(),
             direct_confirmed: event.direct_confirmed,

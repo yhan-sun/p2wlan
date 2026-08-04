@@ -114,21 +114,18 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let should_advance_generation = !previous_network_identity.is_empty()
             && previous_network_identity != next_network_identity;
 
-        let changed = {
-            let mut current = local_candidates.write().await;
-            if previous_candidates == candidates
-                && previous_candidate_sources == candidate_sources
-                && previous_network_identity == next_network_identity
-            {
-                false
-            } else {
-                *current = candidates.clone();
-                *local_candidate_sources.write().await = candidate_sources.clone();
-                *local_network_identity.write().await = next_network_identity.clone();
-                true
-            }
-        };
-        if !changed {
+        let change_reason = candidate_set_change_reason(
+            &previous_candidates,
+            &candidates,
+            &previous_candidate_sources,
+            &candidate_sources,
+        );
+        let old_hash = candidate_set_hash(&previous_candidates, &previous_candidate_sources);
+        let new_hash = candidate_set_hash(&candidates, &candidate_sources);
+        let old_candidate_count = previous_candidates.len();
+        let new_candidate_count = candidates.len();
+        let real_change = change_reason != "no_change" && change_reason != "order_only";
+        if !real_change {
             if profile_changed {
                 debug!(
                     "UDP NAT profile changed without advertised candidate endpoint changes: mapping={:?} public={:?}",
@@ -136,14 +133,28 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     report.nat_profile.public_endpoint
                 );
             }
+            debug!(
+                "UDP candidate refresh kept the existing {} candidates: changed_reason={change_reason} old_hash={old_hash} new_hash={new_hash} old_candidate_count={old_candidate_count} new_candidate_count={new_candidate_count}",
+                candidates.len()
+            );
             continue;
         }
 
+        {
+            let mut current = local_candidates.write().await;
+            *current = candidates.clone();
+            *local_candidate_sources.write().await = candidate_sources.clone();
+            *local_network_identity.write().await = next_network_identity.clone();
+        }
+
         info!(
-            "UDP candidates changed after network update; refreshed {} candidates (mapping={:?}, public={:?})",
+            "UDP candidates changed after network update; refreshed {} candidates (mapping={:?}, public={:?}, old_hash={old_hash}, new_hash={new_hash}, changed_reason={change_reason}, old_candidate_count={old_candidate_count}, new_candidate_count={new_candidate_count})",
             candidates.len(),
             report.nat_profile.mapping_behavior,
             report.nat_profile.public_endpoint
+        );
+        debug!(
+            "UDP candidate set diff: changed_reason={change_reason} old_candidates={previous_candidates:?} new_candidates={candidates:?}"
         );
         let endpoint = control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
             .or(advertised_endpoint)
