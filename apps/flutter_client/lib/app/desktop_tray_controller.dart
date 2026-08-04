@@ -58,6 +58,9 @@ class DesktopTrayController with TrayListener, WindowListener {
 
     try {
       await windowManager.setPreventClose(true);
+      if (Platform.isMacOS) {
+        await trayManager.setTitle(p2wlanAppName);
+      }
       await _updateTrayIcon(force: true);
       await _updateMenu();
     } catch (error) {
@@ -125,7 +128,7 @@ class DesktopTrayController with TrayListener, WindowListener {
     await _updateTrayIcon();
     await trayManager.setToolTip('$p2wlanAppName - $statusLabel');
     if (Platform.isMacOS) {
-      await trayManager.setTitle('');
+      await trayManager.setTitle(p2wlanAppName);
     }
 
     await trayManager.setContextMenu(buildMenuForTesting());
@@ -134,12 +137,16 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _updateTrayIcon({bool force = false}) async {
     final asset = trayIconAssetForTesting();
     if (!force && _lastTrayIconAsset == asset) return;
-    await trayManager.setIcon(
-      asset,
-      isTemplate: false,
-      iconSize: Platform.isMacOS ? _macosTrayIconSize : 18,
-    );
-    _lastTrayIconAsset = asset;
+    try {
+      await trayManager.setIcon(
+        asset,
+        isTemplate: trayIconUsesTemplateForTesting(),
+        iconSize: Platform.isMacOS ? _macosTrayIconSize : 18,
+      );
+      _lastTrayIconAsset = asset;
+    } catch (error) {
+      debugPrint('Failed to update P2WLAN tray icon $asset: $error');
+    }
   }
 
   @visibleForTesting
@@ -212,6 +219,9 @@ class DesktopTrayController with TrayListener, WindowListener {
     if (health == 'healthy') return _macosOnIconAsset;
     return _macosAttentionIconAsset;
   }
+
+  @visibleForTesting
+  bool trayIconUsesTemplateForTesting() => Platform.isMacOS;
 
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
     final virtualIp = snapshot?.virtualIp.trim();

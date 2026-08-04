@@ -527,6 +527,87 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
     inbound_worker.abort();
 }
 
+#[tokio::test]
+async fn live_candidate_refresh_advertises_pool_mappings_even_when_pool_inactive() {
+    let peers = peer_manager();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+    let inbound_worker = tokio::spawn(transport.clone().run_inbound(inbound_tx));
+
+    let first_stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let first_stun_addr = first_stun.local_addr().unwrap();
+    let first_worker = tokio::spawn(async move {
+        for _ in 0..3 {
+            let mut buf = [0u8; 2048];
+            let (n, client_addr) = first_stun.recv_from(&mut buf).await.unwrap();
+            let request = StunMessage::decode(&buf[..n]).unwrap();
+            let mapped = SocketAddr::new("203.0.113.7".parse().unwrap(), client_addr.port());
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(mapped));
+            first_stun
+                .send_to(&response.encode(), client_addr)
+                .await
+                .unwrap();
+        }
+    });
+
+    let second_stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second_stun_addr = second_stun.local_addr().unwrap();
+    let second_worker = tokio::spawn(async move {
+        for _ in 0..3 {
+            let mut buf = [0u8; 2048];
+            let (n, client_addr) = second_stun.recv_from(&mut buf).await.unwrap();
+            let request = StunMessage::decode(&buf[..n]).unwrap();
+            let mapped = SocketAddr::new("203.0.113.7".parse().unwrap(), client_addr.port());
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(mapped));
+            second_stun
+                .send_to(&response.encode(), client_addr)
+                .await
+                .unwrap();
+        }
+    });
+
+    let report = transport
+        .gather_candidate_report_live(
+            vec![first_stun_addr, second_stun_addr],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(!transport.socket_pool_active());
+    let public_candidates = report
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.endpoint.ip == "203.0.113.7"
+                && candidate.source == p2pnet_nat::CandidateSource::StunObserved
+        })
+        .count();
+    assert_eq!(
+        public_candidates, 3,
+        "every bound socket should publish its stable public mapping"
+    );
+    let predicted_candidates = report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source == p2pnet_nat::CandidateSource::Predicted)
+        .count();
+    assert_eq!(predicted_candidates, 0);
+
+    first_worker.await.unwrap();
+    second_worker.await.unwrap();
+    inbound_worker.abort();
+}
+
 #[test]
 fn pool_stun_observation_promotes_an_overlapping_prediction() {
     let mut predicted = p2pnet_nat::IceCandidate::server_reflexive("203.0.113.7", 42_001);

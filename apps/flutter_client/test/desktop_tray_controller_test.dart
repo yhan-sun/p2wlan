@@ -67,6 +67,18 @@ void main() {
     },
   );
 
+  test('desktop tray uses template rendering on macOS', () async {
+    final stores = await _makeStores(api: DiagnosticsApi());
+    addTearDown(stores.dispose);
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    expect(controller.trayIconUsesTemplateForTesting(), Platform.isMacOS);
+  });
+
   test(
     'desktop tray icon exposes healthy state without opening the menu',
     () async {

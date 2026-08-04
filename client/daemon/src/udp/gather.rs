@@ -146,7 +146,7 @@ impl UdpTransport {
         report: &mut CandidateGatherReport,
         config: &IceConfig,
     ) {
-        if !self.socket_pool_active() {
+        if self.socket_count() <= 1 {
             return;
         }
 
@@ -170,7 +170,7 @@ impl UdpTransport {
         stun_servers: &[SocketAddr],
         stun_timeout: Duration,
     ) {
-        if !self.socket_pool_active() {
+        if self.socket_count() <= 1 {
             return;
         }
 

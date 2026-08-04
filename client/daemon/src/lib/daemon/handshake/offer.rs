@@ -63,7 +63,8 @@ impl Daemon {
         }
 
         let response_bytes = response.to_bytes();
-        let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
+        let (candidates, candidate_sources) =
+            self.local_candidate_set_for_signal("handshake answer").await;
         if let Err(error) = self
             .control
             .send_peer_answer_with_sources_schedule_and_session(

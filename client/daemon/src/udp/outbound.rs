@@ -445,6 +445,23 @@ impl UdpTransport {
                 repeated_target_ports,
             )
             .await;
+        info!(
+            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} budget_skipped={} session_capped={}",
+            peer_id,
+            socket_policy.label(),
+            self.socket_count(),
+            socket_count,
+            candidates.len(),
+            attempts,
+            packets_sent,
+            socket0_sent,
+            alt_socket_sent,
+            sent_endpoints.len(),
+            sent_ports.len(),
+            repeated_target_ports,
+            budget_skipped,
+            session_capped
+        );
 
         Ok(packets_sent)
     }

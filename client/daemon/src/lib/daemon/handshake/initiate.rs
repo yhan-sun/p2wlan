@@ -48,7 +48,8 @@ impl Daemon {
             }
         };
         let initiation_bytes = initiation.to_bytes();
-        let (candidates, candidate_sources) = self.wait_for_local_candidate_set().await;
+        let (candidates, candidate_sources) =
+            self.local_candidate_set_for_signal("handshake offer").await;
 
         let peer_id_clone = peer_info.node_id.clone();
         if self.transport.has_session(&peer_id_clone).await {
