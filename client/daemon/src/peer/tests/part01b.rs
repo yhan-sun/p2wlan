@@ -226,6 +226,74 @@ async fn selected_peer_reflexive_pair_is_reported_first() {
 }
 
 #[tokio::test]
+async fn newer_encrypted_confirmation_is_the_only_selected_pair() {
+    let manager = PeerManager::new(test_config());
+    let first: SocketAddr = "1.1.1.1:41000".parse().unwrap();
+    let second: SocketAddr = "1.1.1.1:41017".parse().unwrap();
+    let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", first)).await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[first.to_string(), second.to_string()],
+            &HashMap::from([
+                (first.to_string(), "peer_reflexive".to_string()),
+                (second.to_string(), "peer_reflexive".to_string()),
+            ]),
+        )
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint("peer1", Some(first), Some(local))
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint("peer1", Some(second), Some(local))
+        .await;
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    let first_pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == first)
+        .unwrap();
+    let second_pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == second)
+        .unwrap();
+    assert_eq!(first_pair.state, CandidatePairState::Succeeded);
+    assert!(!first_pair.nominated);
+    assert!(first_pair.nominated_at.is_none());
+    assert!(first_pair.selected_at.is_none());
+    assert_eq!(second_pair.state, CandidatePairState::Selected);
+    assert!(second_pair.nominated);
+    assert!(second_pair.selected_at.is_some());
+
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), Some(local))
+        .await;
+    let peer = &diagnostics[0];
+    assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+    assert_eq!(peer.direct_type, DirectPathType::PeerReflexive);
+    assert_eq!(peer.consent_endpoint.as_deref(), Some("1.1.1.1:41017"));
+    assert_eq!(
+        peer.selected_pair.as_ref().unwrap().remote_endpoint,
+        "1.1.1.1:41017"
+    );
+    assert_eq!(
+        peer.selected_pair.as_ref().unwrap().direct_type,
+        DirectPathType::PeerReflexive
+    );
+    assert_eq!(
+        peer.candidate_pairs
+            .iter()
+            .filter(|pair| pair.pair_state == CandidatePairState::Selected)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn diagnostics_json_contains_direct_candidate_pair_fields() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "8.8.8.8:12293".parse().unwrap();

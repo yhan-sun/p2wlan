@@ -43,6 +43,25 @@ impl PeerConnection {
         local_endpoint: Option<SocketAddr>,
     ) -> (CandidatePairSource, bool) {
         let peer_id = self.node_id.clone();
+        if selected {
+            for pair in self.candidate_pairs.iter_mut().filter(|pair| {
+                pair.local_generation == local_generation && pair.remote_endpoint != endpoint
+            }) {
+                let was_selected = pair.state == CandidatePairState::Selected
+                    || pair.selected_at.is_some()
+                    || pair.nominated;
+                if was_selected {
+                    let old_state = pair.state;
+                    pair.clear_selection();
+                    log_candidate_pair_state_changed(
+                        &peer_id,
+                        pair,
+                        old_state,
+                        "superseded by newer encrypted-confirmed Direct UDP endpoint",
+                    );
+                }
+            }
+        }
         let pair = self.ensure_candidate_pair(endpoint, local_generation);
         let old_state = pair.state;
         let became_reachable = !matches!(

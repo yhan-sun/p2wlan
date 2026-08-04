@@ -57,6 +57,26 @@ impl PeerConnection {
         if selected_pair.is_some_and(|pair| is_low_latency_direct_endpoint(pair.remote_endpoint)) {
             return false;
         }
+        if self.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == local_generation
+                && is_low_latency_direct_endpoint(pair.remote_endpoint)
+                && !matches!(
+                    pair.state,
+                    CandidatePairState::Selected | CandidatePairState::Succeeded
+                )
+                && candidate_pair_probe_due(pair)
+        }) {
+            return true;
+        }
+        if selected_pair.is_some_and(|pair| {
+            pair.source == CandidatePairSource::PeerReflexive
+                && pair.consecutive_failures == 0
+                && pair
+                    .success_age()
+                    .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        }) {
+            return false;
+        }
 
         self.candidate_pairs.iter().any(|pair| {
             pair.local_generation == local_generation
