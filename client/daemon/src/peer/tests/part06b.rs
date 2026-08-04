@@ -97,6 +97,66 @@ async fn confirmed_direct_ignores_background_probe_batch_timeout() {
 }
 
 #[tokio::test]
+async fn probe_batch_timeout_marks_probed_transient_birthday_pairs_failed() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let signaled_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let birthday_endpoint: SocketAddr = "8.8.8.8:41251".parse().unwrap();
+
+    manager
+        .add_peer(&test_peer("peer1", signaled_endpoint))
+        .await;
+    let generation = manager.current_network_generation().await;
+
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        conn.ensure_candidate_pair_with_source(
+            birthday_endpoint,
+            generation,
+            CandidatePairSource::Birthday,
+        );
+    }
+    assert!(
+        manager
+            .record_direct_probe_sent("peer1", birthday_endpoint)
+            .await
+    );
+
+    assert!(
+        manager
+            .record_direct_probe_batch_failure_for_generation(
+                "peer1",
+                generation,
+                "no matched direct probe ACK after remote scatter sweep",
+            )
+            .await
+    );
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    let signaled_pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == signaled_endpoint)
+        .expect("signaled pair should remain present");
+    assert_eq!(signaled_pair.failure_count, 0);
+    assert!(signaled_pair.last_error_code.is_none());
+
+    let birthday_pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == birthday_endpoint)
+        .expect("probed birthday pair should remain present");
+    assert_eq!(birthday_pair.source, CandidatePairSource::Birthday);
+    assert_eq!(birthday_pair.state, CandidatePairState::Failed);
+    assert_eq!(birthday_pair.failure_count, 1);
+    assert_eq!(
+        birthday_pair.last_error_code.as_deref(),
+        Some(REASON_DIRECT_PROBE_FAILED)
+    );
+}
+
+#[tokio::test]
 async fn direct_path_latency_tracks_ewma_and_jitter() {
     let config = test_config();
     let manager = PeerManager::new(config);

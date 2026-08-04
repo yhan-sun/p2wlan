@@ -108,4 +108,53 @@ impl PeerManager {
             .map(|conn| conn.state == ConnectionState::Relay)
             .unwrap_or(false)
     }
+
+    /// Whether a relay path already covers this peer during a direct probe
+    /// failure window.
+    ///
+    /// Unlike [`Self::is_relay`], this also recognizes the FallbackToRelay
+    /// handover and an active relay traffic path, so a synchronized punch
+    /// no-ACK during fallback still enters batch failure learning. It is
+    /// deliberately a separate predicate because handshake offer/answer logic
+    /// keeps using `is_relay` and must not be broadened.
+    pub async fn has_relay_safety_net(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(|conn| {
+                matches!(
+                    conn.state,
+                    ConnectionState::Relay | ConnectionState::FallbackToRelay
+                ) || conn.active_path() == Some(NetworkPath::Relay)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether this IP is known as a peer public candidate before any packet
+    /// content is parsed.
+    ///
+    /// The match covers the current endpoint, the signaled endpoint, signaled
+    /// candidates, and candidate-pair remote endpoints. Used by the UDP
+    /// inbound path to prove that datagrams from a known peer public IP
+    /// reached this daemon at all, independently of Probe v1/v2 decoding.
+    pub async fn has_known_public_candidate_ip(&self, ip: IpAddr) -> bool {
+        self.connections
+            .read()
+            .await
+            .values()
+            .any(|conn| {
+                conn.endpoint.is_some_and(|endpoint| endpoint.ip() == ip)
+                    || conn.signaled_endpoint.is_some_and(|endpoint| endpoint.ip() == ip)
+                    || conn
+                        .candidates
+                        .iter()
+                        .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+                        .any(|endpoint| endpoint.ip() == ip)
+                    || conn
+                        .candidate_pairs
+                        .iter()
+                        .any(|pair| pair.remote_endpoint.ip() == ip)
+            })
+    }
 }

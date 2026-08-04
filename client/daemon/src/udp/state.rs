@@ -68,8 +68,23 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub probe_acks_received: u64,
     /// UDP datagrams received on this socket, including STUN and data traffic.
     pub datagrams_received: u64,
+    /// UDP datagrams received from an IP address that matches a known peer
+    /// public candidate, before any protocol/auth parsing.
+    pub known_peer_ip_datagrams_received: u64,
     /// Datagrams carrying the authenticated Probe v2 framing.
     pub authenticated_probe_packets_received: u64,
+    /// Authenticated Probe v2 punch packets accepted before sending an ACK.
+    pub authenticated_probe_punches_received: u64,
+    /// Authenticated Probe v2 ACK packets observed before pending-probe match.
+    pub authenticated_probe_acks_observed: u64,
+    /// Authenticated Probe v2 ACK packets whose nonce/socket/generation did not
+    /// match a pending outbound probe.
+    pub authenticated_probe_acks_unmatched: u64,
+    /// Legacy Probe v1 ACK packets observed before pending-probe match.
+    pub legacy_probe_acks_observed: u64,
+    /// Legacy Probe v1 ACK packets whose nonce/socket/generation did not match
+    /// a pending outbound probe.
+    pub legacy_probe_acks_unmatched: u64,
     /// Probe v2 frames rejected because their MAC did not match.
     pub authenticated_probe_invalid_mac: u64,
     /// Probe v2 frames addressed to another local node ID.
@@ -141,16 +156,36 @@ impl PunchSocketPolicy {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UdpProbeRxSnapshot {
+    pub known_peer_ip_datagrams_received: u64,
     pub authenticated_probe_packets_received: u64,
+    pub authenticated_probe_acks_observed: u64,
+    pub authenticated_probe_acks_unmatched: u64,
+    pub legacy_probe_acks_observed: u64,
+    pub legacy_probe_acks_unmatched: u64,
     pub probe_acks_received: u64,
 }
 
 impl UdpProbeRxSnapshot {
     pub fn delta_since(self, earlier: Self) -> Self {
         Self {
+            known_peer_ip_datagrams_received: self
+                .known_peer_ip_datagrams_received
+                .saturating_sub(earlier.known_peer_ip_datagrams_received),
             authenticated_probe_packets_received: self
                 .authenticated_probe_packets_received
                 .saturating_sub(earlier.authenticated_probe_packets_received),
+            authenticated_probe_acks_observed: self
+                .authenticated_probe_acks_observed
+                .saturating_sub(earlier.authenticated_probe_acks_observed),
+            authenticated_probe_acks_unmatched: self
+                .authenticated_probe_acks_unmatched
+                .saturating_sub(earlier.authenticated_probe_acks_unmatched),
+            legacy_probe_acks_observed: self
+                .legacy_probe_acks_observed
+                .saturating_sub(earlier.legacy_probe_acks_observed),
+            legacy_probe_acks_unmatched: self
+                .legacy_probe_acks_unmatched
+                .saturating_sub(earlier.legacy_probe_acks_unmatched),
             probe_acks_received: self
                 .probe_acks_received
                 .saturating_sub(earlier.probe_acks_received),
