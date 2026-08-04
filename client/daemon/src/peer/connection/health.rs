@@ -191,15 +191,15 @@ impl PeerConnection {
         reason: impl Into<String>,
     ) -> bool {
         let reason = reason.into();
-        let retained_private_direct = (self.state == ConnectionState::Direct)
+        let retained_confirmed_direct = (self.state == ConnectionState::Direct)
             .then(|| {
                 self.candidate_pairs
                     .iter()
-                    .find(|pair| should_retain_private_direct_pair(pair))
+                    .find(|pair| should_retain_confirmed_direct_pair_on_candidate_refresh(pair))
                     .map(|pair| pair.retained_for_generation(local_generation))
             })
             .flatten();
-        let retained_endpoint = retained_private_direct
+        let retained_endpoint = retained_confirmed_direct
             .as_ref()
             .map(|pair| pair.remote_endpoint);
 
@@ -215,7 +215,7 @@ impl PeerConnection {
         }
         self.ensure_current_candidate_pairs(local_generation);
 
-        if let Some(retained) = retained_private_direct {
+        if let Some(retained) = retained_confirmed_direct {
             if let Some(index) = self.candidate_pairs.iter().position(|pair| {
                 pair.local_generation == local_generation
                     && pair.remote_endpoint == retained.remote_endpoint
@@ -228,6 +228,7 @@ impl PeerConnection {
                 self.endpoint = Some(endpoint);
                 self.direct_generation = local_generation;
             }
+            self.clear_direct_reclaim_window();
             true
         } else {
             false

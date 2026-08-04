@@ -112,6 +112,58 @@ impl PeerManager {
         true
     }
 
+    /// Record a failed background/reclaim probe batch.
+    ///
+    /// A confirmed Direct path should not be torn down by an opportunistic
+    /// retry batch timing out; consent/keepalive failures are the authoritative
+    /// signal for degrading an already selected Direct data path.
+    pub async fn record_direct_probe_batch_failure_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason = reason.into();
+        if generation != self.current_network_generation().await {
+            return false;
+        }
+
+        {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            if conn.state == ConnectionState::Direct && conn.direct_generation == generation {
+                conn.record_direct_event(
+                    generation,
+                    "direct_probe_batch_timeout_ignored",
+                    conn.endpoint,
+                    Some(conn.candidate_pairs.len()),
+                    None,
+                    format!(
+                        "{reason}; ignored because encrypted Direct is already confirmed"
+                    ),
+                );
+                debug!(
+                    event = "direct_probe_batch_timeout_ignored",
+                    peer_id = %node_id,
+                    remote_endpoint = ?conn.endpoint,
+                    reason = %reason,
+                    "ignored background/reclaim Direct probe failure for confirmed Direct peer"
+                );
+                return true;
+            }
+        }
+
+        self.record_direct_failure_for_generation(
+            node_id,
+            generation,
+            REASON_DIRECT_PROBE_FAILED,
+            reason,
+        )
+        .await
+    }
+
     /// Record an unanswered direct keepalive without tearing down a path on one lost probe.
     pub async fn record_direct_keepalive_timeout_for_generation(
         &self,

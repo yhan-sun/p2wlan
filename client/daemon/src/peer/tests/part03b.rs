@@ -359,6 +359,91 @@ async fn hard_local_nat_maintainer_targets_stable_public_endpoint() {
 }
 
 #[tokio::test]
+async fn hard_local_nat_treats_small_stun_pool_as_stable_remote() {
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let stable_pool = [
+        "203.0.113.10:41000".parse::<SocketAddr>().unwrap(),
+        "203.0.113.10:41002".parse::<SocketAddr>().unwrap(),
+        "203.0.113.10:41003".parse::<SocketAddr>().unwrap(),
+    ];
+    let candidates = stable_pool.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let sources = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate, "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", registry_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert_eq!(
+        targets.len(),
+        1,
+        "a small authoritative STUN pool should not trigger birthday expansion"
+    );
+    assert!(stable_pool.contains(&targets[0]));
+
+    let maintainer_targets = manager.direct_nat_maintainer_targets_for("peer1").await;
+    assert_eq!(maintainer_targets, targets);
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("stable pool should still produce one direct target");
+    assert!(!target_set.remote_scatter_pool);
+}
+
+#[tokio::test]
+async fn hard_local_nat_keeps_large_stun_churn_out_of_stable_remote_role() {
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let churn = [
+        "203.0.113.10:41000",
+        "203.0.113.10:41005",
+        "203.0.113.10:41009",
+        "203.0.113.10:41014",
+        "203.0.113.10:41018",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let sources = churn
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate, "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+
+    manager.update_nat_profile(birthday_nat_profile()).await;
+    manager
+        .add_peer(&test_peer("peer1", registry_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &churn, &sources)
+        .await;
+
+    assert!(
+        manager
+            .direct_nat_maintainer_targets_for("peer1")
+            .await
+            .is_empty(),
+        "large same-IP STUN churn should not be treated as a stable socket pool"
+    );
+
+    let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(
+        targets.len() > churn.len(),
+        "large STUN churn should retain birthday expansion"
+    );
+}
+
+#[tokio::test]
 async fn predicted_window_remains_in_synchronized_active_pool_scan() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();

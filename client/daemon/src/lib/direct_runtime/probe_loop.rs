@@ -173,10 +173,9 @@ async fn run_direct_probe_loop(
                                     )
                                     .await;
                                 peers
-                                    .record_direct_failure_for_generation(
+                                    .record_direct_probe_batch_failure_for_generation(
                                         &peer_id,
                                         generation,
-                                        REASON_DIRECT_PROBE_FAILED,
                                         timeout_detail,
                                     )
                                     .await;
@@ -213,10 +212,9 @@ async fn run_direct_probe_loop(
                                 )
                                 .await;
                             peers
-                                .record_direct_failure_for_generation(
+                                .record_direct_probe_batch_failure_for_generation(
                                     &peer_id,
                                     generation,
-                                    REASON_DIRECT_PROBE_FAILED,
                                     format!("{retry_label} failed: {err}"),
                                 )
                                 .await;

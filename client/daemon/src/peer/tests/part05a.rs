@@ -162,7 +162,7 @@ async fn candidate_refresh_retains_low_latency_private_direct() {
 }
 
 #[tokio::test]
-async fn candidate_refresh_still_invalidates_public_direct() {
+async fn candidate_refresh_retains_confirmed_public_direct() {
     let config = test_config();
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "8.8.8.8:51841".parse().unwrap();
@@ -179,16 +179,54 @@ async fn candidate_refresh_still_invalidates_public_direct() {
 
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(generation, 1);
-    assert_eq!(conn.state, ConnectionState::FallbackToRelay);
-    assert_eq!(
-        conn.direct_health.last_error_code.as_deref(),
-        Some(REASON_NETWORK_GENERATION_CHANGED)
-    );
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert_eq!(conn.direct_generation, generation);
+    assert_eq!(conn.endpoint, Some(endpoint));
+    assert!(conn.candidate_pairs.iter().any(|pair| {
+        pair.local_generation == generation
+            && pair.remote_endpoint == endpoint
+            && pair.state == CandidatePairState::Selected
+            && pair.source == CandidatePairSource::Signaled
+    }));
     assert!(
-        !manager
+        manager
             .should_use_direct_for_data("peer1", true, true)
             .await
     );
+}
+
+#[tokio::test]
+async fn candidate_refresh_retains_confirmed_peer_reflexive_direct() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "8.8.4.4:51842".parse().unwrap();
+    let candidates = vec![endpoint.to_string()];
+    let sources = HashMap::from([(endpoint.to_string(), "peer_reflexive".to_string())]);
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(42)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    let generation = manager
+        .advance_candidate_refresh_generation("refreshed UDP candidates")
+        .await;
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert_eq!(conn.direct_generation, generation);
+    assert_eq!(conn.endpoint, Some(endpoint));
+    assert!(conn.candidate_pairs.iter().any(|pair| {
+        pair.local_generation == generation
+            && pair.remote_endpoint == endpoint
+            && pair.state == CandidatePairState::Selected
+            && pair.source == CandidatePairSource::PeerReflexive
+            && pair.rtt_ewma_ms.or(pair.rtt_ms) == Some(42)
+    }));
 }
 
 #[tokio::test]

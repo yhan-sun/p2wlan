@@ -39,6 +39,64 @@ async fn direct_probe_targets_due_respects_backoff_without_false_probing() {
 }
 
 #[tokio::test]
+async fn confirmed_direct_ignores_background_probe_batch_timeout() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "8.8.8.8:51844".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(42)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    let generation = manager.current_network_generation().await;
+
+    assert!(
+        manager
+            .record_direct_probe_batch_failure_for_generation(
+                "peer1",
+                generation,
+                "no matched direct probe ACK after 72 background UDP retry probes",
+            )
+            .await
+    );
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert_eq!(conn.direct_generation, generation);
+    assert_eq!(conn.direct_health.consecutive_failures, 0);
+    assert_eq!(conn.direct_health.last_error_code, None);
+    let pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.local_generation == generation && pair.remote_endpoint == endpoint)
+        .expect("selected direct pair should remain present");
+    assert_eq!(pair.state, CandidatePairState::Selected);
+    assert_eq!(pair.consecutive_failures, 0);
+    assert!(conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "direct_probe_batch_timeout_ignored"));
+    assert!(
+        manager
+            .should_use_direct_for_data("peer1", true, true)
+            .await
+    );
+
+    for _ in 0..DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+        manager
+            .record_direct_keepalive_timeout_for_generation("peer1", endpoint, generation)
+            .await;
+    }
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+    assert_eq!(
+        conn.direct_health.last_error_code.as_deref(),
+        Some(REASON_DIRECT_KEEPALIVE_TIMEOUT)
+    );
+}
+
+#[tokio::test]
 async fn direct_path_latency_tracks_ewma_and_jitter() {
     let config = test_config();
     let manager = PeerManager::new(config);
