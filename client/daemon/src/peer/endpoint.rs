@@ -52,6 +52,27 @@ pub(super) fn should_retain_private_direct_pair(pair: &CandidatePair) -> bool {
         .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
 }
 
+pub(super) fn should_retain_confirmed_direct_pair_on_candidate_refresh(
+    pair: &CandidatePair,
+) -> bool {
+    if should_retain_private_direct_pair(pair) {
+        return true;
+    }
+
+    if pair.state != CandidatePairState::Selected
+        || pair.consecutive_failures > 0
+        || pair
+            .success_age()
+            .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
+    {
+        return false;
+    }
+
+    is_public_probe_endpoint(pair.remote_endpoint)
+        && (pair.source == CandidatePairSource::PeerReflexive
+            || is_public_udp_direct_source(pair.source))
+}
+
 pub(super) fn is_low_latency_direct_endpoint(endpoint: SocketAddr) -> bool {
     is_private_direct_endpoint(endpoint) && !is_overlay_endpoint(endpoint)
 }
@@ -138,7 +159,7 @@ pub(super) fn classify_confirmed_direct_endpoint(
     }
 }
 
-fn is_public_udp_direct_source(source: CandidatePairSource) -> bool {
+pub(super) fn is_public_udp_direct_source(source: CandidatePairSource) -> bool {
     matches!(
         source,
         CandidatePairSource::StunObserved

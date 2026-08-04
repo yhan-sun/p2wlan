@@ -65,6 +65,13 @@ const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
 const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
 const BIRTHDAY_PROBE_WIDE_MAX_DELTA: i32 = 32_768;
 const BIRTHDAY_PROBE_WIDE_STRIDE: i32 = 251;
+/// A peer can advertise a small set of authoritative public mappings when it
+/// uses a UDP socket pool.  That is still a stable remote role for a local
+/// hard NAT: keep one peer-specific binding warm toward the stable peer while
+/// the stable peer scans this side's predicted window.  Larger same-IP
+/// authoritative groups look like NAT port churn and should keep the wider
+/// birthday strategy.
+const STABLE_PUBLIC_POOL_MAX_PORTS_PER_IP: usize = 4;
 const REMOTE_SCATTER_POOL_MIN_PUBLIC_PORTS: usize = 16;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
@@ -174,7 +181,7 @@ use endpoint::{
     candidate_pair_failure_cooldown, candidate_pair_probe_due, candidate_pair_probe_rank_for_mode,
     classify_candidate_pair_path, classify_confirmed_direct_endpoint, endpoint_probe_rank,
     is_low_latency_direct_endpoint, is_overlay_endpoint, is_public_probe_endpoint,
-    should_retain_private_direct_pair,
+    should_retain_confirmed_direct_pair_on_candidate_refresh, should_retain_private_direct_pair,
 };
 #[cfg(test)]
 use probe_budget::birthday_probe_budget_for_base_count;

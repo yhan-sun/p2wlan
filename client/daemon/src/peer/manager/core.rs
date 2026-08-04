@@ -156,14 +156,14 @@ impl PeerManager {
             *generation
         };
 
-        let mut retained_private_direct_count = 0usize;
+        let mut retained_confirmed_direct_count = 0usize;
         let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
-            let retained_private_direct =
+            let retained_confirmed_direct =
                 conn.mark_candidate_refresh_generation_changed(generation, reason.clone());
-            if retained_private_direct {
-                retained_private_direct_count += 1;
+            if retained_confirmed_direct {
+                retained_confirmed_direct_count += 1;
                 continue;
             }
 
@@ -177,7 +177,7 @@ impl PeerManager {
         }
 
         info!(
-            "Local network generation advanced to {generation}: {reason}; retained {retained_private_direct_count} low-latency private direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"
+            "Local network generation advanced to {generation}: {reason}; retained {retained_confirmed_direct_count} confirmed direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"
         );
         generation
     }

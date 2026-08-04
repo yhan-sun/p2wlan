@@ -288,7 +288,7 @@ impl PeerConnection {
             self.asymmetric_stable_public_endpoints(self.probe_candidate_endpoints());
         !public_endpoints.is_empty()
             && !self.has_explicit_predicted_window()
-            && !peer_candidates_need_port_scatter(&public_endpoints)
+            && public_endpoints_fit_stable_socket_pool(&public_endpoints)
     }
 
     fn asymmetric_stable_public_endpoints(&self, endpoints: Vec<SocketAddr>) -> Vec<SocketAddr> {
@@ -570,4 +570,21 @@ fn is_authoritative_stable_public_source(source: CandidatePairSource) -> bool {
             | CandidatePairSource::Pcp
             | CandidatePairSource::NatPmp
     )
+}
+
+fn public_endpoints_fit_stable_socket_pool(endpoints: &[SocketAddr]) -> bool {
+    let mut ports_by_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    for endpoint in endpoints {
+        if !is_public_probe_endpoint(*endpoint) {
+            continue;
+        }
+        ports_by_ip
+            .entry(endpoint.ip())
+            .or_default()
+            .insert(endpoint.port());
+    }
+    !ports_by_ip.is_empty()
+        && ports_by_ip
+            .values()
+            .all(|ports| ports.len() <= STABLE_PUBLIC_POOL_MAX_PORTS_PER_IP)
 }
