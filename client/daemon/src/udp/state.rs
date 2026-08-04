@@ -30,6 +30,14 @@ const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::ZERO;
 /// Hard bound on primary connectivity-check datagrams emitted by one punch
 /// session. Retransmissions are reserved for nomination and consent checks.
 const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
+/// Hard bound for the easy-side remote-port scatter sweep.
+///
+/// When the peer has an address/port-dependent mapping, the stable side must
+/// cover a much wider peer-port window while the hard-NAT side keeps one
+/// destination-specific binding warm.  The one-second outbound budgets still
+/// pace this over time; this cap only prevents the session from stopping after
+/// the first few hundred ports.
+const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
 /// Two STUN observers per experimental socket are enough to publish that
 /// socket's observed mapping and infer a small per-socket port-delta prediction
 /// window without turning the bounded traversal experiment into a large STUN

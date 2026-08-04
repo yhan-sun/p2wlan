@@ -306,6 +306,51 @@ async fn remote_scatter_pool_uses_all_bound_sockets_even_when_local_pool_inactiv
 }
 
 #[tokio::test]
+async fn remote_scatter_pool_exceeds_primary_session_cap_under_sliding_budget() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+
+    let candidates = (0..1_200)
+        .map(|index| {
+            format!(
+                "127.{}.{}.{}:{}",
+                1 + (index % 4),
+                1 + ((index / 4) % 200),
+                1 + ((index / 800) % 200),
+                20_000 + index
+            )
+            .parse()
+            .unwrap()
+        })
+        .collect::<Vec<SocketAddr>>();
+
+    let sent = transport
+        .punch_candidates_remote_scatter_pool("peer-b", candidates, Duration::from_secs(1), 5)
+        .await
+        .unwrap();
+
+    assert!(sent > MAX_PUNCH_PROBES_PER_SESSION);
+    assert!(sent <= MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION);
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "active_pool_scan_completed")
+        .expect("remote scatter scan should record coverage diagnostics");
+    assert_eq!(event.sent_probes, Some(sent));
+    assert!(event
+        .detail
+        .contains("scan_socket_policy=remote_scatter_pool"));
+}
+
+#[tokio::test]
 async fn primary_socket_punch_never_uses_alternate_pool_sockets() {
     let peers = peer_manager();
     peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;

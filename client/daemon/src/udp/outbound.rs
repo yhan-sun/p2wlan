@@ -241,6 +241,12 @@ impl UdpTransport {
         let mut socket0_sent = 0u32;
         let mut alt_socket_sent = 0u32;
         let socket_count = socket_policy.socket_count(self);
+        let session_probe_cap = match socket_policy {
+            PunchSocketPolicy::RemoteScatterPool => MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION,
+            PunchSocketPolicy::ActivePool | PunchSocketPolicy::PrimaryOnly => {
+                MAX_PUNCH_PROBES_PER_SESSION
+            }
+        };
         'schedule: for (round_index, round) in schedule.iter().enumerate() {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
@@ -277,7 +283,7 @@ impl UdpTransport {
             };
 
             for (socket_index, candidate) in probe_order {
-                if packets_sent >= MAX_PUNCH_PROBES_PER_SESSION {
+                if packets_sent >= session_probe_cap {
                     session_capped = true;
                     break 'schedule;
                 }
@@ -388,7 +394,7 @@ impl UdpTransport {
                     Some(candidates.len()),
                     Some(packets_sent),
                     format!(
-                        "stopped UDP punch after the {MAX_PUNCH_PROBES_PER_SESSION}-probe session cap"
+                        "stopped UDP punch after the {session_probe_cap}-probe session cap"
                     ),
                 )
                 .await;
