@@ -63,7 +63,15 @@ async fn run_direct_probe_loop(
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
-                let outcome = run_owned_punch_session(&session, async {
+                let rx_before = udp.probe_rx_snapshot().await;
+                let deadline = punch_session_deadline(
+                    &candidates,
+                    probe_interval,
+                    attempts,
+                    remote_scatter_pool,
+                    udp.socket_count(),
+                );
+                let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
                     let punch_started_stage = if reclaim_active {
                         "direct_reclaim_punch_started"
                     } else {
@@ -119,7 +127,6 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
-                    let rx_before = udp.probe_rx_snapshot().await;
                     let punch_result = if remote_scatter_pool {
                         udp.punch_candidates_remote_scatter_pool(
                             &peer_id,
@@ -244,17 +251,33 @@ async fn run_direct_probe_loop(
                             .await;
                     }
                     PunchSessionOutcome::DeadlineExceeded => {
+                        let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
+                        let timeout_detail = format!(
+                            "background UDP retry stopped after {}ms deadline; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                            deadline.as_millis(),
+                            rx_delta.known_peer_ip_datagrams_received,
+                            rx_delta.authenticated_probe_packets_received,
+                            rx_delta.authenticated_probe_acks_observed,
+                            rx_delta.authenticated_probe_acks_unmatched,
+                            rx_delta.legacy_probe_acks_observed,
+                            rx_delta.legacy_probe_acks_unmatched,
+                            rx_delta.probe_acks_received
+                        );
                         peers
                             .record_direct_event(
                                 &peer_id,
                                 "retry_session_deadline",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
                                 None,
-                                None,
-                                None,
-                                format!(
-                                    "stopped background UDP retry after {}ms hard deadline",
-                                    PUNCH_SESSION_HARD_DEADLINE.as_millis()
-                                ),
+                                timeout_detail.clone(),
+                            )
+                            .await;
+                        peers
+                            .record_direct_probe_batch_failure_for_generation(
+                                &peer_id,
+                                generation,
+                                timeout_detail,
                             )
                             .await;
                     }

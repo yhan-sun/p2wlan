@@ -139,6 +139,32 @@ fn probe_rx_snapshot_delta_is_saturating() {
     );
 }
 
+#[test]
+fn remote_scatter_punch_deadline_keeps_wide_sweep_alive() {
+    let candidates: Vec<SocketAddr> = (0..831)
+        .map(|i| {
+            format!("203.0.113.10:{}", 40_000 + (i % 1000) as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    let deadline = estimate_remote_scatter_punch_deadline(
+        &candidates,
+        Duration::from_millis(200),
+        6,
+        3,
+        Duration::from_secs(2),
+    );
+    assert!(
+        deadline >= Duration::from_secs(45),
+        "an 831-candidate remote scatter sweep must keep at least the 45s floor, got {deadline:?}"
+    );
+    assert!(
+        deadline > Duration::from_secs(24),
+        "remote scatter deadline must exceed the fixed 24s bound, got {deadline:?}"
+    );
+}
+
 #[tokio::test]
 async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())

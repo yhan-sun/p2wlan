@@ -45,6 +45,38 @@ const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
 /// for NAT profiling.
 const SOCKET_POOL_STUN_OBSERVERS_PER_SOCKET: usize = 2;
 
+/// Estimate the hard deadline for a wide remote-scatter punch session.
+///
+/// The fixed 24s bound kills an 831-candidate sweep mid-scan, so a
+/// remote-scatter session derives its deadline from the actual probe schedule:
+/// `min(planned_packets, session cap) × per-probe pacing + round delays +
+/// ACK grace + margin`, floored at 45s. Non-scatter sessions keep the fixed
+/// short bound because their candidate sets are small by construction.
+pub(crate) fn estimate_remote_scatter_punch_deadline(
+    candidates: &[SocketAddr],
+    probe_interval: Duration,
+    attempts: u32,
+    socket_count: usize,
+    ack_grace: Duration,
+) -> Duration {
+    const MIN_REMOTE_SCATTER_SESSION_DEADLINE: Duration = Duration::from_secs(45);
+    const REMOTE_SCATTER_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+    let schedule = build_probe_schedule(candidates, probe_interval, attempts);
+    let planned_packets = schedule
+        .iter()
+        .map(|round| round.endpoints.len().saturating_mul(socket_count))
+        .sum::<usize>();
+    let paced_send_time = OUTBOUND_CONNECTIVITY_PROBE_SPACING
+        .saturating_mul(planned_packets.min(MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION as usize) as u32);
+    let round_delays = schedule.iter().map(|round| round.delay_before).sum::<Duration>();
+    paced_send_time
+        .saturating_add(round_delays)
+        .saturating_add(ack_grace)
+        .saturating_add(REMOTE_SCATTER_DEADLINE_MARGIN)
+        .max(MIN_REMOTE_SCATTER_SESSION_DEADLINE)
+}
+
 /// Counters for one local UDP socket in the bounded traversal experiment.
 /// They deliberately contain no endpoint or peer identity so diagnostics can
 /// expose experiment progress without disclosing local network topology.

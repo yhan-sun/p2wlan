@@ -4,6 +4,31 @@ fn direct_probe_ack_grace(probe_interval: Duration) -> Duration {
         .clamp(Duration::from_secs(1), Duration::from_secs(2))
 }
 
+/// Hard deadline for one owned punch session.
+///
+/// Remote-scatter sweeps cover hundreds of ports across every bound socket and
+/// need the schedule-derived deadline (floor 45s); every other session keeps
+/// the fixed 24s bound.
+fn punch_session_deadline(
+    candidates: &[SocketAddr],
+    probe_interval: Duration,
+    attempts: u32,
+    remote_scatter_pool: bool,
+    socket_count: usize,
+) -> Duration {
+    if remote_scatter_pool {
+        estimate_remote_scatter_punch_deadline(
+            candidates,
+            probe_interval,
+            attempts,
+            socket_count,
+            direct_probe_ack_grace(probe_interval),
+        )
+    } else {
+        PUNCH_SESSION_HARD_DEADLINE
+    }
+}
+
 fn unix_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
