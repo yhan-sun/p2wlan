@@ -57,7 +57,7 @@ impl PeerDiagnostics {
         local_endpoint: Option<SocketAddr>,
         traversal_history: Option<&TraversalHistory>,
     ) -> Self {
-        let active_path = match current_selection {
+        let mut active_path = match current_selection {
             Some(selection) => match selection.path {
                 Some(NetworkPath::Direct) if selection.direct_confirmed => {
                     Some(NetworkPath::Direct)
@@ -90,6 +90,17 @@ impl PeerDiagnostics {
             },
         };
         let selected_pair = conn.selected_candidate_pair_for_diagnostics(local_generation);
+        if active_path.is_none()
+            && conn.state == ConnectionState::Direct
+            && selected_pair.is_some_and(|pair| !is_overlay_endpoint(pair.remote_endpoint))
+            && conn.direct_health.consecutive_failures == 0
+            && conn
+                .direct_health
+                .success_age()
+                .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        {
+            active_path = Some(NetworkPath::Direct);
+        }
         let current_pair =
             conn.current_direct_pair_for_diagnostics(local_generation, current_selection);
         let current_pair_endpoint = current_pair.map(|pair| pair.remote_endpoint);

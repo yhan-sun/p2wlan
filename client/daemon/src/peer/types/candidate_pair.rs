@@ -214,6 +214,15 @@ impl CandidatePair {
         }
     }
 
+    pub(super) fn clear_selection(&mut self) {
+        if self.state == CandidatePairState::Selected {
+            self.state = CandidatePairState::Succeeded;
+        }
+        self.nominated = false;
+        self.nominated_at = None;
+        self.selected_at = None;
+    }
+
     pub(super) fn nominate(&mut self, local_endpoint: Option<SocketAddr>) -> bool {
         if local_endpoint.is_some() {
             self.local_endpoint = local_endpoint;
