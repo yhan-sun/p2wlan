@@ -161,12 +161,12 @@ jobs:
               label="$arch"
             fi
             dst_dir="build/macos/Build/Products/Release/$label"
-            dst="$dst_dir/P2WLAN Diagnostics.app"
+            dst="$dst_dir/P2WLAN.app"
             rm -rf "$dst_dir"
             mkdir -p "$dst_dir"
             cp -R "$src" "$dst"
             for binary in \
-              "$dst/Contents/MacOS/P2WLAN Diagnostics" \
+              "$dst/Contents/MacOS/P2WLAN" \
               "$dst/Contents/Frameworks/App.framework/Versions/A/App" \
               "$dst/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
               lipo "$binary" -thin "$arch" -output "$binary.thin"
