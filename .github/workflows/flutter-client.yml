@@ -153,7 +153,7 @@ jobs:
       - name: Pack macOS apps by architecture
         run: |
           set -euo pipefail
-          src="build/macos/Build/Products/Release/P2WLAN Diagnostics.app"
+          src="build/macos/Build/Products/Release/P2WLAN.app"
           for arch in arm64 x86_64; do
             if [ "$arch" = "x86_64" ]; then
               label="x64"
