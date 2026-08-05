@@ -51,6 +51,26 @@ impl ControlClient {
         (client, event_rx)
     }
 
+    /// Build a client that never spawns the background control loop.
+    ///
+    /// Used by daemon unit tests that only need the command/event plumbing.
+    #[cfg(test)]
+    pub(crate) fn disabled_for_test() -> Self {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(RwLock::new(ClientState {
+            registered: false,
+            peers: HashMap::new(),
+            virtual_ip: None,
+            _relay_servers: Vec::new(),
+        }));
+        Self {
+            event_tx,
+            cmd_tx,
+            state,
+        }
+    }
+
     /// Get a snapshot of the known peers.
     pub async fn peers(&self) -> HashMap<String, PeerInfo> {
         self.state.read().await.peers.clone()

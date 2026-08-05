@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn is_public_probe_endpoint(endpoint: SocketAddr) -> bool {
+pub(crate) fn is_public_probe_endpoint(endpoint: SocketAddr) -> bool {
     match endpoint.ip() {
         IpAddr::V4(ip) => {
             !ip.is_loopback()

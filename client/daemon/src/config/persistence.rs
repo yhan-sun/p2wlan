@@ -105,6 +105,7 @@ impl Config {
                 birthday_probing_enabled: true,
                 socket_pool_enabled: false,
                 socket_pool_size: default_socket_pool_size(),
+                fresh_mapping_punch_enabled: true,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),

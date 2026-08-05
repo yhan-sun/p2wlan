@@ -357,6 +357,7 @@ fn diagnostics_keeps_non_current_peer_reflexive_pair_provisional() {
         0,
         Some(local),
         None,
+        None,
     );
     let selected = diagnostics.selected_pair.as_ref().unwrap();
     let current = diagnostics.current_direct_pair.as_ref().unwrap();

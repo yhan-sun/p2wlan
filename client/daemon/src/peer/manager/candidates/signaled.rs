@@ -140,7 +140,7 @@ impl PeerManager {
                 }
             }
 
-            for c in &valid_candidates {
+            for (rank, c) in valid_candidates.iter().enumerate() {
                 if !conn.candidates.contains(c) {
                     conn.candidates.push(c.clone());
                 }
@@ -154,7 +154,13 @@ impl PeerManager {
                     .unwrap_or_else(|| infer_unlabeled_candidate_source(c));
                 conn.candidate_sources.insert(c.clone(), source);
                 if let Ok(endpoint) = c.parse::<SocketAddr>() {
-                    conn.ensure_candidate_pair_with_observed_source(endpoint, generation, source);
+                    let pair =
+                        conn.ensure_candidate_pair_with_observed_source(endpoint, generation, source);
+                    // The sender ordered its predicted window by priority;
+                    // preserve that order for stable-side probing.
+                    if source == CandidatePairSource::Predicted {
+                        pair.signal_rank = Some(rank as u32);
+                    }
                 }
             }
 

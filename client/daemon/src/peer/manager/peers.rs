@@ -158,6 +158,8 @@ impl PeerManager {
             let mut ip_map = self.ip_to_node.write().await;
             ip_map.remove(&conn.virtual_ip);
         }
+        drop(conns);
+        self.clear_fresh_mapping(node_id, "peer_removed").await;
     }
 
     /// Get a peer connection by node ID.

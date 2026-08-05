@@ -1,4 +1,17 @@
 impl Daemon {
+    /// Build the optional signaling context for fresh-mapping punch
+    /// generations.  Present whenever the UDP transport, control plane and
+    /// STUN observers are available.
+    async fn hole_punch_signal_context(&self) -> Option<HolePunchSignalContext> {
+        Some(HolePunchSignalContext {
+            control: self.control.clone(),
+            local_candidates: self.local_candidates.clone(),
+            local_candidate_sources: self.local_candidate_sources.clone(),
+            stun_servers: self.runtime_stun_servers.read().await.clone(),
+            stun_timeout: *self.runtime_stun_timeout.read().await,
+        })
+    }
+
     async fn current_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
         let _refresh_guard = self.candidate_refresh_lock.lock().await;
         (
@@ -121,6 +134,7 @@ impl Daemon {
             .peers
             .recommended_punch_attempts(self.config.network.punch_attempts)
             .await;
+        let signal = self.hole_punch_signal_context().await;
         spawn_hole_punch_task(
             udp,
             self.peers.clone(),
@@ -129,6 +143,7 @@ impl Daemon {
             Duration::from_millis(self.config.network.punch_interval_ms),
             attempts,
             punch_at_ms,
+            signal,
         )
         .await;
     }
@@ -296,6 +311,7 @@ impl Daemon {
         let attempts = peers
             .recommended_punch_attempts(self.config.network.punch_attempts)
             .await;
+        let signal = self.hole_punch_signal_context().await;
         spawn_hole_punch_task(
             udp,
             peers,
@@ -304,6 +320,7 @@ impl Daemon {
             Duration::from_millis(self.config.network.punch_interval_ms),
             attempts,
             punch_at_ms,
+            signal,
         )
         .await;
     }

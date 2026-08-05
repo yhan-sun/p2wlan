@@ -57,9 +57,48 @@ impl UdpTransport {
         socket: Arc<UdpSocket>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) -> Result<()> {
+        self.run_inbound_socket_inner(socket_index, socket, inbound_tx, None)
+            .await
+    }
+
+    /// Run an inbound reader that stops when `shutdown_rx` turns true.
+    ///
+    /// Dedicated fresh-mapping punch sockets use this so a superseded punch
+    /// generation can close its socket deterministically instead of leaking
+    /// the reader loop.
+    async fn run_dynamic_inbound_socket(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let Some(inbound_tx) = self.inbound_channel() else {
+            debug!(
+                "Dropped dynamic UDP socket reader {socket_index}: no inbound channel attached"
+            );
+            return;
+        };
+        let _ = self
+            .run_inbound_socket_inner(socket_index, socket, inbound_tx, Some(&mut shutdown_rx))
+            .await;
+    }
+
+    async fn run_inbound_socket_inner(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; 65_535];
 
         loop {
+            if let Some(shutdown_rx) = shutdown_rx.as_deref_mut() {
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+
             let (n, source) = match socket.recv_from(&mut buf).await {
                 Ok(packet) => packet,
                 Err(err) if is_ignorable_udp_receive_error(&err) => {
@@ -317,6 +356,9 @@ impl UdpTransport {
                             );
                             continue;
                         }
+                        self.peers
+                            .record_predicted_window_hit_if_predicted(&identity.source_node_id, source)
+                            .await;
                         self.peers
                             .record_direct_probe_success_with_local_endpoint(
                                 &identity.source_node_id,

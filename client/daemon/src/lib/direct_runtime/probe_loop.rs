@@ -1,8 +1,13 @@
+#[allow(clippy::too_many_arguments)]
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     local_candidates: Arc<RwLock<Vec<String>>>,
+    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     punch_deduplicator: PunchAttemptDeduplicator,
+    control: ControlClient,
+    stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
+    stun_timeout: Arc<RwLock<Duration>>,
     retry_after: Duration,
     probe_interval: Duration,
     attempts: u32,
@@ -62,6 +67,17 @@ async fn run_direct_probe_loop(
             };
             let udp = udp.clone();
             let peers = peers.clone();
+            let signal = {
+                let stun_servers = stun_servers.read().await.clone();
+                let stun_timeout = *stun_timeout.read().await;
+                HolePunchSignalContext {
+                    control: control.clone(),
+                    local_candidates: local_candidates.clone(),
+                    local_candidate_sources: local_candidate_sources.clone(),
+                    stun_servers,
+                    stun_timeout,
+                }
+            };
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
@@ -129,6 +145,51 @@ async fn run_direct_probe_loop(
                             .record_birthday_probe_plan_started(&peer_id, plan)
                             .await;
                     }
+
+                    // Fresh-mapping generation: measure a fresh socket and
+                    // create a predictable peer-facing mapping before the
+                    // ordinary candidate sweep.
+                    let fresh_generation = {
+                        let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
+                        let generation = udp
+                            .run_fresh_mapping_generation(
+                                &peer_id,
+                                &signal.stun_servers,
+                                signal.stun_timeout,
+                                &targets,
+                                probe_interval,
+                                attempts.min(2),
+                            )
+                            .await;
+                        match &generation {
+                            FreshMappingOutcome::Accepted(result) => {
+                                advertise_fresh_mapping_prediction(
+                                    &signal,
+                                    &peers,
+                                    &peer_id,
+                                    result,
+                                )
+                                .await;
+                            }
+                            FreshMappingOutcome::Rejected(reason) => {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "fresh_mapping_skipped",
+                                        None,
+                                        None,
+                                        None,
+                                        format!(
+                                            "fresh-mapping generation skipped: {}",
+                                            reason.label()
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                        generation
+                    };
+
                     for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
                         udp.spawn_nat_binding_maintainer(
                             &peer_id,
@@ -138,7 +199,17 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
-                    let punch_result = if stable_remote_scatter {
+                    let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(_))
+                        && udp.has_dynamic_socket_for_peer(&peer_id).await
+                    {
+                        udp.punch_candidates_from_dynamic_socket(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
+                        .await
+                    } else if stable_remote_scatter {
                         udp.punch_candidates_stable_unique_scatter(
                             &peer_id,
                             candidates.clone(),

@@ -300,6 +300,16 @@ impl PeerConnection {
                         .cmp(&speculative_probe_source_rank_for_mode(b.source, mode))
                 })
                 .then_with(|| {
+                    // The sender ordered its predicted window by priority
+                    // (top-1 first); probe it in that order so a
+                    // linear-symmetric peer's peer-facing mapping is hit
+                    // before wider fallbacks.  This must outrank any
+                    // recency/probe-count heuristics for `Predicted` pairs.
+                    a.signal_rank
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.signal_rank.unwrap_or(u32::MAX))
+                })
+                .then_with(|| {
                     candidate_pair_probe_rank_for_mode(a.state, a.source, mode)
                         .cmp(&candidate_pair_probe_rank_for_mode(b.state, b.source, mode))
                 })

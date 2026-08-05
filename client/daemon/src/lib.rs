@@ -127,7 +127,11 @@ use transport::{
     OrderedEncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionCommit,
     ResponderSessionStage, WireGuardTransport,
 };
-use udp::{PeerReflexiveObservation, PunchSendReport, UdpTransport};
+use udp::FRESH_MAPPING_MODEL_SIGNAL_KEY;
+use udp::{
+    FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveObservation,
+    PunchSendReport, UdpTransport,
+};
 
 include!("lib/pending_handshake.rs");
 /// Maximum number of handshake re-initiation attempts before giving up.

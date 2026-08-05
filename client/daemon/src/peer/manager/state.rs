@@ -16,6 +16,12 @@ pub struct PeerManager {
     traversal_history: Arc<RwLock<TraversalHistory>>,
     /// Optional persistent history path.
     traversal_history_path: Option<PathBuf>,
+    /// Per-peer punch generation counters for fresh-mapping batches.
+    punch_generations: Arc<RwLock<HashMap<String, u64>>>,
+    /// Per-peer fresh-mapping state produced by measure-then-punch generations.
+    local_fresh_mappings: Arc<RwLock<HashMap<String, LocalFreshMapping>>>,
+    /// Time-limited prediction-error fingerprint per peer.
+    fresh_mapping_history: Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
     /// Configuration.
     config: Config,
 }
