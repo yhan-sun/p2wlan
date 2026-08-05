@@ -53,11 +53,92 @@ fn birthday_probe_endpoints_for_bases_spreads_beyond_near_window() {
     assert!(ports.contains(&39904));
     assert!(ports.contains(&40096));
     assert!(ports.contains(&40251));
-    assert!(ports.contains(&39749));
-    assert!(ports
-        .iter()
-        .all(|port| port.abs_diff(40000) <= BIRTHDAY_PROBE_WIDE_MAX_DELTA as u16));
+    assert!(ports.contains(&40502));
     assert!(ports.iter().any(|port| port.abs_diff(40000) > 64));
+}
+
+#[test]
+fn birthday_near_window_wraps_across_udp_port_boundaries() {
+    let low = birthday_probe_endpoints("203.0.113.10:1".parse().unwrap());
+    let high = birthday_probe_endpoints("203.0.113.10:65535".parse().unwrap());
+    assert!(low.iter().any(|endpoint| endpoint.port() == 65_535));
+    assert!(high.iter().any(|endpoint| endpoint.port() == 1));
+}
+
+#[test]
+fn stable_public_ip_permutation_covers_every_nonzero_udp_port_per_public_ip() {
+    let public_ips = [
+        "220.163.6.190".parse::<IpAddr>().unwrap(),
+        "203.0.113.10".parse::<IpAddr>().unwrap(),
+    ];
+    let plan = stable_public_ip_probe_plan_from_rank(
+        &public_ips,
+        BIRTHDAY_PROBE_PORT_SPACE * public_ips.len(),
+        0,
+        &HashSet::new(),
+    );
+
+    assert_eq!(
+        plan.endpoints.len(),
+        BIRTHDAY_PROBE_PORT_SPACE * public_ips.len()
+    );
+    for public_ip in public_ips {
+        let ports = plan
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.ip() == public_ip)
+            .map(SocketAddr::port)
+            .collect::<HashSet<_>>();
+        assert_eq!(ports.len(), BIRTHDAY_PROBE_PORT_SPACE);
+        assert!(ports.contains(&1));
+        assert!(ports.contains(&65_535));
+    }
+    assert!(plan
+        .endpoints
+        .contains(&"220.163.6.190:43076".parse().unwrap()));
+    assert_eq!(plan.next_rank, 0);
+    assert!(plan.wrapped);
+}
+
+#[test]
+fn consecutive_stable_public_ip_windows_are_disjoint_before_wrap() {
+    let public_ip: IpAddr = "203.0.113.10".parse().unwrap();
+    let excluded = HashSet::from([
+        "203.0.113.10:40000".parse().unwrap(),
+        "203.0.113.10:41000".parse().unwrap(),
+    ]);
+    let mut committed = HashSet::new();
+    let mut cursor = 0;
+
+    for _ in 0..8 {
+        let plan = stable_public_ip_probe_plan_from_rank(&[public_ip], 3_072, cursor, &excluded);
+        assert!(!plan.wrapped);
+        assert!(plan
+            .endpoints
+            .iter()
+            .all(|endpoint| !excluded.contains(endpoint)));
+        assert!(plan
+            .endpoints
+            .iter()
+            .all(|endpoint| committed.insert(*endpoint)));
+        cursor = plan.next_rank;
+    }
+}
+
+#[test]
+fn stable_public_ip_cursor_never_skips_a_partial_multi_ip_rank() {
+    let public_ips = vec![
+        "203.0.113.10".parse().unwrap(),
+        "203.0.113.11".parse().unwrap(),
+        "203.0.113.12".parse().unwrap(),
+    ];
+    let first = stable_public_ip_probe_plan_from_rank(&public_ips, 4, 0, &HashSet::new());
+    assert_eq!(first.endpoints.len(), 3);
+    assert_eq!(first.next_rank, 1);
+    let second =
+        stable_public_ip_probe_plan_from_rank(&public_ips, 3, first.next_rank, &HashSet::new());
+    assert_eq!(second.endpoints.len(), 3);
+    assert_eq!(second.next_rank, 2);
 }
 
 #[test]
@@ -200,6 +281,242 @@ async fn easy_local_expands_after_the_explicit_prediction_window_fails() {
     assert!(background_retries[0].1.iter().any(|target| {
         target.ip() == observed.ip() && *target != observed && !predicted.contains(target)
     }));
+}
+
+#[tokio::test]
+async fn stable_side_wide_scatter_rotates_unique_birthday_windows() {
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let observed: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_024)
+        .map(|port| SocketAddr::new(observed.ip(), port))
+        .collect::<HashSet<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+
+    manager
+        .add_peer(&test_peer("peer1", registry_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    let mut stable_profile = birthday_nat_profile();
+    stable_profile.mapping_behavior = MappingBehavior::EndpointIndependent;
+    stable_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
+    stable_profile.public_port_stable = Some(true);
+    stable_profile.likely_symmetric = Some(false);
+    stable_profile.birthday_candidate = false;
+    manager.update_nat_profile(stable_profile).await;
+
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        for endpoint in &predicted {
+            conn.ensure_candidate_pair_with_source(*endpoint, 0, CandidatePairSource::Predicted)
+                .record_failure(REASON_DIRECT_PROBE_FAILED, "predicted window miss", None);
+        }
+    }
+
+    let first = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("stable side should produce a wide target set");
+    assert!(first.remote_scatter_pool);
+    assert!(first.stable_remote_scatter);
+    assert!(first.candidates.len() >= 3_000);
+    assert!(first.candidates.len() <= STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET);
+    let first_plan = first.birthday_plan.unwrap();
+    assert!(first_plan.stable_side_unique_scatter);
+    assert_eq!(
+        first_plan.selected_birthday_candidates,
+        first_plan.generated_candidates
+    );
+    assert_eq!(first_plan.start_rank, 0);
+    assert!(
+        !manager
+            .commit_birthday_probe_cursor("peer1", &first_plan, false)
+            .await
+    );
+    let incomplete_retry = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("an incompletely sent window must remain retryable");
+    assert_eq!(
+        incomplete_retry.birthday_plan.unwrap().start_rank,
+        first_plan.start_rank
+    );
+    assert!(
+        manager
+            .commit_birthday_probe_cursor("peer1", &first_plan, true)
+            .await
+    );
+
+    // Reapplying an identical source-only signal must not reset progress.
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    let second = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .expect("next wide target set should continue from the cursor");
+    let second_plan = second.birthday_plan.unwrap();
+    assert_eq!(second_plan.start_rank, first_plan.end_rank);
+    assert_ne!(second.candidates, first.candidates);
+}
+
+fn stable_scatter_signal(
+    public_ip: IpAddr,
+    observed_port: u16,
+) -> (Vec<String>, HashMap<String, String>, HashSet<SocketAddr>) {
+    let observed = SocketAddr::new(public_ip, observed_port);
+    let predicted = (1..=24)
+        .map(|offset| SocketAddr::new(public_ip, observed_port.saturating_add(offset)))
+        .collect::<HashSet<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+    (candidates, sources, predicted)
+}
+
+async fn stable_scatter_manager(public_ip: IpAddr, observed_port: u16) -> PeerManager {
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint = SocketAddr::new(public_ip, observed_port.saturating_sub(1_000));
+    let (candidates, sources, predicted) = stable_scatter_signal(public_ip, observed_port);
+    manager
+        .add_peer(&test_peer("peer1", registry_endpoint))
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let mut stable_profile = birthday_nat_profile();
+    stable_profile.mapping_behavior = MappingBehavior::EndpointIndependent;
+    stable_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
+    stable_profile.public_port_stable = Some(true);
+    stable_profile.likely_symmetric = Some(false);
+    stable_profile.birthday_candidate = false;
+    manager.update_nat_profile(stable_profile).await;
+
+    let generation = manager.current_network_generation().await;
+    let mut conns = manager.connections.write().await;
+    let conn = conns.get_mut("peer1").unwrap();
+    for endpoint in predicted {
+        conn.ensure_candidate_pair_with_source(
+            endpoint,
+            generation,
+            CandidatePairSource::Predicted,
+        )
+        .record_failure(REASON_DIRECT_PROBE_FAILED, "predicted window miss", None);
+    }
+    drop(conns);
+    manager
+}
+
+#[tokio::test]
+async fn same_public_ip_stun_port_churn_preserves_birthday_cursor() {
+    let public_ip = "203.0.113.10".parse().unwrap();
+    let manager = stable_scatter_manager(public_ip, 41_000).await;
+
+    let first_plan = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+    assert!(
+        manager
+            .commit_birthday_probe_cursor("peer1", &first_plan, true)
+            .await
+    );
+    let second_plan = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+    assert_eq!(second_plan.start_rank, first_plan.end_rank);
+
+    let (churned_candidates, churned_sources, churned_predicted) =
+        stable_scatter_signal(public_ip, 51_000);
+    manager
+        .add_candidates_with_sources("peer1", &churned_candidates, &churned_sources)
+        .await;
+    assert!(
+        manager
+            .commit_birthday_probe_cursor("peer1", &second_plan, true)
+            .await
+    );
+
+    let generation = manager.current_network_generation().await;
+    let mut conns = manager.connections.write().await;
+    let conn = conns.get_mut("peer1").unwrap();
+    for endpoint in churned_predicted {
+        conn.ensure_candidate_pair_with_source(
+            endpoint,
+            generation,
+            CandidatePairSource::Predicted,
+        )
+        .record_failure(REASON_DIRECT_PROBE_FAILED, "predicted window miss", None);
+    }
+    drop(conns);
+
+    let after_churn = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+    assert_eq!(after_churn.start_rank, second_plan.end_rank);
+}
+
+#[tokio::test]
+async fn public_ip_change_rejects_stale_birthday_cursor_commit() {
+    let manager = stable_scatter_manager("203.0.113.10".parse().unwrap(), 41_000).await;
+    let stale_plan = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+
+    let (candidates, sources, _) = stable_scatter_signal("198.51.100.20".parse().unwrap(), 42_000);
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    assert!(
+        !manager
+            .commit_birthday_probe_cursor("peer1", &stale_plan, true)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn network_generation_change_rejects_stale_birthday_cursor_commit() {
+    let manager = stable_scatter_manager("203.0.113.10".parse().unwrap(), 41_000).await;
+    let stale_plan = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+
+    manager.advance_network_generation("test handover").await;
+
+    assert!(
+        !manager
+            .commit_birthday_probe_cursor("peer1", &stale_plan, true)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -367,7 +684,10 @@ async fn hard_local_nat_treats_small_stun_pool_as_stable_remote() {
         "203.0.113.10:41002".parse::<SocketAddr>().unwrap(),
         "203.0.113.10:41003".parse::<SocketAddr>().unwrap(),
     ];
-    let candidates = stable_pool.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let candidates = stable_pool
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     let sources = candidates
         .iter()
         .cloned()

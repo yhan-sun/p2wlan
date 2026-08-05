@@ -471,19 +471,21 @@ pub(super) async fn send_relay_validation_packet(
         validation.sequence,
         &payload,
     );
-    let encrypted = transport
-        .encrypt_outbound(OutboundPacket {
-            peer_id: validation.peer_id.to_string(),
-            dst_ip: validation.peer_virtual_ip.to_string(),
-            packet,
-        })
-        .await?
-        .ok_or_else(|| {
-            DaemonError::Peer(format!(
-                "WireGuard session for peer {} is not ready",
-                validation.peer_id
-            ))
-        })?;
-
-    relay.send_packet(&encrypted).await
+    let sent = transport
+        .encrypt_and_emit_outbound(
+            OutboundPacket {
+                peer_id: validation.peer_id.to_string(),
+                dst_ip: validation.peer_virtual_ip.to_string(),
+                packet,
+            },
+            |encrypted| async move { relay.send_packet(&encrypted).await },
+        )
+        .await?;
+    if !sent {
+        return Err(DaemonError::Peer(format!(
+            "WireGuard session for peer {} is not ready",
+            validation.peer_id
+        )));
+    }
+    Ok(())
 }

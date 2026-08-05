@@ -42,6 +42,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_response_does_not_poison_pending_initiator() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let mut initiator = HandshakeInitiator::new(
+            initiator_identity,
+            responder_identity.public_key(),
+            None,
+        );
+        let initiation = initiator.create_initiation().unwrap();
+        let mut responder = HandshakeResponder::new(responder_identity, None);
+        let (valid_response, _) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+
+        let mut invalid_response = valid_response.clone();
+        invalid_response.encrypted_empty[0] ^= 0x80;
+        assert_eq!(invalid_response.receiver_index, initiator.sender_index);
+        assert!(initiator.consume_response(&invalid_response).is_err());
+        assert!(initiator.consume_response(&valid_response).is_ok());
+    }
+
+    #[test]
     fn test_transport_key_pair_debug_redacts_keys() {
         let keys = TransportKeyPair {
             send_key: [0xAB; 32],

@@ -164,6 +164,82 @@ impl PeerManager {
         .await
     }
 
+    /// Record an expected miss from one stable-side birthday window.
+    ///
+    /// Missing a single probabilistic window is normal and must not increase
+    /// peer-level exponential retry backoff.  The candidate pairs are still
+    /// marked for source learning.  Only when `completed_epoch` is true (the
+    /// absolute-port cursor wrapped after a fully sent window) is the miss
+    /// promoted to a peer-level Direct failure.
+    pub async fn record_expected_birthday_window_miss_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        endpoints: &[SocketAddr],
+        completed_epoch: bool,
+        reason: impl Into<String>,
+    ) -> bool {
+        if endpoints.is_empty() || generation != self.current_network_generation().await {
+            return false;
+        }
+        let reason = reason.into();
+        let probed_sources = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+
+            if conn.state == ConnectionState::Direct && conn.direct_generation == generation {
+                conn.record_direct_event(
+                    generation,
+                    "direct_probe_window_miss_ignored",
+                    conn.endpoint,
+                    Some(endpoints.len()),
+                    None,
+                    format!(
+                        "{reason}; ignored because encrypted Direct is already confirmed"
+                    ),
+                );
+                return true;
+            }
+
+            let probed_sources = conn.mark_candidate_pairs_failed_for_endpoints(
+                generation,
+                endpoints,
+                REASON_DIRECT_PROBE_FAILED,
+                reason.clone(),
+                None,
+            );
+            let stage = if completed_epoch {
+                "birthday_probe_epoch_missed"
+            } else {
+                "birthday_probe_window_missed"
+            };
+            conn.record_direct_event(
+                generation,
+                stage,
+                conn.endpoint,
+                Some(endpoints.len()),
+                None,
+                format!(
+                    "{reason}; completed_epoch={completed_epoch}; peer_backoff_applied={completed_epoch}"
+                ),
+            );
+
+            if completed_epoch {
+                conn.direct_health
+                    .record_failure(REASON_DIRECT_PROBE_FAILED, reason.clone());
+                if conn.state != ConnectionState::Relay {
+                    conn.transition(ConnectionState::FallbackToRelay);
+                }
+            }
+            probed_sources
+        };
+
+        self.record_traversal_failures(probed_sources).await;
+        true
+    }
+
     /// Record an unanswered direct keepalive without tearing down a path on one lost probe.
     pub async fn record_direct_keepalive_timeout_for_generation(
         &self,

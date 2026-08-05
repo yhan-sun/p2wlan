@@ -19,10 +19,67 @@ fn test_daemon_creation_manual_mode() {
 }
 
 #[test]
-fn candidate_only_offer_preserves_the_active_probe_session() {
-    assert!(!peer_offer_updates_probe_session(&[], None));
-    assert!(peer_offer_updates_probe_session(&[1], None));
-    assert!(peer_offer_updates_probe_session(&[], Some("session-1")));
+fn only_applied_candidate_only_signals_start_synchronized_punch() {
+    assert!(candidate_signal_starts_synchronized_punch(
+        &[],
+        CandidateSetApplyResult::Applied
+    ));
+    assert!(!candidate_signal_starts_synchronized_punch(
+        &[],
+        CandidateSetApplyResult::IgnoredEmpty
+    ));
+    assert!(!candidate_signal_starts_synchronized_punch(
+        &[],
+        CandidateSetApplyResult::IgnoredStale
+    ));
+    assert!(!candidate_signal_starts_synchronized_punch(
+        &[],
+        CandidateSetApplyResult::IgnoredExpired
+    ));
+    assert!(!candidate_signal_starts_synchronized_punch(
+        &[],
+        CandidateSetApplyResult::PeerMissing
+    ));
+    assert!(candidate_signal_starts_synchronized_punch(
+        &[1],
+        CandidateSetApplyResult::IgnoredStale
+    ));
+}
+
+#[tokio::test]
+async fn candidate_snapshot_reader_waits_for_atomic_refresh_commit() {
+    let daemon = Arc::new(Daemon::new(
+        Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
+    ));
+    let (candidate_written_tx, candidate_written_rx) = tokio::sync::oneshot::channel();
+    let (finish_commit_tx, finish_commit_rx) = tokio::sync::oneshot::channel();
+
+    let writer_daemon = daemon.clone();
+    let writer = tokio::spawn(async move {
+        let _guard = writer_daemon.candidate_refresh_lock.lock().await;
+        *writer_daemon.local_candidates.write().await = vec!["192.168.1.20:40000".to_string()];
+        let _ = candidate_written_tx.send(());
+        let _ = finish_commit_rx.await;
+        *writer_daemon.local_candidate_sources.write().await = HashMap::from([(
+            "192.168.1.20:40000".to_string(),
+            "host".to_string(),
+        )]);
+        *writer_daemon.local_network_identity.write().await =
+            vec!["host:192.168.1.20".to_string()];
+    });
+
+    candidate_written_rx.await.unwrap();
+    let reader_daemon = daemon.clone();
+    let mut reader = tokio::spawn(async move { reader_daemon.current_local_candidate_set().await });
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut reader)
+        .await
+        .is_err());
+    let _ = finish_commit_tx.send(());
+    writer.await.unwrap();
+
+    let (candidates, sources) = reader.await.unwrap();
+    assert_eq!(candidates, vec!["192.168.1.20:40000".to_string()]);
+    assert_eq!(sources.get("192.168.1.20:40000").map(String::as_str), Some("host"));
 }
 
 #[tokio::test]

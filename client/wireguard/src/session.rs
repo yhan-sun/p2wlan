@@ -260,6 +260,19 @@ impl TransportSession {
     pub fn is_expired(&self) -> bool {
         self.send_counter >= self.reject_after_messages || self.age() >= self.reject_after_time
     }
+
+    /// Remaining time before the time-based hard reject threshold.
+    ///
+    /// Message-count rejection is represented by zero once reached; before
+    /// that point the time limit is the useful deadline for scheduling rekey
+    /// retries.
+    pub fn expires_in(&self) -> Duration {
+        if self.send_counter >= self.reject_after_messages {
+            Duration::ZERO
+        } else {
+            self.reject_after_time.saturating_sub(self.age())
+        }
+    }
 }
 
 impl std::fmt::Debug for TransportSession {

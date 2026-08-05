@@ -3,16 +3,17 @@ impl Daemon {
         &mut self,
         peer_info: &control::PeerInfo,
     ) -> Result<Option<u64>> {
-        if self.transport.has_session(&peer_info.node_id).await {
-            return Ok(None);
-        }
-
-        if self.config.node.public_key >= peer_info.public_key {
+        let _handshake_guard = self.handshake_arbiter.acquire(&peer_info.node_id).await;
+        let status = self.transport.session_status(&peer_info.node_id).await;
+        if status.has_active || status.has_pending_responder {
             return Ok(None);
         }
 
         let identity = self.local_identity()?;
         let peer_public = decode_x25519_key(&peer_info.public_key, "peer public key")?;
+        if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
+            return Ok(None);
+        }
 
         // Claim this handshake before candidate gathering.  That work awaits,
         // and the background maintenance loop can otherwise observe an empty
@@ -52,7 +53,8 @@ impl Daemon {
             self.local_candidate_set_for_signal("handshake offer").await;
 
         let peer_id_clone = peer_info.node_id.clone();
-        if self.transport.has_session(&peer_id_clone).await {
+        let status = self.transport.session_status(&peer_id_clone).await;
+        if status.has_active || status.has_pending_responder {
             self.pending_handshakes
                 .lock()
                 .await
@@ -79,12 +81,30 @@ impl Daemon {
         }) else {
             return Ok(None);
         };
-        self.peers
-            .set_probe_session_id(&peer_id_clone, Some(session_id.clone()))
-            .await;
+        if self
+            .peers
+            .stage_probe_session_binding(
+                &peer_id_clone,
+                session_id.clone(),
+                Some(session_id.clone()),
+                None,
+                false,
+            )
+            .await
+            != ProbeBindingStage::Staged
+        {
+            self.pending_handshakes
+                .lock()
+                .await
+                .remove(&peer_id_clone);
+            return Err(DaemonError::Peer(format!(
+                "failed to stage Probe v2 handshake binding for {}",
+                peer_id_clone
+            )));
+        }
 
         let punch_at_ms = relay_assisted_punch_at_ms();
-        if let Err(error) = self
+        let offer_result = self
             .control
             .send_peer_offer_with_sources_punch_and_session(
                 &peer_id_clone,
@@ -95,40 +115,39 @@ impl Daemon {
                 Some(session_id.clone()),
                 Some(probe_ephemeral_public_key.clone()),
             )
-            .await
-        {
-            let mut state = self.pending_handshakes.lock().await;
-            if state.is_current(&peer_id_clone, pending_id) {
-                state.remove(&peer_id_clone);
-                self.peers.set_probe_session_id(&peer_id_clone, None).await;
-            }
-            return Err(error);
-        }
-
-        info!(
-            "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates, attempt {})",
-            peer_id_clone,
-            initiation_bytes.len(),
-            candidates.len(),
-            {
-                let state = self.pending_handshakes.lock().await;
-                state.attempts.get(&peer_id_clone).copied().unwrap_or(0)
-            },
-        );
-        self.peers
-            .record_direct_event(
-                &peer_id_clone,
-                "peer_offer_sent",
-                None,
-                Some(candidates.len()),
-                None,
-                format!(
-                    "sent offer handshake_bytes={} attempt={} punch_at_ms={punch_at_ms}",
-                    initiation_bytes.len(),
-                    attempt_no
-                ),
-            )
             .await;
+
+        if offer_result.is_ok() {
+            info!(
+                "Sent WireGuard handshake initiation to {} ({} bytes, {} candidates, attempt {})",
+                peer_id_clone,
+                initiation_bytes.len(),
+                candidates.len(),
+                {
+                    let state = self.pending_handshakes.lock().await;
+                    state.attempts.get(&peer_id_clone).copied().unwrap_or(0)
+                },
+            );
+            self.peers
+                .record_direct_event(
+                    &peer_id_clone,
+                    "peer_offer_sent",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    format!(
+                        "sent offer handshake_bytes={} attempt={} punch_at_ms={punch_at_ms}",
+                        initiation_bytes.len(),
+                        attempt_no
+                    ),
+                )
+                .await;
+        } else {
+            warn!(
+                "WireGuard offer delivery to {} is ambiguous; retaining pending handshake until timeout",
+                peer_id_clone
+            );
+        }
 
         // Spawn timeout watcher that cleans up pending entry on timeout.
         // Uses the shared Arc<Mutex<>> so the spawned task can remove the entry.
@@ -136,6 +155,7 @@ impl Daemon {
         let timeout_peer = peer_id_clone;
         let transport = self.transport.clone();
         let peers = self.peers.clone();
+        let timeout_session_id = session_id;
         let generation = self.peers.current_network_generation().await;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
@@ -151,15 +171,29 @@ impl Daemon {
                     .await;
             }
             // Remove from pending so retry is possible.
-            let mut state = pending.lock().await;
-            if state.is_current(&timeout_peer, pending_id) {
-                state.remove(&timeout_peer);
-                if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
-                    state.attempts.remove(&timeout_peer);
+            let removed = {
+                let mut state = pending.lock().await;
+                if state.is_current(&timeout_peer, pending_id) {
+                    state.remove(&timeout_peer);
+                    if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
+                        state.attempts.remove(&timeout_peer);
+                    }
+                    true
+                } else {
+                    false
                 }
+            };
+            if removed {
+                peers
+                    .discard_pending_probe_session_binding(
+                        &timeout_peer,
+                        &timeout_session_id,
+                    )
+                    .await;
             }
         });
 
+        offer_result?;
         Ok(Some(punch_at_ms))
     }
 

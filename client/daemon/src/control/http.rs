@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use p2pnet_crypto::Ed25519KeyPair;
 use serde::Deserialize;
@@ -29,8 +29,22 @@ use super::{
 static LAST_CANDIDATE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const SIGNAL_REST_PROTOCOL_VERSION: u8 = 1;
+/// A responder answer must not be held behind a wedged HTTP request for most
+/// of its short receive-only key lifetime. Delivery remains ambiguous on
+/// timeout, so the daemon retains staged state for authenticated confirmation.
+const SIGNAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 include!("http/auth.rs");
 include!("http/device.rs");
 include!("http/signal.rs");
 include!("http/peers.rs");
+
+#[cfg(test)]
+mod signal_send_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn signal_send_timeout_is_bounded() {
+        assert_eq!(SIGNAL_SEND_TIMEOUT, Duration::from_secs(5));
+    }
+}

@@ -33,6 +33,7 @@ pub(super) async fn send_signal(
     );
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
+        .timeout(SIGNAL_SEND_TIMEOUT)
         .bearer_auth(token)
         .json(&serde_json::json!({
             "from_node_id": from_node_id,

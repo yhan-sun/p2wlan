@@ -34,42 +34,62 @@ impl PeerManager {
         candidate_sources: &HashMap<String, String>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
-    ) {
+    ) -> CandidateSetApplyResult {
         let generation = self.current_network_generation().await;
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(u64::MAX as u128) as u64;
-            if candidates_expires_at_ms.is_some_and(|expires_at| {
-                expires_at.saturating_add(CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS) <= now_ms
-            }) {
-                conn.record_direct_event(
-                    generation,
-                    "candidates_expired",
-                    None,
-                    Some(candidates.len()),
-                    None,
-                    "ignored expired signaled UDP candidate set",
-                );
-                return;
-            }
-            if candidate_generation != 0 && candidate_generation <= conn.last_candidate_generation {
-                conn.record_direct_event(
-                    generation,
-                    "candidates_stale",
-                    None,
-                    Some(candidates.len()),
-                    None,
-                    format!("ignored stale candidate generation {candidate_generation}"),
-                );
-                return;
-            }
-            if candidate_generation != 0 {
-                conn.last_candidate_generation = candidate_generation;
-            }
-            conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
+        let mut connections = self.connections.write().await;
+        let Some(conn) = connections.get_mut(node_id) else {
+            return CandidateSetApplyResult::PeerMissing;
+        };
+        let valid_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.parse::<SocketAddr>().is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        if valid_candidates.is_empty() {
+            conn.record_direct_event(
+                generation,
+                "candidates_empty",
+                None,
+                Some(candidates.len()),
+                None,
+                "ignored empty or entirely invalid signaled UDP candidate set",
+            );
+            return CandidateSetApplyResult::IgnoredEmpty;
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        if candidates_expires_at_ms.is_some_and(|expires_at| {
+            expires_at.saturating_add(CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS) <= now_ms
+        }) {
+            conn.record_direct_event(
+                generation,
+                "candidates_expired",
+                None,
+                Some(valid_candidates.len()),
+                None,
+                "ignored expired signaled UDP candidate set",
+            );
+            return CandidateSetApplyResult::IgnoredExpired;
+        }
+        if candidate_generation != 0 && candidate_generation <= conn.last_candidate_generation {
+            conn.record_direct_event(
+                generation,
+                "candidates_stale",
+                None,
+                Some(valid_candidates.len()),
+                None,
+                format!("ignored stale candidate generation {candidate_generation}"),
+            );
+            return CandidateSetApplyResult::IgnoredStale;
+        }
+        if candidate_generation != 0 {
+            conn.last_candidate_generation = candidate_generation;
+        }
+        conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
             let old_signaled_endpoint = conn.signaled_endpoint;
             let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
             let endpoint_was_previous_signaled = conn.endpoint.is_some_and(|endpoint| {
@@ -88,7 +108,7 @@ impl PeerManager {
 
             if endpoint_was_previous_signaled
                 && conn.endpoint.is_some_and(|endpoint| {
-                    !candidates
+                    !valid_candidates
                         .iter()
                         .any(|candidate| candidate == &endpoint.to_string())
                 })
@@ -99,9 +119,9 @@ impl PeerManager {
             // A current trickled signal is authoritative.  Keeping the node
             // registry's old endpoint forever causes port churn to accumulate
             // stale public targets and wastes each synchronized punch window.
-            if !candidates.is_empty() {
+            if !valid_candidates.is_empty() {
                 if let Some(endpoint) = old_signaled_endpoint {
-                    if !candidates
+                    if !valid_candidates
                         .iter()
                         .any(|candidate| candidate == &endpoint.to_string())
                     {
@@ -120,7 +140,7 @@ impl PeerManager {
                 }
             }
 
-            for c in candidates {
+            for c in &valid_candidates {
                 if !conn.candidates.contains(c) {
                     conn.candidates.push(c.clone());
                 }
@@ -138,16 +158,16 @@ impl PeerManager {
                 }
             }
 
-            if !candidates.is_empty() {
+            if !valid_candidates.is_empty() {
                 conn.record_direct_event(
                     generation,
                     "candidates_received",
                     None,
-                    Some(candidates.len()),
+                    Some(valid_candidates.len()),
                     None,
                     format!(
                         "received {} signaled UDP candidates with {} source labels",
-                        candidates.len(),
+                        valid_candidates.len(),
                         candidate_sources.len()
                     ),
                 );
@@ -159,7 +179,7 @@ impl PeerManager {
                     .iter()
                     .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
             }
-        }
+        CandidateSetApplyResult::Applied
     }
 
 }

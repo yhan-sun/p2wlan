@@ -13,7 +13,7 @@ use super::*;
 use crate::config::Config;
 use crate::control::PeerInfo;
 use crate::dataplane::DataPlane;
-use crate::peer::ConnectionState;
+use crate::peer::{ConnectionState, ProbeBindingStage, ProbeKeyRole};
 use crate::transport::WireGuardTransport;
 
 fn peer(node_id: &str, virtual_ip: &str, endpoint: Option<SocketAddr>) -> PeerInfo {

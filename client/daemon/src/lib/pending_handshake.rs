@@ -1,3 +1,33 @@
+#[derive(Clone)]
+struct CachedResponderHandshake {
+    handshake_init: Vec<u8>,
+    /// Static Noise/WireGuard public key authenticated by this initiation.
+    /// Cache replay is valid only while the node ID still maps to this key.
+    initiator_static_public_key: [u8; 32],
+    /// Canonicalized Probe-v2 public key from the request. This is part of the
+    /// offer fingerprint: the same WireGuard initiation and token must not
+    /// replay an answer derived from different Probe key material.
+    request_probe_ephemeral_public_key: Option<String>,
+    response_bytes: Vec<u8>,
+    transport_keys: TransportKeyPair,
+    response_probe_ephemeral_public_key: Option<String>,
+    probe_ephemeral_shared: Option<[u8; 32]>,
+    expires_at: Instant,
+}
+
+enum ResponderHandshakeCacheLookup {
+    Miss,
+    Hit(Box<CachedResponderHandshake>),
+    FingerprintMismatch,
+}
+
+fn normalize_probe_ephemeral_public_key(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 /// Shared pending-handshake state (timeout-safe).
 #[derive(Default)]
 struct PendingHandshakeState {
@@ -13,6 +43,10 @@ struct PendingHandshakeState {
     next_id: u64,
     /// Number of initiation attempts per peer (bounded retries).
     attempts: HashMap<String, u32>,
+    /// Exact responder answers keyed by `(peer, handshake token)`. Noise
+    /// responder messages are randomized, so duplicate offers must replay the
+    /// same bytes and key material rather than generate a second session.
+    responder_cache: HashMap<(String, String), CachedResponderHandshake>,
 }
 
 impl PendingHandshakeState {
@@ -89,9 +123,50 @@ impl PendingHandshakeState {
         self.remove(peer_id);
         self.cancel_reservation(peer_id);
         self.attempts.remove(peer_id);
+        self.responder_cache
+            .retain(|(cached_peer, _), _| cached_peer != peer_id);
     }
 
     fn is_current(&self, peer_id: &str, pending_id: u64) -> bool {
         self.pending_ids.get(peer_id).copied() == Some(pending_id)
+    }
+
+    fn responder_cache_lookup(
+        &mut self,
+        peer_id: &str,
+        token: &str,
+        handshake_init: &[u8],
+        request_probe_ephemeral_public_key: Option<&str>,
+        expected_initiator_static_public_key: &[u8; 32],
+    ) -> ResponderHandshakeCacheLookup {
+        let now = Instant::now();
+        self.responder_cache
+            .retain(|_, cached| cached.expires_at > now);
+        let key = (peer_id.to_string(), token.to_string());
+        let Some(cached) = self.responder_cache.get(&key) else {
+            return ResponderHandshakeCacheLookup::Miss;
+        };
+        let request_probe_ephemeral_public_key =
+            normalize_probe_ephemeral_public_key(request_probe_ephemeral_public_key);
+        if cached.handshake_init != handshake_init
+            || cached.request_probe_ephemeral_public_key != request_probe_ephemeral_public_key
+            || &cached.initiator_static_public_key != expected_initiator_static_public_key
+        {
+            return ResponderHandshakeCacheLookup::FingerprintMismatch;
+        }
+        ResponderHandshakeCacheLookup::Hit(Box::new(cached.clone()))
+    }
+
+    fn cache_responder_handshake(
+        &mut self,
+        peer_id: &str,
+        token: &str,
+        mut cached: CachedResponderHandshake,
+    ) {
+        cached.request_probe_ephemeral_public_key = normalize_probe_ephemeral_public_key(
+            cached.request_probe_ephemeral_public_key.as_deref(),
+        );
+        self.responder_cache
+            .insert((peer_id.to_string(), token.to_string()), cached);
     }
 }

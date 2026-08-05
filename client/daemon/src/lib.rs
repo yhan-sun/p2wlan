@@ -62,7 +62,7 @@ use crate::udp::estimate_remote_scatter_punch_deadline;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
@@ -70,24 +70,26 @@ use p2pnet_crypto::{DhKeyPair, NodeIdentity};
 use p2pnet_nat::{CandidateGatherReport, CandidateSource, MappingBehavior, NatProfile};
 use rand::RngCore;
 use tokio::net::{lookup_host, UdpSocket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
-    candidate_set_change_reason, candidate_set_hash, compact_volatile_public_signal_candidates,
+    candidate_refresh_requires_commit, candidate_set_change_reason, candidate_set_hash,
     control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
-    preserve_peer_reflexive_candidates, publish_local_candidates_to_known_peers,
-    run_udp_candidate_refresh, stable_network_candidate_signature, truncate_signal_candidates,
-    UdpCandidateRefreshContext,
+    prepare_signal_candidates_and_network_identity, publish_local_candidates_to_known_peers,
+    run_udp_candidate_refresh, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
-    candidate_refresh_requires_network_generation_advance, ipv4_mapped_octets, parse_first_ipv4,
+    candidate_refresh_requires_network_generation_advance,
+    compact_volatile_public_signal_candidates, ipv4_mapped_octets, parse_first_ipv4,
     parse_nat_pmp_mapping_response, parse_nat_pmp_public_address_response,
-    parse_pcp_mapping_response, should_update_stable_control_endpoint,
+    parse_pcp_mapping_response, preserve_peer_reflexive_candidates,
+    should_update_stable_control_endpoint, stable_network_candidate_signature,
+    truncate_signal_candidates,
 };
 #[cfg(test)]
 use control::RelayCatalogEntry;
@@ -101,11 +103,12 @@ use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMa
 use network_outbound::run_network_outbound;
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
-    HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportSession,
+    HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportKeyPair,
+    TransportSession,
 };
 use peer::{
-    ConnectionState, PeerManager, DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED,
-    REASON_HANDSHAKE_TIMEOUT,
+    CandidateSetApplyResult, ConnectionState, PeerManager, ProbeBindingStage,
+    DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT,
 };
 use port_mapping::PortMappingManager;
 #[cfg(test)]
@@ -118,14 +121,25 @@ use relay_runtime::{
 };
 #[cfg(test)]
 use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, RelayValidationPacket};
-use transport::{EncryptedPeerPacket, ReceivedEncryptedPacket, WireGuardTransport};
-use udp::{PeerReflexiveObservation, UdpTransport};
+#[cfg(test)]
+use transport::EncryptedPeerPacket;
+use transport::{
+    OrderedEncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionCommit,
+    ResponderSessionStage, WireGuardTransport,
+};
+use udp::{PeerReflexiveObservation, PunchSendReport, UdpTransport};
 
 include!("lib/pending_handshake.rs");
 /// Maximum number of handshake re-initiation attempts before giving up.
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
-/// Handshake timeout before pending entry is cleared.
-const HANDSHAKE_TIMEOUT_SECS: u64 = 90;
+/// Initial signaling should retry quickly; the independent background punch
+/// session can continue while a lost offer/answer is retried.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+/// Rekeys must retry several times before the old 180-second key lifetime ends.
+const REKEY_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Retain the exact responder answer/key material long enough to replay a
+/// duplicate offer idempotently instead of generating a second Noise session.
+const RESPONDER_HANDSHAKE_CACHE_TTL: Duration = Duration::from_secs(120);
 /// Short grace period for UDP/STUN/port-mapping candidates before WireGuard signaling.
 ///
 /// Startup traffic must be able to fall back to relay quickly.  Candidate
@@ -146,6 +160,10 @@ const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// STUN group plus the full predicted successor run. Air-like NATs can need
 /// the high-teens successor ports before a peer-reflexive path appears.
 const MAX_SIGNAL_CANDIDATES: usize = 96;
+/// Reserve a small part of the signaling budget for physical LAN host
+/// candidates. A hard-NAT prediction window can otherwise consume all 96
+/// entries and make same-LAN discovery impossible until a later refresh.
+const MAX_SIGNAL_LAN_HOST_CANDIDATES: usize = 8;
 /// A bounded public candidate group preserves ICE-style linear NAT coverage.
 ///
 /// Air-like linear symmetric NATs need the STUN group plus a predicted run
@@ -211,6 +229,20 @@ const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
 const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(8);
 const DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL: Duration = Duration::from_millis(50);
 const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
+/// Explicitly prove answer adoption even when a healthy Direct path suppresses
+/// the ordinary punch scheduler and no user traffic is flowing.
+const REKEY_CONFIRMATION_DELAYS: [Duration; 9] = [
+    Duration::ZERO,
+    Duration::from_millis(100),
+    Duration::from_millis(300),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+];
+const REKEY_CONFIRMATION_PAYLOAD: &[u8] = b"p2wlan-rekey-confirmation";
 /// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.

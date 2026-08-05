@@ -63,8 +63,11 @@ const BIRTHDAY_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 192;
 const BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 192;
 const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
 const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
-const BIRTHDAY_PROBE_WIDE_MAX_DELTA: i32 = 32_768;
-const BIRTHDAY_PROBE_WIDE_STRIDE: i32 = 251;
+const BIRTHDAY_PROBE_PORT_SPACE: usize = u16::MAX as usize;
+const BIRTHDAY_PROBE_WIDE_STRIDE: usize = 251;
+/// Stable/easy peers should spend the remote-scatter session cap on distinct
+/// remote ports instead of repeating every port from each local pool socket.
+const STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET: usize = 3_072;
 /// A peer can advertise a small set of authoritative public mappings when it
 /// uses a UDP socket pool.  That is still a stable remote role for a local
 /// hard NAT: keep one peer-specific binding warm toward the stable peer while
@@ -84,6 +87,48 @@ const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
 const PROBE_MAC_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 mac key";
 const PROBE_MAC_SESSION_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 session key";
 const PROBE_MAC_EPHEMERAL_SESSION_KEY_DOMAIN: &[u8] = b"p2wlan udp probe v2 ephemeral session key";
+const PROBE_SESSION_BINDING_OVERLAP: Duration = Duration::from_secs(90);
+/// Keep a responder Probe binding alive for the full wide NAT-scatter window.
+/// An authenticated Probe packet is also a WireGuard adoption proof, so this
+/// is deliberately longer than the 10-15s control-plane retry timers.
+const PENDING_PROBE_SESSION_BINDING_GRACE: Duration = Duration::from_secs(60);
+const MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeKeyRole {
+    Active,
+    Pending { token: String },
+    Previous,
+    Compatibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeKeyCandidate {
+    pub(crate) key: ProbeMacKey,
+    pub(crate) role: ProbeKeyRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeBindingStage {
+    Staged,
+    ReplayableDuplicate,
+    StaleDuplicate,
+    Busy,
+    PeerMissing,
+}
+
+/// Outcome of applying a versioned candidate signal from the control plane.
+///
+/// Callers use this to avoid starting a synchronized punch for a signal whose
+/// candidates were rejected before they changed any peer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSetApplyResult {
+    Applied,
+    IgnoredEmpty,
+    IgnoredStale,
+    IgnoredExpired,
+    PeerMissing,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeTargetMode {
@@ -122,6 +167,21 @@ impl ProbeTargetMode {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BirthdayProbePlan {
+    pub local_generation: u64,
+    pub stable_side_unique_scatter: bool,
+    pub bases: Vec<SocketAddr>,
+    pub public_ips: Vec<IpAddr>,
+    pub start_rank: usize,
+    pub end_rank: usize,
+    pub generated_candidates: usize,
+    pub selected_candidates: usize,
+    pub selected_birthday_candidates: usize,
+    pub unique_target_ports: usize,
+    pub wrapped: bool,
+}
+
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
 /// Stable reason code for direct path probe timeout/failure.
@@ -157,13 +217,14 @@ mod diagnostics;
 mod endpoint;
 mod probe_budget;
 mod types;
+use birthday::{
+    birthday_probe_endpoint_plan_for_bases_from_rank, birthday_probe_wide_rank_count,
+    peer_candidates_need_port_scatter, stable_public_ip_probe_plan_from_rank,
+};
 #[cfg(test)]
 use birthday::{
-    birthday_probe_endpoints, birthday_probe_endpoints_for_bases, birthday_probe_near_rank_count,
-};
-use birthday::{
-    birthday_probe_endpoints_for_bases_from_rank, birthday_probe_wide_rank_count,
-    peer_candidates_need_port_scatter,
+    birthday_probe_endpoints, birthday_probe_endpoints_for_bases,
+    birthday_probe_endpoints_for_bases_from_rank, birthday_probe_near_rank_count,
 };
 use candidate_ranking::{
     birthday_base_rank, candidate_pair_dynamic_probe_rank, candidate_pair_freshness_rank_at,
@@ -177,10 +238,11 @@ pub use diagnostics::{
     CandidatePairDiagnostics, CandidatePairSourceStats, DirectTraversalEventDiagnostics,
     PathHealthDiagnostics, PathSelectionEventDiagnostics, PeerDiagnostics, PeerManagerStats,
 };
+pub(crate) use endpoint::is_overlay_endpoint;
 use endpoint::{
     candidate_pair_failure_cooldown, candidate_pair_probe_due, candidate_pair_probe_rank_for_mode,
     classify_candidate_pair_path, classify_confirmed_direct_endpoint, endpoint_probe_rank,
-    is_low_latency_direct_endpoint, is_overlay_endpoint, is_public_probe_endpoint,
+    is_low_latency_direct_endpoint, is_public_probe_endpoint,
     should_retain_confirmed_direct_pair_on_candidate_refresh, should_retain_private_direct_pair,
 };
 #[cfg(test)]

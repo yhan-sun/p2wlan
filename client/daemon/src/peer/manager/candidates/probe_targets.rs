@@ -3,6 +3,8 @@ pub(crate) struct DirectProbeTargetSet {
     pub peer_id: String,
     pub candidates: Vec<SocketAddr>,
     pub remote_scatter_pool: bool,
+    pub stable_remote_scatter: bool,
+    pub birthday_plan: Option<BirthdayProbePlan>,
 }
 
 impl PeerManager {
@@ -57,7 +59,7 @@ impl PeerManager {
             conn.retire_speculative_pairs_when_direct_confirmed(generation);
             return None;
         }
-        let endpoints = conn.candidate_probe_endpoints(
+        let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
             generation,
             &history,
             local_nat_profile.as_ref(),
@@ -79,17 +81,23 @@ impl PeerManager {
         if endpoints.is_empty() {
             None
         } else {
+            let remote_scatter_pool = conn.candidate_targets_need_remote_scatter_pool(&endpoints);
             Some(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
-                remote_scatter_pool: conn.candidate_targets_need_remote_scatter_pool(&endpoints),
+                stable_remote_scatter: remote_scatter_pool
+                    && birthday_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.stable_side_unique_scatter),
+                remote_scatter_pool,
                 candidates: endpoints,
+                birthday_plan,
             })
         }
     }
 
-    /// Return stable public endpoints that a hard local NAT should continuously
-    /// probe with one socket while the easier peer scans this side's moving
-    /// public-port window.
+    /// Return the preferred stable public endpoint that every active local UDP
+    /// socket should continuously probe while the easier peer scans this side's
+    /// moving public-port window.
     pub async fn direct_nat_maintainer_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
         let generation = self.current_network_generation().await;
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
@@ -156,7 +164,7 @@ impl PeerManager {
                     }
                     return None;
                 }
-                let endpoints = conn.candidate_probe_endpoints(
+                let (endpoints, _) = conn.candidate_probe_endpoints(
                     generation,
                     &history,
                     local_nat_profile.as_ref(),
@@ -232,7 +240,7 @@ impl PeerManager {
                     }
                     return None;
                 }
-                let endpoints = conn.candidate_probe_endpoints(
+                let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
                     generation,
                     &history,
                     local_nat_profile.as_ref(),
@@ -259,15 +267,121 @@ impl PeerManager {
                             ),
                         );
                     }
+                    let remote_scatter_pool =
+                        conn.candidate_targets_need_remote_scatter_pool(&endpoints);
                     Some(DirectProbeTargetSet {
                         peer_id: conn.node_id.clone(),
-                        remote_scatter_pool: conn
-                            .candidate_targets_need_remote_scatter_pool(&endpoints),
+                        stable_remote_scatter: remote_scatter_pool
+                            && birthday_plan
+                                .as_ref()
+                                .is_some_and(|plan| plan.stable_side_unique_scatter),
+                        remote_scatter_pool,
                         candidates: endpoints,
+                        birthday_plan,
                     })
                 }
             })
             .collect()
+    }
+
+    pub(crate) async fn record_birthday_probe_plan_started(
+        &self,
+        node_id: &str,
+        plan: &BirthdayProbePlan,
+    ) {
+        let bases = plan
+            .bases
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let public_ips = plan
+            .public_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let detail = format!(
+            "generation={} stable_side={} public_ips={public_ips:?} bases={bases:?} start_rank={} end_rank={} wrapped={} generated_candidates={} selected_candidates={} selected_birthday_candidates={} unique_target_ports={}",
+            plan.local_generation,
+            plan.stable_side_unique_scatter,
+            plan.start_rank,
+            plan.end_rank,
+            plan.wrapped,
+            plan.generated_candidates,
+            plan.selected_candidates,
+            plan.selected_birthday_candidates,
+            plan.unique_target_ports,
+        );
+        self.record_direct_event(
+            node_id,
+            "birthday_probe_plan_started",
+            plan.bases.first().copied(),
+            Some(plan.selected_candidates),
+            None,
+            detail.clone(),
+        )
+        .await;
+        info!(
+            event = "birthday_probe_plan_started",
+            peer_id = %node_id,
+            network_generation = plan.local_generation,
+            stable_side = plan.stable_side_unique_scatter,
+            public_ips = ?public_ips,
+            bases = ?bases,
+            start_rank = plan.start_rank,
+            end_rank = plan.end_rank,
+            wrapped = plan.wrapped,
+            generated_candidates = plan.generated_candidates,
+            selected_candidates = plan.selected_candidates,
+            selected_birthday_candidates = plan.selected_birthday_candidates,
+            unique_target_ports = plan.unique_target_ports,
+            "birthday_probe_plan_started peer_id={} generation={} stable_side={} public_ips={:?} bases={:?} start_rank={} end_rank={} wrapped={} generated_candidates={} selected_candidates={} selected_birthday_candidates={} unique_target_ports={}",
+            node_id,
+            plan.local_generation,
+            plan.stable_side_unique_scatter,
+            public_ips,
+            bases,
+            plan.start_rank,
+            plan.end_rank,
+            plan.wrapped,
+            plan.generated_candidates,
+            plan.selected_candidates,
+            plan.selected_birthday_candidates,
+            plan.unique_target_ports,
+        );
+    }
+
+    pub(crate) async fn commit_birthday_probe_cursor(
+        &self,
+        node_id: &str,
+        plan: &BirthdayProbePlan,
+        covered_all_selected_candidates: bool,
+    ) -> bool {
+        if !plan.stable_side_unique_scatter
+            || !covered_all_selected_candidates
+            || plan.selected_birthday_candidates != plan.generated_candidates
+        {
+            return false;
+        }
+        let generation = self.current_network_generation().await;
+        if generation != plan.local_generation {
+            return false;
+        }
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        let current_endpoints = conn.probe_candidate_endpoints();
+        let current_bases = conn.birthday_probe_bases(&current_endpoints, generation);
+        let mut current_public_ips = current_bases
+            .iter()
+            .map(|base| base.ip())
+            .collect::<Vec<_>>();
+        current_public_ips.sort_unstable();
+        current_public_ips.dedup();
+        if current_public_ips != plan.public_ips {
+            return false;
+        }
+        conn.commit_birthday_probe_cursor(plan.start_rank, plan.end_rank)
     }
 
     /// Record that a UDP probe datagram was actually sent to a candidate.

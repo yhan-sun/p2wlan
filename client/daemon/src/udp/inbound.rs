@@ -1,4 +1,30 @@
 impl UdpTransport {
+    /// Commit a modern responder handshake transaction from an authenticated
+    /// pending Probe-v2 packet. WireGuard is promoted first; Probe is only
+    /// promoted for the same exact token after that succeeds.
+    async fn confirm_pending_probe_adoption(&self, peer_id: &str, token: &str) -> bool {
+        let Some(wireguard) = self.wireguard_transport.as_ref() else {
+            return false;
+        };
+        if !self
+            .peers
+            .confirm_probe_and_transport_transaction(peer_id, token, || async {
+                matches!(
+                    wireguard.confirm_responder_session(peer_id, token).await,
+                    ResponderSessionConfirmation::Promoted
+                        | ResponderSessionConfirmation::AlreadyActive
+                )
+            })
+            .await
+        {
+            return false;
+        }
+        wireguard
+            .acknowledge_promoted_responder_token(peer_id, token)
+            .await;
+        true
+    }
+
     /// Receive encrypted UDP datagrams until the socket or channel closes.
     pub async fn run_inbound(
         self,
@@ -112,11 +138,11 @@ impl UdpTransport {
                     );
                     continue;
                 }
-                let keys = self
+                let key_candidates = self
                     .peers
-                    .probe_keys_for_peer(&identity.source_node_id)
+                    .probe_key_candidates_for_peer(&identity.source_node_id)
                     .await;
-                if keys.is_empty() {
+                if key_candidates.is_empty() {
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.authenticated_probe_no_key =
                             metrics.authenticated_probe_no_key.saturating_add(1)
@@ -128,8 +154,9 @@ impl UdpTransport {
                     );
                     continue;
                 }
-                let Some((packet, key)) = keys.into_iter().find_map(|key| {
-                    decode_authenticated_punch_packet(data, &key).map(|packet| (packet, key))
+                let Some((packet, key_candidate)) = key_candidates.into_iter().find_map(|candidate| {
+                    decode_authenticated_punch_packet(data, &candidate.key)
+                        .map(|packet| (packet, candidate))
                 }) else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.authenticated_probe_invalid_mac =
@@ -142,13 +169,20 @@ impl UdpTransport {
                     );
                     continue;
                 };
+                let pending_token = match &key_candidate.role {
+                    ProbeKeyRole::Pending { token } => Some(token.clone()),
+                    _ => None,
+                };
+                let key = key_candidate.key;
 
                 match packet.kind {
                     PunchPacketKind::Punch => {
+                        let punch_generation =
+                            packet.generation.unwrap_or(identity.generation);
                         match self
                             .admit_authenticated_punch(
                                 &identity.source_node_id,
-                                packet.generation.unwrap_or(identity.generation),
+                                punch_generation,
                                 packet.kind,
                                 packet.nonce,
                                 source,
@@ -156,6 +190,33 @@ impl UdpTransport {
                             .await
                         {
                             AuthenticatedPunchAdmission::Accepted => {
+                                if let Some(token) = pending_token.as_deref() {
+                                    if self
+                                        .confirm_pending_probe_adoption(
+                                            &identity.source_node_id,
+                                            token,
+                                        )
+                                        .await
+                                    {
+                                        debug!(
+                                            "Promoted matching WireGuard and Probe v2 bindings for peer {} after accepted authenticated punch",
+                                            identity.source_node_id
+                                        );
+                                    } else {
+                                        self.rollback_authenticated_punch_replay_admission(
+                                            &identity.source_node_id,
+                                            punch_generation,
+                                            packet.kind,
+                                            packet.nonce,
+                                        )
+                                        .await;
+                                        debug!(
+                                            "Ignored accepted pending Probe v2 punch from {}; matching WireGuard/Probe transaction is unavailable",
+                                            identity.source_node_id
+                                        );
+                                        continue;
+                                    }
+                                }
                                 self.update_socket_diagnostics(socket_index, |metrics| {
                                     metrics.authenticated_probe_punches_received = metrics
                                         .authenticated_probe_punches_received
@@ -164,6 +225,20 @@ impl UdpTransport {
                                 .await;
                             }
                             AuthenticatedPunchAdmission::Replay => {
+                                if pending_token.is_some() {
+                                    // A replay that still authenticated only
+                                    // as Pending means the original Accepted
+                                    // packet did not finish the matching WG +
+                                    // Probe transaction. ACKing it would let
+                                    // the sender infer Direct success even
+                                    // though this side deliberately refused
+                                    // adoption.
+                                    debug!(
+                                        "Ignored replayed pending Probe v2 punch from peer {} at {}; transaction is not active",
+                                        identity.source_node_id, source
+                                    );
+                                    continue;
+                                }
                                 let generation = self.peers.current_network_generation().await;
                                 let ack = build_authenticated_punch_ack(
                                     packet.nonce,
@@ -300,21 +375,43 @@ impl UdpTransport {
                                             == Some(identity.source_node_id.as_str())
                                         && pending.accepts_authenticated_ack
                                 })
-                                .map(|pending| {
-                                    (
-                                        pending.sent_at.elapsed(),
-                                        pending.generation,
-                                        pending.local_endpoint,
-                                        pending.purpose,
-                                    )
-                                });
+                                .cloned();
                             if matched.is_some() {
                                 pending_probes.remove(&packet.nonce);
                             }
                             matched
                         };
 
-                        if let Some((latency, generation, local_endpoint, purpose)) = ack_match {
+                        if let Some(pending) = ack_match {
+                            if let Some(token) = pending_token.as_deref() {
+                                if self
+                                    .confirm_pending_probe_adoption(
+                                        &identity.source_node_id,
+                                        token,
+                                    )
+                                    .await
+                                {
+                                    debug!(
+                                        "Promoted matching WireGuard and Probe v2 bindings for peer {} after matched authenticated ACK",
+                                        identity.source_node_id
+                                    );
+                                } else {
+                                    debug!(
+                                        "Ignored matched pending Probe v2 ACK from {}; matching WireGuard/Probe transaction is unavailable",
+                                        identity.source_node_id
+                                    );
+                                    self.pending_probes
+                                        .lock()
+                                        .await
+                                        .entry(packet.nonce)
+                                        .or_insert(pending);
+                                    continue;
+                                }
+                            }
+                            let latency = pending.sent_at.elapsed();
+                            let generation = pending.generation;
+                            let local_endpoint = pending.local_endpoint;
+                            let purpose = pending.purpose;
                             self.update_socket_diagnostics(socket_index, |metrics| {
                                 metrics.probe_acks_received += 1
                             })

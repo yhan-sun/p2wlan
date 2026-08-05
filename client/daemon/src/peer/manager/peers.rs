@@ -1,3 +1,68 @@
+fn normalize_probe_session_id(session_id: Option<String>) -> Option<String> {
+    session_id.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn prune_probe_session_bindings(conn: &mut PeerConnection, now: Instant) {
+    conn.pending_probe_bindings
+        .retain(|_, pending| pending.expires_at > now);
+    if conn
+        .previous_probe_binding
+        .as_ref()
+        .is_some_and(|previous| previous.expires_at <= now)
+    {
+        conn.previous_probe_binding = None;
+    }
+}
+
+fn install_active_probe_binding(
+    conn: &mut PeerConnection,
+    binding: ProbeSessionBinding,
+    retain_previous: bool,
+) -> bool {
+    let previous = active_probe_binding(conn);
+    let replaced = previous != binding;
+    if retain_previous && replaced {
+        conn.previous_probe_binding = Some(RetainedProbeSessionBinding {
+            binding: previous,
+            expires_at: Instant::now() + PROBE_SESSION_BINDING_OVERLAP,
+        });
+    } else if !retain_previous {
+        conn.previous_probe_binding = None;
+    }
+    conn.probe_binding_token = binding.token.clone();
+    conn.probe_session_id = binding.session_id.clone();
+    conn.probe_ephemeral_shared = binding.ephemeral_shared;
+    conn.pending_probe_bindings.clear();
+    replaced
+}
+
+fn push_unique_probe_key(
+    candidates: &mut Vec<ProbeKeyCandidate>,
+    key: ProbeMacKey,
+    role: ProbeKeyRole,
+) {
+    if !candidates.iter().any(|candidate| candidate.key == key) {
+        candidates.push(ProbeKeyCandidate { key, role });
+    }
+}
+
+fn push_probe_binding_compatibility_keys(
+    candidates: &mut Vec<ProbeKeyCandidate>,
+    base_key: ProbeMacKey,
+    binding: &ProbeSessionBinding,
+) {
+    if let Some(session_id) = binding.session_id.as_deref() {
+        push_unique_probe_key(
+            candidates,
+            derive_session_probe_mac_key(&base_key, session_id),
+            ProbeKeyRole::Compatibility,
+        );
+    }
+}
+
 impl PeerManager {
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
@@ -70,6 +135,9 @@ impl PeerManager {
             conn.relay_server = None;
             conn.probe_session_id = None;
             conn.probe_ephemeral_shared = None;
+            conn.probe_binding_token = None;
+            conn.pending_probe_bindings.clear();
+            conn.previous_probe_binding = None;
         } else if conn.state == ConnectionState::Closed {
             conn.transition(ConnectionState::Idle);
         }
@@ -166,19 +234,21 @@ impl PeerManager {
 
     /// Set the explicit control-plane session ID used to bind Probe v2 MAC keys.
     pub async fn set_probe_session_id(&self, node_id: &str, session_id: Option<String>) -> bool {
-        let normalized = session_id.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
+        let normalized = normalize_probe_session_id(session_id);
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
-        if conn.probe_session_id == normalized {
-            return true;
-        }
-        conn.probe_session_id = normalized;
-        conn.probe_ephemeral_shared = None;
+        conn.pending_probe_bindings.clear();
+        install_active_probe_binding(
+            conn,
+            ProbeSessionBinding {
+                token: None,
+                session_id: normalized,
+                ephemeral_shared: None,
+            },
+            false,
+        );
         true
     }
 
@@ -189,16 +259,204 @@ impl PeerManager {
         session_id: Option<String>,
         ephemeral_shared: Option<[u8; 32]>,
     ) -> bool {
-        let normalized = session_id.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
+        let normalized = normalize_probe_session_id(session_id);
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
-        conn.probe_session_id = normalized;
-        conn.probe_ephemeral_shared = ephemeral_shared;
+        conn.pending_probe_bindings.clear();
+        install_active_probe_binding(
+            conn,
+            ProbeSessionBinding {
+                token: None,
+                session_id: normalized,
+                ephemeral_shared,
+            },
+            false,
+        );
+        true
+    }
+
+    /// Stage a Probe-v2 replacement without changing the outbound key. A
+    /// responder marks its staged key promotable by authenticated inbound
+    /// traffic; an initiator waits for the matching answer and installs it
+    /// explicitly.
+    pub(crate) async fn stage_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: String,
+        session_id: Option<String>,
+        ephemeral_shared: Option<[u8; 32]>,
+        promote_on_match: bool,
+    ) -> ProbeBindingStage {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return ProbeBindingStage::StaleDuplicate;
+        }
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return ProbeBindingStage::PeerMissing;
+        };
+        let now = Instant::now();
+        prune_probe_session_bindings(conn, now);
+        if conn.probe_binding_token.as_deref() == Some(token.as_str()) {
+            return ProbeBindingStage::ReplayableDuplicate;
+        }
+        if let Some(pending) = conn.pending_probe_bindings.get_mut(&token) {
+            // An exact cached answer replay gets a fresh delivery window.
+            pending.expires_at = now + PENDING_PROBE_SESSION_BINDING_GRACE;
+            return ProbeBindingStage::ReplayableDuplicate;
+        }
+        if conn
+            .previous_probe_binding
+            .as_ref()
+            .and_then(|previous| previous.binding.token.as_deref())
+            == Some(token.as_str())
+        {
+            return ProbeBindingStage::StaleDuplicate;
+        }
+        if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
+            return ProbeBindingStage::Busy;
+        }
+        conn.pending_probe_bindings.insert(token.clone(), PendingProbeSessionBinding {
+            binding: ProbeSessionBinding {
+                token: Some(token),
+                session_id: normalize_probe_session_id(session_id),
+                ephemeral_shared,
+            },
+            expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
+            promote_on_match,
+        });
+        ProbeBindingStage::Staged
+    }
+
+    /// Extend a staged responder binding after the control-plane answer
+    /// delivery attempt completes. This keeps signaling latency separate from
+    /// the authenticated adoption window.
+    pub(crate) async fn refresh_pending_probe_session_binding_grace(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> bool {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        let Some(pending) = conn.pending_probe_bindings.get_mut(token) else {
+            return false;
+        };
+        pending.expires_at = Instant::now() + PENDING_PROBE_SESSION_BINDING_GRACE;
+        true
+    }
+
+    /// Install an answer-confirmed Probe-v2 binding for outbound traffic while
+    /// retaining the former inbound key during the overlap window.
+    pub(crate) async fn install_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: String,
+        session_id: Option<String>,
+        ephemeral_shared: Option<[u8; 32]>,
+    ) -> bool {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        prune_probe_session_bindings(conn, Instant::now());
+        install_active_probe_binding(
+            conn,
+            ProbeSessionBinding {
+                token: Some(token),
+                session_id: normalize_probe_session_id(session_id),
+                ephemeral_shared,
+            },
+            true,
+        );
+        true
+    }
+
+    /// Roll back an unpublished Probe-v2 replacement. Returns false when the
+    /// token was already promoted by authenticated traffic.
+    pub(crate) async fn discard_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> bool {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return true;
+        };
+        prune_probe_session_bindings(conn, Instant::now());
+        if conn.probe_binding_token.as_deref() == Some(token) {
+            return false;
+        }
+        conn.pending_probe_bindings.remove(token);
+        true
+    }
+
+    /// Promote a responder's staged Probe-v2 binding after a packet validates
+    /// under that exact key and token.
+    pub(crate) async fn confirm_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> bool {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        let should_promote = conn
+            .pending_probe_bindings
+            .get(token)
+            .is_some_and(|pending| pending.promote_on_match);
+        if !should_promote {
+            return conn.probe_binding_token.as_deref() == Some(token);
+        }
+        let pending = conn
+            .pending_probe_bindings
+            .remove(token)
+            .expect("pending Probe binding checked above");
+        install_active_probe_binding(conn, pending.binding, true);
+        true
+    }
+
+    /// Atomically bridge a Probe-v2 adoption check with its matching
+    /// WireGuard responder confirmation. The peer binding write lock remains
+    /// held across `confirm_transport`, so peer removal, identity rotation,
+    /// and competing handshake commits cannot clear the Probe transaction
+    /// after WireGuard has already been promoted.
+    pub(crate) async fn confirm_probe_and_transport_transaction<F, Fut>(
+        &self,
+        node_id: &str,
+        token: &str,
+        confirm_transport: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        let should_promote = conn
+            .pending_probe_bindings
+            .get(token)
+            .is_some_and(|pending| pending.promote_on_match);
+        let already_active = conn.probe_binding_token.as_deref() == Some(token);
+        if !should_promote && !already_active {
+            return false;
+        }
+        if !confirm_transport().await {
+            return false;
+        }
+        if should_promote {
+            let pending = conn
+                .pending_probe_bindings
+                .remove(token)
+                .expect("promotable Probe binding checked above");
+            install_active_probe_binding(conn, pending.binding, true);
+        }
         true
     }
 
@@ -214,32 +472,88 @@ impl PeerManager {
             .and_then(effective_probe_mac_key)
     }
 
+    /// Return role-tagged Probe-v2 keys for inbound authentication. Only an
+    /// exact match on a promotable pending key can commit a responder rekey.
+    pub(crate) async fn probe_key_candidates_for_peer(
+        &self,
+        node_id: &str,
+    ) -> Vec<ProbeKeyCandidate> {
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Vec::new();
+        };
+        prune_probe_session_bindings(conn, Instant::now());
+        let Some(base_key) = conn.probe_mac_key else {
+            return Vec::new();
+        };
+
+        let active = active_probe_binding(conn);
+        let pending = conn.pending_probe_bindings.clone();
+        let previous = conn.previous_probe_binding.clone();
+        let mut candidates = Vec::new();
+        push_unique_probe_key(
+            &mut candidates,
+            probe_mac_key_for_binding(base_key, &active),
+            ProbeKeyRole::Active,
+        );
+        for pending in pending.values() {
+            let role = if pending.promote_on_match {
+                ProbeKeyRole::Pending {
+                    token: pending
+                        .binding
+                        .token
+                        .clone()
+                        .expect("staged Probe binding must have a token"),
+                }
+            } else {
+                ProbeKeyRole::Compatibility
+            };
+            push_unique_probe_key(
+                &mut candidates,
+                probe_mac_key_for_binding(base_key, &pending.binding),
+                role,
+            );
+        }
+        if let Some(previous) = previous.as_ref() {
+            push_unique_probe_key(
+                &mut candidates,
+                probe_mac_key_for_binding(base_key, &previous.binding),
+                ProbeKeyRole::Previous,
+            );
+        }
+        push_probe_binding_compatibility_keys(&mut candidates, base_key, &active);
+        for pending in pending.values() {
+            push_probe_binding_compatibility_keys(
+                &mut candidates,
+                base_key,
+                &pending.binding,
+            );
+        }
+        if let Some(previous) = previous.as_ref() {
+            push_probe_binding_compatibility_keys(
+                &mut candidates,
+                base_key,
+                &previous.binding,
+            );
+        }
+        push_unique_probe_key(
+            &mut candidates,
+            base_key,
+            ProbeKeyRole::Compatibility,
+        );
+        candidates
+    }
+
     /// Return Probe v2 MAC keys to try for inbound compatibility.
     ///
     /// The strongest key is first.  When a session ID is active, weaker
     /// session/static fallbacks are retained so upgraded peers can still receive
     /// probes from older clients or from signals relayed by older control servers.
     pub async fn probe_keys_for_peer(&self, node_id: &str) -> Vec<ProbeMacKey> {
-        let Some(conn) = self.connections.read().await.get(node_id).cloned() else {
-            return Vec::new();
-        };
-        let mut keys = Vec::new();
-        if let Some(key) = effective_probe_mac_key(&conn) {
-            keys.push(key);
-        }
-        if conn.probe_session_id.is_some() {
-            if let Some(base_key) = conn.probe_mac_key {
-                if let Some(session_id) = conn.probe_session_id.as_deref() {
-                    let session_key = derive_session_probe_mac_key(&base_key, session_id);
-                    if !keys.contains(&session_key) {
-                        keys.push(session_key);
-                    }
-                }
-                if !keys.contains(&base_key) {
-                    keys.push(base_key);
-                }
-            }
-        }
-        keys
+        self.probe_key_candidates_for_peer(node_id)
+            .await
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect()
     }
 }

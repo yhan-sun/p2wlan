@@ -1,4 +1,12 @@
 impl PeerConnection {
+    fn commit_birthday_probe_cursor(&mut self, start_rank: usize, end_rank: usize) -> bool {
+        if self.birthday_probe_cursor != start_rank {
+            return false;
+        }
+        self.birthday_probe_cursor = end_rank % birthday_probe_wide_rank_count();
+        true
+    }
+
     fn candidate_endpoints(&self) -> Vec<SocketAddr> {
         let mut endpoints = Vec::new();
         for candidate in &self.candidates {
@@ -250,21 +258,24 @@ impl PeerConnection {
         history: &TraversalHistory,
         local_nat_profile: Option<&NatProfile>,
         mode: ProbeTargetMode,
-    ) -> Vec<SocketAddr> {
+    ) -> (Vec<SocketAddr>, Option<BirthdayProbePlan>) {
         self.ensure_current_candidate_pairs(local_generation);
         let use_asymmetric_stable_role =
             self.should_use_asymmetric_stable_remote_role(local_nat_profile);
+        let stable_side_unique_scatter =
+            self.should_use_stable_side_unique_scatter(local_nat_profile);
         let mut endpoints = if use_asymmetric_stable_role {
             self.asymmetric_stable_remote_endpoints(local_generation)
         } else {
             self.probe_candidate_endpoints()
         };
-        self.ensure_birthday_candidate_pairs(
+        let mut birthday_plan = self.ensure_birthday_candidate_pairs(
             local_generation,
             history,
             local_nat_profile,
             mode.allows_local_nat_birthday() && !use_asymmetric_stable_role,
             mode.allows_failed_prediction_fallback() && !use_asymmetric_stable_role,
+            stable_side_unique_scatter,
             &mut endpoints,
         );
         self.prune_candidate_pairs_outside_targets(local_generation, &endpoints);
@@ -335,10 +346,35 @@ impl PeerConnection {
                 })
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
-        apply_adaptive_probe_budgets(pairs, &source_stats, history, mode)
-            .into_iter()
-            .map(|pair| pair.remote_endpoint)
-            .collect()
+        let endpoints = apply_adaptive_probe_budgets(
+            pairs,
+            &source_stats,
+            history,
+            mode,
+            birthday_plan
+                .as_ref()
+                .filter(|plan| plan.stable_side_unique_scatter)
+                .map(|plan| plan.generated_candidates),
+        )
+        .into_iter()
+        .map(|pair| pair.remote_endpoint)
+        .collect::<Vec<_>>();
+        let selected_birthday_candidates = endpoints
+            .iter()
+            .filter(|endpoint| {
+                self.candidate_source_for_endpoint(**endpoint) == CandidatePairSource::Birthday
+            })
+            .count();
+        if let Some(plan) = birthday_plan.as_mut() {
+            plan.selected_candidates = endpoints.len();
+            plan.selected_birthday_candidates = selected_birthday_candidates;
+            plan.unique_target_ports = endpoints
+                .iter()
+                .map(|endpoint| endpoint.port())
+                .collect::<HashSet<_>>()
+                .len();
+        }
+        (endpoints, birthday_plan)
     }
 
     /// A mapping-dependent local NAT should create only a few mappings toward
@@ -358,6 +394,27 @@ impl PeerConnection {
         !public_endpoints.is_empty()
             && !self.has_explicit_predicted_window()
             && public_endpoints_fit_stable_socket_pool(&public_endpoints)
+    }
+
+    fn should_use_stable_side_unique_scatter(
+        &self,
+        local_nat_profile: Option<&NatProfile>,
+    ) -> bool {
+        let local_is_stable = local_nat_profile.is_some_and(|profile| {
+            !profile.udp_blocked
+                && profile.public_ip_stable == Some(true)
+                && profile.public_port_stable == Some(true)
+                && matches!(
+                    profile.mapping_behavior,
+                    MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent
+                )
+        });
+        if !local_is_stable {
+            return false;
+        }
+
+        self.has_explicit_predicted_window()
+            || self.candidate_targets_need_remote_scatter_pool(&self.probe_candidate_endpoints())
     }
 
     /// Widened trigger for the NAT-state binding maintainer.
@@ -470,6 +527,7 @@ impl PeerConnection {
         endpoints
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ensure_birthday_candidate_pairs(
         &mut self,
         local_generation: u64,
@@ -477,8 +535,9 @@ impl PeerConnection {
         local_nat_profile: Option<&NatProfile>,
         allow_local_nat_trigger: bool,
         allow_failed_prediction_fallback: bool,
+        stable_side_unique_scatter: bool,
         endpoints: &mut Vec<SocketAddr>,
-    ) {
+    ) -> Option<BirthdayProbePlan> {
         let bases = self.birthday_probe_bases(endpoints, local_generation);
 
         let has_explicit_predicted_window = self.has_explicit_predicted_window();
@@ -499,32 +558,59 @@ impl PeerConnection {
         let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases)
             && (!has_explicit_predicted_window || failed_prediction_fallback);
         if !local_needs_birthday && !peer_looks_port_dependent {
-            return;
+            return None;
         }
 
         let per_base_budget = birthday_probe_budget(history);
-        let budget =
-            per_base_budget.saturating_mul(bases.len().min(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE));
+        let budget = if stable_side_unique_scatter {
+            STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET.saturating_sub(endpoints.len())
+        } else {
+            per_base_budget.saturating_mul(bases.len().min(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE))
+        };
         if budget == 0 {
-            return;
+            return None;
         }
 
         let mut generated = 0usize;
-        let rotation_start_rank = self
-            .candidate_pairs
-            .iter()
-            .filter(|pair| {
-                pair.local_generation == local_generation
-                    && pair.source == CandidatePairSource::Birthday
-            })
-            .map(|pair| pair.probe_count as usize)
-            .min()
-            .unwrap_or(0)
-            .saturating_mul(per_base_budget)
-            % birthday_probe_wide_rank_count();
-        for endpoint in
-            birthday_probe_endpoints_for_bases_from_rank(&bases, budget, rotation_start_rank)
-        {
+        let mut public_ips = bases.iter().map(|base| base.ip()).collect::<Vec<_>>();
+        public_ips.sort_unstable();
+        public_ips.dedup();
+        if stable_side_unique_scatter && public_ips.is_empty() {
+            return None;
+        }
+        let rotation_start_rank = if stable_side_unique_scatter {
+            self.birthday_probe_cursor % birthday_probe_wide_rank_count()
+        } else {
+            self.candidate_pairs
+                .iter()
+                .filter(|pair| {
+                    pair.local_generation == local_generation
+                        && pair.source == CandidatePairSource::Birthday
+                })
+                .map(|pair| pair.probe_count as usize)
+                .min()
+                .unwrap_or(0)
+                .saturating_mul(per_base_budget)
+                % birthday_probe_wide_rank_count()
+        };
+        let endpoint_plan = if stable_side_unique_scatter {
+            stable_public_ip_probe_plan_from_rank(
+                &public_ips,
+                budget,
+                rotation_start_rank,
+                &endpoints.iter().copied().collect(),
+            )
+        } else {
+            birthday_probe_endpoint_plan_for_bases_from_rank(
+                &bases,
+                budget,
+                rotation_start_rank,
+                true,
+            )
+        };
+        let plan_end_rank = endpoint_plan.next_rank;
+        let plan_wrapped = endpoint_plan.wrapped;
+        for endpoint in endpoint_plan.endpoints {
             if endpoints.contains(&endpoint) {
                 continue;
             }
@@ -536,9 +622,22 @@ impl PeerConnection {
             );
             generated += 1;
             if generated >= budget {
-                return;
+                break;
             }
         }
+        Some(BirthdayProbePlan {
+            local_generation,
+            stable_side_unique_scatter,
+            bases,
+            public_ips,
+            start_rank: rotation_start_rank,
+            end_rank: plan_end_rank,
+            generated_candidates: generated,
+            selected_candidates: 0,
+            selected_birthday_candidates: 0,
+            unique_target_ports: 0,
+            wrapped: plan_wrapped,
+        })
     }
 
     fn birthday_probe_bases(

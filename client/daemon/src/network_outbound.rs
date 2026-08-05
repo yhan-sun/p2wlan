@@ -13,7 +13,7 @@ use crate::peer::{
     NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED, REASON_PATH_DIRECT_TRIAL,
 };
 use crate::relay::RelayTransport;
-use crate::transport::EncryptedPeerPacket;
+use crate::transport::{EncryptedPeerPacket, OrderedEncryptedPeerPacket};
 use crate::udp::UdpTransport;
 
 const OUTBOUND_RETRY_TTL: Duration = Duration::from_secs(3);
@@ -54,7 +54,7 @@ impl RetryableOutboundFailure {
 }
 
 pub(super) async fn run_network_outbound(
-    mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>,
+    mut encrypted_rx: mpsc::Receiver<OrderedEncryptedPeerPacket>,
     peers: Arc<PeerManager>,
     prefer_direct: bool,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,

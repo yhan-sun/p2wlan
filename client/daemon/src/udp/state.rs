@@ -5,7 +5,8 @@ type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 type PeerReflexiveNotificationState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
 type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr, usize), Instant>>>;
-type NatMaintainerState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
+type NatMaintainerKey = (String, SocketAddr, usize);
+type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease>>>;
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
@@ -44,6 +45,72 @@ const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
 /// burst. The primary socket still uses the complete configured observer set
 /// for NAT profiling.
 const SOCKET_POOL_STUN_OBSERVERS_PER_SOCKET: usize = 2;
+
+#[derive(Debug, Clone)]
+struct NatMaintainerLease {
+    expires_at: Instant,
+    worker_token: Arc<()>,
+}
+
+impl NatMaintainerLease {
+    fn new(expires_at: Instant) -> Self {
+        Self {
+            expires_at,
+            worker_token: Arc::new(()),
+        }
+    }
+
+    fn renew_until(&mut self, expires_at: Instant) {
+        self.expires_at = self.expires_at.max(expires_at);
+    }
+
+    fn is_owned_by(&self, worker_token: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.worker_token, worker_token)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NatMaintainerLeaseStatus {
+    Active(Instant),
+    Expired,
+    Replaced,
+}
+
+fn nat_maintainer_lease_status(
+    maintainers: &mut HashMap<NatMaintainerKey, NatMaintainerLease>,
+    key: &NatMaintainerKey,
+    worker_token: &Arc<()>,
+    now: Instant,
+) -> NatMaintainerLeaseStatus {
+    let Some(lease) = maintainers.get(key) else {
+        return NatMaintainerLeaseStatus::Replaced;
+    };
+    if !lease.is_owned_by(worker_token) {
+        return NatMaintainerLeaseStatus::Replaced;
+    }
+    if lease.expires_at > now {
+        return NatMaintainerLeaseStatus::Active(lease.expires_at);
+    }
+
+    maintainers.remove(key);
+    NatMaintainerLeaseStatus::Expired
+}
+
+fn remove_nat_maintainer_lease_if_owned(
+    maintainers: &mut HashMap<NatMaintainerKey, NatMaintainerLease>,
+    key: &NatMaintainerKey,
+    worker_token: &Arc<()>,
+) -> bool {
+    if !maintainers
+        .get(key)
+        .is_some_and(|lease| lease.is_owned_by(worker_token))
+    {
+        return false;
+    }
+
+    maintainers.remove(key);
+    true
+}
 
 /// Estimate the hard deadline for a wide remote-scatter punch session.
 ///
@@ -86,7 +153,7 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub socket_index: usize,
     /// Successful UDP punch probes sent from this socket.
     pub probes_sent: u64,
-    /// Single-socket NAT-state maintainer probes sent from this socket.
+    /// Pool-aware NAT-state maintainer probes sent from this socket.
     pub nat_maintainer_probes_sent: u64,
     /// NAT-state maintainer probes skipped by the outbound admission budget.
     pub nat_maintainer_probe_skips: u64,
@@ -165,6 +232,7 @@ enum PendingProbePurpose {
 enum PunchSocketPolicy {
     ActivePool,
     RemoteScatterPool,
+    StableUniqueScatter,
     PrimaryOnly,
 }
 
@@ -173,6 +241,7 @@ impl PunchSocketPolicy {
         match self {
             Self::ActivePool => transport.punch_socket_count(),
             Self::RemoteScatterPool => transport.socket_count(),
+            Self::StableUniqueScatter => 1,
             Self::PrimaryOnly => 1,
         }
     }
@@ -181,9 +250,16 @@ impl PunchSocketPolicy {
         match self {
             Self::ActivePool => "active_pool",
             Self::RemoteScatterPool => "remote_scatter_pool",
+            Self::StableUniqueScatter => "stable_unique_scatter",
             Self::PrimaryOnly => "primary_only",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PunchSendReport {
+    pub packets_sent: u32,
+    pub unique_target_endpoints: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

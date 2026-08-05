@@ -58,15 +58,30 @@ fn derive_ephemeral_session_probe_mac_key(
     hmac(base_key, &input)
 }
 
-fn effective_probe_mac_key(conn: &PeerConnection) -> Option<ProbeMacKey> {
-    let base_key = conn.probe_mac_key?;
-    Some(match conn.probe_session_id.as_deref() {
-        Some(session_id) if !session_id.is_empty() => match conn.probe_ephemeral_shared.as_ref() {
+fn probe_mac_key_for_binding(
+    base_key: ProbeMacKey,
+    binding: &ProbeSessionBinding,
+) -> ProbeMacKey {
+    match binding.session_id.as_deref() {
+        Some(session_id) if !session_id.is_empty() => match binding.ephemeral_shared.as_ref() {
             Some(shared) => derive_ephemeral_session_probe_mac_key(&base_key, session_id, shared),
             None => derive_session_probe_mac_key(&base_key, session_id),
         },
         _ => base_key,
-    })
+    }
+}
+
+fn active_probe_binding(conn: &PeerConnection) -> ProbeSessionBinding {
+    ProbeSessionBinding {
+        token: conn.probe_binding_token.clone(),
+        session_id: conn.probe_session_id.clone(),
+        ephemeral_shared: conn.probe_ephemeral_shared,
+    }
+}
+
+fn effective_probe_mac_key(conn: &PeerConnection) -> Option<ProbeMacKey> {
+    let base_key = conn.probe_mac_key?;
+    Some(probe_mac_key_for_binding(base_key, &active_probe_binding(conn)))
 }
 
 fn probe_key_type(conn: &PeerConnection) -> &'static str {

@@ -8,6 +8,7 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) local_candidates: Arc<RwLock<Vec<String>>>,
     pub(super) local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     pub(super) local_network_identity: Arc<RwLock<Vec<String>>>,
+    pub(super) candidate_refresh_lock: Arc<Mutex<()>>,
     pub(super) nat_profile: Arc<RwLock<Option<NatProfile>>>,
     pub(super) gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
     pub(super) gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
@@ -29,6 +30,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         local_candidates,
         local_candidate_sources,
         local_network_identity,
+        candidate_refresh_lock,
         nat_profile,
         gateway_mapping_runtime,
         gateway_mapping_diagnostics,
@@ -44,6 +46,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
     loop {
         ticker.tick().await;
 
+        let refresh_guard = candidate_refresh_lock.lock().await;
+
         let report = match udp
             .gather_candidate_report_live(stun_servers.clone(), stun_timeout)
             .await
@@ -55,10 +59,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         };
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
-        let next_network_identity = stable_network_candidate_signature(
-            &candidates,
-            &candidate_sources,
-        );
         peers.update_nat_profile(report.nat_profile.clone()).await;
         let profile_changed = {
             let mut current_profile = nat_profile.write().await;
@@ -102,14 +102,12 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         }
         let previous_candidates = local_candidates.read().await.clone();
         let previous_candidate_sources = local_candidate_sources.read().await.clone();
-        preserve_peer_reflexive_candidates(
+        let next_network_identity = prepare_signal_candidates_and_network_identity(
             &previous_candidates,
             &previous_candidate_sources,
             &mut candidates,
             &mut candidate_sources,
         );
-        compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
-        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
         let previous_network_identity = local_network_identity.read().await.clone();
         let should_advance_generation = !previous_network_identity.is_empty()
             && previous_network_identity != next_network_identity;
@@ -125,7 +123,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let old_candidate_count = previous_candidates.len();
         let new_candidate_count = candidates.len();
         let real_change = change_reason != "no_change" && change_reason != "order_only";
-        if !real_change {
+        if !candidate_refresh_requires_commit(real_change, should_advance_generation) {
             if profile_changed {
                 debug!(
                     "UDP NAT profile changed without advertised candidate endpoint changes: mapping={:?} public={:?}",
@@ -163,7 +161,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             peers
                 .advance_candidate_refresh_generation("refreshed UDP candidates")
                 .await;
-        } else {
+        }
+        drop(refresh_guard);
+
+        if !should_advance_generation {
             debug!(
                 "UDP candidate refresh changed only volatile reflexive ports; keeping network generation and signaling stable"
             );

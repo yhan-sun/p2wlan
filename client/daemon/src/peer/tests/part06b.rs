@@ -157,6 +157,127 @@ async fn probe_batch_timeout_marks_probed_transient_birthday_pairs_failed() {
 }
 
 #[tokio::test]
+async fn expected_birthday_window_misses_do_not_increase_peer_retry_backoff() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let signaled_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let first_window: SocketAddr = "8.8.8.8:43076".parse().unwrap();
+    let second_window: SocketAddr = "8.8.8.8:46148".parse().unwrap();
+
+    manager
+        .add_peer(&test_peer("peer1", signaled_endpoint))
+        .await;
+    let generation = manager.current_network_generation().await;
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        conn.ensure_candidate_pair_with_source(
+            first_window,
+            generation,
+            CandidatePairSource::Birthday,
+        );
+        conn.ensure_candidate_pair_with_source(
+            second_window,
+            generation,
+            CandidatePairSource::Birthday,
+        );
+    }
+
+    for endpoint in [first_window, second_window] {
+        assert!(manager.record_direct_probe_sent("peer1", endpoint).await);
+        assert!(
+            manager
+                .record_expected_birthday_window_miss_for_generation(
+                    "peer1",
+                    generation,
+                    &[endpoint],
+                    false,
+                    format!("completed stable-side birthday window at {endpoint} without ACK"),
+                )
+                .await
+        );
+    }
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.direct_health.consecutive_failures, 0);
+    assert_eq!(conn.direct_health.failure_count, 0);
+    for endpoint in [first_window, second_window] {
+        let pair = conn
+            .candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == endpoint)
+            .unwrap();
+        assert_eq!(pair.state, CandidatePairState::Failed);
+        assert_eq!(pair.failure_count, 1);
+    }
+    assert_eq!(
+        conn.direct_retry_after(Duration::from_secs(5)),
+        Duration::from_secs(5),
+        "ordinary birthday-window misses must retain the short retry cadence"
+    );
+    assert_eq!(
+        conn.direct_events
+            .iter()
+            .filter(|event| event.stage == "birthday_probe_window_missed")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn completed_birthday_epochs_can_increase_peer_retry_backoff() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let signaled_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let epoch_endpoint: SocketAddr = "8.8.8.8:43076".parse().unwrap();
+
+    manager
+        .add_peer(&test_peer("peer1", signaled_endpoint))
+        .await;
+    let generation = manager.current_network_generation().await;
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        conn.ensure_candidate_pair_with_source(
+            epoch_endpoint,
+            generation,
+            CandidatePairSource::Birthday,
+        );
+    }
+
+    for epoch in 0..2 {
+        assert!(manager.record_direct_probe_sent("peer1", epoch_endpoint).await);
+        assert!(
+            manager
+                .record_expected_birthday_window_miss_for_generation(
+                    "peer1",
+                    generation,
+                    &[epoch_endpoint],
+                    true,
+                    format!("absolute birthday port epoch {epoch} completed without ACK"),
+                )
+                .await
+        );
+    }
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.direct_health.consecutive_failures, 2);
+    assert_eq!(conn.direct_health.failure_count, 2);
+    assert_eq!(
+        conn.direct_retry_after(Duration::from_secs(5)),
+        Duration::from_secs(10),
+        "only complete epoch misses should enter peer-level exponential backoff"
+    );
+    assert_eq!(
+        conn.direct_events
+            .iter()
+            .filter(|event| event.stage == "birthday_probe_epoch_missed")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn direct_path_latency_tracks_ewma_and_jitter() {
     let config = test_config();
     let manager = PeerManager::new(config);

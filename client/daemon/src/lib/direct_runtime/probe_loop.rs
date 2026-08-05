@@ -28,6 +28,8 @@ async fn run_direct_probe_loop(
             let peer_id = target.peer_id;
             let candidates = target.candidates;
             let remote_scatter_pool = target.remote_scatter_pool;
+            let stable_remote_scatter = target.stable_remote_scatter;
+            let birthday_plan = target.birthday_plan;
             let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
             let dedup_window = if reclaim_active {
                 DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW
@@ -69,7 +71,11 @@ async fn run_direct_probe_loop(
                     probe_interval,
                     attempts,
                     remote_scatter_pool,
-                    udp.socket_count(),
+                    if stable_remote_scatter {
+                        1
+                    } else {
+                        udp.socket_count()
+                    },
                 );
                 let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
                     let punch_started_stage = if reclaim_active {
@@ -118,6 +124,11 @@ async fn run_direct_probe_loop(
                             ),
                         )
                         .await;
+                    if let Some(plan) = birthday_plan.as_ref() {
+                        peers
+                            .record_birthday_probe_plan_started(&peer_id, plan)
+                            .await;
+                    }
                     for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
                         udp.spawn_nat_binding_maintainer(
                             &peer_id,
@@ -127,7 +138,15 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
-                    let punch_result = if remote_scatter_pool {
+                    let punch_result = if stable_remote_scatter {
+                        udp.punch_candidates_stable_unique_scatter(
+                            &peer_id,
+                            candidates.clone(),
+                            probe_interval,
+                            attempts,
+                        )
+                        .await
+                    } else if remote_scatter_pool {
                         udp.punch_candidates_remote_scatter_pool(
                             &peer_id,
                             candidates.clone(),
@@ -135,6 +154,10 @@ async fn run_direct_probe_loop(
                             attempts,
                         )
                         .await
+                        .map(|sent| PunchSendReport {
+                            packets_sent: sent,
+                            unique_target_endpoints: 0,
+                        })
                     } else {
                         udp.punch_candidates(
                             &peer_id,
@@ -143,11 +166,50 @@ async fn run_direct_probe_loop(
                             attempts,
                         )
                         .await
+                        .map(|sent| PunchSendReport {
+                            packets_sent: sent,
+                            unique_target_endpoints: 0,
+                        })
                     };
 
                     match punch_result {
-                        Ok(0) => {}
-                        Ok(sent) => {
+                        Ok(report) if report.packets_sent == 0 => {}
+                        Ok(report) => {
+                            let sent = report.packets_sent;
+                            let birthday_window_completion = if let Some(plan) =
+                                birthday_plan.as_ref().filter(|_| stable_remote_scatter)
+                            {
+                                let covered_all_selected_candidates = stable_remote_scatter
+                                    && report.unique_target_endpoints as usize >= candidates.len();
+                                let cursor_advanced = peers
+                                    .commit_birthday_probe_cursor(
+                                        &peer_id,
+                                        plan,
+                                        covered_all_selected_candidates,
+                                    )
+                                    .await;
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "birthday_probe_plan_completed",
+                                        candidates.first().copied(),
+                                        Some(candidates.len()),
+                                        Some(sent),
+                                        format!(
+                                            "stable_side={} unique_target_endpoints={} covered_all_selected_candidates={} cursor_advanced={} start_rank={} end_rank={}",
+                                            stable_remote_scatter,
+                                            report.unique_target_endpoints,
+                                            covered_all_selected_candidates,
+                                            cursor_advanced,
+                                            plan.start_rank,
+                                            plan.end_rank
+                                        ),
+                                    )
+                                    .await;
+                                Some((cursor_advanced, plan.wrapped))
+                            } else {
+                                None
+                            };
                             peers
                                 .record_direct_event(
                                     &peer_id,
@@ -184,13 +246,40 @@ async fn run_direct_probe_loop(
                                         timeout_detail.clone(),
                                     )
                                     .await;
-                                peers
-                                    .record_direct_probe_batch_failure_for_generation(
-                                        &peer_id,
-                                        generation,
-                                        timeout_detail,
-                                    )
-                                    .await;
+                                match birthday_window_completion {
+                                    Some((true, completed_epoch)) => {
+                                        peers
+                                            .record_expected_birthday_window_miss_for_generation(
+                                                &peer_id,
+                                                generation,
+                                                &candidates,
+                                                completed_epoch,
+                                                timeout_detail,
+                                            )
+                                            .await;
+                                    }
+                                    Some((false, _)) => {
+                                        peers
+                                            .record_direct_event(
+                                                &peer_id,
+                                                "birthday_probe_window_incomplete",
+                                                candidates.first().copied(),
+                                                Some(candidates.len()),
+                                                Some(sent),
+                                                "stable-side birthday window was not fully sent or its cursor became stale; retaining short retry cadence without peer backoff",
+                                            )
+                                            .await;
+                                    }
+                                    None => {
+                                        peers
+                                            .record_direct_probe_batch_failure_for_generation(
+                                                &peer_id,
+                                                generation,
+                                                timeout_detail,
+                                            )
+                                            .await;
+                                    }
+                                }
                                 debug!(
                                     "Direct UDP retry probes for peer {peer_id} received no ACK"
                                 );
@@ -273,13 +362,26 @@ async fn run_direct_probe_loop(
                                 timeout_detail.clone(),
                             )
                             .await;
-                        peers
-                            .record_direct_probe_batch_failure_for_generation(
-                                &peer_id,
-                                generation,
-                                timeout_detail,
-                            )
-                            .await;
+                        if stable_remote_scatter && birthday_plan.is_some() {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "birthday_probe_window_incomplete",
+                                    candidates.first().copied(),
+                                    Some(candidates.len()),
+                                    None,
+                                    "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
+                                )
+                                .await;
+                        } else {
+                            peers
+                                .record_direct_probe_batch_failure_for_generation(
+                                    &peer_id,
+                                    generation,
+                                    timeout_detail,
+                                )
+                                .await;
+                        }
                     }
                 }
             });

@@ -107,7 +107,8 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
     let expired: SocketAddr = "203.0.113.10:43000".parse().unwrap();
     manager.add_peer(&test_peer("peer1", initial)).await;
 
-    manager
+    assert_eq!(
+        manager
         .add_candidates_with_metadata(
             "peer1",
             &[initial.to_string()],
@@ -115,8 +116,11 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
             10,
             Some(u64::MAX),
         )
-        .await;
-    manager
+        .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert_eq!(
+        manager
         .add_candidates_with_metadata(
             "peer1",
             &[stale.to_string()],
@@ -124,8 +128,11 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
             9,
             Some(u64::MAX),
         )
-        .await;
-    manager
+        .await,
+        CandidateSetApplyResult::IgnoredStale
+    );
+    assert_eq!(
+        manager
         .add_candidates_with_metadata(
             "peer1",
             &[expired.to_string()],
@@ -133,7 +140,9 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
             11,
             Some(1),
         )
-        .await;
+        .await,
+        CandidateSetApplyResult::IgnoredExpired
+    );
 
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.last_candidate_generation, 10);
@@ -148,6 +157,64 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
         .direct_events
         .iter()
         .any(|event| event.stage == "candidates_expired"));
+}
+
+#[tokio::test]
+async fn empty_invalid_and_missing_candidate_sets_do_not_replace_live_state() {
+    let manager = PeerManager::new(test_config());
+    let initial: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", initial)).await;
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[initial.to_string()],
+                &HashMap::new(),
+                10,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata("peer1", &[], &HashMap::new(), 11, Some(u64::MAX))
+            .await,
+        CandidateSetApplyResult::IgnoredEmpty
+    );
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &["not-a-socket".to_string()],
+                &HashMap::new(),
+                12,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::IgnoredEmpty
+    );
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "missing",
+                &[initial.to_string()],
+                &HashMap::new(),
+                1,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::PeerMissing
+    );
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.last_candidate_generation, 10);
+    assert!(conn.candidates.contains(&initial.to_string()));
+    assert!(conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "candidates_empty"));
 }
 
 #[tokio::test]

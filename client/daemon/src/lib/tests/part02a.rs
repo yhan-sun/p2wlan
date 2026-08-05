@@ -44,6 +44,12 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
     assert!(candidates.contains(&stun));
     assert!(candidates.contains(&predicted));
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.starts_with("192.168.1.")),
+        "the signal cap must reserve room for physical LAN host candidates"
+    );
     assert_eq!(
         sources.get(&stun).map(String::as_str),
         Some("stun_observed")
@@ -53,6 +59,121 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
         Some("predicted")
     );
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+}
+
+#[test]
+fn canonical_network_identity_is_computed_before_air_sized_signal_cap() {
+    let physical_host = "192.168.0.239:56255".to_string();
+    let shared_lan_host = "100.74.65.1:56255".to_string();
+    let ten_twenty_lan_host = "10.20.0.13:56255".to_string();
+    let mut candidates = vec![
+        physical_host.clone(),
+        shared_lan_host.clone(),
+        ten_twenty_lan_host.clone(),
+    ];
+    candidates.extend((20_000..20_120).map(|port| format!("93.184.216.34:{port}")));
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let source = if endpoint == physical_host
+                || endpoint == shared_lan_host
+                || endpoint == ten_twenty_lan_host
+            {
+                "host"
+            } else {
+                "predicted"
+            };
+            (endpoint, source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+
+    let identity = prepare_signal_candidates_and_network_identity(
+        &[],
+        &HashMap::new(),
+        &mut candidates,
+        &mut sources,
+    );
+
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert!(candidates.contains(&physical_host));
+    assert!(candidates.contains(&shared_lan_host));
+    assert!(candidates.contains(&ten_twenty_lan_host));
+    assert!(identity.contains(&"physical-host-ip:192.168.0.239".to_string()));
+    assert!(identity.contains(&"physical-host-ip:100.74.65.1".to_string()));
+    assert!(identity.contains(&"physical-host-ip:10.20.0.13".to_string()));
+    assert!(identity.contains(&"public-ip:93.184.216.34".to_string()));
+    assert_eq!(sources.len(), candidates.len());
+}
+
+#[test]
+fn host_reservation_is_stable_across_interface_enumeration_order() {
+    fn retained_hosts(mut candidates: Vec<String>) -> Vec<String> {
+        candidates.extend((20_000..20_120).map(|port| format!("93.184.216.34:{port}")));
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| {
+                let source = if endpoint.starts_with("93.184.216.34:") {
+                    "predicted"
+                } else {
+                    "host"
+                };
+                (endpoint, source.to_string())
+            })
+            .collect::<HashMap<_, _>>();
+        truncate_signal_candidates(&mut candidates, &mut sources);
+        candidates
+            .into_iter()
+            .filter(|candidate| sources.get(candidate).map(String::as_str) == Some("host"))
+            .collect()
+    }
+
+    let hosts = (1..=12)
+        .map(|index| format!("10.20.1.{index}:51820"))
+        .chain(["[fd12:3456::1]:51820".to_string()])
+        .collect::<Vec<_>>();
+    let mut reversed = hosts.clone();
+    reversed.reverse();
+
+    assert_eq!(retained_hosts(hosts), retained_hosts(reversed));
+}
+
+#[test]
+fn canonical_network_identity_ignores_capped_prediction_window_churn() {
+    fn prepared_identity(first_port: u16) -> Vec<String> {
+        let host = "192.168.0.239:56255".to_string();
+        let mut candidates = vec![host.clone()];
+        candidates.extend(
+            (first_port..first_port + 120).map(|port| format!("93.184.216.34:{port}")),
+        );
+        let mut sources = candidates
+            .iter()
+            .cloned()
+            .map(|endpoint| {
+                let source = if endpoint == host { "host" } else { "predicted" };
+                (endpoint, source.to_string())
+            })
+            .collect::<HashMap<_, _>>();
+        let identity = prepare_signal_candidates_and_network_identity(
+            &[],
+            &HashMap::new(),
+            &mut candidates,
+            &mut sources,
+        );
+        assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+        assert!(candidates.contains(&host));
+        identity
+    }
+
+    assert_eq!(prepared_identity(20_000), prepared_identity(21_000));
+}
+
+#[test]
+fn identity_only_candidate_refresh_still_requires_commit() {
+    assert!(candidate_refresh_requires_commit(false, true));
+    assert!(candidate_refresh_requires_commit(true, false));
+    assert!(!candidate_refresh_requires_commit(false, false));
 }
 
 #[test]

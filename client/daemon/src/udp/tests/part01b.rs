@@ -404,7 +404,119 @@ async fn primary_socket_punch_never_uses_alternate_pool_sockets() {
 }
 
 #[tokio::test]
-async fn nat_binding_maintainer_uses_only_primary_socket() {
+async fn stable_unique_scatter_spends_budget_on_distinct_remote_ports() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(4)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+
+    let candidates = (0..200)
+        .map(|offset| format!("127.0.0.1:{}", 23_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+    let report = transport
+        .punch_candidates_stable_unique_scatter("peer-b", candidates.clone(), Duration::ZERO, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(report.packets_sent, 200);
+    assert_eq!(report.unique_target_endpoints, 200);
+    let pending = transport.pending_probes.lock().await;
+    assert_eq!(pending.len(), candidates.len());
+    assert!(pending.values().all(|probe| probe.socket_index == 0));
+    drop(pending);
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].probes_sent, 200);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .skip(1)
+            .map(|member| member.probes_sent)
+            .sum::<u64>(),
+        0
+    );
+    let peer_diagnostics = peers.diagnostics().await;
+    let event = peer_diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "stable_unique_scan_completed")
+        .expect("stable-side scan should emit unique coverage diagnostics");
+    assert_eq!(event.probe_tx_unique_target_ports, Some(200));
+    assert_eq!(event.probe_tx_repeated_target_ports, Some(0));
+    assert!(event
+        .detail
+        .contains("scan_socket_policy=stable_unique_scatter"));
+}
+
+#[tokio::test]
+async fn stable_unique_scatter_retries_budget_skips_before_repeating_sent_endpoints() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+
+    let initially_limited_ip = IpAddr::V4("127.0.0.2".parse().unwrap());
+    {
+        let mut budget = transport.outbound_probe_budget.lock().await;
+        budget.insert(
+            OutboundProbeBudgetKey::PeerRemoteIp("peer-b".to_string(), initially_limited_ip),
+            std::iter::repeat_n(Instant::now(), OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP).collect(),
+        );
+    }
+
+    let initially_skipped = (0..8)
+        .map(|offset| format!("127.0.0.2:{}", 24_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+    let initially_sent = (0..8)
+        .map(|offset| format!("127.0.0.3:{}", 25_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+    let candidates = initially_skipped
+        .iter()
+        .chain(&initially_sent)
+        .copied()
+        .collect::<Vec<_>>();
+
+    let report = transport
+        .punch_candidates_stable_unique_scatter(
+            "peer-b",
+            candidates.clone(),
+            Duration::from_millis(900),
+            4,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.unique_target_endpoints as usize, candidates.len());
+    assert_eq!(
+        report.packets_sent as usize,
+        candidates.len() + initially_sent.len()
+    );
+
+    let pending = transport.pending_probes.lock().await;
+    let mut sent_sequence = pending
+        .values()
+        .map(|probe| (probe.sent_at, probe.endpoint))
+        .collect::<Vec<_>>();
+    sent_sequence.sort_by_key(|(sent_at, _)| *sent_at);
+    let mut unique_before_repeat = HashSet::new();
+    let first_repeat = sent_sequence
+        .iter()
+        .position(|(_, endpoint)| !unique_before_repeat.insert(*endpoint))
+        .expect("the final round should repeat endpoints only after full unique coverage");
+    assert_eq!(first_repeat, candidates.len());
+    assert!(initially_skipped
+        .iter()
+        .all(|endpoint| unique_before_repeat.contains(endpoint)));
+}
+
+#[tokio::test]
+async fn nat_binding_maintainer_uses_every_pool_socket() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
     let peers = peer_manager();
@@ -416,7 +528,11 @@ async fn nat_binding_maintainer_uses_only_primary_socket() {
         .await
         .unwrap();
     transport.set_socket_pool_active(true);
-    let primary_addr = transport.active_sockets()[0].local_addr().unwrap();
+    let expected_sources = transport
+        .active_sockets()
+        .iter()
+        .map(|socket| socket.local_addr().unwrap())
+        .collect::<std::collections::HashSet<_>>();
 
     assert!(
         transport
@@ -442,7 +558,7 @@ async fn nat_binding_maintainer_uses_only_primary_socket() {
 
     let mut buf = [0u8; 64];
     let mut sources = std::collections::HashSet::new();
-    for _ in 0..3 {
+    while sources.len() < expected_sources.len() {
         let (n, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
             .await
             .unwrap()
@@ -454,31 +570,228 @@ async fn nat_binding_maintainer_uses_only_primary_socket() {
         sources.insert(source);
     }
 
-    assert_eq!(sources, std::collections::HashSet::from([primary_addr]));
+    assert_eq!(sources, expected_sources);
     sleep(Duration::from_millis(50)).await;
     let diagnostics = transport.socket_pool_diagnostics().await;
-    assert!(diagnostics[0].nat_maintainer_probes_sent >= 3);
-    assert_eq!(
-        diagnostics
-            .iter()
-            .skip(1)
-            .map(|member| member.nat_maintainer_probes_sent)
-            .sum::<u64>(),
-        0
-    );
-    let peer_diagnostics = peers.diagnostics().await;
-    assert!(peer_diagnostics[0]
-        .direct_events
+    assert!(diagnostics
         .iter()
-        .any(|event| event.stage == "nat_maintainer_started"));
-    assert!(peer_diagnostics[0]
-        .direct_events
+        .all(|member| member.nat_maintainer_probes_sent >= 1));
+    let peer_diagnostics = peers.diagnostics().await;
+    let direct_events = &peer_diagnostics[0].direct_events;
+    assert_eq!(
+        direct_events
+            .iter()
+            .filter(|event| event.stage == "nat_maintainer_started")
+            .count(),
+        3
+    );
+    assert!(direct_events
         .iter()
         .any(|event| event.stage == "nat_maintainer_suppressed"));
-    assert!(peer_diagnostics[0]
+    assert_eq!(
+        direct_events
+            .iter()
+            .filter(|event| event.stage == "nat_maintainer_stopped")
+            .count(),
+        3
+    );
+    for socket_index in 0..3 {
+        assert!(direct_events.iter().any(|event| {
+            event.stage == "nat_maintainer_started"
+                && event
+                    .detail
+                    .contains(&format!("socket_index={socket_index}"))
+                && event.detail.contains(&format!("target={receiver_addr}"))
+        }));
+    }
+}
+
+#[test]
+fn nat_binding_maintainer_staggers_pool_socket_start_times() {
+    let interval = Duration::from_millis(150);
+
+    assert_eq!(nat_maintainer_initial_delay(interval, 0, 3), Duration::ZERO);
+    assert_eq!(
+        nat_maintainer_initial_delay(interval, 1, 3),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        nat_maintainer_initial_delay(interval, 2, 3),
+        Duration::from_millis(100)
+    );
+}
+
+#[tokio::test]
+async fn overlapping_nat_maintainer_call_renews_existing_socket_tasks() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+
+    assert!(
+        transport
+            .spawn_nat_binding_maintainer(
+                "peer-b",
+                receiver_addr,
+                Duration::from_millis(5),
+                Duration::from_millis(40),
+            )
+            .await
+    );
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        !transport
+            .spawn_nat_binding_maintainer(
+                "peer-b",
+                receiver_addr,
+                Duration::from_millis(5),
+                Duration::from_millis(90),
+            )
+            .await
+    );
+
+    sleep(Duration::from_millis(45)).await;
+    let after_original_deadline = transport
+        .socket_pool_diagnostics()
+        .await
+        .into_iter()
+        .map(|member| member.nat_maintainer_probes_sent)
+        .collect::<Vec<_>>();
+    sleep(Duration::from_millis(20)).await;
+    let after_renewal = transport
+        .socket_pool_diagnostics()
+        .await
+        .into_iter()
+        .map(|member| member.nat_maintainer_probes_sent)
+        .collect::<Vec<_>>();
+    assert!(after_renewal
+        .iter()
+        .zip(after_original_deadline)
+        .all(|(renewed, original)| renewed > &original));
+}
+
+#[test]
+fn stale_nat_maintainer_worker_cannot_remove_replacement_lease() {
+    let key = ("peer-b".to_string(), "127.0.0.1:24567".parse().unwrap(), 0);
+    let old_lease = NatMaintainerLease::new(Instant::now());
+    let old_worker_token = old_lease.worker_token.clone();
+    let replacement_lease = NatMaintainerLease::new(Instant::now() + Duration::from_secs(1));
+    let replacement_worker_token = replacement_lease.worker_token.clone();
+    let replacement_deadline = replacement_lease.expires_at;
+    let mut maintainers = HashMap::from([(key.clone(), replacement_lease)]);
+
+    assert_eq!(
+        nat_maintainer_lease_status(&mut maintainers, &key, &old_worker_token, Instant::now(),),
+        NatMaintainerLeaseStatus::Replaced
+    );
+    assert!(!remove_nat_maintainer_lease_if_owned(
+        &mut maintainers,
+        &key,
+        &old_worker_token,
+    ));
+    let live_lease = maintainers
+        .get(&key)
+        .expect("replacement lease must survive stale worker cleanup");
+    assert!(live_lease.is_owned_by(&replacement_worker_token));
+    assert_eq!(live_lease.expires_at, replacement_deadline);
+}
+
+#[test]
+fn renewed_nat_maintainer_lease_remains_active_past_original_deadline() {
+    let key = ("peer-b".to_string(), "127.0.0.1:24568".parse().unwrap(), 0);
+    let now = Instant::now();
+    let original_deadline = now + Duration::from_millis(10);
+    let renewed_deadline = now + Duration::from_secs(1);
+    let mut lease = NatMaintainerLease::new(original_deadline);
+    let worker_token = lease.worker_token.clone();
+    lease.renew_until(renewed_deadline);
+    let mut maintainers = HashMap::from([(key.clone(), lease)]);
+
+    assert_eq!(
+        nat_maintainer_lease_status(
+            &mut maintainers,
+            &key,
+            &worker_token,
+            original_deadline + Duration::from_millis(1),
+        ),
+        NatMaintainerLeaseStatus::Active(renewed_deadline)
+    );
+}
+
+#[tokio::test]
+async fn nat_binding_maintainer_stops_every_pool_socket_after_direct_success() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+    transport.set_socket_pool_active(true);
+
+    assert!(
+        transport
+            .spawn_nat_binding_maintainer(
+                "peer-b",
+                receiver_addr,
+                Duration::from_millis(5),
+                Duration::from_millis(200),
+            )
+            .await
+    );
+
+    let mut buf = [0u8; 64];
+    let mut sources = std::collections::HashSet::new();
+    while sources.len() < 3 {
+        let (n, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_punch_packet(&buf[..n]).unwrap().kind,
+            PunchPacketKind::Punch
+        );
+        sources.insert(source);
+    }
+
+    peers.update_state("peer-b", ConnectionState::Direct).await;
+    sleep(Duration::from_millis(25)).await;
+    let stopped_counts = transport
+        .socket_pool_diagnostics()
+        .await
+        .into_iter()
+        .map(|member| member.nat_maintainer_probes_sent)
+        .collect::<Vec<_>>();
+    sleep(Duration::from_millis(25)).await;
+    let later_counts = transport
+        .socket_pool_diagnostics()
+        .await
+        .into_iter()
+        .map(|member| member.nat_maintainer_probes_sent)
+        .collect::<Vec<_>>();
+    assert_eq!(later_counts, stopped_counts);
+
+    let peer_diagnostics = peers.diagnostics().await;
+    let direct_confirmed_stops = peer_diagnostics[0]
         .direct_events
         .iter()
-        .any(|event| event.stage == "nat_maintainer_stopped"));
+        .filter(|event| {
+            event.stage == "nat_maintainer_stopped"
+                && event.detail.contains("reason=direct_confirmed")
+        })
+        .count();
+    assert_eq!(direct_confirmed_stops, 3);
+    assert!(transport.nat_maintainers.lock().await.is_empty());
 }
 
 #[tokio::test]

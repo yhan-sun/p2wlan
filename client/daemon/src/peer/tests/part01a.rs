@@ -119,6 +119,157 @@ async fn probe_mac_key_becomes_session_bound_with_static_fallback() {
 }
 
 #[tokio::test]
+async fn staged_probe_binding_keeps_outbound_old_until_authenticated_promotion() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let remote_identity = NodeIdentity::generate();
+    let remote_public_key = hex::encode(remote_identity.public_key());
+    let mut peer = test_peer("peer-probe-rekey", "8.8.8.8:12294".parse().unwrap());
+    peer.public_key = remote_public_key;
+    manager.add_peer(&peer).await;
+
+    let old_shared = [1u8; 32];
+    let new_shared = [2u8; 32];
+    manager
+        .set_probe_session_binding(
+            "peer-probe-rekey",
+            Some("old-session".to_string()),
+            Some(old_shared),
+        )
+        .await;
+    let old_key = manager.probe_key_for_peer("peer-probe-rekey").await.unwrap();
+
+    assert_eq!(
+        manager
+            .stage_probe_session_binding(
+                "peer-probe-rekey",
+                "new-token".to_string(),
+                Some("new-session".to_string()),
+                Some(new_shared),
+                true,
+            )
+            .await,
+        ProbeBindingStage::Staged
+    );
+    assert_eq!(
+        manager.probe_key_for_peer("peer-probe-rekey").await,
+        Some(old_key)
+    );
+
+    let candidates = manager
+        .probe_key_candidates_for_peer("peer-probe-rekey")
+        .await;
+    assert!(candidates.iter().any(|candidate| {
+        candidate.role == ProbeKeyRole::Active && candidate.key == old_key
+    }));
+    assert!(candidates.iter().any(|candidate| {
+        matches!(candidate.role, ProbeKeyRole::Pending { ref token } if token == "new-token")
+    }));
+
+    assert!(manager
+        .confirm_pending_probe_session_binding("peer-probe-rekey", "new-token")
+        .await);
+    let new_key = manager.probe_key_for_peer("peer-probe-rekey").await.unwrap();
+    assert_ne!(new_key, old_key);
+    let inbound_keys = manager.probe_keys_for_peer("peer-probe-rekey").await;
+    assert!(inbound_keys.contains(&old_key));
+    assert!(inbound_keys.contains(&new_key));
+}
+
+#[tokio::test]
+async fn multiple_probe_tokens_are_retained_until_exact_token_promotion() {
+    let manager = PeerManager::new(test_config());
+    let remote_identity = NodeIdentity::generate();
+    let mut peer = test_peer("peer-probe-multi", "8.8.8.8:12296".parse().unwrap());
+    peer.public_key = hex::encode(remote_identity.public_key());
+    manager.add_peer(&peer).await;
+    manager
+        .set_probe_session_binding(
+            "peer-probe-multi",
+            Some("old-session".to_string()),
+            Some([1u8; 32]),
+        )
+        .await;
+
+    for (token, session, shared) in [
+        ("token-a", "session-a", [2u8; 32]),
+        ("token-b", "session-b", [3u8; 32]),
+    ] {
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    "peer-probe-multi",
+                    token.to_string(),
+                    Some(session.to_string()),
+                    Some(shared),
+                    true,
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
+    }
+    let candidates = manager
+        .probe_key_candidates_for_peer("peer-probe-multi")
+        .await;
+    for token in ["token-a", "token-b"] {
+        assert!(candidates.iter().any(|candidate| {
+            matches!(&candidate.role, ProbeKeyRole::Pending { token: candidate_token } if candidate_token == token)
+        }));
+    }
+
+    assert!(manager
+        .confirm_pending_probe_session_binding("peer-probe-multi", "token-b")
+        .await);
+    let candidates = manager
+        .probe_key_candidates_for_peer("peer-probe-multi")
+        .await;
+    assert!(!candidates.iter().any(|candidate| {
+        matches!(candidate.role, ProbeKeyRole::Pending { .. })
+    }));
+}
+
+#[tokio::test]
+async fn failed_initiator_probe_stage_does_not_promote_on_inbound_match() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let remote_identity = NodeIdentity::generate();
+    let mut peer = test_peer("peer-probe-pending", "8.8.8.8:12295".parse().unwrap());
+    peer.public_key = hex::encode(remote_identity.public_key());
+    manager.add_peer(&peer).await;
+    manager
+        .set_probe_session_id("peer-probe-pending", Some("old-session".to_string()))
+        .await;
+    let old_key = manager.probe_key_for_peer("peer-probe-pending").await.unwrap();
+
+    assert_eq!(
+        manager
+            .stage_probe_session_binding(
+                "peer-probe-pending",
+                "pending-token".to_string(),
+                Some("pending-session".to_string()),
+                None,
+                false,
+            )
+            .await,
+        ProbeBindingStage::Staged
+    );
+    assert!(!manager
+        .confirm_pending_probe_session_binding("peer-probe-pending", "pending-token")
+        .await);
+    assert_eq!(
+        manager.probe_key_for_peer("peer-probe-pending").await,
+        Some(old_key)
+    );
+    assert!(manager
+        .discard_pending_probe_session_binding("peer-probe-pending", "pending-token")
+        .await);
+    assert_eq!(
+        manager.probe_key_for_peer("peer-probe-pending").await,
+        Some(old_key)
+    );
+}
+
+#[tokio::test]
 async fn diagnostics_classifies_public_udp_direct_selected_pair() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "8.8.8.8:12293".parse().unwrap();

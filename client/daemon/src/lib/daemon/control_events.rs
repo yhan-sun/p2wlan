@@ -1,8 +1,8 @@
-fn peer_offer_updates_probe_session(
-    handshake_init: &[u8],
-    session_id: Option<&str>,
+fn candidate_signal_starts_synchronized_punch(
+    handshake_payload: &[u8],
+    apply_result: CandidateSetApplyResult,
 ) -> bool {
-    !handshake_init.is_empty() || session_id.is_some()
+    !handshake_payload.is_empty() || apply_result == CandidateSetApplyResult::Applied
 }
 
 impl Daemon {
@@ -235,17 +235,6 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
-                    // Candidate-only trickle offers intentionally omit session
-                    // metadata. They must not clear the MAC key negotiated by
-                    // the current WireGuard handshake.
-                    if peer_offer_updates_probe_session(
-                        &handshake_init,
-                        session_id.as_deref(),
-                    ) {
-                        self.peers
-                            .set_probe_session_id(&from_node_id, session_id.clone())
-                            .await;
-                    }
                     self.peers
                         .record_direct_event(
                             &from_node_id,
@@ -259,7 +248,7 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    self.peers
+                    let candidate_apply_result = self.peers
                         .add_candidates_with_metadata(
                             &from_node_id,
                             &candidates,
@@ -284,7 +273,16 @@ impl Daemon {
                             warn!("Failed to handle peer offer from {from_node_id}: {err}");
                         }
                     }
-                    self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
+                    if candidate_signal_starts_synchronized_punch(
+                        &handshake_init,
+                        candidate_apply_result,
+                    ) {
+                        self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
+                    } else {
+                        debug!(
+                            "Skipping synchronized punch for rejected candidate-only offer from {from_node_id}: {candidate_apply_result:?}"
+                        );
+                    }
                 }
 
                 ControlEvent::PeerAnswer {
@@ -317,7 +315,7 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    self.peers
+                    let candidate_apply_result = self.peers
                         .add_candidates_with_metadata(
                             &from_node_id,
                             &candidates,
@@ -339,7 +337,16 @@ impl Daemon {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
                         }
                     }
-                    self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
+                    if candidate_signal_starts_synchronized_punch(
+                        &handshake_response,
+                        candidate_apply_result,
+                    ) {
+                        self.start_hole_punch_at(&from_node_id, punch_at_ms).await;
+                    } else {
+                        debug!(
+                            "Skipping synchronized punch for rejected candidate-only answer from {from_node_id}: {candidate_apply_result:?}"
+                        );
+                    }
                 }
 
                 ControlEvent::PeerReflexive {
@@ -356,8 +363,8 @@ impl Daemon {
                         .await;
                     let punch_at_ms =
                         punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
-                    let candidates = self.local_candidates.read().await.clone();
-                    let candidate_sources = self.local_candidate_sources.read().await.clone();
+                    let (candidates, candidate_sources) =
+                        self.current_local_candidate_set().await;
                     let selected_remote_endpoint = self
                         .peers
                         .selected_direct_endpoint_for_consent(&from_node_id)

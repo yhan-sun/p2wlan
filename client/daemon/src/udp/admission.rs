@@ -63,6 +63,21 @@ impl UdpTransport {
         AuthenticatedPunchAdmission::Accepted
     }
 
+    async fn rollback_authenticated_punch_replay_admission(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        kind: PunchPacketKind,
+        nonce: ProbeNonce,
+    ) {
+        self.authenticated_punch_replay.lock().await.remove(&(
+            peer_id.to_string(),
+            generation,
+            nonce,
+            punch_kind_code(kind),
+        ));
+    }
+
     async fn admit_outbound_connectivity_probe(
         &self,
         peer_id: &str,
