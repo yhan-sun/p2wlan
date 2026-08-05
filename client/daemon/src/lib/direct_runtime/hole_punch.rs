@@ -447,64 +447,22 @@ async fn spawn_hole_punch_task(
 /// Advertise the fresh-mapping prediction window to the peer.
 ///
 /// The predicted ports are signaled in priority order (top-1 first, then the
-/// successor window) as `predicted` candidates.  Old peers ignore the new
-/// reserved model metadata keys and simply probe the extra candidates, so the
-/// signal degrades gracefully to today's strategy.
+/// successor window) as real `predicted` candidates.  No reserved metadata
+/// keys are embedded in `candidate_sources`: the control plane requires every
+/// key to be a real candidate, values to stay under 64 bytes, and the map
+/// size to stay within the candidate count, so model details travel only in
+/// structured logs and diagnostics.  Older clients simply probe the ordered
+/// candidates, so the signal degrades gracefully to today's strategy.
 async fn advertise_fresh_mapping_prediction(
     signal: &HolePunchSignalContext,
     peers: &Arc<PeerManager>,
     peer_id: &str,
     result: &FreshMappingResult,
 ) {
-    let mut candidates = Vec::new();
-    let mut candidate_sources = HashMap::new();
-    for port in &result.predicted_ports {
-        let endpoint = SocketAddr::new(
-            result.public_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            *port,
-        )
-        .to_string();
-        if !candidates.contains(&endpoint) {
-            candidates.push(endpoint.clone());
-            candidate_sources.insert(endpoint, "predicted".to_string());
-        }
-    }
-    let current = signal.local_candidates.read().await.clone();
-    let current_sources = signal.local_candidate_sources.read().await.clone();
-    for endpoint in current {
-        if !candidates.contains(&endpoint) {
-            candidates.push(endpoint.clone());
-        }
-        if let Some(source) = current_sources.get(&endpoint) {
-            candidate_sources.insert(endpoint, source.clone());
-        }
-    }
-    let mut candidate_sources_mut = candidate_sources.clone();
-    let _network_identity = prepare_signal_candidates_and_network_identity(
-        &[],
-        &HashMap::new(),
-        &mut candidates,
-        &mut candidate_sources_mut,
-    );
-
-    // Reserved model metadata: ignored by older clients, which still benefit
-    // from the ordered predicted candidates themselves.
-    let model_meta = serde_json::json!({
-        "generation": result.punch_generation,
-        "network_generation": result.network_generation,
-        "socket_index": result.socket_index,
-        "socket_local_port": result.socket_local_endpoint.port(),
-        "model": result.model.kind.clone().label(),
-        "confidence": result.model.confidence,
-        "sequence": result.model.sequence,
-        "deltas": result.model.deltas,
-        "predicted": result.predicted_ports,
-        "first_punch_sent_ms": result.first_punch_sent_at_ms,
-        "last_punch_sent_ms": result.last_punch_sent_at_ms,
-    });
-    candidate_sources_mut.insert(
-        FRESH_MAPPING_MODEL_SIGNAL_KEY.to_string(),
-        model_meta.to_string(),
+    let (candidates, candidate_sources) = build_fresh_mapping_signal_payload(
+        result,
+        &signal.local_candidates.read().await.clone(),
+        &signal.local_candidate_sources.read().await.clone(),
     );
 
     let punch_at_ms = Some(relay_assisted_punch_at_ms());
@@ -513,7 +471,7 @@ async fn advertise_fresh_mapping_prediction(
         .send_peer_offer_with_sources_and_punch_at(
             peer_id,
             &candidates,
-            &candidate_sources_mut,
+            &candidate_sources,
             &[],
             punch_at_ms,
         )
@@ -528,15 +486,23 @@ async fn advertise_fresh_mapping_prediction(
         event = "fresh_mapping_prediction_signaled",
         peer_id = %peer_id,
         punch_generation = result.punch_generation,
+        network_generation = result.network_generation,
+        socket_local_endpoint = %result.socket_local_endpoint,
+        first_punch_sent_at_ms = result.first_punch_sent_at_ms,
+        last_punch_sent_at_ms = result.last_punch_sent_at_ms,
         socket_index = result.socket_index,
         predicted = ?result.predicted_ports,
         model = ?result.model.kind,
         confidence = result.model.confidence,
         candidate_count = candidates.len(),
         punch_at_ms = ?punch_at_ms,
-        "fresh_mapping_prediction_signaled peer_id={} punch_generation={} socket_index={} predicted={:?} model={:?} confidence={} candidates={}",
+        "fresh_mapping_prediction_signaled peer_id={} punch_generation={} network_generation={} socket_local={} first_sent_ms={} last_sent_ms={} socket_index={} predicted={:?} model={:?} confidence={} candidates={}",
         peer_id,
         result.punch_generation,
+        result.network_generation,
+        result.socket_local_endpoint,
+        result.first_punch_sent_at_ms,
+        result.last_punch_sent_at_ms,
         result.socket_index,
         result.predicted_ports,
         result.model.kind,
@@ -551,8 +517,12 @@ async fn advertise_fresh_mapping_prediction(
             Some(candidates.len()),
             None,
             format!(
-                "signaled predicted window punch_generation={} predicted={:?} model={:?} confidence={} candidates={}",
+                "signaled predicted window punch_generation={} network_generation={} socket_local={} first_sent_ms={} last_sent_ms={} predicted={:?} model={:?} confidence={} candidates={}",
                 result.punch_generation,
+                result.network_generation,
+                result.socket_local_endpoint,
+                result.first_punch_sent_at_ms,
+                result.last_punch_sent_at_ms,
                 result.predicted_ports,
                 result.model.kind.clone().label(),
                 result.model.confidence,
@@ -560,4 +530,46 @@ async fn advertise_fresh_mapping_prediction(
             ),
         )
         .await;
+}
+
+/// Build the signal payload carrying the fresh-mapping prediction window.
+///
+/// The payload must satisfy the control-plane validation rules applied by the
+/// Go signaling service: every `candidate_sources` key must be a real
+/// candidate, values must stay under 64 bytes, and the map size must not
+/// exceed the candidate count.  The predicted ports are ordered top-1 first so
+/// the stable side probes the model prediction before the successor window.
+fn build_fresh_mapping_signal_payload(
+    result: &FreshMappingResult,
+    current_candidates: &[String],
+    current_sources: &HashMap<String, String>,
+) -> (Vec<String>, HashMap<String, String>) {
+    let mut candidates = Vec::new();
+    let mut candidate_sources = HashMap::new();
+    for port in &result.predicted_ports {
+        let endpoint = SocketAddr::new(
+            result.public_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            *port,
+        )
+        .to_string();
+        if !candidates.contains(&endpoint) {
+            candidates.push(endpoint.clone());
+            candidate_sources.insert(endpoint, "predicted".to_string());
+        }
+    }
+    for endpoint in current_candidates {
+        if !candidates.contains(endpoint) {
+            candidates.push(endpoint.clone());
+        }
+        if let Some(source) = current_sources.get(endpoint) {
+            candidate_sources.insert(endpoint.clone(), source.clone());
+        }
+    }
+    let _network_identity = prepare_signal_candidates_and_network_identity(
+        &[],
+        &HashMap::new(),
+        &mut candidates,
+        &mut candidate_sources,
+    );
+    (candidates, candidate_sources)
 }

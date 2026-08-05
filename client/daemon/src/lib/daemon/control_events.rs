@@ -146,6 +146,10 @@ impl Daemon {
                             .lock()
                             .await
                             .clear_peer(&peer_info.node_id);
+                        if let Some(udp) = self.udp_transport.read().await.clone() {
+                            udp.detach_dynamic_punch_socket(&peer_info.node_id, "peer_offline")
+                                .await;
+                        }
                         if self.dns.is_enabled() {
                             if let Some(previous) = previous.as_ref() {
                                 self.dns.unregister(&previous.virtual_ip).await;
@@ -216,6 +220,9 @@ impl Daemon {
                     self.transport.remove_session(&node_id).await;
                     self.pending_handshakes.lock().await.clear_peer(&node_id);
                     self.peers.remove_peer(&node_id).await;
+                    if let Some(udp) = self.udp_transport.read().await.clone() {
+                        udp.detach_dynamic_punch_socket(&node_id, "peer_left").await;
+                    }
                 }
 
                 ControlEvent::PeerOffer {

@@ -376,6 +376,9 @@ self.task_manager
 
         info!("Daemon shutting down");
         // Explicit cleanup: notify control loop and clean routes without relying on Drop.
+        if let Some(udp) = self.udp_transport.read().await.clone() {
+            udp.detach_all_dynamic_punch_sockets("daemon_shutdown").await;
+        }
         self.request_shutdown();
         let _ = self.control.shutdown().await;
         self.task_manager.shutdown_all(Duration::from_secs(5)).await;

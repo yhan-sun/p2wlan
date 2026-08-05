@@ -66,11 +66,6 @@ pub(crate) const FRESH_MAPPING_OBSERVERS_PER_BATCH: usize = 4;
 pub(crate) const FRESH_MAPPING_MEASURE_BUDGET: Duration = Duration::from_millis(1_200);
 /// Deltas further apart than this never form a linear model.
 pub(crate) const FRESH_MAPPING_MAX_ABS_STEP: i16 = 2_048;
-/// Reserved candidate-source key carrying the JSON mapping-model metadata.
-///
-/// Older clients ignore unknown keys and simply probe the ordered predicted
-/// candidates, so the field is optional and backward compatible.
-pub(crate) const FRESH_MAPPING_MODEL_SIGNAL_KEY: &str = "__p2wlan_mapping_model_v1";
 
 /// One dedicated punch socket owned by a per-peer fresh-mapping generation.
 ///
