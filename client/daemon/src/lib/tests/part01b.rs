@@ -148,7 +148,7 @@ fn signal_candidate_cap_preserves_high_teen_linear_prediction() {
 }
 
 #[test]
-fn signal_candidate_cap_does_not_preserve_external_overlay_hosts_over_public_predictions() {
+fn signal_candidate_cap_keeps_bounded_private_hosts_without_hardcoded_overlay_ranges() {
     let tailscale_v4 = "100.84.190.40:51820".to_string();
     let tailscale_v6 = "[fd7a:115c:a1e0::e136:be29]:51820".to_string();
     let p2wlan_overlay = "10.20.0.13:51820".to_string();
@@ -171,11 +171,15 @@ fn signal_candidate_cap_does_not_preserve_external_overlay_hosts_over_public_pre
     truncate_signal_candidates(&mut candidates, &mut sources);
 
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
-    assert!(!candidates.contains(&tailscale_v4));
-    assert!(!candidates.contains(&tailscale_v6));
-    assert!(!candidates.contains(&p2wlan_overlay));
-    assert!(candidates
-        .iter()
-        .all(|endpoint| endpoint.starts_with("220.163.6.190:")));
+    assert!(candidates.contains(&tailscale_v4));
+    assert!(candidates.contains(&tailscale_v6));
+    assert!(candidates.contains(&p2wlan_overlay));
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|endpoint| endpoint.starts_with("220.163.6.190:"))
+            .count(),
+        MAX_SIGNAL_CANDIDATES - 3
+    );
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
 }

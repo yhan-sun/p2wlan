@@ -1,10 +1,10 @@
 impl UdpTransport {
-    /// Keep a mapping-dependent local NAT binding warm toward one stable peer endpoint.
+    /// Keep mapping-dependent local NAT bindings warm toward one stable peer endpoint.
     ///
     /// This is intentionally separate from the bounded candidate punch: a
     /// symmetric/hard NAT side should maintain one destination-specific binding
-    /// with the primary socket while the easier peer scans the hard side's
-    /// predicted/birthday window.
+    /// from every bound traversal socket while the easier peer scans the hard
+    /// side's predicted/birthday window.
     pub async fn spawn_nat_binding_maintainer(
         &self,
         peer_id: &str,
@@ -16,136 +16,232 @@ impl UdpTransport {
             return false;
         }
 
-        let key = (peer_id.to_string(), endpoint);
         let now = Instant::now();
         let expires_at = now + duration;
-        {
-            let mut maintainers = self.nat_maintainers.lock().await;
-            maintainers.retain(|_, expires_at| *expires_at > now);
-            if maintainers.contains_key(&key) {
-                self.peers
-                    .record_direct_event(
-                        peer_id,
-                        "nat_maintainer_suppressed",
-                        Some(endpoint),
-                        Some(1),
-                        None,
-                        "suppressed overlapping NAT-state maintainer for this peer endpoint",
-                    )
-                    .await;
-                return false;
-            }
-            maintainers.insert(key.clone(), expires_at);
+        let socket_count = self.socket_count();
+        if socket_count == 0 {
+            return false;
         }
 
-        let transport = self.clone();
-        let peers = self.peers.clone();
-        let peer_id = peer_id.to_string();
-        tokio::spawn(async move {
-            peers
+        let mut started_socket_leases = Vec::with_capacity(socket_count);
+        let mut suppressed_socket_indices = Vec::new();
+        {
+            let mut maintainers = self.nat_maintainers.lock().await;
+            maintainers.retain(|_, lease| lease.expires_at > now);
+
+            for socket_index in 0..socket_count {
+                let key = (peer_id.to_string(), endpoint, socket_index);
+                if let Some(existing_lease) = maintainers.get_mut(&key) {
+                    existing_lease.renew_until(expires_at);
+                    suppressed_socket_indices.push(socket_index);
+                    continue;
+                }
+                let lease = NatMaintainerLease::new(expires_at);
+                let worker_token = lease.worker_token.clone();
+                maintainers.insert(key, lease);
+                started_socket_leases.push((socket_index, worker_token));
+            }
+        }
+
+        if !suppressed_socket_indices.is_empty() {
+            self.peers
                 .record_direct_event(
-                    &peer_id,
-                    "nat_maintainer_started",
+                    peer_id,
+                    "nat_maintainer_suppressed",
                     Some(endpoint),
-                    Some(1),
+                    Some(socket_count),
                     None,
                     format!(
-                        "maintaining hard-NAT binding toward stable endpoint for {}ms every {}ms",
-                        duration.as_millis(),
-                        interval.as_millis()
+                        "suppressed overlapping NAT-state maintainer sockets={suppressed_socket_indices:?} target={endpoint}"
                     ),
                 )
                 .await;
+        }
 
-            let started_at = Instant::now();
-            let deadline = started_at + duration;
-            let mut sent = 0u32;
-            let mut skipped = 0u32;
-            let mut last_skip_reason = None;
-            let mut stop_reason = "duration_elapsed";
+        if started_socket_leases.is_empty() {
+            return false;
+        }
 
-            loop {
-                if peers.is_direct(&peer_id).await {
-                    stop_reason = "direct_confirmed";
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
+        for (socket_index, worker_token) in started_socket_leases {
+            let transport = self.clone();
+            let peers = self.peers.clone();
+            let peer_id = peer_id.to_string();
+            let key = (peer_id.clone(), endpoint, socket_index);
+            let initial_delay = nat_maintainer_initial_delay(interval, socket_index, socket_count);
+            tokio::spawn(async move {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "nat_maintainer_started",
+                        Some(endpoint),
+                        Some(socket_count),
+                        None,
+                        format!(
+                            "maintaining hard-NAT binding socket_index={socket_index} target={endpoint} for {}ms every {}ms initial_delay_ms={}",
+                            duration.as_millis(),
+                            interval.as_millis(),
+                            initial_delay.as_millis()
+                        ),
+                    )
+                    .await;
 
-                match transport
-                    .admit_outbound_connectivity_probe(&peer_id, endpoint)
-                    .await
-                {
-                    OutboundProbeAdmission::Accepted => {
-                        match transport
-                            .send_probe_from_socket(0, Some(&peer_id), endpoint)
-                            .await
-                        {
-                            Ok(_) => {
-                                sent = sent.saturating_add(1);
-                                transport
-                                    .update_socket_diagnostics(0, |metrics| {
-                                        metrics.nat_maintainer_probes_sent =
-                                            metrics.nat_maintainer_probes_sent.saturating_add(1);
-                                    })
-                                    .await;
-                                peers.record_direct_probe_sent(&peer_id, endpoint).await;
-                            }
-                            Err(err) => {
-                                stop_reason = "send_error";
-                                peers
-                                    .record_direct_event(
-                                        &peer_id,
-                                        "nat_maintainer_send_error",
-                                        Some(endpoint),
-                                        Some(1),
-                                        Some(sent),
-                                        format!("NAT-state maintainer send failed: {err}"),
-                                    )
-                                    .await;
-                                break;
+                let mut sent = 0u32;
+                let mut skipped = 0u32;
+                let mut last_skip_reason = None;
+                let mut stop_reason = "duration_elapsed";
+                let mut lease_finished = false;
+
+                if !initial_delay.is_zero() {
+                    let lease_status = {
+                        let mut maintainers = transport.nat_maintainers.lock().await;
+                        nat_maintainer_lease_status(
+                            &mut maintainers,
+                            &key,
+                            &worker_token,
+                            Instant::now(),
+                        )
+                    };
+                    match lease_status {
+                        NatMaintainerLeaseStatus::Active(deadline) => {
+                            let remaining =
+                                deadline.saturating_duration_since(Instant::now());
+                            if !remaining.is_zero() {
+                                sleep(initial_delay.min(remaining)).await;
                             }
                         }
-                    }
-                    limited => {
-                        skipped = skipped.saturating_add(1);
-                        last_skip_reason = Some(outbound_probe_admission_reason(limited));
-                        transport
-                            .update_socket_diagnostics(0, |metrics| {
-                                metrics.nat_maintainer_probe_skips =
-                                    metrics.nat_maintainer_probe_skips.saturating_add(1);
-                            })
-                            .await;
+                        NatMaintainerLeaseStatus::Expired => {
+                            lease_finished = true;
+                        }
+                        NatMaintainerLeaseStatus::Replaced => {
+                            stop_reason = "lease_replaced";
+                            lease_finished = true;
+                        }
                     }
                 }
 
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
+                loop {
+                    if lease_finished {
+                        break;
+                    }
+                    if peers.is_direct(&peer_id).await {
+                        stop_reason = "direct_confirmed";
+                        break;
+                    }
+                    let lease_status = {
+                        let mut maintainers = transport.nat_maintainers.lock().await;
+                        nat_maintainer_lease_status(
+                            &mut maintainers,
+                            &key,
+                            &worker_token,
+                            Instant::now(),
+                        )
+                    };
+                    match lease_status {
+                        NatMaintainerLeaseStatus::Active(_) => {}
+                        NatMaintainerLeaseStatus::Expired => break,
+                        NatMaintainerLeaseStatus::Replaced => {
+                            stop_reason = "lease_replaced";
+                            break;
+                        }
+                    }
+
+                    match transport
+                        .admit_outbound_connectivity_probe(&peer_id, endpoint)
+                        .await
+                    {
+                        OutboundProbeAdmission::Accepted => {
+                            match transport
+                                .send_probe_from_socket(socket_index, Some(&peer_id), endpoint)
+                                .await
+                            {
+                                Ok(_) => {
+                                    sent = sent.saturating_add(1);
+                                    transport
+                                        .update_socket_diagnostics(socket_index, |metrics| {
+                                            metrics.nat_maintainer_probes_sent = metrics
+                                                .nat_maintainer_probes_sent
+                                                .saturating_add(1);
+                                        })
+                                        .await;
+                                    peers.record_direct_probe_sent(&peer_id, endpoint).await;
+                                }
+                                Err(err) => {
+                                    stop_reason = "send_error";
+                                    peers
+                                        .record_direct_event(
+                                            &peer_id,
+                                            "nat_maintainer_send_error",
+                                            Some(endpoint),
+                                            Some(socket_count),
+                                            Some(sent),
+                                            format!(
+                                                "NAT-state maintainer send failed socket_index={socket_index} target={endpoint}: {err}"
+                                            ),
+                                        )
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
+                        limited => {
+                            skipped = skipped.saturating_add(1);
+                            last_skip_reason = Some(outbound_probe_admission_reason(limited));
+                            transport
+                                .update_socket_diagnostics(socket_index, |metrics| {
+                                    metrics.nat_maintainer_probe_skips =
+                                        metrics.nat_maintainer_probe_skips.saturating_add(1);
+                                })
+                                .await;
+                        }
+                    }
+
+                    let lease_status = {
+                        let mut maintainers = transport.nat_maintainers.lock().await;
+                        nat_maintainer_lease_status(
+                            &mut maintainers,
+                            &key,
+                            &worker_token,
+                            Instant::now(),
+                        )
+                    };
+                    match lease_status {
+                        NatMaintainerLeaseStatus::Active(deadline) => {
+                            let remaining =
+                                deadline.saturating_duration_since(Instant::now());
+                            sleep(interval.min(remaining)).await;
+                        }
+                        NatMaintainerLeaseStatus::Expired => break,
+                        NatMaintainerLeaseStatus::Replaced => {
+                            stop_reason = "lease_replaced";
+                            break;
+                        }
+                    }
                 }
-                sleep(interval.min(remaining)).await;
-            }
 
-            peers
-                .record_direct_event(
-                    &peer_id,
-                    "nat_maintainer_stopped",
-                    Some(endpoint),
-                    Some(1),
-                    Some(sent),
-                    format!(
-                        "stopped NAT-state maintainer reason={stop_reason} sent={sent} skipped={skipped} last_skip_reason={}",
-                        last_skip_reason.unwrap_or("none")
-                    ),
-                )
-                .await;
+                {
+                    let mut maintainers = transport.nat_maintainers.lock().await;
+                    remove_nat_maintainer_lease_if_owned(
+                        &mut maintainers,
+                        &key,
+                        &worker_token,
+                    );
+                }
 
-            let mut maintainers = transport.nat_maintainers.lock().await;
-            if maintainers.get(&key).copied() == Some(expires_at) {
-                maintainers.remove(&key);
-            }
-        });
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "nat_maintainer_stopped",
+                        Some(endpoint),
+                        Some(socket_count),
+                        Some(sent),
+                        format!(
+                            "stopped NAT-state maintainer socket_index={socket_index} target={endpoint} reason={stop_reason} sent={sent} skipped={skipped} last_skip_reason={}",
+                            last_skip_reason.unwrap_or("none")
+                        ),
+                    )
+                    .await;
+            });
+        }
 
         true
     }
@@ -166,6 +262,7 @@ impl UdpTransport {
             PunchSocketPolicy::ActivePool,
         )
         .await
+        .map(|report| report.packets_sent)
     }
 
     /// Send active UDP probes from every bound socket for a remote hard-NAT
@@ -184,6 +281,29 @@ impl UdpTransport {
             probe_interval,
             attempts,
             PunchSocketPolicy::RemoteScatterPool,
+        )
+        .await
+        .map(|report| report.packets_sent)
+    }
+
+    /// Sweep a remote hard-NAT port window from one stable local socket.
+    ///
+    /// Using every local socket here only repeats each remote port and consumes
+    /// the 3,072-packet cap three times faster. The hard-NAT peer separately
+    /// keeps all of its destination-specific socket mappings alive.
+    pub(crate) async fn punch_candidates_stable_unique_scatter(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
+        self.punch_candidates_with_socket_policy(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::StableUniqueScatter,
         )
         .await
     }
@@ -210,6 +330,7 @@ impl UdpTransport {
             PunchSocketPolicy::PrimaryOnly,
         )
         .await
+        .map(|report| report.packets_sent)
     }
 
     async fn punch_candidates_with_socket_policy(
@@ -219,9 +340,9 @@ impl UdpTransport {
         probe_interval: Duration,
         attempts: u32,
         socket_policy: PunchSocketPolicy,
-    ) -> Result<u32> {
+    ) -> Result<PunchSendReport> {
         if candidates.is_empty() || attempts == 0 {
-            return Ok(0);
+            return Ok(PunchSendReport::default());
         }
 
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
@@ -242,7 +363,9 @@ impl UdpTransport {
         let mut alt_socket_sent = 0u32;
         let socket_count = socket_policy.socket_count(self);
         let session_probe_cap = match socket_policy {
-            PunchSocketPolicy::RemoteScatterPool => MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION,
+            PunchSocketPolicy::RemoteScatterPool | PunchSocketPolicy::StableUniqueScatter => {
+                MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION
+            }
             PunchSocketPolicy::ActivePool | PunchSocketPolicy::PrimaryOnly => {
                 MAX_PUNCH_PROBES_PER_SESSION
             }
@@ -286,6 +409,12 @@ impl UdpTransport {
                 if packets_sent >= session_probe_cap {
                     session_capped = true;
                     break 'schedule;
+                }
+                if socket_policy == PunchSocketPolicy::StableUniqueScatter
+                    && sent_endpoints.len() < candidates.len()
+                    && sent_endpoints.contains(&candidate)
+                {
+                    continue;
                 }
                 match self
                     .admit_outbound_connectivity_probe(peer_id, candidate)
@@ -393,9 +522,7 @@ impl UdpTransport {
                     candidates.first().copied(),
                     Some(candidates.len()),
                     Some(packets_sent),
-                    format!(
-                        "stopped UDP punch after the {session_probe_cap}-probe session cap"
-                    ),
+                    format!("stopped UDP punch after the {session_probe_cap}-probe session cap"),
                 )
                 .await;
         }
@@ -425,6 +552,7 @@ impl UdpTransport {
             }
             PunchSocketPolicy::ActivePool => "single_socket_scan_completed",
             PunchSocketPolicy::RemoteScatterPool => "single_socket_scan_completed",
+            PunchSocketPolicy::StableUniqueScatter => "stable_unique_scan_completed",
             PunchSocketPolicy::PrimaryOnly => "primary_socket_scan_completed",
         };
         self.peers
@@ -469,7 +597,10 @@ impl UdpTransport {
             session_capped
         );
 
-        Ok(packets_sent)
+        Ok(PunchSendReport {
+            packets_sent,
+            unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
+        })
     }
 
     /// Send a single encrypted packet.
@@ -660,4 +791,16 @@ impl UdpTransport {
             }
         }
     }
+}
+
+fn nat_maintainer_initial_delay(
+    interval: Duration,
+    socket_index: usize,
+    socket_count: usize,
+) -> Duration {
+    if socket_index == 0 || socket_count <= 1 {
+        return Duration::ZERO;
+    }
+
+    interval.mul_f64(socket_index as f64 / socket_count as f64)
 }

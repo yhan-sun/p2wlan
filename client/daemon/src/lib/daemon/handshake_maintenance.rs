@@ -2,17 +2,18 @@ struct HandshakeMaintenanceContext {
     peers: Arc<PeerManager>,
     transport: WireGuardTransport,
     pending: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
+    handshake_arbiter: HandshakeArbiter,
     control: ControlClient,
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: Arc<RwLock<Vec<String>>>,
+    candidate_refresh_lock: Arc<Mutex<()>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
     runtime_stun_timeout: Arc<RwLock<Duration>>,
     udp_advertise: Option<String>,
     node_private_key: String,
-    node_public_key: String,
 }
 
 async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
@@ -20,17 +21,18 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         peers,
         transport,
         pending,
+        handshake_arbiter,
         control,
         local_candidates,
         local_candidate_sources,
         local_network_identity,
+        candidate_refresh_lock,
         nat_profile,
         udp_transport,
         runtime_stun_servers,
         runtime_stun_timeout,
         udp_advertise,
         node_private_key,
-        node_public_key,
     } = ctx;
 
     let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -41,20 +43,26 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             if !conn.online {
                 continue;
             }
+            let _handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
             // Establish missing sessions and refresh sessions that need rekey.
-            let has_session = transport.has_session(&conn.node_id).await;
-            let needs = transport.session_needs_rekey(&conn.node_id).await;
-            let expired = transport.session_is_expired(&conn.node_id).await;
-            if has_session && !needs && !expired {
+            let status = transport.session_status(&conn.node_id).await;
+            if status.has_pending_responder {
+                debug!(
+                    "Responder rekey for {} is awaiting authenticated confirmation; suppressing a crossing initiator offer",
+                    conn.node_id
+                );
                 continue;
             }
-            let is_rekey = has_session;
-            if !has_session {
+            if status.has_active && !status.needs_rekey && !status.expired {
+                continue;
+            }
+            let is_rekey = status.has_active;
+            if !status.has_active {
                 debug!(
                     "No WireGuard session for {}; retrying handshake",
                     conn.node_id
                 );
-            } else if expired {
+            } else if status.expired {
                 info!(
                     "Session for peer {} expired; rekeying before dropping old session",
                     conn.node_id
@@ -102,12 +110,6 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 debug!("No control peer info for handshake with {}", conn.node_id);
                 continue;
             };
-            if node_public_key >= peer_info.public_key {
-                // Let the other side initiate.
-                pending.lock().await.cancel_reservation(&conn.node_id);
-                continue;
-            }
-
             let Ok(private_key) =
                 decode_x25519_key(&node_private_key, "node private key")
             else {
@@ -121,6 +123,14 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 continue;
             };
             let identity = NodeIdentity::from_private_key(private_key);
+            if !local_is_designated_handshake_initiator(
+                &identity.public_key(),
+                &peer_public,
+            ) {
+                // Let the deterministically selected peer initiate.
+                pending.lock().await.cancel_reservation(&conn.node_id);
+                continue;
+            }
             let mut initiator =
                 HandshakeInitiator::new(identity, peer_public, None);
             let Ok(initiation) = initiator.create_initiation() else {
@@ -138,6 +148,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 &local_candidates,
                 &local_candidate_sources,
                 &local_network_identity,
+                &candidate_refresh_lock,
                 &nat_profile,
                 "handshake maintenance",
             )
@@ -145,6 +156,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             let (candidates, candidate_sources) = if let Some(refreshed) = refreshed {
                 refreshed
             } else {
+                let _refresh_guard = candidate_refresh_lock.lock().await;
                 (
                     local_candidates.read().await.clone(),
                     local_candidate_sources.read().await.clone(),
@@ -157,22 +169,13 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // cancel once it has been replaced by a session that no longer needs
             // rekey. This avoids a brief no-session window that pushes traffic
             // through relay during otherwise healthy Direct paths.
-            let current_has_session = transport.has_session(&conn.node_id).await;
-            let current_needs = if is_rekey && current_has_session {
-                transport.session_needs_rekey(&conn.node_id).await
-            } else {
-                false
-            };
-            let current_expired = if is_rekey && current_has_session {
-                transport.session_is_expired(&conn.node_id).await
-            } else {
-                false
-            };
+            let current_status = transport.session_status(&conn.node_id).await;
             if should_cancel_maintenance_offer(
                 is_rekey,
-                current_has_session,
-                current_needs,
-                current_expired,
+                current_status.has_active,
+                current_status.needs_rekey,
+                current_status.expired,
+                current_status.has_pending_responder,
             ) {
                 pending.lock().await.cancel_reservation(&conn.node_id);
                 continue;
@@ -199,12 +202,42 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             }) else {
                 continue;
             };
-            peers
-                .set_probe_session_id(&conn.node_id, Some(session_id.clone()))
-                .await;
+            // An inbound responder rekey can be staged after the candidate
+            // refresh check above but before this initiator's Probe binding is
+            // staged. Re-check at the mutation boundary so the crossing
+            // initiator never overwrites the responder's pending binding.
+            let pre_probe_status = transport.session_status(&conn.node_id).await;
+            if should_cancel_maintenance_offer(
+                is_rekey,
+                pre_probe_status.has_active,
+                pre_probe_status.needs_rekey,
+                pre_probe_status.expired,
+                pre_probe_status.has_pending_responder,
+            ) {
+                pending.lock().await.remove(&conn.node_id);
+                continue;
+            }
+            if peers
+                .stage_probe_session_binding(
+                    &conn.node_id,
+                    session_id.clone(),
+                    Some(session_id.clone()),
+                    None,
+                    false,
+                )
+                .await
+                != ProbeBindingStage::Staged
+            {
+                pending.lock().await.remove(&conn.node_id);
+                warn!(
+                    "Failed to stage Probe v2 binding for handshake with {}",
+                    conn.node_id
+                );
+                continue;
+            }
 
             let punch_at_ms = Some(relay_assisted_punch_at_ms());
-            if let Err(err) = control
+            let offer_result = control
                 .send_peer_offer_with_sources_punch_and_session(
                     &conn.node_id,
                     &candidates,
@@ -214,15 +247,8 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     Some(session_id.clone()),
                     Some(probe_ephemeral_public_key.clone()),
                 )
-                .await
-            {
-                warn!("Handshake offer to {} failed: {err}", conn.node_id);
-                let mut state = pending.lock().await;
-                if state.is_current(&conn.node_id, pending_id) {
-                    state.remove(&conn.node_id);
-                    peers.set_probe_session_id(&conn.node_id, None).await;
-                }
-            } else {
+                .await;
+            if offer_result.is_ok() {
                 if is_rekey {
                     info!(
                         "Rekey: sent handshake initiation to {} ({} bytes, attempt {})",
@@ -238,35 +264,62 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         attempt_no
                     );
                 }
-                // Timeout cleanup
-                let pending2 = pending.clone();
-                let timeout_peer = conn.node_id.clone();
-                let transport2 = transport.clone();
-                let peers2 = peers.clone();
-                let generation = peers.current_network_generation().await;
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS))
+            } else {
+                warn!(
+                    "Handshake offer delivery to {} is ambiguous; retaining pending handshake until timeout",
+                    conn.node_id
+                );
+            }
+
+            // Timeout cleanup runs for both successful and delivery-ambiguous
+            // control requests. The short rekey timeout permits retries well
+            // before the old WireGuard session reaches hard reject.
+            let pending2 = pending.clone();
+            let timeout_peer = conn.node_id.clone();
+            let transport2 = transport.clone();
+            let peers2 = peers.clone();
+            let timeout_session_id = session_id;
+            let timeout_secs = if is_rekey {
+                REKEY_HANDSHAKE_TIMEOUT_SECS
+            } else {
+                HANDSHAKE_TIMEOUT_SECS
+            };
+            let generation = peers.current_network_generation().await;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+                let status = transport2.session_status(&timeout_peer).await;
+                if !is_rekey && !status.has_active {
+                    warn!("Handshake timeout for peer {timeout_peer}");
+                    peers2
+                        .record_direct_failure_for_generation(
+                            &timeout_peer,
+                            generation,
+                            REASON_HANDSHAKE_TIMEOUT,
+                            "handshake timed out",
+                        )
                         .await;
-                    if !transport2.has_session(&timeout_peer).await {
-                        warn!("Handshake timeout for peer {timeout_peer}");
-                        peers2
-                            .record_direct_failure_for_generation(
-                                &timeout_peer,
-                                generation,
-                                REASON_HANDSHAKE_TIMEOUT,
-                                "handshake timed out",
-                            )
-                            .await;
-                    }
+                }
+                let removed = {
                     let mut state = pending2.lock().await;
                     if state.is_current(&timeout_peer, pending_id) {
                         state.remove(&timeout_peer);
                         if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
                             state.attempts.remove(&timeout_peer);
                         }
+                        true
+                    } else {
+                        false
                     }
-                });
-            }
+                };
+                if removed {
+                    peers2
+                        .discard_pending_probe_session_binding(
+                            &timeout_peer,
+                            &timeout_session_id,
+                        )
+                        .await;
+                }
+            });
         }
     }
 
@@ -283,9 +336,11 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     local_candidates: &Arc<RwLock<Vec<String>>>,
     local_candidate_sources: &Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: &Arc<RwLock<Vec<String>>>,
+    candidate_refresh_lock: &Arc<Mutex<()>>,
     nat_profile: &Arc<RwLock<Option<NatProfile>>>,
     reason: &str,
 ) -> Option<(Vec<String>, HashMap<String, String>)> {
+    let refresh_guard = candidate_refresh_lock.lock().await;
     let udp = udp_transport.read().await.clone()?;
     let stun_servers = runtime_stun_servers.read().await.clone();
     if stun_servers.is_empty() {
@@ -326,16 +381,12 @@ async fn refresh_candidate_cache_for_maintenance_signal(
 
     let previous_candidates = local_candidates.read().await.clone();
     let previous_candidate_sources = local_candidate_sources.read().await.clone();
-    preserve_peer_reflexive_candidates(
+    let next_network_identity = prepare_signal_candidates_and_network_identity(
         &previous_candidates,
         &previous_candidate_sources,
         &mut candidates,
         &mut candidate_sources,
     );
-    compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
-    truncate_signal_candidates(&mut candidates, &mut candidate_sources);
-
-    let next_network_identity = stable_network_candidate_signature(&candidates, &candidate_sources);
     let previous_network_identity = local_network_identity.read().await.clone();
     let should_advance_generation =
         !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
@@ -361,9 +412,12 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     }
 
     if let Some(endpoint) = control_udp_endpoint_from_candidates(&candidates, &candidate_sources) {
+        drop(refresh_guard);
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
             warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
         }
+    } else {
+        drop(refresh_guard);
     }
 
     Some((candidates, candidate_sources))

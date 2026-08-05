@@ -67,6 +67,7 @@ fn build_timestamp() -> [u8; TIMESTAMP_SIZE] {
 // =============================================================================
 
 /// State for the initiator side of a Noise IK handshake.
+#[derive(Clone)]
 pub struct HandshakeInitiator {
     /// The initiator's node identity (static key pair).
     identity: NodeIdentity,
@@ -169,6 +170,17 @@ impl HandshakeInitiator {
     ///
     /// Returns the transport session keys.
     pub fn consume_response(&mut self, msg: &MessageResponse) -> Result<TransportKeyPair> {
+        // Authentication is the final operation in a Noise response.  Work on
+        // a clone so a response with the right receiver index but an invalid
+        // tag cannot mutate the pending initiator and poison a later valid
+        // response.
+        let mut staged = self.clone();
+        let keys = staged.consume_response_inner(msg)?;
+        *self = staged;
+        Ok(keys)
+    }
+
+    fn consume_response_inner(&mut self, msg: &MessageResponse) -> Result<TransportKeyPair> {
         // Verify receiver_index matches our sender_index
         if msg.receiver_index != self.sender_index {
             return Err(WireGuardError::HandshakeFailed(format!(

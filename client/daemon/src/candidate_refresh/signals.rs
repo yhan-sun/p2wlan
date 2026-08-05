@@ -211,6 +211,20 @@ pub(super) fn truncate_signal_candidates(
             .map(|(index, endpoint)| (endpoint.clone(), index))
             .collect::<HashMap<_, _>>();
         let predicted_order = balanced_predicted_signal_order(candidates, candidate_sources);
+        let mut retained_lan_hosts = candidates
+            .iter()
+            .filter(|endpoint| {
+                is_physical_lan_host_signal_candidate(
+                    endpoint,
+                    candidate_sources.get(*endpoint).map(String::as_str),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        retained_lan_hosts.sort();
+        retained_lan_hosts.truncate(MAX_SIGNAL_LAN_HOST_CANDIDATES);
+        let retained_lan_host_set = retained_lan_hosts.iter().cloned().collect::<HashSet<_>>();
+
         candidates.sort_by(|left, right| {
             compare_signal_candidates(
                 left,
@@ -225,10 +239,29 @@ pub(super) fn truncate_signal_candidates(
             candidates.len(),
             MAX_SIGNAL_CANDIDATES
         );
-        candidates.truncate(MAX_SIGNAL_CANDIDATES);
+        let public_budget = MAX_SIGNAL_CANDIDATES.saturating_sub(retained_lan_hosts.len());
+        let mut retained = candidates
+            .iter()
+            .filter(|endpoint| !retained_lan_host_set.contains(*endpoint))
+            .take(public_budget)
+            .cloned()
+            .collect::<Vec<_>>();
+        retained.extend(retained_lan_hosts);
+        *candidates = retained;
     }
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
+}
+
+fn is_physical_lan_host_signal_candidate(endpoint: &str, source: Option<&str>) -> bool {
+    if source != Some("host") {
+        return false;
+    }
+    endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
+        !candidate.ip().is_unspecified()
+            && !candidate.ip().is_loopback()
+            && !is_public_udp_candidate(candidate)
+    })
 }
 
 fn compare_signal_candidates(
@@ -389,24 +422,55 @@ pub(super) fn preserve_peer_reflexive_candidates(
     }
 }
 
+/// Build the canonical local network identity from the complete candidate
+/// snapshot, then apply the smaller control-plane signaling budget.
+///
+/// Network identity must not depend on which entries happen to fit inside the
+/// 96-candidate wire limit. In particular, hard-NAT prediction windows can
+/// fill that limit and otherwise hide the physical LAN host address.
+pub(super) fn prepare_signal_candidates_and_network_identity(
+    previous_candidates: &[String],
+    previous_candidate_sources: &HashMap<String, String>,
+    candidates: &mut Vec<String>,
+    candidate_sources: &mut HashMap<String, String>,
+) -> Vec<String> {
+    preserve_peer_reflexive_candidates(
+        previous_candidates,
+        previous_candidate_sources,
+        candidates,
+        candidate_sources,
+    );
+    let network_identity = stable_network_candidate_signature(candidates, candidate_sources);
+    compact_volatile_public_signal_candidates(candidates, candidate_sources);
+    truncate_signal_candidates(candidates, candidate_sources);
+    network_identity
+}
+
+pub(super) fn candidate_refresh_requires_commit(
+    real_candidate_change: bool,
+    should_advance_generation: bool,
+) -> bool {
+    real_candidate_change || should_advance_generation
+}
+
 pub(super) fn add_peer_reflexive_candidate_to_set(
     observed_endpoint: &str,
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
 ) -> std::result::Result<bool, std::net::AddrParseError> {
     let endpoint = observed_endpoint.parse::<SocketAddr>()?.to_string();
-    let already_present = candidates.contains(&endpoint);
-    let source_changed =
-        candidate_sources.get(&endpoint).map(String::as_str) != Some("peer_reflexive");
-
-    if !already_present {
-        candidates.insert(0, endpoint.clone());
+    if candidates.contains(&endpoint) {
+        // The endpoint is already advertised. Keep its existing global source
+        // evidence (especially STUN or gateway mapping) instead of repeatedly
+        // relabeling it as peer-specific evidence on every observation.
+        return Ok(false);
     }
+    candidates.insert(0, endpoint.clone());
     candidate_sources.insert(endpoint, "peer_reflexive".to_string());
     compact_volatile_public_signal_candidates(candidates, candidate_sources);
     truncate_signal_candidates(candidates, candidate_sources);
 
-    Ok(!already_present || source_changed)
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -508,7 +572,6 @@ pub(super) fn stable_network_candidate_signature(
             .map(String::as_str)
             .unwrap_or("signaled");
         match endpoint.parse::<SocketAddr>() {
-            Ok(addr) if is_external_overlay_udp_candidate(addr) => {}
             Ok(addr) if is_public_udp_candidate(addr) => {
                 // Port churn and candidate-source promotion do not mean the
                 // host changed networks. A public IP change does.
@@ -558,12 +621,5 @@ fn is_public_udp_candidate(candidate: SocketAddr) -> bool {
                 && !ip.is_unique_local()
                 && (ip.segments()[0] & 0xffc0) != 0xfe80
         }
-    }
-}
-
-fn is_external_overlay_udp_candidate(candidate: SocketAddr) -> bool {
-    match candidate.ip() {
-        IpAddr::V4(ip) => is_shared_ipv4(ip),
-        IpAddr::V6(ip) => ip.is_unique_local(),
     }
 }

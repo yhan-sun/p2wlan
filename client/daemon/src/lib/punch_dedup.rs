@@ -168,7 +168,11 @@ fn should_cancel_maintenance_offer(
     has_session: bool,
     needs_rekey: bool,
     expired: bool,
+    has_pending_responder: bool,
 ) -> bool {
+    if has_pending_responder {
+        return true;
+    }
     if is_rekey {
         has_session && !needs_rekey && !expired
     } else {

@@ -200,6 +200,66 @@ impl PeerConnection {
         probed_sources
     }
 
+    /// Mark only the candidate pairs that were part of a completed probe
+    /// window as failed.  A stable-side birthday sweep deliberately probes a
+    /// different absolute-port window on each pass, so applying failure to
+    /// every current candidate would incorrectly penalize endpoints that were
+    /// not sent in this pass.
+    fn mark_candidate_pairs_failed_for_endpoints(
+        &mut self,
+        local_generation: u64,
+        endpoints: &[SocketAddr],
+        code: impl Into<String>,
+        reason: impl Into<String>,
+        local_endpoint: Option<SocketAddr>,
+    ) -> Vec<CandidatePairSource> {
+        let code = code.into();
+        let reason = reason.into();
+        let local_endpoint_text = format_log_endpoint(local_endpoint);
+        let peer_id = self.node_id.clone();
+        let mut probed_sources = Vec::new();
+        let mut seen_endpoints = Vec::new();
+
+        for endpoint in endpoints.iter().copied() {
+            if seen_endpoints.contains(&endpoint) {
+                continue;
+            }
+            seen_endpoints.push(endpoint);
+
+            let Some(pair) = self.candidate_pairs.iter_mut().find(|pair| {
+                pair.local_generation == local_generation
+                    && pair.remote_endpoint == endpoint
+                    && pair.last_probe_at.is_some()
+            }) else {
+                continue;
+            };
+
+            if !probed_sources.contains(&pair.source) {
+                probed_sources.push(pair.source);
+            }
+            let candidate_source = pair.source;
+            let rtt_ms = pair.rtt_ewma_ms.or(pair.rtt_ms);
+            let old_state = pair.state;
+            pair.record_failure(code.clone(), reason.clone(), local_endpoint);
+            log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
+            debug!(
+                event = "candidate_pair_probe_window_missed",
+                peer_id = %peer_id,
+                local_endpoint = %local_endpoint_text,
+                remote_endpoint = %endpoint,
+                candidate_source = ?candidate_source,
+                rtt_ms = ?rtt_ms,
+                reason = %reason,
+                "candidate_pair_probe_window_missed peer_id={} remote_endpoint={} reason={}",
+                peer_id,
+                endpoint,
+                reason
+            );
+        }
+
+        probed_sources
+    }
+
     fn mark_network_generation_changed(
         &mut self,
         local_generation: u64,

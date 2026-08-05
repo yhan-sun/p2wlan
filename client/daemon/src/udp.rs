@@ -27,8 +27,10 @@ use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
 use crate::error::{DaemonError, Result};
-use crate::peer::{PeerManager, REASON_DIRECT_SEND_FAILED};
-use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
+use crate::peer::{PeerManager, ProbeKeyRole, REASON_DIRECT_SEND_FAILED};
+use crate::transport::{
+    EncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionConfirmation, WireGuardTransport,
+};
 
 mod probe_budget;
 use probe_budget::{

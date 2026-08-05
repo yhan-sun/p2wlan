@@ -2,6 +2,26 @@
 // Peer Connection
 // ============================================================
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeSessionBinding {
+    token: Option<String>,
+    session_id: Option<String>,
+    ephemeral_shared: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedProbeSessionBinding {
+    binding: ProbeSessionBinding,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProbeSessionBinding {
+    binding: ProbeSessionBinding,
+    expires_at: Instant,
+    promote_on_match: bool,
+}
+
 /// Information about a connection to a specific peer.
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -19,6 +39,13 @@ pub struct PeerConnection {
     pub probe_session_id: Option<String>,
     /// Session-local X25519 shared secret used to rotate Probe v2 MAC keys.
     pub probe_ephemeral_shared: Option<[u8; 32]>,
+    /// Opaque handshake token associated with the current Probe-v2 binding.
+    probe_binding_token: Option<String>,
+    /// Replacement Probe-v2 binding staged transactionally during a handshake.
+    pending_probe_bindings: HashMap<String, PendingProbeSessionBinding>,
+    /// Prior Probe-v2 binding accepted during a rekey overlap or restored when
+    /// publishing the replacement offer fails.
+    previous_probe_binding: Option<RetainedProbeSessionBinding>,
     /// Peer's virtual IP.
     pub virtual_ip: String,
     /// Peer's public endpoint (ip:port) if known.
@@ -65,6 +92,9 @@ pub struct PeerConnection {
     direct_reclaim_until: Option<Instant>,
     /// Direct candidate-pair reachability table.
     pub candidate_pairs: Vec<CandidatePair>,
+    /// Wide birthday rank committed by the last fully covered stable-side scan.
+    /// Candidate source refreshes and Probe-v2 rekeys intentionally preserve it.
+    birthday_probe_cursor: usize,
     /// Last selector decision made for outbound peer traffic.
     pub last_path_selection: Option<PathSelection>,
     /// Recent real outbound path-selector transitions.
@@ -84,6 +114,9 @@ impl PeerConnection {
             probe_mac_key: None,
             probe_session_id: None,
             probe_ephemeral_shared: None,
+            probe_binding_token: None,
+            pending_probe_bindings: HashMap::new(),
+            previous_probe_binding: None,
             virtual_ip: virtual_ip.to_string(),
             endpoint: None,
             signaled_endpoint: None,
@@ -106,6 +139,7 @@ impl PeerConnection {
             direct_generation: 0,
             direct_reclaim_until: None,
             candidate_pairs: Vec::new(),
+            birthday_probe_cursor: 0,
             last_path_selection: None,
             path_events: Vec::new(),
             direct_events: Vec::new(),
@@ -116,6 +150,9 @@ impl PeerConnection {
         self.endpoint = self.signaled_endpoint;
         self.probe_session_id = None;
         self.probe_ephemeral_shared = None;
+        self.probe_binding_token = None;
+        self.pending_probe_bindings.clear();
+        self.previous_probe_binding = None;
         self.candidates.clear();
         self.signaled_candidates.clear();
         self.last_candidate_generation = 0;
@@ -129,6 +166,7 @@ impl PeerConnection {
         self.direct_generation = 0;
         self.direct_reclaim_until = None;
         self.candidate_pairs.clear();
+        self.birthday_probe_cursor = 0;
         self.last_path_selection = None;
         self.path_events.clear();
         self.direct_events.clear();

@@ -5,9 +5,11 @@ pub(super) fn apply_adaptive_probe_budgets<'a>(
     stats: &[CandidatePairSourceStats],
     history: &TraversalHistory,
     mode: ProbeTargetMode,
+    birthday_budget_override: Option<usize>,
 ) -> Vec<&'a CandidatePair> {
     let predicted_budget = predicted_probe_budget_for_mode(stats, history, mode);
-    let birthday_budget = birthday_probe_budget_for_pairs(history, &pairs);
+    let birthday_budget = birthday_budget_override
+        .unwrap_or_else(|| birthday_probe_budget_for_pairs(history, &pairs));
     let mut predicted_used = 0usize;
     let mut birthday_used = 0usize;
 

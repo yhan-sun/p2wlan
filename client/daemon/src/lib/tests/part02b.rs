@@ -112,14 +112,14 @@ fn peer_reflexive_candidate_update_is_idempotent_after_first_advertisement() {
 }
 
 #[test]
-fn peer_reflexive_candidate_update_reports_source_upgrade_once() {
+fn existing_stun_candidate_is_not_relabelled_peer_reflexive() {
     let mut candidates = vec!["93.184.216.34:45000".to_string()];
     let mut sources = HashMap::from([(
         "93.184.216.34:45000".to_string(),
         "stun_observed".to_string(),
     )]);
 
-    assert!(add_peer_reflexive_candidate_to_set(
+    assert!(!add_peer_reflexive_candidate_to_set(
         "93.184.216.34:45000",
         &mut candidates,
         &mut sources,
@@ -133,7 +133,38 @@ fn peer_reflexive_candidate_update_reports_source_upgrade_once() {
     .unwrap());
     assert_eq!(
         sources.get("93.184.216.34:45000").map(String::as_str),
-        Some("peer_reflexive")
+        Some("stun_observed")
+    );
+}
+
+#[test]
+fn stun_rediscovery_then_peer_reflexive_observation_is_stable() {
+    let endpoint = "93.184.216.34:45000".to_string();
+    let previous = vec![endpoint.clone()];
+    let previous_sources = HashMap::from([(endpoint.clone(), "peer_reflexive".to_string())]);
+    let mut refreshed = vec![endpoint.clone()];
+    let mut refreshed_sources =
+        HashMap::from([(endpoint.clone(), "stun_observed".to_string())]);
+
+    preserve_peer_reflexive_candidates(
+        &previous,
+        &previous_sources,
+        &mut refreshed,
+        &mut refreshed_sources,
+    );
+    assert_eq!(
+        refreshed_sources.get(&endpoint).map(String::as_str),
+        Some("stun_observed")
+    );
+    assert!(!add_peer_reflexive_candidate_to_set(
+        &endpoint,
+        &mut refreshed,
+        &mut refreshed_sources,
+    )
+    .unwrap());
+    assert_eq!(
+        refreshed_sources.get(&endpoint).map(String::as_str),
+        Some("stun_observed")
     );
 }
 

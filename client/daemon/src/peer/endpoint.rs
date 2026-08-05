@@ -77,7 +77,7 @@ pub(super) fn is_low_latency_direct_endpoint(endpoint: SocketAddr) -> bool {
     is_private_direct_endpoint(endpoint) && !is_overlay_endpoint(endpoint)
 }
 
-pub(super) fn is_overlay_endpoint(endpoint: SocketAddr) -> bool {
+pub(crate) fn is_overlay_endpoint(endpoint: SocketAddr) -> bool {
     match endpoint.ip() {
         IpAddr::V4(ip) => {
             let octets = ip.octets();

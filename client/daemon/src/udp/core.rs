@@ -21,6 +21,7 @@ pub struct UdpTransport {
     outbound_probe_budget: OutboundProbeBudgetState,
     global_outbound_probe_budget: Option<Arc<GlobalOutboundProbeBudget>>,
     local_node_id: Option<String>,
+    wireguard_transport: Option<WireGuardTransport>,
 }
 
 impl UdpTransport {
@@ -51,6 +52,7 @@ impl UdpTransport {
             outbound_probe_budget: Arc::new(Mutex::new(HashMap::new())),
             global_outbound_probe_budget: default_global_outbound_probe_budget(),
             local_node_id: None,
+            wireguard_transport: None,
         })
     }
 
@@ -201,6 +203,13 @@ impl UdpTransport {
     /// Attach the local control-plane node ID used by authenticated UDP Probe v2.
     pub fn with_local_node_id(mut self, node_id: impl Into<String>) -> Self {
         self.local_node_id = Some(node_id.into());
+        self
+    }
+
+    /// Attach the WireGuard session registry so an authenticated pending
+    /// Probe-v2 packet confirms the matching responder session first.
+    pub fn with_wireguard_transport(mut self, transport: WireGuardTransport) -> Self {
+        self.wireguard_transport = Some(transport);
         self
     }
 

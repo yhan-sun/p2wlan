@@ -13,15 +13,20 @@ pub struct Daemon {
     /// Shared WireGuard transport session adapter.
     transport: WireGuardTransport,
     /// Encrypted outbound packets emitted by the WireGuard adapter.
-    encrypted_rx: Option<mpsc::Receiver<EncryptedPeerPacket>>,
+    encrypted_rx: Option<mpsc::Receiver<OrderedEncryptedPeerPacket>>,
     /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
     pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
+    /// Serializes offer, answer, and maintenance mutations for one peer.
+    handshake_arbiter: HandshakeArbiter,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Local-only source metadata keyed by candidate endpoint string.
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     /// Stable physical/public identity used for network-generation changes.
     local_network_identity: Arc<RwLock<Vec<String>>>,
+    /// Serializes candidate gathering/commit so endpoints, sources, identity,
+    /// and generation advance as one coherent snapshot.
+    candidate_refresh_lock: Arc<Mutex<()>>,
     /// Latest local NAT behavior profile inferred from STUN observations.
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Cached gateway mapping lifecycle and structured diagnostics.
@@ -85,9 +90,11 @@ impl Daemon {
             transport,
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
+            handshake_arbiter: HandshakeArbiter::default(),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             local_network_identity: Arc::new(RwLock::new(Vec::new())),
+            candidate_refresh_lock: Arc::new(Mutex::new(())),
             nat_profile: Arc::new(RwLock::new(None)),
             gateway_mapping_runtime: Arc::new(RwLock::new(GatewayMappingRuntime::default())),
             gateway_mapping_diagnostics: Arc::new(RwLock::new(GatewayMappingDiagnostics {

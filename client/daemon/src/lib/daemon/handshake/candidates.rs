@@ -1,12 +1,19 @@
 impl Daemon {
+    async fn current_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
+        let _refresh_guard = self.candidate_refresh_lock.lock().await;
+        (
+            self.local_candidates.read().await.clone(),
+            self.local_candidate_sources.read().await.clone(),
+        )
+    }
+
     async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(50);
         let timeout = Duration::from_millis(CANDIDATE_READY_TIMEOUT_MS);
 
         loop {
-            let candidates = self.local_candidates.read().await.clone();
-            let candidate_sources = self.local_candidate_sources.read().await.clone();
+            let (candidates, candidate_sources) = self.current_local_candidate_set().await;
             if !candidates.is_empty() {
                 return (candidates, candidate_sources);
             }
@@ -38,6 +45,7 @@ impl Daemon {
     }
 
     async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) -> bool {
+        let _refresh_guard = self.candidate_refresh_lock.lock().await;
         let mut candidates = self.local_candidates.write().await;
         let mut candidate_sources = self.local_candidate_sources.write().await;
         match add_peer_reflexive_candidate_to_set(
@@ -76,10 +84,7 @@ impl Daemon {
         {
             refreshed
         } else {
-            (
-                self.local_candidates.read().await.clone(),
-                self.local_candidate_sources.read().await.clone(),
-            )
+            self.current_local_candidate_set().await
         };
         if candidates.is_empty() {
             debug!("Local UDP candidates are not ready; skipping {reason} candidate publication to {node_id}");
@@ -133,6 +138,7 @@ impl Daemon {
         udp: &UdpTransport,
         reason: &str,
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
+        let refresh_guard = self.candidate_refresh_lock.lock().await;
         let stun_servers = self.runtime_stun_servers.read().await.clone();
         if stun_servers.is_empty() {
             return None;
@@ -182,17 +188,12 @@ impl Daemon {
 
         let previous_candidates = self.local_candidates.read().await.clone();
         let previous_candidate_sources = self.local_candidate_sources.read().await.clone();
-        preserve_peer_reflexive_candidates(
+        let next_network_identity = prepare_signal_candidates_and_network_identity(
             &previous_candidates,
             &previous_candidate_sources,
             &mut candidates,
             &mut candidate_sources,
         );
-        compact_volatile_public_signal_candidates(&mut candidates, &mut candidate_sources);
-        truncate_signal_candidates(&mut candidates, &mut candidate_sources);
-
-        let next_network_identity =
-            stable_network_candidate_signature(&candidates, &candidate_sources);
         let previous_network_identity = self.local_network_identity.read().await.clone();
         let should_advance_generation =
             !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
@@ -208,7 +209,7 @@ impl Daemon {
         let new_candidate_count = candidates.len();
         let real_change = change_reason != "no_change" && change_reason != "order_only";
 
-        if real_change || should_advance_generation {
+        if candidate_refresh_requires_commit(real_change, should_advance_generation) {
             *self.local_candidates.write().await = candidates.clone();
             *self.local_candidate_sources.write().await = candidate_sources.clone();
             *self.local_network_identity.write().await = next_network_identity;
@@ -236,9 +237,12 @@ impl Daemon {
         if let Some(endpoint) =
             control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
         {
+            drop(refresh_guard);
             if let Err(err) = self.control.update_endpoint(&endpoint, "unknown").await {
                 warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
             }
+        } else {
+            drop(refresh_guard);
         }
 
         Some((candidates, candidate_sources))

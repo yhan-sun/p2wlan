@@ -5,6 +5,7 @@ struct UdpDirectTaskContext {
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: Arc<RwLock<Vec<String>>>,
+    candidate_refresh_lock: Arc<Mutex<()>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
     gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
@@ -33,6 +34,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
         local_candidates,
         local_candidate_sources: udp_local_candidate_sources,
         local_network_identity,
+        candidate_refresh_lock,
         nat_profile,
         gateway_mapping_runtime,
         gateway_mapping_diagnostics,
@@ -55,6 +57,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
 
     match UdpTransport::bind(udp_bind, peers.clone()).await {
         Ok(udp) => {
+            let initial_refresh_guard = candidate_refresh_lock.lock().await;
             let udp = if socket_pool_enabled {
                 match udp.clone().with_socket_pool(socket_pool_size).await {
                     Ok(udp) => udp,
@@ -71,6 +74,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
             let (peer_reflexive_tx, peer_reflexive_rx) = mpsc::channel(128);
             let udp = udp
                 .with_local_node_id(local_node_id.clone())
+                .with_wireguard_transport(direct_validation_transport.clone())
                 .with_peer_reflexive_observer(peer_reflexive_tx);
             tokio::spawn(run_peer_reflexive_signal_loop(
                 peer_reflexive_rx,
@@ -118,8 +122,6 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                                 }
                             );
                         }
-                        *local_network_identity.write().await =
-                            stable_network_candidate_signature(&endpoints, &sources);
                         *nat_profile.write().await = Some(report.nat_profile);
                         (endpoints, sources)
                     }
@@ -172,10 +174,13 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                 )
                 .await;
             }
-            truncate_signal_candidates(
+            let initial_network_identity = prepare_signal_candidates_and_network_identity(
+                &[],
+                &HashMap::new(),
                 &mut candidate_endpoints,
                 &mut candidate_sources,
             );
+            *local_network_identity.write().await = initial_network_identity;
             let mut published_endpoint = None;
             if let Some(endpoint) = control_udp_endpoint_from_candidates(
                 &candidate_endpoints,
@@ -194,6 +199,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
             );
             *local_candidates.write().await = candidate_endpoints.clone();
             *udp_local_candidate_sources.write().await = candidate_sources.clone();
+            drop(initial_refresh_guard);
 
             publish_local_candidates_to_known_peers(
                 &control,
@@ -222,6 +228,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         local_candidates,
                         local_candidate_sources: udp_local_candidate_sources.clone(),
                         local_network_identity: local_network_identity.clone(),
+                        candidate_refresh_lock: candidate_refresh_lock.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
                         gateway_mapping_diagnostics,
@@ -248,6 +255,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         local_candidates,
                         local_candidate_sources: udp_local_candidate_sources.clone(),
                         local_network_identity: local_network_identity.clone(),
+                        candidate_refresh_lock: candidate_refresh_lock.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
                         gateway_mapping_diagnostics,
