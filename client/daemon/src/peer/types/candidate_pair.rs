@@ -77,6 +77,13 @@ pub struct CandidatePair {
     pub remote_endpoint: SocketAddr,
     /// Endpoint source used for probe ranking and diagnostics.
     pub source: CandidatePairSource,
+    /// Rank order within the signaled candidate list for `Predicted`
+    /// endpoints (0 = the sender's top-1 prediction).
+    ///
+    /// The stable side must probe the sender's predicted window in signal
+    /// order (top-1 first, then successors) so a linear-symmetric peer's
+    /// peer-facing mapping is hit before wider fallbacks.
+    pub signal_rank: Option<u32>,
     /// When this source/endpoint combination was last refreshed by a real
     /// signal or authenticated observation, not merely by scheduler reuse.
     pub source_observed_at: Option<Instant>,
@@ -128,6 +135,7 @@ impl CandidatePair {
             local_endpoint: None,
             remote_endpoint,
             source,
+            signal_rank: None,
             source_observed_at: Some(Instant::now()),
             local_generation,
             state: CandidatePairState::Waiting,

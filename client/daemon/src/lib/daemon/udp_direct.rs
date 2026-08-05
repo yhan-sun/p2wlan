@@ -75,6 +75,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
             let udp = udp
                 .with_local_node_id(local_node_id.clone())
                 .with_wireguard_transport(direct_validation_transport.clone())
+                .with_inbound_channel(udp_inbound_tx.clone())
                 .with_peer_reflexive_observer(peer_reflexive_tx);
             tokio::spawn(run_peer_reflexive_signal_loop(
                 peer_reflexive_rx,
@@ -211,6 +212,13 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                 udp_punch_interval,
                 udp_punch_attempts,
                 "initial UDP candidates ready",
+                Some(HolePunchSignalContext {
+                    control: control.clone(),
+                    local_candidates: local_candidates.clone(),
+                    local_candidate_sources: udp_local_candidate_sources.clone(),
+                    stun_servers: stun_servers.clone(),
+                    stun_timeout,
+                }),
             )
             .await;
 

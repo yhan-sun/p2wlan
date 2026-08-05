@@ -185,6 +185,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 probe_interval,
                 punch_attempts,
                 "UDP volatile candidate refresh",
+                Some(HolePunchSignalContext {
+                    control: control.clone(),
+                    local_candidates: local_candidates.clone(),
+                    local_candidate_sources: local_candidate_sources.clone(),
+                    stun_servers: stun_servers.clone(),
+                    stun_timeout,
+                }),
             )
             .await;
             continue;
@@ -205,6 +212,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             probe_interval,
             punch_attempts,
             "UDP candidate refresh",
+            Some(HolePunchSignalContext {
+                control: control.clone(),
+                local_candidates: local_candidates.clone(),
+                local_candidate_sources: local_candidate_sources.clone(),
+                stun_servers: stun_servers.clone(),
+                stun_timeout,
+            }),
         )
         .await;
     }
@@ -221,6 +235,7 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     probe_interval: Duration,
     attempts: u32,
     reason: &str,
+    signal: Option<HolePunchSignalContext>,
 ) {
     if candidates.is_empty() {
         debug!("Skipping {reason} candidate publication because local candidate set is empty");
@@ -259,6 +274,7 @@ pub(super) async fn publish_local_candidates_to_known_peers(
             probe_interval,
             attempts,
             punch_at_ms,
+            signal.clone(),
         )
         .await;
     }

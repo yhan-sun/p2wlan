@@ -16,6 +16,7 @@ pub mod client;
 pub mod detection;
 pub mod error;
 pub mod ice;
+pub mod mapping;
 pub mod punch;
 pub mod stun;
 
@@ -28,6 +29,11 @@ pub use ice::{
     gather_candidate_report, gather_candidates, gather_local_addresses, CandidateGatherReport,
     FilteringBehavior, HairpinBehavior, IceConfig, MappingBehavior, MappingLifetime, NatProfile,
     StunObservation,
+};
+pub use mapping::{
+    build_model, build_model_for_batch, model_is_fresh, modular_add, modular_difference,
+    predict_ports, MappingBatch, MappingObservation, ModelRejection, PortModel, PortModelKind,
+    PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
 };
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,

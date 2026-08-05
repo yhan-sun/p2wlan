@@ -6,7 +6,7 @@
 //! - Falls back to relay when direct connection fails
 //! - Routes packets between TUN device and peer tunnels
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -239,11 +239,12 @@ pub use diagnostics::{
     PathHealthDiagnostics, PathSelectionEventDiagnostics, PeerDiagnostics, PeerManagerStats,
 };
 pub(crate) use endpoint::is_overlay_endpoint;
+pub(crate) use endpoint::is_public_probe_endpoint;
 use endpoint::{
     candidate_pair_failure_cooldown, candidate_pair_probe_due, candidate_pair_probe_rank_for_mode,
     classify_candidate_pair_path, classify_confirmed_direct_endpoint, endpoint_probe_rank,
-    is_low_latency_direct_endpoint, is_public_probe_endpoint,
-    should_retain_confirmed_direct_pair_on_candidate_refresh, should_retain_private_direct_pair,
+    is_low_latency_direct_endpoint, should_retain_confirmed_direct_pair_on_candidate_refresh,
+    should_retain_private_direct_pair,
 };
 #[cfg(test)]
 use probe_budget::birthday_probe_budget_for_base_count;
@@ -270,6 +271,7 @@ include!("peer/manager/path.rs");
 include!("peer/manager/direct_success.rs");
 include!("peer/manager/direct_failure.rs");
 include!("peer/manager/relay.rs");
+include!("peer/manager/fresh_mapping.rs");
 include!("peer/manager/diagnostics.rs");
 include!("peer/utils.rs");
 

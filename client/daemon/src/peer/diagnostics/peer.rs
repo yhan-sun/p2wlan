@@ -46,9 +46,12 @@ pub struct PeerDiagnostics {
     pub last_path_selection: Option<PathSelectionDiagnostics>,
     pub path_events: Vec<PathSelectionEventDiagnostics>,
     pub direct_events: Vec<DirectTraversalEventDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh_mapping: Vec<FreshMappingDiag>,
 }
 
 impl PeerDiagnostics {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_connection_with_path_selection(
         conn: &PeerConnection,
         current_selection: Option<&PathSelection>,
@@ -56,6 +59,7 @@ impl PeerDiagnostics {
         local_generation: u64,
         local_endpoint: Option<SocketAddr>,
         traversal_history: Option<&TraversalHistory>,
+        fresh_mapping_history: Option<&HashMap<String, VecDeque<FreshMappingPredictionResult>>>,
     ) -> Self {
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
@@ -224,6 +228,24 @@ impl PeerDiagnostics {
                 .iter()
                 .map(DirectTraversalEventDiagnostics::from)
                 .collect(),
+            fresh_mapping: fresh_mapping_history
+                .and_then(|history| history.get(&conn.node_id))
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| FreshMappingDiag {
+                            peer_id: conn.node_id.clone(),
+                            punch_generation: result.punch_generation,
+                            predicted_top: result.predicted_top_port,
+                            actual_port: result.actual_port,
+                            error: result.error,
+                            model: result.model_label.clone(),
+                            confidence: result.confidence,
+                            hit_window: result.hit_window,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -235,6 +257,7 @@ impl From<&PeerConnection> for PeerDiagnostics {
             None,
             None,
             conn.direct_generation,
+            None,
             None,
             None,
         )

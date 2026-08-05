@@ -18,6 +18,9 @@ impl PeerManager {
             local_nat_profile: Arc::new(RwLock::new(None)),
             traversal_history: Arc::new(RwLock::new(traversal_history)),
             traversal_history_path,
+            punch_generations: Arc::new(RwLock::new(HashMap::new())),
+            local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
+            fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -134,6 +137,8 @@ impl PeerManager {
                 direct_reclaim_count += 1;
             }
         }
+        drop(conns);
+        self.clear_all_fresh_mappings("network_generation_changed").await;
 
         info!(
             "Local network generation advanced to {generation}: {reason}; opened {direct_reclaim_count} Direct reclaim window(s)"
@@ -175,6 +180,8 @@ impl PeerManager {
                 direct_reclaim_count += 1;
             }
         }
+        drop(conns);
+        self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
 
         info!(
             "Local network generation advanced to {generation}: {reason}; retained {retained_confirmed_direct_count} confirmed direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"

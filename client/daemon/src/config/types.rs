@@ -151,6 +151,14 @@ pub struct NetworkConfig {
     /// Total UDP sockets (primary plus experimental members) when the pool is enabled.
     #[serde(default = "default_socket_pool_size")]
     pub socket_pool_size: usize,
+    /// Enable fresh-socket measure-then-punch generations for hard NATs.
+    ///
+    /// Each hard-NAT Direct attempt binds a dedicated fresh UDP socket,
+    /// measures the NAT's port sequence through distinct STUN observers in
+    /// send order, models the allocation step, and punches the peer from the
+    /// same socket so the peer-facing mapping is the model's prediction.
+    #[serde(default = "default_true")]
+    pub fresh_mapping_punch_enabled: bool,
 }
 
 fn default_cidr() -> String {

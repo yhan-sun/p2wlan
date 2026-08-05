@@ -161,8 +161,8 @@ impl UdpTransport {
         }
 
         let local_endpoint = self
-            .active_sockets()
-            .get(socket_index)
+            .socket_for_peer(Some(peer_id))
+            .await
             .and_then(|socket| socket.local_addr().ok());
         match self
             .send_probe_from_socket(socket_index, Some(peer_id), observed_endpoint)
@@ -222,15 +222,58 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeNonce> {
-        let socket = self
-            .active_sockets()
-            .get(socket_index)
-            .cloned()
-            .ok_or_else(|| {
+        let socket = self.socket_for_index_or_dynamic(socket_index, peer_id).await.ok_or_else(
+            || {
                 DaemonError::Network(format!(
                     "UDP socket pool member {socket_index} is unavailable"
                 ))
-            })?;
+            },
+        )?;
+        self.send_probe_on_socket(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+        )
+        .await
+    }
+
+    /// Resolve a socket by fixed pool index, falling back to the peer's
+    /// dedicated punch socket when the index is a dynamic one.
+    async fn socket_for_index_or_dynamic(
+        &self,
+        socket_index: usize,
+        peer_id: Option<&str>,
+    ) -> Option<Arc<UdpSocket>> {
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
+            return self.active_sockets().get(socket_index).cloned();
+        }
+        let dynamic = self.dynamic_sockets.lock().await;
+        if let Some(dynamic_socket) = dynamic.get(&socket_index) {
+            return Some(dynamic_socket.socket.clone());
+        }
+        if let Some(peer_id) = peer_id {
+            return self.socket_for_peer(Some(peer_id)).await;
+        }
+        None
+    }
+
+    /// Send one authenticated/legacy probe from an explicit socket.
+    ///
+    /// This is the shared core for pool sockets and dedicated punch sockets:
+    /// the pending-probe bookkeeping, MAC/nonce construction and retransmit
+    /// burst are identical for both.
+    async fn send_probe_on_socket(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+    ) -> Result<ProbeNonce> {
         let generation = self.peers.current_network_generation().await;
         let requires_legacy_probe = match peer_id {
             Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,

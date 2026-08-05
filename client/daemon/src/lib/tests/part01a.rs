@@ -363,7 +363,11 @@ async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() 
         peers.clone(),
         udp_transport,
         local_candidates.clone(),
+        Arc::new(RwLock::new(HashMap::new())),
         PunchAttemptDeduplicator::default(),
+        ControlClient::disabled_for_test(),
+        Arc::new(RwLock::new(Vec::new())),
+        Arc::new(RwLock::new(Duration::from_millis(50))),
         Duration::from_millis(20),
         Duration::from_millis(5),
         1,
@@ -579,6 +583,7 @@ async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
         Duration::from_millis(10),
         1,
         None,
+        None,
     )
     .await;
 
@@ -647,6 +652,7 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         "node-b".to_string(),
         Duration::from_millis(10),
         1,
+        None,
         None,
     )
     .await;

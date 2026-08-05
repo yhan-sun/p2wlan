@@ -361,6 +361,11 @@ impl Daemon {
                     let local_candidate_changed = self
                         .add_local_peer_reflexive_candidate(&observed_endpoint)
                         .await;
+                    if let Ok(observed_addr) = observed_endpoint.parse::<SocketAddr>() {
+                        self.peers
+                            .record_fresh_mapping_prediction_result(&from_node_id, observed_addr)
+                            .await;
+                    }
                     let punch_at_ms =
                         punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
                     let (candidates, candidate_sources) =

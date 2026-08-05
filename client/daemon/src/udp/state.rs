@@ -10,6 +10,8 @@ type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
+type DynamicSocketIndex = usize;
+type DynamicSocketState = Arc<Mutex<HashMap<DynamicSocketIndex, DynamicPunchSocket>>>;
 
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
@@ -45,6 +47,130 @@ const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
 /// burst. The primary socket still uses the complete configured observer set
 /// for NAT profiling.
 const SOCKET_POOL_STUN_OBSERVERS_PER_SOCKET: usize = 2;
+
+/// Fresh punch sockets are indexed from this base so their indices never
+/// collide with the fixed pool sockets (0..socket_count).
+pub(crate) const DYNAMIC_SOCKET_INDEX_BASE: usize = 4096;
+/// Maximum concurrent dynamic punch sockets across all peers.
+pub(crate) const MAX_DYNAMIC_PUNCH_SOCKETS: usize = 8;
+/// How long a measured mapping model stays trustworthy before the next punch
+/// generation must re-measure.
+pub(crate) const FRESH_MAPPING_MODEL_MAX_AGE: Duration = Duration::from_millis(2_500);
+/// Per-sample STUN timeout for fresh-mapping measurements.  Kept far below the
+/// normal STUN timeout so the measure-then-punch flow stays inside the
+/// synchronized NAT opening window.
+pub(crate) const FRESH_MAPPING_STUN_TIMEOUT: Duration = Duration::from_millis(350);
+/// Number of distinct STUN observers contacted per fresh mapping batch.
+pub(crate) const FRESH_MAPPING_OBSERVERS_PER_BATCH: usize = 4;
+/// Hard budget for the whole measurement phase.
+pub(crate) const FRESH_MAPPING_MEASURE_BUDGET: Duration = Duration::from_millis(1_200);
+/// Deltas further apart than this never form a linear model.
+pub(crate) const FRESH_MAPPING_MAX_ABS_STEP: i16 = 2_048;
+/// Reserved candidate-source key carrying the JSON mapping-model metadata.
+///
+/// Older clients ignore unknown keys and simply probe the ordered predicted
+/// candidates, so the field is optional and backward compatible.
+pub(crate) const FRESH_MAPPING_MODEL_SIGNAL_KEY: &str = "__p2wlan_mapping_model_v1";
+
+/// One dedicated punch socket owned by a per-peer fresh-mapping generation.
+///
+/// The socket is bound fresh for the generation, measures the NAT port
+/// sequence through several distinct STUN observers in send order, and then
+/// carries the authenticated punch that creates the peer-facing mapping.  On
+/// Direct confirmation the same socket continues as the peer's data path
+/// socket (`peer_socket_affinity`), so the confirmed mapping is never
+/// abandoned for a different socket.
+#[derive(Debug)]
+pub(crate) struct DynamicPunchSocket {
+    pub(crate) socket_index: usize,
+    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) peer_id: String,
+    pub(crate) network_generation: u64,
+    pub(crate) punch_generation: u64,
+    pub(crate) created_at: Instant,
+    pub(crate) shutdown_tx: watch::Sender<bool>,
+    pub(crate) reader: tokio::task::JoinHandle<()>,
+}
+
+impl DynamicPunchSocket {
+    pub(crate) fn local_endpoint(&self) -> Option<SocketAddr> {
+        self.socket.local_addr().ok()
+    }
+}
+
+/// Outcome of one fresh-mapping punch generation.
+#[derive(Debug, Clone)]
+pub(crate) enum FreshMappingOutcome {
+    /// The generation measured, modeled and punched successfully.
+    Accepted(Box<FreshMappingResult>),
+    /// The generation could not produce a trustworthy prediction and the
+    /// caller must fall back to the legacy punch strategy.
+    Rejected(FreshMappingRejection),
+}
+
+/// A successful fresh-mapping generation result.
+#[derive(Debug, Clone)]
+pub(crate) struct FreshMappingResult {
+    /// Per-peer punch generation counter.
+    pub(crate) punch_generation: u64,
+    /// Network generation the measurement ran in.
+    pub(crate) network_generation: u64,
+    /// Local endpoint of the dedicated punch socket.
+    pub(crate) socket_local_endpoint: SocketAddr,
+    /// Dynamic socket index for diagnostics/affinity.
+    pub(crate) socket_index: usize,
+    /// Model inferred from the send-ordered STUN sequence.
+    pub(crate) model: p2pnet_nat::PortModel,
+    /// Rank-ordered predicted public ports (rank 0 = top-1).
+    pub(crate) predicted_ports: Vec<u16>,
+    /// Public IP the mapping belongs to.
+    pub(crate) public_ip: Option<std::net::IpAddr>,
+    /// First and last authenticated punch send timestamps (monotonic ms).
+    pub(crate) first_punch_sent_at_ms: u64,
+    pub(crate) last_punch_sent_at_ms: u64,
+}
+
+/// Why a fresh-mapping generation was rejected and the legacy flow continued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FreshMappingRejection {
+    /// Local NAT profile is stable; no dynamic mapping to predict.
+    StableLocalNat,
+    /// No stable authoritative peer endpoint to punch toward.
+    NoStablePeerEndpoint,
+    /// Fewer than three successful STUN samples in send order.
+    InsufficientSamples,
+    /// The batch mixed sockets/generations/duplicate sequences.
+    InconsistentBatch,
+    /// The batch was too old before the model could be used.
+    BatchStale,
+    /// Observed public addresses changed mid-batch.
+    PublicIpChanged,
+    /// The port sequence had no consistent linear behavior.
+    UnpredictableSequence,
+    /// The dedicated socket could not be bound.
+    BindFailed,
+    /// No local node ID / probe key for authenticated punching.
+    MissingProbeKey,
+    /// The generation was superseded or the peer went away.
+    Superseded,
+}
+
+impl FreshMappingRejection {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::StableLocalNat => "stable_local_nat",
+            Self::NoStablePeerEndpoint => "no_stable_peer_endpoint",
+            Self::InsufficientSamples => "insufficient_samples",
+            Self::InconsistentBatch => "inconsistent_batch",
+            Self::BatchStale => "batch_stale",
+            Self::PublicIpChanged => "public_ip_changed",
+            Self::UnpredictableSequence => "unpredictable_sequence",
+            Self::BindFailed => "bind_failed",
+            Self::MissingProbeKey => "missing_probe_key",
+            Self::Superseded => "superseded",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct NatMaintainerLease {

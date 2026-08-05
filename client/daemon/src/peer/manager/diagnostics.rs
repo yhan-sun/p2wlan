@@ -55,6 +55,11 @@ impl PeerManager {
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
         let traversal_history = self.traversal_history.read().await.clone();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -68,6 +73,7 @@ impl PeerManager {
                     generation,
                     None,
                     Some(&traversal_history),
+                    Some(&fresh_mapping_history),
                 )
             })
             .collect();
@@ -89,6 +95,11 @@ impl PeerManager {
     ) -> Vec<PeerDiagnostics> {
         let generation = self.current_network_generation().await;
         let traversal_history = self.traversal_history.read().await.clone();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -104,6 +115,7 @@ impl PeerManager {
                     generation,
                     local_endpoint,
                     Some(&traversal_history),
+                    Some(&fresh_mapping_history),
                 )
             })
             .collect();

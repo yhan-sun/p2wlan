@@ -1,3 +1,18 @@
+/// Optional signaling context for a synchronized hole punch.
+///
+/// When present, the punch task can run a fresh-mapping generation and
+/// immediately advertise the predicted port window to the peer so the stable
+/// side probes the model's top-1 + successor window first.
+#[derive(Clone)]
+struct HolePunchSignalContext {
+    control: ControlClient,
+    local_candidates: Arc<RwLock<Vec<String>>>,
+    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    stun_servers: Vec<SocketAddr>,
+    stun_timeout: Duration,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_hole_punch_task(
     udp: UdpTransport,
     peers: Arc<PeerManager>,
@@ -6,6 +21,7 @@ async fn spawn_hole_punch_task(
     probe_interval: Duration,
     attempts: u32,
     punch_at_ms: Option<u64>,
+    signal: Option<HolePunchSignalContext>,
 ) {
     let Some(session) = punch_deduplicator.claim(&peer_id).await else {
         peers
@@ -43,6 +59,44 @@ async fn spawn_hole_punch_task(
                 ),
             )
             .await;
+
+        // Run the fresh-mapping generation before waiting for the rendezvous
+        // window: the measurement needs ~1s, and the peer-facing mapping must
+        // already exist when the stable side starts probing at punch_at.
+        let fresh_generation = if let Some(signal) = signal.as_ref() {
+            let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
+            let generation = udp
+                .run_fresh_mapping_generation(
+                    &peer_id,
+                    &signal.stun_servers,
+                    signal.stun_timeout,
+                    &targets,
+                    probe_interval,
+                    attempts.min(2),
+                )
+                .await;
+            match &generation {
+                FreshMappingOutcome::Accepted(result) => {
+                    advertise_fresh_mapping_prediction(signal, &peers, &peer_id, result).await;
+                }
+                FreshMappingOutcome::Rejected(reason) => {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "fresh_mapping_skipped",
+                            None,
+                            None,
+                            None,
+                            format!("fresh-mapping generation skipped: {}", reason.label()),
+                        )
+                        .await;
+                }
+            }
+            generation
+        } else {
+            FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
+        };
+
         if !punch_delay.is_zero() {
             sleep(punch_delay).await;
         }
@@ -150,7 +204,17 @@ async fn spawn_hole_punch_task(
             },
         );
         let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
-            let punch_result = if stable_remote_scatter {
+            let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(_))
+                && udp.has_dynamic_socket_for_peer(&peer_id).await
+            {
+                udp.punch_candidates_from_dynamic_socket(
+                    &peer_id,
+                    candidates.clone(),
+                    probe_interval,
+                    attempts,
+                )
+                .await
+            } else if stable_remote_scatter {
                 udp.punch_candidates_stable_unique_scatter(
                     &peer_id,
                     candidates.clone(),
@@ -378,4 +442,122 @@ async fn spawn_hole_punch_task(
             }
         }
     });
+}
+
+/// Advertise the fresh-mapping prediction window to the peer.
+///
+/// The predicted ports are signaled in priority order (top-1 first, then the
+/// successor window) as `predicted` candidates.  Old peers ignore the new
+/// reserved model metadata keys and simply probe the extra candidates, so the
+/// signal degrades gracefully to today's strategy.
+async fn advertise_fresh_mapping_prediction(
+    signal: &HolePunchSignalContext,
+    peers: &Arc<PeerManager>,
+    peer_id: &str,
+    result: &FreshMappingResult,
+) {
+    let mut candidates = Vec::new();
+    let mut candidate_sources = HashMap::new();
+    for port in &result.predicted_ports {
+        let endpoint = SocketAddr::new(
+            result.public_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            *port,
+        )
+        .to_string();
+        if !candidates.contains(&endpoint) {
+            candidates.push(endpoint.clone());
+            candidate_sources.insert(endpoint, "predicted".to_string());
+        }
+    }
+    let current = signal.local_candidates.read().await.clone();
+    let current_sources = signal.local_candidate_sources.read().await.clone();
+    for endpoint in current {
+        if !candidates.contains(&endpoint) {
+            candidates.push(endpoint.clone());
+        }
+        if let Some(source) = current_sources.get(&endpoint) {
+            candidate_sources.insert(endpoint, source.clone());
+        }
+    }
+    let mut candidate_sources_mut = candidate_sources.clone();
+    let _network_identity = prepare_signal_candidates_and_network_identity(
+        &[],
+        &HashMap::new(),
+        &mut candidates,
+        &mut candidate_sources_mut,
+    );
+
+    // Reserved model metadata: ignored by older clients, which still benefit
+    // from the ordered predicted candidates themselves.
+    let model_meta = serde_json::json!({
+        "generation": result.punch_generation,
+        "network_generation": result.network_generation,
+        "socket_index": result.socket_index,
+        "socket_local_port": result.socket_local_endpoint.port(),
+        "model": result.model.kind.clone().label(),
+        "confidence": result.model.confidence,
+        "sequence": result.model.sequence,
+        "deltas": result.model.deltas,
+        "predicted": result.predicted_ports,
+        "first_punch_sent_ms": result.first_punch_sent_at_ms,
+        "last_punch_sent_ms": result.last_punch_sent_at_ms,
+    });
+    candidate_sources_mut.insert(
+        FRESH_MAPPING_MODEL_SIGNAL_KEY.to_string(),
+        model_meta.to_string(),
+    );
+
+    let punch_at_ms = Some(relay_assisted_punch_at_ms());
+    if let Err(error) = signal
+        .control
+        .send_peer_offer_with_sources_and_punch_at(
+            peer_id,
+            &candidates,
+            &candidate_sources_mut,
+            &[],
+            punch_at_ms,
+        )
+        .await
+    {
+        warn!(
+            "Failed to advertise fresh-mapping prediction window to peer {peer_id}: {error}"
+        );
+        return;
+    }
+    info!(
+        event = "fresh_mapping_prediction_signaled",
+        peer_id = %peer_id,
+        punch_generation = result.punch_generation,
+        socket_index = result.socket_index,
+        predicted = ?result.predicted_ports,
+        model = ?result.model.kind,
+        confidence = result.model.confidence,
+        candidate_count = candidates.len(),
+        punch_at_ms = ?punch_at_ms,
+        "fresh_mapping_prediction_signaled peer_id={} punch_generation={} socket_index={} predicted={:?} model={:?} confidence={} candidates={}",
+        peer_id,
+        result.punch_generation,
+        result.socket_index,
+        result.predicted_ports,
+        result.model.kind,
+        result.model.confidence,
+        candidates.len()
+    );
+    peers
+        .record_direct_event(
+            peer_id,
+            "fresh_mapping_prediction_signaled",
+            None,
+            Some(candidates.len()),
+            None,
+            format!(
+                "signaled predicted window punch_generation={} predicted={:?} model={:?} confidence={} candidates={}",
+                result.punch_generation,
+                result.predicted_ports,
+                result.model.kind.clone().label(),
+                result.model.confidence,
+                candidates.len()
+            ),
+        )
+        .await;
 }
