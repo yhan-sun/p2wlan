@@ -23,7 +23,9 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
+            libxdo-dev \
             librsvg2-dev \
+            xdotool \
             patchelf
       - name: Rust Fmt Check
         run: cargo fmt --all --check
