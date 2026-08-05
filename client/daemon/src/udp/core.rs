@@ -203,19 +203,29 @@ impl UdpTransport {
         let Some(peer_id) = peer_id else {
             return 0;
         };
-        self.peer_socket_affinity
-            .lock()
-            .await
-            .get(peer_id)
-            .copied()
-            .filter(|index| *index < socket_count || *index >= DYNAMIC_SOCKET_INDEX_BASE)
-            .unwrap_or(0)
+        let affinity = self.peer_socket_affinity.lock().await.get(peer_id).copied();
+        let Some(index) = affinity else {
+            return 0;
+        };
+        if index < socket_count {
+            return index;
+        }
+        if index >= DYNAMIC_SOCKET_INDEX_BASE
+            && self.dynamic_sockets.lock().await.contains_key(&index)
+        {
+            return index;
+        }
+        self.peer_socket_affinity.lock().await.remove(peer_id);
+        0
     }
 
     /// The UDP socket that should carry traffic for `peer_id`.
     ///
     /// A per-peer fresh-mapping punch socket takes precedence (it owns the
     /// peer-facing NAT mapping); otherwise the pool socket pinned by affinity.
+    /// A dynamic socket whose network generation is stale is detached and the
+    /// peer falls back to the pool, so a handover never keeps sending from a
+    /// dead mapping.
     pub async fn socket_for_peer(&self, peer_id: Option<&str>) -> Option<Arc<UdpSocket>> {
         if let Some(peer_id) = peer_id {
             if let Some(index) = self.dynamic_socket_index_for_peer(peer_id).await {
@@ -238,9 +248,31 @@ impl UdpTransport {
     }
 
     /// Dynamic punch socket index pinned for a peer, if any.
+    ///
+    /// A socket that no longer matches the current network generation is
+    /// detached immediately: its NAT mapping belongs to an old network and
+    /// must not keep receiving probes or data.
     pub async fn dynamic_socket_index_for_peer(&self, peer_id: &str) -> Option<usize> {
         let index = *self.peer_socket_affinity.lock().await.get(peer_id)?;
-        (index >= DYNAMIC_SOCKET_INDEX_BASE).then_some(index)
+        if index < DYNAMIC_SOCKET_INDEX_BASE {
+            return None;
+        }
+        let stale_generation = {
+            let dynamic = self.dynamic_sockets.lock().await;
+            let Some(dynamic) = dynamic.get(&index) else {
+                // Evicted or detached: clear the stale affinity so later
+                // lookups fall back to the pool instead of returning None.
+                self.peer_socket_affinity.lock().await.remove(peer_id);
+                return None;
+            };
+            dynamic.network_generation != self.peers.current_network_generation().await
+        };
+        if stale_generation {
+            self.detach_dynamic_punch_socket(peer_id, "network_generation_changed")
+                .await;
+            return None;
+        }
+        Some(index)
     }
 
     async fn remember_peer_socket(&self, peer_id: &str, socket_index: usize) {

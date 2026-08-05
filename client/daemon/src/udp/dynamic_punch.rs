@@ -38,17 +38,43 @@ impl UdpTransport {
         network_generation: u64,
         punch_generation: u64,
     ) -> Result<()> {
-        {
-            let mut dynamic = self.dynamic_sockets.lock().await;
-            if dynamic.len() >= MAX_DYNAMIC_PUNCH_SOCKETS {
-                let oldest = dynamic
+        let evict = {
+            let dynamic = self.dynamic_sockets.lock().await;
+            if dynamic.len() < MAX_DYNAMIC_PUNCH_SOCKETS {
+                None
+            } else {
+                let mut candidates = dynamic
                     .iter()
-                    .min_by_key(|(_, entry)| entry.created_at)
-                    .map(|(index, _)| *index);
-                if let Some(oldest) = oldest {
-                    let old = dynamic.remove(&oldest).expect("removed dynamic socket");
-                    self.detach_dynamic_entry(old, "dynamic_socket_cap_reached").await;
+                    .map(|(index, entry)| (*index, entry.peer_id.clone(), entry.created_at))
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|(_, _, created_at)| *created_at);
+                drop(dynamic);
+                let mut evict = None;
+                for (index, candidate_peer, _) in candidates {
+                    if !self.peers.is_direct(&candidate_peer).await {
+                        evict = Some((index, candidate_peer));
+                        break;
+                    }
                 }
+                evict
+            }
+        };
+        if let Some((evict_index, evicted_peer)) = evict {
+            let evicted = self
+                .dynamic_sockets
+                .lock()
+                .await
+                .remove(&evict_index)
+                .expect("evicted dynamic socket");
+            self.detach_dynamic_entry(evicted, "dynamic_socket_cap_reached")
+                .await;
+            // Drop any affinity that pointed at the evicted socket so the
+            // peer cleanly falls back to its pool socket.  Direct peers are
+            // never evicted, so this only affects peers that were already
+            // probing or reconnecting.
+            let mut affinity = self.peer_socket_affinity.lock().await;
+            if affinity.get(&evicted_peer) == Some(&evict_index) {
+                affinity.remove(&evicted_peer);
             }
         }
 
@@ -131,6 +157,25 @@ impl UdpTransport {
             index.and_then(|index| dynamic.remove(&index))
         };
         if let Some(entry) = entry {
+            self.detach_dynamic_entry(entry, reason).await;
+        }
+    }
+
+    /// Detach every dedicated punch socket (daemon shutdown / teardown).
+    pub(crate) async fn detach_all_dynamic_punch_sockets(&self, reason: &str) {
+        let entries = self
+            .dynamic_sockets
+            .lock()
+            .await
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        self.dynamic_socket_diagnostics.lock().await.clear();
+        self.peer_socket_affinity
+            .lock()
+            .await
+            .retain(|_, index| *index < DYNAMIC_SOCKET_INDEX_BASE);
+        for entry in entries {
             self.detach_dynamic_entry(entry, reason).await;
         }
     }

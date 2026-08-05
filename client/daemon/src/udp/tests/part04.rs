@@ -684,3 +684,132 @@ async fn strict_filtering_both_sides_synchronized_punch_ack_returns_on_same_sock
     .await
     .expect("B matched A's triggered-check ACK");
 }
+
+#[tokio::test]
+async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() {
+    let local_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let (tx, _rx) = mpsc::channel(64);
+    let transport = transport.with_inbound_channel(tx);
+
+    // Fill the cap with non-Direct peers.
+    let mut indices = Vec::new();
+    for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
+        peers
+            .add_peer(&peer_with_public_key(
+                peer_id,
+                "10.20.0.9",
+                hex::encode(local_identity.public_key()),
+                None,
+            ))
+            .await;
+        let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+        transport
+            .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1)
+            .await
+            .unwrap();
+        transport.remember_peer_socket(peer_id, index).await;
+        indices.push((peer_id.to_string(), index));
+    }
+    assert_eq!(transport.dynamic_socket_count().await, 8);
+
+    // The 9th attach evicts the oldest non-Direct socket and clears its
+    // affinity instead of leaving a stale index behind.
+    let (index9, socket9) = transport.bind_fresh_punch_socket().await.unwrap();
+    transport
+        .attach_dynamic_punch_socket("peer-9", index9, socket9, 0, 1)
+        .await
+        .unwrap();
+    transport.remember_peer_socket("peer-9", index9).await;
+    assert_eq!(transport.dynamic_socket_count().await, 8);
+
+    // The evicted peer's affinity is gone: it falls back to the pool socket.
+    let evicted_peer = indices[0].0.clone();
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer(&evicted_peer).await,
+        None
+    );
+    // With no socket pool, the fallback is exactly the primary pool socket.
+    assert_eq!(transport.socket_count(), 1);
+    let fallback = transport.socket_for_peer(Some(&evicted_peer)).await;
+    assert!(fallback.is_some(), "evicted peer must fall back to the pool");
+    assert_eq!(
+        fallback.unwrap().local_addr().unwrap(),
+        transport.local_addr().unwrap(),
+        "fallback must be the primary pool socket"
+    );
+
+    // A Direct peer's socket is never evicted: mark peer-2 Direct and fill
+    // again; the Direct socket must survive.
+    peers.record_direct_success_for_generation("peer-2", None, 0).await;
+    let (index10, socket10) = transport.bind_fresh_punch_socket().await.unwrap();
+    transport
+        .attach_dynamic_punch_socket("peer-10", index10, socket10, 0, 1)
+        .await
+        .unwrap();
+    assert!(
+        transport
+            .dynamic_sockets
+            .lock()
+            .await
+            .contains_key(&indices[1].1),
+        "Direct peer's dynamic socket must not be evicted"
+    );
+    assert!(
+        transport
+            .dynamic_socket_index_for_peer("peer-2")
+            .await
+            .is_some()
+    );
+
+    transport
+        .detach_all_dynamic_punch_sockets("test_shutdown")
+        .await;
+    assert_eq!(transport.dynamic_socket_count().await, 0);
+}
+
+#[tokio::test]
+async fn network_generation_change_detaches_dynamic_socket_on_next_use() {
+    let local_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let (tx, _rx) = mpsc::channel(64);
+    let transport = transport.with_inbound_channel(tx);
+
+    let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    transport
+        .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1)
+        .await
+        .unwrap();
+    transport.remember_peer_socket("peer-b", index).await;
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        Some(index)
+    );
+
+    // Network generation changes: the next lookup must detach the socket.
+    peers.advance_network_generation("test handover").await;
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        None,
+        "stale-generation dynamic socket must detach"
+    );
+    assert!(!transport.has_dynamic_socket_for_peer("peer-b").await);
+    assert!(
+        transport.socket_for_peer(Some("peer-b")).await.is_some(),
+        "peer must fall back to the pool after the dynamic socket detaches"
+    );
+}

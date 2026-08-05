@@ -413,3 +413,152 @@ func TestCreateSignalRejectsInvalidPeerReflexive(t *testing.T) {
 		})
 	}
 }
+
+// The client's fresh-mapping prediction window must pass the real control
+// plane validation: every candidate_sources key is a real candidate, values
+// stay under 64 bytes, and the map size never exceeds the candidate count.
+// This locks the client contract used by
+// p2wlan_daemon::build_fresh_mapping_signal_payload so a predicted-window
+// offer can never be rejected with HTTP 400.
+func TestCreateSignalAcceptsPredictedCandidateWindow(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-predicted@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	// Exact payload shape produced by the daemon: ranked predicted window
+	// first, then the peer's own host/stun candidates, all real endpoints.
+	body := strings.NewReader(`{
+		"to_node_id":"` + target.ID + `",
+		"type":"peer_offer",
+		"candidates":[
+			"220.163.6.190:45393",
+			"220.163.6.190:45394",
+			"220.163.6.190:45395",
+			"220.163.6.190:45388",
+			"192.168.0.239:58980"
+		],
+		"candidate_sources":{
+			"220.163.6.190:45393":"predicted",
+			"220.163.6.190:45394":"predicted",
+			"220.163.6.190:45395":"predicted",
+			"220.163.6.190:45388":"stun_observed",
+			"192.168.0.239:58980":"host"
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", body)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  source.ID,
+		NetworkID: source.NetworkID,
+		UserID:    user.ID,
+	}))
+	recorder := httptest.NewRecorder()
+
+	NewServer(nil, nil, db).CreateSignal(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ranked predicted window, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	signals, err := db.ListAndDeleteSignals(target.ID)
+	if err != nil {
+		t.Fatalf("ListAndDeleteSignals: %v", err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	if len(signals[0].Candidates) != 5 {
+		t.Fatalf("expected 5 candidates, got %d", len(signals[0].Candidates))
+	}
+	if len(signals[0].CandidateSources) != 5 {
+		t.Fatalf("expected 5 candidate sources, got %d", len(signals[0].CandidateSources))
+	}
+}
+
+// Reserved metadata keys embedded in candidate_sources must stay rejected:
+// the map must not carry keys that are not real candidates.
+func TestCreateSignalRejectsReservedMetadataKeysInCandidateSources(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("signal-reserved@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	source, err := db.CreateDevice(user.ID, "default", "signal-source-key", "signal-source", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice source: %v", err)
+	}
+	target, err := db.CreateDevice(user.ID, "default", "signal-target-key", "signal-target", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice target: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown key",
+			body: `{
+				"to_node_id":"` + target.ID + `",
+				"type":"peer_offer",
+				"candidates":["220.163.6.190:45393"],
+				"candidate_sources":{
+					"220.163.6.190:45393":"predicted",
+					"__p2wlan_mapping_model_v1":"{\"model\":\"fixed_step\"}"
+				}
+			}`,
+		},
+		{
+			name: "more sources than candidates",
+			body: `{
+				"to_node_id":"` + target.ID + `",
+				"type":"peer_offer",
+				"candidates":["220.163.6.190:45393"],
+				"candidate_sources":{
+					"220.163.6.190:45393":"predicted",
+					"220.163.6.190:45394":"predicted"
+				}
+			}`,
+		},
+		{
+			name: "source value too long",
+			body: `{
+				"to_node_id":"` + target.ID + `",
+				"type":"peer_offer",
+				"candidates":["220.163.6.190:45393"],
+				"candidate_sources":{"220.163.6.190:45393":"` + strings.Repeat("x", 65) + `"}
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", strings.NewReader(tc.body))
+			req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+				DeviceID:  source.ID,
+				NetworkID: source.NetworkID,
+				UserID:    user.ID,
+			}))
+			recorder := httptest.NewRecorder()
+			NewServer(nil, nil, db).CreateSignal(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
