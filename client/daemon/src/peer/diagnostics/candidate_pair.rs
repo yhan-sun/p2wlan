@@ -52,7 +52,12 @@ impl CandidatePairDiagnostics {
         let direct_type = classify_candidate_pair_path(active_path, Some(pair), direct_confirmed);
         let selected = pair.state == CandidatePairState::Selected;
         let nominated = pair.nominated || selected;
-        let is_public_udp_direct = direct_type == DirectPathType::PublicUdp;
+        // A peer-reflexive pair over a real public endpoint is public UDP
+        // direct; only overlay/relay paths are not.
+        let is_public_udp_direct = matches!(
+            direct_type,
+            DirectPathType::PublicUdp | DirectPathType::PeerReflexive
+        );
         let is_peer_reflexive_direct = direct_type == DirectPathType::PeerReflexive;
         let public_mapping_stable = direct_type == DirectPathType::PublicUdp;
         let is_overlay_direct = direct_type == DirectPathType::Overlay;

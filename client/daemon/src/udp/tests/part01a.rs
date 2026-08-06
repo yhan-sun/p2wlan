@@ -82,6 +82,8 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
         purpose: PendingProbePurpose::ConnectivityCheck,
         accepts_authenticated_ack: true,
         accepts_legacy_ack: true,
+        socket_epoch: 0,
+        cleanup_epoch: 0,
     };
 
     assert!(legacy_ack_matches_pending(

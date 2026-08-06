@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 // period prevents a peer with a modestly fast system clock from rejecting an
 // otherwise fresh server-issued candidate set.  Generation ordering still
 // prevents old sets from replacing newer ones.
-const CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS: u64 = 120_000;
+pub(crate) const CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS: u64 = 120_000;
 
 use crate::config::Config;
 use crate::control::PeerInfo;
@@ -176,6 +176,10 @@ pub(crate) struct BirthdayProbePlan {
     pub start_rank: usize,
     pub end_rank: usize,
     pub generated_candidates: usize,
+    /// Total candidate count after birthday generation, before the adaptive
+    /// probe budgets filter endpoints out.  The cursor must only advance when
+    /// nothing planned was dropped by cooldown/budget filtering.
+    pub planned_candidates: usize,
     pub selected_candidates: usize,
     pub selected_birthday_candidates: usize,
     pub unique_target_ports: usize,

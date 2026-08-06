@@ -27,6 +27,100 @@ async fn candidate_pairs_record_predicted_source_from_signal_metadata() {
 }
 
 #[tokio::test]
+async fn fresh_mapping_prediction_result_is_deduplicated_per_generation_and_port() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51841".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let model = p2pnet_nat::mapping::build_model(
+        &[45390, 45391, 45392],
+        Some("203.0.113.10".parse().unwrap()),
+        1_000,
+    );
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            model,
+            vec![45393, 45394, 45395, 45396],
+            "0.0.0.0:58980".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            39,
+            0,
+        )
+        .await;
+
+    let actual = "203.0.113.10:45395".parse().unwrap();
+    manager
+        .record_fresh_mapping_prediction_result("peer1", actual)
+        .await;
+    // Retransmitted peer-reflexive notifications repeat the same mapping.
+    manager
+        .record_fresh_mapping_prediction_result("peer1", actual)
+        .await;
+    manager
+        .record_fresh_mapping_prediction_result("peer1", actual)
+        .await;
+    // A different observed port is a genuinely new result.
+    manager
+        .record_fresh_mapping_prediction_result("peer1", "203.0.113.10:45396".parse().unwrap())
+        .await;
+
+    let history = manager
+        .fresh_mapping_history
+        .lock()
+        .unwrap()
+        .get("peer1")
+        .cloned()
+        .unwrap();
+    assert_eq!(history.len(), 2, "duplicate results must be suppressed");
+    assert_eq!(history[0].punch_generation, 39);
+    assert_eq!(history[0].actual_port, 45395);
+    assert!(history[0].hit_window);
+    assert_eq!(history[1].actual_port, 45396);
+}
+
+#[tokio::test]
+async fn fresh_prediction_label_classifies_as_predicted_with_rank() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51842".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let predicted = "203.0.113.10:40007".to_string();
+    let signaled = "203.0.113.10:40001".to_string();
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[signaled.clone(), predicted.clone()],
+            &HashMap::from([
+                (signaled.clone(), "stun_observed".to_string()),
+                (
+                    predicted.clone(),
+                    format!("{}39", crate::FRESH_PREDICTION_SOURCE_LABEL_PREFIX),
+                ),
+            ]),
+        )
+        .await;
+
+    let generation = manager.current_network_generation().await;
+    let conns = manager.connections.read().await;
+    let conn = conns.get("peer1").unwrap();
+    let pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint.to_string() == predicted)
+        .expect("predicted endpoint must have a candidate pair");
+    assert_eq!(pair.source, CandidatePairSource::Predicted);
+    assert_eq!(pair.local_generation, generation);
+    assert_eq!(pair.signal_rank, Some(1), "predicted window order must be preserved");
+    let ordinary = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint.to_string() == signaled)
+        .unwrap();
+    assert_eq!(ordinary.source, CandidatePairSource::StunObserved);
+}
+
+#[tokio::test]
 async fn candidate_pair_stats_include_history_budget_diagnostics() {
     let mut history = TraversalHistory::default();
     history.record_failure(CandidatePairSource::Predicted);
@@ -423,4 +517,768 @@ async fn synchronized_punch_retries_failed_predicted_without_birthday_expansion(
     assert!(background[0].1.iter().all(|target| {
         *target == stable_endpoint || predicted_endpoints.contains(target)
     }));
+}
+
+#[tokio::test]
+async fn remote_fresh_prediction_high_water_orders_incarnations_and_generations() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51860".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let boot = 1_742_987_654_321u64;
+    let id = |boot_epoch: u64, generation: u64| crate::FreshPredictionId {
+        boot_epoch,
+        generation,
+    };
+    let payload = (vec!["203.0.113.10:45393".to_string()], HashMap::new(), None);
+    // Admit = prepare + apply + commit (the real transaction order).
+    async fn admit(
+        manager: &PeerManager,
+        peer_id: &str,
+        identity: crate::FreshPredictionId,
+        payload: &(Vec<String>, HashMap<String, String>, Option<u64>),
+    ) -> RemoteFreshAdmission {
+        match manager
+            .prepare_remote_fresh_prediction(
+                peer_id,
+                identity,
+                &payload.0,
+                &payload.1,
+                payload.2,
+            )
+            .await
+        {
+            RemoteFreshAdmission::Accepted => {
+                assert_eq!(
+                    manager
+                        .apply_remote_fresh_candidates(
+                            peer_id,
+                            identity,
+                            &payload.0,
+                            &payload.1,
+                            identity.boot_epoch.saturating_mul(2).saturating_add(identity.generation),
+                            payload.2,
+                        )
+                        .await,
+                    CandidateSetApplyResult::Applied,
+                    "accepted identity must apply: {identity:?}"
+                );
+                assert!(
+                    manager.commit_remote_fresh_prediction(peer_id, identity).await,
+                    "accepted identity must commit"
+                );
+                RemoteFreshAdmission::Accepted
+            }
+            other => other,
+        }
+    }
+
+    // 1. Same incarnation: G2 supersedes G1.
+    assert_eq!(admit(&manager, "peer1", id(boot, 1), &payload).await, RemoteFreshAdmission::Accepted);
+    assert_eq!(admit(&manager, "peer1", id(boot, 2), &payload).await, RemoteFreshAdmission::Accepted);
+    // 2. After G2 was accepted, a late G1 must be refused.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 1), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Stale
+    );
+    // 3. A new daemon incarnation may replace the old one with generation 1.
+    let new_boot = boot + 1;
+    assert_eq!(admit(&manager, "peer1", id(new_boot, 1), &payload).await, RemoteFreshAdmission::Accepted);
+    // 4. After the new boot was accepted, the old boot's late signals are
+    // refused even with a higher generation.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 40), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Stale
+    );
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(new_boot, 1), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::AlreadyRecorded,
+        "equal identity with an identical payload is an idempotent retry and must not re-apply"
+    );
+    // An equal identity with a DIFFERENT payload is a payload mismatch: a
+    // retry must never apply different candidates under the same identity.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction(
+                "peer1",
+                id(new_boot, 1),
+                &["203.0.113.10:99999".to_string()],
+                &HashMap::new(),
+                None,
+            )
+            .await,
+        RemoteFreshAdmission::PayloadMismatch,
+        "an equal-id retry with a different candidate payload must be rejected"
+    );
+    // An equal-id retry with a different expiry is also a payload mismatch.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction(
+                "peer1",
+                id(new_boot, 1),
+                &payload.0,
+                &payload.1,
+                Some(123_456),
+            )
+            .await,
+        RemoteFreshAdmission::PayloadMismatch,
+        "an equal-id retry with a different expiry must be rejected"
+    );
+    // An equal-id commit is refused by the strict CAS: the identity was
+    // already committed by the first winner, so a retry's commit must report
+    // "not the winner" instead of claiming success twice.
+    assert!(
+        !manager.commit_remote_fresh_prediction("peer1", id(new_boot, 1)).await,
+        "an already-committed identity must not commit twice"
+    );
+
+    // 5. PeerLeft does NOT reset the high-water: the peer re-joins (same
+    // public key, same incarnation space) and a late old-incarnation signal
+    // stays rejected; only a strictly newer incarnation is admitted.
+    manager.remove_peer("peer1").await;
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 40), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Stale,
+        "PeerLeft must not clear the high-water: a late old-incarnation signal stays rejected after the rejoin"
+    );
+    assert_eq!(
+        admit(&manager, "peer1", id(new_boot + 1, 1), &payload).await,
+        RemoteFreshAdmission::Accepted,
+        "a strictly newer incarnation is admitted after the rejoin"
+    );
+}
+
+#[tokio::test]
+async fn remote_fresh_prediction_commit_only_wins_once_under_concurrency() {
+    let manager = Arc::new(PeerManager::new(test_config()));
+    let endpoint: SocketAddr = "127.0.0.1:51863".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let id = |generation: u64| crate::FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation,
+    };
+    let payload = (vec!["203.0.113.10:45393".to_string()], HashMap::new(), None);
+    // Two concurrent FULL transactions (prepare -> apply -> commit) of the
+    // same identity: both prepare as Accepted and both really apply, but the
+    // strict compare-and-swap commit lets exactly ONE win.  Each task uses
+    // its own candidate generation (as two racing signals would), so the
+    // second apply is not judged stale by the peer's generation high-water.
+    let mut handles = Vec::new();
+    for task in 0..2 {
+        let manager = manager.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            let prepared = manager
+                .prepare_remote_fresh_prediction(
+                    "peer1",
+                    id(1),
+                    &payload.0,
+                    &payload.1,
+                    payload.2,
+                )
+                .await;
+            tokio::task::yield_now().await;
+            let applied = manager
+                .apply_remote_fresh_candidates(
+                    "peer1",
+                    id(1),
+                    &payload.0,
+                    &payload.1,
+                    id(1)
+                        .boot_epoch
+                        .saturating_mul(2)
+                        .saturating_add(id(1).generation)
+                        .saturating_add(task as u64),
+                    payload.2,
+                )
+                .await;
+            tokio::task::yield_now().await;
+            let committed = manager.commit_remote_fresh_prediction("peer1", id(1)).await;
+            if !committed {
+                // The loser rolls its own apply back.
+                manager.rollback_remote_fresh_apply("peer1", id(1)).await;
+            }
+            (prepared, applied, committed)
+        }));
+    }
+    let outcomes = futures_util::future::join_all(handles).await;
+    let outcomes = outcomes
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("both concurrent transactions must complete");
+    assert!(outcomes
+        .iter()
+        .all(|(prepared, _, _)| *prepared == RemoteFreshAdmission::Accepted));
+    // The apply REALLY runs in this concurrent test, and at least one apply
+    // wins the candidate-generation race: the lower-generation task can be
+    // judged stale by the higher one (the peer's ordinary high-water), which
+    // is a legitimate outcome, not a skipped apply.
+    assert!(
+        outcomes
+            .iter()
+            .any(|(_, applied, _)| *applied == CandidateSetApplyResult::Applied),
+        "the concurrent applies must really run and at least one must apply"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|(_, _, committed)| *committed).count(),
+        1,
+        "exactly one concurrent commit of an identity may win (never both)"
+    );
+    // A stale commit (older identity) never wins once G2 is committed.
+    let id2 = id(2);
+    let id1 = id(1);
+    let prepared = manager
+        .prepare_remote_fresh_prediction("peer1", id2, &payload.0, &payload.1, payload.2)
+        .await;
+    assert_eq!(prepared, RemoteFreshAdmission::Accepted);
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates(
+                "peer1",
+                id2,
+                &payload.0,
+                &payload.1,
+                id2.boot_epoch.saturating_mul(2).saturating_add(3),
+                payload.2,
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(manager.commit_remote_fresh_prediction("peer1", id2).await);
+    assert!(
+        !manager.commit_remote_fresh_prediction("peer1", id1).await,
+        "a stale identity must never overwrite a newer committed one"
+    );
+    // The committed identity's snapshot is immutable: the idempotent retry of
+    // id(2) with the SAME payload is admitted, and the punch targets come
+    // from the committed snapshot, never from the current refresh set.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id2, &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::AlreadyRecorded,
+        "an identical-payload retry of the committed identity is idempotent"
+    );
+    let snapshot = manager.remote_fresh_snapshot_for("peer1", id2).await;
+    assert_eq!(
+        snapshot.as_ref().map(|snapshot| snapshot.candidates.clone()),
+        Some(vec!["203.0.113.10:45393".to_string()]),
+        "the committed snapshot is the first-applied payload"
+    );
+}
+
+#[tokio::test]
+async fn remote_fresh_prediction_high_water_resets_on_public_key_change() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51861".parse().unwrap();
+    let boot = 1_742_987_654_321u64;
+    let id = |boot_epoch: u64, generation: u64| crate::FreshPredictionId {
+        boot_epoch,
+        generation,
+    };
+    let mut peer = test_peer("peer1", endpoint);
+    manager.add_peer(&peer).await;
+    let payload = (vec!["203.0.113.10:45393".to_string()], HashMap::new(), None);
+    // The real transaction: prepare -> apply -> commit.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 9), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Accepted
+    );
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates(
+                "peer1",
+                id(boot, 9),
+                &payload.0,
+                &payload.1,
+                boot.saturating_mul(2).saturating_add(9),
+                payload.2,
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(manager.commit_remote_fresh_prediction("peer1", id(boot, 9)).await);
+
+    // The peer rotates its public key: a new incarnation's prediction space
+    // starts fresh, so generation 1 of the new key is admitted even though
+    // the old key had reached generation 9.
+    peer.public_key = "rotated-public-key".to_string();
+    manager.add_peer(&peer).await;
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 1), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Accepted,
+        "public-key identity change must reset the remote high-water"
+    );
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates(
+                "peer1",
+                id(boot, 1),
+                &payload.0,
+                &payload.1,
+                boot.saturating_mul(2).saturating_add(1),
+                payload.2,
+            )
+            .await,
+        CandidateSetApplyResult::Applied,
+        "the new identity's apply must really apply"
+    );
+    assert!(
+        manager.commit_remote_fresh_prediction("peer1", id(boot, 1)).await,
+        "the new identity's commit must win after the key rotation reset"
+    );
+}
+
+#[tokio::test]
+async fn stale_fresh_prediction_never_overwrites_fresh_mapping_state() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51862".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let model = p2pnet_nat::mapping::build_model(
+        &[45390, 45391, 45392],
+        Some("203.0.113.10".parse().unwrap()),
+        1_000,
+    );
+    // G2 records first.
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            p2pnet_nat::mapping::PortModel::clone(&model),
+            vec![45394, 45395, 45396],
+            "0.0.0.0:58980".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            2,
+            0,
+        )
+        .await;
+    // A late G1 must not overwrite the newer state.
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            model,
+            vec![45391, 45392, 45393],
+            "0.0.0.0:58981".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            1,
+            0,
+        )
+        .await;
+    let state = manager.fresh_mapping_for_peer("peer1").await.unwrap();
+    assert_eq!(state.punch_generation, 2);
+    assert_eq!(state.predicted_ports, vec![45394, 45395, 45396]);
+    assert_eq!(state.socket_local_endpoint.port(), 58980);
+}
+
+#[tokio::test]
+async fn fresh_mapping_prediction_history_dedup_is_atomic_under_concurrency() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51863".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let model = p2pnet_nat::mapping::build_model(
+        &[45390, 45391, 45392],
+        Some("203.0.113.10".parse().unwrap()),
+        1_000,
+    );
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            model,
+            vec![45393, 45394, 45395, 45396],
+            "0.0.0.0:58980".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            39,
+            0,
+        )
+        .await;
+
+    // Many concurrent notifications for the same (generation, port): exactly
+    // one must be recorded as the first inserter.
+    let manager = std::sync::Arc::new(manager);
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let manager = manager.clone();
+        tasks.push(tokio::spawn(async move {
+            manager
+                .record_fresh_mapping_prediction_result(
+                    "peer1",
+                    "203.0.113.10:45395".parse().unwrap(),
+                )
+                .await;
+        }));
+    }
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("dedup tasks must finish without deadlock")
+            .unwrap();
+    }
+    let history = manager
+        .fresh_mapping_history
+        .lock()
+        .unwrap()
+        .get("peer1")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        history.iter().filter(|recorded| recorded.actual_port == 45395).count(),
+        1,
+        "concurrent duplicates must collapse into one history entry"
+    );
+    let hits = manager
+        .connections
+        .read()
+        .await
+        .get("peer1")
+        .unwrap()
+        .direct_events
+        .iter()
+        .filter(|event| event.stage == "fresh_mapping_prediction_hit")
+        .count();
+    assert_eq!(hits, 1, "only the first inserter may record the hit event");
+}
+
+/// An apply whose commit loses the CAS must not leave its candidates in the
+/// shared candidate set: the losers roll their own apply back, so a higher
+/// identity's committed candidates are the only ones that survive.
+#[tokio::test]
+async fn lost_commit_rolls_its_apply_back_out_of_the_shared_set() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51864".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let id = |generation: u64| crate::FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation,
+    };
+    let loser_candidates = vec!["203.0.113.10:45393".to_string()];
+    let loser_sources = HashMap::from([(
+        "203.0.113.10:45393".to_string(),
+        crate::fresh_prediction_source_label(id(1)),
+    )]);
+    let winner_candidates = vec!["203.0.113.10:45401".to_string()];
+    let winner_sources = HashMap::from([(
+        "203.0.113.10:45401".to_string(),
+        crate::fresh_prediction_source_label(id(2)),
+    )]);
+
+    // The loser's full transaction runs first (the prepare/apply/commit
+    // sequence is serialized by the control event loop).
+    assert!(matches!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(1), &loser_candidates, &loser_sources, None)
+            .await,
+        RemoteFreshAdmission::Accepted
+    ));
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates("peer1", id(1), &loser_candidates, &loser_sources, 1, None)
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    // The winner's transaction supersedes it before the loser commits: the
+    // winner's apply replaces the loser's candidates in the shared set.
+    assert!(matches!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(2), &winner_candidates, &winner_sources, None)
+            .await,
+        RemoteFreshAdmission::Accepted
+    ));
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates("peer1", id(2), &winner_candidates, &winner_sources, 2, None)
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(manager.commit_remote_fresh_prediction("peer1", id(2)).await);
+
+    // The loser's commit loses the CAS and must roll its own apply back.
+    assert!(
+        !manager.commit_remote_fresh_prediction("peer1", id(1)).await,
+        "the older identity must lose the commit"
+    );
+    manager.rollback_remote_fresh_apply("peer1", id(1)).await;
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert!(
+        !conn.candidates.contains(&"203.0.113.10:45393".to_string()),
+        "the loser's candidates must be rolled back out of the shared set"
+    );
+    assert!(
+        conn.candidates.contains(&"203.0.113.10:45401".to_string()),
+        "the winner's committed candidates must survive"
+    );
+    // The loser's identity is never committed: a retry of the SAME payload is
+    // admitted again (the high-water is the winner's, so it is still Stale for
+    // the old identity, but the snapshot bookkeeping is clean).
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(1), &loser_candidates, &loser_sources, None)
+            .await,
+        RemoteFreshAdmission::Stale
+    );
+}
+
+/// An ordinary refresh interleaved with a fresh retry must not disturb the
+/// fresh session: the punch targets come from the committed snapshot, and an
+/// ordinary refresh never re-applies or overwrites the fresh identity.
+#[tokio::test]
+async fn ordinary_refresh_never_overwrites_committed_fresh_snapshot() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51865".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let id = crate::FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 1,
+    };
+    let fresh_candidates = vec!["203.0.113.10:45393".to_string()];
+    let fresh_sources = HashMap::from([(
+        "203.0.113.10:45393".to_string(),
+        crate::fresh_prediction_source_label(id),
+    )]);
+
+    // Commit the fresh identity (full transaction).
+    assert!(matches!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id, &fresh_candidates, &fresh_sources, None)
+            .await,
+        RemoteFreshAdmission::Accepted
+    ));
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates("peer1", id, &fresh_candidates, &fresh_sources, 1, None)
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(manager.commit_remote_fresh_prediction("peer1", id).await);
+
+    // An ordinary refresh interleaves and replaces the shared candidate set.
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &["198.51.100.9:44444".to_string()],
+            &HashMap::from([("198.51.100.9:44444".to_string(), "stun_observed".to_string())]),
+            99,
+            None,
+        )
+        .await;
+
+    // The committed snapshot is untouched: a retry of the fresh identity with
+    // the SAME payload is still idempotent, and its punch targets come from
+    // the snapshot — never from the refreshed ordinary set.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id, &fresh_candidates, &fresh_sources, None)
+            .await,
+        RemoteFreshAdmission::AlreadyRecorded,
+        "an ordinary refresh must never consume or overwrite the fresh identity"
+    );
+    let snapshot = manager.remote_fresh_snapshot_for("peer1", id).await;
+    let snapshot_targets = snapshot
+        .map(|snapshot| snapshot.candidates)
+        .unwrap_or_default();
+    assert_eq!(
+        snapshot_targets, fresh_candidates,
+        "the committed fresh snapshot must stay immutable across ordinary refreshes"
+    );
+}
+
+/// PeerLeft removes the connection; a rejoin with a NEW public key
+/// (`is_new == true`, `public_key_changed == false` on the fresh connection)
+/// must NOT inherit the old incarnation's fresh-prediction high-water: the
+/// old high-water would judge the new incarnation's first predictions stale
+/// forever.  The identity-key map survives `remove_peer`, so the rejoin is
+/// recognized as an identity change even though the connection is new.
+#[tokio::test]
+async fn rejoin_with_new_key_after_peer_left_resets_the_fresh_space() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51864".parse().unwrap();
+    let boot = 1_742_987_654_321u64;
+    let id = |boot_epoch: u64, generation: u64| crate::FreshPredictionId {
+        boot_epoch,
+        generation,
+    };
+    let payload = (vec!["203.0.113.10:45393".to_string()], HashMap::new(), None);
+
+    let peer = test_peer("peer1", endpoint);
+    manager.add_peer(&peer).await;
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 9), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Accepted
+    );
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates(
+                "peer1",
+                id(boot, 9),
+                &payload.0,
+                &payload.1,
+                boot.saturating_mul(2).saturating_add(9),
+                payload.2,
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(manager.commit_remote_fresh_prediction("peer1", id(boot, 9)).await);
+
+    // The peer leaves and rejoins with a NEW public key: the connection is
+    // brand new, so `public_key_changed` is false, but the identity-key map
+    // records the change and must reset the fresh space.
+    manager.remove_peer("peer1").await;
+    let mut rejoined = test_peer("peer1", endpoint);
+    rejoined.public_key = "rejoined-with-new-key".to_string();
+    let update = manager.add_peer(&rejoined).await;
+    assert!(update.is_new, "the rejoin creates a new connection");
+    assert!(
+        !update.public_key_changed,
+        "a new connection cannot report a public-key change"
+    );
+
+    // The old high-water must be gone: the new identity's first prediction
+    // (same boot epoch, low generation) is admitted and really applies.
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 1), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::Accepted,
+        "a rejoin with a new key must not inherit the old incarnation's high-water"
+    );
+    assert_eq!(
+        manager
+            .apply_remote_fresh_candidates(
+                "peer1",
+                id(boot, 1),
+                &payload.0,
+                &payload.1,
+                boot.saturating_mul(2).saturating_add(1),
+                payload.2,
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(
+        manager.commit_remote_fresh_prediction("peer1", id(boot, 1)).await,
+        "the new identity's commit must win"
+    );
+
+    // A rejoin with the SAME key keeps the high-water (a plain PeerLeft does
+    // not clear it): the late old signal stays rejected.
+    manager.remove_peer("peer1").await;
+    let update = manager.add_peer(&rejoined).await;
+    assert!(update.is_new);
+    assert!(
+        !update.public_key_changed,
+        "the same-key rejoin is not an identity change"
+    );
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction(
+                "peer1",
+                id(boot - 1, 1),
+                &payload.0,
+                &payload.1,
+                payload.2,
+            )
+            .await,
+        RemoteFreshAdmission::Stale,
+        "a same-key rejoin must keep the committed high-water (late old signals stay rejected)"
+    );
+    assert_eq!(
+        manager
+            .prepare_remote_fresh_prediction("peer1", id(boot, 1), &payload.0, &payload.1, payload.2)
+            .await,
+        RemoteFreshAdmission::AlreadyRecorded,
+        "the same-key rejoin's committed identity stays idempotently retryable"
+    );
+}
+
+/// The snapshot map keeps only the CURRENT high-water's snapshot per peer:
+/// older identities' snapshots are pruned at commit, so the map cannot grow
+/// without bound across generations and incarnations.
+#[tokio::test]
+async fn fresh_snapshots_are_pruned_to_the_current_high_water() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51865".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let boot = 1_742_987_654_321u64;
+    let id = |boot_epoch: u64, generation: u64| crate::FreshPredictionId {
+        boot_epoch,
+        generation,
+    };
+    let payload = (vec!["203.0.113.10:45393".to_string()], HashMap::new(), None);
+    async fn admit(
+        manager: &PeerManager,
+        identity: crate::FreshPredictionId,
+        payload: &(Vec<String>, HashMap<String, String>, Option<u64>),
+    ) {
+        assert_eq!(
+            manager
+                .prepare_remote_fresh_prediction("peer1", identity, &payload.0, &payload.1, payload.2)
+                .await,
+            RemoteFreshAdmission::Accepted
+        );
+        assert_eq!(
+            manager
+                .apply_remote_fresh_candidates(
+                    "peer1",
+                    identity,
+                    &payload.0,
+                    &payload.1,
+                    identity.boot_epoch.saturating_mul(2).saturating_add(identity.generation),
+                    payload.2,
+                )
+                .await,
+            CandidateSetApplyResult::Applied
+        );
+        assert!(manager.commit_remote_fresh_prediction("peer1", identity).await);
+    }
+
+    admit(&manager, id(boot, 1), &payload).await;
+    admit(&manager, id(boot, 2), &payload).await;
+    admit(&manager, id(boot, 3), &payload).await;
+    let snapshot_count = manager
+        .remote_fresh_snapshots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|((owner, _), _)| owner == "peer1")
+        .count();
+    assert_eq!(
+        snapshot_count, 1,
+        "only the current high-water's snapshot may survive"
+    );
+    assert!(
+        manager
+            .remote_fresh_snapshot_for("peer1", id(boot, 3))
+            .await
+            .is_some(),
+        "the newest identity's snapshot must be retained"
+    );
+    assert!(
+        manager
+            .remote_fresh_snapshot_for("peer1", id(boot, 1))
+            .await
+            .is_none(),
+        "the oldest identity's snapshot must be pruned"
+    );
 }

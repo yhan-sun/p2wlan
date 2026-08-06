@@ -10,6 +10,13 @@ pub struct PeerManager {
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.
     network_generation: Arc<RwLock<u64>>,
+    /// Lock-free mirror of `network_generation`, updated in the same critical
+    /// section as the lock so the UDP socket-state layer can read the CURRENT
+    /// generation without awaiting (the socket-state checks must never read
+    /// the generation before acquiring their own lock: a generation that
+    /// advances between the read and the lock would let a stale entry pass the
+    /// check).
+    network_generation_sync: Arc<std::sync::atomic::AtomicU64>,
     /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
     local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Anonymous local traversal outcome history.
@@ -22,6 +29,44 @@ pub struct PeerManager {
     local_fresh_mappings: Arc<RwLock<HashMap<String, LocalFreshMapping>>>,
     /// Time-limited prediction-error fingerprint per peer.
     fresh_mapping_history: Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
+    /// Per-peer high-water of the remote's fresh-mapping prediction identity.
+    ///
+    /// The remote signals fresh predictions as `predicted_fresh:<boot>:<gen>`.
+    /// Only a strictly newer (boot, generation) may be applied: a superseded
+    /// generation that an old task managed to send late is rejected before it
+    /// can overwrite the current candidate set or start a punch session.  The
+    /// high-water follows the peer's incarnation: public-key identity changes
+    /// reset it, while a plain PeerLeft does not (a late old-incarnation
+    /// signal must stay rejected after the peer rejoins).
+    remote_fresh_generations:
+        Arc<std::sync::Mutex<HashMap<String, crate::FreshPredictionId>>>,
+    /// Immutable candidate snapshots bound to committed fresh identities.
+    ///
+    /// An idempotent retry of an identity can only ever punch toward the
+    /// snapshot the identity was committed with, and a retry whose payload
+    /// differs is rejected instead of applied.
+    remote_fresh_snapshots:
+        Arc<std::sync::Mutex<HashMap<(String, crate::FreshPredictionId), FreshPredictionSnapshot>>>,
+    /// Fresh applies recorded between apply and commit, so a commit can
+    /// promote the applied payload to the durable snapshot or a losing
+    /// commit can roll exactly its own candidates back.
+    pending_fresh_applies:
+        Arc<std::sync::Mutex<HashMap<(String, crate::FreshPredictionId), PendingFreshApply>>>,
+    /// The last public key each node ID joined with, surviving `remove_peer`.
+    ///
+    /// The remote fresh-prediction space is bound to the peer's identity: a
+    /// PeerLeft followed by a rejoin with a NEW public key must not inherit
+    /// the old incarnation's high-water (its predictions would be judged
+    /// stale forever).  The identity map outlives the connection so
+    /// `add_peer` can compare the rejoining key even when `is_new`.
+    remote_fresh_identity_keys: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Synchronous mirror of which peers are currently Direct.
+    ///
+    /// Kept in lockstep with every `ConnectionState` transition (the single
+    /// choke point for state changes), so the UDP dynamic-socket eviction can
+    /// re-verify "is this peer Direct?" inside its socket-state lock without
+    /// ever awaiting the async peer manager there.
+    direct_peers: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Configuration.
     config: Config,
 }

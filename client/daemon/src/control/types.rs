@@ -430,6 +430,10 @@ enum ControlCommand {
         candidate_sources: HashMap<String, String>,
         handshake_init: Vec<u8>,
         punch_at_ms: Option<u64>,
+        /// When this offer advertises a fresh-mapping prediction, the owning
+        /// punch session's cancellation: the HTTP worker refuses to send once
+        /// the session was superseded.
+        fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Send a peer answer.

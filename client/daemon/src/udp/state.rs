@@ -10,8 +10,65 @@ type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
-type DynamicSocketIndex = usize;
-type DynamicSocketState = Arc<Mutex<HashMap<DynamicSocketIndex, DynamicPunchSocket>>>;
+
+/// All socket ownership state under one mutex.
+///
+/// The dynamic punch socket map, the per-peer affinity pins and the affinity
+/// epoch counter are deliberately merged: every ownership transition
+/// (attach, evict, detach, commit, affinity adoption) happens under this one
+/// lock, so there is no cross-lock ordering between the former
+/// `dynamic_sockets` and `peer_socket_affinity` maps and ABBA deadlocks are
+/// impossible by construction.
+pub(crate) struct SocketState {
+    pub(crate) dynamic: HashMap<usize, DynamicPunchSocket>,
+    pub(crate) affinity: HashMap<String, PeerSocketPin>,
+    /// Monotonic evidence counter. Every affinity adoption and every
+    /// fresh-mapping commit stamps the pin with a strictly newer value, so
+    /// stale ACKs and late generations can never downgrade a newer path.
+    pub(crate) affinity_epoch: u64,
+    /// Per-peer pending-probe cleanup epochs.  `clear_pending_probes_for_peer`
+    /// bumps the peer's epoch while it drops the peer's pending probes, and a
+    /// pending probe stamps the epoch that was current when it was sent: an
+    /// ACK handler whose transaction check failed may only re-insert the
+    /// pending probe when the peer was NOT cleaned up since the probe was
+    /// sent, so a cleanup that raced the ACK can never be undone by a late
+    /// re-insertion.
+    pub(crate) probe_cleanup_epochs: HashMap<String, u64>,
+    /// Per-peer punch generation of the newest socket that actually committed.
+    /// `commit_and_pin` re-verifies this high-water inside its lock
+    /// transaction: an older generation's commit must never overwrite the pin
+    /// of a generation that already committed, no matter how the sessions'
+    /// awaits interleave.
+    pub(crate) committed_punch_generations: HashMap<String, u64>,
+}
+
+impl SocketState {
+    pub(crate) fn next_epoch(&mut self) -> u64 {
+        self.affinity_epoch = self.affinity_epoch.saturating_add(1);
+        self.affinity_epoch
+    }
+}
+
+/// Per-peer pin of the UDP socket that should carry the peer's traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerSocketPin {
+    /// Pool socket index (< DYNAMIC_SOCKET_INDEX_BASE) or dynamic index.
+    pub(crate) socket_index: usize,
+    /// Evidence epoch that established this pin. Adoption is only allowed
+    /// when the incoming evidence is at least as new as the pin's epoch.
+    pub(crate) epoch: u64,
+}
+/// Evidence backing an affinity adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketEvidence {
+    /// Evidence tied to the instant a probe was sent (matched ACK): the
+    /// epoch recorded on the pending probe at send time.
+    Stamped(u64),
+    /// Fresh inbound evidence (authenticated punch or encrypted packet
+    /// received on this socket right now): the mapping demonstrably works
+    /// at arrival time.
+    Fresh,
+}
 
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
@@ -66,6 +123,16 @@ pub(crate) const FRESH_MAPPING_OBSERVERS_PER_BATCH: usize = 4;
 pub(crate) const FRESH_MAPPING_MEASURE_BUDGET: Duration = Duration::from_millis(1_200);
 /// Deltas further apart than this never form a linear model.
 pub(crate) const FRESH_MAPPING_MAX_ABS_STEP: i16 = 2_048;
+/// Upper bound for how long a dynamic socket detach waits for outstanding
+/// send leases to drain before aborting the reader.
+///
+/// The lease bound to each pending probe keeps the reader alive until the
+/// probe's ACK arrives or the pending entry times out, so a detach that raced
+/// a send must give the in-flight ACK a chance to be matched.  The bound
+/// covers the probe retransmission window (25/75 ms) plus the caller's ACK
+/// grace (1-2 s); after it, the detach proceeds, drops the socket's pending
+/// entries and aborts the reader.
+pub(crate) const DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One dedicated punch socket owned by a per-peer fresh-mapping generation.
 ///
@@ -83,8 +150,107 @@ pub(crate) struct DynamicPunchSocket {
     pub(crate) network_generation: u64,
     pub(crate) punch_generation: u64,
     pub(crate) created_at: Instant,
+    /// Lifecycle phase of this generation's socket. A Provisional socket is
+    /// owned by its in-flight generation and may be detached by the
+    /// generation's watcher or its own error paths; a Committed socket has
+    /// met the generation's commit conditions and only peer-level cleanup or
+    /// the generation's own post-commit rollback may remove it.
+    pub(crate) phase: DynamicSocketPhase,
     pub(crate) shutdown_tx: watch::Sender<bool>,
     pub(crate) reader: tokio::task::JoinHandle<()>,
+    /// Send-lease bookkeeping shared with every outstanding
+    /// [`DynamicSocketSendLease`]: a detach removes the entry from the map
+    /// immediately but waits for the leases to drain before aborting the
+    /// reader, so a probe whose send raced the detach still receives its ACK
+    /// on a live reader.
+    pub(crate) send_leases: Arc<DynamicSocketLeaseState>,
+}
+
+/// Reference-counted send-lease state for one dynamic socket.
+///
+/// The counter lives outside the socket-state lock so dropping a lease never
+/// needs to acquire it (a Drop that blocked on a lock held by the very task
+/// that was cancelled would deadlock).
+#[derive(Debug, Default)]
+pub(crate) struct DynamicSocketLeaseState {
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl DynamicSocketLeaseState {
+    fn acquire(&self) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn release(&self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Number of outstanding leases (in-flight sends on this socket).
+    pub(crate) fn outstanding(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// RAII send-lease on one dynamic punch socket.
+///
+/// Acquired under the socket-state lock when a probe send resolves a dynamic
+/// socket, released on drop — including when the sending future is cancelled.
+/// The detach path removes the map entry immediately (so no new resolver can
+/// acquire a lease) but waits for outstanding leases to drain before aborting
+/// the reader, which closes the resolve -> send -> ACK race: the ACK of a
+/// send that raced the detach still arrives at a reader that is alive.
+#[derive(Debug)]
+pub(crate) struct DynamicSocketSendLease {
+    state: Arc<DynamicSocketLeaseState>,
+    #[allow(dead_code)]
+    socket_index: usize,
+}
+
+impl DynamicSocketSendLease {
+    /// A lease that never blocks any detach; used for pool sockets that have
+    /// no reader-lifetime requirement.
+    pub(crate) fn noop(socket_index: usize) -> Self {
+        Self {
+            state: Arc::new(DynamicSocketLeaseState::default()),
+            socket_index,
+        }
+    }
+}
+
+impl Drop for DynamicSocketSendLease {
+    fn drop(&mut self) {
+        self.state.release();
+    }
+}
+
+/// Lifecycle phase of one fresh-mapping punch socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicSocketPhase {
+    /// Bound and attached, owned by an in-flight generation. Cancellation or
+    /// an abandoned future detaches it.
+    Provisional,
+    /// The generation met its commit conditions and pinned this socket as the
+    /// peer's data path, but the durable handoff (the fresh prediction was
+    /// advertised to the peer) has NOT been confirmed yet.  The guard watcher
+    /// may still roll the peer back to the predecessor pin and detach this
+    /// socket when the owning session is cancelled or the future is dropped.
+    CommittedPendingHandoff,
+    /// Durable handoff confirmed (the fresh prediction was advertised and the
+    /// watcher acknowledged the finalize): the socket IS the peer's long-term
+    /// data path.  Only peer-level cleanup (PeerLeft, public-key change, a
+    /// newer commit's predecessor detach, network-generation change) may
+    /// remove it; a session cancellation can never roll it back.
+    Finalized,
+}
+
+impl DynamicSocketPhase {
+    /// Whether a dynamic socket may be handed out as the peer's traffic path.
+    ///
+    /// A Provisional socket is owned by its in-flight generation; everything
+    /// else (pending handoff or finalized) is pinned and usable.
+    pub(crate) fn is_usable(self) -> bool {
+        !matches!(self, DynamicSocketPhase::Provisional)
+    }
 }
 
 impl DynamicPunchSocket {
@@ -93,14 +259,42 @@ impl DynamicPunchSocket {
     }
 }
 
+/// Why a dynamic punch socket could not be attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicSocketAttachError {
+    /// The dynamic socket cap is full and no entry could be evicted safely
+    /// (the same peer's predecessor and Direct peers are never evicted).
+    CapacityRejected,
+    /// The transport has no inbound channel, so the socket reader could not
+    /// deliver anything; the attach is rolled back.
+    NoInboundChannel,
+}
+
 /// Outcome of one fresh-mapping punch generation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum FreshMappingOutcome {
-    /// The generation measured, modeled and punched successfully.
-    Accepted(Box<FreshMappingResult>),
+    /// The generation measured, modeled and punched successfully.  The guard
+    /// is returned with the result: the durable handoff (`finalize`) runs in
+    /// the caller AFTER the fresh prediction was advertised, so an advertise
+    /// failure or a session cancellation can still roll the socket back.
+    /// Until `finalize` the socket is `CommittedPendingHandoff`; a guard that
+    /// is dropped without finalizing rolls the peer back to its previous
+    /// path.
+    Accepted(Box<FreshMappingResult>, Box<ProvisionalSocketGuard>),
     /// The generation could not produce a trustworthy prediction and the
     /// caller must fall back to the legacy punch strategy.
     Rejected(FreshMappingRejection),
+}
+
+impl std::fmt::Debug for ProvisionalSocketGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The guard contains live channels and a task handle; only its
+        // identity is stable for debugging.
+        f.debug_struct("ProvisionalSocketGuard")
+            .field("socket_index", &self.socket_index)
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A successful fresh-mapping generation result.
@@ -144,10 +338,17 @@ pub(crate) enum FreshMappingRejection {
     UnpredictableSequence,
     /// The dedicated socket could not be bound.
     BindFailed,
+    /// The dynamic socket cap had no safely evictable entry, so the new
+    /// generation's socket was refused without exceeding the cap.
+    CapacityRejected,
     /// No local node ID / probe key for authenticated punching.
     MissingProbeKey,
     /// The generation was superseded or the peer went away.
     Superseded,
+    /// The peer-facing punch loop sent no probe into the kernel queue
+    /// (attempts=0, all sends failed, or every send was aborted by
+    /// cancellation). The generation must not claim success.
+    NoProbesSent,
 }
 
 impl FreshMappingRejection {
@@ -161,8 +362,10 @@ impl FreshMappingRejection {
             Self::PublicIpChanged => "public_ip_changed",
             Self::UnpredictableSequence => "unpredictable_sequence",
             Self::BindFailed => "bind_failed",
+            Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",
             Self::Superseded => "superseded",
+            Self::NoProbesSent => "no_probes_sent",
         }
     }
 }
@@ -341,6 +544,15 @@ struct PendingProbe {
     purpose: PendingProbePurpose,
     accepts_authenticated_ack: bool,
     accepts_legacy_ack: bool,
+    /// Affinity evidence epoch at the moment this probe was sent. A matched
+    /// ACK may only adopt the sending socket when this epoch is at least as
+    /// new as the currently pinned one.
+    socket_epoch: u64,
+    /// Peer cleanup epoch at the moment this probe was sent.  An ACK handler
+    /// may only re-insert this pending entry after a failed transaction check
+    /// when the peer was not cleaned up since then, so a racing cleanup can
+    /// never be undone by a late re-insertion.
+    cleanup_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

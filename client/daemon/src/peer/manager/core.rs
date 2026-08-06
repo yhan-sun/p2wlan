@@ -15,12 +15,18 @@ impl PeerManager {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
+            network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_nat_profile: Arc::new(RwLock::new(None)),
             traversal_history: Arc::new(RwLock::new(traversal_history)),
             traversal_history_path,
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            remote_fresh_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_fresh_applies: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            remote_fresh_identity_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            direct_peers: Arc::new(std::sync::Mutex::new(HashSet::new())),
             config,
         }
     }
@@ -113,6 +119,29 @@ impl PeerManager {
         *self.network_generation.read().await
     }
 
+    /// Lock-free current network generation for checks that must run inside
+    /// another subsystem's critical section (the UDP socket-state lock).
+    ///
+    /// The mirror is updated in the same critical section as the RwLock, so
+    /// this never lags a completed advance; the generation only moves forward,
+    /// so a check against this value can never pass with a stale generation.
+    pub(crate) fn current_network_generation_sync(&self) -> u64 {
+        self.network_generation_sync.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a peer connection currently exists, readable without awaiting.
+    ///
+    /// Used under the UDP adoption lock to refuse ACK/punch adoption for a
+    /// peer whose connection was removed concurrently (PeerLeft): a late
+    /// packet must never recreate affinity or candidate state for a peer that
+    /// no longer exists.
+    pub(crate) fn peer_exists_sync(&self, node_id: &str) -> bool {
+        self.connections
+            .try_read()
+            .map(|connections| connections.contains_key(node_id))
+            .unwrap_or(false)
+    }
+
     /// Advance local network generation and invalidate confirmed direct paths.
     ///
     /// Existing remote candidates are kept so they can be reprobed, but prior
@@ -122,6 +151,10 @@ impl PeerManager {
         let generation = {
             let mut generation = self.network_generation.write().await;
             *generation = generation.saturating_add(1);
+            // Keep the lock-free mirror in the same critical section: the UDP
+            // socket-state checks read it without awaiting.
+            self.network_generation_sync
+                .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
 
@@ -158,6 +191,10 @@ impl PeerManager {
         let generation = {
             let mut generation = self.network_generation.write().await;
             *generation = generation.saturating_add(1);
+            // Keep the lock-free mirror in the same critical section (see
+            // `current_network_generation_sync`).
+            self.network_generation_sync
+                .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
 

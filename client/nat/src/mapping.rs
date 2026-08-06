@@ -390,21 +390,32 @@ pub fn build_model(
 
     if let Some(step) = dominant_step(&deltas) {
         if step != 0 && other_deltas_are_multiples(&deltas, step) {
-            let mut majority = 0usize;
-            for delta in &deltas {
-                if *delta == step {
-                    majority += 1;
+            // Every delta must share the dominant step's direction.  A shared
+            // CGNAT can interleave other flows between our own requests, so
+            // same-direction jumps (e.g. `1,1,2`) are still predictable; a
+            // mixed-direction sequence (e.g. `-1,+3,-1`) means the allocator
+            // hands out ports in an order we cannot model, and predicting
+            // along the dominant step would walk the wrong way.
+            let same_direction = deltas
+                .iter()
+                .all(|delta| *delta == 0 || delta.signum() == step.signum());
+            if same_direction {
+                let mut majority = 0usize;
+                for delta in &deltas {
+                    if *delta == step {
+                        majority += 1;
+                    }
                 }
-            }
-            if majority * 2 >= deltas.len() {
-                return PortModel {
-                    kind: PortModelKind::NoisyLinear { step },
-                    confidence: 75,
-                    public_ip,
-                    sequence: sequence.to_vec(),
-                    deltas,
-                    sampled_at_ms,
-                };
+                if majority * 2 >= deltas.len() {
+                    return PortModel {
+                        kind: PortModelKind::NoisyLinear { step },
+                        confidence: 75,
+                        public_ip,
+                        sequence: sequence.to_vec(),
+                        deltas,
+                        sampled_at_ms,
+                    };
+                }
             }
         }
     }
@@ -464,6 +475,24 @@ pub const MAX_PREDICTED_PORTS: usize = 24;
 ///
 /// `last` is the final observed public port.
 pub fn predict_ports(model: &PortModel, last: u16) -> Vec<PredictionCandidate> {
+    predict_ports_for_elapsed(model, last, 0, 0)
+}
+
+/// Same as [`predict_ports`], with a window that grows with the expected gap
+/// between the end of the measurement and the peer's probes.
+///
+/// A shared CGNAT keeps consuming public ports while we wait for the signal to
+/// reach the peer (`gap_ms`).  The extra ports are estimated from the
+/// consumption rate observed during the measurement: every delta beyond the
+/// model step is one unrelated mapping consumed between our own requests.
+/// `measurement_span_ms` is the wall time of the STUN batch; pass 0 to keep
+/// the fixed confidence-based window only.
+pub fn predict_ports_for_elapsed(
+    model: &PortModel,
+    last: u16,
+    measurement_span_ms: u64,
+    gap_ms: u64,
+) -> Vec<PredictionCandidate> {
     let mut candidates = Vec::with_capacity(MAX_PREDICTED_PORTS);
 
     match model.kind {
@@ -498,12 +527,16 @@ pub fn predict_ports(model: &PortModel, last: u16) -> Vec<PredictionCandidate> {
         PortModelKind::FixedStep { step }
         | PortModelKind::Linear { step }
         | PortModelKind::NoisyLinear { step } => {
-            let window_size = match model.confidence {
+            let base_window = match model.confidence {
                 90..=100 => 6,
                 75..=89 => 12,
                 60..=74 => MAX_PREDICTED_PORTS,
                 _ => 0,
             };
+            let extra_window = extra_window_ports(model, measurement_span_ms, gap_ms);
+            let window_size = base_window
+                .saturating_add(extra_window)
+                .min(MAX_PREDICTED_PORTS);
             let low_confidence = model.confidence < 75;
             for distance in 0..window_size {
                 let port = modular_add(last, step.saturating_mul((distance + 1) as i16));
@@ -529,6 +562,43 @@ pub fn predict_ports(model: &PortModel, last: u16) -> Vec<PredictionCandidate> {
 
     candidates.truncate(MAX_PREDICTED_PORTS);
     candidates
+}
+
+/// Extra candidate ports covering the mappings a shared CGNAT will consume
+/// between the last STUN response and the peer's probes.
+///
+/// The observed sequence already contains the externality: every delta that
+/// overshoots the model step is one unrelated mapping consumed between two of
+/// our requests.  `excess / span` is the observed port consumption rate of
+/// unrelated traffic; multiplying by the expected gap yields the extra ports
+/// the peer-facing mapping may drift by.
+fn extra_window_ports(model: &PortModel, measurement_span_ms: u64, gap_ms: u64) -> usize {
+    if measurement_span_ms == 0 || gap_ms == 0 {
+        return 0;
+    }
+    let step = match model.kind {
+        PortModelKind::FixedStep { step }
+        | PortModelKind::Linear { step }
+        | PortModelKind::NoisyLinear { step } => step,
+        _ => return 0,
+    };
+    let mut excess_ports = 0u64;
+    let step_direction = i64::from(step.signum());
+    for delta in &model.deltas {
+        // Measure the overshoot along the model's direction: with step +1 a
+        // delta of +3 consumed two extra ports; with step -1 a delta of -3
+        // consumed two extra ports as well.
+        let beyond = (i64::from(*delta) - i64::from(step)) * step_direction;
+        if beyond > 0 {
+            excess_ports += beyond as u64;
+        }
+    }
+    if excess_ports == 0 {
+        return 0;
+    }
+    let rate = excess_ports as f64 / measurement_span_ms.max(1) as f64;
+    let extra = (rate * gap_ms as f64).ceil() as usize;
+    extra.min(MAX_PREDICTED_PORTS)
 }
 
 /// Whether the model's samples are still within their trusted age.
@@ -808,6 +878,86 @@ mod tests {
             .collect::<Vec<_>>();
         ascending.sort_unstable();
         assert_eq!(ascending, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn mixed_direction_noisy_linear_is_rejected_not_predicted() {
+        // A shared CGNAT interleaving other flows hands ports back and forth:
+        // deltas [-1,+3,-1] previously produced a NoisyLinear step of -1
+        // with 75 confidence even though the public port grows over time.
+        let ports = [10134u16, 10133, 10136, 10135];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(!model.kind.clone().is_predictable(), "{:?}", model.kind);
+        assert!(predict_ports(&model, 10135).is_empty());
+    }
+
+    #[test]
+    fn same_direction_noisy_linear_still_predicts() {
+        // Same-direction overshoots remain predictable: 1,1,2 is a
+        // consumed-mapping NoisyLinear, not a rejection.
+        let ports = [33051u16, 33052, 33053, 33055];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(
+            matches!(
+                model.kind,
+                PortModelKind::NoisyLinear { step: 1 } | PortModelKind::Linear { step: 1 }
+            ),
+            "{:?}",
+            model.kind
+        );
+        let predicted = predict_ports(&model, 33055);
+        assert_eq!(predicted[0].port, 33056);
+    }
+
+    #[test]
+    fn elapsed_window_grows_with_consumption_rate_and_gap() {
+        // Deltas [1,1,2] over a 100ms measurement: one external mapping was
+        // consumed, so the rate is 10 ports/s.  A 500ms gap must add 5 ports
+        // on top of the 6-port high-confidence base window.
+        let ports = [33051u16, 33052, 33053, 33055];
+        let model = build_model(&ports, Some(ip()), 1000);
+        let base = predict_ports(&model, 33055);
+        assert_eq!(base.len(), 12, "NoisyLinear 75 confidence -> 12 base");
+        let extended = predict_ports_for_elapsed(&model, 33055, 100, 500);
+        assert!(
+            extended.len() > base.len(),
+            "extended {} must exceed base {}",
+            extended.len(),
+            base.len()
+        );
+        assert_eq!(extended[0].port, 33056);
+        assert!(extended.iter().any(|candidate| candidate.port == 33060));
+        assert!(extended.len() <= MAX_PREDICTED_PORTS);
+        // No external consumption -> no extension.
+        let clean = build_model(&[45390u16, 45391, 45392], Some(ip()), 1000);
+        assert_eq!(
+            predict_ports_for_elapsed(&clean, 45392, 100, 500).len(),
+            predict_ports(&clean, 45392).len()
+        );
+    }
+
+    #[test]
+    fn elapsed_window_respects_negative_step_direction() {
+        // step -1 with one extra consumed mapping: deltas [-1,-2].
+        let ports = [20010u16, 20009, 20007];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(
+            matches!(
+                model.kind,
+                PortModelKind::NoisyLinear { step: -1 } | PortModelKind::Linear { step: -1 }
+            ),
+            "{:?}",
+            model.kind
+        );
+        let base = predict_ports(&model, 20007);
+        let extended = predict_ports_for_elapsed(&model, 20007, 50, 500);
+        assert!(
+            extended.len() > base.len(),
+            "extended {} must exceed base {}",
+            extended.len(),
+            base.len()
+        );
+        assert_eq!(extended[0].port, 20006);
     }
 
     #[test]

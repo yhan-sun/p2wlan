@@ -161,7 +161,13 @@ impl PeerDiagnostics {
                 .then_with(|| a.remote_endpoint.cmp(&b.remote_endpoint))
         });
 
-        let is_public_udp_direct = direct_type == DirectPathType::PublicUdp;
+        // A peer-reflexive pair over a real public IPv4 endpoint is still a
+        // public UDP direct path: both endpoints are routable Internet
+        // addresses.  Only overlay/relay paths are not public-IP direct.
+        let is_public_udp_direct = matches!(
+            direct_type,
+            DirectPathType::PublicUdp | DirectPathType::PeerReflexive
+        );
         let is_peer_reflexive_direct = direct_type == DirectPathType::PeerReflexive;
         let public_mapping_stable = direct_type == DirectPathType::PublicUdp;
         let is_overlay_direct = direct_type == DirectPathType::Overlay;

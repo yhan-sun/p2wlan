@@ -16,6 +16,9 @@ fn success_rate_per_mille(success_count: u64, failure_count: u64) -> Option<u16>
 }
 
 fn candidate_pair_source_from_label(label: &str) -> Option<CandidatePairSource> {
+    if label.starts_with(crate::FRESH_PREDICTION_SOURCE_LABEL_PREFIX) {
+        return Some(CandidatePairSource::Predicted);
+    }
     match label {
         "predicted" => Some(CandidatePairSource::Predicted),
         "peer_reflexive" => Some(CandidatePairSource::PeerReflexive),

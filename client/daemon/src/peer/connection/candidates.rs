@@ -643,6 +643,7 @@ impl PeerConnection {
             start_rank: rotation_start_rank,
             end_rank: plan_end_rank,
             generated_candidates: generated,
+            planned_candidates: endpoints.len(),
             selected_candidates: 0,
             selected_birthday_candidates: 0,
             unique_target_ports: 0,

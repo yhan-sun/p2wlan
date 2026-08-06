@@ -74,20 +74,39 @@ fn fresh_mapping_signal_payload_passes_control_plane_validation() {
         "stun_observed".to_string(),
     );
 
-    let (candidates, sources) =
-        build_fresh_mapping_signal_payload(&result, &current_candidates, &current_sources);
+    let (candidates, sources) = build_fresh_mapping_signal_payload(
+        &result,
+        1_742_987_654_321,
+        &current_candidates,
+        &current_sources,
+    );
 
     assert_passes_control_plane_validation(&candidates, &sources);
 
-    // Predicted ports are signaled first, in rank order (top-1 first).
+    // Predicted ports are signaled first, in rank order (top-1 first), with
+    // the distinct fresh-prediction label carrying the punch generation.
     let predicted = candidates
         .iter()
-        .filter(|candidate| sources.get(*candidate).map(String::as_str) == Some("predicted"))
+        .filter(|candidate| {
+            sources
+                .get(*candidate)
+                .is_some_and(|source| source.starts_with(FRESH_PREDICTION_SOURCE_LABEL_PREFIX))
+        })
         .collect::<Vec<_>>();
     assert_eq!(predicted.len(), 6);
     assert_eq!(predicted[0].parse::<SocketAddr>().unwrap().port(), 45393);
     assert_eq!(predicted[1].parse::<SocketAddr>().unwrap().port(), 45394);
     assert_eq!(predicted[5].parse::<SocketAddr>().unwrap().port(), 45398);
+    for endpoint in &predicted {
+        let label = sources.get(*endpoint).expect("predicted endpoint source");
+        assert_eq!(
+            label,
+            &fresh_prediction_source_label(FreshPredictionId {
+                boot_epoch: 1_742_987_654_321,
+                generation: result.punch_generation,
+            })
+        );
+    }
 
     // No reserved metadata keys exist in the payload.
     assert!(
@@ -100,8 +119,12 @@ fn fresh_mapping_signal_payload_passes_control_plane_validation() {
 fn fresh_mapping_signal_payload_without_public_ip_falls_back_to_unspecified_ip() {
     let mut result = sample_result();
     result.public_ip = None;
-    let (candidates, _sources) =
-        build_fresh_mapping_signal_payload(&result, &[], &HashMap::new());
+    let (candidates, _sources) = build_fresh_mapping_signal_payload(
+        &result,
+        1_742_987_654_321,
+        &[],
+        &HashMap::new(),
+    );
     let first: SocketAddr = candidates[0].parse().unwrap();
     assert_eq!(first.port(), 45393);
 }

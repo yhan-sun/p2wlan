@@ -25,6 +25,64 @@ impl UdpTransport {
         true
     }
 
+    /// Re-insert a matched pending probe after a failed transaction check,
+    /// unless the peer was cleaned up since the probe was sent.
+    ///
+    /// The cleanup epoch check, the insert and the re-verification close the
+    /// race with `clear_pending_probes_for_peer`: whichever of the two runs
+    /// last decides, and a cleanup can never be undone by a late re-insertion
+    /// of an old pending entry.  No lock nesting: the pending lock is never
+    /// held while the socket-state lock is re-read.
+    async fn restore_pending_probe_if_peer_still_clean(
+        &self,
+        nonce: ProbeNonce,
+        pending: PendingProbe,
+    ) -> bool {
+        let Some(peer_id) = pending.peer_id.as_deref() else {
+            return false;
+        };
+        loop {
+            let cleanup_epoch = self.peer_probe_cleanup_epoch(peer_id).await;
+            if pending.cleanup_epoch != cleanup_epoch {
+                return false;
+            }
+            self.pending_probes
+                .lock()
+                .await
+                .entry(nonce)
+                .or_insert_with(|| pending.clone());
+            if self.peer_probe_cleanup_epoch(peer_id).await == cleanup_epoch {
+                return true;
+            }
+            // A cleanup ran between the check and the insert: drop the entry
+            // we just restored and retry (the retry will observe the new
+            // epoch and refuse).
+            self.pending_probes.lock().await.remove(&nonce);
+        }
+    }
+
+    /// Whether the peer was NOT cleaned up since `pending` was sent.
+    ///
+    /// The ACK handler re-verifies this AFTER removing the matched pending
+    /// entry and BEFORE any adoption (remember socket, learn endpoint, record
+    /// direct success, promote Direct): a cleanup that raced the ACK must
+    /// leave nothing behind.
+    async fn peer_still_clean(&self, pending: &PendingProbe) -> bool {
+        let Some(peer_id) = pending.peer_id.as_deref() else {
+            return false;
+        };
+        let current = self.peer_probe_cleanup_epoch(peer_id).await;
+        if current != pending.cleanup_epoch {
+            debug!(
+                "cleanup epoch mismatch for peer {peer_id}: pending ACK stamped epoch {} but the peer was cleaned to epoch {current}; adoption skipped",
+                pending.cleanup_epoch
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     /// Receive encrypted UDP datagrams until the socket or channel closes.
     pub async fn run_inbound(
         self,
@@ -93,13 +151,37 @@ impl UdpTransport {
         let mut buf = vec![0u8; 65_535];
 
         loop {
-            if let Some(shutdown_rx) = shutdown_rx.as_deref_mut() {
-                if *shutdown_rx.borrow() {
-                    return Ok(());
+            // The shutdown signal is selected TOGETHER with the receive: a
+            // reader parked in `recv_from` must never stay blocked forever
+            // when the owning generation is cancelled before its socket was
+            // ever inserted (the shutdown sender then drops, closing the
+            // channel, and this arm fires).  Without the select, the reader
+            // would block in `recv_from` for as long as the socket Arc it
+            // itself holds keeps the file descriptor alive — a socket/reader
+            // leak.
+            let packet = match shutdown_rx.as_deref_mut() {
+                Some(shutdown_rx) => {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            // The sender was dropped (pre-insert cancellation)
+                            // or the stop signal was sent (detach): either way
+                            // the reader must exit.  `borrow()` would panic on
+                            // the closed channel, so the value is only read
+                            // when `changed()` reported an actual change.
+                            match shutdown_rx.has_changed() {
+                                Ok(true) if *shutdown_rx.borrow_and_update() => {
+                                    return Ok(());
+                                }
+                                Err(_) => return Ok(()),
+                                _ => continue,
+                            }
+                        }
+                        packet = socket.recv_from(&mut buf) => packet,
+                    }
                 }
-            }
-
-            let (n, source) = match socket.recv_from(&mut buf).await {
+                None => socket.recv_from(&mut buf).await,
+            };
+            let (n, source) = match packet {
                 Ok(packet) => packet,
                 Err(err) if is_ignorable_udp_receive_error(&err) => {
                     debug!("Ignoring transient UDP receive error on direct transport: {err}");
@@ -356,6 +438,22 @@ impl UdpTransport {
                             );
                             continue;
                         }
+                        // The adoption section (socket pin, direct success
+                        // accounting, peer-reflexive notification) runs under
+                        // the peer's adoption lock, re-verifying the peer
+                        // still exists: a PeerLeft cleanup that raced this
+                        // punch must not leave affinity or candidate state
+                        // for a peer that no longer exists (a same-ID rejoin
+                        // would otherwise inherit it).
+                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
+                        let _adoption_guard = adoption.lock().await;
+                        if !self.peers.peer_exists_sync(&identity.source_node_id) {
+                            trace!(
+                                "Ignored authenticated UDP punch from {}; peer was removed before adoption",
+                                identity.source_node_id
+                            );
+                            continue;
+                        }
                         self.peers
                             .record_predicted_window_hit_if_predicted(&identity.source_node_id, source)
                             .await;
@@ -375,8 +473,12 @@ impl UdpTransport {
                                 )
                                 .await;
                         }
-                        self.remember_peer_socket(&identity.source_node_id, socket_index)
-                            .await;
+                        self.remember_peer_socket(
+                            &identity.source_node_id,
+                            socket_index,
+                            SocketEvidence::Fresh,
+                        )
+                        .await;
                         self.notify_peer_reflexive_observation(&identity.source_node_id, source)
                             .await;
 
@@ -405,8 +507,35 @@ impl UdpTransport {
                                 .saturating_add(1)
                         })
                         .await;
+                        // The whole match -> verify -> adopt sequence runs
+                        // under the peer's adoption lock: a PeerLeft /
+                        // offline / public-key-change cleanup can never
+                        // interleave between the pending removal and the
+                        // adoption awaits, so a late ACK can neither match
+                        // nor recreate affinity/candidate/endpoint state for
+                        // a peer that was cleaned.  The cleanup that loses
+                        // the lock runs after and removes everything this
+                        // ACK created; the cleanup that wins the lock bumps
+                        // the epoch and the fence below refuses the adoption.
+                        let adoption = self
+                            .adoption_lock_for(&identity.source_node_id)
+                            .await;
+                        let _adoption_guard = adoption.lock().await;
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
+                            // The cleanup epoch is read under the socket-state
+                            // lock and the pending match runs under it: an ACK
+                            // can only match a pending probe whose stamped
+                            // cleanup epoch still equals the peer's current
+                            // one, so an ACK from before an offline /
+                            // PeerLeft / endpoint / public-key cleanup can
+                            // never match a probe sent after it.
+                            let state = self.socket_state.lock().await;
+                            let cleanup_epoch = state
+                                .probe_cleanup_epochs
+                                .get(identity.source_node_id.as_str())
+                                .copied()
+                                .unwrap_or(0);
                             let mut pending_probes = self.pending_probes.lock().await;
                             let matched = pending_probes
                                 .get(&packet.nonce)
@@ -415,6 +544,7 @@ impl UdpTransport {
                                         && pending.socket_index == socket_index
                                         && pending.peer_id.as_deref()
                                             == Some(identity.source_node_id.as_str())
+                                        && pending.cleanup_epoch == cleanup_epoch
                                         && pending.accepts_authenticated_ack
                                 })
                                 .cloned();
@@ -425,6 +555,16 @@ impl UdpTransport {
                         };
 
                         if let Some(pending) = ack_match {
+                            // The peer must still be clean (no offline /
+                            // PeerLeft / endpoint / public-key change since
+                            // the probe was sent) before ANY adoption.  Under
+                            // the adoption lock the epoch cannot move between
+                            // this fence and the last adoption; the fence is
+                            // still re-verified so a cleanup that won the
+                            // lock first refuses the whole adoption.
+                            if !self.peer_still_clean(&pending).await {
+                                continue;
+                            }
                             if let Some(token) = pending_token.as_deref() {
                                 if self
                                     .confirm_pending_probe_adoption(
@@ -442,11 +582,18 @@ impl UdpTransport {
                                         "Ignored matched pending Probe v2 ACK from {}; matching WireGuard/Probe transaction is unavailable",
                                         identity.source_node_id
                                     );
-                                    self.pending_probes
-                                        .lock()
-                                        .await
-                                        .entry(packet.nonce)
-                                        .or_insert(pending);
+                                    // Re-inserting is only safe when the peer
+                                    // was not cleaned up (offline, PeerLeft,
+                                    // endpoint/public-key change) between the
+                                    // probe send and this ACK: a cleanup that
+                                    // raced this handler must never be undone
+                                    // by a late re-insertion of the old
+                                    // pending entry.
+                                    self.restore_pending_probe_if_peer_still_clean(
+                                        packet.nonce,
+                                        pending,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             }
@@ -454,12 +601,17 @@ impl UdpTransport {
                             let generation = pending.generation;
                             let local_endpoint = pending.local_endpoint;
                             let purpose = pending.purpose;
+                            let socket_epoch = pending.socket_epoch;
                             self.update_socket_diagnostics(socket_index, |metrics| {
                                 metrics.probe_acks_received += 1
                             })
                             .await;
-                            self.remember_peer_socket(&identity.source_node_id, socket_index)
-                                .await;
+                            self.remember_peer_socket(
+                                &identity.source_node_id,
+                                socket_index,
+                                SocketEvidence::Stamped(socket_epoch),
+                            )
+                            .await;
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;
@@ -543,6 +695,17 @@ impl UdpTransport {
                                 if let Some(peer_id) =
                                     self.peers.learn_endpoint_from_addr(source).await
                                 {
+                                    // Same adoption fence as the authenticated
+                                    // punch: under the peer's adoption lock the
+                                    // peer must still exist before any socket
+                                    // pin or Direct promotion, so a PeerLeft
+                                    // that raced this punch leaves nothing
+                                    // behind.
+                                    let adoption = self.adoption_lock_for(&peer_id).await;
+                                    let _adoption_guard = adoption.lock().await;
+                                    if !self.peers.peer_exists_sync(&peer_id) {
+                                        continue;
+                                    }
                                     self.peers
                                         .record_direct_probe_success_with_local_endpoint(
                                             &peer_id,
@@ -550,7 +713,12 @@ impl UdpTransport {
                                             socket.local_addr().ok(),
                                         )
                                         .await;
-                                    self.remember_peer_socket(&peer_id, socket_index).await;
+                                    self.remember_peer_socket(
+                                        &peer_id,
+                                        socket_index,
+                                        SocketEvidence::Fresh,
+                                    )
+                                    .await;
                                     self.notify_peer_reflexive_observation(&peer_id, source)
                                         .await;
                                     self.trigger_peer_reflexive_check(
@@ -594,6 +762,8 @@ impl UdpTransport {
                                         pending.peer_id.clone(),
                                         pending.local_endpoint,
                                         pending.purpose,
+                                        pending.socket_epoch,
+                                        pending.cleanup_epoch,
                                     )
                                 });
                             if matched.is_some() {
@@ -604,25 +774,61 @@ impl UdpTransport {
                         let ack_matched = ack_match.is_some();
                         let pending_peer_id = ack_match
                             .as_ref()
-                            .and_then(|(_, _, peer_id, _, _)| peer_id.clone());
+                            .and_then(|(_, _, peer_id, _, _, _, _)| peer_id.clone());
+                        // The peer identity comes from the matched pending
+                        // probe (never from the source address alone, which
+                        // would let a spoofed ACK drive endpoint learning).
                         let peer_id = match pending_peer_id.as_ref() {
-                            Some(peer_id) => {
-                                self.peers
-                                    .learn_correlated_probe_endpoint(peer_id, source)
-                                    .await;
-                                Some(peer_id.clone())
-                            }
+                            Some(peer_id) => Some(peer_id.clone()),
                             None => self.peers.learn_endpoint_from_addr(source).await,
                         };
                         if let Some(peer_id) = peer_id {
-                            if let Some((latency, generation, _, local_endpoint, purpose)) =
-                                ack_match
+                            // The whole fence -> learn -> adopt sequence runs
+                            // under the peer's adoption lock, and the cleanup
+                            // fence runs BEFORE any endpoint learning: a
+                            // legacy ACK must never learn an endpoint, pin a
+                            // socket or promote Direct after the peer was
+                            // cleaned (offline, PeerLeft, endpoint/public-key
+                            // change).
+                            let adoption = self.adoption_lock_for(&peer_id).await;
+                            let _adoption_guard = adoption.lock().await;
+                            let pending_cleanup_epoch =
+                                ack_match.as_ref().map(|(_, _, _, _, _, _, epoch)| *epoch);
+                            let still_clean = match pending_cleanup_epoch {
+                                Some(stamped) => {
+                                    self.peer_probe_cleanup_epoch(&peer_id).await == stamped
+                                }
+                                None => true,
+                            };
+                            if !still_clean {
+                                debug!(
+                                    "Ignoring legacy ACK from {source} for peer {peer_id}: the peer was cleaned after the probe was sent"
+                                );
+                                continue;
+                            }
+                            if let Some((
+                                latency,
+                                generation,
+                                _,
+                                local_endpoint,
+                                purpose,
+                                socket_epoch,
+                                _,
+                            )) = ack_match
                             {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
                                     metrics.probe_acks_received += 1
                                 })
                                 .await;
-                                self.remember_peer_socket(&peer_id, socket_index).await;
+                                self.peers
+                                    .learn_correlated_probe_endpoint(&peer_id, source)
+                                    .await;
+                                self.remember_peer_socket(
+                                    &peer_id,
+                                    socket_index,
+                                    SocketEvidence::Stamped(socket_epoch),
+                                )
+                                .await;
                                 self.notify_peer_reflexive_observation(&peer_id, source)
                                     .await;
                                 let accepted = self
@@ -685,8 +891,12 @@ impl UdpTransport {
                 continue;
             }
 
+            // Raw encrypted UDP is NOT fresh affinity evidence: the socket is
+            // only adopted for the peer after WireGuard decryption proves the
+            // datagram really belongs to it (see `run_inbound_with_peers`).
+            // Endpoint learning may still run here, but it only records the
+            // observed source, never the sending socket.
             if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
-                self.remember_peer_socket(&peer_id, socket_index).await;
                 trace!("Learned encrypted UDP source {source} for peer {peer_id}");
             }
 
@@ -701,6 +911,7 @@ impl UdpTransport {
                     local_endpoint: socket.local_addr().ok(),
                     relay_endpoint: None,
                     relay_peer_id: None,
+                    socket_index: Some(socket_index),
                     wire_bytes: data.to_vec(),
                 })
                 .await

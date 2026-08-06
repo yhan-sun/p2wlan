@@ -9,6 +9,7 @@ impl Daemon {
             local_candidate_sources: self.local_candidate_sources.clone(),
             stun_servers: self.runtime_stun_servers.read().await.clone(),
             stun_timeout: *self.runtime_stun_timeout.read().await,
+            boot_epoch_ms: self.boot_epoch_ms,
         })
     }
 
@@ -113,6 +114,7 @@ impl Daemon {
                 &candidate_sources,
                 &[],
                 punch_at_ms,
+                None,
             )
             .await
         {
@@ -144,6 +146,8 @@ impl Daemon {
             attempts,
             punch_at_ms,
             signal,
+            None,
+            None,
         )
         .await;
     }
@@ -264,10 +268,22 @@ impl Daemon {
     }
 
     async fn start_hole_punch(&self, node_id: &str) {
-        self.start_hole_punch_at(node_id, None).await;
+        self.start_hole_punch_at(node_id, None, None, None).await;
     }
 
-    async fn start_hole_punch_at(&self, node_id: &str, punch_at_ms: Option<u64>) {
+    /// Start a synchronized hole punch for `node_id`.
+    ///
+    /// `frozen_targets` is only Some for a fresh-mapping prediction session:
+    /// the immutable candidate snapshot frozen when the fresh signal arrived.
+    /// A later ordinary refresh may update the shared candidate set, but it
+    /// must never change the target of a running fresh session.
+    async fn start_hole_punch_at(
+        &self,
+        node_id: &str,
+        punch_at_ms: Option<u64>,
+        fresh_prediction: Option<FreshPredictionId>,
+        frozen_targets: Option<Vec<SocketAddr>>,
+    ) {
         let Some(udp) = self.udp_transport.read().await.clone() else {
             debug!("UDP transport is not ready; skipping hole punch for {node_id}");
             return;
@@ -321,6 +337,8 @@ impl Daemon {
             attempts,
             punch_at_ms,
             signal,
+            fresh_prediction,
+            frozen_targets,
         )
         .await;
     }

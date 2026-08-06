@@ -43,8 +43,11 @@ use websocket::spawn_signal_websocket;
 use futures_util::SinkExt;
 #[cfg(test)]
 use http::{
-    next_candidate_generation, normalize_signal_candidate_expiry, normalize_signal_punch_at,
-    peer_metadata_changed, peer_reflexive_endpoint_from_signal,
+    next_candidate_generation, next_candidate_generation_for_incarnation,
+    normalize_signal_candidate_expiry, normalize_signal_punch_at, peer_metadata_changed,
+    peer_reflexive_endpoint_from_signal, CandidateGenerationError,
+    CANDIDATE_GENERATION_COUNTER_BITS, CANDIDATE_GENERATION_COUNTER_MASK,
+    CANDIDATE_GENERATION_INCARNATION_BITS, CANDIDATE_GENERATION_INCARNATION_FLAG,
 };
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};

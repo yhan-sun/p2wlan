@@ -300,13 +300,14 @@ impl PeerManager {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         let detail = format!(
-            "generation={} stable_side={} public_ips={public_ips:?} bases={bases:?} start_rank={} end_rank={} wrapped={} generated_candidates={} selected_candidates={} selected_birthday_candidates={} unique_target_ports={}",
+            "generation={} stable_side={} public_ips={public_ips:?} bases={bases:?} start_rank={} end_rank={} wrapped={} generated_candidates={} planned_candidates={} selected_candidates={} selected_birthday_candidates={} unique_target_ports={}",
             plan.local_generation,
             plan.stable_side_unique_scatter,
             plan.start_rank,
             plan.end_rank,
             plan.wrapped,
             plan.generated_candidates,
+            plan.planned_candidates,
             plan.selected_candidates,
             plan.selected_birthday_candidates,
             plan.unique_target_ports,
@@ -356,9 +357,19 @@ impl PeerManager {
         plan: &BirthdayProbePlan,
         covered_all_selected_candidates: bool,
     ) -> bool {
+        // Only the public IPs and the actual probing coverage matter.  The
+        // candidate base ports churn every refresh cycle (peer STUN ports
+        // move), and `generated_candidates` excludes bases that were already
+        // in the endpoint set, so comparing it against the selected birthday
+        // count would stall the cursor forever on a healthy scan.
+        // The budget check is strict: `planned_candidates` is the full target
+        // list before cooldown/budget filtering, so a plan whose endpoints
+        // were dropped before sending must not advance the cursor past ports
+        // that were never probed.
         if !plan.stable_side_unique_scatter
             || !covered_all_selected_candidates
-            || plan.selected_birthday_candidates != plan.generated_candidates
+            || plan.selected_birthday_candidates == 0
+            || plan.selected_candidates != plan.planned_candidates
         {
             return false;
         }

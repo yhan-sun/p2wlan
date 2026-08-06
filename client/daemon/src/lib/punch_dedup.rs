@@ -12,11 +12,27 @@ struct PunchAttemptState {
 struct PunchAttemptRecord {
     session_id: u64,
     priority: u8,
+    /// Identity of the fresh-mapping prediction backing this session, when
+    /// the session is a fresh-prediction claim.  Ordering is lexicographic on
+    /// (incarnation boot epoch, generation): a newer incarnation supersedes
+    /// an older one, and within one incarnation a newer generation wins.
+    fresh_generation: Option<crate::FreshPredictionId>,
     cancellation: Arc<PunchSessionCancellation>,
 }
 
+/// Background retry / birthday sweep sessions.  Never preempts anything.
+const PUNCH_PRIORITY_BACKGROUND: u8 = 0;
+/// Ordinary synchronized punch (candidate refresh, handshake offers).
+const PUNCH_PRIORITY_SYNCHRONIZED: u8 = 1;
+/// Synchronized punch triggered by a fresh-mapping prediction signal.
+///
+/// The peer measured its NAT port sequence and signaled a predicted window;
+/// this session must preempt every older ordinary/birthday session so the
+/// prediction is used while it is still fresh.
+const PUNCH_PRIORITY_FRESH_PREDICTION: u8 = 2;
+
 #[derive(Default)]
-struct PunchSessionCancellation {
+pub(crate) struct PunchSessionCancellation {
     cancelled: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -55,8 +71,7 @@ impl PunchSessionCancellation {
         }
     }
 
-    #[cfg(test)]
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -67,9 +82,15 @@ impl PunchSessionPermit {
         self.cancellation.cancelled().await;
     }
 
-    #[cfg(test)]
     fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Handle for watchers that must observe this session's cancellation
+    /// (e.g. cleanup of a provisional fresh-mapping socket whose owning work
+    /// future may be dropped at an await point).
+    pub(crate) fn cancellation_handle(&self) -> Arc<PunchSessionCancellation> {
+        self.cancellation.clone()
     }
 }
 
@@ -81,7 +102,7 @@ impl Drop for PunchSessionPermit {
 
 impl PunchAttemptDeduplicator {
     async fn claim(&self, peer_id: &str) -> Option<PunchSessionPermit> {
-        self.claim_with_priority(peer_id, 1)
+        self.claim_with_priority(peer_id, PUNCH_PRIORITY_SYNCHRONIZED, None)
     }
 
     async fn claim_with_window(
@@ -89,13 +110,39 @@ impl PunchAttemptDeduplicator {
         peer_id: &str,
         _window: Duration,
     ) -> Option<PunchSessionPermit> {
-        self.claim_with_priority(peer_id, 0)
+        self.claim_with_priority(peer_id, PUNCH_PRIORITY_BACKGROUND, None)
     }
 
-    fn claim_with_priority(&self, peer_id: &str, priority: u8) -> Option<PunchSessionPermit> {
+    /// Claim the punch session for a fresh-mapping prediction signal.
+    ///
+    /// `signal_id` is the incarnation+generation identity carried by the
+    /// offer that delivered the predicted window.  A newer fresh prediction
+    /// supersedes an older one at the same priority (including one from an
+    /// older daemon incarnation); any older ordinary or background session is
+    /// cancelled immediately.
+    async fn claim_fresh_prediction(
+        &self,
+        peer_id: &str,
+        signal_id: crate::FreshPredictionId,
+    ) -> Option<PunchSessionPermit> {
+        self.claim_with_priority(peer_id, PUNCH_PRIORITY_FRESH_PREDICTION, Some(signal_id))
+    }
+
+    fn claim_with_priority(
+        &self,
+        peer_id: &str,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+    ) -> Option<PunchSessionPermit> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(active) = state.active.get(peer_id) {
-            if active.priority >= priority {
+            let preempt = active.priority < priority
+                || (active.priority == priority
+                    && priority == PUNCH_PRIORITY_FRESH_PREDICTION
+                    && active
+                        .fresh_generation
+                        .is_some_and(|active_id| fresh_generation.is_some_and(|id| id > active_id)));
+            if !preempt {
                 return None;
             }
             active.cancellation.cancel();
@@ -109,6 +156,7 @@ impl PunchAttemptDeduplicator {
             PunchAttemptRecord {
                 session_id,
                 priority,
+                fresh_generation,
                 cancellation: cancellation.clone(),
             },
         );
@@ -128,6 +176,18 @@ impl PunchAttemptDeduplicator {
             .is_some_and(|active| active.session_id == session_id)
         {
             state.active.remove(peer_id);
+        }
+    }
+
+    /// Cancel and drop the active session for a peer (peer left / offline).
+    ///
+    /// A fast rejoin must not be suppressed by a stale punch session, nor
+    /// must that stale session keep mutating socket state after the peer is
+    /// gone.
+    pub(crate) fn cancel(&self, peer_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = state.active.remove(peer_id) {
+            active.cancellation.cancel();
         }
     }
 

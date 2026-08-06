@@ -31,8 +31,14 @@ async fn authenticate(path: &Path, args: AuthArgs, register: bool) -> Result<(),
         "{server}/api/v1/{}",
         if register { "register" } else { "login" }
     );
+    // The control server login never goes through a proxy: the request is a
+    // one-shot credential exchange with the control plane itself, and a
+    // system-level HTTP proxy would otherwise intercept loopback/LAN control
+    // servers (some proxy clients even answer 502 for loopback).  HTTP(S)_PROXY
+    // environment variables are deliberately NOT consulted here either.
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .no_proxy()
         .build()
         .map_err(|error| format!("无法初始化网络请求：{error}"))?
         .post(endpoint)
@@ -110,6 +116,7 @@ async fn revoke_current_device_credential(config: &Config) -> Result<(), String>
     let server = normalize_control_server(&config.control.server_url)?;
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_proxy()
         .build()
         .map_err(|error| format!("无法初始化网络请求：{error}"))?
         .delete(format!("{server}/api/v1/devices/credential"))

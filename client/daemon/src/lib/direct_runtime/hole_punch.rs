@@ -10,6 +10,8 @@ struct HolePunchSignalContext {
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     stun_servers: Vec<SocketAddr>,
     stun_timeout: Duration,
+    /// Daemon incarnation epoch embedded in the fresh-prediction label.
+    boot_epoch_ms: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22,8 +24,14 @@ async fn spawn_hole_punch_task(
     attempts: u32,
     punch_at_ms: Option<u64>,
     signal: Option<HolePunchSignalContext>,
+    fresh_prediction: Option<FreshPredictionId>,
+    frozen_targets: Option<Vec<SocketAddr>>,
 ) {
-    let Some(session) = punch_deduplicator.claim(&peer_id).await else {
+    let claimed = match fresh_prediction {
+        Some(id) => punch_deduplicator.claim_fresh_prediction(&peer_id, id).await,
+        None => punch_deduplicator.claim(&peer_id).await,
+    };
+    let Some(session) = claimed else {
         peers
             .record_direct_event(
                 &peer_id,
@@ -64,35 +72,109 @@ async fn spawn_hole_punch_task(
         // window: the measurement needs ~1s, and the peer-facing mapping must
         // already exist when the stable side starts probing at punch_at.
         let fresh_generation = if let Some(signal) = signal.as_ref() {
-            let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
-            let generation = udp
-                .run_fresh_mapping_generation(
-                    &peer_id,
-                    &signal.stun_servers,
-                    signal.stun_timeout,
-                    &targets,
-                    probe_interval,
-                    attempts.min(2),
-                )
-                .await;
-            match &generation {
-                FreshMappingOutcome::Accepted(result) => {
-                    advertise_fresh_mapping_prediction(signal, &peers, &peer_id, result).await;
+            if signal.boot_epoch_ms == 0 {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "fresh_mapping_skipped",
+                        None,
+                        None,
+                        None,
+                        "fresh-mapping prediction disabled this boot (no trustworthy persistent incarnation); continuing with ordinary punching",
+                    )
+                    .await;
+                FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
+            } else {
+                let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
+                let mut generation = udp
+                    .run_fresh_mapping_generation(
+                        &peer_id,
+                        &signal.stun_servers,
+                        signal.stun_timeout,
+                        &targets,
+                        probe_interval,
+                        attempts.min(2),
+                        Some(&session.cancellation_handle()),
+                    )
+                    .await;
+                match &mut generation {
+                    FreshMappingOutcome::Accepted(result, handoff) => {
+                        // The session may have been superseded while the
+                        // generation measured: a stale prediction must not be
+                        // advertised (its HTTP-send-time generation would look
+                        // newer to the peer and cancel the fresher session).
+                        if session.is_cancelled() {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "fresh_mapping_skipped",
+                                    None,
+                                    None,
+                                    None,
+                                    "fresh-mapping generation completed but its punch session was superseded; not advertising the prediction",
+                                )
+                                .await;
+                            // The guard stays alive until this task ends; its
+                            // watcher then rolls the peer back to its
+                            // previous path (nothing was advertised).
+                        } else {
+                            // The durable handoff happens ONLY after the
+                            // prediction is really advertised: a send failure
+                            // or a cancellation during the advertise keeps the
+                            // socket rollable, so the guard is dropped without
+                            // finalizing instead of leaving an un-advertised
+                            // socket as the peer's long-term path.
+                            let advertised =
+                                advertise_fresh_mapping_prediction(
+                                    signal,
+                                    &peers,
+                                    &peer_id,
+                                    &*result,
+                                    &session.cancellation_handle(),
+                                )
+                                .await;
+                            if advertised {
+                                if !handoff.finalize().await {
+                                    peers
+                                        .record_direct_event(
+                                            &peer_id,
+                                            "fresh_mapping_skipped",
+                                            None,
+                                            None,
+                                            None,
+                                            "fresh-mapping prediction was advertised but the socket was rolled back before the durable handoff; continuing with ordinary punching",
+                                        )
+                                        .await;
+                                }
+                            } else {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "fresh_mapping_skipped",
+                                        None,
+                                        None,
+                                        None,
+                                        "fresh-mapping prediction was not advertised; the generation's socket rolls back to the previous path",
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    FreshMappingOutcome::Rejected(reason) => {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "fresh_mapping_skipped",
+                                None,
+                                None,
+                                None,
+                                format!("fresh-mapping generation skipped: {}", reason.label()),
+                            )
+                            .await;
+                    }
                 }
-                FreshMappingOutcome::Rejected(reason) => {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "fresh_mapping_skipped",
-                            None,
-                            None,
-                            None,
-                            format!("fresh-mapping generation skipped: {}", reason.label()),
-                        )
-                        .await;
-                }
+                generation
             }
-            generation
         } else {
             FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
         };
@@ -102,7 +184,22 @@ async fn spawn_hole_punch_task(
         }
 
         let generation = peers.current_network_generation().await;
-        let Some(target) = peers.direct_probe_target_set_for(&peer_id).await else {
+        // A fresh-mapping prediction session punches toward the immutable
+        // candidate snapshot frozen when the fresh signal arrived; ordinary
+        // sessions read the shared candidate set at session time.  A later
+        // ordinary refresh may update the shared set, but it must never change
+        // the target of a running fresh session.
+        let target = match frozen_targets {
+            Some(frozen) => Some(DirectProbeTargetSet {
+                peer_id: peer_id.clone(),
+                candidates: frozen,
+                remote_scatter_pool: false,
+                stable_remote_scatter: false,
+                birthday_plan: None,
+            }),
+            None => peers.direct_probe_target_set_for(&peer_id).await,
+        };
+        let Some(target) = target else {
             if peers.is_direct(&peer_id).await {
                 peers
                     .record_direct_event(
@@ -192,6 +289,7 @@ async fn spawn_hole_punch_task(
             .await;
 
         let rx_before = udp.probe_rx_snapshot().await;
+        let mut last_punch_report: Option<PunchSendReport> = None;
         let deadline = punch_session_deadline(
             &candidates,
             probe_interval,
@@ -204,7 +302,10 @@ async fn spawn_hole_punch_task(
             },
         );
         let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
-            let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(_))
+            if session.is_cancelled() {
+                return;
+            }
+            let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                 && udp.has_dynamic_socket_for_peer(&peer_id).await
             {
                 udp.punch_candidates_from_dynamic_socket(
@@ -245,6 +346,7 @@ async fn spawn_hole_punch_task(
 
             match punch_result {
                 Ok(report) => {
+                    last_punch_report = Some(report);
                     let sent = report.packets_sent;
                     let birthday_window_completion = if let Some(plan) =
                         birthday_plan.as_ref().filter(|_| stable_remote_scatter)
@@ -419,17 +521,40 @@ async fn spawn_hole_punch_task(
                         timeout_detail.clone(),
                     )
                     .await;
-                if stable_remote_scatter && birthday_plan.is_some() {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "birthday_probe_window_incomplete",
-                            candidates.first().copied(),
-                            Some(candidates.len()),
-                            None,
-                            "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
-                        )
-                        .await;
+                if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
+                    let covered_all = last_punch_report.is_some_and(|report| {
+                        report.unique_target_endpoints as usize >= candidates.len()
+                    });
+                    if covered_all {
+                        let cursor_advanced = peers
+                            .commit_birthday_probe_cursor(&peer_id, plan, true)
+                            .await;
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "birthday_probe_plan_completed",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                last_punch_report.map(|report| report.packets_sent),
+                                format!(
+                                    "stable-side birthday session deadline after a complete send report; cursor_advanced={cursor_advanced} start_rank={} end_rank={}",
+                                    plan.start_rank,
+                                    plan.end_rank
+                                ),
+                            )
+                            .await;
+                    } else {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "birthday_probe_window_incomplete",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                None,
+                                "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
+                            )
+                            .await;
+                    }
                 } else if peers.has_relay_safety_net(&peer_id).await {
                     peers
                         .record_direct_probe_batch_failure_for_generation(
@@ -447,40 +572,82 @@ async fn spawn_hole_punch_task(
 /// Advertise the fresh-mapping prediction window to the peer.
 ///
 /// The predicted ports are signaled in priority order (top-1 first, then the
-/// successor window) as real `predicted` candidates.  No reserved metadata
-/// keys are embedded in `candidate_sources`: the control plane requires every
-/// key to be a real candidate, values to stay under 64 bytes, and the map
-/// size to stay within the candidate count, so model details travel only in
-/// structured logs and diagnostics.  Older clients simply probe the ordered
-/// candidates, so the signal degrades gracefully to today's strategy.
+/// successor window) as real `predicted` candidates carrying the distinct
+/// fresh-prediction label with the sender's incarnation+generation.  No
+/// reserved metadata keys are embedded in `candidate_sources`: the control
+/// plane requires every key to be a real candidate, values to stay under 64
+/// bytes, and the map size to stay within the candidate count, so model
+/// details travel only in structured logs and diagnostics.  Older clients
+/// simply probe the ordered candidates, so the signal degrades gracefully to
+/// today's strategy.
+///
+/// Ownership checks run before building the payload, again before the
+/// command is queued, and inside the HTTP worker just before the request;
+/// once the command is irrevocably on the wire the receiver's per-peer
+/// fresh-generation high-water rejects any superseded label, so a stale
+/// prediction can never overwrite a newer one.
+///
+/// Returns `true` only when the prediction was actually queued to the
+/// control plane: the caller then finalizes the generation's durable
+/// handoff.  A cancellation or a send failure leaves the generation's socket
+/// rollable, so the caller must drop the guard instead of finalizing.
 async fn advertise_fresh_mapping_prediction(
     signal: &HolePunchSignalContext,
     peers: &Arc<PeerManager>,
     peer_id: &str,
     result: &FreshMappingResult,
-) {
+    cancellation: &Arc<crate::PunchSessionCancellation>,
+) -> bool {
+    if cancellation.is_cancelled() {
+        peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_skipped",
+                None,
+                None,
+                None,
+                "fresh-mapping prediction ownership was revoked before the payload was built",
+            )
+            .await;
+        return false;
+    }
     let (candidates, candidate_sources) = build_fresh_mapping_signal_payload(
         result,
+        signal.boot_epoch_ms,
         &signal.local_candidates.read().await.clone(),
         &signal.local_candidate_sources.read().await.clone(),
     );
 
     let punch_at_ms = Some(relay_assisted_punch_at_ms());
+    if cancellation.is_cancelled() {
+        peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_skipped",
+                None,
+                Some(candidates.len()),
+                None,
+                "fresh-mapping prediction ownership was revoked before the signal was queued",
+            )
+            .await;
+        return false;
+    }
     if let Err(error) = signal
         .control
-        .send_peer_offer_with_sources_and_punch_at(
+        .send_fresh_peer_offer_with_sources_and_punch_at(
             peer_id,
             &candidates,
             &candidate_sources,
             &[],
             punch_at_ms,
+            cancellation.clone(),
         )
         .await
     {
         warn!(
             "Failed to advertise fresh-mapping prediction window to peer {peer_id}: {error}"
         );
-        return;
+        return false;
     }
     info!(
         event = "fresh_mapping_prediction_signaled",
@@ -530,6 +697,7 @@ async fn advertise_fresh_mapping_prediction(
             ),
         )
         .await;
+    true
 }
 
 /// Build the signal payload carrying the fresh-mapping prediction window.
@@ -541,11 +709,21 @@ async fn advertise_fresh_mapping_prediction(
 /// the stable side probes the model prediction before the successor window.
 fn build_fresh_mapping_signal_payload(
     result: &FreshMappingResult,
+    boot_epoch_ms: u64,
     current_candidates: &[String],
     current_sources: &HashMap<String, String>,
 ) -> (Vec<String>, HashMap<String, String>) {
     let mut candidates = Vec::new();
     let mut candidate_sources = HashMap::new();
+    // Distinct label carrying the sender's incarnation epoch and per-peer
+    // punch generation: ordinary ICE `predicted` candidates must not be
+    // mistaken for a fresh prediction, and the embedded identity orders
+    // predictions by measurement generation instead of HTTP send time.
+    let fresh_id = FreshPredictionId {
+        boot_epoch: boot_epoch_ms,
+        generation: result.punch_generation,
+    };
+    let fresh_label = fresh_prediction_source_label(fresh_id);
     for port in &result.predicted_ports {
         let endpoint = SocketAddr::new(
             result.public_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
@@ -554,7 +732,7 @@ fn build_fresh_mapping_signal_payload(
         .to_string();
         if !candidates.contains(&endpoint) {
             candidates.push(endpoint.clone());
-            candidate_sources.insert(endpoint, "predicted".to_string());
+            candidate_sources.insert(endpoint, fresh_label.clone());
         }
     }
     for endpoint in current_candidates {
@@ -562,7 +740,11 @@ fn build_fresh_mapping_signal_payload(
             candidates.push(endpoint.clone());
         }
         if let Some(source) = current_sources.get(endpoint) {
-            candidate_sources.insert(endpoint.clone(), source.clone());
+            // Never overwrite the fresh-prediction label of an overlapping
+            // predicted port with the ordinary ICE label.
+            candidate_sources
+                .entry(endpoint.clone())
+                .or_insert_with(|| source.clone());
         }
     }
     let _network_identity = prepare_signal_candidates_and_network_identity(

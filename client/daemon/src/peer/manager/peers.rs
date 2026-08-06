@@ -75,6 +75,9 @@ impl PeerManager {
         let conn = conns
             .entry(info.node_id.clone())
             .or_insert_with(|| PeerConnection::new(&info.node_id, &info.virtual_ip));
+        // Keep the synchronous Direct-set mirror attached to every connection
+        // so its `transition` keeps the UDP eviction's nonevictable set fresh.
+        conn.attach_direct_cache(self.direct_peers.clone());
 
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
@@ -102,6 +105,35 @@ impl PeerManager {
         }
         if public_key_changed {
             conn.reset_for_identity_change();
+        }
+        // The remote fresh-prediction space is bound to the peer's identity
+        // (public key): a rejoin with a NEW key — including a PeerLeft
+        // followed by `add_peer` with `is_new == true` — must not inherit the
+        // old incarnation's high-water, or the new incarnation's predictions
+        // would be judged stale against it forever.  The key map survives
+        // `remove_peer`, so the comparison works even when the connection was
+        // recreated.
+        let identity_changed = {
+            let mut keys = self
+                .remote_fresh_identity_keys
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = keys
+                .get(&info.node_id)
+                .is_none_or(|key| key != &info.public_key);
+            keys.insert(info.node_id.clone(), info.public_key.clone());
+            changed
+        };
+        if identity_changed {
+            self.reset_remote_fresh_generation(
+                &info.node_id,
+                if public_key_changed {
+                    "public_key_changed"
+                } else {
+                    "identity_key_changed_on_rejoin"
+                },
+            )
+            .await;
         }
         conn.nat_type = info.nat_type.clone();
         conn.online = info.online;
@@ -152,6 +184,12 @@ impl PeerManager {
     }
 
     /// Remove a peer.
+    ///
+    /// A plain PeerLeft must NOT clear the remote fresh high-water: a late
+    /// signal from the old incarnation must stay rejected after the peer
+    /// rejoins, and the new incarnation's strictly-monotonic counter
+    /// supersedes the old one anyway.  Only a public-key / identity change
+    /// resets the fresh space.
     pub async fn remove_peer(&self, node_id: &str) {
         let mut conns = self.connections.write().await;
         if let Some(conn) = conns.remove(node_id) {
@@ -159,6 +197,10 @@ impl PeerManager {
             ip_map.remove(&conn.virtual_ip);
         }
         drop(conns);
+        self.direct_peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(node_id);
         self.clear_fresh_mapping(node_id, "peer_removed").await;
     }
 

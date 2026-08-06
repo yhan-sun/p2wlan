@@ -73,6 +73,7 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
         }
         Some("peer_reflexive" | "learned" | "predicted" | "birthday") => u8::MAX,
         Some("relay") => u8::MAX,
+        Some(source) if crate::parse_fresh_prediction_source_label(source).is_some() => u8::MAX,
         Some(_) | None => {
             if endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
                 !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
@@ -149,6 +150,14 @@ pub(super) fn compact_volatile_public_signal_candidates(
         let Some(source) = candidate_sources.get(endpoint).map(String::as_str) else {
             continue;
         };
+        // Fresh-mapping prediction windows are reserved by
+        // `truncate_signal_candidates` after this stage: the per-public-IP
+        // volatile truncation must never delete a predicted port before the
+        // reservation can preserve it, so the whole prepared candidate set
+        // keeps every publishable window port (top-1 first).
+        if is_valid_fresh_signal_source(source) {
+            continue;
+        }
         if !is_volatile_public_signal_source(source) {
             continue;
         }
@@ -180,24 +189,39 @@ pub(super) fn compact_volatile_public_signal_candidates(
     }
 
     candidates.retain(|endpoint| {
-        let is_volatile_public = candidate_sources
+        let is_fresh_reserved = candidate_sources
             .get(endpoint)
             .map(String::as_str)
-            .is_some_and(is_volatile_public_signal_source)
+            .is_some_and(is_valid_fresh_signal_source);
+        let is_volatile_public = !is_fresh_reserved
+            && candidate_sources
+                .get(endpoint)
+                .map(String::as_str)
+                .is_some_and(is_volatile_public_signal_source)
             && endpoint
                 .parse::<SocketAddr>()
                 .is_ok_and(is_public_udp_candidate);
-        !is_volatile_public || retained_volatile.contains(endpoint)
+        is_fresh_reserved || !is_volatile_public || retained_volatile.contains(endpoint)
     });
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
 }
 
+/// Whether a source label identifies a volatile public candidate that may be
+/// compacted and truncated per public IP.  A genuine fresh-mapping prediction
+/// window is volatile too: it is a time-sensitive guess, not a stable path.
 fn is_volatile_public_signal_source(source: &str) -> bool {
     matches!(
         source,
         "stun_observed" | "peer_reflexive" | "learned" | "predicted"
-    )
+    ) || crate::parse_fresh_prediction_source_label(source).is_some()
+}
+
+/// Whether a source label belongs to the predicted class: ordinary `predicted`
+/// or a valid fresh-mapping prediction label.  Both order after STUN evidence
+/// and before host/public unknowns, but only within the same rank.
+fn is_predicted_class_signal_source(source: &str) -> bool {
+    source == "predicted" || crate::parse_fresh_prediction_source_label(source).is_some()
 }
 
 pub(super) fn truncate_signal_candidates(
@@ -225,7 +249,40 @@ pub(super) fn truncate_signal_candidates(
         retained_lan_hosts.truncate(MAX_SIGNAL_LAN_HOST_CANDIDATES);
         let retained_lan_host_set = retained_lan_hosts.iter().cloned().collect::<HashSet<_>>();
 
-        candidates.sort_by(|left, right| {
+        // Fresh-mapping prediction windows are time-sensitive: reserve their
+        // whole window (bounded by the model's MAX_PREDICTED_PORTS) so a full
+        // ordinary candidate set cannot crowd them out.  The window keeps its
+        // sender order (top-1 first, then the successor window).
+        let fresh_window = candidates
+            .iter()
+            .filter(|endpoint| {
+                candidate_sources
+                    .get(*endpoint)
+                    .map(String::as_str)
+                    .is_some_and(is_valid_fresh_signal_source)
+            })
+            .take(MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fresh_window_set = fresh_window.iter().cloned().collect::<HashSet<_>>();
+        let fresh_budget = fresh_window.len();
+
+        let mut others = candidates
+            .iter()
+            .filter(|endpoint| {
+                !fresh_window_set.contains(*endpoint) && !retained_lan_host_set.contains(*endpoint)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        warn!(
+            "Truncating {} gathered UDP candidates to the signaling limit of {}",
+            candidates.len(),
+            MAX_SIGNAL_CANDIDATES
+        );
+        let public_budget = MAX_SIGNAL_CANDIDATES
+            .saturating_sub(fresh_budget)
+            .saturating_sub(retained_lan_hosts.len());
+        others.sort_by(|left, right| {
             compare_signal_candidates(
                 left,
                 right,
@@ -234,23 +291,20 @@ pub(super) fn truncate_signal_candidates(
                 &predicted_order,
             )
         });
-        warn!(
-            "Truncating {} gathered UDP candidates to the signaling limit of {}",
-            candidates.len(),
-            MAX_SIGNAL_CANDIDATES
-        );
-        let public_budget = MAX_SIGNAL_CANDIDATES.saturating_sub(retained_lan_hosts.len());
-        let mut retained = candidates
-            .iter()
-            .filter(|endpoint| !retained_lan_host_set.contains(*endpoint))
-            .take(public_budget)
-            .cloned()
-            .collect::<Vec<_>>();
+        others.truncate(public_budget);
+        let mut retained = fresh_window;
+        retained.extend(others);
         retained.extend(retained_lan_hosts);
         *candidates = retained;
     }
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));
+}
+
+/// Whether a source label is a well-formed fresh-mapping prediction label
+/// that may claim the reserved signaling window.
+fn is_valid_fresh_signal_source(source: &str) -> bool {
+    crate::parse_fresh_prediction_source_label(source).is_some()
 }
 
 fn is_physical_lan_host_signal_candidate(endpoint: &str, source: Option<&str>) -> bool {
@@ -303,7 +357,10 @@ fn balanced_predicted_signal_order(
     let mut previous: Option<(SocketAddr, i32)> = None;
 
     for endpoint in candidates.iter().filter(|endpoint| {
-        candidate_sources.get(*endpoint).map(String::as_str) == Some("predicted")
+        candidate_sources
+            .get(*endpoint)
+            .map(String::as_str)
+            .is_some_and(is_predicted_class_signal_source)
     }) {
         let Ok(address) = endpoint.parse::<SocketAddr>() else {
             runs.push(vec![endpoint.clone()]);
@@ -363,7 +420,12 @@ fn signal_candidate_rank(endpoint: &str, source: Option<&str>) -> u8 {
         Some("upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") => 1,
         Some("manual") => 2,
         Some("stun_observed") => 3,
+        // Ordinary `predicted` and fresh predictions share the predicted
+        // rank: both are volatile guesses that order after observed
+        // evidence.  The fresh window additionally holds a reserved budget
+        // in `truncate_signal_candidates` so it is never crowded out.
         Some("predicted") => 4,
+        Some(source) if crate::parse_fresh_prediction_source_label(source).is_some() => 4,
         Some("host") => match endpoint.parse::<SocketAddr>() {
             Ok(endpoint) if is_public_udp_candidate(endpoint) => 5,
             _ => 8,

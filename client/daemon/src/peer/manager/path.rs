@@ -102,6 +102,31 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Node IDs of every peer with a verified direct path.
+    ///
+    /// Used by the dynamic socket cap to pre-compute the nonevictable set
+    /// before taking the socket-state lock, so eviction selection never awaits
+    /// peer state while holding the lock.
+    pub(crate) async fn direct_peer_ids(&self) -> HashSet<String> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| conn.state == ConnectionState::Direct)
+            .map(|conn| conn.node_id.clone())
+            .collect()
+    }
+
+    /// Whether the peer is Direct, synchronously, via the mirror.  Updated
+    /// by every `ConnectionState` transition, so it is always at least as
+    /// fresh as the last committed transition.
+    pub(crate) fn is_direct_sync(&self, node_id: &str) -> bool {
+        self.direct_peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(node_id)
+    }
+
     /// Whether relay-assisted punching should be deferred for a peer that is
     /// already on a healthy confirmed Direct path.
     ///

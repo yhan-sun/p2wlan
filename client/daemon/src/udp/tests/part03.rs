@@ -304,7 +304,7 @@ async fn udp_inbound_decrypts_and_writes_packet_to_tun() {
         let peers = peers.clone();
         tokio::spawn(async move {
             wireguard
-                .run_inbound_with_peers(udp_inbound_rx, inbound_tx, Some(peers))
+                .run_inbound_with_peers(udp_inbound_rx, inbound_tx, Some(peers), None)
                 .await
         })
     };
@@ -697,6 +697,8 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
             purpose: PendingProbePurpose::ConnectivityCheck,
             accepts_authenticated_ack: false,
             accepts_legacy_ack: true,
+            socket_epoch: 0,
+            cleanup_epoch: 0,
         },
     );
 
@@ -758,6 +760,8 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
             purpose: PendingProbePurpose::ConnectivityCheck,
             accepts_authenticated_ack: true,
             accepts_legacy_ack: false,
+            socket_epoch: 0,
+            cleanup_epoch: 0,
         },
     );
 

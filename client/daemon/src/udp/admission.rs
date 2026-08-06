@@ -163,7 +163,7 @@ impl UdpTransport {
         let local_endpoint = self
             .socket_for_peer(Some(peer_id))
             .await
-            .and_then(|socket| socket.local_addr().ok());
+            .and_then(|(_, socket)| socket.local_addr().ok());
         match self
             .send_probe_from_socket(socket_index, Some(peer_id), observed_endpoint)
             .await
@@ -222,15 +222,19 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeNonce> {
-        let socket = self.socket_for_index_or_dynamic(socket_index, peer_id).await.ok_or_else(
-            || {
+        let (actual_index, socket, _lease) = self
+            .socket_for_index_or_dynamic(socket_index, peer_id)
+            .await
+            .ok_or_else(|| {
                 DaemonError::Network(format!(
                     "UDP socket pool member {socket_index} is unavailable"
                 ))
-            },
-        )?;
+            })?;
+        // The pending probe records the ACTUAL sending socket: when the
+        // requested dynamic socket was detached concurrently, the resolver
+        // falls back to the peer's pool socket and the ACK will arrive there.
         self.send_probe_on_socket(
-            socket_index,
+            actual_index,
             socket,
             peer_id,
             peer_addr,
@@ -241,30 +245,64 @@ impl UdpTransport {
     }
 
     /// Resolve a socket by fixed pool index, falling back to the peer's
-    /// dedicated punch socket when the index is a dynamic one.
+    /// dedicated punch socket when the index is a dynamic one, and finally to
+    /// the peer's resolved pool socket when the dynamic socket is gone.
+    ///
+    /// Returns the actual index together with the socket so callers record
+    /// the real sending socket: a dynamic socket detached between two
+    /// separate resolve calls would otherwise leave a pending probe indexed to
+    /// a socket that never sent, and the ACK would never match.  Never holds
+    /// the socket-state lock while resolving the peer's socket:
+    /// `socket_for_peer` re-acquires the same lock, and this function must
+    /// not hold it across that call.
+    ///
+    /// A dynamic socket is only handed out when it still belongs to the peer,
+    /// is Committed and matches the current network generation, and the
+    /// returned lease keeps the reader alive until the send completes.
     async fn socket_for_index_or_dynamic(
         &self,
         socket_index: usize,
         peer_id: Option<&str>,
-    ) -> Option<Arc<UdpSocket>> {
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
         if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
-            return self.active_sockets().get(socket_index).cloned();
+            let socket = self.active_sockets().get(socket_index)?.clone();
+            // Pool sockets need no lease; hand out a never-blocking lease for
+            // a uniform return type.
+            return Some((
+                socket_index,
+                socket,
+                DynamicSocketSendLease::noop(socket_index),
+            ));
         }
-        let dynamic = self.dynamic_sockets.lock().await;
-        if let Some(dynamic_socket) = dynamic.get(&socket_index) {
-            return Some(dynamic_socket.socket.clone());
+        let peer_id = peer_id?;
+        // Validate peer ownership, phase and network generation, and hold a
+        // send lease that keeps the reader alive through the send.
+        if let Some(resolved) = self.resolve_dynamic_socket_for_send(peer_id).await {
+            return Some(resolved);
         }
-        if let Some(peer_id) = peer_id {
-            return self.socket_for_peer(Some(peer_id)).await;
-        }
-        None
+        // The dynamic socket is gone (or belongs to someone else): fall back
+        // to the peer's resolved pool socket.
+        self.socket_for_peer(Some(peer_id)).await.map(|(index, socket)| {
+            (index, socket, DynamicSocketSendLease::noop(index))
+        })
     }
 
     /// Send one authenticated/legacy probe from an explicit socket.
     ///
     /// This is the shared core for pool sockets and dedicated punch sockets:
     /// the pending-probe bookkeeping, MAC/nonce construction and retransmit
-    /// burst are identical for both.
+    /// burst are identical for both.  The pending entry records the affinity
+    /// evidence epoch at send time so a matched ACK can only adopt the
+    /// sending socket when nothing newer committed meanwhile.
+    ///
+    /// The send is one consistent transaction: the network generation, the
+    /// affinity evidence epoch and the peer's cleanup epoch are snapshotted
+    /// under the socket-state lock, the payload is built from that snapshot,
+    /// and the snapshot is RE-VERIFIED under the lock before the pending
+    /// entry is registered — a cleanup or a network-generation change that
+    /// landed between the snapshot and the registration invalidates the WHOLE
+    /// probe (the stale payload is never stamped with the new epoch and never
+    /// sent).
     async fn send_probe_on_socket(
         &self,
         socket_index: usize,
@@ -274,7 +312,24 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeNonce> {
-        let generation = self.peers.current_network_generation().await;
+        // Consistent peer snapshot under one lock acquisition: generation
+        // (lock-free mirror), affinity evidence epoch and cleanup epoch.
+        let (generation, socket_epoch, cleanup_epoch) = {
+            let state = self.socket_state.lock().await;
+            let generation = self.peers.current_network_generation_sync();
+            let socket_epoch = match peer_id {
+                Some(peer_id) => state
+                    .affinity
+                    .get(peer_id)
+                    .map(|pin| pin.epoch)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            let cleanup_epoch = peer_id
+                .and_then(|peer_id| state.probe_cleanup_epochs.get(peer_id).copied())
+                .unwrap_or(0);
+            (generation, socket_epoch, cleanup_epoch)
+        };
         let requires_legacy_probe = match peer_id {
             Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
             None => true,
@@ -330,7 +385,48 @@ impl UdpTransport {
                 (bytes.to_vec(), nonce, false, true, None)
             };
 
-        {
+        // Re-verify the snapshot and register the pending probe as one
+        // transaction under the socket-state lock and the pending lock (in
+        // that order everywhere): a cleanup or network-generation change that
+        // ran between the snapshot and here invalidates the whole probe —
+        // the old payload must never be stamped with the new cleanup epoch.
+        // The send lease for a dynamic socket is registered in this same
+        // critical section: the detach path can only drain after removing the
+        // entry under this same lock, so it always observes this lease.
+        let send_lease = {
+            let state = self.socket_state.lock().await;
+            if self.peers.current_network_generation_sync() != generation {
+                debug!(
+                    "Probe to {} invalidated: the network generation changed while the packet was built",
+                    peer_addr
+                );
+                return Err(DaemonError::Network(
+                    "probe invalidated: network generation changed".to_string(),
+                ));
+            }
+            let current_cleanup_epoch = peer_id
+                .and_then(|peer_id| state.probe_cleanup_epochs.get(peer_id).copied())
+                .unwrap_or(0);
+            if current_cleanup_epoch != cleanup_epoch {
+                debug!(
+                    "Probe to {} invalidated: the peer was cleaned up while the packet was built (epoch {cleanup_epoch} -> {current_cleanup_epoch})",
+                    peer_addr
+                );
+                return Err(DaemonError::Network(
+                    "probe invalidated: peer cleanup raced the send".to_string(),
+                ));
+            }
+            let send_lease = if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
+                state.dynamic.get(&socket_index).map(|entry| {
+                    entry.send_leases.acquire();
+                    DynamicSocketSendLease {
+                        state: entry.send_leases.clone(),
+                        socket_index,
+                    }
+                })
+            } else {
+                None
+            };
             let mut pending = self.pending_probes.lock().await;
             pending.retain(|_, pending| {
                 pending.sent_at.elapsed() < Duration::from_secs(60)
@@ -348,9 +444,12 @@ impl UdpTransport {
                     purpose,
                     accepts_authenticated_ack,
                     accepts_legacy_ack,
+                    socket_epoch,
+                    cleanup_epoch,
                 },
             );
-        }
+            send_lease
+        };
 
         if let Err(error) = socket.send_to(&bytes, peer_addr).await {
             self.pending_probes.lock().await.remove(&nonce);
@@ -358,6 +457,10 @@ impl UdpTransport {
                 "UDP probe send to {peer_addr} failed: {error}"
             )));
         }
+        // The send completed: release the in-flight send lease.  The pending
+        // entry itself keeps the detach waiting until the ACK arrives or the
+        // bounded drain timeout expires.
+        drop(send_lease);
 
         self.update_socket_diagnostics(socket_index, |metrics| metrics.probes_sent += 1)
             .await;

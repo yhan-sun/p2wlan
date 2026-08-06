@@ -328,7 +328,8 @@ async fn diagnostics_json_contains_direct_candidate_pair_fields() {
     assert_eq!(json["active_path"], "direct");
     assert_eq!(json["direct_type"], "peer_reflexive");
     assert_eq!(json["consent_endpoint"], "8.8.8.8:12293");
-    assert_eq!(json["is_public_udp_direct"], false);
+    // A peer-reflexive pair over a real public endpoint is public UDP direct.
+    assert_eq!(json["is_public_udp_direct"], true);
     assert_eq!(json["is_peer_reflexive_direct"], true);
     assert_eq!(json["public_mapping_stable"], false);
     assert_eq!(json["is_overlay_direct"], false);
@@ -341,7 +342,7 @@ async fn diagnostics_json_contains_direct_candidate_pair_fields() {
     assert_eq!(pair["remote_source"], "peer_reflexive");
     assert_eq!(pair["pair_state"], "selected");
     assert_eq!(pair["direct_type"], "peer_reflexive");
-    assert_eq!(pair["is_public_udp_direct"], false);
+    assert_eq!(pair["is_public_udp_direct"], true);
     assert_eq!(pair["is_peer_reflexive_direct"], true);
     assert_eq!(pair["public_mapping_stable"], false);
     assert!(pair["warning"].is_null());

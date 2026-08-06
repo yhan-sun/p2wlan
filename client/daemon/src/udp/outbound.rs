@@ -626,14 +626,13 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
-        let socket = match self.socket_for_peer(Some(&packet.peer_id)).await {
-            Some(socket) => socket,
+        let (socket_index, socket) = match self.socket_for_peer(Some(&packet.peer_id)).await {
+            Some(resolved) => resolved,
             None => return Err(DaemonError::Network(format!(
                 "no UDP socket available for peer {}",
                 packet.peer_id
             ))),
         };
-        let socket_index = self.socket_index_for_peer(Some(&packet.peer_id)).await;
         let sent = socket
             .send_to(&packet.wire_bytes, endpoint)
             .await
