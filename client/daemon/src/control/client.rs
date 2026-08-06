@@ -51,6 +51,13 @@ impl ControlClient {
         (client, event_rx)
     }
 
+    /// Clone of the control event channel, for tests that drive the daemon's
+    /// control event loop directly.
+    #[cfg(test)]
+    pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<ControlEvent> {
+        self.event_tx.clone()
+    }
+
     /// Build a client that never spawns the background control loop.
     ///
     /// Used by daemon unit tests that only need the command/event plumbing.
@@ -109,6 +116,7 @@ impl ControlClient {
             &HashMap::new(),
             handshake_init,
             None,
+            None,
         )
         .await
     }
@@ -127,18 +135,25 @@ impl ControlClient {
             candidate_sources,
             handshake_init,
             None,
+            None,
         )
         .await
     }
 
     /// Send a peer offer with candidate sources and an optional synchronized punch window.
-    pub async fn send_peer_offer_with_sources_and_punch_at(
+    ///
+    /// `fresh_ownership` optionally carries the punch-session cancellation for
+    /// a fresh-mapping prediction advertisement: the HTTP worker refuses to
+    /// send once the session was superseded, so a stale prediction can never
+    /// reach the wire after its owner was cancelled.
+    pub(crate) async fn send_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,
         candidates: &[String],
         candidate_sources: &HashMap<String, String>,
         handshake_init: &[u8],
         punch_at_ms: Option<u64>,
+        fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
@@ -150,6 +165,41 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
+                fresh_ownership,
+                response_tx,
+            })
+            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
+    }
+
+    /// Send a fresh-mapping prediction advertisement.
+    ///
+    /// Unlike an ordinary peer offer this travels on the independent
+    /// `peer_offer_fresh` signal type (queue key), so an ordinary candidate
+    /// refresh can never overwrite the predicted window on the server, and the
+    /// server's per-pair ordering delivers it in send order.
+    pub(crate) async fn send_fresh_peer_offer_with_sources_and_punch_at(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::SendPeerOffer {
+                to_node_id: to_node_id.to_string(),
+                candidates: candidates.to_vec(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: candidate_sources.clone(),
+                handshake_init: handshake_init.to_vec(),
+                punch_at_ms,
+                fresh_ownership: Some(fresh_ownership),
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
@@ -180,6 +230,7 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
+                fresh_ownership: None,
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;

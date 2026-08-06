@@ -38,6 +38,97 @@ pub(crate) struct FreshMappingPredictionResult {
 const FRESH_MAPPING_STATE_MAX_AGE: Duration = Duration::from_secs(30);
 const FRESH_MAPPING_RESULT_HISTORY_PER_PEER: usize = 8;
 
+/// Whether a remote fresh-mapping prediction identity was admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFreshAdmission {
+    /// The (incarnation, generation) is newer than the high-water: its
+    /// candidates may be applied, and the identity is committed only after
+    /// the apply really succeeded (prepare/apply/commit transaction).
+    Accepted,
+    /// The identity is exactly the current high-water and the payload is
+    /// byte-identical (candidates, sources, expiry) to the snapshot the
+    /// identity was committed with: an idempotent retry of an already-applied
+    /// prediction.  The fresh punch may start from the COMMITTED snapshot.
+    AlreadyRecorded,
+    /// The identity equals the high-water but the payload differs from the
+    /// snapshot the identity was committed with.  A retry must never apply
+    /// different candidates under the same identity: rejected.
+    PayloadMismatch,
+    /// The identity is older than the high-water (a superseded prediction
+    /// sent late); its candidates must not be applied.
+    Stale,
+}
+
+/// The immutable candidate snapshot one fresh-prediction identity was
+/// committed with.  Bound to the identity at commit time: an idempotent
+/// retry of the same identity can only ever punch toward this snapshot, and a
+/// retry whose payload differs is rejected instead of applied.
+#[derive(Debug, Clone)]
+pub(crate) struct FreshPredictionSnapshot {
+    /// The candidate payload the identity was committed with: an idempotent
+    /// retry can only ever punch toward this snapshot.
+    pub(crate) candidates: Vec<String>,
+    /// Fingerprint of the full payload (candidates + sources + expiry); the
+    /// retry verification compares hashes, never re-applies the payload.
+    pub(crate) payload_hash: u64,
+    /// The expiry deadline (receiver-local clock) the identity was committed
+    /// with, so an idempotent retry can never punch toward an expired
+    /// prediction and a retry whose expiry differs is rejected.
+    pub(crate) candidates_expires_at_ms: Option<u64>,
+}
+
+/// Deterministic payload fingerprint for one fresh signal: stable within a
+/// process, so a retry's payload can be compared against the committed
+/// snapshot without shipping the whole candidate set around.
+pub(crate) fn fresh_payload_hash(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+    candidates_expires_at_ms: Option<u64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut sorted = candidates.to_vec();
+    sorted.sort();
+    for candidate in &sorted {
+        candidate.hash(&mut hasher);
+        hasher.write_u8(0xff);
+        if let Some(source) = candidate_sources.get(candidate) {
+            source.hash(&mut hasher);
+        }
+        hasher.write_u8(0xfe);
+    }
+    candidates_expires_at_ms.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Shared peer-connection state one fresh apply overwrote, captured at apply
+/// time so a losing commit's rollback can restore or precisely remove exactly
+/// its own contributions without clobbering a later (winning) apply.
+#[derive(Debug, Clone)]
+pub(crate) struct FreshApplyPreviousState {
+    /// `conn.last_candidate_generation` before this apply.
+    pub(crate) last_candidate_generation: u64,
+    /// `conn.last_candidates_expires_at_ms` before this apply.
+    pub(crate) last_candidates_expires_at_ms: Option<u64>,
+}
+
+/// A fresh apply recorded before its commit: the candidates this apply
+/// installed (for the rollback), the payload (for the committed snapshot),
+/// the candidate generation this apply advanced the peer's high-water to,
+/// and the previous shared state the apply overwrote.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingFreshApply {
+    pub(crate) candidates: Vec<String>,
+    pub(crate) payload_hash: u64,
+    pub(crate) candidates_expires_at_ms: Option<u64>,
+    /// The candidate generation value this apply set on the connection (0
+    /// when the apply did not advance it).
+    pub(crate) candidate_generation: u64,
+    /// Shared state the apply overwrote, restored by the losing commit's
+    /// rollback only while it still equals what this apply set.
+    pub(crate) previous: FreshApplyPreviousState,
+}
+
 impl PeerManager {
     /// Whether the local NAT profile needs fresh-socket mapping prediction.
     ///
@@ -81,7 +172,16 @@ impl PeerManager {
         punch_generation: u64,
         network_generation: u64,
     ) {
-        self.local_fresh_mappings.write().await.insert(
+        let mut mappings = self.local_fresh_mappings.write().await;
+        // A stale generation that completed late must never overwrite the
+        // fresh state a newer generation already recorded.
+        if mappings
+            .get(peer_id)
+            .is_some_and(|existing| existing.punch_generation > punch_generation)
+        {
+            return;
+        }
+        mappings.insert(
             peer_id.to_string(),
             LocalFreshMapping {
                 punch_generation,
@@ -93,6 +193,305 @@ impl PeerManager {
                 created_at: Instant::now(),
             },
         );
+    }
+
+    /// Prepare the admission of a fresh-mapping prediction identity signaled
+    /// by the remote, WITHOUT mutating the high-water.
+    ///
+    /// Only a strictly newer (incarnation, generation) may be applied; an
+    /// equal identity is an idempotent retry — admitted only when the retry's
+    /// payload is byte-identical (candidates, sources, expiry) to the
+    /// snapshot the identity was committed with, because a retry must never
+    /// apply different candidates under the same identity.  An older identity
+    /// is a superseded prediction sent late.  The high-water only advances in
+    /// [`Self::commit_remote_fresh_prediction`] after the candidates were
+    /// really applied, so a signal whose apply fails (peer missing, empty
+    /// set, expired set, stale candidate generation) never consumes the
+    /// identity and a later retry can still succeed.
+    pub(crate) async fn prepare_remote_fresh_prediction(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidates_expires_at_ms: Option<u64>,
+    ) -> RemoteFreshAdmission {
+        let payload_hash =
+            fresh_payload_hash(candidates, candidate_sources, candidates_expires_at_ms);
+        let high_water = self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match high_water.get(peer_id).copied() {
+            None => RemoteFreshAdmission::Accepted,
+            Some(current) if id > current => RemoteFreshAdmission::Accepted,
+            Some(current) if id == current => {
+                // Idempotent retry: the payload must match the snapshot the
+                // identity was committed with.
+                let snapshots = self
+                    .remote_fresh_snapshots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match snapshots.get(&(peer_id.to_string(), id)) {
+                    Some(snapshot) if snapshot.payload_hash == payload_hash => {
+                        RemoteFreshAdmission::AlreadyRecorded
+                    }
+                    Some(_) => RemoteFreshAdmission::PayloadMismatch,
+                    None => {
+                        // The identity is committed but no snapshot survived
+                        // (state reset by an identity change): a retry cannot
+                        // be verified against anything, so it is rejected
+                        // rather than applied blind.
+                        RemoteFreshAdmission::PayloadMismatch
+                    }
+                }
+            }
+            Some(_) => RemoteFreshAdmission::Stale,
+        }
+    }
+
+    /// Apply the fresh signal's candidates and record the apply so the
+    /// commit can either promote it to the durable snapshot or roll it back.
+    ///
+    /// The apply captures the shared state it overwrites (the peer's
+    /// candidate-generation high-water and expiry) so a losing commit can
+    /// restore or precisely remove exactly its own contributions.  The
+    /// pre-apply shared candidate set is not restored wholesale: the
+    /// prepare/apply/commit sequence is serialized by the control event loop,
+    /// and when two applies DO run concurrently the loser's rollback removes
+    /// only the candidates this apply installed that the winner's committed
+    /// snapshot does not contain (see [`Self::rollback_remote_fresh_apply`]).
+    pub(crate) async fn apply_remote_fresh_candidates(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+    ) -> CandidateSetApplyResult {
+        let (previous_generation, previous_expiry) = {
+            let conns = self.connections.read().await;
+            conns
+                .get(peer_id)
+                .map(|conn| {
+                    (
+                        conn.last_candidate_generation,
+                        conn.last_candidates_expires_at_ms,
+                    )
+                })
+                .unwrap_or((0, None))
+        };
+        let result = self
+            .add_candidates_with_metadata(
+                peer_id,
+                candidates,
+                candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
+            )
+            .await;
+        if result == CandidateSetApplyResult::Applied {
+            let payload_hash =
+                fresh_payload_hash(candidates, candidate_sources, candidates_expires_at_ms);
+            self.pending_fresh_applies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    (peer_id.to_string(), id),
+                    PendingFreshApply {
+                        candidates: candidates.to_vec(),
+                        payload_hash,
+                        candidates_expires_at_ms,
+                        candidate_generation,
+                        previous: FreshApplyPreviousState {
+                            last_candidate_generation: previous_generation,
+                            last_candidates_expires_at_ms: previous_expiry,
+                        },
+                    },
+                );
+        }
+        result
+    }
+
+    /// Commit a fresh-mapping prediction identity as the peer's high-water
+    /// and freeze its immutable candidate snapshot.
+    ///
+    /// The high-water CAS, the pending-apply promotion and the snapshot
+    /// freeze are ONE lock transaction (high-water -> pending -> snapshots,
+    /// the same order `prepare` uses for high-water -> snapshots): a retry
+    /// of the identity can never observe "high-water advanced but snapshot
+    /// missing".  The commit only succeeds when the apply was really
+    /// recorded: without a pending apply there is no payload to freeze, so
+    /// the high-water does NOT advance and the identity stays unconsumed for
+    /// a later retry.  Exactly one concurrent commit of an identity wins; the
+    /// loser must roll its own apply back.
+    ///
+    /// Only the current high-water's snapshot is retained: every older
+    /// snapshot for the peer is pruned here, so the snapshot map cannot grow
+    /// without bound across identities.
+    pub(crate) async fn commit_remote_fresh_prediction(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+    ) -> bool {
+        let mut high_water = self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match high_water.get(peer_id).copied() {
+            Some(current) if id <= current => return false,
+            _ => {}
+        }
+        let apply = {
+            let mut pending = self
+                .pending_fresh_applies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The apply must have been recorded for the SAME identity: a
+            // commit without a recorded apply has no payload to freeze and
+            // must not advance the high-water.
+            let Some(apply) = pending.remove(&(peer_id.to_string(), id)) else {
+                return false;
+            };
+            apply
+        };
+        high_water.insert(peer_id.to_string(), id);
+        let mut snapshots = self
+            .remote_fresh_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Freeze the committed snapshot and prune every older snapshot for
+        // this peer: only the current high-water's snapshot is ever needed.
+        snapshots.retain(|(owner, snapshot_id), _| owner != peer_id || *snapshot_id == id);
+        snapshots.insert(
+            (peer_id.to_string(), id),
+            FreshPredictionSnapshot {
+                candidates: apply.candidates,
+                payload_hash: apply.payload_hash,
+                candidates_expires_at_ms: apply.candidates_expires_at_ms,
+            },
+        );
+        true
+    }
+
+    /// Roll back an apply whose commit lost the CAS: remove precisely the
+    /// state this apply caused that a later (winning) apply did not re-own.
+    ///
+    /// - The candidate-generation high-water and the expiry are restored to
+    ///   their pre-apply values ONLY while they still equal what this apply
+    ///   set (a later apply that advanced them is untouched).
+    /// - The candidates this apply installed are removed only while they are
+    ///   still labeled `Predicted` AND are absent from the winner's committed
+    ///   snapshot: a candidate the winner re-signaled must survive, so a
+    ///   losing apply can never tear down the winning prediction's set.
+    pub(crate) async fn rollback_remote_fresh_apply(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+    ) {
+        let Some(pending) = self
+            .pending_fresh_applies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(peer_id.to_string(), id))
+        else {
+            return;
+        };
+        // The winner's committed snapshot bounds the rollback: a candidate
+        // the winner re-signaled must never be removed by the loser.  The
+        // lock order is high-water -> snapshots, matching `commit`.
+        let winner_candidates = {
+            let high_water = self
+                .remote_fresh_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let winner_id = high_water.get(peer_id).copied().unwrap_or(id);
+            drop(high_water);
+            self.remote_fresh_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&(peer_id.to_string(), winner_id))
+                .map(|snapshot| snapshot.candidates.clone())
+                .unwrap_or_default()
+        };
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(peer_id) else {
+            return;
+        };
+        // Restore the high-water and expiry only while they still equal what
+        // THIS apply set: a later (winning) apply owns them otherwise.
+        if pending.candidate_generation != 0
+            && conn.last_candidate_generation == pending.candidate_generation
+        {
+            conn.last_candidate_generation = pending.previous.last_candidate_generation;
+        }
+        if conn.last_candidates_expires_at_ms == pending.candidates_expires_at_ms {
+            conn.last_candidates_expires_at_ms = pending.previous.last_candidates_expires_at_ms;
+        }
+        for candidate in &pending.candidates {
+            let re_owned_by_winner = winner_candidates.contains(candidate);
+            if !re_owned_by_winner
+                && conn.candidate_sources.get(candidate) == Some(&CandidatePairSource::Predicted)
+            {
+                conn.candidates.retain(|existing| existing != candidate);
+                conn.candidate_sources.remove(candidate);
+                conn.signaled_candidates.remove(candidate);
+                conn.candidate_pairs.retain(|pair| {
+                    !(pair.source == CandidatePairSource::Predicted
+                        && pair.remote_endpoint.to_string() == *candidate)
+                });
+            }
+        }
+    }
+
+    /// The immutable committed snapshot for a fresh identity, if any.
+    pub(crate) async fn remote_fresh_snapshot_for(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+    ) -> Option<FreshPredictionSnapshot> {
+        self.remote_fresh_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(peer_id.to_string(), id))
+            .cloned()
+    }
+
+    /// Reset the remote fresh-generation high-water for a peer.
+    ///
+    /// Called on public-key identity change and other explicit identity
+    /// resets: a new peer incarnation starts a fresh generation space, so the
+    /// next prediction signal is accepted regardless of what the old
+    /// incarnation sent.  A plain PeerLeft deliberately does NOT clear the
+    /// high-water (see `remove_peer`): a late old-incarnation signal must
+    /// stay rejected after the peer rejoins, and the new incarnation's
+    /// strictly-monotonic counter supersedes it anyway.
+    pub(crate) async fn reset_remote_fresh_generation(&self, peer_id: &str, reason: &str) {
+        let removed = self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id)
+            .is_some();
+        self.remote_fresh_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(owner, _), _| owner != peer_id);
+        self.pending_fresh_applies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(owner, _), _| owner != peer_id);
+        if removed {
+            info!(
+                event = "remote_fresh_generation_reset",
+                peer_id = %peer_id,
+                reason = %reason,
+                "remote_fresh_generation_reset peer_id={} reason={}",
+                peer_id,
+                reason
+            );
+        }
     }
 
     /// Current fresh-mapping state for a peer, when still fresh and valid for
@@ -187,6 +586,34 @@ impl PeerManager {
             window_ports: state.predicted_ports.clone(),
             hit_window,
         };
+        // The peer-reflexive notification can arrive many times for the same
+        // peer-facing mapping (retransmissions, triggered checks), and the
+        // same (generation, port) pair can reappear after other results
+        // interleave.  One prediction result per (generation, actual port) is
+        // enough for the diagnostics history and the hit/miss event stream.
+        // The dedup check and the insert are one lock section: two concurrent
+        // notifications can never both pass the check, so exactly the first
+        // inserter records the hit/miss event.
+        let inserted = {
+            let mut history = self.fresh_mapping_history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = history.entry(peer_id.to_string()).or_default();
+            if entry.iter().any(|recorded| {
+                recorded.punch_generation == result.punch_generation
+                    && recorded.actual_port == result.actual_port
+            }) {
+                false
+            } else {
+                entry.push_back(result.clone());
+                while entry.len() > FRESH_MAPPING_RESULT_HISTORY_PER_PEER {
+                    entry.pop_front();
+                }
+                true
+            }
+        };
+        if !inserted {
+            return;
+        }
+        // Logging and the event stream run outside the lock.
         info!(
             event = "fresh_mapping_prediction_result",
             peer_id = %peer_id,
@@ -228,18 +655,6 @@ impl PeerManager {
                 ),
             )
             .await;
-        {
-            let mut history = self.fresh_mapping_history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            history
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(result);
-            while history.get(peer_id).is_some_and(|results| {
-                results.len() > FRESH_MAPPING_RESULT_HISTORY_PER_PEER
-            }) {
-                history.get_mut(peer_id).expect("history entry").pop_front();
-            }
-        }
     }
 
     /// Stable authoritative public endpoint(s) to punch toward during a

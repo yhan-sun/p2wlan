@@ -101,6 +101,11 @@ pub struct PeerConnection {
     pub path_events: Vec<PathSelectionEvent>,
     /// Recent direct traversal timeline events.
     pub direct_events: Vec<DirectTraversalEvent>,
+    /// Shared synchronous Direct-set mirror owned by the PeerManager.  Kept in
+    /// lockstep from `transition` and `reset_for_identity_change`, so the UDP
+    /// dynamic-socket eviction can re-verify "is this peer Direct?" under its
+    /// own socket-state lock without awaiting the async manager there.
+    direct_cache: Option<Arc<std::sync::Mutex<HashSet<String>>>>,
 }
 
 impl PeerConnection {
@@ -143,6 +148,7 @@ impl PeerConnection {
             last_path_selection: None,
             path_events: Vec::new(),
             direct_events: Vec::new(),
+            direct_cache: None,
         }
     }
 
@@ -170,6 +176,7 @@ impl PeerConnection {
         self.last_path_selection = None;
         self.path_events.clear();
         self.direct_events.clear();
+        self.sync_direct_cache();
     }
 
     /// Whether the connection is active (direct or relay).
@@ -196,6 +203,28 @@ impl PeerConnection {
             self.connected_at = Some(Instant::now());
         }
         self.state = new_state;
+        self.sync_direct_cache();
+    }
+
+    /// Keep the manager's synchronous Direct-set mirror in lockstep with this
+    /// connection's state, so the UDP layer can re-verify the nonevictable
+    /// set inside its socket-state lock.
+    fn sync_direct_cache(&self) {
+        let Some(cache) = &self.direct_cache else {
+            return;
+        };
+        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.state == ConnectionState::Direct {
+            cache.insert(self.node_id.clone());
+        } else {
+            cache.remove(&self.node_id);
+        }
+    }
+
+    /// Attach the manager's synchronous Direct-set mirror (manager-owned).
+    pub(crate) fn attach_direct_cache(&mut self, cache: Arc<std::sync::Mutex<HashSet<String>>>) {
+        self.direct_cache = Some(cache);
+        self.sync_direct_cache();
     }
 
     /// Current selected traffic path, if active.

@@ -364,6 +364,11 @@ pub struct ReceivedEncryptedPacket {
     pub relay_endpoint: Option<String>,
     /// Relay-authenticated source node ID, checked against the decrypted session owner.
     pub relay_peer_id: Option<String>,
+    /// Local UDP socket index that received this packet.  Only set for direct
+    /// UDP delivery; the affinity adoption after successful WireGuard
+    /// decryption uses it so the decrypting peer is pinned to the socket that
+    /// actually carried its traffic.
+    pub socket_index: Option<usize>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
@@ -1309,23 +1314,30 @@ impl WireGuardTransport {
         encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
         inbound_tx: mpsc::Sender<InboundPacket>,
     ) -> Result<()> {
-        self.run_inbound_with_peers(encrypted_rx, inbound_tx, None)
+        self.run_inbound_with_peers(encrypted_rx, inbound_tx, None, None)
             .await
     }
 
     /// Consume encrypted network packets and confirm direct UDP only after
     /// successful WireGuard decryption.
+    ///
+    /// `udp` optionally carries the direct UDP transport: a decrypted packet
+    /// whose receive socket is known adopts the socket as the peer's fresh
+    /// affinity evidence — raw encrypted UDP is never affinity evidence
+    /// before decryption proves the datagram belongs to the peer.
     pub async fn run_inbound_with_peers(
         &self,
         mut encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
         inbound_tx: mpsc::Sender<InboundPacket>,
         peers: Option<Arc<PeerManager>>,
+        udp: Option<crate::udp::UdpTransport>,
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
             let relay_peer_id = packet.relay_peer_id;
+            let socket_index = packet.socket_index;
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
                     if relay_peer_id
@@ -1372,6 +1384,20 @@ impl WireGuardTransport {
                                     local_endpoint,
                                 )
                                 .await;
+                            // Only now that WireGuard decryption succeeded is
+                            // the receiving socket adopted as the peer's
+                            // fresh affinity evidence.  The socket is
+                            // re-validated inside `remember_peer_socket`
+                            // (peer ownership, Committed phase, current
+                            // network generation).
+                            if let (Some(udp), Some(socket_index)) = (udp.as_ref(), socket_index) {
+                                udp.remember_peer_socket(
+                                    &inbound.peer_id,
+                                    socket_index,
+                                    crate::udp::SocketEvidence::Fresh,
+                                )
+                                .await;
+                            }
                             debug!(
                                 "Confirmed direct UDP data path from {source} for peer {}",
                                 inbound.peer_id

@@ -363,14 +363,15 @@ fn diagnostics_keeps_non_current_peer_reflexive_pair_provisional() {
     let current = diagnostics.current_direct_pair.as_ref().unwrap();
 
     assert_eq!(diagnostics.direct_type, DirectPathType::PeerReflexive);
-    assert!(!diagnostics.is_public_udp_direct);
+    // A peer-reflexive pair over a real public endpoint is public UDP direct.
+    assert!(diagnostics.is_public_udp_direct);
     assert!(diagnostics.is_peer_reflexive_direct);
     assert!(!diagnostics.public_mapping_stable);
     assert_eq!(diagnostics.warning, None);
     assert_eq!(selected.remote_endpoint, selected_remote.to_string());
     assert_eq!(current.remote_endpoint, current_remote.to_string());
     assert_eq!(selected.direct_type, DirectPathType::PeerReflexive);
-    assert!(!selected.is_public_udp_direct);
+    assert!(selected.is_public_udp_direct);
     assert!(selected.is_peer_reflexive_direct);
     assert!(!selected.public_mapping_stable);
     assert_eq!(selected.warning, None);

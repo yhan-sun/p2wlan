@@ -201,6 +201,7 @@ impl Daemon {
                     self.control.clone(),
                     self.runtime_stun_servers.clone(),
                     self.runtime_stun_timeout.clone(),
+                    self.boot_epoch_ms,
                     DIRECT_RETRY_BASE_INTERVAL,
                     punch_interval,
                     punch_attempts.clamp(1, 3),
@@ -295,6 +296,7 @@ let udp_direct_context = UdpDirectTaskContext {
     punch_deduplicator: self.punch_attempts.clone(),
     udp_punch_interval: punch_interval,
     udp_punch_attempts: punch_attempts,
+    boot_epoch_ms: self.boot_epoch_ms,
 };
 self.task_manager
     .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))

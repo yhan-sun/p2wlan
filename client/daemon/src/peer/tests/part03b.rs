@@ -520,6 +520,63 @@ async fn network_generation_change_rejects_stale_birthday_cursor_commit() {
 }
 
 #[tokio::test]
+async fn birthday_cursor_commits_when_planned_and_selected_counts_differ() {
+    // The field log showed `selected_birthday_candidates=2973` while
+    // `generated_candidates=2976` (three planned endpoints were already part
+    // of the advertised candidate set and were deduplicated).  The old
+    // equality check stalled the cursor at start_rank 8942 for nine cycles;
+    // the commit must only require that every selected candidate was covered
+    // and that birthday probing actually happened.
+    let public_ip = "203.0.113.10".parse().unwrap();
+    let manager = stable_scatter_manager(public_ip, 41_000).await;
+    let generation = manager.current_network_generation().await;
+    // Advance the cursor to the field-observed start_rank first.
+    let ramp = BirthdayProbePlan {
+        local_generation: generation,
+        stable_side_unique_scatter: true,
+        bases: vec![SocketAddr::new(public_ip, 41_000)],
+        public_ips: vec![public_ip],
+        start_rank: 0,
+        end_rank: 8942,
+        generated_candidates: 2_976,
+        planned_candidates: 3_072,
+        selected_candidates: 3_072,
+        selected_birthday_candidates: 2_976,
+        unique_target_ports: 3_072,
+        wrapped: false,
+    };
+    assert!(manager.commit_birthday_probe_cursor("peer1", &ramp, true).await);
+    let plan = BirthdayProbePlan {
+        local_generation: manager.current_network_generation().await,
+        stable_side_unique_scatter: true,
+        bases: vec![SocketAddr::new(public_ip, 41_000)],
+        public_ips: vec![public_ip],
+        start_rank: 8942,
+        end_rank: 11_921,
+        generated_candidates: 2_976,
+        planned_candidates: 3_072,
+        selected_candidates: 3_072,
+        selected_birthday_candidates: 2_973,
+        unique_target_ports: 3_072,
+        wrapped: false,
+    };
+    assert!(
+        manager
+            .commit_birthday_probe_cursor("peer1", &plan, true)
+            .await,
+        "cursor must advance even when some planned birthday endpoints were deduplicated"
+    );
+    let next = manager
+        .direct_probe_target_set_for("peer1")
+        .await
+        .unwrap()
+        .birthday_plan
+        .unwrap();
+    assert_eq!(next.start_rank, 11_921 % birthday_probe_wide_rank_count());
+    assert_ne!(next.start_rank, 8942);
+}
+
+#[tokio::test]
 async fn remote_port_churn_triggers_birthday_probe_targets() {
     let config = test_config();
     let manager = PeerManager::new(config);

@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -108,7 +109,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"to_node_id and type are required"}`, http.StatusBadRequest)
 		return
 	}
-	if req.Type != "peer_offer" && req.Type != "peer_answer" && req.Type != "peer_reflexive" {
+	if req.Type != "peer_offer" && req.Type != "peer_offer_fresh" && req.Type != "peer_answer" && req.Type != "peer_reflexive" {
 		http.Error(w, `{"error":"unsupported signal type"}`, http.StatusBadRequest)
 		return
 	}
@@ -183,6 +184,26 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	if len(req.Handshake) > 4096 {
 		http.Error(w, `{"error":"handshake too long"}`, http.StatusBadRequest)
 		return
+	}
+	// The handshake must be well-formed hex of a plausible WireGuard
+	// handshake-initiation length when non-empty: a bad handshake must be
+	// rejected at creation time instead of poisoning the receiver's poll
+	// batch (the client skips malformed rows, but the server should not queue
+	// garbage that a mixed-version fleet then has to survive).
+	if req.Handshake != "" {
+		trimmed := strings.TrimSpace(req.Handshake)
+		if len(trimmed)%2 != 0 {
+			http.Error(w, `{"error":"handshake must be even-length hex"}`, http.StatusBadRequest)
+			return
+		}
+		if _, err := hex.DecodeString(trimmed); err != nil {
+			http.Error(w, `{"error":"handshake must be valid hex"}`, http.StatusBadRequest)
+			return
+		}
+		if len(trimmed) > 2*4096 {
+			http.Error(w, `{"error":"handshake too long"}`, http.StatusBadRequest)
+			return
+		}
 	}
 	if req.PunchAtMS < 0 {
 		http.Error(w, `{"error":"punch_at_ms must be non-negative"}`, http.StatusBadRequest)
@@ -298,6 +319,17 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 
 	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey)
 	if err != nil {
+		if errors.Is(err, database.ErrSignalQueueLimit) {
+			// A clear degradable signal: the queue bound (pair rows/bytes,
+			// global rows, or sender frequency) is exceeded.  The sender
+			// falls back to a later retry instead of unbounded growth.
+			writeJSON(w, http.StatusTooManyRequests, map[string]interface{}{
+				"error":      err.Error(),
+				"error_code": "signal_queue_limit",
+				"retryable":  true,
+			})
+			return
+		}
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
 	}

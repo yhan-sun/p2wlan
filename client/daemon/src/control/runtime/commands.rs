@@ -44,19 +44,41 @@ match cmd {
                             }
                             let _ = response_tx.send(res);
                         }
-                        ControlCommand::SendPeerOffer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_init, punch_at_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms, None, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;
-                            match &res {
-                                Ok(()) => { debug!("Sent peer offer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
-                                Err(err) => {
-                                    let err_str = err.to_string();
-                                    let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err_str.clone() });
-                                    if is_permanent_auth_error(&err_str) {
-                                        break;
+                        ControlCommand::SendPeerOffer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_init, punch_at_ms, fresh_ownership, response_tx } => {
+                            if fresh_ownership.is_some_and(|ownership| ownership.is_cancelled()) {
+                                // The fresh-mapping prediction's punch session
+                                // was superseded while this command waited in
+                                // the queue: sending it would let the receiver
+                                // claim a stale window.
+                                debug!("Skipped queued peer offer to {to_node_id}: fresh-mapping prediction ownership was revoked before the HTTP request");
+                                let _ = response_tx.send(Ok(()));
+                            } else {
+                                // Fresh predictions travel on the ordinary
+                                // `peer_offer` wire type: the fresh identity
+                                // lives in the `predicted_fresh:*` candidate
+                                // source labels, and the receiver's per-peer
+                                // fresh high-water is the authority on
+                                // supersession.  Keeping one wire type makes a
+                                // new client work against an old server (which
+                                // would otherwise reject `peer_offer_fresh`
+                                // with 400) and an old client against a new
+                                // server (which would otherwise hand it an
+                                // unknown type it silently drops).  The server
+                                // never overwrites queued signals, so delivery
+                                // order is the per-pair sequence either way.
+                                let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_offer", &candidates, &candidate_sources, &handshake_init, punch_at_ms, None, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;
+                                match &res {
+                                    Ok(()) => { debug!("Sent peer_offer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
+                                    Err(err) => {
+                                        let err_str = err.to_string();
+                                        let _ = event_tx.send(ControlEvent::ServerError { code: 4000, message: err_str.clone() });
+                                        if is_permanent_auth_error(&err_str) {
+                                            break;
+                                        }
                                     }
                                 }
+                                let _ = response_tx.send(res);
                             }
-                            let _ = response_tx.send(res);
                         }
                         ControlCommand::SendPeerAnswer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_response, punch_at_ms, punch_at_server_ms, response_tx } => {
                             let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms, punch_at_server_ms, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;

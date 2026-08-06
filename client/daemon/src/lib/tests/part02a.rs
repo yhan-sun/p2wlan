@@ -562,3 +562,236 @@ fn candidate_set_change_reason_detects_added_removed_and_port_changes() {
         "source_changed"
     );
 }
+
+#[test]
+fn fresh_window_survives_full_candidate_set_with_order_and_budget() {
+    // Scenario from the field: 96 ordinary candidates are already gathered
+    // when a fresh-mapping prediction window must be signaled.
+    let mut candidates = (1..=MAX_SIGNAL_CANDIDATES)
+        .map(|index| {
+            format!(
+                "198.51.100.{}:{}",
+                index % 32 + 1,
+                40000 + index
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    // Mix in ordinary predicted candidates that must NOT be mistaken for the
+    // fresh window.
+    for (offset, label) in [
+        ("198.51.100.33:43001", "predicted"),
+        ("198.51.100.33:43003", "predicted"),
+        ("198.51.100.33:43005", "predicted"),
+    ] {
+        candidates.push(offset.to_string());
+        sources.insert(offset.to_string(), label.to_string());
+    }
+
+    // The fresh window: top-1 first, then the successor window, all on the
+    // public IP the model observed.
+    let boot: u64 = 1_742_987_654_321;
+    let fresh_label = fresh_prediction_source_label(FreshPredictionId {
+        boot_epoch: boot,
+        generation: 39,
+    });
+    let window = (0..MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
+        .map(|distance| format!("203.0.113.10:{}", 45393 + distance))
+        .collect::<Vec<_>>();
+    let mut fresh = window.clone();
+    fresh.reverse();
+    for endpoint in fresh {
+        candidates.insert(0, endpoint.clone());
+        sources.insert(endpoint, fresh_label.clone());
+    }
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    // The output stays within the wire limit, the whole fresh window survives
+    // in sender order (top-1 first), and the source map stays aligned.
+    assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert_eq!(sources.len(), candidates.len());
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    let kept_window = window
+        .iter()
+        .filter(|endpoint| candidates.contains(endpoint))
+        .collect::<Vec<_>>();
+    assert_eq!(kept_window.len(), MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+    let kept_ports = kept_window
+        .iter()
+        .map(|endpoint| endpoint.parse::<SocketAddr>().unwrap().port())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept_ports,
+        (45393u16..45393u16 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES as u16).collect::<Vec<_>>(),
+        "fresh window ports must all be preserved in sender order"
+    );
+    // Fresh candidates lead the list so the receiver probes top-1 first.
+    assert_eq!(
+        candidates[0],
+        "203.0.113.10:45393",
+        "fresh top-1 must stay first"
+    );
+    // Every surviving fresh endpoint carries the fresh label.
+    for endpoint in &window {
+        if candidates.contains(endpoint) {
+            assert_eq!(
+                sources.get(endpoint).map(String::as_str),
+                Some(fresh_label.as_str()),
+                "fresh label must survive truncation for {endpoint}"
+            );
+        }
+    }
+    // Ordinary predicted candidates that survived are still ordinary.
+    for (endpoint, label) in [
+        ("198.51.100.33:43001", "predicted"),
+        ("198.51.100.33:43003", "predicted"),
+        ("198.51.100.33:43005", "predicted"),
+    ] {
+        if candidates.contains(&endpoint.to_string()) {
+            assert_eq!(
+                sources.get(endpoint).map(String::as_str),
+                Some(label),
+                "ordinary predicted candidate must not be relabeled fresh"
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_and_zero_generation_labels_do_not_claim_fresh_budget() {
+    let boot: u64 = 1_742_987_654_321;
+    let mut candidates = (1..=MAX_SIGNAL_CANDIDATES + 8)
+        .map(|index| format!("198.51.100.1:{}", 40000 + index))
+        .collect::<Vec<_>>();
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    // Malformed labels and generation zero are NOT fresh: they degrade to
+    // ordinary predicted candidates and must not reserve the fresh budget.
+    for (endpoint, label) in [
+        ("203.0.113.10:46001", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}garbage")),
+        ("203.0.113.10:46002", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}{boot}:0")),
+        ("203.0.113.10:46003", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}39")),
+        ("203.0.113.10:46004", "predicted".to_string()),
+    ] {
+        candidates.push(endpoint.to_string());
+        sources.insert(endpoint.to_string(), label);
+    }
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
+    // None of the degraded labels survived as reserved candidates; if any of
+    // the 203.0.113.10 endpoints survived at all it is only via the ordinary
+    // truncation path, never ahead of the STUN candidates.
+    for endpoint in [
+        "203.0.113.10:46001",
+        "203.0.113.10:46002",
+        "203.0.113.10:46003",
+        "203.0.113.10:46004",
+    ] {
+        if candidates.contains(&endpoint.to_string()) {
+            assert!(
+                candidates.iter().position(|c| c == endpoint).unwrap() >= 4,
+                "degraded predicted candidate must not jump ahead of the STUN prefix"
+            );
+        }
+    }
+    assert!(
+        candidates.iter().all(|endpoint| {
+            !crate::parse_fresh_prediction_source_label(
+                sources.get(endpoint).map(String::as_str).unwrap_or(""),
+            )
+            .is_some()
+        }),
+        "no malformed/zero label may be treated as a valid fresh prediction"
+    );
+}
+
+#[test]
+fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
+    let boot: u64 = 1_742_987_654_321;
+    let fresh_label = fresh_prediction_source_label(FreshPredictionId {
+        boot_epoch: boot,
+        generation: 7,
+    });
+    // LAN host candidates are a necessary reservation and must survive.
+    let mut candidates = vec![
+        "192.168.1.10:51820".to_string(),
+        "192.168.1.11:51820".to_string(),
+        "10.0.0.5:51820".to_string(),
+    ];
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| (endpoint, "host".to_string()))
+        .collect::<HashMap<_, _>>();
+    // Two public IPs with fresh + ordinary predicted + STUN candidates.
+    for index in 1..=MAX_SIGNAL_CANDIDATES {
+        let endpoint = if index % 2 == 0 {
+            format!("198.51.100.10:{}", 40000 + index)
+        } else {
+            format!("198.51.100.20:{}", 40000 + index)
+        };
+        candidates.push(endpoint.clone());
+        sources.insert(endpoint, "stun_observed".to_string());
+    }
+    for distance in (0..MAX_SIGNAL_FRESH_WINDOW_CANDIDATES).rev() {
+        let endpoint = format!("203.0.113.10:{}", 45393 + distance);
+        candidates.insert(0, endpoint.clone());
+        sources.insert(endpoint, fresh_label.clone());
+    }
+    let ordinary_predicted = "198.51.100.30:43009".to_string();
+    candidates.push(ordinary_predicted.clone());
+    sources.insert(ordinary_predicted.clone(), "predicted".to_string());
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
+    // LAN hosts preserved (budget allows all three).
+    for endpoint in ["192.168.1.10:51820", "192.168.1.11:51820", "10.0.0.5:51820"] {
+        assert!(
+            candidates.contains(&endpoint.to_string()),
+            "LAN host {endpoint} must survive"
+        );
+    }
+    // Whole fresh window preserved, ordered top-1 first, and leading.
+    let window_ports = candidates
+        .iter()
+        .take(MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
+        .map(|endpoint| endpoint.parse::<SocketAddr>().unwrap().port())
+        .collect::<Vec<_>>();
+    assert_eq!(window_ports, (45393u16..45393u16 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES as u16).collect::<Vec<_>>());
+    // Ordinary predicted may or may not survive the STUN-filled budget; if it
+    // does it stays an ordinary predicted candidate.
+    if candidates.contains(&ordinary_predicted) {
+        assert_eq!(
+            sources.get(&ordinary_predicted).map(String::as_str),
+            Some("predicted")
+        );
+    }
+    // Source map aligned and fresh labels intact.
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    let fresh_kept = candidates
+        .iter()
+        .filter(|endpoint| {
+            crate::parse_fresh_prediction_source_label(
+                sources.get(*endpoint).map(String::as_str).unwrap_or(""),
+            )
+            .is_some()
+        })
+        .count();
+    assert_eq!(fresh_kept, MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+    // Both public IPs still represented after truncation.
+    assert!(candidates.iter().any(|c| c.starts_with("198.51.100.10:")));
+    assert!(candidates.iter().any(|c| c.starts_with("198.51.100.20:")));
+}

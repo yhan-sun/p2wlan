@@ -176,7 +176,135 @@ fn candidate_expiry_uses_the_server_clock_offset() {
 
 #[test]
 fn candidate_generations_are_strictly_monotonic() {
-    let first = next_candidate_generation();
-    let second = next_candidate_generation();
+    crate::incarnation::set_local_incarnation(1_742_987_654_321);
+    let first = next_candidate_generation().unwrap();
+    let second = next_candidate_generation().unwrap();
     assert!(second > first);
+}
+
+#[test]
+fn candidate_generations_embed_the_incarnation_in_the_high_bits() {
+    let incarnation = 1_742_987_654_321;
+    let first = next_candidate_generation_for_incarnation(incarnation, 0).unwrap();
+    let second = next_candidate_generation_for_incarnation(incarnation, first).unwrap();
+    assert!(second > first);
+    // The incarnation-encoded space lives above the legacy wall-clock space.
+    assert!(first > 1_752_000_000_000);
+    // Clock rollback between calls must never produce a smaller generation.
+    let after_rollback = next_candidate_generation_for_incarnation(incarnation, second).unwrap();
+    assert!(after_rollback > second);
+
+    // A newer incarnation dominates every counter of an older incarnation:
+    // a late request from an old process (lower high bits) compares smaller
+    // even when its low counter wrapped higher.
+    let old_process_late = CANDIDATE_GENERATION_INCARNATION_FLAG
+        | (1_742_987_654_321u64 << CANDIDATE_GENERATION_COUNTER_BITS)
+        | CANDIDATE_GENERATION_COUNTER_MASK;
+    let new_process_first =
+        next_candidate_generation_for_incarnation(1_742_987_654_322, 0).unwrap();
+    assert!(new_process_first > old_process_late);
+}
+
+#[test]
+fn candidate_generation_incarnation_values_stay_within_positive_int64() {
+    let incarnation = 1_742_987_654_321;
+    let value = next_candidate_generation_for_incarnation(incarnation, 0).unwrap();
+    assert!(value < i64::MAX as u64);
+    // The most extreme encodable generation also stays within i64.
+    let value =
+        next_candidate_generation_for_incarnation(incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
+            .unwrap();
+    assert!(value < i64::MAX as u64);
+    // The maximum encodable incarnation still fits the signed int64 JSON path
+    // (the all-ones 63-bit pattern is exactly i64::MAX).
+    let max_incarnation = (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1;
+    let value =
+        next_candidate_generation_for_incarnation(max_incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
+            .unwrap();
+    assert!(value <= i64::MAX as u64);
+}
+
+#[test]
+fn candidate_generation_refuses_to_mask_a_wrapped_incarnation() {
+    // A wall-clock-seeded incarnation above the 41-bit field limit must be
+    // refused, never masked: masking would let a boot from the year 2040
+    // encode as a *smaller* high half than a boot today, and receivers would
+    // judge its signals stale forever after a restart.
+    assert!(matches!(
+        next_candidate_generation_for_incarnation(1u64 << CANDIDATE_GENERATION_INCARNATION_BITS, 0),
+        Err(CandidateGenerationError::IncarnationExhausted(_))
+    ));
+    // Just below the limit still encodes.
+    assert!(
+        next_candidate_generation_for_incarnation(
+            (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1,
+            0,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn candidate_generation_refuses_to_wrap_the_per_boot_counter() {
+    let incarnation = 1_742_987_654_321;
+    // The counter at its field maximum refuses to advance (wrapping to 0
+    // would collide with the boot's first generation).
+    assert!(matches!(
+        next_candidate_generation_for_incarnation(incarnation, CANDIDATE_GENERATION_COUNTER_MASK),
+        Err(CandidateGenerationError::CounterExhausted(_))
+    ));
+    // One below the maximum still advances.
+    let value =
+        next_candidate_generation_for_incarnation(incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
+            .unwrap();
+    assert_eq!(value & CANDIDATE_GENERATION_COUNTER_MASK, CANDIDATE_GENERATION_COUNTER_MASK);
+}
+
+/// An untrustworthy incarnation (0: corrupt state, lost state, or no config
+/// path) must NEVER be encoded under the flag: a flagged value with a zero
+/// incarnation field is lower than every real incarnation-encoded value, so
+/// a receiver whose high-water saw a real incarnation would judge this
+/// boot's ordinary candidates stale forever.  The compat value is 0 — the
+/// legacy "no ordering metadata" value the receiver's stale check never
+/// rejects (`candidate_generation != 0` gates the comparison).
+#[test]
+fn candidate_generation_with_untrustworthy_incarnation_is_legacy_compat_zero() {
+    let value = next_candidate_generation_for_incarnation(0, 0).unwrap();
+    assert_eq!(value, 0, "incarnation 0 must degrade to the legacy no-metadata value");
+    assert_eq!(
+        value & CANDIDATE_GENERATION_INCARNATION_FLAG,
+        0,
+        "the compat value must never carry the incarnation flag"
+    );
+    // The process-level entry point is a thin wrapper over the pure rule
+    // (`next_candidate_generation_for_incarnation(local_incarnation(), ..)`),
+    // so a daemon booted without a trustworthy incarnation never emits
+    // flagged values.
+    // Once a real incarnation is available again the flagged space resumes
+    // from a value that dominates every legacy generation the boot sent.
+    let resumed = next_candidate_generation_for_incarnation(1_742_987_654_321, 0).unwrap();
+    assert!(resumed > 1_752_000_000_000, "the resumed incarnation space must be strictly above legacy values");
+}
+
+/// Old-client -> new-client and new-client -> old-client ordering semantics:
+/// a legacy (pre-incarnation) wall-clock generation sent by an old client is
+/// always below the incarnation-encoded space, so a NEW client that already
+/// recorded an incarnation-encoded generation never accepts the old
+/// client's stale numbers — while the old client's fresh predictions (which
+/// carry no incarnation) simply never preempt a real prediction.
+#[test]
+fn legacy_generations_never_cross_the_incarnation_flag() {
+    // The highest legacy wall-clock value a pre-incarnation client can send
+    // (~year 2250 in ms) stays strictly below every incarnation-encoded
+    // value, including the very first one of a fresh incarnation.
+    let legacy_max = 9_999_999_999_999u64; // legacy space is well below 2^62
+    let first_encoded = next_candidate_generation_for_incarnation(1_742_987_654_321, 0).unwrap();
+    assert!(legacy_max < CANDIDATE_GENERATION_INCARNATION_FLAG);
+    assert!(legacy_max < first_encoded);
+    // Downgrade: a NEW client receiving from an OLD client (legacy values)
+    // after having recorded an incarnation-encoded high-water must keep
+    // judging the legacy numbers stale — the old client's compat generation
+    // 0 is the only one that still applies.
+    let old_client_value = 1_752_000_000_000u64;
+    assert!(old_client_value < first_encoded);
 }

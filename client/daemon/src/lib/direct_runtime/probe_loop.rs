@@ -8,6 +8,7 @@ async fn run_direct_probe_loop(
     control: ControlClient,
     stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
     stun_timeout: Arc<RwLock<Duration>>,
+    boot_epoch_ms: u64,
     retry_after: Duration,
     probe_interval: Duration,
     attempts: u32,
@@ -76,12 +77,14 @@ async fn run_direct_probe_loop(
                     local_candidate_sources: local_candidate_sources.clone(),
                     stun_servers,
                     stun_timeout,
+                    boot_epoch_ms,
                 }
             };
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
                 let rx_before = udp.probe_rx_snapshot().await;
+                let mut last_punch_report: Option<PunchSendReport> = None;
                 let deadline = punch_session_deadline(
                     &candidates,
                     probe_interval,
@@ -94,6 +97,9 @@ async fn run_direct_probe_loop(
                     },
                 );
                 let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
+                    if session.is_cancelled() {
+                        return;
+                    }
                     let punch_started_stage = if reclaim_active {
                         "direct_reclaim_punch_started"
                     } else {
@@ -151,7 +157,7 @@ async fn run_direct_probe_loop(
                     // ordinary candidate sweep.
                     let fresh_generation = {
                         let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
-                        let generation = udp
+                        let mut generation = udp
                             .run_fresh_mapping_generation(
                                 &peer_id,
                                 &signal.stun_servers,
@@ -159,17 +165,62 @@ async fn run_direct_probe_loop(
                                 &targets,
                                 probe_interval,
                                 attempts.min(2),
+                                Some(&session.cancellation_handle()),
                             )
                             .await;
-                        match &generation {
-                            FreshMappingOutcome::Accepted(result) => {
-                                advertise_fresh_mapping_prediction(
-                                    &signal,
-                                    &peers,
-                                    &peer_id,
-                                    result,
-                                )
-                                .await;
+                        match &mut generation {
+                            FreshMappingOutcome::Accepted(result, handoff) => {
+                                if session.is_cancelled() {
+                                    peers
+                                        .record_direct_event(
+                                            &peer_id,
+                                            "fresh_mapping_skipped",
+                                            None,
+                                            None,
+                                            None,
+                                            "fresh-mapping generation completed but its punch session was superseded; not advertising the prediction",
+                                        )
+                                        .await;
+                                } else {
+                                    // The durable handoff happens only after
+                                    // the prediction is really advertised: a
+                                    // send failure or a cancellation during
+                                    // the advertise keeps the socket
+                                    // rollable.
+                                    let advertised = advertise_fresh_mapping_prediction(
+                                        &signal,
+                                        &peers,
+                                        &peer_id,
+                                        &*result,
+                                        &session.cancellation_handle(),
+                                    )
+                                    .await;
+                                    if advertised {
+                                        if !handoff.finalize().await {
+                                            peers
+                                                .record_direct_event(
+                                                    &peer_id,
+                                                    "fresh_mapping_skipped",
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    "fresh-mapping prediction was advertised but the socket was rolled back before the durable handoff; continuing with ordinary punching",
+                                                )
+                                                .await;
+                                        }
+                                    } else {
+                                        peers
+                                            .record_direct_event(
+                                                &peer_id,
+                                                "fresh_mapping_skipped",
+                                                None,
+                                                None,
+                                                None,
+                                                "fresh-mapping prediction was not advertised; the generation's socket rolls back to the previous path",
+                                            )
+                                            .await;
+                                    }
+                                }
                             }
                             FreshMappingOutcome::Rejected(reason) => {
                                 peers
@@ -199,7 +250,7 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
-                    let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(_))
+                    let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                         && udp.has_dynamic_socket_for_peer(&peer_id).await
                     {
                         udp.punch_candidates_from_dynamic_socket(
@@ -246,6 +297,7 @@ async fn run_direct_probe_loop(
                     match punch_result {
                         Ok(report) if report.packets_sent == 0 => {}
                         Ok(report) => {
+                            last_punch_report = Some(report);
                             let sent = report.packets_sent;
                             let birthday_window_completion = if let Some(plan) =
                                 birthday_plan.as_ref().filter(|_| stable_remote_scatter)
@@ -433,17 +485,50 @@ async fn run_direct_probe_loop(
                                 timeout_detail.clone(),
                             )
                             .await;
-                        if stable_remote_scatter && birthday_plan.is_some() {
-                            peers
-                                .record_direct_event(
-                                    &peer_id,
-                                    "birthday_probe_window_incomplete",
-                                    candidates.first().copied(),
-                                    Some(candidates.len()),
-                                    None,
-                                    "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
-                                )
-                                .await;
+                        if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
+                            // The deadline can cut the session short even
+                            // though the whole planned window was already
+                            // sent (the session was only waiting out the ACK
+                            // grace): advance the cursor so the next cycle
+                            // does not rescan the same 3,000 ports.
+                            let covered_all = last_punch_report
+                                .is_some_and(|report| {
+                                    report.unique_target_endpoints as usize >= candidates.len()
+                                });
+                            if covered_all {
+                                let cursor_advanced = peers
+                                    .commit_birthday_probe_cursor(
+                                        &peer_id,
+                                        plan,
+                                        true,
+                                    )
+                                    .await;
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "birthday_probe_plan_completed",
+                                        candidates.first().copied(),
+                                        Some(candidates.len()),
+                                        last_punch_report.map(|report| report.packets_sent),
+                                        format!(
+                                            "stable-side birthday session deadline after a complete send report; cursor_advanced={cursor_advanced} start_rank={} end_rank={}",
+                                            plan.start_rank,
+                                            plan.end_rank
+                                        ),
+                                    )
+                                    .await;
+                            } else {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "birthday_probe_window_incomplete",
+                                        candidates.first().copied(),
+                                        Some(candidates.len()),
+                                        None,
+                                        "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
+                                    )
+                                    .await;
+                            }
                         } else {
                             peers
                                 .record_direct_probe_batch_failure_for_generation(

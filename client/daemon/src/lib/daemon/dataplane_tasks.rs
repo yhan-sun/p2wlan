@@ -21,10 +21,16 @@ impl Daemon {
 
             let inbound_transport = transport.clone();
             let inbound_peers = self.peers.clone();
+            let inbound_udp = self.udp_transport.read().await.clone();
             self.task_manager
                 .spawn_result("wireguard-inbound", true, async move {
                     inbound_transport
-                        .run_inbound_with_peers(network_inbound_rx, inbound_tx, Some(inbound_peers))
+                        .run_inbound_with_peers(
+                            network_inbound_rx,
+                            inbound_tx,
+                            Some(inbound_peers),
+                            inbound_udp,
+                        )
                         .await
                 })
                 .await;
@@ -36,10 +42,16 @@ impl Daemon {
             let (inbound_tx, inbound_rx) = mpsc::channel(1024);
             let inbound_transport = self.transport.clone();
             let inbound_peers = self.peers.clone();
+            let inbound_udp = self.udp_transport.read().await.clone();
             self.task_manager
                 .spawn_result("wireguard-inbound", true, async move {
                     inbound_transport
-                        .run_inbound_with_peers(network_inbound_rx, inbound_tx, Some(inbound_peers))
+                        .run_inbound_with_peers(
+                            network_inbound_rx,
+                            inbound_tx,
+                            Some(inbound_peers),
+                            inbound_udp,
+                        )
                         .await
                 })
                 .await;

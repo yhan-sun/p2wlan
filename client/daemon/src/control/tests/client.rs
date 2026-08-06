@@ -1,3 +1,5 @@
+use tokio::net::TcpListener;
+use tokio::time::{sleep, timeout};
 #[test]
 fn test_control_client_creation() {
     let config = test_config();
@@ -119,4 +121,231 @@ fn test_peer_info_default() {
     let info = PeerInfo::default();
     assert!(info.node_id.is_empty());
     assert!(!info.online);
+}
+
+#[tokio::test]
+async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
+    // Mock control plane: registers the device, answers signal polls with an
+    // empty list, and counts every POST to /api/v1/signals.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let signal_posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let posts = signal_posts.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let posts = posts.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let is_signal_post =
+                    head.starts_with("POST") && head.contains("/api/v1/signals");
+                let is_device_post =
+                    head.starts_with("POST") && head.contains("/api/v1/devices");
+                if is_signal_post {
+                    posts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let body = if is_device_post {
+                    r#"{"success":true,"node_id":"node-a","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#
+                } else {
+                    r#"{"success":true,"signals":[],"server_time_ms":0}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut config = test_config();
+    config.control.server_url = format!("http://{address}");
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, mut rx) = ControlClient::new(&config, true, None, None);
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(ControlEvent::Registered { .. }) => break,
+                Some(_) => continue,
+                None => panic!("control channel closed before registration"),
+            }
+        }
+    })
+    .await
+    .expect("device registration must complete against the mock server");
+
+    // A fresh-mapping offer whose punch session was revoked must be skipped
+    // by the HTTP worker even though it is already queued.
+    let revoked = Arc::new(crate::PunchSessionCancellation::default());
+    revoked.cancel();
+    let result = client
+        .send_peer_offer_with_sources_and_punch_at(
+            "peer-b",
+            &["203.0.113.10:40001".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            Some(revoked),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "a revoked fresh offer must be skipped locally, not fail"
+    );
+    // Give the worker time to process the queue: it must never post.
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        signal_posts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a revoked fresh-mapping offer must never reach the wire"
+    );
+
+    // A live ownership reaches the wire exactly once.
+    let live = Arc::new(crate::PunchSessionCancellation::default());
+    let result = client
+        .send_peer_offer_with_sources_and_punch_at(
+            "peer-b",
+            &["203.0.113.10:40002".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            Some(live),
+        )
+        .await;
+    assert!(result.is_ok(), "a live fresh offer must be sent");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if signal_posts.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the live fresh offer must reach the wire");
+    assert_eq!(
+        signal_posts.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the live offer may be posted"
+    );
+
+    drop(client);
+    server.abort();
+}
+
+/// A malformed signal in a poll batch must never abort the whole batch: the
+/// server already deleted every delivered row, so aborting here would drop the
+/// healthy signals of the same poll together with the bad one.  The healthy
+/// signals must still reach the event loop and the poll must return Ok.
+#[tokio::test]
+async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
+    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut chunk = [0u8; 4096];
+        let mut buf = Vec::new();
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Two healthy signals sandwich one with a malformed handshake.
+        let body = serde_json::json!({
+            "signals": [
+                {
+                    "from_node_id": "peer-b",
+                    "type": "peer_offer",
+                    "candidates": ["203.0.113.10:40001"],
+                    "candidate_sources": {"203.0.113.10:40001": "stun_observed"},
+                    "handshake": "01020304",
+                    "punch_at_ms": 0
+                },
+                {
+                    "from_node_id": "peer-c",
+                    "type": "peer_offer",
+                    "candidates": ["203.0.113.10:40002"],
+                    "handshake": "zz-not-hex"
+                },
+                {
+                    "from_node_id": "peer-d",
+                    "type": "peer_offer",
+                    "candidates": ["203.0.113.10:40003"],
+                    "handshake": "01020305",
+                    "punch_at_ms": 0
+                }
+            ],
+            "server_time_ms": 0
+        });
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    });
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let result = poll_signals(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        "test-token",
+        "node-a",
+        &event_tx,
+        0,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a malformed signal must be skipped, not abort the poll: {result:?}"
+    );
+
+    // The two healthy signals arrive; the malformed one is dropped.
+    let mut offered = Vec::new();
+    for _ in 0..2 {
+        match timeout(Duration::from_secs(5), event_rx.recv()).await {
+            Ok(Some(ControlEvent::PeerOffer { from_node_id, .. })) => {
+                offered.push(from_node_id);
+            }
+            other => panic!("expected a healthy peer offer, got {other:?}"),
+        }
+    }
+    offered.sort();
+    assert_eq!(offered, vec!["peer-b".to_string(), "peer-d".to_string()]);
+    assert!(
+        event_rx.try_recv().is_err(),
+        "the malformed signal must not produce an event"
+    );
+
+    server.abort();
 }

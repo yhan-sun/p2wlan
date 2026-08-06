@@ -24,6 +24,8 @@ struct UdpDirectTaskContext {
     punch_deduplicator: PunchAttemptDeduplicator,
     udp_punch_interval: Duration,
     udp_punch_attempts: u32,
+    /// Daemon incarnation epoch embedded in fresh-prediction labels.
+    boot_epoch_ms: u64,
 }
 
 async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
@@ -53,6 +55,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
         punch_deduplicator,
         udp_punch_interval,
         udp_punch_attempts,
+        boot_epoch_ms,
     } = ctx;
 
     match UdpTransport::bind(udp_bind, peers.clone()).await {
@@ -218,6 +221,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                     local_candidate_sources: udp_local_candidate_sources.clone(),
                     stun_servers: stun_servers.clone(),
                     stun_timeout,
+                    boot_epoch_ms,
                 }),
             )
             .await;
@@ -245,6 +249,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         peers: peers.clone(),
                         probe_interval: udp_punch_interval,
                         punch_attempts: udp_punch_attempts,
+                        boot_epoch_ms,
                     }) => Ok(()),
                 }
             } else {
@@ -272,6 +277,7 @@ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
                         peers: peers.clone(),
                         probe_interval: udp_punch_interval,
                         punch_attempts: udp_punch_attempts,
+                        boot_epoch_ms,
                     }) => Ok(()),
                 }
             }

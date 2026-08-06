@@ -38,6 +38,7 @@ pub mod diagnostics;
 pub mod dns;
 pub mod error;
 pub mod gateway_mapping;
+pub mod incarnation;
 mod network_outbound;
 pub mod peer;
 pub mod port_mapping;
@@ -107,7 +108,7 @@ use p2pnet_wireguard::{
     TransportSession,
 };
 use peer::{
-    CandidateSetApplyResult, ConnectionState, PeerManager, ProbeBindingStage,
+    CandidateSetApplyResult, ConnectionState, DirectProbeTargetSet, PeerManager, ProbeBindingStage,
     DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT,
 };
 use port_mapping::PortMappingManager;
@@ -260,6 +261,70 @@ const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 /// Hard-NAT sweep can finish and record coverage instead of being cancelled
 /// mid-scan.
 const PUNCH_SESSION_HARD_DEADLINE: Duration = Duration::from_secs(24);
+
+/// Source label prefix that marks a genuinely fresh-mapping prediction signal.
+///
+/// The value carries the sender's persistent monotonic incarnation plus the
+/// per-peer punch generation, e.g. `predicted_fresh:1742987654321:39`.  The
+/// incarnation is a persisted counter (seeded from the wall clock only on the
+/// very first boot) that strictly increases per daemon restart, so ordering
+/// never depends on the wall clock: a clock rollback or a restart within the
+/// same millisecond still yields a strictly newer incarnation, and a new
+/// incarnation can replace an old one after a restart.  Ordinary ICE gathering
+/// also emits `predicted` candidates, so only this distinct label may preempt
+/// punch sessions; the embedded incarnation+generation lets the receiver
+/// reject a stale prediction that a superseded task managed to send late.
+pub(crate) const FRESH_PREDICTION_SOURCE_LABEL_PREFIX: &str = "predicted_fresh:";
+
+/// Reserved part of the 96-candidate signaling budget for the fresh-mapping
+/// prediction window.  The prediction is time-sensitive: it must not be
+/// crowded out by ordinary STUN/predicted candidates, and the sender order
+/// (top-1 first, then the successor window) must survive truncation intact.
+/// `MAX_PREDICTED_PORTS` bounds the window the model can produce, so a
+/// reservation of that size preserves every publishable window port.
+pub(crate) const MAX_SIGNAL_FRESH_WINDOW_CANDIDATES: usize =
+    p2pnet_nat::mapping::MAX_PREDICTED_PORTS;
+
+/// Identity of one fresh-mapping prediction: the sender's daemon incarnation
+/// (`boot_epoch`, a persistent strictly-monotonic counter seeded from the wall
+/// clock only on the first boot) plus the per-peer punch generation inside
+/// that incarnation.
+///
+/// Ordering is lexicographic: within one incarnation `generation` orders
+/// predictions, while a newer incarnation always supersedes an older one (even
+/// across a clock rollback or a same-millisecond restart), and once a new
+/// incarnation has been accepted, late signals from the old incarnation can
+/// never win again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FreshPredictionId {
+    pub boot_epoch: u64,
+    pub generation: u64,
+}
+
+/// Parse a candidate source label as a fresh-mapping prediction.
+///
+/// Malformed labels, a zero boot epoch and generation zero are all rejected
+/// (the candidate then degrades to an ordinary `predicted` candidate and can
+/// never claim fresh priority).  The strict two-part format prevents an old
+/// single-number label from being confused with a valid incarnation.
+pub(crate) fn parse_fresh_prediction_source_label(label: &str) -> Option<FreshPredictionId> {
+    let rest = label.strip_prefix(FRESH_PREDICTION_SOURCE_LABEL_PREFIX)?;
+    let (boot_epoch, generation) = rest.split_once(':')?;
+    let boot_epoch = boot_epoch.parse::<u64>().ok()?;
+    let generation = generation.parse::<u64>().ok()?;
+    (boot_epoch != 0 && generation != 0).then_some(FreshPredictionId {
+        boot_epoch,
+        generation,
+    })
+}
+
+/// Canonical wire label for one fresh-mapping prediction.
+pub(crate) fn fresh_prediction_source_label(id: FreshPredictionId) -> String {
+    format!(
+        "{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}{}:{}",
+        id.boot_epoch, id.generation
+    )
+}
 
 include!("lib/punch_dedup.rs");
 include!("lib/daemon/core.rs");

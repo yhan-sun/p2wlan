@@ -15,6 +15,8 @@ mod tests {
     use crate::config::Config;
     use crate::control::PeerInfo;
     use crate::peer::{ConnectionState, NetworkPath, ProbeBindingStage, ProbeKeyRole};
+    use crate::udp::UdpTransport;
+    use tokio::time::sleep;
 
     fn establish_sessions() -> (TransportSession, TransportSession) {
         let node_a = NodeIdentity::generate();
@@ -1140,7 +1142,7 @@ mod tests {
             let peers = peers.clone();
             async move {
                 transport
-                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), None)
                     .await
             }
         });
@@ -1150,6 +1152,7 @@ mod tests {
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
+socket_index: None,
                 wire_bytes,
             })
             .await
@@ -1261,7 +1264,7 @@ mod tests {
             let peers = peers.clone();
             async move {
                 transport
-                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), None)
                     .await
             }
         });
@@ -1272,6 +1275,7 @@ mod tests {
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
+socket_index: None,
                 wire_bytes,
             })
             .await
@@ -1323,7 +1327,7 @@ mod tests {
             let peers = peers.clone();
             async move {
                 transport
-                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), None)
                     .await
             }
         });
@@ -1334,6 +1338,7 @@ mod tests {
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
+socket_index: None,
                 wire_bytes,
             })
             .await
@@ -1383,7 +1388,7 @@ mod tests {
             let peers = peers.clone();
             async move {
                 transport
-                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers))
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), None)
                     .await
             }
         });
@@ -1394,6 +1399,7 @@ mod tests {
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("different-peer".to_string()),
+socket_index: None,
                 wire_bytes,
             })
             .await
@@ -1428,5 +1434,122 @@ mod tests {
 
         let inbound = transport.decrypt_inbound(&wire_bytes).await.unwrap();
         assert!(inbound.is_none());
+    }
+
+    #[tokio::test]
+    async fn adopts_affinity_socket_only_after_wireguard_decryption() {
+        // Raw encrypted UDP is never fresh affinity evidence: only a packet
+        // that decrypts successfully may pin its receiving socket for the
+        // peer.  Garbage (undecryptable) UDP must leave the affinity empty.
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: "peer-a-pubkey".to_string(),
+                endpoint: "127.0.0.1:51820".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let (udp_inbound_tx, _udp_inbound_rx) = mpsc::channel(4);
+        let udp = udp.with_inbound_channel(udp_inbound_tx);
+
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            let udp = udp.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), Some(udp))
+                    .await
+            }
+        });
+
+        // 1. Undecryptable datagram claiming the socket: no affinity pin.
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some("198.51.100.7:51820".parse().unwrap()),
+                local_endpoint: udp.local_addr().ok(),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                wire_bytes: vec![0xAB; 64],
+            })
+            .await
+            .unwrap();
+        // Give the worker a deterministic window to process the garbage.
+        sleep(Duration::from_millis(100)).await;
+        {
+            let pin = udp.affinity_pin_for_test("peer-a").await;
+            assert!(
+                pin.is_none(),
+                "undecryptable raw UDP must never pin affinity evidence"
+            );
+        }
+
+        // 2. A genuinely encrypted packet from the peer: after decryption the
+        // receiving socket becomes the peer's fresh affinity pin.
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x5151,
+            1,
+            b"affinity",
+        );
+        let wire_bytes = remote_session.encrypt_to_bytes(&packet).unwrap();
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some("198.51.100.7:51820".parse().unwrap()),
+                local_endpoint: udp.local_addr().ok(),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                wire_bytes,
+            })
+            .await
+            .unwrap();
+        let inbound = tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("decrypted packet must be emitted")
+            .expect("channel closed");
+        assert_eq!(inbound.peer_id, "peer-a");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pin = udp.affinity_pin_for_test("peer-a").await;
+                if pin.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("decryption success must adopt the receiving socket");
+        let pin = udp.affinity_pin_for_test("peer-a").await.unwrap();
+        assert_eq!(
+            pin.socket_index, 0,
+            "the affinity must point at the socket that carried the decrypted packet"
+        );
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
     }
 }

@@ -1038,11 +1038,13 @@ async fn probe_ack_pins_peer_to_the_socket_that_received_it() {
     timeout(Duration::from_secs(1), async {
         loop {
             if transport
-                .peer_socket_affinity
+                .socket_state
                 .lock()
                 .await
+                .affinity
                 .get("peer-b")
                 .copied()
+                .map(|pin| pin.socket_index)
                 == Some(1)
             {
                 break;

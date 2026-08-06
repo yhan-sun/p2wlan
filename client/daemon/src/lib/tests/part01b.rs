@@ -183,3 +183,109 @@ fn signal_candidate_cap_keeps_bounded_private_hosts_without_hardcoded_overlay_ra
     );
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
 }
+
+/// The full prepare pipeline (compact then truncate) must never delete a
+/// fresh-mapping prediction port before the truncate stage can reserve it:
+/// 96 ordinary volatile candidates on the same public IP plus the complete
+/// 24-port fresh window must end with every fresh port preserved, in sender
+/// order (top-1 first), inside the 96-candidate signaling budget.
+#[test]
+fn fresh_window_survives_full_prepare_pipeline_alongside_96_ordinary_volatile() {
+    let fresh_id = crate::FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 7,
+    };
+    let fresh_label = crate::fresh_prediction_source_label(fresh_id);
+    let mut candidates = Vec::new();
+    let mut sources = HashMap::new();
+
+    // 96 ordinary volatile public candidates, all on the same public IP.
+    for index in 0..MAX_SIGNAL_CANDIDATES {
+        let endpoint = format!("8.8.8.8:{}", 41000 + index);
+        candidates.push(endpoint.clone());
+        sources.insert(endpoint, "stun_observed".to_string());
+    }
+    // The complete 24-port fresh prediction window, sender order preserved:
+    // the first entry is the model's top-1 prediction.
+    let fresh_ports = (44_000..44_000 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
+        .map(|port| port as u16);
+    let mut fresh_endpoints = Vec::new();
+    for port in fresh_ports {
+        let endpoint = format!("8.8.8.8:{port}");
+        fresh_endpoints.push(endpoint.clone());
+        candidates.push(endpoint.clone());
+        sources.insert(endpoint, fresh_label.clone());
+    }
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+
+    // Run the whole prepare pipeline exactly like the runtime refresh path.
+    let identity = prepare_signal_candidates_and_network_identity(
+        &[],
+        &HashMap::new(),
+        &mut candidates,
+        &mut sources,
+    );
+    assert!(!identity.is_empty());
+
+    // Every fresh window port survives, in the sender's original order.
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|endpoint| fresh_endpoints.contains(endpoint))
+            .cloned()
+            .collect::<Vec<_>>(),
+        fresh_endpoints,
+        "the fresh window must survive compact+truncate in sender order"
+    );
+    // The final set fits the wire budget.
+    assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
+    assert!(candidates.len() > MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+    // Sources stay consistent with the surviving set.
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+    assert!(fresh_endpoints
+        .iter()
+        .all(|endpoint| sources.get(endpoint).is_some_and(|source| source == &fresh_label)));
+}
+
+/// Compact must reserve the fresh window per public IP too: when ordinary
+/// volatile candidates of the same IP would crowd the per-IP truncation
+/// budget, fresh prediction ports are exempt and survive into the truncate
+/// stage's reservation.
+#[test]
+fn compact_never_truncates_fresh_window_ports_before_reservation() {
+    let fresh_id = crate::FreshPredictionId {
+        boot_epoch: 1_742_987_654_322,
+        generation: 3,
+    };
+    let fresh_label = crate::fresh_prediction_source_label(fresh_id);
+    let mut candidates = Vec::new();
+    let mut sources = HashMap::new();
+    // 150 ordinary volatile candidates on one public IP (would overflow the
+    // per-IP budget on their own) plus 24 fresh ports on the same IP.
+    for index in 0..150 {
+        let endpoint = format!("1.1.1.1:{}", 50000 + index);
+        candidates.push(endpoint.clone());
+        sources.insert(endpoint, "predicted".to_string());
+    }
+    let mut fresh_endpoints = Vec::new();
+    for index in 0..MAX_SIGNAL_FRESH_WINDOW_CANDIDATES {
+        let endpoint = format!("1.1.1.1:{}", 45500 + index);
+        fresh_endpoints.push(endpoint.clone());
+        candidates.push(endpoint.clone());
+        sources.insert(endpoint, fresh_label.clone());
+    }
+
+    compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|endpoint| fresh_endpoints.contains(endpoint))
+            .cloned()
+            .collect::<Vec<_>>(),
+        fresh_endpoints
+    );
+    assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
+    assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
+}

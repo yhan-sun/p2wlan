@@ -17,6 +17,7 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) peers: Arc<PeerManager>,
     pub(super) probe_interval: Duration,
     pub(super) punch_attempts: u32,
+    pub(super) boot_epoch_ms: u64,
 }
 
 pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
@@ -39,6 +40,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         peers,
         probe_interval,
         punch_attempts,
+        boot_epoch_ms,
     } = context;
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
     ticker.tick().await;
@@ -191,6 +193,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     local_candidate_sources: local_candidate_sources.clone(),
                     stun_servers: stun_servers.clone(),
                     stun_timeout,
+                    boot_epoch_ms,
                 }),
             )
             .await;
@@ -218,6 +221,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 local_candidate_sources: local_candidate_sources.clone(),
                 stun_servers: stun_servers.clone(),
                 stun_timeout,
+                boot_epoch_ms,
             }),
         )
         .await;
@@ -256,6 +260,7 @@ pub(super) async fn publish_local_candidates_to_known_peers(
                 candidate_sources,
                 &[],
                 punch_at_ms,
+                None,
             )
             .await
         {
@@ -275,6 +280,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
             attempts,
             punch_at_ms,
             signal.clone(),
+            None,
+            None,
         )
         .await;
     }

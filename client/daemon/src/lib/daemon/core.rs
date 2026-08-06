@@ -60,6 +60,13 @@ pub struct Daemon {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Shutdown signal receiver cloned into background tasks.
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Persistent monotonic daemon incarnation.  Fresh-mapping prediction
+    /// labels embed this as the incarnation epoch (`predicted_fresh:<boot>:<gen>`)
+    /// and candidate generations embed it in their high bits: a restarted
+    /// daemon always supersedes every generation an older incarnation sent,
+    /// regardless of wall-clock rollback or a restart within the same
+    /// millisecond, and old incarnations' late signals can never win again.
+    boot_epoch_ms: u64,
 }
 
 impl Daemon {
@@ -81,6 +88,24 @@ impl Daemon {
         let health = tasks::HealthState::new();
         let task_manager = tasks::TaskManager::new(health.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // The fresh-mapping prediction incarnation epoch: a persistent
+        // strictly-monotonic counter (seeded from the wall clock only on the
+        // very first boot).  A restarted daemon's label supersedes every label
+        // an older incarnation sent even when the wall clock rolled back or
+        // the restart landed within the same millisecond, and the receiver's
+        // high-water keeps older incarnations' late signals out.
+        //
+        // Zero means no trustworthy incarnation exists for this boot (missing
+        // config path, corrupt or unreadable state file, version mismatch,
+        // unwritable state directory, or the counter exhausted): fresh-mapping
+        // prediction is disabled rather than silently re-seeded from the wall
+        // clock, which could regress below the high-water receivers recorded.
+        let boot_epoch_ms = crate::incarnation::next_boot_incarnation(&config).unwrap_or(0);
+        if boot_epoch_ms == 0 {
+            warn!(
+                "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation); ordinary punching continues"
+            );
+        }
 
         Self {
             config: Arc::new(config.clone()),
@@ -118,6 +143,7 @@ impl Daemon {
             task_manager,
             shutdown_tx,
             shutdown_rx,
+            boot_epoch_ms,
         }
     }
 

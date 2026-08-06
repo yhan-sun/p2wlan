@@ -17,8 +17,13 @@ pub(super) async fn send_signal(
 ) -> Result<()> {
     // Keep the revision and expiry derived from one instant: a candidate set
     // must have a coherent lifetime even if the wall clock is adjusted while
-    // this request is being assembled.
-    let candidate_generation = next_candidate_generation();
+    // this request is being assembled.  A refused generation (incarnation or
+    // per-boot counter exhausted) fails the whole signal instead of sending a
+    // wrapped value receivers would judge stale.
+    let candidate_generation = next_candidate_generation().map_err(|error| {
+        warn!("{error}; dropping this candidate signal");
+        DaemonError::ControlPlane(error.to_string())
+    })?;
     let client_time_ms = unix_time_millis();
     let candidates_expires_at_ms = client_time_ms.saturating_add(45_000);
     let probe_ephemeral_signature = sign_probe_ephemeral_transcript(
@@ -141,16 +146,37 @@ pub(super) async fn poll_signals(
             server_time_ms,
             received_at_ms,
         );
+        // One malformed signal must never abort the batch: the server already
+        // deleted every delivered row from its queue, so aborting here would
+        // drop the healthy signals of the same poll together with the bad one.
         let handshake = if signal.handshake.trim().is_empty() {
             Vec::new()
+        } else if signal.handshake.trim().len() % 2 != 0 {
+            warn!(
+                "Skipping signal from {} type={}: handshake hex has an odd length",
+                signal.from_node_id, signal.signal_type
+            );
+            continue;
         } else {
-            hex::decode(signal.handshake.trim()).map_err(|e| {
-                DaemonError::ControlPlane(format!("signal handshake hex decode failed: {e}"))
-            })?
+            match hex::decode(signal.handshake.trim()) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    warn!(
+                        "Skipping signal from {} type={}: handshake hex decode failed: {error}",
+                        signal.from_node_id, signal.signal_type
+                    );
+                    continue;
+                }
+            }
         };
 
         match signal.signal_type.as_str() {
-            "peer_offer" => {
+            // `peer_offer_fresh` is the independent queue key for fresh-mapping
+            // prediction advertisements: it is delivered in send order and an
+            // ordinary `peer_offer` can never overwrite it server-side.  The
+            // event handler re-verifies the fresh label and the per-peer
+            // high-water before applying anything.
+            "peer_offer" | "peer_offer_fresh" => {
                 let _ = event_tx.send(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
@@ -235,17 +261,119 @@ pub(super) fn normalize_signal_candidate_expiry(
     })
 }
 
-pub(super) fn next_candidate_generation() -> u64 {
+/// Marker bit that separates incarnation-encoded candidate generations (this
+/// release and later) from the legacy wall-clock generations older releases
+/// sent.  All incarnation-encoded values live above 2^62 while every legacy
+/// wall-clock value fits far below it, so after an upgrade the first
+/// incarnation-encoded generation always supersedes the highest legacy value a
+/// receiver has seen, and a rolled-back clock can never reintroduce an older
+/// number.  The value stays below i64::MAX so JSON/Go int64 handling is safe.
+pub(super) const CANDIDATE_GENERATION_INCARNATION_FLAG: u64 = 0x4000_0000_0000_0000;
+/// Incarnation occupies the 41 bits below the flag, the per-boot counter the
+/// low 21 bits.  The incarnation field must be wide enough to hold the
+/// persisted incarnation without truncation: the old 31-bit field wrapped
+/// every 2^31 ms (~24.86 days), so a restart shortly after a wrap produced an
+/// encoded incarnation that receivers judged stale (a receiver compares the
+/// full value, so a truncated high half silently reorders boots).  41 bits
+/// holds the wall-clock-seeded counter until year ~2039; beyond that the
+/// generation is refused instead of wrapping (see
+/// [`next_candidate_generation_value`]).
+pub(super) const CANDIDATE_GENERATION_INCARNATION_BITS: u64 = 41;
+/// Counter field width in bits: 2^21 generations per boot before the limit is
+/// reached and further generations are refused.
+pub(super) const CANDIDATE_GENERATION_COUNTER_BITS: u64 = 63 - 1 - CANDIDATE_GENERATION_INCARNATION_BITS;
+pub(super) const CANDIDATE_GENERATION_COUNTER_MASK: u64 = (1u64 << CANDIDATE_GENERATION_COUNTER_BITS) - 1;
+
+/// Why no candidate generation could be produced for this signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CandidateGenerationError {
+    /// The persisted incarnation no longer fits the encoding field: refusing
+    /// to mask it would let a wrapped incarnation reorder boots at the
+    /// receiver.
+    IncarnationExhausted(u64),
+    /// The per-boot generation counter reached its field limit: refusing to
+    /// wrap keeps every generation strictly newer than its predecessors.
+    CounterExhausted(u64),
+}
+
+impl std::fmt::Display for CandidateGenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncarnationExhausted(incarnation) => write!(
+                f,
+                "candidate generation exhausted: the daemon incarnation {incarnation} no longer fits the {CANDIDATE_GENERATION_INCARNATION_BITS}-bit encoding field (refusing to mask and wrap)"
+            ),
+            Self::CounterExhausted(counter) => write!(
+                f,
+                "candidate generation exhausted: the per-boot generation counter reached {counter} and cannot advance without wrapping"
+            ),
+        }
+    }
+}
+
+pub(super) fn next_candidate_generation() -> std::result::Result<u64, CandidateGenerationError> {
     loop {
         let previous = LAST_CANDIDATE_GENERATION.load(Ordering::Relaxed);
-        let next = unix_time_millis().max(previous.saturating_add(1));
+        let next = next_candidate_generation_value(previous)?;
         if LAST_CANDIDATE_GENERATION
             .compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            return next;
+            return Ok(next);
         }
     }
+}
+
+/// Pure next-generation rule: the persistent incarnation dominates the high
+/// bits, the low bits keep a strictly increasing per-boot counter, and the
+/// wall clock only seeds the first value of a boot (clock rollback is already
+/// absorbed by `max(previous + 1, ...)`).
+///
+/// Both fields refuse to wrap instead of masking: an encoded generation that
+/// wraps the incarnation would let an old boot outrank a newer one at the
+/// receiver, and a wrapped counter would collide with an older generation of
+/// the same boot.
+pub(super) fn next_candidate_generation_value(
+    previous: u64,
+) -> std::result::Result<u64, CandidateGenerationError> {
+    next_candidate_generation_for_incarnation(crate::incarnation::local_incarnation(), previous)
+}
+
+/// Pure rule with an explicit incarnation, so tests never depend on the
+/// process-global incarnation.
+pub(super) fn next_candidate_generation_for_incarnation(
+    incarnation: u64,
+    previous: u64,
+) -> std::result::Result<u64, CandidateGenerationError> {
+    if incarnation == 0 {
+        // No trustworthy persistent incarnation exists for this boot (missing
+        // config path, corrupt/unreadable state, version mismatch, or the
+        // counter exhausted).  The generation MUST NOT silently encode
+        // incarnation=0 under the flag: a flagged value with a zero
+        // incarnation field is lower than every real incarnation-encoded
+        // value, so a receiver whose high-water already saw one would judge
+        // this boot's ordinary candidates stale forever.  Instead the
+        // ordinary candidates carry generation 0 — the legacy "no ordering
+        // metadata" value that the receiver's stale check never rejects
+        // (`candidate_generation != 0` gates the comparison).  Fresh
+        // prediction is disabled for such a boot anyway, so the ordering the
+        // generation would provide is not needed.
+        return Ok(0);
+    }
+    let incarnation_max = (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1;
+    if incarnation > incarnation_max {
+        return Err(CandidateGenerationError::IncarnationExhausted(incarnation));
+    }
+    let previous_counter = previous & CANDIDATE_GENERATION_COUNTER_MASK;
+    if previous_counter >= CANDIDATE_GENERATION_COUNTER_MASK {
+        return Err(CandidateGenerationError::CounterExhausted(previous_counter));
+    }
+    let counter = (unix_time_millis() & CANDIDATE_GENERATION_COUNTER_MASK)
+        .max(previous_counter.saturating_add(1))
+        .min(CANDIDATE_GENERATION_COUNTER_MASK);
+    Ok(CANDIDATE_GENERATION_INCARNATION_FLAG
+        | (incarnation << CANDIDATE_GENERATION_COUNTER_BITS)
+        | counter)
 }
 
 fn unix_time_millis() -> u64 {
