@@ -1369,6 +1369,63 @@ async fn peer_reflexive_worker_cap_retains_coalesced_peers() {
     drop(next_permit);
 }
 
+/// A UDP replacement may be published while a retired peer-reflexive worker
+/// still owns the last daemon-wide permit. The replacement must remain
+/// queued below that same cap, then wake and claim capacity as soon as the
+/// retired worker releases it without requiring another endpoint observation.
+#[tokio::test]
+async fn peer_reflexive_worker_cap_survives_udp_transport_replacement() {
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let retired_slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
+    enqueue_peer_reflexive_signal_observation(
+        &retired_slots,
+        PeerReflexiveObservation {
+            peer_id: "node-retired".to_string(),
+            observed_endpoint: "127.0.0.1:45451".parse().unwrap(),
+        },
+    )
+    .await;
+    let (retired_peer, retired_permit) =
+        claim_pending_peer_reflexive_signal_worker(&retired_slots, &permits)
+            .await
+            .expect("the retired UDP instance must claim the only worker permit");
+    assert_eq!(retired_peer, "node-retired");
+
+    let replacement_slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
+    enqueue_peer_reflexive_signal_observation(
+        &replacement_slots,
+        PeerReflexiveObservation {
+            peer_id: "node-replacement".to_string(),
+            observed_endpoint: "127.0.0.1:45452".parse().unwrap(),
+        },
+    )
+    .await;
+    let replacement_work = Arc::new(tokio::sync::Notify::new());
+    let replacement_wait = wait_for_pending_peer_reflexive_signal_worker(
+        &replacement_slots,
+        &replacement_work,
+        &permits,
+    );
+    tokio::pin!(replacement_wait);
+
+    assert!(
+        timeout(Duration::from_millis(100), replacement_wait.as_mut())
+            .await
+            .is_err(),
+        "the replacement instance must not exceed the retired instance's worker cap"
+    );
+    assert_eq!(permits.available_permits(), 0);
+
+    drop(retired_permit);
+    let (replacement_peer, replacement_permit) =
+        timeout(Duration::from_secs(1), replacement_wait.as_mut())
+            .await
+            .expect("the replacement waiter must wake when the retired permit is released")
+            .expect("the replacement endpoint must still be queued");
+    assert_eq!(replacement_peer, "node-replacement");
+    drop(replacement_permit);
+}
+
 #[tokio::test]
 async fn peer_reflexive_slot_keeps_newest_endpoint_during_rate_limit_backoff() {
     let slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
