@@ -54,7 +54,11 @@ jobs:
         # path (incarnation persistence) and the full signal/lease flow on
         # Windows; desktop/TUN crates are excluded because Windows builds of
         # the TUN dataplane need admin privileges for packet tests.
-        run: cargo test -p p2wlan-daemon --lib -p p2pnet-nat --lib
+        run: |
+          cargo test -p p2wlan-daemon --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p p2pnet-nat --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   go:
     name: Go Check

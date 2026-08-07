@@ -569,6 +569,17 @@ mod tests {
         // as state loss (see `missing_file_with_existing_lock_is_state_loss`).
         fs::remove_file(dir.join(INCARNATION_FILE_NAME)).unwrap();
         fs::remove_file(dir.join(INCARNATION_LOCK_FILE_NAME)).unwrap();
+        // A first boot is seeded from the wall clock. On a fast CI host both
+        // calls can otherwise land in the same millisecond, which cannot
+        // demonstrate the intended "later persisted state" property.
+        let wait_started = std::time::Instant::now();
+        while now_ms() <= first {
+            assert!(
+                wait_started.elapsed() < std::time::Duration::from_secs(1),
+                "wall clock did not advance beyond the original incarnation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let reseeded = next_boot_incarnation(&config).unwrap();
         assert!(reseeded > first);
         let _ = fs::remove_dir_all(&dir);
