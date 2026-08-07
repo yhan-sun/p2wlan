@@ -806,14 +806,27 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
     let (inbound_tx, _inbound_rx) = mpsc::channel(4);
     let inbound_worker = tokio::spawn(transport.clone().run_inbound(inbound_tx));
 
+    // Keep each socket's two observations adjacent so the candidate gatherer
+    // exercises prediction, but put pairs far enough apart that platforms
+    // which allocate consecutive UDP source ports cannot make distinct pool
+    // mappings collide after candidate de-duplication.
+    let mapped_ports = Arc::new(std::sync::Mutex::new(HashMap::<SocketAddr, u16>::new()));
     let first_stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let first_stun_addr = first_stun.local_addr().unwrap();
+    let first_mapped_ports = mapped_ports.clone();
     let first_worker = tokio::spawn(async move {
         for _ in 0..3 {
             let mut buf = [0u8; 2048];
             let (n, client_addr) = first_stun.recv_from(&mut buf).await.unwrap();
             let request = StunMessage::decode(&buf[..n]).unwrap();
-            let mapped = SocketAddr::new("203.0.113.7".parse().unwrap(), client_addr.port());
+            let mapped_port = {
+                let mut mapped_ports = first_mapped_ports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let next_port = 40_000u16 + mapped_ports.len() as u16 * 16;
+                *mapped_ports.entry(client_addr).or_insert(next_port)
+            };
+            let mapped = SocketAddr::new("203.0.113.7".parse().unwrap(), mapped_port);
             let mut response =
                 StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
             response.add_attribute(StunAttribute::XorMappedAddress(mapped));
@@ -826,14 +839,25 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
 
     let second_stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let second_stun_addr = second_stun.local_addr().unwrap();
+    let second_mapped_ports = mapped_ports;
     let second_worker = tokio::spawn(async move {
         for _ in 0..3 {
             let mut buf = [0u8; 2048];
             let (n, client_addr) = second_stun.recv_from(&mut buf).await.unwrap();
             let request = StunMessage::decode(&buf[..n]).unwrap();
+            let mapped_port = {
+                let mut mapped_ports = second_mapped_ports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let next_port = 40_000u16 + mapped_ports.len() as u16 * 16;
+                mapped_ports
+                    .entry(client_addr)
+                    .or_insert(next_port)
+                    .saturating_add(1)
+            };
             let mapped = SocketAddr::new(
                 "203.0.113.7".parse().unwrap(),
-                client_addr.port().saturating_add(1),
+                mapped_port,
             );
             let mut response =
                 StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);

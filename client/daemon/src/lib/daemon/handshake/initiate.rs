@@ -127,13 +127,38 @@ impl Daemon {
         // Candidate gathering may wait on a live STUN fan-out.  Keep the
         // owner reservation, but never keep the per-peer arbiter across it.
         drop(handshake_guard);
-        let (candidates, candidate_sources) = tokio::select! {
-            candidates = self.local_candidate_set_for_signal("handshake offer") => candidates,
-            changed = reservation.cancellation.changed() => {
-                if changed.is_err() || *reservation.cancellation.borrow() {
-                    return Ok(None);
+        let (candidates, candidate_sources) = {
+            let snapshot = self.cached_local_candidate_set().await;
+            if snapshot.0.is_empty() {
+                tokio::select! {
+                    candidates = self.local_candidate_set_for_signal("handshake offer") => candidates,
+                    changed = reservation.cancellation.changed() => {
+                        if changed.is_err() || *reservation.cancellation.borrow() {
+                            return Ok(None);
+                        }
+                        return Ok(None);
+                    }
                 }
-                return Ok(None);
+            } else {
+                // A usable cached set already exists.  Refresh only within a
+                // short budget; a slow STUN/prediction gather must never
+                // delay the offer's rendezvous window.
+                match tokio::time::timeout(
+                    Duration::from_millis(HANDSHAKE_OFFER_REFRESH_BUDGET_MS),
+                    async {
+                        let udp = self.udp_transport.read().await.clone()?;
+                        self.refresh_local_candidates_for_imminent_signal(
+                            &udp,
+                            "handshake offer",
+                        )
+                        .await
+                    },
+                )
+                .await
+                {
+                    Ok(Some(refreshed)) => refreshed,
+                    _ => snapshot,
+                }
             }
         };
         if *reservation.cancellation.borrow() {

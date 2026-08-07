@@ -15,6 +15,41 @@ pub(super) async fn send_signal(
     probe_ephemeral_public_key: Option<&str>,
     signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<()> {
+    let payload = prepare_signal_payload(
+        from_node_id,
+        to_node_id,
+        signal_type,
+        candidates,
+        candidate_sources,
+        handshake,
+        punch_at_ms,
+        punch_at_server_ms,
+        session_id,
+        probe_ephemeral_public_key,
+        signing_identity,
+    )?;
+    send_prepared_signal(http, base_url, token, &payload).await
+}
+
+/// Build one immutable signal body.
+///
+/// Critical handshake delivery retries this exact value. In particular, the
+/// candidate generation, expiry, Probe signature, session id, and WireGuard
+/// bytes must not change between delivery-ambiguous attempts.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_signal_payload(
+    from_node_id: &str,
+    to_node_id: &str,
+    signal_type: &str,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+    handshake: &[u8],
+    punch_at_ms: Option<u64>,
+    punch_at_server_ms: Option<u64>,
+    session_id: Option<&str>,
+    probe_ephemeral_public_key: Option<&str>,
+    signing_identity: Option<&SignalSigningIdentity>,
+) -> Result<serde_json::Value> {
     // Keep the revision and expiry derived from one instant: a candidate set
     // must have a coherent lifetime even if the wall clock is adjusted while
     // this request is being assembled.  A refused generation (incarnation or
@@ -36,27 +71,37 @@ pub(super) async fn send_signal(
         candidate_generation,
         candidates_expires_at_ms,
     );
+    Ok(serde_json::json!({
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "type": signal_type,
+        "protocol_version": SIGNAL_REST_PROTOCOL_VERSION,
+        "candidates": candidates,
+        "candidate_sources": candidate_sources,
+        "candidate_generation": candidate_generation,
+        "candidates_expires_at_ms": candidates_expires_at_ms,
+        "session_id": session_id,
+        "probe_ephemeral_public_key": probe_ephemeral_public_key,
+        "probe_ephemeral_signature": probe_ephemeral_signature,
+        "handshake": hex::encode(handshake),
+        "punch_at_ms": punch_at_ms,
+        "punch_at_server_ms": punch_at_server_ms,
+        "client_time_ms": client_time_ms,
+    }))
+}
+
+/// Send a signal body that was prepared once by its owning handshake.
+pub(super) async fn send_prepared_signal(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
     let res = http
         .post(format!("{base_url}/api/v1/signals"))
         .timeout(SIGNAL_SEND_TIMEOUT)
         .bearer_auth(token)
-        .json(&serde_json::json!({
-            "from_node_id": from_node_id,
-            "to_node_id": to_node_id,
-            "type": signal_type,
-            "protocol_version": SIGNAL_REST_PROTOCOL_VERSION,
-            "candidates": candidates,
-            "candidate_sources": candidate_sources,
-            "candidate_generation": candidate_generation,
-            "candidates_expires_at_ms": candidates_expires_at_ms,
-            "session_id": session_id,
-            "probe_ephemeral_public_key": probe_ephemeral_public_key,
-            "probe_ephemeral_signature": probe_ephemeral_signature,
-            "handshake": hex::encode(handshake),
-            "punch_at_ms": punch_at_ms,
-            "punch_at_server_ms": punch_at_server_ms,
-            "client_time_ms": client_time_ms,
-        }))
+        .json(payload)
         .send()
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("send signal request failed: {e}")))?;

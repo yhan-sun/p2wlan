@@ -1090,6 +1090,10 @@ impl Daemon {
                     // existing per-peer owner and replay it once registration
                     // becomes visible.
                     if self.peers.get_connection(&from_node_id).await.is_none() {
+                        // Wake the peer poll immediately: the regular cadence
+                        // can be seconds away and a cold-start handshake must
+                        // not wait it out.
+                        self.control.refresh_peers_now();
                         self.peers
                             .record_direct_event(
                                 &from_node_id,
@@ -1278,6 +1282,13 @@ impl Daemon {
                         from_node_id,
                         candidates.len()
                     );
+                    // An answer may arrive before the peer-list poll registers
+                    // its sender: wake the peer poll so the pending initiator
+                    // transaction can be consumed without waiting out the
+                    // regular cadence.
+                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                        self.control.refresh_peers_now();
+                    }
                     self.peers
                         .record_direct_event(
                             &from_node_id,
@@ -1370,6 +1381,12 @@ impl Daemon {
                     observed_endpoint,
                     punch_at_ms,
                 } => {
+                    // A peer-reflexive observation may arrive before the
+                    // peer-list poll registers the sender; wake the poll so a
+                    // cold-start handshake is not delayed by the cadence.
+                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                        self.control.refresh_peers_now();
+                    }
                     let work = PendingPeerReflexive {
                         from_node_id: from_node_id.clone(),
                         observed_endpoint,

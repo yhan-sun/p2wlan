@@ -1,4 +1,23 @@
 match cmd {
+                        ControlCommand::PollPeersNow => {
+                            // A signal arrived from a peer that the daemon has
+                            // not registered yet: bring the peer list current
+                            // immediately instead of waiting out the regular
+                            // poll cadence, then re-arm the regular tick so
+                            // this does not create a poll burst.
+                            peer_tick.reset();
+                            let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
+                            match &poll_result {
+                                Ok(_) => {
+                                    poll_failures = 0;
+                                    let _ = event_tx.send(ControlEvent::ControlHealthy);
+                                }
+                                Err(err) => {
+                                    warn!("Immediate peer polling failed: {err}");
+                                    poll_failures = poll_failures.saturating_add(1);
+                                }
+                            }
+                        }
                         ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
                             let res = create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await;
                             match res {
@@ -89,20 +108,6 @@ match cmd {
                                 }
                             };
                             let _ = response_tx.send(outcome);
-                        }
-                        ControlCommand::SendPeerAnswer { to_node_id, candidates, session_id, probe_ephemeral_public_key, candidate_sources, handshake_response, punch_at_ms, punch_at_server_ms, response_tx } => {
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_answer", &candidates, &candidate_sources, &handshake_response, punch_at_ms, punch_at_server_ms, session_id.as_deref(), probe_ephemeral_public_key.as_deref(), signal_signing_identity.as_ref()).await;
-                            match &res {
-                                Ok(()) => { debug!("Sent peer answer to {to_node_id} punch_at_ms={punch_at_ms:?}"); }
-                                Err(err) => {
-                                    let err_str = err.to_string();
-                                    let _ = event_tx.send(ControlEvent::ServerError { code: 4001, message: err_str.clone() });
-                                    if is_permanent_auth_error(&err_str) {
-                                        break;
-                                    }
-                                }
-                            }
-                            let _ = response_tx.send(res);
                         }
                         ControlCommand::SendPeerReflexive { to_node_id, observed_endpoint, punch_at_ms, response_tx } => {
                             let candidates = vec![observed_endpoint.clone()];

@@ -296,16 +296,6 @@ async fn run_udp_direct_instance(
                 }
             }
 
-            if upnp_enabled {
-                maybe_add_port_mapping_udp_candidate(
-                    udp.local_addr().ok(),
-                    &mut candidate_endpoints,
-                    &mut candidate_sources,
-                    gateway_mapping_runtime.clone(),
-                    gateway_mapping_diagnostics.clone(),
-                )
-                .await;
-            }
             let initial_network_identity = prepare_signal_candidates_and_network_identity(
                 &[],
                 &HashMap::new(),
@@ -313,24 +303,76 @@ async fn run_udp_direct_instance(
                 &mut candidate_sources,
             );
             *local_network_identity.write().await = initial_network_identity;
-            let mut published_endpoint = None;
-            if let Some(endpoint) = control_udp_endpoint_from_candidates(
-                &candidate_endpoints,
-                &candidate_sources,
-            ) {
-                if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
-                    warn!("Failed to queue UDP endpoint update '{endpoint}': {err}");
-                } else {
-                    published_endpoint = Some(endpoint);
-                }
-            }
-
+            // Commit the candidate snapshot BEFORE the endpoint publish and
+            // any gateway-mapping discovery.  A congested control lane or a
+            // silent SSDP gateway must never delay the local candidate commit
+            // (which every responder answer reads).
             info!(
                 "Prepared {} UDP candidate endpoints for signaling",
                 candidate_endpoints.len()
             );
             *local_candidates.write().await = candidate_endpoints.clone();
             *udp_local_candidate_sources.write().await = candidate_sources.clone();
+            if upnp_enabled {
+                // Gateway mapping discovery (SSDP/IGD/PCP/NAT-PMP) can take
+                // seconds on gateways without a mapping service.  It must
+                // never block the commit or hold the refresh lock; run it as
+                // bounded best-effort background work and fold any discovered
+                // candidate back into the committed set.
+                let local_addr = udp.local_addr().ok();
+                let local_candidates = local_candidates.clone();
+                let local_sources = udp_local_candidate_sources.clone();
+                let runtime = gateway_mapping_runtime.clone();
+                let diagnostics = gateway_mapping_diagnostics.clone();
+                tokio::spawn(async move {
+                    let mut discovered = Vec::new();
+                    let mut discovered_sources = HashMap::new();
+                    maybe_add_port_mapping_udp_candidate(
+                        local_addr,
+                        &mut discovered,
+                        &mut discovered_sources,
+                        runtime,
+                        diagnostics,
+                    )
+                    .await;
+                    if discovered.is_empty() {
+                        return;
+                    }
+                    let mut candidates = local_candidates.write().await;
+                    let mut sources = local_sources.write().await;
+                    for endpoint in discovered {
+                        if !candidates.contains(&endpoint) {
+                            candidates.push(endpoint.clone());
+                        }
+                        if let Some(source) = discovered_sources.get(&endpoint) {
+                            sources.insert(endpoint, source.clone());
+                        }
+                    }
+                });
+            }
+            let mut published_endpoint = None;
+            if let Some(endpoint) = control_udp_endpoint_from_candidates(
+                &candidate_endpoints,
+                &candidate_sources,
+            ) {
+                // The handshake control lane has its own bounded deadline; a
+                // short caller budget keeps a pathological lane from stalling
+                // transport startup.
+                match tokio::time::timeout(
+                    Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
+                    control.update_endpoint_for_handshake(&endpoint, "unknown"),
+                )
+                .await
+                {
+                    Ok(Ok(())) => published_endpoint = Some(endpoint),
+                    Ok(Err(err)) => {
+                        warn!("Failed to publish initial UDP endpoint '{endpoint}': {err}")
+                    }
+                    Err(_) => {
+                        warn!("Initial UDP endpoint publish '{endpoint}' exceeded its budget")
+                    }
+                }
+            }
             drop(initial_refresh_guard);
 
             publish_local_candidates_to_known_peers(

@@ -2847,25 +2847,22 @@ async fn attach_dropped_while_waiting_for_socket_lock_leaks_nothing() {
     );
     // The reader must be GONE: it held the last Arc of the socket (the map
     // entry never existed), so a reader still parked in `recv_from` would
-    // keep the socket bound forever.  A connected UDP probe to a closed port
-    // gets ICMP connection-refused: the first send succeeds (the ICMP lands
-    // asynchronously) and the SECOND send must fail.  If a leaked reader
-    // were still bound, both sends would succeed and this assertion fires.
-    let probe = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    probe.connect(local_addr).await.unwrap();
-    let first = probe.send(b"ping").await;
-    sleep(Duration::from_millis(50)).await;
-    let second = probe.send(b"ping").await;
-    assert!(
-        first.is_ok(),
-        "the first probe must be sendable regardless of the reader state"
-    );
-    assert!(
-        second.is_err(),
-        "the socket must be closed (no leaked reader keeps it bound): first send {first:?}, second send {second:?}"
-    );
-    // No reader exists: nothing answers, and nothing panics.
-    sleep(Duration::from_millis(100)).await;
+    // keep the socket bound forever.  Rebinding the exact local endpoint is
+    // portable; unlike a connected UDP send it does not depend on whether an
+    // OS reports an asynchronous ICMP connection-refused error.
+    let _rebound = timeout(Duration::from_secs(2), async {
+        loop {
+            match UdpSocket::bind(local_addr).await {
+                Ok(socket) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("failed to rebind {local_addr} after dropped attach: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("a dropped attach must release its bound UDP socket");
 }
 
 /// Aborting the attach task AFTER the map insert (while it awaits the

@@ -446,14 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn unwritable_dir_disables_instead_of_reseeding() {
-        let dir = isolate("unwritable");
-        let config_dir = dir.join("ro-config");
-        fs::create_dir_all(&config_dir).unwrap();
-        let mut permissions = fs::metadata(&config_dir).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&config_dir, permissions).unwrap();
-        let config = temp_config(Some(config_dir.join("config.json")));
+    fn unavailable_state_parent_disables_instead_of_reseeding() {
+        let dir = isolate("unavailable-parent");
+        // Windows' read-only directory attribute does not prevent the owner
+        // from creating files. A regular file as the config parent makes the
+        // lock path unavailable on every supported platform.
+        let config_parent = dir.join("not-a-directory");
+        fs::write(&config_parent, b"not a directory").unwrap();
+        let config = temp_config(Some(config_parent.join("config.json")));
         assert_eq!(next_boot_incarnation(&config), None);
         let _ = fs::remove_dir_all(&dir);
     }

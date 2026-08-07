@@ -333,18 +333,28 @@ impl Daemon {
         }
 
         // All state required to replay/validate the response is now staged.
-        // STUN refresh and the control POST can take seconds, so neither may
-        // retain the per-peer arbiter.  A crossing answer needs this mutex to
-        // consume its pending initiator immediately.
+        // The answer must never wait for a live STUN refresh or the ordinary
+        // candidate/endpoint lane: use the cached candidate snapshot, with a
+        // short bounded wait only when no candidates have been gathered yet.
         drop(handshake_guard);
-        let (candidates, candidate_sources) = match cancellation.as_deref_mut() {
-            Some(cancellation) => {
-                tokio::select! {
-                    candidates = self.local_candidate_set_for_signal("handshake answer") => candidates,
-                    _ = cancellation.changed() => return Ok(()),
+        let (candidates, candidate_sources) = {
+            let snapshot = self.cached_local_candidate_set().await;
+            if snapshot.0.is_empty() {
+                match cancellation.as_deref_mut() {
+                    Some(cancellation) => {
+                        tokio::select! {
+                            _ = self.wait_for_local_candidate_set() => {}
+                            _ = cancellation.changed() => return Ok(()),
+                        }
+                    }
+                    None => {
+                        self.wait_for_local_candidate_set().await;
+                    }
                 }
+                self.cached_local_candidate_set().await
+            } else {
+                snapshot
             }
-            None => self.local_candidate_set_for_signal("handshake answer").await,
         };
         if cancellation
             .as_deref()
@@ -472,6 +482,20 @@ impl Daemon {
                 ),
             )
             .await;
+
+        // The endpoint update and candidate refresh are NOT prerequisites of
+        // the answer: they run after it as bounded best-effort work and are
+        // aborted on PeerLeft or owner replacement.
+        let post_answer = self.post_answer_candidate_refresh_and_endpoint_publish();
+        match cancellation {
+            Some(cancellation) => {
+                tokio::select! {
+                    _ = post_answer => {}
+                    _ = cancellation.changed() => {}
+                }
+            }
+            None => post_answer.await,
+        }
         Ok(())
     }
 

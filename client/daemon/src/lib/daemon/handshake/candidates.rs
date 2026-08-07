@@ -21,6 +21,19 @@ impl Daemon {
         )
     }
 
+    /// Snapshot the cached candidate set WITHOUT taking the refresh lock.
+    ///
+    /// Used only by the responder answer path: a live STUN refresh must never
+    /// delay the answer, so the snapshot may be momentarily inconsistent with
+    /// the source map.  That is harmless for a best-effort signal payload (a
+    /// missing source label is ignored by the server).
+    async fn cached_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
+        (
+            self.local_candidates.read().await.clone(),
+            self.local_candidate_sources.read().await.clone(),
+        )
+    }
+
     async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(50);
@@ -157,7 +170,78 @@ impl Daemon {
         udp: &UdpTransport,
         reason: &str,
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
-        let refresh_guard = self.candidate_refresh_lock.lock().await;
+        let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
+        if let Some(endpoint) =
+            control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1)
+        {
+            // The endpoint publish travels the handshake control lane with a
+            // short caller budget: the ordinary lane may be congested by
+            // candidate-only traffic and must never delay the signal that
+            // follows this refresh.
+            match tokio::time::timeout(
+                Duration::from_millis(PRE_SIGNAL_ENDPOINT_PUBLISH_BUDGET_MS),
+                self.control.update_endpoint_for_handshake(&endpoint, "unknown"),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}")
+                }
+                Err(_) => {
+                    debug!(
+                        "Pre-signal UDP endpoint publish '{endpoint}' exceeded its budget"
+                    )
+                }
+            }
+        }
+        Some(refreshed)
+    }
+
+    /// Bounded, best-effort candidate refresh that runs only AFTER a responder
+    /// answer has been issued.  The answer itself uses the cached candidate
+    /// snapshot; this background step keeps future candidate-only publishes
+    /// and the server-side endpoint fresh.  It never blocks the answer, never
+    /// waits on the ordinary control FIFO (the endpoint publish travels the
+    /// handshake control lane), and is aborted by the caller when PeerLeft or
+    /// an owner replacement fires.
+    async fn post_answer_candidate_refresh_and_endpoint_publish(&self) {
+        let _deadline_guard = tokio::time::timeout(
+            Duration::from_secs(POST_ANSWER_REFRESH_DEADLINE_SECS),
+            async {
+                let Some(udp) = self.udp_transport.read().await.clone() else {
+                    return;
+                };
+                let Some((candidates, candidate_sources)) = self
+                    .refresh_local_candidates_core(&udp, "post-answer")
+                    .await
+                else {
+                    return;
+                };
+                if let Some(endpoint) =
+                    control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
+                {
+                    if let Err(err) = self
+                        .control
+                        .update_endpoint_for_handshake(&endpoint, "unknown")
+                        .await
+                    {
+                        warn!(
+                            "Failed to publish post-answer UDP endpoint '{endpoint}': {err}"
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    async fn refresh_local_candidates_core(
+        &self,
+        udp: &UdpTransport,
+        reason: &str,
+    ) -> Option<(Vec<String>, HashMap<String, String>)> {
+        let _refresh_guard = self.candidate_refresh_lock.lock().await;
         let stun_servers = self.runtime_stun_servers.read().await.clone();
         if stun_servers.is_empty() {
             return None;
@@ -253,17 +337,6 @@ impl Daemon {
                 "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates (old_hash={old_hash} new_hash={new_hash} changed_reason={change_reason})",
                 candidates.len()
             );
-        }
-
-        if let Some(endpoint) =
-            control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
-        {
-            drop(refresh_guard);
-            if let Err(err) = self.control.update_endpoint(&endpoint, "unknown").await {
-                warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
-            }
-        } else {
-            drop(refresh_guard);
         }
 
         Some((candidates, candidate_sources))
