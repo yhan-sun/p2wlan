@@ -98,10 +98,17 @@ pub(super) async fn poll_signals(
     self_node_id: &str,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     wait_ms: u64,
+    recent_signal_ids: &Arc<tokio::sync::Mutex<VecDeque<String>>>,
 ) -> Result<()> {
+    // ACK mode (`ack=1`): the server hands out delivery LEASES instead of
+    // deleting rows at GET time, so a connection that breaks mid-body or a
+    // client that dies mid-processing can never lose a signal — the lease
+    // expires and the batch is redelivered.  An old server ignores the query
+    // parameter and keeps its delete-on-GET contract, which is exactly what
+    // an old client expects (no infinite redelivery either way).
     let res = http
         .get(format!(
-            "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={wait_ms}"
+            "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={wait_ms}&ack=1"
         ))
         .bearer_auth(token)
         .send()
@@ -129,14 +136,53 @@ pub(super) async fn poll_signals(
             );
         }
     }
+    if let Some(delivery) = body.delivery.as_ref() {
+        debug!(
+            "Control server granted an ACK-mode delivery lease (batch_token={} lease_expires_at_ms={:?}); acknowledging per-row tokens after enqueue",
+            delivery.batch_token, delivery.lease_expires_at_ms
+        );
+    }
 
+    // Every signal that was delivered to us in ACK mode must be acknowledged
+    // once it was fully decoded and enqueued; duplicates (a redelivered batch
+    // whose ACK was lost) are acknowledged too, so a row is never redelivered
+    // forever.
+    let mut acks: Vec<SignalAckRequest> = Vec::new();
+    let mut seen_any_delivery = false;
+    let mut dedup = recent_signal_ids.lock().await;
     for signal in body.signals {
+        if let (Some(signal_id), Some(delivery_token)) =
+            (signal.id.as_deref(), signal.delivery_token.as_deref())
+        {
+            seen_any_delivery = true;
+            acks.push(SignalAckRequest {
+                id: signal_id.to_string(),
+                delivery_token: delivery_token.to_string(),
+            });
+        }
         if signal.protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
             warn!(
                 "Skipping unsupported signal protocol_version={} from {} type={}",
                 signal.protocol_version, signal.from_node_id, signal.signal_type
             );
             continue;
+        }
+        if let Some(signal_id) = signal.id.as_deref() {
+            // A redelivered batch (lost ACK, expired lease) must not apply
+            // the same signal twice: the bounded id cache dedups by signal
+            // id; candidate generation and the fresh high-water dedup the
+            // rest.
+            if dedup.iter().any(|seen| seen == signal_id) {
+                debug!(
+                    "Skipping duplicate signal {signal_id} from {} (redelivered batch); already processed",
+                    signal.from_node_id
+                );
+                continue;
+            }
+            dedup.push_back(signal_id.to_string());
+            while dedup.len() > MAX_RECENT_SIGNAL_IDS {
+                dedup.pop_front();
+            }
         }
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
@@ -147,8 +193,9 @@ pub(super) async fn poll_signals(
             received_at_ms,
         );
         // One malformed signal must never abort the batch: the server already
-        // deleted every delivered row from its queue, so aborting here would
-        // drop the healthy signals of the same poll together with the bad one.
+        // leased every delivered row, so aborting here would drop the healthy
+        // signals of the same poll together with the bad one (their leases
+        // would expire and redeliver, so nothing is lost).
         let handshake = if signal.handshake.trim().is_empty() {
             Vec::new()
         } else if signal.handshake.trim().len() % 2 != 0 {
@@ -188,6 +235,7 @@ pub(super) async fn poll_signals(
                     handshake_init: handshake,
                     punch_at_ms,
                     punch_at_server_ms,
+                    sender_public_key: signal.sender_public_key,
                 });
             }
             "peer_answer" => {
@@ -202,6 +250,7 @@ pub(super) async fn poll_signals(
                     handshake_response: handshake,
                     punch_at_ms,
                     punch_at_server_ms,
+                    sender_public_key: signal.sender_public_key,
                 });
             }
             "peer_reflexive" => {
@@ -223,7 +272,58 @@ pub(super) async fn poll_signals(
             }
         }
     }
+    drop(dedup);
 
+    // Acknowledge the whole delivered batch only now that every signal was
+    // decoded and enqueued into the local event queue.  Best-effort: when the
+    // ACK fails, the lease expires and the batch is redelivered (deduped by
+    // signal id), so nothing is lost and nothing is applied twice.
+    if seen_any_delivery && !acks.is_empty() {
+        if let Err(err) = ack_signals(http, base_url, token, self_node_id, &acks).await {
+            warn!(
+                "Signal delivery ACK failed for {} signals (the lease will expire and redeliver): {err}",
+                acks.len()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// How many recent signal IDs the receive-side dedup cache retains.  Bounded
+/// well above any lease window's batch volume (a 500-row batch redelivered a
+/// few times must still dedup), and sized so the memory cost stays trivial.
+const MAX_RECENT_SIGNAL_IDS: usize = 2_048;
+
+/// One per-row delivery acknowledgement.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SignalAckRequest {
+    id: String,
+    delivery_token: String,
+}
+
+/// Acknowledge a delivered signal batch (idempotent server-side).
+async fn ack_signals(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    self_node_id: &str,
+    acks: &[SignalAckRequest],
+) -> Result<()> {
+    let res = http
+        .post(format!("{base_url}/api/v1/signals/ack?node_id={self_node_id}"))
+        .timeout(SIGNAL_SEND_TIMEOUT)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "signals": acks }))
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("signal ack request failed: {e}")))?;
+    if !res.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "signal ack returned HTTP {}",
+            res.status()
+        )));
+    }
     Ok(())
 }
 
@@ -287,9 +387,11 @@ pub(super) const CANDIDATE_GENERATION_COUNTER_MASK: u64 = (1u64 << CANDIDATE_GEN
 /// Why no candidate generation could be produced for this signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CandidateGenerationError {
-    /// The persisted incarnation no longer fits the encoding field: refusing
-    /// to mask it would let a wrapped incarnation reorder boots at the
-    /// receiver.
+    /// The persisted incarnation no longer fits the encoding field.  Kept for
+    /// documentation and API stability: signaling now degrades such boots to
+    /// the legacy generation 0 instead of failing (see
+    /// [`next_candidate_generation_for_incarnation`]).
+    #[allow(dead_code)]
     IncarnationExhausted(u64),
     /// The per-boot generation counter reached its field limit: refusing to
     /// wrap keeps every generation strictly newer than its predecessors.
@@ -345,35 +447,45 @@ pub(super) fn next_candidate_generation_for_incarnation(
     incarnation: u64,
     previous: u64,
 ) -> std::result::Result<u64, CandidateGenerationError> {
-    if incarnation == 0 {
-        // No trustworthy persistent incarnation exists for this boot (missing
-        // config path, corrupt/unreadable state, version mismatch, or the
-        // counter exhausted).  The generation MUST NOT silently encode
-        // incarnation=0 under the flag: a flagged value with a zero
-        // incarnation field is lower than every real incarnation-encoded
-        // value, so a receiver whose high-water already saw one would judge
-        // this boot's ordinary candidates stale forever.  Instead the
-        // ordinary candidates carry generation 0 — the legacy "no ordering
-        // metadata" value that the receiver's stale check never rejects
-        // (`candidate_generation != 0` gates the comparison).  Fresh
-        // prediction is disabled for such a boot anyway, so the ordering the
-        // generation would provide is not needed.
-        return Ok(0);
-    }
     let incarnation_max = (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1;
-    if incarnation > incarnation_max {
-        return Err(CandidateGenerationError::IncarnationExhausted(incarnation));
+    if incarnation == 0 || incarnation > incarnation_max {
+        // No encodable trustworthy incarnation exists for this boot (missing
+        // config path, corrupt/unreadable state, version mismatch, counter
+        // exhausted, or the persisted incarnation outgrew the 41-bit field).
+        // The generation MUST NOT silently encode incarnation=0 under the
+        // flag: a flagged value with a zero incarnation field is lower than
+        // every real incarnation-encoded value, so a receiver whose
+        // high-water already saw one would judge this boot's ordinary
+        // candidates stale forever.  Instead the ordinary candidates carry
+        // generation 0 — the legacy "no ordering metadata" value that the
+        // receiver's stale check never rejects (`candidate_generation != 0`
+        // gates the comparison).  Ordinary offer/answer signaling therefore
+        // keeps working; only fresh prediction is disabled for such a boot
+        // (the ordering the generation would provide is not needed, and the
+        // fresh label check in `hole_punch_signal_context` disables the
+        // fresh path when the incarnation cannot be encoded).
+        return Ok(0);
     }
     let previous_counter = previous & CANDIDATE_GENERATION_COUNTER_MASK;
     if previous_counter >= CANDIDATE_GENERATION_COUNTER_MASK {
         return Err(CandidateGenerationError::CounterExhausted(previous_counter));
     }
-    let counter = (unix_time_millis() & CANDIDATE_GENERATION_COUNTER_MASK)
-        .max(previous_counter.saturating_add(1))
-        .min(CANDIDATE_GENERATION_COUNTER_MASK);
+    // The per-boot counter starts at 1 and strictly increments: it never
+    // borrows the wall clock's low bits, so the boot time can never decide
+    // how much capacity this boot has left.
+    let counter = previous_counter.saturating_add(1).min(CANDIDATE_GENERATION_COUNTER_MASK);
     Ok(CANDIDATE_GENERATION_INCARNATION_FLAG
         | (incarnation << CANDIDATE_GENERATION_COUNTER_BITS)
         | counter)
+}
+
+/// Whether a daemon incarnation fits the candidate-generation encoding field.
+///
+/// `boot_epoch_ms == 0` (no trustworthy persistent incarnation) AND an
+/// incarnation that outgrew the 41-bit field both disable fresh prediction:
+/// the fresh label embeds the incarnation and must never wrap.
+pub(crate) fn incarnation_fits_candidate_generation_encoding(incarnation: u64) -> bool {
+    incarnation != 0 && incarnation < (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS)
 }
 
 fn unix_time_millis() -> u64 {

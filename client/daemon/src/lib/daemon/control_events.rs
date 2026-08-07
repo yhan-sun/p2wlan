@@ -1,3 +1,24 @@
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use std::future::Future;
+use std::pin::Pin;
+
+/// The serial control receiver owns fresh-prediction admission and short
+/// state commits.  Slow STUN/HTTP work runs here instead of directly in the
+/// receiver, with every producer supplying a per-peer reservation and this
+/// global cap providing a hard upper bound during a control-plane burst.
+type ControlEventWork<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+const MAX_CONTROL_EVENT_SLOW_WORK: usize = 64;
+
+/// A control signal can arrive a few seconds before the corresponding
+/// PeerJoined event (REST polling and signal delivery are independent).  Keep
+/// one bounded responder worker alive for this interval so the authenticated
+/// offer is replayed after the peer identity is installed instead of being
+/// rejected as unknown.  The worker is cancelled by the normal peer-lifecycle
+/// cleanup path, and repeated offers replace its single queued value.
+const UNKNOWN_PEER_OFFER_WAIT: Duration = Duration::from_secs(8);
+const UNKNOWN_PEER_OFFER_POLL: Duration = Duration::from_millis(25);
+
 fn candidate_signal_starts_synchronized_punch(
     handshake_payload: &[u8],
     apply_result: CandidateSetApplyResult,
@@ -63,7 +84,341 @@ enum FreshSignalVerdict {
     Inconsistent,
 }
 
+/// What punch may start from a fresh-prediction signal.
+#[derive(Debug, Clone)]
+enum FreshPunchDecision {
+    /// No fresh prediction: an ordinary signal.
+    None,
+    /// The committed fresh snapshot is valid (present, unexpired, non-empty):
+    /// the immutable targets may be punched at FRESH priority.
+    Fresh(crate::FreshPredictionId, Vec<SocketAddr>),
+    /// The signal carried a fresh label but its committed snapshot is expired
+    /// or empty: it must NOT claim fresh priority and must NOT fall back to
+    /// the shared candidate set as if it were a fresh prediction.  Only a
+    /// handshake-carrying signal may degrade to an ORDINARY priority punch
+    /// over the shared candidates; a candidate-only signal is ignored.
+    Degraded,
+}
+
 impl Daemon {
+    async fn wait_for_peer_offer_identity(
+        &self,
+        peer_id: &str,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> bool {
+        let deadline = Instant::now() + UNKNOWN_PEER_OFFER_WAIT;
+        loop {
+            if self.peers.get_connection(peer_id).await.is_some() {
+                return true;
+            }
+            if *cancellation.borrow() {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                debug!(
+                    "Dropping deferred peer offer from {peer_id}: peer identity was not registered within {:?}",
+                    UNKNOWN_PEER_OFFER_WAIT
+                );
+                return false;
+            }
+            tokio::select! {
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() {
+                        return false;
+                    }
+                }
+                _ = sleep(UNKNOWN_PEER_OFFER_POLL.min(remaining)) => {}
+            }
+        }
+    }
+
+    async fn apply_deferred_peer_offer_punch(
+        &self,
+        offer: &PendingPeerOffer,
+        candidate_apply_result: CandidateSetApplyResult,
+        fresh_punch: FreshPunchDecision,
+    ) {
+        match fresh_punch {
+            FreshPunchDecision::Fresh(id, frozen_targets) => {
+                self.start_hole_punch_at(
+                    &offer.from_node_id,
+                    offer.punch_at_ms,
+                    Some(id),
+                    Some(frozen_targets),
+                )
+                .await;
+            }
+            FreshPunchDecision::Degraded => {
+                if !offer.handshake_init.is_empty() {
+                    self.start_hole_punch_at(&offer.from_node_id, offer.punch_at_ms, None, None)
+                        .await;
+                }
+            }
+            FreshPunchDecision::None => {
+                if candidate_signal_starts_synchronized_punch(
+                    &offer.handshake_init,
+                    candidate_apply_result,
+                ) {
+                    self.start_hole_punch_at(&offer.from_node_id, offer.punch_at_ms, None, None)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Run the slow half of one peer-reflexive control event.
+    ///
+    /// Updating the candidate set can wait behind a live STUN refresh and the
+    /// optional re-advertisement performs HTTP I/O. This must never execute
+    /// in the serial control receiver: offers and answers need to keep making
+    /// their short candidate/handshake transactions while this work waits.
+    /// The caller owns a per-peer newest-wins reservation, so endpoint churn
+    /// cannot create more than one active worker for a peer.
+    async fn handle_peer_reflexive_work(
+        &self,
+        work: &PendingPeerReflexive,
+        cancellation: &mut watch::Receiver<bool>,
+    ) {
+        if *cancellation.borrow() {
+            return;
+        }
+        let peer_id = &work.from_node_id;
+        let already_direct_at_arrival = self
+            .peers
+            .should_defer_relay_assisted_punch(peer_id)
+            .await;
+        let local_candidate_changed = tokio::select! {
+            changed = cancellation.changed() => {
+                if changed.is_err() || *cancellation.borrow() {
+                    return;
+                }
+                return;
+            }
+            changed = self.add_local_peer_reflexive_candidate(&work.observed_endpoint) => changed,
+        };
+        if let Ok(observed_addr) = work.observed_endpoint.parse::<SocketAddr>() {
+            self.peers
+                .record_fresh_mapping_prediction_result(peer_id, observed_addr)
+                .await;
+        }
+        let punch_at_ms = work
+            .punch_at_ms
+            .or_else(|| Some(relay_assisted_punch_at_ms()));
+        let (candidates, candidate_sources) = tokio::select! {
+            changed = cancellation.changed() => {
+                if changed.is_err() || *cancellation.borrow() {
+                    return;
+                }
+                return;
+            }
+            candidates = self.current_local_candidate_set() => candidates,
+        };
+        let selected_remote_endpoint = self
+            .peers
+            .selected_direct_endpoint_for_consent(peer_id)
+            .await;
+        // Re-check after the potentially long candidate-refresh wait. A
+        // concurrent inbound ACK/answer may have promoted Direct meanwhile;
+        // that must suppress the stale HTTP offer and punch, even when the
+        // peer was not Direct at the time this observation arrived.
+        let already_direct = self
+            .peers
+            .should_defer_relay_assisted_punch(peer_id)
+            .await;
+        let schedule_punch = !already_direct;
+        let skip_reason = already_direct.then_some("direct_confirmed_healthy");
+        self.peers
+            .record_direct_event(
+                peer_id,
+                "peer_reflexive_received",
+                work.observed_endpoint.parse().ok(),
+                Some(candidates.len()),
+                None,
+                format!(
+                    "peer observed our UDP source as {}; already_advertised={} already_direct_at_arrival={already_direct_at_arrival} already_direct={already_direct} selected_remote_endpoint={selected_remote_endpoint:?} schedule_punch={schedule_punch} skip_reason={skip_reason:?}",
+                    work.observed_endpoint,
+                    !local_candidate_changed,
+                ),
+            )
+            .await;
+        if already_direct || *cancellation.borrow() {
+            return;
+        }
+        if local_candidate_changed && !candidates.is_empty() {
+            let send_result = tokio::select! {
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() {
+                        return;
+                    }
+                    return;
+                }
+                result = self.control.send_peer_offer_with_sources_and_punch_at(
+                    peer_id,
+                    &candidates,
+                    &candidate_sources,
+                    &[],
+                    punch_at_ms,
+                    None,
+                ) => result,
+            };
+            if let Err(err) = send_result {
+                warn!(
+                    "Failed to re-advertise peer-reflexive local candidate to {peer_id}: {err}"
+                );
+            } else {
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "peer_reflexive_offer_sent",
+                        work.observed_endpoint.parse().ok(),
+                        Some(candidates.len()),
+                        None,
+                        "re-advertised local candidates after peer-reflexive observation",
+                    )
+                    .await;
+            }
+        } else if !local_candidate_changed {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "peer_reflexive_offer_skipped",
+                    work.observed_endpoint.parse().ok(),
+                    Some(candidates.len()),
+                    None,
+                    "peer-reflexive candidate already advertised; skipped full offer re-advertisement",
+                )
+                .await;
+        }
+        if !*cancellation.borrow()
+            && !self
+                .peers
+                .should_defer_relay_assisted_punch(peer_id)
+                .await
+        {
+            self.start_hole_punch_at(peer_id, punch_at_ms, None, None)
+                .await;
+        }
+    }
+
+    /// Consume the newest queued peer-reflexive observation under one owner.
+    /// The global control slow-work set caps the number of these workers;
+    /// this per-peer owner prevents endpoint churn from consuming that cap.
+    async fn run_peer_reflexive_worker(
+        &self,
+        mut work: PendingPeerReflexive,
+        mut reservation: PeerReflexiveWorkReservation,
+    ) {
+        loop {
+            let peer_id = work.from_node_id.clone();
+            if *reservation.cancellation.borrow() {
+                return;
+            }
+            self.handle_peer_reflexive_work(&work, &mut reservation.cancellation)
+                .await;
+            let Some(next) = self
+                .pending_handshakes
+                .lock()
+                .await
+                .finish_peer_reflexive_work(&peer_id, reservation.owner)
+            else {
+                return;
+            };
+            work = next;
+        }
+    }
+
+    /// Finish an offer that arrived before PeerJoined.  Candidate/fresh
+    /// admission is deliberately repeated after registration, because the
+    /// first attempt would return `PeerMissing` and must not consume a fresh
+    /// prediction identity.  The same responder owner handles queued retries.
+    async fn run_deferred_peer_offer_worker(
+        &self,
+        mut offer: PendingPeerOffer,
+        mut reservation: ResponderWorkReservation,
+    ) {
+        loop {
+            let peer_id = offer.from_node_id.clone();
+            if *reservation.cancellation.borrow() {
+                return;
+            }
+            if !self
+                .wait_for_peer_offer_identity(
+                    &offer.from_node_id,
+                    &mut reservation.cancellation,
+                )
+                .await
+            {
+                // A newer offer may have replaced the timed-out value while
+                // the peer was still unknown.  Consume it under the same
+                // owner; otherwise release the owner so a later signal can
+                // create a fresh bounded waiter.
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .await
+                    .finish_responder_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+            // Several offers may have arrived while this worker waited for
+            // PeerJoined.  Consume the newest one before any candidate or
+            // WireGuard state is touched; the same owner remains active so a
+            // later arrival races only with the post-work handoff below.
+            if let Some(newest) = self
+                .pending_handshakes
+                .lock()
+                .await
+                .take_queued_responder_work(&peer_id, reservation.owner)
+            {
+                offer = newest;
+                continue;
+            }
+            let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
+                .fresh_prediction_transaction(
+                    &offer.from_node_id,
+                    &offer.candidates,
+                    &offer.candidate_sources,
+                    offer.candidate_generation,
+                    offer.candidates_expires_at_ms,
+                    offer.sender_public_key.as_deref(),
+                )
+                .await;
+            self.apply_deferred_peer_offer_punch(
+                &offer,
+                candidate_apply_result,
+                fresh_punch,
+            )
+            .await;
+
+            if !offer.handshake_init.is_empty() {
+                if let Err(err) = self
+                    .handle_event_peer_offer(
+                        offer,
+                        reservation.owner,
+                        &mut reservation.cancellation,
+                    )
+                    .await
+                {
+                    warn!("Failed to handle deferred peer offer from {peer_id}: {err}");
+                }
+            }
+
+            let Some(next) = self
+                .pending_handshakes
+                .lock()
+                .await
+                .finish_responder_work(&peer_id, reservation.owner)
+            else {
+                return;
+            };
+            offer = next;
+        }
+    }
+
     /// Freeze the immutable candidate snapshot bound to a fresh identity.
     ///
     /// The snapshot is the payload the identity was committed with (stored by
@@ -110,6 +465,32 @@ impl Daemon {
         Some(targets)
     }
 
+    /// Whether a signal's server-bound sender identity fingerprint matches
+    /// the peer's CURRENT public key.
+    ///
+    /// The control server binds every queued signal to the sender's identity
+    /// fingerprint at send time.  When the peer later changes its public key
+    /// (rejoin as a new identity), signals that were still queued from the
+    /// OLD identity carry the old fingerprint: they must never enter the new
+    /// identity's fresh-prediction high-water space, so their fresh labels
+    /// are treated as stale.  Signals without a fingerprint (old server) or
+    /// for a peer without a recorded public key are conservatively treated as
+    /// matching (no identity information to contradict them).
+    async fn signal_sender_identity_matches_peer(
+        &self,
+        peer_id: &str,
+        sender_public_key: Option<&str>,
+    ) -> bool {
+        let Some(sender_public_key) = sender_public_key.map(str::trim).filter(|key| !key.is_empty())
+        else {
+            return true;
+        };
+        let Some(connection) = self.peers.get_connection(peer_id).await else {
+            return false;
+        };
+        connection.public_key.trim() == sender_public_key
+    }
+
     /// The prepare/apply/commit transaction for one fresh signal, shared by
     /// the offer and answer paths.
     ///
@@ -128,11 +509,11 @@ impl Daemon {
         candidate_sources: &HashMap<String, String>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
     ) -> (
         FreshSignalVerdict,
         CandidateSetApplyResult,
-        Option<crate::FreshPredictionId>,
-        Option<Vec<SocketAddr>>,
+        FreshPunchDecision,
     ) {
         let fresh_verdict = match fresh_prediction_from_sources(candidate_sources) {
             Err(()) => {
@@ -150,67 +531,91 @@ impl Daemon {
             }
             Ok(None) => FreshSignalVerdict::None,
             Ok(Some(id)) => {
-                match self
-                    .peers
-                    .prepare_remote_fresh_prediction(
-                        from_node_id,
-                        id,
-                        candidates,
-                        candidate_sources,
-                        candidates_expires_at_ms,
-                    )
-                    .await
-                {
-                    crate::peer::RemoteFreshAdmission::Accepted => FreshSignalVerdict::Accepted(id),
-                    crate::peer::RemoteFreshAdmission::AlreadyRecorded => {
-                        self.peers
-                            .record_direct_event(
-                                from_node_id,
-                                "fresh_prediction_retry",
-                                None,
-                                Some(candidates.len()),
-                                None,
-                                format!(
-                                    "offer is an idempotent retry of the committed fresh-mapping prediction {id:?}; candidates are not re-applied"
-                                ),
-                            )
-                            .await;
-                        FreshSignalVerdict::AlreadyRecorded(id)
-                    }
-                    crate::peer::RemoteFreshAdmission::PayloadMismatch => {
-                        self.peers
-                            .record_direct_event(
-                                from_node_id,
-                                "fresh_prediction_payload_mismatch",
-                                None,
-                                Some(candidates.len()),
-                                None,
-                                format!(
-                                    "offer retries the committed fresh-mapping prediction {id:?} with a different candidate payload/expiry; rejected"
-                                ),
-                            )
-                            .await;
-                        FreshSignalVerdict::PayloadMismatch(id)
-                    }
-                    crate::peer::RemoteFreshAdmission::Stale => {
-                        self.peers
-                            .record_direct_event(
-                                from_node_id,
-                                "fresh_prediction_stale",
-                                None,
-                                Some(candidates.len()),
-                                None,
-                                format!(
-                                    "offer carried a superseded fresh-mapping prediction {id:?}; candidates ignored"
-                                ),
-                            )
-                            .await;
-                        FreshSignalVerdict::Stale
+                let signal_identity_matches = self
+                    .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
+                    .await;
+                if !signal_identity_matches {
+                    // The signal was bound by the control server to a sender
+                    // identity fingerprint that is NOT the peer's current
+                    // public key (the peer changed key and this is a stale
+                    // queued signal from the old identity): its fresh label
+                    // must never enter the NEW identity's high-water space.
+                    self.peers
+                        .record_direct_event(
+                            from_node_id,
+                            "fresh_prediction_stale_identity",
+                            None,
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "offer carried fresh-mapping prediction {id:?} from a stale sender identity; fresh candidates ignored"
+                            ),
+                        )
+                        .await;
+                    FreshSignalVerdict::Stale
+                } else {
+                    match self
+                        .peers
+                        .prepare_remote_fresh_prediction(
+                            from_node_id,
+                            id,
+                            candidates,
+                            candidate_sources,
+                            candidates_expires_at_ms,
+                        )
+                        .await
+                    {
+                        crate::peer::RemoteFreshAdmission::Accepted => FreshSignalVerdict::Accepted(id),
+                        crate::peer::RemoteFreshAdmission::AlreadyRecorded => {
+                            self.peers
+                                .record_direct_event(
+                                    from_node_id,
+                                    "fresh_prediction_retry",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    format!(
+                                        "offer is an idempotent retry of the committed fresh-mapping prediction {id:?}; candidates are not re-applied"
+                                    ),
+                                )
+                                .await;
+                            FreshSignalVerdict::AlreadyRecorded(id)
+                        }
+                        crate::peer::RemoteFreshAdmission::PayloadMismatch => {
+                            self.peers
+                                .record_direct_event(
+                                    from_node_id,
+                                    "fresh_prediction_payload_mismatch",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    format!(
+                                        "offer retries the committed fresh-mapping prediction {id:?} with a different candidate payload/expiry; rejected"
+                                    ),
+                                )
+                                .await;
+                            FreshSignalVerdict::PayloadMismatch(id)
+                        }
+                        crate::peer::RemoteFreshAdmission::Stale => {
+                            self.peers
+                                .record_direct_event(
+                                    from_node_id,
+                                    "fresh_prediction_stale",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    format!(
+                                        "offer carried a superseded fresh-mapping prediction {id:?}; candidates ignored"
+                                    ),
+                                )
+                                .await;
+                            FreshSignalVerdict::Stale
+                        }
                     }
                 }
             }
         };
-        let (candidate_apply_result, fresh_punch, frozen_targets) = match fresh_verdict {
+        let (candidate_apply_result, fresh_punch) = match fresh_verdict {
             FreshSignalVerdict::None => (
                 self.peers
                     .add_candidates_with_metadata(
@@ -221,8 +626,7 @@ impl Daemon {
                         candidates_expires_at_ms,
                     )
                     .await,
-                None,
-                None,
+                FreshPunchDecision::None,
             ),
             FreshSignalVerdict::Accepted(id) => {
                 let apply_result = self
@@ -253,7 +657,7 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    (apply_result, None, None)
+                    (apply_result, FreshPunchDecision::None)
                 } else if self
                     .peers
                     .commit_remote_fresh_prediction(from_node_id, id)
@@ -264,7 +668,28 @@ impl Daemon {
                     let frozen = self
                         .freeze_fresh_punch_targets(from_node_id, id)
                         .await;
-                    (apply_result, Some(id), frozen)
+                    let decision = match frozen {
+                        Some(targets) => FreshPunchDecision::Fresh(id, targets),
+                        // The committed snapshot expired or is empty: the
+                        // prediction must never claim fresh priority or fall
+                        // back to the shared candidates as if it were fresh.
+                        None => {
+                            self.peers
+                                .record_direct_event(
+                                    from_node_id,
+                                    "fresh_prediction_snapshot_invalid",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    format!(
+                                        "fresh prediction {id:?} committed but its snapshot is expired or empty; the signal degrades to ordinary priority"
+                                    ),
+                                )
+                                .await;
+                            FreshPunchDecision::Degraded
+                        }
+                    };
+                    (apply_result, decision)
                 } else {
                     // The commit lost the CAS to a newer identity: roll this
                     // apply's candidates back so they cannot pollute the
@@ -284,28 +709,48 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    (CandidateSetApplyResult::IgnoredStale, None, None)
+                    (CandidateSetApplyResult::IgnoredStale, FreshPunchDecision::None)
                 }
             }
             FreshSignalVerdict::AlreadyRecorded(id) => {
                 // The candidates were applied by the first attempt; the punch
-                // may still start from the committed snapshot.
+                // may still start from the committed snapshot — but only a
+                // valid (unexpired, non-empty) snapshot may claim fresh
+                // priority.
                 let frozen = self.freeze_fresh_punch_targets(from_node_id, id).await;
-                (CandidateSetApplyResult::Applied, Some(id), frozen)
+                let decision = match frozen {
+                    Some(targets) => FreshPunchDecision::Fresh(id, targets),
+                    None => {
+                        self.peers
+                            .record_direct_event(
+                                from_node_id,
+                                "fresh_prediction_snapshot_invalid",
+                                None,
+                                Some(candidates.len()),
+                                None,
+                                format!(
+                                    "fresh prediction retry {id:?} has an expired or empty committed snapshot; the signal degrades to ordinary priority"
+                                ),
+                            )
+                            .await;
+                        FreshPunchDecision::Degraded
+                    }
+                };
+                (CandidateSetApplyResult::Applied, decision)
             }
             FreshSignalVerdict::PayloadMismatch(id) => {
                 debug!(
                     "Fresh-mapping prediction {id:?} from {from_node_id} was rejected: the retry payload differs from the committed snapshot"
                 );
-                (CandidateSetApplyResult::IgnoredStale, None, None)
+                (CandidateSetApplyResult::IgnoredStale, FreshPunchDecision::None)
             }
             FreshSignalVerdict::Stale | FreshSignalVerdict::Inconsistent => {
                 // The current candidate set stays authoritative; only the
                 // handshake below may proceed.
-                (CandidateSetApplyResult::IgnoredStale, None, None)
+                (CandidateSetApplyResult::IgnoredStale, FreshPunchDecision::None)
             }
         };
-        (fresh_verdict, candidate_apply_result, fresh_punch, frozen_targets)
+        (fresh_verdict, candidate_apply_result, fresh_punch)
     }
 
     async fn run_control_event_loop(
@@ -314,6 +759,14 @@ impl Daemon {
         network_inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) {
         // Process control events until shutdown is requested.
+        // Move the receiver out first so the event loop can hold immutable
+        // borrows of the daemon in its cooperative slow-work set.  All daemon
+        // state is already interior-synchronized; the receiver is the sole
+        // field that needs mutable access.
+        let (_replacement_tx, replacement_rx) = mpsc::unbounded_channel();
+        let mut control_rx = std::mem::replace(&mut self.control_rx, replacement_rx);
+        let daemon: &Daemon = &*self;
+        let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut task_shutdown_rx = self.task_manager.shutdown_rx();
         loop {
@@ -330,7 +783,11 @@ impl Daemon {
                         break;
                     }
                 }
-                event = self.control_rx.recv() => {
+                _ = slow_work.next(), if !slow_work.is_empty() => {
+                    // The work item logs its own outcome.  Completion only
+                    // frees one bounded slot; no state is committed here.
+                }
+                event = control_rx.recv() => {
                     let Some(event) = event else {
                         warn!("Control event channel closed");
                         break;
@@ -400,26 +857,22 @@ impl Daemon {
                     self.peers.add_peer(&peer_info).await;
 
                     if peer_info.online {
-                        let mut sent_handshake_offer = false;
-                        match self.maybe_initiate_handshake(&peer_info).await {
-                            Ok(punch_at_ms) => {
-                                sent_handshake_offer = punch_at_ms.is_some();
-                                self.start_hole_punch_at(&peer_info.node_id, punch_at_ms, None, None).await;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    "Failed to initiate WireGuard handshake with {}: {err}",
-                                    peer_info.node_id
-                                );
-                                self.start_hole_punch(&peer_info.node_id).await;
-                            }
-                        }
-                        if !sent_handshake_offer {
-                            self.publish_current_candidates_to_peer(
-                                &peer_info.node_id,
-                                "peer joined",
-                            )
-                            .await;
+                        if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                            warn!(
+                                "Deferring peer-join handshake for {}: control slow-work cap {} is full",
+                                peer_info.node_id,
+                                MAX_CONTROL_EVENT_SLOW_WORK,
+                            );
+                        } else if let Some(reservation) = self
+                            .reserve_event_initiator_handshake(&peer_info.node_id)
+                            .await
+                        {
+                            let peer_info = peer_info.clone();
+                            slow_work.push(Box::pin(async move {
+                                daemon
+                                    .run_event_initiator_handshake(peer_info, reservation)
+                                    .await;
+                            }));
                         }
 
                         if self.dns.is_enabled() {
@@ -443,20 +896,33 @@ impl Daemon {
                     let previous = self.peers.get_connection(&peer_info.node_id).await;
                     let update = self.peers.add_peer(&peer_info).await;
                     if !peer_info.online {
-                        self.transport.remove_session(&peer_info.node_id).await;
-                        self.pending_handshakes
-                            .lock()
-                            .await
-                            .clear_peer(&peer_info.node_id);
+                        {
+                            // Linearize lifecycle cleanup with the short
+                            // offer/answer mutation phase.  The handler drops
+                            // this arbiter before STUN/HTTP, so offline state
+                            // never waits for a slow control-plane request.
+                            let _handshake_guard =
+                                self.handshake_arbiter.acquire(&peer_info.node_id).await;
+                            self.transport.remove_session(&peer_info.node_id).await;
+                            self.pending_handshakes
+                                .lock()
+                                .await
+                                .clear_peer(&peer_info.node_id);
+                        }
                         self.punch_attempts.cancel(&peer_info.node_id);
                         if let Some(udp) = self.udp_transport.read().await.clone() {
-                            udp.detach_dynamic_punch_socket(&peer_info.node_id, "peer_offline")
-                                .await;
-                            // The peer is gone: its pending probes must not be
-                            // matched or re-inserted by late ACKs, so the
-                            // cleanup epoch moves on while the probes drop.
-                            udp.clear_pending_probes_for_peer(&peer_info.node_id)
-                                .await;
+                            // One atomic lifecycle cleanup under the peer's
+                            // adoption lock: the pending probes drop and the
+                            // cleanup epoch moves on, the dynamic sockets
+                            // detach and the affinity clears, all in one
+                            // transaction, so a late ACK can neither match,
+                            // re-insert nor leave pool affinity behind.
+                            udp.cleanup_peer_lifecycle(
+                                &peer_info.node_id,
+                                "peer_offline",
+                                false,
+                            )
+                            .await;
                         }
                         if self.dns.is_enabled() {
                             if let Some(previous) = previous.as_ref() {
@@ -472,11 +938,18 @@ impl Daemon {
                         continue;
                     }
                     if update.public_key_changed {
-                        self.transport.remove_session(&peer_info.node_id).await;
-                        self.pending_handshakes
-                            .lock()
-                            .await
-                            .clear_peer(&peer_info.node_id);
+                        {
+                            // See the offline path above: a stale worker can
+                            // neither stage after this identity cleanup nor
+                            // commit once its owner is cancelled.
+                            let _handshake_guard =
+                                self.handshake_arbiter.acquire(&peer_info.node_id).await;
+                            self.transport.remove_session(&peer_info.node_id).await;
+                            self.pending_handshakes
+                                .lock()
+                                .await
+                                .clear_peer(&peer_info.node_id);
+                        }
                         info!(
                             "Peer {} public key changed; discarded the old WireGuard session",
                             peer_info.node_id
@@ -491,13 +964,12 @@ impl Daemon {
                             .clear_fresh_mapping(&peer_info.node_id, "public_key_changed")
                             .await;
                         if let Some(udp) = self.udp_transport.read().await.clone() {
-                            udp.detach_dynamic_punch_socket(
+                            udp.cleanup_peer_lifecycle(
                                 &peer_info.node_id,
                                 "public_key_changed",
+                                false,
                             )
                             .await;
-                            udp.clear_pending_probes_for_peer(&peer_info.node_id)
-                                .await;
                         }
                     } else if update.endpoint_changed {
                         // The peer moved to a different public endpoint:
@@ -529,26 +1001,22 @@ impl Daemon {
                             )
                             .await;
                     }
-                    let mut sent_handshake_offer = false;
-                    match self.maybe_initiate_handshake(&peer_info).await {
-                        Ok(punch_at_ms) => {
-                            sent_handshake_offer = punch_at_ms.is_some();
-                            self.start_hole_punch_at(&peer_info.node_id, punch_at_ms, None, None).await;
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Failed to refresh WireGuard handshake with {} after peer update: {err}",
-                                peer_info.node_id
-                            );
-                            self.start_hole_punch(&peer_info.node_id).await;
-                        }
-                    }
-                    if !sent_handshake_offer {
-                        self.publish_current_candidates_to_peer(
-                            &peer_info.node_id,
-                            "peer updated",
-                        )
-                        .await;
+                    if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                        warn!(
+                            "Deferring peer-update handshake for {}: control slow-work cap {} is full",
+                            peer_info.node_id,
+                            MAX_CONTROL_EVENT_SLOW_WORK,
+                        );
+                    } else if let Some(reservation) = self
+                        .reserve_event_initiator_handshake(&peer_info.node_id)
+                        .await
+                    {
+                        let peer_info = peer_info.clone();
+                        slow_work.push(Box::pin(async move {
+                            daemon
+                                .run_event_initiator_handshake(peer_info, reservation)
+                                .await;
+                        }));
                     }
                 }
 
@@ -559,16 +1027,27 @@ impl Daemon {
                             self.dns.unregister(&previous.virtual_ip).await;
                         }
                     }
-                    self.transport.remove_session(&node_id).await;
-                    self.pending_handshakes.lock().await.clear_peer(&node_id);
+                    {
+                        // PeerLeft shares the same short state boundary as
+                        // offer staging. It never holds the arbiter across the
+                        // subsequent UDP lifecycle cleanup.
+                        let _handshake_guard = self.handshake_arbiter.acquire(&node_id).await;
+                        self.transport.remove_session(&node_id).await;
+                        self.pending_handshakes.lock().await.clear_peer(&node_id);
+                    }
                     self.punch_attempts.cancel(&node_id);
-                    self.peers.remove_peer(&node_id).await;
                     if let Some(udp) = self.udp_transport.read().await.clone() {
-                        udp.detach_dynamic_punch_socket(&node_id, "peer_left").await;
-                        // Pending probes of the departed peer are dropped and
-                        // the cleanup epoch moves on: a late ACK handler can
-                        // neither match nor re-insert them.
-                        udp.clear_pending_probes_for_peer(&node_id).await;
+                        // One atomic lifecycle cleanup under the peer's
+                        // adoption lock: the connection removal, the pending
+                        // probe drop with the cleanup-epoch bump, the dynamic
+                        // socket detach and the affinity clear form ONE
+                        // transaction, linearized against every ACK adoption
+                        // for this peer.  A late ACK can neither match, nor
+                        // re-insert, nor leave pool affinity / endpoint /
+                        // candidate state behind for a new identity that
+                        // later rejoins under the same node ID.
+                        udp.cleanup_peer_lifecycle(&node_id, "peer_left", true)
+                            .await;
                     }
                 }
 
@@ -583,6 +1062,7 @@ impl Daemon {
                     handshake_init,
                     punch_at_ms,
                     punch_at_server_ms,
+                    sender_public_key,
                 } => {
                     info!(
                         "Received peer offer from {} ({} candidates)",
@@ -602,51 +1082,181 @@ impl Daemon {
                             ),
                         )
                         .await;
+                    // Signal delivery can race the peer-list poll: an offer
+                    // may be received before PeerJoined has installed the
+                    // sender's static public key.  Do not run candidate
+                    // admission or consume the responder transaction in that
+                    // state.  Enqueue the complete newest offer under the
+                    // existing per-peer owner and replay it once registration
+                    // becomes visible.
+                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                        self.peers
+                            .record_direct_event(
+                                &from_node_id,
+                                "peer_offer_deferred_unknown",
+                                None,
+                                Some(candidates.len()),
+                                None,
+                                "deferred offer until PeerJoined installs peer identity",
+                            )
+                            .await;
+                        let admitted = {
+                            let mut state = self.pending_handshakes.lock().await;
+                            if !state.has_responder_worker(&from_node_id)
+                                && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
+                            {
+                                warn!(
+                                    "Dropping peer offer from {from_node_id}: control slow-work cap {} is full",
+                                    MAX_CONTROL_EVENT_SLOW_WORK,
+                                );
+                                None
+                            } else {
+                                state.enqueue_responder_work(PendingPeerOffer {
+                                    from_node_id: from_node_id.clone(),
+                                    candidates: candidates.clone(),
+                                    candidate_sources: candidate_sources.clone(),
+                                    candidate_generation,
+                                    candidates_expires_at_ms,
+                                    sender_public_key: sender_public_key.clone(),
+                                    handshake_init: handshake_init.clone(),
+                                    punch_at_ms,
+                                    punch_at_server_ms,
+                                    session_id: session_id.clone(),
+                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                })
+                            }
+                        };
+                        if let Some((reservation, offer)) = admitted {
+                            slow_work.push(Box::pin(async move {
+                                daemon
+                                    .run_deferred_peer_offer_worker(offer, reservation)
+                                    .await;
+                            }));
+                        }
+                        continue;
+                    }
                     // Fresh-prediction verification happens BEFORE any
                     // candidate state is touched: a superseded prediction
                     // must not pollute the candidate set, while the handshake
                     // itself is still handled below.  The prepare/apply/commit
                     // transaction is shared with the answer path.
-                    let (_fresh_verdict, candidate_apply_result, fresh_punch, frozen_targets) = self
+                    let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
                         .fresh_prediction_transaction(
                             &from_node_id,
                             &candidates,
                             &candidate_sources,
                             candidate_generation,
                             candidates_expires_at_ms,
+                            sender_public_key.as_deref(),
                         )
                         .await;
                     if !handshake_init.is_empty() {
-                        if let Err(err) = self
-                            .handle_peer_offer(
-                                &from_node_id,
-                                &candidates,
-                                &handshake_init,
-                                punch_at_ms,
-                                punch_at_server_ms,
-                                session_id.clone(),
-                                probe_ephemeral_public_key.clone(),
-                            )
-                            .await
-                        {
-                            warn!("Failed to handle peer offer from {from_node_id}: {err}");
+                        let admitted = {
+                            let mut state = self.pending_handshakes.lock().await;
+                            if !state.has_responder_worker(&from_node_id)
+                                && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
+                            {
+                                warn!(
+                                    "Deferring peer offer from {from_node_id}: control slow-work cap {} is full",
+                                    MAX_CONTROL_EVENT_SLOW_WORK,
+                                );
+                                None
+                            } else {
+                                state.enqueue_responder_work(PendingPeerOffer {
+                                    from_node_id: from_node_id.clone(),
+                                    candidates: candidates.clone(),
+                                    candidate_sources: candidate_sources.clone(),
+                                    candidate_generation,
+                                    candidates_expires_at_ms,
+                                    sender_public_key: sender_public_key.clone(),
+                                    handshake_init: handshake_init.clone(),
+                                    punch_at_ms,
+                                    punch_at_server_ms,
+                                    session_id: session_id.clone(),
+                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                })
+                            }
+                        };
+                        if let Some((mut reservation, mut offer)) = admitted {
+                            slow_work.push(Box::pin(async move {
+                                loop {
+                                    let peer_id = offer.from_node_id.clone();
+                                    if let Err(err) = daemon
+                                        .handle_event_peer_offer(
+                                            offer,
+                                            reservation.owner,
+                                            &mut reservation.cancellation,
+                                        )
+                                        .await
+                                    {
+                                        warn!("Failed to handle peer offer from {peer_id}: {err}");
+                                    }
+                                    let Some(next) = daemon
+                                        .pending_handshakes
+                                        .lock()
+                                        .await
+                                        .finish_responder_work(&peer_id, reservation.owner)
+                                    else {
+                                        break;
+                                    };
+                                    offer = next;
+                                }
+                            }));
                         }
                     }
-                    if candidate_signal_starts_synchronized_punch(
-                        &handshake_init,
-                        candidate_apply_result,
-                    ) {
-                        self.start_hole_punch_at(
-                            &from_node_id,
-                            punch_at_ms,
-                            fresh_punch,
-                            frozen_targets,
-                        )
-                        .await;
-                    } else {
-                        debug!(
-                            "Skipping synchronized punch for rejected candidate-only offer from {from_node_id}: {candidate_apply_result:?}"
-                        );
+                    match fresh_punch {
+                        // A valid fresh snapshot punches its frozen targets at
+                        // FRESH priority, always.
+                        FreshPunchDecision::Fresh(id, frozen_targets) => {
+                            self.start_hole_punch_at(
+                                &from_node_id,
+                                punch_at_ms,
+                                Some(id),
+                                Some(frozen_targets),
+                            )
+                            .await;
+                        }
+                        // An expired or empty committed snapshot must never
+                        // claim fresh priority or fall back to the shared
+                        // candidates as a fresh signal: only a handshake-
+                        // carrying offer degrades to an ordinary priority
+                        // punch; a candidate-only offer is ignored.
+                        FreshPunchDecision::Degraded => {
+                            if !handshake_init.is_empty() {
+                                debug!(
+                                    "Degrading synchronized punch for {from_node_id}: the fresh snapshot is expired or empty; punching at ordinary priority"
+                                );
+                                self.start_hole_punch_at(
+                                    &from_node_id,
+                                    punch_at_ms,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    "Skipping punch for candidate-only offer from {from_node_id}: its fresh snapshot is expired or empty"
+                                );
+                            }
+                        }
+                        FreshPunchDecision::None => {
+                            if candidate_signal_starts_synchronized_punch(
+                                &handshake_init,
+                                candidate_apply_result,
+                            ) {
+                                self.start_hole_punch_at(
+                                    &from_node_id,
+                                    punch_at_ms,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    "Skipping synchronized punch for rejected candidate-only offer from {from_node_id}: {candidate_apply_result:?}"
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -661,6 +1271,7 @@ impl Daemon {
                     handshake_response,
                     punch_at_ms,
                     punch_at_server_ms: _,
+                    sender_public_key,
                 } => {
                     info!(
                         "Received peer answer from {} ({} candidates)",
@@ -682,13 +1293,14 @@ impl Daemon {
                         .await;
                     // Fresh-prediction verification happens BEFORE any
                     // candidate state is touched (see the offer path).
-                    let (_fresh_verdict, candidate_apply_result, fresh_punch, frozen_targets) = self
+                    let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
                         .fresh_prediction_transaction(
                             &from_node_id,
                             &candidates,
                             &candidate_sources,
                             candidate_generation,
                             candidates_expires_at_ms,
+                            sender_public_key.as_deref(),
                         )
                         .await;
                     if !handshake_response.is_empty() {
@@ -704,21 +1316,52 @@ impl Daemon {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
                         }
                     }
-                    if candidate_signal_starts_synchronized_punch(
-                        &handshake_response,
-                        candidate_apply_result,
-                    ) {
-                        self.start_hole_punch_at(
-                            &from_node_id,
-                            punch_at_ms,
-                            fresh_punch,
-                            frozen_targets,
-                        )
-                        .await;
-                    } else {
-                        debug!(
-                            "Skipping synchronized punch for rejected candidate-only answer from {from_node_id}: {candidate_apply_result:?}"
-                        );
+                    match fresh_punch {
+                        FreshPunchDecision::Fresh(id, frozen_targets) => {
+                            self.start_hole_punch_at(
+                                &from_node_id,
+                                punch_at_ms,
+                                Some(id),
+                                Some(frozen_targets),
+                            )
+                            .await;
+                        }
+                        FreshPunchDecision::Degraded => {
+                            if !handshake_response.is_empty() {
+                                debug!(
+                                    "Degrading synchronized punch for {from_node_id}: the fresh snapshot is expired or empty; punching at ordinary priority"
+                                );
+                                self.start_hole_punch_at(
+                                    &from_node_id,
+                                    punch_at_ms,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    "Skipping punch for candidate-only answer from {from_node_id}: its fresh snapshot is expired or empty"
+                                );
+                            }
+                        }
+                        FreshPunchDecision::None => {
+                            if candidate_signal_starts_synchronized_punch(
+                                &handshake_response,
+                                candidate_apply_result,
+                            ) {
+                                self.start_hole_punch_at(
+                                    &from_node_id,
+                                    punch_at_ms,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    "Skipping synchronized punch for rejected candidate-only answer from {from_node_id}: {candidate_apply_result:?}"
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -727,90 +1370,30 @@ impl Daemon {
                     observed_endpoint,
                     punch_at_ms,
                 } => {
-                    let already_direct = self
-                        .peers
-                        .should_defer_relay_assisted_punch(&from_node_id)
-                        .await;
-                    let local_candidate_changed = self
-                        .add_local_peer_reflexive_candidate(&observed_endpoint)
-                        .await;
-                    if let Ok(observed_addr) = observed_endpoint.parse::<SocketAddr>() {
-                        self.peers
-                            .record_fresh_mapping_prediction_result(&from_node_id, observed_addr)
-                            .await;
-                    }
-                    let punch_at_ms =
-                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms()));
-                    let (candidates, candidate_sources) =
-                        self.current_local_candidate_set().await;
-                    let selected_remote_endpoint = self
-                        .peers
-                        .selected_direct_endpoint_for_consent(&from_node_id)
-                        .await;
-                    let schedule_punch = !already_direct;
-                    let skip_reason = if already_direct {
-                        Some("direct_confirmed_healthy")
-                    } else {
-                        None
+                    let work = PendingPeerReflexive {
+                        from_node_id: from_node_id.clone(),
+                        observed_endpoint,
+                        punch_at_ms,
                     };
-                    self.peers
-                        .record_direct_event(
-                            &from_node_id,
-                            "peer_reflexive_received",
-                            observed_endpoint.parse().ok(),
-                            Some(candidates.len()),
-                            None,
-                            format!(
-                                "peer observed our UDP source as {observed_endpoint}; already_advertised={} already_direct={already_direct} selected_remote_endpoint={:?} schedule_punch={schedule_punch} skip_reason={skip_reason:?}",
-                                !local_candidate_changed,
-                                selected_remote_endpoint,
-                            ),
-                        )
-                        .await;
-                    if already_direct {
-                        continue;
-                    }
-                    if local_candidate_changed && !candidates.is_empty() {
-                        if let Err(err) = self
-                            .control
-                            .send_peer_offer_with_sources_and_punch_at(
-                                &from_node_id,
-                                &candidates,
-                                &candidate_sources,
-                                &[],
-                                punch_at_ms,
-                                None,
-                            )
-                            .await
+                    let admitted = {
+                        let mut state = self.pending_handshakes.lock().await;
+                        if !state.has_peer_reflexive_worker(&from_node_id)
+                            && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
                         {
                             warn!(
-                                "Failed to re-advertise peer-reflexive local candidate to {from_node_id}: {err}"
+                                "Dropping peer-reflexive work for {from_node_id}: control slow-work cap {} is full",
+                                MAX_CONTROL_EVENT_SLOW_WORK,
                             );
+                            None
                         } else {
-                            self.peers
-                                .record_direct_event(
-                                    &from_node_id,
-                                    "peer_reflexive_offer_sent",
-                                    observed_endpoint.parse().ok(),
-                                    Some(candidates.len()),
-                                    None,
-                                    "re-advertised local candidates after peer-reflexive observation",
-                                )
-                                .await;
+                            state.enqueue_peer_reflexive_work(work)
                         }
-                    } else if !local_candidate_changed {
-                        self.peers
-                            .record_direct_event(
-                                &from_node_id,
-                                "peer_reflexive_offer_skipped",
-                                observed_endpoint.parse().ok(),
-                                Some(candidates.len()),
-                                None,
-                                "peer-reflexive candidate already advertised; skipped full offer re-advertisement",
-                            )
-                            .await;
+                    };
+                    if let Some((reservation, work)) = admitted {
+                        slow_work.push(Box::pin(async move {
+                            daemon.run_peer_reflexive_worker(work, reservation).await;
+                        }));
                     }
-                    self.start_hole_punch_at(&from_node_id, punch_at_ms, None, None).await;
                 }
 
                 ControlEvent::PeerRejected {
@@ -858,5 +1441,10 @@ impl Daemon {
                 }
             }
         }
+        // Drop all borrowed background work before restoring the receiver.
+        // Dropping these futures also releases any STUN/HTTP wait promptly on
+        // daemon shutdown rather than leaving detached work behind.
+        drop(slow_work);
+        self.control_rx = control_rx;
     }
 }

@@ -4,7 +4,7 @@
 //! fetch, endpoint lease refresh, signal send/poll, peer polling and tunnel
 //! creation. Split out of `control.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use p2pnet_crypto::Ed25519KeyPair;
 use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::error::{DaemonError, Result};

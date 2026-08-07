@@ -1,6 +1,6 @@
 impl Daemon {
     async fn handle_peer_answer(
-        &mut self,
+        &self,
         from_node_id: &str,
         handshake_response: &[u8],
         session_id: Option<String>,

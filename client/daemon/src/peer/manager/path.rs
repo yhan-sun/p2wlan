@@ -127,6 +127,21 @@ impl PeerManager {
             .contains(node_id)
     }
 
+    /// Whether a peer is still eligible to receive a newly allocated
+    /// direct-validation worker. This deliberately distinguishes an offline
+    /// peer retained for diagnostics from a live peer: lifecycle cleanup can
+    /// cancel an old owner, and queued observations must not immediately
+    /// recreate one for a Closed/offline connection.
+    pub(crate) async fn is_direct_validation_eligible(&self, node_id: &str) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|connection| {
+                connection.online && connection.state != ConnectionState::Closed
+            })
+    }
+
     /// Whether relay-assisted punching should be deferred for a peer that is
     /// already on a healthy confirmed Direct path.
     ///

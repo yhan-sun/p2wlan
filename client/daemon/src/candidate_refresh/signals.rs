@@ -2,6 +2,7 @@ pub(super) fn advertised_udp_endpoint(
     local_addr: SocketAddr,
     configured: Option<&str>,
     candidates: &[String],
+    include_host_candidate: bool,
 ) -> Option<String> {
     if let Some(endpoint) = configured
         .map(str::trim)
@@ -10,7 +11,7 @@ pub(super) fn advertised_udp_endpoint(
         return Some(endpoint.to_string());
     }
 
-    if !local_addr.ip().is_unspecified() {
+    if include_host_candidate && !local_addr.ip().is_unspecified() {
         return Some(local_addr.to_string());
     }
 

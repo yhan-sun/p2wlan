@@ -106,6 +106,8 @@ impl Config {
                 socket_pool_enabled: false,
                 socket_pool_size: default_socket_pool_size(),
                 fresh_mapping_punch_enabled: true,
+                fresh_mapping_harness_loopback: false,
+                gather_host_candidates: true,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),

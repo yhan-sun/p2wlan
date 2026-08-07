@@ -281,7 +281,7 @@ let udp_direct_context = UdpDirectTaskContext {
     nat_profile: self.nat_profile.clone(),
     gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
     gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
-    udp_transport: self.udp_transport.clone(),
+    udp_transport_publication: self.udp_transport_publication.clone(),
     direct_validation_transport: self.transport.clone(),
     direct_validation_local_ip: self.config.network.virtual_ip.clone(),
     udp_inbound_tx: network_inbound_tx.clone(),
@@ -297,6 +297,7 @@ let udp_direct_context = UdpDirectTaskContext {
     udp_punch_interval: punch_interval,
     udp_punch_attempts: punch_attempts,
     boot_epoch_ms: self.boot_epoch_ms,
+    shutdown_rx: self.shutdown_rx.clone(),
 };
 self.task_manager
     .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
@@ -381,6 +382,11 @@ self.task_manager
         if let Some(udp) = self.udp_transport.read().await.clone() {
             udp.detach_all_dynamic_punch_sockets("daemon_shutdown").await;
         }
+        // Withdraw the live publication before background tasks are aborted so
+        // inbound consumers and the instance-owned peer-reflexive worker see
+        // a deterministic shutdown transition instead of retaining a stale
+        // socket clone through daemon teardown.
+        self.udp_transport_publication.clear_current().await;
         self.request_shutdown();
         let _ = self.control.shutdown().await;
         self.task_manager.shutdown_all(Duration::from_secs(5)).await;

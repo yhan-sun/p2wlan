@@ -206,6 +206,7 @@ impl RelayTransport {
                             relay_endpoint: Some(self.relay_endpoint.clone()),
                             relay_peer_id: Some(from_node),
                             socket_index: None,
+                            udp_transport_owner: None,
                             wire_bytes: data,
                         })
                         .await

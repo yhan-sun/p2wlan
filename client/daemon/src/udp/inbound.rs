@@ -159,21 +159,29 @@ impl UdpTransport {
             // would block in `recv_from` for as long as the socket Arc it
             // itself holds keeps the file descriptor alive — a socket/reader
             // leak.
+            //
+            // The exit decision reads the VALUE itself (`borrow_and_update`)
+            // and never relies on `has_changed()` after `changed()`: `changed`
+            // consumes the notification, so `has_changed()` afterwards can
+            // report false even though the stop value is already visible —
+            // the reader would spin forever instead of exiting.
             let packet = match shutdown_rx.as_deref_mut() {
                 Some(shutdown_rx) => {
                     tokio::select! {
-                        _ = shutdown_rx.changed() => {
-                            // The sender was dropped (pre-insert cancellation)
-                            // or the stop signal was sent (detach): either way
-                            // the reader must exit.  `borrow()` would panic on
-                            // the closed channel, so the value is only read
-                            // when `changed()` reported an actual change.
-                            match shutdown_rx.has_changed() {
-                                Ok(true) if *shutdown_rx.borrow_and_update() => {
+                        change = shutdown_rx.changed() => {
+                            match change {
+                                // The sender was dropped (pre-insert
+                                // cancellation) or the stop signal was sent
+                                // (detach after the drain finished): either
+                                // way the reader must exit.
+                                Err(_) => return Ok(()),
+                                Ok(()) if *shutdown_rx.borrow_and_update() => {
                                     return Ok(());
                                 }
-                                Err(_) => return Ok(()),
-                                _ => continue,
+                                // A notification without the stop value (only
+                                // possible if a future change type is added):
+                                // keep receiving.
+                                Ok(()) => continue,
                             }
                         }
                         packet = socket.recv_from(&mut buf) => packet,
@@ -479,8 +487,7 @@ impl UdpTransport {
                             SocketEvidence::Fresh,
                         )
                         .await;
-                        self.notify_peer_reflexive_observation(&identity.source_node_id, source)
-                            .await;
+                        self.notify_peer_reflexive_observation(&identity.source_node_id, source);
 
                         if ack_sent {
                             debug!(
@@ -615,11 +622,7 @@ impl UdpTransport {
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;
-                            self.notify_peer_reflexive_observation(
-                                &identity.source_node_id,
-                                source,
-                            )
-                            .await;
+                            self.notify_peer_reflexive_observation(&identity.source_node_id, source);
                             let accepted = self
                                 .peers
                                 .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
@@ -631,6 +634,16 @@ impl UdpTransport {
                                 )
                                 .await;
                             if accepted {
+                                // A matched ACK is the most reliable proof that
+                                // the peer's mapping works RIGHT NOW: fire the
+                                // daemon-internal encrypted validation toward
+                                // the ACK's source so both sides converge to
+                                // Direct without user traffic.
+                                self.trigger_encrypted_validation(
+                                    &identity.source_node_id,
+                                    source,
+                                )
+                                .await;
                                 if purpose == PendingProbePurpose::ConsentCheck {
                                     self.peers
                                         .record_direct_event(
@@ -719,8 +732,7 @@ impl UdpTransport {
                                         SocketEvidence::Fresh,
                                     )
                                     .await;
-                                    self.notify_peer_reflexive_observation(&peer_id, source)
-                                        .await;
+                                    self.notify_peer_reflexive_observation(&peer_id, source);
                                     self.trigger_peer_reflexive_check(
                                         socket_index,
                                         &peer_id,
@@ -829,8 +841,7 @@ impl UdpTransport {
                                     SocketEvidence::Stamped(socket_epoch),
                                 )
                                 .await;
-                                self.notify_peer_reflexive_observation(&peer_id, source)
-                                    .await;
+                                self.notify_peer_reflexive_observation(&peer_id, source);
                                 let accepted = self
                                     .peers
                                     .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
@@ -842,6 +853,8 @@ impl UdpTransport {
                                     )
                                     .await;
                                 if accepted {
+                                    self.trigger_encrypted_validation(&peer_id, source)
+                                        .await;
                                     if purpose == PendingProbePurpose::ConsentCheck {
                                         self.peers
                                             .record_direct_event(
@@ -912,6 +925,12 @@ impl UdpTransport {
                     relay_endpoint: None,
                     relay_peer_id: None,
                     socket_index: Some(socket_index),
+                    // The token is sampled at enqueue time, not when the
+                    // WireGuard worker later decrypts this datagram. A
+                    // publication replacement can therefore reject a queued
+                    // packet from the retired reader instead of treating it
+                    // as evidence for the replacement socket.
+                    udp_transport_owner: Some(self.inbound_publication_owner()),
                     wire_bytes: data.to_vec(),
                 })
                 .await

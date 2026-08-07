@@ -21,6 +21,10 @@ async fn run_control_loop(
         token.clone()
     };
     let signal_signing_identity = SignalSigningIdentity::from_config(&config);
+    // Bounded cache of recently processed signal IDs: a redelivered batch
+    // (lost ACK, expired lease) is deduped by signal id.
+    let recent_signal_ids: Arc<tokio::sync::Mutex<VecDeque<String>>> =
+        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
 
     info!("Connecting to control plane at {base_url}");
 
@@ -192,7 +196,7 @@ async fn run_control_loop(
         } else {
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
-        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
+        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await {
             warn!("Initial signal polling failed: {err}");
             let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
@@ -296,7 +300,7 @@ async fn run_control_loop(
                     }
                 }
                 Some(()) = signal_wake_rx.recv() => {
-                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0).await {
+                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await {
                         Ok(()) => {
                             signal_failures = 0;
                             last_signal_reconcile = Instant::now();
@@ -323,7 +327,7 @@ async fn run_control_loop(
                         continue;
                     }
                     let wait_ms = if ws_connected { 0 } else { SIGNAL_LONG_POLL_WAIT_MS };
-                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, wait_ms).await {
+                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, wait_ms, &recent_signal_ids).await {
                         Ok(()) => {
                             signal_failures = 0;
                             if ws_connected {

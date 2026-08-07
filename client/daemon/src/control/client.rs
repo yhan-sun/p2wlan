@@ -110,15 +110,26 @@ impl ControlClient {
         candidates: &[String],
         handshake_init: &[u8],
     ) -> Result<()> {
-        self.send_peer_offer_with_sources_and_punch_at(
-            to_node_id,
-            candidates,
-            &HashMap::new(),
-            handshake_init,
-            None,
-            None,
-        )
-        .await
+        match self
+            .send_peer_offer_with_sources_and_punch_at(
+                to_node_id,
+                candidates,
+                &HashMap::new(),
+                handshake_init,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(PeerOfferSendFailure::Cancelled) => Ok(()),
+            Err(PeerOfferSendFailure::SendFailed) => {
+                Err(DaemonError::ControlPlane("peer offer send failed".into()))
+            }
+            Err(PeerOfferSendFailure::ChannelClosed) => {
+                Err(DaemonError::ControlPlane("command channel closed".into()))
+            }
+        }
     }
 
     /// Send a peer offer with optional candidate source metadata.
@@ -129,15 +140,26 @@ impl ControlClient {
         candidate_sources: &HashMap<String, String>,
         handshake_init: &[u8],
     ) -> Result<()> {
-        self.send_peer_offer_with_sources_and_punch_at(
-            to_node_id,
-            candidates,
-            candidate_sources,
-            handshake_init,
-            None,
-            None,
-        )
-        .await
+        match self
+            .send_peer_offer_with_sources_and_punch_at(
+                to_node_id,
+                candidates,
+                candidate_sources,
+                handshake_init,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(PeerOfferSendFailure::Cancelled) => Ok(()),
+            Err(PeerOfferSendFailure::SendFailed) => {
+                Err(DaemonError::ControlPlane("peer offer send failed".into()))
+            }
+            Err(PeerOfferSendFailure::ChannelClosed) => {
+                Err(DaemonError::ControlPlane("command channel closed".into()))
+            }
+        }
     }
 
     /// Send a peer offer with candidate sources and an optional synchronized punch window.
@@ -145,7 +167,9 @@ impl ControlClient {
     /// `fresh_ownership` optionally carries the punch-session cancellation for
     /// a fresh-mapping prediction advertisement: the HTTP worker refuses to
     /// send once the session was superseded, so a stale prediction can never
-    /// reach the wire after its owner was cancelled.
+    /// reach the wire after its owner was cancelled.  The outcome reports
+    /// whether the signal was really sent (`Sent`), was revoked before the
+    /// request (`Cancelled`) or failed (`Failed`).
     pub(crate) async fn send_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,
@@ -154,7 +178,7 @@ impl ControlClient {
         handshake_init: &[u8],
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
@@ -168,10 +192,13 @@ impl ControlClient {
                 fresh_ownership,
                 response_tx,
             })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
+            .map_err(|_| PeerOfferSendFailure::ChannelClosed)?;
+        match response_rx.await {
+            Ok(PeerOfferSendOutcome::Sent) => Ok(()),
+            Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),
+            Ok(PeerOfferSendOutcome::Failed) => Err(PeerOfferSendFailure::SendFailed),
+            Err(_) => Err(PeerOfferSendFailure::ChannelClosed),
+        }
     }
 
     /// Send a fresh-mapping prediction advertisement.
@@ -180,6 +207,10 @@ impl ControlClient {
     /// `peer_offer_fresh` signal type (queue key), so an ordinary candidate
     /// refresh can never overwrite the predicted window on the server, and the
     /// server's per-pair ordering delivers it in send order.
+    ///
+    /// Returns `Err(PeerOfferSendFailure::Cancelled)` when the ownership was
+    /// revoked before the HTTP request: the caller must NOT treat the
+    /// prediction as advertised and must NOT finalize the generation's socket.
     pub(crate) async fn send_fresh_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,
@@ -188,7 +219,7 @@ impl ControlClient {
         handshake_init: &[u8],
         punch_at_ms: Option<u64>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
@@ -202,10 +233,13 @@ impl ControlClient {
                 fresh_ownership: Some(fresh_ownership),
                 response_tx,
             })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
+            .map_err(|_| PeerOfferSendFailure::ChannelClosed)?;
+        match response_rx.await {
+            Ok(PeerOfferSendOutcome::Sent) => Ok(()),
+            Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),
+            Ok(PeerOfferSendOutcome::Failed) => Err(PeerOfferSendFailure::SendFailed),
+            Err(_) => Err(PeerOfferSendFailure::ChannelClosed),
+        }
     }
 
     /// Send a peer offer with an explicit traversal session ID.
@@ -234,9 +268,14 @@ impl ControlClient {
                 response_tx,
             })
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| DaemonError::ControlPlane("peer offer response channel closed".into()))?
+        match response_rx.await {
+            Ok(PeerOfferSendOutcome::Sent) => Ok(()),
+            Ok(PeerOfferSendOutcome::Cancelled) => Ok(()),
+            Ok(PeerOfferSendOutcome::Failed) => Err(DaemonError::ControlPlane(
+                "peer offer send failed".into(),
+            )),
+            Err(_) => Err(DaemonError::ControlPlane("peer offer response channel closed".into())),
+        }
     }
 
     /// Send a peer answer.

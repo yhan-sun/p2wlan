@@ -71,7 +71,7 @@ use p2pnet_crypto::{DhKeyPair, NodeIdentity};
 use p2pnet_nat::{CandidateGatherReport, CandidateSource, MappingBehavior, NatProfile};
 use rand::RngCore;
 use tokio::net::{lookup_host, UdpSocket};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
@@ -94,7 +94,7 @@ use candidate_refresh::{
 };
 #[cfg(test)]
 use control::RelayCatalogEntry;
-use control::{ControlClient, ControlEvent};
+use control::{ControlClient, ControlEvent, PeerOfferSendFailure};
 use dataplane::{DataPlane, InboundPacket, OutboundPacket};
 use diagnostics::{
     run_diagnostics_server_with_retry, run_speedtest_server_with_retry, DiagnosticsContext,
@@ -123,14 +123,16 @@ use relay_runtime::{
 #[cfg(test)]
 use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, RelayValidationPacket};
 #[cfg(test)]
+use transport::parse_direct_validation_token;
+#[cfg(test)]
 use transport::EncryptedPeerPacket;
 use transport::{
-    OrderedEncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionCommit,
-    ResponderSessionStage, WireGuardTransport,
+    build_direct_validation_payload, DirectValidationKind, OrderedEncryptedPeerPacket,
+    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, WireGuardTransport,
 };
 use udp::{
-    FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveObservation,
-    PunchSendReport, UdpTransport,
+    FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveIngress,
+    PeerReflexiveObservation, PunchSendReport, UdpTransport,
 };
 
 include!("lib/pending_handshake.rs");
@@ -138,9 +140,17 @@ include!("lib/pending_handshake.rs");
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Initial signaling should retry quickly; the independent background punch
 /// session can continue while a lost offer/answer is retried.
-const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+///
+/// The timeout must cover the full control-plane offer/answer round trip,
+/// not just the send: each leg rides a peer poll (default 5s), the responder
+/// refreshes its candidates before answering (a STUN gather takes 10-15s on
+/// the field, and the whole round trip has been measured up to ~48s), and a
+/// late answer must still match its pending session_id instead of being
+/// discarded as stale — otherwise the WireGuard session never forms and the
+/// direct-validation path can never promote the peer.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 60;
 /// Rekeys must retry several times before the old 180-second key lifetime ends.
-const REKEY_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const REKEY_HANDSHAKE_TIMEOUT_SECS: u64 = 45;
 /// Retain the exact responder answer/key material long enough to replay a
 /// duplicate offer idempotently instead of generating a second Noise session.
 const RESPONDER_HANDSHAKE_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -199,16 +209,14 @@ const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(500);
 const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
 /// Ignore very stale relay-assisted windows and punch immediately instead.
 const RELAY_ASSISTED_PUNCH_STALE_AFTER: Duration = Duration::from_secs(3);
-/// Re-advertise peer-reflexive observations a few times during the most useful
-/// NAT opening window. The UDP layer already rate-limits duplicate observations,
-/// so this stays bounded while giving the remote side several chances to catch
-/// the learned source port.
-const PEER_REFLEXIVE_SIGNAL_DELAYS: [Duration; 4] = [
-    Duration::ZERO,
-    Duration::from_millis(80),
-    Duration::from_millis(250),
-    Duration::from_millis(700),
-];
+/// A peer-reflexive endpoint is relayed at most once per peer in this normal
+/// cadence.  New observations are coalesced to the newest endpoint rather
+/// than producing a fixed burst of HTTP POSTs for every NAT port change.
+const PEER_REFLEXIVE_SIGNAL_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// HTTP 429 is a strong server-side back-pressure signal.  Retain only the
+/// newest observation and retry it after this exponentially increasing delay.
+const PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL: Duration = Duration::from_secs(2);
+const PEER_REFLEXIVE_SIGNAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// When an authenticated Probe v2 source address is observed, send a tiny
 /// endpoint-specific burst immediately.  This keeps the just-discovered NAT
 /// mapping warm without waiting behind the peer-wide synchronized punch lease.
@@ -219,20 +227,44 @@ const PEER_REFLEXIVE_FAST_PUNCH_ATTEMPTS: u32 = 2;
 /// public ports. This is a NAT-state maintainer, not a data-path keepalive.
 const HARD_NAT_MAINTAINER_CONNECTING_INTERVAL: Duration = Duration::from_millis(150);
 const HARD_NAT_MAINTAINER_CONNECTING_DURATION: Duration = Duration::from_secs(60);
-/// Send a few real encrypted packets over a freshly observed UDP path. The
-/// packets are valid ICMP echo requests, so the remote TUN can answer and both
-/// sides can confirm the WireGuard data path without waiting for user traffic.
-const DIRECT_ENCRYPTED_VALIDATION_DELAYS: [Duration; 3] = [
+/// Send a few encrypted direct-validation requests over a freshly observed
+/// UDP path and wait for the peer's daemon-internal ACK.
+///
+/// The request/ACK protocol is fully daemon-internal and authenticated by the
+/// WireGuard session: neither side needs TUN, an OS ICMP echo reply, or user
+/// traffic.  The responder validates the request (peer identity via the
+/// session, network generation via the embedded token), promotes itself to
+/// Direct on a valid request and returns an idempotent ACK; the initiator
+/// promotes to Direct when the ACK matches the outstanding request token.
+const DIRECT_VALIDATION_REQUEST_DELAYS: [Duration; 3] = [
     Duration::ZERO,
     Duration::from_millis(80),
     Duration::from_millis(250),
 ];
+/// How long the initiator waits for the validation ACK before retrying.
+const DIRECT_VALIDATION_ACK_WAIT: Duration = Duration::from_millis(750);
 /// A peer-reflexive ACK can arrive before the offer/answer handler installs the
 /// WireGuard session. Keep the observed NAT mapping alive while waiting for the
 /// handshake instead of permanently discarding the only useful endpoint.
-const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(8);
+///
+/// The wait must cover the full control-plane handshake round trip (offer ->
+/// peer poll -> responder candidate refresh -> answer -> peer poll), which is
+/// deliberately longer than the bounded re-initiation cadence: a validation
+/// that gives up mid-handshake only re-fires on the next matched ACK, adding
+/// tens of seconds to convergence.
+const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(45);
 const DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL: Duration = Duration::from_millis(50);
-const DIRECT_ENCRYPTED_VALIDATION_PAYLOAD: &[u8] = b"p2wlan-direct-validation";
+/// ICMP echo-request payload prefix marking a daemon-internal direct
+/// validation REQUEST. The token contains network generation (8 bytes BE),
+/// request id (2 bytes BE), attempt sequence (1 byte), and validation-session
+/// owner token (8 bytes BE).
+const DIRECT_VALIDATION_REQUEST_PAYLOAD: &[u8] = b"p2wlan-direct-validation-req";
+/// ICMP echo-request payload prefix marking the daemon-internal direct
+/// validation ACK.  Carries the mirrored token of the request it answers.
+const DIRECT_VALIDATION_ACK_PAYLOAD: &[u8] = b"p2wlan-direct-validation-ack";
+/// How long a validation ACK may lag behind its request before the token is
+/// considered stale and must not confirm the path.
+const DIRECT_VALIDATION_EXPECTATION_TTL: Duration = Duration::from_secs(8);
 /// Explicitly prove answer adoption even when a healthy Direct path suppresses
 /// the ordinary punch scheduler and no user traffic is flowing.
 const REKEY_CONFIRMATION_DELAYS: [Duration; 9] = [
@@ -327,6 +359,7 @@ pub(crate) fn fresh_prediction_source_label(id: FreshPredictionId) -> String {
 }
 
 include!("lib/punch_dedup.rs");
+include!("lib/daemon/udp_transport_slot.rs");
 include!("lib/daemon/core.rs");
 include!("lib/daemon/udp_direct.rs");
 include!("lib/daemon/handshake_maintenance.rs");

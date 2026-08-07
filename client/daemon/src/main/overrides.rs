@@ -104,6 +104,12 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.prefer_direct {
         config.relay.prefer_direct = true;
     }
+    if cli.fresh_mapping_harness_loopback {
+        config.network.fresh_mapping_harness_loopback = true;
+    }
+    if cli.no_host_candidates {
+        config.network.gather_host_candidates = false;
+    }
     if let Some(ref name) = cli.device_name {
         config.node.device_name = name.clone();
     }

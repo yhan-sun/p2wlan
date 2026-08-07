@@ -103,26 +103,26 @@ impl MappingBatch {
         iter.all(|ip| ip == first).then_some(first)
     }
 
-    /// Whether every observation used the same local socket and generation.
+    /// Whether every observation used the same local socket and preserves
+    /// request-send order.
     ///
-    /// Mixed sockets, generations or send-order duplication invalidate a
-    /// batch and must never feed a model.
+    /// Mixed sockets, reordered observations or duplicated sequence numbers
+    /// invalidate a batch and must never feed a model. A timed-out observer
+    /// is deliberately omitted by the collector, so successful observations
+    /// may have sequence gaps (for example `0, 2, 3`). Gaps do not make the
+    /// remaining send-ordered samples unsafe to model.
     pub fn is_consistent(&self) -> bool {
-        let mut sequences = Vec::with_capacity(self.observations.len());
+        let mut previous_sequence = None;
         for observation in &self.observations {
             if observation.local_endpoint != self.socket_identity {
                 return false;
             }
-            if sequences.contains(&observation.sequence) {
+            if previous_sequence.is_some_and(|previous| observation.sequence <= previous) {
                 return false;
             }
-            sequences.push(observation.sequence);
+            previous_sequence = Some(observation.sequence);
         }
-        sequences.sort_unstable();
-        sequences
-            .iter()
-            .enumerate()
-            .all(|(index, sequence)| *sequence == index as u16)
+        true
     }
 
     /// Whether the whole batch is newer than `max_age`.
@@ -165,6 +165,12 @@ pub enum PortModelKind {
     /// mappings consumed between our own requests (e.g. `1,1,2` or
     /// `1,1,4`).  The prediction still walks the dominant step.
     NoisyLinear { step: i16 },
+    /// Every observed allocation moved in the same direction, but no exact
+    /// step dominated. This occurs on a shared CGNAT whose other clients
+    /// consume a small, variable number of ports between our requests. The
+    /// result deliberately emits only the fixed-size adjacent-port window in
+    /// that direction; it never pretends that any one stride is known.
+    MonotonicWindow { direction: i8 },
     /// Deltas repeat with a fixed period (e.g. `+1,-1,+1,-1`).
     Periodic { steps: Vec<i16> },
     /// All observed ports identical: endpoint-independent mapping.
@@ -180,6 +186,7 @@ impl PortModelKind {
             PortModelKind::FixedStep { .. } => "fixed_step",
             PortModelKind::Linear { .. } => "linear",
             PortModelKind::NoisyLinear { .. } => "noisy_linear",
+            PortModelKind::MonotonicWindow { .. } => "monotonic_window",
             PortModelKind::Periodic { .. } => "periodic",
             PortModelKind::Stable => "stable",
             PortModelKind::Unpredictable { .. } => "unpredictable",
@@ -420,6 +427,31 @@ pub fn build_model(
         }
     }
 
+    // Real shared CGNATs can consume a variable number of consecutive ports
+    // between our sequential STUN requests. The Mini-Air trace, for example,
+    // measured `+14,+14,+5` and later `+1,+7,+3`: all allocations advanced
+    // in one direction, but there was no reusable stride. Rejecting those
+    // batches meant we never advertised any fresh mapping prediction at all.
+    // Treat only *small* monotonic jumps as a low-confidence adjacent-port
+    // window. The bound is exactly the wire/probe cap, so this cannot turn a
+    // weak sample into an unbounded birthday scan or claim a false step.
+    if same_direction
+        && deltas
+            .iter()
+            .all(|delta| delta.unsigned_abs() as usize <= MAX_PREDICTED_PORTS)
+    {
+        return PortModel {
+            kind: PortModelKind::MonotonicWindow {
+                direction: if positive { 1 } else { -1 },
+            },
+            confidence: 60,
+            public_ip,
+            sequence: sequence.to_vec(),
+            deltas,
+            sampled_at_ms,
+        };
+    }
+
     let narrow_random = deltas
         .iter()
         .all(|delta| delta.unsigned_abs() <= 16 && *delta != 0);
@@ -557,6 +589,21 @@ pub fn predict_ports_for_elapsed(
                 });
             }
         }
+        PortModelKind::MonotonicWindow { direction } => {
+            // There is no justified top-1 stride here. Probe the bounded
+            // adjacent window in the observed allocation direction, retaining
+            // the rank only as a deterministic send order.
+            let step = i16::from(direction);
+            for distance in 1..=MAX_PREDICTED_PORTS {
+                candidates.push(PredictionCandidate {
+                    port: modular_add(last, step.saturating_mul(distance as i16)),
+                    rank: (distance - 1) as u8,
+                    reason: PredictionReason::LowConfidenceWindow {
+                        distance: distance as u8,
+                    },
+                });
+            }
+        }
         PortModelKind::Unpredictable { .. } => {}
     }
 
@@ -580,6 +627,7 @@ fn extra_window_ports(model: &PortModel, measurement_span_ms: u64, gap_ms: u64) 
         PortModelKind::FixedStep { step }
         | PortModelKind::Linear { step }
         | PortModelKind::NoisyLinear { step } => step,
+        PortModelKind::MonotonicWindow { .. } => return 0,
         _ => return 0,
     };
     let mut excess_ports = 0u64;
@@ -866,6 +914,20 @@ mod tests {
     }
 
     #[test]
+    fn successful_samples_with_a_timed_out_observer_keep_send_order() {
+        // A collector retains only successful observations. A timeout at
+        // sequence 1 must not make the valid request order 0,2,3 look like a
+        // mixed batch: it still has three measurements from one socket.
+        let mut batch = consistent_batch(&[33051, 33052, 33054]);
+        batch.observations[1].sequence = 2;
+        batch.observations[2].sequence = 3;
+
+        assert!(batch.is_consistent());
+        let model = build_model_for_batch(&batch, Duration::from_secs(5), 2000).unwrap();
+        assert!(model.kind.clone().is_predictable(), "{:?}", model.kind);
+    }
+
+    #[test]
     fn negative_step_predicts_backward() {
         let ports = [20010, 20007, 20004];
         let model = build_model(&ports, Some(ip()), 1000);
@@ -907,6 +969,40 @@ mod tests {
         );
         let predicted = predict_ports(&model, 33055);
         assert_eq!(predicted[0].port, 33056);
+    }
+
+    #[test]
+    fn shared_cgnat_monotonic_jitter_uses_bounded_adjacent_window() {
+        // Captured from the Mini-Air AddressOrPortDependent side on one fresh
+        // socket: all mappings advanced, but shared traffic made the deltas
+        // +14,+14,+5. There is no safe fixed stride; the only supported
+        // fallback is the capped +1..+24 successor window.
+        let ports = [62364u16, 62378, 62392, 62397];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(
+            model.kind,
+            PortModelKind::MonotonicWindow { direction: 1 }
+        ));
+        assert_eq!(model.confidence, 60);
+
+        let predicted = predict_ports(&model, 62397);
+        assert_eq!(predicted.len(), MAX_PREDICTED_PORTS);
+        assert_eq!(predicted[0].port, 62398);
+        assert_eq!(predicted[0].rank, 0);
+        assert_eq!(predicted.last().unwrap().port, 62421);
+        assert!(matches!(
+            predicted[0].reason,
+            PredictionReason::LowConfidenceWindow { distance: 1 }
+        ));
+    }
+
+    #[test]
+    fn wide_monotonic_jitter_is_still_rejected() {
+        // Same direction alone is insufficient when the observed jumps exceed
+        // the hard 24-port prediction/probe window.
+        let model = build_model(&[1000u16, 1025, 1053], Some(ip()), 1000);
+        assert!(!model.kind.clone().is_predictable(), "{:?}", model.kind);
+        assert!(predict_ports(&model, 1053).is_empty());
     }
 
     #[test]

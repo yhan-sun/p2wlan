@@ -70,35 +70,50 @@ pub(crate) struct FreshPredictionSnapshot {
     pub(crate) candidates: Vec<String>,
     /// Fingerprint of the full payload (candidates + sources + expiry); the
     /// retry verification compares hashes, never re-applies the payload.
-    pub(crate) payload_hash: u64,
+    pub(crate) payload_hash: [u8; 32],
     /// The expiry deadline (receiver-local clock) the identity was committed
     /// with, so an idempotent retry can never punch toward an expired
     /// prediction and a retry whose expiry differs is rejected.
     pub(crate) candidates_expires_at_ms: Option<u64>,
 }
 
-/// Deterministic payload fingerprint for one fresh signal: stable within a
-/// process, so a retry's payload can be compared against the committed
-/// snapshot without shipping the whole candidate set around.
+/// Deterministic, stable, collision-resistant payload fingerprint for one
+/// fresh signal.
+///
+/// The fingerprint identifies the exact payload (candidates + sources +
+/// expiry) a fresh identity was committed with, so a retry's payload can be
+/// compared against the committed snapshot without shipping the whole
+/// candidate set around.  The digest is a fixed-key BLAKE2b-256 over the
+/// normalized (sorted) payload: it is byte-stable across processes and
+/// machines, and 256 bits of keyed-away digest are immune to the
+/// accidental-collision concerns of a 64-bit `DefaultHasher` (whose output
+/// must never be the sole identity of a payload a receiver acts on).
 pub(crate) fn fresh_payload_hash(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
     candidates_expires_at_ms: Option<u64>,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+) -> [u8; 32] {
+    use blake2::digest::{Update, VariableOutput};
+    let mut hasher = blake2::Blake2bVar::new(32).expect("blake2b-256 output size");
     let mut sorted = candidates.to_vec();
     sorted.sort();
     for candidate in &sorted {
-        candidate.hash(&mut hasher);
-        hasher.write_u8(0xff);
+        hasher.update(candidate.as_bytes());
+        hasher.update(&[0xff]);
         if let Some(source) = candidate_sources.get(candidate) {
-            source.hash(&mut hasher);
+            hasher.update(source.as_bytes());
         }
-        hasher.write_u8(0xfe);
+        hasher.update(&[0xfe]);
     }
-    candidates_expires_at_ms.hash(&mut hasher);
-    hasher.finish()
+    match candidates_expires_at_ms {
+        Some(expires_at) => hasher.update(&expires_at.to_be_bytes()),
+        None => hasher.update(&[0x00]),
+    }
+    let mut digest = [0u8; 32];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("blake2b-256 finalize");
+    digest
 }
 
 /// Shared peer-connection state one fresh apply overwrote, captured at apply
@@ -119,7 +134,7 @@ pub(crate) struct FreshApplyPreviousState {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFreshApply {
     pub(crate) candidates: Vec<String>,
-    pub(crate) payload_hash: u64,
+    pub(crate) payload_hash: [u8; 32],
     pub(crate) candidates_expires_at_ms: Option<u64>,
     /// The candidate generation value this apply set on the connection (0
     /// when the apply did not advance it).
@@ -130,12 +145,27 @@ pub(crate) struct PendingFreshApply {
 }
 
 impl PeerManager {
+    /// Whether the NAT-sim harness allows loopback endpoints in the
+    /// fresh-mapping flow.
+    pub(crate) async fn fresh_mapping_harness_loopback_enabled(&self) -> bool {
+        self.config.network.fresh_mapping_harness_loopback
+    }
+
+    /// Whether the local socket address is gathered as a Host candidate.
+    pub(crate) async fn gather_host_candidates(&self) -> bool {
+        self.config.network.gather_host_candidates
+    }
+
     /// Whether the local NAT profile needs fresh-socket mapping prediction.
     ///
     /// Endpoint-independent / open NATs have a stable public port; only
     /// address/port-dependent (symmetric-class) mappings benefit from the
-    /// measure-then-punch generation.
+    /// measure-then-punch generation.  The NAT-sim harness forces the fresh
+    /// path on so the deterministic dual-NAT simulation exercises it.
     pub(crate) async fn local_nat_requires_fresh_mapping_punch(&self) -> bool {
+        if self.fresh_mapping_harness_loopback_enabled().await {
+            return true;
+        }
         if !self.config.network.fresh_mapping_punch_enabled {
             return false;
         }
@@ -661,6 +691,13 @@ impl PeerManager {
     /// fresh-mapping generation.
     pub(crate) async fn stable_remote_punch_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
         let generation = self.current_network_generation().await;
+        // The NAT-sim harness allows loopback endpoints in the fresh-mapping
+        // flow (config.network.fresh_mapping_harness_loopback).
+        let allow_loopback = self.config.network.fresh_mapping_harness_loopback;
+        let eligible = |endpoint: SocketAddr| {
+            is_public_probe_endpoint(endpoint)
+                || (allow_loopback && endpoint.ip().is_loopback())
+        };
         let conns = self.connections.read().await;
         let Some(conn) = conns.get(node_id) else {
             return Vec::new();
@@ -668,7 +705,7 @@ impl PeerManager {
         let mut endpoints = conn
             .asymmetric_stable_public_endpoints(conn.probe_candidate_endpoints())
             .into_iter()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| eligible(*endpoint))
             .collect::<Vec<_>>();
         endpoints.dedup();
         endpoints.truncate(1);
@@ -684,7 +721,7 @@ impl PeerManager {
                         pair.source,
                         CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
                     )
-                    && is_public_probe_endpoint(pair.remote_endpoint)
+                    && eligible(pair.remote_endpoint)
                     && pair
                         .last_success_at
                         .is_some_and(|at| at.elapsed() <= RELAY_PEER_CONFIRMATION_MAX_AGE)

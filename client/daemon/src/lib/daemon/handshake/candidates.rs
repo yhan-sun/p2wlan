@@ -178,11 +178,13 @@ impl Daemon {
         *self.nat_profile.write().await = Some(report.nat_profile.clone());
 
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+        let include_host_candidate = self.peers.gather_host_candidates().await;
         if let Some(endpoint) = udp.local_addr().ok().and_then(|local_addr| {
             advertised_udp_endpoint(
                 local_addr,
                 self.config.network.udp_advertise.as_deref(),
                 &candidates,
+                include_host_candidate,
             )
         }) {
             if !candidates.contains(&endpoint) {

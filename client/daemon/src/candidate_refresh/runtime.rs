@@ -72,8 +72,14 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         };
 
+        let include_host_candidate = peers.gather_host_candidates().await;
         let advertised_endpoint = udp.local_addr().ok().and_then(|local_addr| {
-            advertised_udp_endpoint(local_addr, udp_advertise.as_deref(), &candidates)
+            advertised_udp_endpoint(
+                local_addr,
+                udp_advertise.as_deref(),
+                &candidates,
+                include_host_candidate,
+            )
         });
         if let Some(endpoint) = advertised_endpoint.as_ref() {
             if !candidates.contains(endpoint) {

@@ -3,13 +3,232 @@ type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
 type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
-type PeerReflexiveNotificationState = Arc<Mutex<HashMap<(String, SocketAddr), Instant>>>;
-type TriggeredCheckState = Arc<Mutex<HashMap<(String, SocketAddr, usize), Instant>>>;
+/// Bounded, per-peer newest-wins ingress for peer-reflexive observations.
+///
+/// The UDP reader cannot await a downstream worker or enqueue one task per
+/// port change.  A synchronous short-held map keeps the newest endpoint for
+/// every admitted peer and a Notify wakes the single consumer.  Existing peers
+/// always replace their slot; only a genuinely new peer is rejected at the
+/// hard bound.
+pub(crate) const MAX_PENDING_PEER_REFLEXIVE_INGRESS_PEERS: usize = 128;
+
+/// Per-peer reverse-check pacing state.  `latest_endpoint` is updated even
+/// while a check is in flight or inside its cooldown, so port churn cannot
+/// bypass the peer-level rate limit and the next admitted check uses the
+/// newest observed endpoint.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriggeredCheckRecord {
+    pub(crate) latest_endpoint: SocketAddr,
+    pub(crate) last_sent_at: Instant,
+    pub(crate) in_flight: bool,
+}
+
+type TriggeredCheckState = Arc<Mutex<HashMap<String, TriggeredCheckRecord>>>;
 type NatMaintainerKey = (String, SocketAddr, usize);
 type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease>>>;
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
+/// A peer owns at most one direct-validation worker for one network
+/// generation.  The watch value carries the newest observed endpoint so a
+/// burst of peer-reflexive observations cannot fan out into validation tasks.
+type DirectValidationSessionState = Arc<Mutex<HashMap<String, DirectValidationSession>>>;
+/// Per-peer outstanding direct-validation request that may still be answered
+/// by an ACK: keyed by peer, one at a time (newer requests replace older
+/// ones), with the token the peer's ACK must carry and a bounded TTL.
+type DirectValidationExpectationState = Arc<Mutex<HashMap<String, DirectValidationExpectation>>>;
+
+/// Process-wide owner sequence for direct-validation sessions.
+///
+/// A token is mirrored into the encrypted request/ACK payload, so it must not
+/// restart when a UDP socket is rebound.  Otherwise a delayed ACK from a
+/// retired transport could collide with a new same-generation session after
+/// both registries started their local counters at one.
+static NEXT_DIRECT_VALIDATION_OWNER_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_direct_validation_owner_token() -> u64 {
+    NEXT_DIRECT_VALIDATION_OWNER_TOKEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("direct-validation owner token space exhausted")
+}
+
+/// Cloneable direct-validation registry shared with `PeerManager`.
+///
+/// Keeping the session and expectation maps in one handle lets a network
+/// generation advance cancel both while it holds the common epoch gate.  The
+/// transport and the manager therefore operate on the exact same ownership
+/// records rather than attempting best-effort cross-component cleanup.
+#[derive(Clone)]
+pub(crate) struct DirectValidationRegistry {
+    pub(crate) sessions: DirectValidationSessionState,
+    pub(crate) expectations: DirectValidationExpectationState,
+    /// Set permanently when the UDP transport is withdrawn. A stale
+    /// scheduler/receiver may still wake after teardown, but it can never
+    /// install a fresh session into the retired registry.
+    pub(crate) closed: Arc<AtomicBool>,
+}
+
+impl DirectValidationRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            expectations: Arc::new(Mutex::new(HashMap::new())),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Revoke one peer's worker and every expectation it owns.  This is safe
+    /// to call from lifecycle cleanup and may race a worker: registration
+    /// takes the session lock before the expectation lock, so either the
+    /// expectation is inserted first and removed here, or the worker observes
+    /// no matching owner and refuses to insert it.
+    pub(crate) async fn cancel_peer(&self, peer_id: &str) {
+        // Keep the session guard while taking the expectation guard. Session
+        // creation and expectation registration use this same order, so a
+        // same-ID rejoin cannot install a replacement expectation between the
+        // old session's removal and its conditional cleanup.
+        let mut sessions = self.sessions.lock().await;
+        let owner_token = if let Some(session) = sessions.remove(peer_id) {
+            let current = *session.target_tx.borrow();
+            session.target_tx.send_replace(DirectValidationTarget {
+                cancelled: true,
+                ..current
+            });
+            Some(current.owner_token)
+        } else {
+            None
+        };
+        let mut expectations = self.expectations.lock().await;
+        match owner_token {
+            Some(owner_token) => {
+                if expectations
+                    .get(peer_id)
+                    .is_some_and(|expectation| expectation.owner_token == owner_token)
+                {
+                    expectations.remove(peer_id);
+                }
+            }
+            // An expectation without a session is stale state (the
+            // compatibility test helper can create one); clean it while the
+            // session lock still excludes a concurrent replacement.
+            None => {
+                expectations.remove(peer_id);
+            }
+        }
+        drop(sessions);
+    }
+
+    /// Revoke every session and expectation that does not belong to the
+    /// newly-current generation.  `PeerManager` calls this while it owns the
+    /// shared network epoch gate, making the generation publication and this
+    /// invalidation one transaction.
+    pub(crate) async fn cancel_before_generation(&self, current_generation: u64) {
+        let mut cancelled_peers = HashSet::new();
+        // Keep the session guard through expectation cleanup. This is the
+        // registry's cancellation transaction and follows the same
+        // session -> expectation order as registration/ACK consumption.
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|peer_id, session| {
+            let current = *session.target_tx.borrow();
+            if current.generation == current_generation && !current.cancelled {
+                return true;
+            }
+            session.target_tx.send_replace(DirectValidationTarget {
+                cancelled: true,
+                ..current
+            });
+            cancelled_peers.insert(peer_id.clone());
+            false
+        });
+        let mut expectations = self.expectations.lock().await;
+        expectations.retain(|peer_id, expectation| {
+            !cancelled_peers.contains(peer_id) && expectation.generation == current_generation
+        });
+        drop(sessions);
+    }
+
+    /// Revoke all direct-validation ownership during UDP shutdown or
+    /// transport replacement.
+    pub(crate) async fn cancel_all(&self) {
+        // Publish terminal state before acquiring the map locks. A scheduler
+        // that checked just before this store rechecks after it obtains the
+        // session lock, so it cannot recreate an owner after teardown.
+        self.closed.store(true, Ordering::Release);
+        // Keep the session lock while clearing expectations so a queued
+        // scheduler observation cannot create a new owner in the middle of
+        // transport teardown.
+        let mut sessions_guard = self.sessions.lock().await;
+        let sessions = std::mem::take(&mut *sessions_guard);
+        for session in sessions.into_values() {
+            let current = *session.target_tx.borrow();
+            session.target_tx.send_replace(DirectValidationTarget {
+                cancelled: true,
+                ..current
+            });
+        }
+        self.expectations.lock().await.clear();
+        drop(sessions_guard);
+    }
+}
+
+/// The mutable target owned by a direct-validation worker.
+///
+/// A same-generation observation replaces `endpoint` (newest-wins).  A
+/// generation change or lifecycle cleanup sets `cancelled`, so an old worker
+/// cannot keep validating after its ownership was revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectValidationTarget {
+    pub(crate) endpoint: SocketAddr,
+    pub(crate) generation: u64,
+    pub(crate) owner_token: u64,
+    pub(crate) cancelled: bool,
+}
+
+/// Session record held by `UdpTransport`.  The sender remains owned by the
+/// registry; workers only receive updates and therefore cannot resurrect a
+/// completed or cancelled session.
+pub(crate) struct DirectValidationSession {
+    pub(crate) target_tx: watch::Sender<DirectValidationTarget>,
+}
+
+/// Ownership lease returned exactly once when the scheduler must spawn a
+/// validation worker.  Future observations merge into the watch value rather
+/// than receiving another lease.
+pub(crate) struct DirectValidationSessionLease {
+    pub(crate) peer_id: String,
+    pub(crate) owner_token: u64,
+    pub(crate) target_rx: watch::Receiver<DirectValidationTarget>,
+}
+
+pub(crate) enum DirectValidationSessionStart {
+    Spawn(DirectValidationSessionLease),
+    Merged,
+    /// The scheduler read a generation that advanced before it acquired the
+    /// shared epoch gate.  It must drop this stale observation rather than
+    /// creating an old-generation worker after the advance completed.
+    IgnoredStaleGeneration,
+    /// The peer is already Direct or this UDP registry was withdrawn. Neither
+    /// case may allocate a replacement validation worker from queued evidence.
+    IgnoredInactive,
+}
+
+/// The token a daemon-internal direct-validation ACK must carry to confirm a
+/// request this daemon sent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectValidationExpectation {
+    pub(crate) request_id: u16,
+    pub(crate) generation: u64,
+    /// The validation worker that registered this request.  Conditional
+    /// cleanup prevents an old worker from deleting a newer worker's slot.
+    pub(crate) owner_token: u64,
+    pub(crate) expires_at: Instant,
+}
 
 /// All socket ownership state under one mutex.
 ///
@@ -73,7 +292,6 @@ pub(crate) enum SocketEvidence {
 const DIRECT_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PUNCH_PROBE_RETRANSMIT_DELAYS_MS: [u64; 2] = [25, 75];
 const PUNCH_ACK_RETRANSMIT_DELAYS_MS: [u64; 2] = [20, 80];
-const PEER_REFLEXIVE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(2);
 const TRIGGERED_CHECK_COOLDOWN: Duration = Duration::from_millis(750);
 const AUTH_PUNCH_REPLAY_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_PUNCH_REPLAY_MAX_ENTRIES: usize = 4096;
@@ -150,6 +368,20 @@ pub(crate) struct DynamicPunchSocket {
     pub(crate) network_generation: u64,
     pub(crate) punch_generation: u64,
     pub(crate) created_at: Instant,
+    /// Monotonic counter of AUTHENTICATED post-attach evidence observed on
+    /// this socket: a matched Probe-v2 ACK, an accepted authenticated punch,
+    /// or a successfully decrypted WireGuard datagram received on it.
+    ///
+    /// Evidence is the socket's own record, never an indirect inference from
+    /// the affinity epoch: `commit_and_pin` snapshots this value into the
+    /// commit outcome, and the watcher's rollback promotes the socket to
+    /// Finalized when the counter moved since the commit — a working data
+    /// path is never deleted by a cancellation that raced it.  Only evidence
+    /// validated against this exact entry (peer identity, network
+    /// generation, usable phase) increments the counter, so stale evidence
+    /// from an old socket, an old generation or an old network epoch can
+    /// never upgrade a new owner.
+    pub(crate) authenticated_evidence: u64,
     /// Lifecycle phase of this generation's socket. A Provisional socket is
     /// owned by its in-flight generation and may be detached by the
     /// generation's watcher or its own error paths; a Committed socket has
@@ -182,7 +414,16 @@ impl DynamicSocketLeaseState {
     }
 
     fn release(&self) {
-        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // Never underflow: `noop` leases start at 0 and their Drop must not
+        // wrap the counter (a wrapped counter would look like a huge
+        // outstanding count and block every future detach).
+        self.count
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| Some(count.saturating_sub(1)),
+            )
+            .ok();
     }
 
     /// Number of outstanding leases (in-flight sends on this socket).
@@ -531,6 +772,87 @@ pub struct PeerReflexiveObservation {
     pub peer_id: String,
     /// Public/source endpoint observed by this node.
     pub observed_endpoint: SocketAddr,
+}
+
+#[derive(Clone)]
+pub struct PeerReflexiveIngress {
+    latest: Arc<std::sync::Mutex<HashMap<String, PeerReflexiveObservation>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl PeerReflexiveIngress {
+    /// Create an empty ingress with one bounded newest-wins slot per peer.
+    pub fn new() -> Self {
+        Self {
+            latest: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Submit without awaiting.  A full map rejects only a new peer; an
+    /// already-admitted peer always wins with its newest endpoint.
+    pub fn submit(&self, observation: PeerReflexiveObservation) -> bool {
+        let peer_id = observation.peer_id.clone();
+        let accepted = {
+            let mut latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if latest.contains_key(&peer_id)
+                || latest.len() < MAX_PENDING_PEER_REFLEXIVE_INGRESS_PEERS
+            {
+                latest.insert(peer_id, observation);
+                true
+            } else {
+                false
+            }
+        };
+        if accepted {
+            self.notify.notify_one();
+        }
+        accepted
+    }
+
+    /// Wait for and remove one pending observation.
+    ///
+    /// The ingress is designed for one consumer. If several tasks call this,
+    /// each observation is delivered to only one of them.
+    pub async fn next(&self) -> PeerReflexiveObservation {
+        loop {
+            // Register before checking the map so a concurrent submit cannot
+            // fall into the check/await gap and strand an observation.
+            let notified = self.notify.notified();
+            let observation = {
+                let mut latest = self
+                    .latest
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                latest
+                    .keys()
+                    .next()
+                    .cloned()
+                    .and_then(|peer_id| latest.remove(&peer_id))
+            };
+            if let Some(observation) = observation {
+                return observation;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+impl Default for PeerReflexiveIngress {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]

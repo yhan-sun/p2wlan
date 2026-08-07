@@ -1,7 +1,52 @@
 impl Daemon {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     async fn handle_peer_offer(
-        &mut self,
+        &self,
+        from_node_id: &str,
+        candidates: &[String],
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+    ) -> Result<()> {
+        self.handle_peer_offer_with_cancellation(
+            from_node_id,
+            candidates,
+            handshake_init,
+            punch_at_ms,
+            punch_at_server_ms,
+            session_id,
+            probe_ephemeral_public_key,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn handle_event_peer_offer(
+        &self,
+        offer: PendingPeerOffer,
+        owner: u64,
+        cancellation: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.handle_peer_offer_with_cancellation(
+            &offer.from_node_id,
+            &offer.candidates,
+            &offer.handshake_init,
+            offer.punch_at_ms,
+            offer.punch_at_server_ms,
+            offer.session_id,
+            offer.probe_ephemeral_public_key,
+            Some(cancellation),
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_peer_offer_with_cancellation(
+        &self,
         from_node_id: &str,
         _candidates: &[String],
         handshake_init: &[u8],
@@ -9,8 +54,32 @@ impl Daemon {
         punch_at_server_ms: Option<u64>,
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
+        mut cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+        responder_work_owner: Option<u64>,
     ) -> Result<()> {
-        let _handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        let handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        if let Some(owner) = responder_work_owner {
+            let current = self
+                .pending_handshakes
+                .lock()
+                .await
+                .responder_work_is_current(from_node_id, owner);
+            if !current {
+                return Ok(());
+            }
+        }
         let initiation = MessageInitiation::from_bytes(handshake_init)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard initiation: {e}")))?;
         // The static WireGuard public keys provide a deterministic role: the
@@ -177,8 +246,6 @@ impl Daemon {
                 .await;
         }
 
-        let (candidates, candidate_sources) =
-            self.local_candidate_set_for_signal("handshake answer").await;
         let responder_transport_session = TransportSession::new(keys.clone());
         let initial_stage = self
             .transport
@@ -265,21 +332,82 @@ impl Daemon {
                 .cache_responder_handshake(from_node_id, &handshake_token, cache_entry);
         }
 
-        let answer_result = self.control
-            .send_peer_answer_with_sources_schedule_and_session(
-                from_node_id,
-                &candidates,
-                &candidate_sources,
-                &response_bytes,
-                // Echo the offer's server deadline so both peers use the
-                // same rendezvous window. WebSocket-only peers have no
-                // server deadline and retain the previous local fallback.
-                punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
-                punch_at_server_ms,
-                session_id.clone(),
-                response_probe_ephemeral_public_key,
-            )
-            .await;
+        // All state required to replay/validate the response is now staged.
+        // STUN refresh and the control POST can take seconds, so neither may
+        // retain the per-peer arbiter.  A crossing answer needs this mutex to
+        // consume its pending initiator immediately.
+        drop(handshake_guard);
+        let (candidates, candidate_sources) = match cancellation.as_deref_mut() {
+            Some(cancellation) => {
+                tokio::select! {
+                    candidates = self.local_candidate_set_for_signal("handshake answer") => candidates,
+                    _ = cancellation.changed() => return Ok(()),
+                }
+            }
+            None => self.local_candidate_set_for_signal("handshake answer").await,
+        };
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+
+        let answer_result = match cancellation.as_deref_mut() {
+            Some(cancellation) => {
+                tokio::select! {
+                    answer = self.control.send_peer_answer_with_sources_schedule_and_session(
+                        from_node_id,
+                        &candidates,
+                        &candidate_sources,
+                        &response_bytes,
+                        // Echo the offer's server deadline so both peers use
+                        // the same rendezvous window. WebSocket-only peers
+                        // have no server deadline and retain the previous
+                        // local fallback.
+                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
+                        punch_at_server_ms,
+                        session_id.clone(),
+                        response_probe_ephemeral_public_key.clone(),
+                    ) => answer,
+                    _ = cancellation.changed() => return Ok(()),
+                }
+            }
+            None => self
+                .control
+                .send_peer_answer_with_sources_schedule_and_session(
+                    from_node_id,
+                    &candidates,
+                    &candidate_sources,
+                    &response_bytes,
+                    punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
+                    punch_at_server_ms,
+                    session_id.clone(),
+                    response_probe_ephemeral_public_key,
+                )
+                .await,
+        };
+
+        // Re-enter the state boundary after the slow POST.  Lifecycle cleanup
+        // can cancel this exact responder owner while the request is in
+        // flight; a stale task must not refresh grace or commit a replacement.
+        let _handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        if let Some(owner) = responder_work_owner {
+            let current = self
+                .pending_handshakes
+                .lock()
+                .await
+                .responder_work_is_current(from_node_id, owner);
+            if !current {
+                return Ok(());
+            }
+        }
         // Refresh both pending slots after the HTTP attempt. This separates
         // potentially slow control-plane delivery from the wide direct
         // adoption window; an ambiguous error intentionally leaves both

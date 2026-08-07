@@ -17,6 +17,24 @@ pub struct PeerManager {
     /// advances between the read and the lock would let a stale entry pass the
     /// check).
     network_generation_sync: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared network-epoch gate serializing every generation advance against
+    /// every UDP socket-state mutation that stamps, commits, finalizes or
+    /// adopts socket ownership for a generation.
+    ///
+    /// The UDP layer reads the generation through the lock-free mirror inside
+    /// its socket-state critical section; without a common gate an advance
+    /// could bump the mirror BETWEEN the UDP read and the UDP write of the
+    /// same critical section, letting an old-generation commit, finalize or
+    /// pending-probe registration land AFTER the generation already moved on.
+    /// Both the advances and the UDP mutation sites hold this gate first
+    /// (gate -> socket_state -> pending probes), so a generation update is
+    /// atomic with respect to every generation-sensitive socket transition.
+    network_epoch_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The currently published UDP direct-validation registry.  The UDP
+    /// transport registers this handle when it binds; generation advances use
+    /// it while holding `network_epoch_gate` to revoke old validation owners
+    /// and their ACK expectations atomically with the new generation.
+    direct_validation_registry: Arc<RwLock<Option<crate::udp::DirectValidationRegistry>>>,
     /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
     local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Anonymous local traversal outcome history.

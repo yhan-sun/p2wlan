@@ -9,14 +9,14 @@ mod tests {
     use p2pnet_wireguard::{
         HandshakeInitiator, HandshakeResponder, MessageTransport, TransportSession, TYPE_TRANSPORT,
     };
-    use tokio::sync::{mpsc, oneshot, Notify};
+    use tokio::sync::{mpsc, oneshot, watch, Notify};
 
     use super::*;
     use crate::config::Config;
     use crate::control::PeerInfo;
     use crate::peer::{ConnectionState, NetworkPath, ProbeBindingStage, ProbeKeyRole};
     use crate::udp::UdpTransport;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     fn establish_sessions() -> (TransportSession, TransportSession) {
         let node_a = NodeIdentity::generate();
@@ -1153,6 +1153,7 @@ mod tests {
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
 socket_index: None,
+                udp_transport_owner: None,
                 wire_bytes,
             })
             .await
@@ -1276,6 +1277,7 @@ socket_index: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
 socket_index: None,
+                udp_transport_owner: None,
                 wire_bytes,
             })
             .await
@@ -1339,6 +1341,7 @@ socket_index: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
 socket_index: None,
+                udp_transport_owner: None,
                 wire_bytes,
             })
             .await
@@ -1400,6 +1403,7 @@ socket_index: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("different-peer".to_string()),
 socket_index: None,
+                udp_transport_owner: None,
                 wire_bytes,
             })
             .await
@@ -1492,6 +1496,7 @@ socket_index: None,
                 relay_endpoint: None,
                 relay_peer_id: None,
                 socket_index: Some(0),
+                udp_transport_owner: None,
                 wire_bytes: vec![0xAB; 64],
             })
             .await
@@ -1523,6 +1528,7 @@ socket_index: None,
                 relay_endpoint: None,
                 relay_peer_id: None,
                 socket_index: Some(0),
+                udp_transport_owner: None,
                 wire_bytes,
             })
             .await
@@ -1551,5 +1557,597 @@ socket_index: None,
 
         drop(encrypted_tx);
         worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_udp_inbound_uses_transport_published_after_worker_start() {
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: "peer-a-pubkey".to_string(),
+                endpoint: "127.0.0.1:51820".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+
+        let (udp_updates_tx, udp_updates_rx) = watch::channel(None);
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers_live_udp(
+                        encrypted_rx,
+                        inbound_tx,
+                        Some(peers),
+                        udp_updates_rx,
+                    )
+                    .await
+            }
+        });
+
+        // The WireGuard worker is already alive with no UDP transport.  A
+        // later publish must be observed for this packet, not discarded as a
+        // startup-time `None` snapshot.
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        udp.set_inbound_publication_owner(1);
+        let local_endpoint = udp.local_addr().unwrap();
+        udp_updates_tx.send_replace(Some(udp.clone()));
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x5152,
+            1,
+            b"delayed-udp-publication",
+        );
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some("198.51.100.8:51820".parse().unwrap()),
+                local_endpoint: Some(local_endpoint),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                udp_transport_owner: Some(1),
+                wire_bytes: remote_session.encrypt_to_bytes(&packet).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), inbound_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .peer_id,
+            "peer-a"
+        );
+        assert!(
+            udp.affinity_pin_for_test("peer-a").await.is_some(),
+            "the delayed publication must supply affinity ownership"
+        );
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_udp_inbound_reacquires_replacement_transport() {
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: "peer-a-pubkey".to_string(),
+                endpoint: "127.0.0.1:51820".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+
+        let stale_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let replacement_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        stale_udp.set_inbound_publication_owner(1);
+        replacement_udp.set_inbound_publication_owner(2);
+        let replacement_endpoint = replacement_udp.local_addr().unwrap();
+        let (udp_updates_tx, udp_updates_rx) = watch::channel(Some(stale_udp.clone()));
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(2);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers_live_udp(
+                        encrypted_rx,
+                        inbound_tx,
+                        Some(peers),
+                        udp_updates_rx,
+                    )
+                    .await
+            }
+        });
+
+        // Replace before the decrypted packet reaches the worker.  A static
+        // snapshot would write the old transport's affinity; the live source
+        // must use the new socket state.
+        udp_updates_tx.send_replace(Some(replacement_udp.clone()));
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x5153,
+            1,
+            b"udp-replacement",
+        );
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some("198.51.100.9:51820".parse().unwrap()),
+                local_endpoint: Some(replacement_endpoint),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                udp_transport_owner: Some(2),
+                wire_bytes: remote_session.encrypt_to_bytes(&packet).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let _ = timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replacement_udp.affinity_pin_for_test("peer-a").await.is_some());
+        assert!(
+            stale_udp.affinity_pin_for_test("peer-a").await.is_none(),
+            "the retired UDP transport must not receive post-replacement affinity"
+        );
+
+        drop(encrypted_tx);
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_udp_inbound_rejects_queued_retired_owner_validation_ack() {
+        // An old UDP reader can enqueue a packet just before its transport is
+        // withdrawn. Hold the WireGuard session lock so the packet cannot
+        // finish decrypting until after publication has moved to a replacement.
+        // Its token intentionally matches the replacement's live expectation:
+        // only the envelope's publication owner can distinguish this stale
+        // reader from a packet actually received by the replacement socket.
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        let source: std::net::SocketAddr = "198.51.100.73:51820".parse().unwrap();
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                endpoint: "198.51.100.72:51820".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+
+        let stale_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        stale_udp.set_inbound_publication_owner(1);
+        // Binding this transport registers the replacement validation registry.
+        let replacement_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        replacement_udp.set_inbound_publication_owner(2);
+        let generation = peers.current_network_generation().await;
+        let owner_token = match replacement_udp
+            .begin_or_merge_direct_validation("peer-a", source, generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            _ => panic!("replacement transport must own the validation lease"),
+        };
+        let request_id = 0x7A21;
+        assert!(replacement_udp
+            .expect_direct_validation_ack_owned(
+                "peer-a",
+                request_id,
+                generation,
+                owner_token,
+                source,
+            )
+            .await);
+
+        let stale_local_endpoint = stale_udp.local_addr().unwrap();
+        let (udp_updates_tx, udp_updates_rx) = watch::channel(Some(stale_udp.clone()));
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers_live_udp(
+                        encrypted_rx,
+                        inbound_tx,
+                        Some(peers),
+                        udp_updates_rx,
+                    )
+                    .await
+            }
+        });
+
+        let decrypt_gate = wg_transport.sessions.lock().await;
+        let ack_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            request_id,
+            0,
+            &build_direct_validation_payload(
+                DirectValidationKind::Ack,
+                generation,
+                request_id,
+                0,
+                owner_token,
+            ),
+        );
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some(source),
+                local_endpoint: Some(stale_local_endpoint),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                udp_transport_owner: Some(1),
+                wire_bytes: remote_session.encrypt_to_bytes(&ack_packet).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        // This mirrors UdpTransportPublication::publish: revoke the old
+        // reader's owner before exposing the replacement to live inbound.
+        assert!(stale_udp.clear_inbound_publication_owner_if_matches(1));
+        udp_updates_tx.send_replace(Some(replacement_udp.clone()));
+        drop(decrypt_gate);
+        drop(encrypted_tx);
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("inbound worker must drain the retired reader packet")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "internal validation ACKs must stay off the TUN path"
+        );
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_ne!(connection.state, ConnectionState::Direct);
+        assert_eq!(connection.direct_health.success_count, 0);
+        assert_ne!(connection.endpoint, Some(source));
+        assert!(
+            replacement_udp
+                .has_direct_validation_expectation("peer-a")
+                .await,
+            "a queued packet from a retired reader must not consume the replacement expectation"
+        );
+        assert!(
+            replacement_udp.affinity_pin_for_test("peer-a").await.is_none(),
+            "a retired reader packet must not establish replacement affinity"
+        );
+        assert!(
+            stale_udp.affinity_pin_for_test("peer-a").await.is_none(),
+            "a retired reader packet must not retain old transport affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_generation_validation_ack_cannot_promote_or_adopt_affinity() {
+        // Exercise the real decrypt -> inbound ACK handler path.  This is not
+        // a unit test of the expectation map: a token that was valid before a
+        // network generation advance must be rejected before it can mutate
+        // either Direct state or the receiving UDP socket affinity.
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let source: std::net::SocketAddr = "198.51.100.44:51820".parse().unwrap();
+        let old_generation = peers.current_network_generation().await;
+        let owner_token = match udp
+            .begin_or_merge_direct_validation("peer-a", source, old_generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            crate::udp::DirectValidationSessionStart::Merged => {
+                panic!("first validation observation must receive an owner lease")
+            }
+            crate::udp::DirectValidationSessionStart::IgnoredStaleGeneration => {
+                panic!("the current generation must accept the initial owner lease")
+            }
+            crate::udp::DirectValidationSessionStart::IgnoredInactive => {
+                panic!("an active non-Direct peer must accept the initial owner lease")
+            }
+        };
+        assert!(udp
+            .expect_direct_validation_ack_owned(
+                "peer-a",
+                0x7A11,
+                old_generation,
+                owner_token,
+                source,
+            )
+            .await);
+
+        assert_eq!(
+            peers
+                .advance_network_generation("test old validation ACK")
+                .await,
+            old_generation + 1
+        );
+        assert!(
+            !udp.has_direct_validation_expectation("peer-a").await,
+            "generation advance must atomically clear old validation expectations"
+        );
+
+        let ack_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x7A11,
+            0,
+            &build_direct_validation_payload(
+                DirectValidationKind::Ack,
+                old_generation,
+                0x7A11,
+                0,
+                owner_token,
+            ),
+        );
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            let udp = udp.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), Some(udp))
+                    .await
+            }
+        });
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some(source),
+                local_endpoint: udp.local_addr().ok(),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                udp_transport_owner: None,
+                wire_bytes: remote_session.encrypt_to_bytes(&ack_packet).unwrap(),
+            })
+            .await
+            .unwrap();
+        drop(encrypted_tx);
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("inbound worker must drain stale ACK")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "internal validation packets must not reach the TUN"
+        );
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_ne!(connection.state, ConnectionState::Direct);
+        assert_eq!(
+            connection.direct_health.success_count, 0,
+            "the old token must not record Direct success in the new generation"
+        );
+        assert!(
+            !connection
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "direct_validation_ack_received"),
+            "a rejected old ACK must not be recorded as a Direct confirmation"
+        );
+        assert!(
+            udp.affinity_pin_for_test("peer-a").await.is_none(),
+            "the old ACK must not establish a socket affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_validation_owner_ack_cannot_promote_rebound_same_generation_session() {
+        // Exercise the real decrypt -> inbound ACK handler with an intentional
+        // request-id collision. The second UDP registry uses the SAME network
+        // generation and request id as the retired one, so only the wire owner
+        // token can distinguish a delayed old ACK from the live expectation.
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+        let source: std::net::SocketAddr = "198.51.100.55:51820".parse().unwrap();
+        let generation = peers.current_network_generation().await;
+        let request_id = 0x5A17;
+
+        let retired_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let retired_owner = match retired_udp
+            .begin_or_merge_direct_validation("peer-a", source, generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            _ => panic!("retired transport must obtain the first lease"),
+        };
+        assert!(retired_udp
+            .expect_direct_validation_ack_owned(
+                "peer-a",
+                request_id,
+                generation,
+                retired_owner,
+                source,
+            )
+            .await);
+
+        // Binding a replacement changes the active registry without advancing
+        // the network generation. Its globally allocated owner must differ.
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let current_owner = match udp
+            .begin_or_merge_direct_validation("peer-a", source, generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            _ => panic!("replacement transport must obtain a fresh lease"),
+        };
+        assert_ne!(retired_owner, current_owner);
+        assert!(udp
+            .expect_direct_validation_ack_owned(
+                "peer-a",
+                request_id,
+                generation,
+                current_owner,
+                source,
+            )
+            .await);
+
+        let old_ack_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            request_id,
+            0,
+            &build_direct_validation_payload(
+                DirectValidationKind::Ack,
+                generation,
+                request_id,
+                0,
+                retired_owner,
+            ),
+        );
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            let udp = udp.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), Some(udp))
+                    .await
+            }
+        });
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some(source),
+                local_endpoint: udp.local_addr().ok(),
+                relay_endpoint: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                udp_transport_owner: None,
+                wire_bytes: remote_session.encrypt_to_bytes(&old_ack_packet).unwrap(),
+            })
+            .await
+            .unwrap();
+        drop(encrypted_tx);
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("inbound worker must drain delayed ACK")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "internal validation ACKs must remain off the TUN path"
+        );
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_ne!(connection.state, ConnectionState::Direct);
+        assert_eq!(
+            connection.direct_health.success_count, 0,
+            "a colliding old owner token must not record Direct success"
+        );
+        assert!(
+            udp.has_direct_validation_expectation("peer-a").await,
+            "the live owner's expectation must survive a mismatched old ACK"
+        );
+        assert_eq!(
+            udp.direct_validation_target("peer-a")
+                .await
+                .expect("the live owner must remain registered")
+                .owner_token,
+            current_owner
+        );
+        assert!(
+            udp.affinity_pin_for_test("peer-a").await.is_none(),
+            "a colliding old ACK must not establish affinity"
+        );
     }
 }

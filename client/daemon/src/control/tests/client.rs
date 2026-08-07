@@ -194,7 +194,8 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
     .expect("device registration must complete against the mock server");
 
     // A fresh-mapping offer whose punch session was revoked must be skipped
-    // by the HTTP worker even though it is already queued.
+    // by the HTTP worker even though it is already queued, and must be
+    // reported as Cancelled — never as a successful send.
     let revoked = Arc::new(crate::PunchSessionCancellation::default());
     revoked.cancel();
     let result = client
@@ -208,8 +209,11 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
         )
         .await;
     assert!(
-        result.is_ok(),
-        "a revoked fresh offer must be skipped locally, not fail"
+        matches!(
+            result,
+            Err(crate::control::PeerOfferSendFailure::Cancelled)
+        ),
+        "a revoked fresh offer must be reported as Cancelled, got {result:?}"
     );
     // Give the worker time to process the queue: it must never post.
     sleep(Duration::from_millis(200)).await;
@@ -323,6 +327,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         "node-a",
         &event_tx,
         0,
+        &Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
     )
     .await;
     assert!(
@@ -347,5 +352,137 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         "the malformed signal must not produce an event"
     );
 
+    server.abort();
+}
+
+/// ACK-mode delivery: the server hands out delivery leases with per-row
+/// tokens, the client decodes and enqueues every healthy signal, and only
+/// THEN acknowledges the batch.  A redelivered batch (simulated by a second
+/// poll with the same signals) is deduped by signal id but still ACKed.
+#[tokio::test]
+async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let ack_posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = {
+        let ack_posts = ack_posts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut chunk = [0u8; 8192];
+                let mut buf = Vec::new();
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                if request.starts_with("POST") {
+                    // The ACK request: count it and reply success.
+                    ack_posts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let body = r#"{"success":true,"deleted":1}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                // GET: deliver the same leased batch (as after a lost ACK).
+                let body = serde_json::json!({
+                    "signals": [
+                        {
+                            "id": "signal-redelivery-1",
+                            "from_node_id": "peer-b",
+                            "type": "peer_offer",
+                            "candidates": ["203.0.113.10:45001"],
+                            "handshake": "01020304",
+                            "delivery_token": "dlv-token-1"
+                        }
+                    ],
+                    "delivery": {
+                        "batch_token": "batch-token-1",
+                        "lease_expires_at_ms": 1760000000000i64
+                    },
+                    "server_time_ms": 0
+                });
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        })
+    };
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let dedup: Arc<tokio::sync::Mutex<VecDeque<String>>> =
+        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+
+    // First poll: the signal is decoded, enqueued, and ACKed.
+    let result = poll_signals(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        "test-token",
+        "node-a",
+        &event_tx,
+        0,
+        &dedup,
+    )
+    .await;
+    assert!(result.is_ok(), "first poll must succeed: {result:?}");
+    match timeout(Duration::from_secs(5), event_rx.recv()).await {
+        Ok(Some(ControlEvent::PeerOffer { from_node_id, .. })) => {
+            assert_eq!(from_node_id, "peer-b");
+        }
+        other => panic!("expected the delivered peer offer, got {other:?}"),
+    }
+    // The ACK is sent after the enqueue (the mock server must have seen it).
+    timeout(Duration::from_secs(5), async {
+        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the delivered batch must be ACKed after enqueueing");
+
+    // Second poll: the SAME batch is redelivered (the ACK was "lost" and the
+    // lease expired).  The signal id dedup skips the duplicate event but the
+    // ACK is still sent, so the server stops redelivering.
+    let result = poll_signals(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        "test-token",
+        "node-a",
+        &event_tx,
+        0,
+        &dedup,
+    )
+    .await;
+    assert!(result.is_ok(), "second poll must succeed: {result:?}");
+    assert!(
+        event_rx.try_recv().is_err(),
+        "a redelivered signal must not be enqueued twice"
+    );
+    timeout(Duration::from_secs(5), async {
+        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the redelivered batch must still be ACKed");
     server.abort();
 }

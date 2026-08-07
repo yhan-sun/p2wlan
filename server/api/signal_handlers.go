@@ -19,6 +19,25 @@ var signalLongPollFallbackInterval = 100 * time.Millisecond
 
 const maxSignalCandidates = 96
 
+// senderIdentityFingerprint is the sender's identity fingerprint bound to a
+// queued signal row at send time.
+//
+// The WireGuard public key is the identity the receiver tracks (its
+// fresh-prediction high-water is bound to the peer's public key): a queued
+// signal from an OLD identity key must never enter the NEW identity's
+// high-water space after the sender's key changed.  Devices without one fall
+// back to the Ed25519 identity key so every signal still carries a sender
+// identity the receiver can compare against the peer's current key.
+func senderIdentityFingerprint(sender *database.Device) string {
+	if sender == nil {
+		return ""
+	}
+	if strings.TrimSpace(sender.PublicKey) != "" {
+		return sender.PublicKey
+	}
+	return strings.TrimSpace(sender.Ed25519PublicKey)
+}
+
 func probeEphemeralTranscript(signalType, fromNodeID, toNodeID, sessionID, probeEphemeralPublicKey string, candidateGeneration, candidatesExpiresAtMS int64) []byte {
 	var b strings.Builder
 	b.WriteString("p2wlan signal probe ephemeral v1\n")
@@ -317,7 +336,7 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey)
+	signal, err := s.db.CreateSignalWithTraversalSession(fromNodeID, req.ToNodeID, req.Type, protocolVersion, req.Candidates, req.CandidateSources, req.Handshake, normalizedPunchAtMS, req.CandidateGeneration, candidatesExpiresAtMS, req.SessionID, req.ProbeEphemeralPublicKey, senderIdentityFingerprint(senderDevice))
 	if err != nil {
 		if errors.Is(err, database.ErrSignalQueueLimit) {
 			// A clear degradable signal: the queue bound (pair rows/bytes,
@@ -342,6 +361,16 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListSignals handles GET /api/v1/signals.
+//
+// Clients that opt into ACK mode (`ack=1`) receive a DELIVERY LEASE instead
+// of a deletion: the rows are not removed at GET time, every signal carries
+// its delivery token, and the batch carries a batch token plus the lease
+// deadline.  The client must ACK the batch (or individual signals) once it
+// has decoded and enqueued everything; an expired lease re-delivers the
+// batch, so a client that dies mid-processing or a connection that breaks
+// mid-body can never lose a signal.  Legacy clients (no `ack=1`) keep the
+// delete-on-GET semantics, and they can never steal rows a lease-mode client
+// already holds.
 func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 	var nodeID string
 
@@ -367,17 +396,42 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ackMode := strings.TrimSpace(r.URL.Query().Get("ack")) == "1"
 	waitMS := boundedSignalWaitMS(r)
 	deadline := time.Now().Add(time.Duration(waitMS) * time.Millisecond)
 	for {
 		version := s.signalNotifier.version(nodeID)
-		signals, err := s.db.ListAndDeleteSignals(nodeID)
+		var signals []database.Signal
+		var err error
+		leaseExpiresAtMS := int64(0)
+		if ackMode {
+			signals, leaseExpiresAtMS, err = s.db.ListSignalsWithLease(nodeID)
+		} else {
+			signals, err = s.db.ListAndDeleteSignals(nodeID)
+		}
 		if err != nil {
 			http.Error(w, `{"error":"failed to list signals"}`, http.StatusInternalServerError)
 			return
 		}
 		if len(signals) > 0 || waitMS == 0 || !time.Now().Before(deadline) {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"signals": signals, "protocol_version": database.SignalProtocolVersion, "server_time_ms": time.Now().UnixMilli()})
+			response := map[string]interface{}{
+				"signals":          signals,
+				"protocol_version": database.SignalProtocolVersion,
+				"server_time_ms":   time.Now().UnixMilli(),
+			}
+			if ackMode && len(signals) > 0 {
+				// The batch token lets a client ACK the whole batch at once;
+				// per-row delivery tokens remain the reliable path.
+				entries := make([]struct{ ID, Token string }, 0, len(signals))
+				for _, signal := range signals {
+					entries = append(entries, struct{ ID, Token string }{signal.ID, signal.DeliveryToken})
+				}
+				response["delivery"] = map[string]interface{}{
+					"batch_token":         database.BatchTokenFor(entries),
+					"lease_expires_at_ms": leaseExpiresAtMS,
+				}
+			}
+			writeJSON(w, http.StatusOK, response)
 			return
 		}
 
@@ -394,6 +448,67 @@ func (s *Server) ListSignals(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// AckSignals handles POST /api/v1/signals/ack.
+//
+// Idempotent: deleting an already-ACKed signal is a no-op, and a repeated
+// ACK of the same batch is harmless.  Each signal is only deleted when its
+// delivery token still matches the token the client received, so a client can
+// only ever confirm the delivery it actually got.  The optional batch token
+// acknowledges a whole batch in one call (validated against the current
+// lease state; on a changed batch the client retries per-row).
+func (s *Server) AckSignals(w http.ResponseWriter, r *http.Request) {
+	var nodeID string
+	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
+		nodeID = deviceClaims.DeviceID
+	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
+		nodeID = strings.TrimSpace(r.URL.Query().Get("node_id"))
+		if nodeID == "" {
+			http.Error(w, `{"error":"node_id is required"}`, http.StatusBadRequest)
+			return
+		}
+		belongs, err := s.db.DeviceBelongsToUser(nodeID, userClaims.UserID)
+		if err != nil || !belongs {
+			http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
+			return
+		}
+	} else {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Signals    []database.SignalAck `json:"signals"`
+		BatchToken string               `json:"batch_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Signals) > database.MaxSignalBatch {
+		http.Error(w, `{"error":"too many signal acks"}`, http.StatusBadRequest)
+		return
+	}
+	for _, ack := range req.Signals {
+		if strings.TrimSpace(ack.ID) == "" || strings.TrimSpace(ack.DeliveryToken) == "" {
+			http.Error(w, `{"error":"each ack needs id and delivery_token"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	deleted := int64(0)
+	var err error
+	if len(req.Signals) > 0 {
+		deleted, err = s.db.AckSignals(nodeID, req.Signals)
+	} else if strings.TrimSpace(req.BatchToken) != "" {
+		deleted, err = s.db.AckSignalBatch(nodeID, req.BatchToken)
+	}
+	if err != nil {
+		http.Error(w, `{"error":"failed to ack signals"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "deleted": deleted})
 }
 
 func boundedSignalWaitMS(r *http.Request) int {

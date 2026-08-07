@@ -49,6 +49,11 @@ impl UdpTransport {
     /// Direct mirror — the async snapshot taken before the lock is only an
     /// ordering hint and can never be the sole authority.  Reader aborts for
     /// evicted sockets happen outside the lock.
+    ///
+    /// The insert runs under the shared network-epoch gate: a generation
+    /// advance can never land between the entry's generation stamp and the
+    /// map insert, so an old-generation socket can never be registered after
+    /// the generation moved on.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn attach_dynamic_punch_socket(
         &self,
@@ -103,6 +108,7 @@ impl UdpTransport {
         // attach runs concurrently.
         let mut evicted = Vec::new();
         let capacity_ok = {
+            let _epoch_gate = self.network_epoch_gate.lock().await;
             let mut state = self.socket_state.lock().await;
             if state.dynamic.len() >= MAX_DYNAMIC_PUNCH_SOCKETS {
                 let mut candidates = state
@@ -157,6 +163,7 @@ impl UdpTransport {
                             network_generation,
                             punch_generation,
                             created_at: Instant::now(),
+                            authenticated_evidence: 0,
                             phase: DynamicSocketPhase::Provisional,
                             shutdown_tx,
                             reader: reader_handle.take().expect("reader handle owned"),
@@ -175,6 +182,7 @@ impl UdpTransport {
                         network_generation,
                         punch_generation,
                         created_at: Instant::now(),
+                        authenticated_evidence: 0,
                         phase: DynamicSocketPhase::Provisional,
                         shutdown_tx,
                         reader: reader_handle.take().expect("reader handle owned"),
@@ -220,15 +228,17 @@ impl UdpTransport {
 
     /// Remove a dynamic socket entry and stop its reader.
     ///
-    /// The entry is removed from the map by the caller before this runs.  The
-    /// reader abort is deferred until every outstanding send lease drained
-    /// (the in-flight `resolve -> send` race) AND every pending probe that
-    /// was sent from this socket has been removed (a matched ACK or the
-    /// bounded timeout), so the ACK of a probe that raced the detach still
-    /// arrives at a live reader.  After [`DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT`]
-    /// the socket's pending probes are dropped and the reader is aborted.
+    /// The entry is removed from the map by the caller before this runs.
+    ///
+    /// The shutdown ORDER is deliberate: the reader MUST keep receiving while
+    /// the outstanding send leases drain and the socket's pending probes wait
+    /// for their ACKs — the ACK of a probe that raced the detach only arrives
+    /// at a live reader.  The stop signal is therefore sent AFTER the bounded
+    /// drain (and after the socket's pending probes were dropped on drain
+    /// timeout), so the reader exits only once nothing can arrive for it
+    /// anymore; the abort is a belt-and-braces for a reader stuck in
+    /// `recv_from`.
     async fn detach_dynamic_entry(&self, entry: DynamicPunchSocket, reason: &str) {
-        entry.shutdown_tx.send_replace(true);
         let drained = tokio::time::timeout(
             DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT,
             self.wait_for_detach_drain(entry.socket_index, &entry.send_leases),
@@ -242,6 +252,9 @@ impl UdpTransport {
             // abort.
             self.drop_pending_probes_for_socket(entry.socket_index).await;
         }
+        // Only now stop the reader: every ACK that could still arrive was
+        // given its chance during the drain.
+        entry.shutdown_tx.send_replace(true);
         entry.reader.abort();
         self.dynamic_socket_diagnostics.lock().await.remove(&entry.socket_index);
         debug!(
@@ -367,6 +380,12 @@ impl UdpTransport {
     /// Removes every dynamic socket owned by the peer (an old generation's
     /// socket may coexist with a provisional one) and clears the affinity.
     /// Reader aborts run outside the lock.
+    ///
+    /// Production cleanups go through `cleanup_peer_lifecycle` (which runs
+    /// the same removal inside the peer's adoption-lock transaction); this
+    /// standalone form is used by tests and by teardown paths that never
+    /// race ACK adoption.
+    #[cfg(test)]
     pub(crate) async fn detach_dynamic_punch_socket(&self, peer_id: &str, reason: &str) {
         let entries = {
             let mut state = self.socket_state.lock().await;
@@ -544,10 +563,14 @@ impl UdpTransport {
         if cancellation.is_some_and(|c| c.is_cancelled()) {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
         }
+        let allow_loopback = self
+            .peers
+            .fresh_mapping_harness_loopback_enabled()
+            .await;
         let stable_targets = stable_targets
             .iter()
             .copied()
-            .filter(|endpoint| fresh_mapping_target_eligible(*endpoint))
+            .filter(|endpoint| fresh_mapping_target_eligible(*endpoint, allow_loopback))
             .collect::<Vec<_>>();
         if stable_targets.is_empty() {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::NoStablePeerEndpoint);
@@ -756,6 +779,7 @@ impl UdpTransport {
         let step = match &model.kind {
             PortModelKind::FixedStep { step } | PortModelKind::Linear { step }
             | PortModelKind::NoisyLinear { step } => Some(*step),
+            PortModelKind::MonotonicWindow { direction } => Some(i16::from(*direction)),
             _ => None,
         };
         if step.is_some_and(|step| u32::from(step.unsigned_abs()) > FRESH_MAPPING_MAX_ABS_STEP as u32) {
@@ -1140,9 +1164,15 @@ fn model_deltas(batch: &MappingBatch) -> Vec<i16> {
 /// Whether a target endpoint may receive a fresh-mapping punch.
 ///
 /// Production filters to real public probe endpoints; unit tests simulate the
-/// peer's public side on the loopback NAT address.
-fn fresh_mapping_target_eligible(endpoint: SocketAddr) -> bool {
+/// peer's public side on the loopback NAT address, and the NAT-sim harness
+/// (`config.network.fresh_mapping_harness_loopback`) deliberately allows
+/// loopback endpoints so the deterministic dual-NAT simulation exercises the
+/// production fresh path.
+fn fresh_mapping_target_eligible(endpoint: SocketAddr, allow_loopback: bool) -> bool {
     if is_public_probe_endpoint(endpoint) {
+        return true;
+    }
+    if allow_loopback && endpoint.ip().is_loopback() {
         return true;
     }
     #[cfg(test)]
@@ -1178,6 +1208,12 @@ struct CommitOutcome {
     /// The pin this commit installed.  Post-commit rollback compares the
     /// live affinity against this pin before touching anything.
     installed: Option<PeerSocketPin>,
+    /// The entry's authenticated-evidence counter at commit time, snapshotted
+    /// under the same lock.  The watcher's rollback promotes the socket to
+    /// Finalized when the counter moved afterwards: fresh authenticated
+    /// evidence observed AFTER the commit proves the mapping carries the
+    /// peer's traffic and the socket must never be rolled back and deleted.
+    evidence_at_commit: u64,
 }
 
 /// How long `finalize` waits for the watcher's explicit acknowledgement
@@ -1412,6 +1448,11 @@ impl ProvisionalSocketGuard {
     ///   committed-generation high-water), so an older generation can never
     ///   pin over a newer commit no matter how the awaits interleaved.
     ///
+    /// The whole transition runs under the shared network-epoch gate: a
+    /// generation advance can never bump the mirror between the in-lock
+    /// generation read and the phase flip + pin insert, so a stale generation
+    /// can never commit once the generation has moved on.
+    ///
     /// The outcome (predecessor + installed pin) is published to the watcher
     /// inside the same critical section, so the watcher's post-commit
     /// rollback always knows exactly which pin this commit installed.
@@ -1431,7 +1472,9 @@ impl ProvisionalSocketGuard {
             committed: false,
             predecessor: None,
             installed: None,
+            evidence_at_commit: 0,
         };
+        let _epoch_gate = transport.network_epoch_gate.lock().await;
         let mut state = transport.socket_state.lock().await;
         let Some(entry) = state.dynamic.get(&socket_index) else {
             return refused;
@@ -1483,10 +1526,19 @@ impl ProvisionalSocketGuard {
             .entry(peer_id.to_string())
             .and_modify(|committed| *committed = (*committed).max(punch_generation))
             .or_insert(punch_generation);
+        // Snapshot the entry's authenticated evidence at commit time: the
+        // watcher compares this against the live counter on rollback, so
+        // evidence observed AFTER this commit keeps the socket.
+        let evidence_at_commit = state
+            .dynamic
+            .get(&socket_index)
+            .map(|entry| entry.authenticated_evidence)
+            .unwrap_or(0);
         let outcome = CommitOutcome {
             committed: true,
             predecessor,
             installed: Some(installed),
+            evidence_at_commit,
         };
         *self.outcome.lock().expect("guard outcome mutex") = Some(outcome);
         // Publish under the same lock the entry was flipped under: the
@@ -1516,25 +1568,77 @@ impl ProvisionalSocketGuard {
     /// finalize.  Only then is the superseded predecessor detached (unless it
     /// was re-pinned by authenticated traffic).
     ///
+    /// The flip re-verifies under the lock (and under the shared network-epoch
+    /// gate) that the entry still belongs to this guard's peer, still matches
+    /// the punch generation this guard committed, is still pinned as THIS
+    /// commit installed it, still matches the current network generation, and
+    /// the session was not cancelled meanwhile: a stale or superseded entry is
+    /// never finalized.
+    ///
     /// Returns `false` when the socket was already rolled back (entry gone)
     /// or never committed: the durable handoff did not happen and the caller
     /// must not treat the socket as the peer's long-term path.
     pub(crate) async fn finalize(&self) -> bool {
-        // Phase flip under the lock: after this, the watcher can never roll
-        // the socket back.
+        // Phase flip under the gate and the lock: after this, the watcher can
+        // never roll the socket back.
         let flipped = {
+            let _epoch_gate = self.transport.network_epoch_gate.lock().await;
             let mut state = self.transport.socket_state.lock().await;
-            let Some(entry) = state.dynamic.get_mut(&self.socket_index) else {
-                // Rolled back (or evicted) before the durable handoff: the
-                // watcher already restored the predecessor.
-                return false;
-            };
-            if entry.phase == DynamicSocketPhase::Provisional {
+            let (phase, peer_id, punch_generation, network_generation) =
+                match state.dynamic.get(&self.socket_index) {
+                    Some(entry) => (
+                        entry.phase,
+                        entry.peer_id.clone(),
+                        entry.punch_generation,
+                        entry.network_generation,
+                    ),
+                    // Rolled back (or evicted) before the durable handoff: the
+                    // watcher already restored the predecessor.
+                    None => return false,
+                };
+            if phase == DynamicSocketPhase::Provisional {
                 // Never committed; the generation's own cleanup owns it.
                 return false;
             }
-            if entry.phase != DynamicSocketPhase::Finalized {
-                entry.phase = DynamicSocketPhase::Finalized;
+            if phase != DynamicSocketPhase::Finalized {
+                let (committed_punch_generation, current_network_generation, installed) = {
+                    let outcome = self.outcome.lock().expect("guard outcome mutex");
+                    (
+                        state
+                            .committed_punch_generations
+                            .get(&self.peer_id)
+                            .copied()
+                            .unwrap_or(0),
+                        self.transport.peers.current_network_generation_sync(),
+                        outcome.and_then(|outcome| {
+                            if outcome.committed {
+                                outcome.installed
+                            } else {
+                                None
+                            }
+                        }),
+                    )
+                };
+                let revalidated = installed.is_some_and(|installed| {
+                    peer_id == self.peer_id
+                        && punch_generation == committed_punch_generation
+                        && network_generation == current_network_generation
+                        && state.affinity.get(&self.peer_id).copied() == Some(installed)
+                        && !self.cancellation.is_cancelled()
+                });
+                if !revalidated {
+                    debug!(
+                        "finalize refused for socket index={} peer={}: ownership, punch generation, network generation, affinity or cancellation changed since the commit",
+                        self.socket_index,
+                        self.peer_id
+                    );
+                    return false;
+                }
+                state
+                    .dynamic
+                    .get_mut(&self.socket_index)
+                    .expect("finalize entry verified above")
+                    .phase = DynamicSocketPhase::Finalized;
             }
             true
         };
@@ -1580,12 +1684,16 @@ impl UdpTransport {
     ///
     /// Returns the entry to detach, or `None` when nothing must be detached:
     /// - the entry is already `Finalized` or gone;
-    /// - the affinity still equals THIS commit's installed pin → full
-    ///   rollback: restore the predecessor pin (or clear the affinity) and
-    ///   detach this generation's socket;
-    /// - the affinity was re-pinned to THIS socket by fresh evidence → the
-    ///   socket demonstrably carries the peer's traffic: promote it to
-    ///   `Finalized` and keep it;
+    /// - authenticated evidence was observed on the entry AFTER the commit
+    ///   (matched ACK, accepted authenticated punch, or decrypted WireGuard
+    ///   data received on this socket): the socket demonstrably carries the
+    ///   peer's traffic, so it is promoted to `Finalized` and kept — the
+    ///   evidence counter is the socket's own record and can never be faked
+    ///   by a stale pin or an old network epoch;
+    /// - the affinity still equals THIS commit's installed pin (and no
+    ///   post-commit evidence exists) → full rollback: restore the
+    ///   predecessor pin (or clear the affinity) and detach this
+    ///   generation's socket;
     /// - a newer commit or evidence owns the affinity → detach this socket
     ///   WITHOUT restoring the predecessor (a restore would downgrade the
     ///   current owner — the "G2 rollback overwrites G3 commit" race).
@@ -1603,6 +1711,33 @@ impl UdpTransport {
             }
         }
         let peer_id = state.dynamic.get(socket_index)?.peer_id.clone();
+        // Post-commit authenticated evidence is the socket's OWN record:
+        // whenever the counter moved past the commit snapshot the mapping
+        // demonstrably carried the peer's traffic, so the socket is promoted
+        // to the durable phase instead of being rolled back — even when the
+        // affinity still equals the installed pin (the evidence re-verified
+        // the very socket the commit pinned).
+        let has_post_commit_evidence = state
+            .dynamic
+            .get(socket_index)
+            .is_some_and(|entry| entry.authenticated_evidence > outcome.evidence_at_commit);
+        if has_post_commit_evidence {
+            state
+                .dynamic
+                .get_mut(socket_index)
+                .expect("committed socket verified above")
+                .phase = DynamicSocketPhase::Finalized;
+            debug!(
+                "rollback promoted socket index={socket_index} peer={peer_id} to Finalized: authenticated evidence arrived after the commit (counter {} -> {})",
+                outcome.evidence_at_commit,
+                state
+                    .dynamic
+                    .get(socket_index)
+                    .map(|entry| entry.authenticated_evidence)
+                    .unwrap_or(0)
+            );
+            return None;
+        }
         let affinity = state.affinity.get(&peer_id).copied();
         if affinity == Some(installed) {
             // Full rollback: restore the predecessor pin and detach this
@@ -1634,9 +1769,11 @@ impl UdpTransport {
             Some(entry)
         } else if affinity.is_some_and(|pin| pin.socket_index == *socket_index) {
             // The socket was re-pinned by fresh inbound evidence since the
-            // commit: it demonstrably carries the peer's traffic and must not
-            // be deleted.  Promote it to the durable phase; the predecessor
-            // is NOT restored (this socket owns the affinity now).
+            // commit (its evidence counter would normally have moved too; the
+            // epoch-only match is the belt-and-braces path for pool pins).
+            // It demonstrably carries the peer's traffic and must not be
+            // deleted.  Promote it to the durable phase; the predecessor is
+            // NOT restored (this socket owns the affinity now).
             state
                 .dynamic
                 .get_mut(socket_index)

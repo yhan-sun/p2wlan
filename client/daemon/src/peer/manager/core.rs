@@ -16,6 +16,8 @@ impl PeerManager {
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
+            direct_validation_registry: Arc::new(RwLock::new(None)),
             local_nat_profile: Arc::new(RwLock::new(None)),
             traversal_history: Arc::new(RwLock::new(traversal_history)),
             traversal_history_path,
@@ -129,6 +131,53 @@ impl PeerManager {
         self.network_generation_sync.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The shared network-epoch gate that serializes generation advances
+    /// against the UDP socket-state mutations that commit, finalize, attach
+    /// or adopt ownership stamped with a generation.
+    ///
+    /// The UDP transport acquires this gate (gate -> socket_state ->
+    /// pending probes) around every generation-sensitive mutation so an
+    /// advance can never bump the generation between the mutation's read and
+    /// its write; the advances hold the same gate for their whole critical
+    /// section.
+    pub(crate) fn network_epoch_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.network_epoch_gate.clone()
+    }
+
+    /// Publish the validation ownership registry of the active UDP transport.
+    ///
+    /// Replacement is serialized with generation transitions.  The previous
+    /// transport's workers and expectations are revoked before the new handle
+    /// is made visible, so a dead/rebound socket cannot leave validation ACK
+    /// state behind to promote a later transport.
+    pub(crate) async fn register_direct_validation_registry(
+        &self,
+        registry: crate::udp::DirectValidationRegistry,
+    ) {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_gate = epoch_gate.lock().await;
+        let previous = self
+            .direct_validation_registry
+            .write()
+            .await
+            .replace(registry);
+        if let Some(previous) = previous {
+            previous.cancel_all().await;
+        }
+    }
+
+    /// Cancel the registry that is current at the instant this lifecycle
+    /// operation holds the epoch gate. A control-event handler may have cloned
+    /// an old `UdpTransport` just before a rebind; resolving the registry here
+    /// avoids leaving the replacement transport's validation owner alive.
+    pub(crate) async fn cancel_active_direct_validation_for_peer(&self, peer_id: &str) {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_gate = epoch_gate.lock().await;
+        if let Some(registry) = self.direct_validation_registry.read().await.clone() {
+            registry.cancel_peer(peer_id).await;
+        }
+    }
+
     /// Whether a peer connection currently exists, readable without awaiting.
     ///
     /// Used under the UDP adoption lock to refuse ACK/punch adoption for a
@@ -146,8 +195,16 @@ impl PeerManager {
     ///
     /// Existing remote candidates are kept so they can be reprobed, but prior
     /// direct success is no longer trusted for active-path selection.
+    ///
+    /// The whole advance runs under the shared network-epoch gate: no UDP
+    /// socket-state mutation that read the old generation can commit, finalize,
+    /// attach, adopt or register a pending probe in between, so after this
+    /// returns every generation-sensitive transition belongs to the new
+    /// generation.
     pub async fn advance_network_generation(&self, reason: impl Into<String>) -> u64 {
         let reason = reason.into();
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_gate = epoch_gate.lock().await;
         let generation = {
             let mut generation = self.network_generation.write().await;
             *generation = generation.saturating_add(1);
@@ -157,6 +214,9 @@ impl PeerManager {
                 .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
+        if let Some(registry) = self.direct_validation_registry.read().await.clone() {
+            registry.cancel_before_generation(generation).await;
+        }
 
         let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
@@ -186,8 +246,14 @@ impl PeerManager {
     /// low-latency private/LAN Direct path is still healthy. Preserve that
     /// selected private pair in the new generation so data traffic does not
     /// briefly fall back to relay on every refresh.
+    ///
+    /// Like the full advance, the whole transition runs under the shared
+    /// network-epoch gate so generation-sensitive UDP socket mutations are
+    /// linearized against it.
     pub async fn advance_candidate_refresh_generation(&self, reason: impl Into<String>) -> u64 {
         let reason = reason.into();
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_gate = epoch_gate.lock().await;
         let generation = {
             let mut generation = self.network_generation.write().await;
             *generation = generation.saturating_add(1);
@@ -197,6 +263,9 @@ impl PeerManager {
                 .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
+        if let Some(registry) = self.direct_validation_registry.read().await.clone() {
+            registry.cancel_before_generation(generation).await;
+        }
 
         let mut retained_confirmed_direct_count = 0usize;
         let mut direct_reclaim_count = 0usize;

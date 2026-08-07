@@ -36,6 +36,10 @@ pub struct Daemon {
     punch_attempts: PunchAttemptDeduplicator,
     /// Bound UDP transport shared with control-plane-triggered punching.
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    /// Authoritative UDP transport publication stream.  The legacy RwLock is
+    /// retained for existing best-effort consumers; WireGuard inbound uses
+    /// this watch-backed slot so it follows delayed publication and replacement.
+    udp_transport_publication: UdpTransportPublication,
     /// Resolved STUN / observer endpoints used by live candidate refreshes.
     runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
     /// Timeout for runtime STUN refreshes.
@@ -101,11 +105,23 @@ impl Daemon {
         // prediction is disabled rather than silently re-seeded from the wall
         // clock, which could regress below the high-water receivers recorded.
         let boot_epoch_ms = crate::incarnation::next_boot_incarnation(&config).unwrap_or(0);
+        // An incarnation that outgrew the 41-bit candidate-generation
+        // encoding field also disables fresh prediction (the label must never
+        // wrap): ordinary signaling continues with the legacy generation 0.
+        let boot_epoch_ms = if crate::control::incarnation_fits_candidate_generation_encoding(
+            boot_epoch_ms,
+        ) {
+            boot_epoch_ms
+        } else {
+            0
+        };
         if boot_epoch_ms == 0 {
             warn!(
-                "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation); ordinary punching continues"
+                "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation or the incarnation outgrew its encoding field); ordinary punching continues"
             );
         }
+
+        let udp_transport = Arc::new(RwLock::new(None));
 
         Self {
             config: Arc::new(config.clone()),
@@ -128,7 +144,8 @@ impl Daemon {
                 ..GatewayMappingDiagnostics::default()
             })),
             punch_attempts: PunchAttemptDeduplicator::default(),
-            udp_transport: Arc::new(RwLock::new(None)),
+            udp_transport: udp_transport.clone(),
+            udp_transport_publication: UdpTransportPublication::new(udp_transport),
             runtime_stun_servers: Arc::new(RwLock::new(Vec::new())),
             runtime_stun_timeout: Arc::new(RwLock::new(Duration::from_millis(
                 config.network.stun_timeout_ms,

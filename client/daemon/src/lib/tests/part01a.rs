@@ -401,9 +401,23 @@ async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_sessio
     let packet = Ipv4Packet::new(&decrypted).unwrap();
     assert_eq!(packet.src_addr(), Ipv4Addr::new(10, 20, 0, 1));
     assert_eq!(packet.dst_addr(), Ipv4Addr::new(10, 20, 0, 2));
+    // The first datagram is the daemon-internal validation REQUEST: it
+    // carries the request payload prefix plus the token (generation, request
+    // id, sequence), never the plain echo payload of the old design.
+    let token = parse_direct_validation_token(&decrypted).unwrap();
+    assert_eq!(token.kind, DirectValidationKind::Request);
+    assert_eq!(token.generation, 0);
+    assert_eq!(token.sequence, 0);
+    assert_ne!(
+        token.owner_token, 0,
+        "every validation request must carry its nonzero session owner token"
+    );
+    // `payload()` here is the whole ICMP datagram (header + data): the
+    // request prefix sits after the 8-byte ICMP header.
     assert!(packet
         .payload()
-        .ends_with(DIRECT_ENCRYPTED_VALIDATION_PAYLOAD));
+        .get(8..)
+        .is_some_and(|data| data.starts_with(DIRECT_VALIDATION_REQUEST_PAYLOAD)));
 
     let diagnostics = peers.diagnostics().await;
     assert!(diagnostics[0]
@@ -1002,6 +1016,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
             handshake_init: Vec::new(),
             punch_at_ms: None,
             punch_at_server_ms: None,
+            sender_public_key: None,
         })
         .unwrap();
 
@@ -1051,6 +1066,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
             handshake_init: Vec::new(),
             punch_at_ms: None,
             punch_at_server_ms: None,
+            sender_public_key: None,
         })
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1112,6 +1128,7 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
             handshake_init: Vec::new(),
             punch_at_ms: None,
             punch_at_server_ms: None,
+            sender_public_key: None,
         })
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1185,6 +1202,7 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
                 handshake_init: Vec::new(),
                 punch_at_ms: None,
                 punch_at_server_ms: None,
+                sender_public_key: None,
             })
             .unwrap();
     };
@@ -1338,6 +1356,7 @@ async fn fresh_prediction_for_missing_peer_keeps_identity() {
             handshake_init: Vec::new(),
             punch_at_ms: None,
             punch_at_server_ms: None,
+            sender_public_key: None,
         })
         .unwrap();
     // Give the event loop a deterministic window to process the offer.

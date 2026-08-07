@@ -1,10 +1,14 @@
 package database
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -27,6 +31,20 @@ type Signal struct {
 	Handshake               string            `json:"handshake"`
 	PunchAtMS               int64             `json:"punch_at_ms,omitempty"`
 	CreatedAt               int64             `json:"created_at"`
+	// SenderPublicKey is the sender's identity fingerprint (public key, hex)
+	// AT SEND TIME, bound to the row so a receiver can tell which identity a
+	// queued signal came from.  After the sender's key changes, still-queued
+	// signals from the old identity must never enter the new identity's
+	// fresh-prediction high-water space.
+	SenderPublicKey string `json:"sender_public_key,omitempty"`
+	// DeliveryToken is the per-delivery lease token assigned when the row is
+	// handed to a polling client in ACK mode.  The row is NOT deleted at
+	// delivery: the client must ACK it (idempotently) or the lease expires
+	// and the row is redelivered.
+	DeliveryToken string `json:"delivery_token,omitempty"`
+	// LeaseExpiresAtMS is the server-clock instant (unix ms) the current
+	// delivery lease expires; 0 means the row is free to deliver.
+	LeaseExpiresAtMS int64 `json:"lease_expires_at_ms,omitempty"`
 	// Server-assigned monotonic sequence per (from, to) pair.  Delivery
 	// ordering is defined by this sequence, never by the wall clock, so two
 	// signals created within the same second still arrive in send order and a
@@ -34,9 +52,19 @@ type Signal struct {
 	SignalSeq int64 `json:"signal_seq,omitempty"`
 }
 
+// SignalAck identifies one delivered signal for an idempotent ACK.
+type SignalAck struct {
+	ID            string `json:"id"`
+	DeliveryToken string `json:"delivery_token"`
+}
+
 const (
 	SignalProtocolVersion int64 = 1
 	signalTTLSeconds      int64 = 120
+	// How long a delivered (leased) signal stays reserved before it is
+	// redelivered.  Bounded well below the TTL so a client that dies
+	// mid-processing loses at most one lease window, never the signal.
+	signalLeaseSeconds int64 = 15
 )
 
 // Queue bounds.  The 120s TTL alone is not a bound: a flooded pair or node
@@ -84,7 +112,7 @@ func (db *DB) CreateSignalWithPunchAt(fromNodeID, toNodeID, typ string, candidat
 // CreateSignalWithTraversalMetadata persists the candidate-set ordering metadata.
 // Legacy callers use generation 0 and no explicit expiry.
 func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64) (*Signal, error) {
-	return db.CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ, SignalProtocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, "", "")
+	return db.CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ, SignalProtocolVersion, candidates, candidateSources, handshake, punchAtMS, candidateGeneration, candidatesExpiresAtMS, "", "", "")
 }
 
 // CreateSignalWithTraversalSession persists candidate-set metadata plus optional traversal session key material.
@@ -95,6 +123,11 @@ func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string
 // supersession.  In particular an ordinary refresh must never overwrite a
 // fresh-mapping prediction that arrived earlier, and a signal G1 arriving
 // late (after G2 was already queued) must never delete G2.
+//
+// `senderPublicKey` is the sender's identity fingerprint at send time and is
+// persisted with the row: the receiver binds the signal to the identity that
+// actually sent it, so old-identity queued signals cannot pollute a new
+// identity's fresh high-water after a key change.
 //
 // The sequence is persisted in the dedicated `signal_seqs` table, NOT derived
 // from the queued rows: the queue is drained by polling, so MAX(signal_seq)
@@ -111,7 +144,7 @@ func (db *DB) CreateSignalWithTraversalMetadata(fromNodeID, toNodeID, typ string
 // sender bypass the limit.  Exceeding any bound fails with
 // ErrSignalQueueLimit so the API can return 429 instead of silently dropping
 // or unbounded growth.
-func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey string) (*Signal, error) {
+func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string, protocolVersion int64, candidates []string, candidateSources map[string]string, handshake string, punchAtMS, candidateGeneration, candidatesExpiresAtMS int64, sessionID, probeEphemeralPublicKey, senderPublicKey string) (*Signal, error) {
 	if candidates == nil {
 		candidates = []string{}
 	}
@@ -161,8 +194,8 @@ func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string,
 		return nil, err
 	}
 
-	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, signal_seq, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, protocolVersion, string(candidatesJSON), string(candidateSourcesJSON), candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, handshake, punchAtMS, signalSeq, now)
+	_, err = tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, fromNodeID, toNodeID, typ, protocolVersion, string(candidatesJSON), string(candidateSourcesJSON), candidateGeneration, candidatesExpiresAtMS, sessionID, probeEphemeralPublicKey, handshake, punchAtMS, senderPublicKey, signalSeq, now)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +212,7 @@ func (db *DB) CreateSignalWithTraversalSession(fromNodeID, toNodeID, typ string,
 
 	return &Signal{
 		ID: id, FromNodeID: fromNodeID, ToNodeID: toNodeID, Type: typ,
-		ProtocolVersion: protocolVersion, Candidates: candidates, CandidateSources: candidateSources, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, SessionID: sessionID, ProbeEphemeralPublicKey: probeEphemeralPublicKey, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now, SignalSeq: signalSeq,
+		ProtocolVersion: protocolVersion, Candidates: candidates, CandidateSources: candidateSources, CandidateGeneration: candidateGeneration, CandidatesExpiresAtMS: candidatesExpiresAtMS, SessionID: sessionID, ProbeEphemeralPublicKey: probeEphemeralPublicKey, Handshake: handshake, PunchAtMS: punchAtMS, CreatedAt: now, SenderPublicKey: senderPublicKey, SignalSeq: signalSeq,
 	}, nil
 }
 
@@ -238,6 +271,10 @@ func enforceSignalQueueBounds(tx *sql.Tx, fromNodeID, toNodeID string, payloadBy
 // into memory, and only the delivered rows are deleted: a client that fails
 // mid-processing loses at most one bounded batch and the rest is redelivered
 // on the next poll.
+//
+// Rows currently HELD by an ACK-mode delivery lease are never returned or
+// deleted here: a legacy delete-on-GET poll must not steal a signal a
+// lease-mode client already received but has not yet ACKed.
 func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -250,8 +287,9 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, signal_seq, created_at
-		FROM signals WHERE to_node_id = ? AND created_at >= ? ORDER BY signal_seq ASC, created_at ASC, id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, MaxSignalBatch)
+	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at
+		FROM signals WHERE to_node_id = ? AND created_at >= ? AND lease_expires_at <= ?
+		ORDER BY signal_seq ASC, created_at ASC, id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, MaxSignalBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +309,7 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		var s Signal
 		var candidatesJSON string
 		var candidateSourcesJSON string
-		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SignalSeq, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		// One malformed row must never block the whole batch: the row is
@@ -318,4 +356,236 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	}
 
 	return signals, nil
+}
+
+// ListSignalsWithLease returns up to MaxSignalBatch queued messages for a
+// node WITHOUT deleting them, assigning each a delivery lease instead.
+//
+// Delivery order is the per-pair monotonic server sequence.  A row is only
+// delivered when it is free: no active lease (either never leased or the
+// lease EXPIRED, so a client that died mid-processing gets a redelivery).
+// The lease keeps the row invisible to every other poll — including the
+// legacy delete-on-GET path — until the client ACKs it (idempotently) or the
+// lease expires.
+//
+// Returns the delivered signals (each carrying its per-row delivery token)
+// and the server-clock lease deadline in unix milliseconds.
+func (db *DB) ListSignalsWithLease(toNodeID string) ([]Signal, int64, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	leaseExpires := now + signalLeaseSeconds
+	if _, err := tx.Exec(`DELETE FROM signals WHERE created_at < ?`, now-signalTTLSeconds); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at
+		FROM signals WHERE to_node_id = ? AND created_at >= ? AND lease_expires_at <= ?
+		ORDER BY signal_seq ASC, created_at ASC, id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, MaxSignalBatch)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	signals := []Signal{}
+	malformedIDs := make([]interface{}, 0, 8)
+	malformedPlaceholders := ""
+	for rows.Next() {
+		var s Signal
+		var candidatesJSON string
+		var candidateSourcesJSON string
+		if err := rows.Scan(&s.ID, &s.FromNodeID, &s.ToNodeID, &s.Type, &s.ProtocolVersion, &candidatesJSON, &candidateSourcesJSON, &s.CandidateGeneration, &s.CandidatesExpiresAtMS, &s.SessionID, &s.ProbeEphemeralPublicKey, &s.Handshake, &s.PunchAtMS, &s.SenderPublicKey, &s.SignalSeq, &s.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		// One malformed row must never block the batch: it is skipped and
+		// DELETED (keeping it would poison every later poll forever), like
+		// the legacy path does.
+		if err := json.Unmarshal([]byte(candidatesJSON), &s.Candidates); err != nil {
+			appendID(&malformedIDs, &malformedPlaceholders, s.ID)
+			continue
+		}
+		if s.Candidates == nil {
+			s.Candidates = []string{}
+		}
+		if err := json.Unmarshal([]byte(candidateSourcesJSON), &s.CandidateSources); err != nil {
+			appendID(&malformedIDs, &malformedPlaceholders, s.ID)
+			continue
+		}
+		if s.CandidateSources == nil {
+			s.CandidateSources = map[string]string{}
+		}
+		s.DeliveryToken = fmt.Sprintf("dlv-%d-%d", time.Now().UnixNano(), nextSignalID.Add(1))
+		s.LeaseExpiresAtMS = leaseExpires * 1000
+		signals = append(signals, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, err
+	}
+
+	if len(signals) > 0 {
+		entries := make([]struct{ ID, Token string }, 0, len(signals))
+		for _, signal := range signals {
+			entries = append(entries, struct{ ID, Token string }{signal.ID, signal.DeliveryToken})
+		}
+		batchToken := BatchTokenFor(entries)
+		// Assign the lease for exactly the delivered rows, in the same
+		// transaction that read them: two concurrent polls can never lease
+		// the same row, and the row stays visible to NO poll until the client
+		// ACKs it or the lease expires.
+		for _, signal := range signals {
+			result, err := tx.Exec(`UPDATE signals
+				SET delivery_token = ?, delivery_batch_token = ?, lease_expires_at = ?
+				WHERE to_node_id = ? AND id = ? AND lease_expires_at <= ?`,
+				signal.DeliveryToken, batchToken, leaseExpires, toNodeID, signal.ID, now)
+			if err != nil {
+				return nil, 0, err
+			}
+			if affected, err := result.RowsAffected(); err != nil {
+				return nil, 0, err
+			} else if affected != 1 {
+				// A separate server process may have claimed the row after the
+				// SELECT.  Never overwrite its lease; abort this transaction so
+				// the caller retries from a fresh snapshot.
+				return nil, 0, fmt.Errorf("signal lease changed while claiming %s", signal.ID)
+			}
+		}
+	}
+	if len(malformedIDs) > 0 {
+		args := append([]interface{}{toNodeID}, malformedIDs...)
+		if _, err := tx.Exec(`DELETE FROM signals WHERE to_node_id = ? AND id IN (`+malformedPlaceholders+`)`, args...); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+
+	return signals, leaseExpires * 1000, nil
+}
+
+// AckSignals idempotently acknowledges delivered signals: each row is
+// deleted only when its delivery token still matches the token the client
+// received (the client proves it really got THAT delivery).  Already-deleted
+// rows are no-ops, so a repeated ACK is harmless.  Returns the number of
+// rows actually deleted.
+func (db *DB) AckSignals(toNodeID string, acks []SignalAck) (int64, error) {
+	if len(acks) == 0 {
+		return 0, nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	deleted := int64(0)
+	for _, ack := range acks {
+		result, err := tx.Exec(`DELETE FROM signals
+			WHERE to_node_id = ? AND id = ? AND delivery_token = ? AND delivery_token != ''`,
+			toNodeID, ack.ID, ack.DeliveryToken)
+		if err != nil {
+			return 0, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		deleted += count
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// AckSignalBatch acknowledges every signal of one delivered batch using the
+// server-generated batch token.  The batch token is a digest of the delivery
+// tokens the batch was handed out with; it validates only while every row of
+// that batch is still leased with those exact tokens, so a batch whose rows
+// were partially ACKed or re-leased fails and the client must fall back to
+// per-row ACKs.  Returns the number of rows deleted.
+func (db *DB) AckSignalBatch(toNodeID, batchToken string) (int64, error) {
+	if strings.TrimSpace(batchToken) == "" {
+		return 0, nil
+	}
+	now := time.Now().Unix()
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id, delivery_token FROM signals
+		WHERE to_node_id = ? AND delivery_batch_token = ? AND delivery_token != '' AND lease_expires_at > ?`, toNodeID, batchToken, now)
+	if err != nil {
+		return 0, err
+	}
+	var leased []struct{ ID, Token string }
+	for rows.Next() {
+		var entry struct{ ID, Token string }
+		if err := rows.Scan(&entry.ID, &entry.Token); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		leased = append(leased, entry)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(leased) == 0 {
+		return 0, nil
+	}
+	if BatchTokenFor(leased) != batchToken {
+		// The batch changed (partially ACKed, re-leased, or new rows
+		// arrived): the client must retry with per-row ACKs.
+		return 0, nil
+	}
+	args := make([]interface{}, 0, len(leased))
+	placeholders := ""
+	for _, entry := range leased {
+		args = append(args, entry.ID)
+		if placeholders != "" {
+			placeholders += ","
+		}
+		placeholders += "?"
+	}
+	args = append([]interface{}{toNodeID}, args...)
+	args = append(args, batchToken, now)
+	result, err := tx.Exec(`DELETE FROM signals
+		WHERE to_node_id = ? AND id IN (`+placeholders+`) AND delivery_batch_token = ? AND lease_expires_at > ?`, args...)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// BatchTokenFor deterministically digests one delivery batch: the tokens are
+// sorted by row id and hashed, so the same batch always produces the same
+// token and a changed batch never does.
+func BatchTokenFor(entries []struct{ ID, Token string }) string {
+	sorted := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		sorted = append(sorted, entry.ID+":"+entry.Token)
+	}
+	sort.Strings(sorted)
+	digest := sha256.Sum256([]byte(strings.Join(sorted, "|")))
+	return hex.EncodeToString(digest[:])
+}
+
+func appendID(ids *[]interface{}, placeholders *string, id string) {
+	*ids = append(*ids, id)
+	if *placeholders != "" {
+		*placeholders += ","
+	}
+	*placeholders += "?"
 }

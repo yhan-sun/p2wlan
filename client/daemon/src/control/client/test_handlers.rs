@@ -83,6 +83,7 @@ impl ControlClient {
                     handshake_init,
                     punch_at_ms,
                     punch_at_server_ms: None,
+                    sender_public_key: None,
                 });
             }
 
@@ -109,6 +110,7 @@ impl ControlClient {
                     handshake_response,
                     punch_at_ms,
                     punch_at_server_ms: None,
+                    sender_public_key: None,
                 });
             }
 
