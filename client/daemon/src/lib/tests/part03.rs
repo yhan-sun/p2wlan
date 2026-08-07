@@ -996,6 +996,58 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
         .expect("cancelled candidate worker returned an error");
 }
 
+#[tokio::test]
+async fn committed_initiator_offer_wait_is_cancelled_when_pending_is_removed() {
+    let peer_id = "peer-cancelled-initiator-offer";
+    let mut state = PendingHandshakeState::default();
+    let reservation = state
+        .reserve_start_with_owner(peer_id)
+        .expect("initiator reservation must be admitted");
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let initiator = HandshakeInitiator::new(local_identity, peer_identity.public_key(), None);
+    let pending_id = state
+        .insert_reserved_if_current(
+            peer_id.to_string(),
+            reservation.owner,
+            initiator,
+            None,
+            None,
+        )
+        .expect("reservation must commit into a pending initiator");
+    assert!(state.is_current(peer_id, pending_id));
+    assert!(
+        state.pending_cancellations.contains_key(peer_id),
+        "committing the initiator must retain the reservation cancellation sender"
+    );
+
+    let mut cancellation = reservation.cancellation.clone();
+    let (offer_started_tx, offer_started_rx) = tokio::sync::oneshot::channel();
+    let offer_wait = tokio::spawn(async move {
+        await_initiator_offer_or_cancellation(
+            async move {
+                let _ = offer_started_tx.send(());
+                std::future::pending::<Result<()>>().await
+            },
+            &mut cancellation,
+        )
+        .await
+    });
+    offer_started_rx
+        .await
+        .expect("offer waiter must reach the slow control-plane wait");
+
+    // `handle_peer_answer` uses this exact removal path after it consumes a
+    // matching answer; `clear_peer` reaches it for PeerLeft. Both must wake
+    // the committed initiator rather than leave a control-event slot pending.
+    assert!(state.remove(peer_id).is_some());
+    let outcome = tokio::time::timeout(Duration::from_millis(100), offer_wait)
+        .await
+        .expect("removing a pending initiator must cancel its offer wait")
+        .expect("offer waiter task must not panic");
+    assert!(outcome.is_none());
+}
+
 #[test]
 fn handshake_role_is_deterministic_from_decoded_static_public_keys() {
     let lower = [0x11; 32];

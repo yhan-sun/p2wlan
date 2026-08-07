@@ -1,3 +1,40 @@
+/// Await an initiator offer only while its reserved pending transaction is
+/// still live.  The control runtime owns the actual HTTP request, but dropping
+/// this receiver wait on cancellation releases the bounded control-event work
+/// slot immediately instead of leaving it occupied until that request times
+/// out.
+async fn await_initiator_offer_or_cancellation<F>(
+    offer: F,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<Result<()>>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    // A closed sender is fail-closed too: without the reservation owner we
+    // must not report an old offer as current.
+    if *cancellation.borrow() || cancellation.has_changed().is_err() {
+        return None;
+    }
+
+    tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            let _ = changed;
+            None
+        }
+        result = offer => {
+            // If both branches become ready together, prefer cancellation;
+            // this final check also covers a sender being dropped immediately
+            // after the request completed.
+            if *cancellation.borrow() || cancellation.has_changed().is_err() {
+                None
+            } else {
+                Some(result)
+            }
+        }
+    }
+}
+
 impl Daemon {
     /// Fast admission used by the serial control event loop before it puts
     /// potentially slow initiator work into its bounded work set.
@@ -176,9 +213,8 @@ impl Daemon {
         // POST is queued must be able to consume the pending transaction.
         drop(handshake_guard);
         let punch_at_ms = relay_assisted_punch_at_ms();
-        let offer_result = self
-            .control
-            .send_peer_offer_with_sources_punch_and_session(
+        let Some(offer_result) = await_initiator_offer_or_cancellation(
+            self.control.send_peer_offer_with_sources_punch_and_session(
                 &peer_id,
                 &candidates,
                 &candidate_sources,
@@ -186,8 +222,13 @@ impl Daemon {
                 Some(punch_at_ms),
                 Some(session_id.clone()),
                 Some(probe_ephemeral_public_key),
-            )
-            .await;
+            ),
+            &mut reservation.cancellation,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
 
         if offer_result.is_ok() {
             info!(

@@ -50,30 +50,49 @@ where
     F: FnMut(SocketAddr, Arc<PeerManager>) -> Fut,
     Fut: std::future::Future<Output = Result<UdpTransport>>,
 {
-    // One permit pool outlives every individual UDP socket instance. A rebind
-    // may begin while an old validation worker is still unwinding, so each
-    // replacement scheduler must consume the same daemon-lifetime capacity.
+    // Each worker permit pool outlives individual UDP socket instances. A
+    // rebind may begin while retired validation or peer-reflexive workers are
+    // still unwinding, so every replacement scheduler consumes the same
+    // daemon-lifetime capacity.
     let direct_validation_worker_permits = new_direct_validation_worker_permits();
+    let peer_reflexive_signal_worker_permits = new_peer_reflexive_signal_worker_permits();
     let mut retry_delay = udp_direct_retry_initial_delay();
     loop {
         if udp_direct_shutdown_requested(&ctx.shutdown_rx) {
             return Ok(());
         }
 
-        let result = match bind(ctx.udp_bind, ctx.peers.clone()).await {
+        let (result, instance_runtime) = match bind(ctx.udp_bind, ctx.peers.clone()).await {
             Ok(udp) => {
-                run_udp_direct_instance(
-                    ctx.clone(),
-                    udp,
-                    direct_validation_worker_permits.clone(),
+                let instance_started_at = Instant::now();
+                (
+                    run_udp_direct_instance(
+                        ctx.clone(),
+                        udp,
+                        direct_validation_worker_permits.clone(),
+                        peer_reflexive_signal_worker_permits.clone(),
+                    )
+                    .await,
+                    Some(instance_started_at.elapsed()),
                 )
-                .await
             }
-            Err(err) => Err(err),
+            Err(err) => (Err(err), None),
         };
 
         if udp_direct_shutdown_requested(&ctx.shutdown_rx) {
             return Ok(());
+        }
+
+        if let Some(instance_runtime) = instance_runtime {
+            let reset_retry_delay =
+                udp_direct_retry_delay_after_instance(retry_delay, instance_runtime);
+            if reset_retry_delay != retry_delay {
+                info!(
+                    runtime_ms = instance_runtime.as_millis(),
+                    "UDP direct instance was stable; resetting bind retry backoff"
+                );
+                retry_delay = reset_retry_delay;
+            }
         }
 
         match result {
@@ -101,6 +120,7 @@ async fn run_udp_direct_instance(
     ctx: UdpDirectTaskContext,
     udp: UdpTransport,
     direct_validation_worker_permits: Arc<tokio::sync::Semaphore>,
+    peer_reflexive_signal_worker_permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let UdpDirectTaskContext {
         udp_bind: _,
@@ -184,8 +204,7 @@ async fn run_udp_direct_instance(
         control.clone(),
         udp.clone(),
         peers.clone(),
-        direct_validation_transport,
-        direct_validation_local_ip,
+        peer_reflexive_signal_worker_permits,
         lease.shutdown_receiver(),
     ));
 
@@ -429,6 +448,32 @@ fn udp_direct_retry_max_delay() -> Duration {
     }
 }
 
+/// A live socket earns a retry reset only after it has survived long enough
+/// that the preceding failure is no longer likely to be an immediate bind or
+/// reader crash loop.  A short-lived successful bind intentionally retains
+/// its exponential backoff.
+fn udp_direct_retry_reset_after() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(25)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(30)
+    }
+}
+
+fn udp_direct_retry_delay_after_instance(
+    retry_delay: Duration,
+    instance_runtime: Duration,
+) -> Duration {
+    if instance_runtime >= udp_direct_retry_reset_after() {
+        udp_direct_retry_initial_delay()
+    } else {
+        retry_delay
+    }
+}
+
 fn udp_direct_shutdown_requested(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
     *shutdown_rx.borrow()
 }
@@ -496,12 +541,11 @@ async fn run_peer_reflexive_signal_loop_until_cancelled(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
-    transport: WireGuardTransport,
-    local_virtual_ip: String,
+    worker_permits: Arc<tokio::sync::Semaphore>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::select! {
-        _ = run_peer_reflexive_signal_loop(ingress, control, udp, peers, transport, local_virtual_ip) => {},
+        _ = run_peer_reflexive_signal_loop(ingress, control, udp, peers, worker_permits) => {},
         _ = wait_for_udp_direct_shutdown(shutdown_rx) => {},
     }
 }
@@ -633,6 +677,26 @@ mod udp_direct_tests {
             .expect("UDP supervisor task must not panic")
             .expect("UDP supervisor must exit cleanly");
         drop(candidate_guard);
+    }
+
+    #[test]
+    fn udp_direct_retry_backoff_resets_only_after_a_stable_instance() {
+        let current_delay = udp_direct_retry_max_delay();
+        let stability_window = udp_direct_retry_reset_after();
+
+        assert_eq!(
+            udp_direct_retry_delay_after_instance(current_delay, stability_window),
+            udp_direct_retry_initial_delay(),
+            "a stable UDP instance must reset the next bind retry"
+        );
+        assert_eq!(
+            udp_direct_retry_delay_after_instance(
+                current_delay,
+                stability_window.saturating_sub(Duration::from_millis(1)),
+            ),
+            current_delay,
+            "a short-lived UDP instance must retain exponential backoff"
+        );
     }
 }
 

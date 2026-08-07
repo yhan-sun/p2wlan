@@ -8,6 +8,19 @@ const MAX_ACTIVE_PEER_REFLEXIVE_SIGNAL_WORKERS: usize = 16;
 /// refused once this bounded table is full.
 const MAX_PENDING_PEER_REFLEXIVE_SIGNAL_PEERS: usize = 128;
 
+/// Create the peer-reflexive worker capacity shared by every UDP transport
+/// instance supervised for one daemon lifetime.
+///
+/// A replacement transport can be published while a retired instance is still
+/// unwinding a control-plane request. Keeping this semaphore above an
+/// individual signal loop makes the 16-worker bound daemon-wide instead of
+/// allowing one full pool per overlapping UDP instance.
+fn new_peer_reflexive_signal_worker_permits() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        MAX_ACTIVE_PEER_REFLEXIVE_SIGNAL_WORKERS,
+    ))
+}
+
 #[derive(Default)]
 struct PeerReflexiveSignalSlot {
     latest: Option<PeerReflexiveObservation>,
@@ -58,6 +71,7 @@ async fn enqueue_peer_reflexive_signal_observation(
 /// The `active` bit is set while holding the slot lock, before the task is
 /// spawned, so the receive loop cannot race itself into duplicate workers for
 /// one peer.
+#[cfg(test)]
 async fn claim_pending_peer_reflexive_signal_worker(
     slots: &PeerReflexiveSignalSlots,
     worker_permits: &Arc<tokio::sync::Semaphore>,
@@ -78,37 +92,53 @@ async fn claim_pending_peer_reflexive_signal_worker(
     Some((peer_id, permit))
 }
 
-/// Fill all currently available worker permits from coalesced peer slots.
-async fn spawn_pending_peer_reflexive_signal_workers(
+/// Wait until this loop has a pending peer and the shared daemon worker budget
+/// has capacity.  A plain `try_acquire` is insufficient once UDP transports
+/// can overlap during replacement: the new instance would not be notified
+/// when an old instance releases its final permit.
+async fn wait_for_pending_peer_reflexive_signal_worker(
     slots: &PeerReflexiveSignalSlots,
-    workers: &mut tokio::task::JoinSet<()>,
+    work_available: &Arc<tokio::sync::Notify>,
     worker_permits: &Arc<tokio::sync::Semaphore>,
-    control: &ControlClient,
-    udp: &UdpTransport,
-    peers: &Arc<PeerManager>,
-) {
+) -> Option<(String, tokio::sync::OwnedSemaphorePermit)> {
     loop {
-        let Some((peer_id, permit)) =
-            claim_pending_peer_reflexive_signal_worker(slots, worker_permits).await
-        else {
-            return;
-        };
+        // Register before inspecting slots so an observation inserted between
+        // the check and await leaves a stored notification for this waiter.
+        let notified = work_available.notified();
+        let has_pending = slots
+            .lock()
+            .await
+            .values()
+            .any(|slot| !slot.active && slot.latest.is_some());
+        if !has_pending {
+            notified.await;
+            continue;
+        }
+        drop(notified);
 
-        let worker_slots = slots.clone();
-        let worker_control = control.clone();
-        let worker_udp = udp.clone();
-        let worker_peers = peers.clone();
-        workers.spawn(async move {
-            let _permit = permit;
-            run_peer_reflexive_signal_worker(
-                peer_id,
-                worker_slots,
-                worker_control,
-                worker_udp,
-                worker_peers,
-            )
-            .await;
-        });
+        // This awaits one daemon-wide permit.  If another overlapping UDP
+        // instance owns the last permit, releasing it wakes this waiter
+        // directly rather than depending on another local observation.
+        let Ok(permit) = worker_permits.clone().acquire_owned().await else {
+            return None;
+        };
+        let peer_id = {
+            let mut slots_guard = slots.lock().await;
+            slots_guard
+                .iter_mut()
+                .find(|(_, slot)| !slot.active && slot.latest.is_some())
+                .map(|(peer_id, slot)| {
+                    slot.active = true;
+                    peer_id.clone()
+                })
+        };
+        if let Some(peer_id) = peer_id {
+            return Some((peer_id, permit));
+        }
+
+        // Another scheduler consumed the last pending slot while this future
+        // waited for capacity. Return the permit and resume waiting for work.
+        drop(permit);
     }
 }
 
@@ -140,32 +170,31 @@ async fn run_peer_reflexive_signal_loop(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
-    _transport: WireGuardTransport,
-    _local_virtual_ip: String,
+    worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
-    run_peer_reflexive_signal_loop_with_worker_limit(
+    run_peer_reflexive_signal_loop_with_worker_permits(
         ingress,
         control,
         udp,
         peers,
-        MAX_ACTIVE_PEER_REFLEXIVE_SIGNAL_WORKERS,
+        worker_permits,
     )
     .await;
 }
 
-/// Implementation with a test-configurable worker cap.  Production callers
-/// use [`run_peer_reflexive_signal_loop`] so the cap remains a single audited
-/// constant at the daemon boundary.
-async fn run_peer_reflexive_signal_loop_with_worker_limit(
+/// Run the peer-reflexive loop against an explicit permit pool. Production
+/// receives its pool from the UDP supervisor; focused tests can pass a small
+/// shared pool to exercise replacement overlap deterministically.
+async fn run_peer_reflexive_signal_loop_with_worker_permits(
     ingress: PeerReflexiveIngress,
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
-    worker_limit: usize,
+    worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
     let slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
+    let work_available = Arc::new(tokio::sync::Notify::new());
     let mut workers = tokio::task::JoinSet::new();
-    let worker_permits = Arc::new(tokio::sync::Semaphore::new(worker_limit));
 
     loop {
         tokio::select! {
@@ -183,32 +212,36 @@ async fn run_peer_reflexive_signal_loop_with_worker_limit(
                         "dropping peer-reflexive signal for a new peer because the coalesced table is full"
                     );
                 }
-                spawn_pending_peer_reflexive_signal_workers(
-                    &slots,
-                    &mut workers,
-                    &worker_permits,
-                    &control,
-                    &udp,
-                    &peers,
-                )
-                .await;
+                work_available.notify_one();
             }
             joined = workers.join_next(), if !workers.is_empty() => {
                 if let Some(Err(error)) = joined {
                     warn!(%error, "peer-reflexive signal worker terminated unexpectedly");
                 }
-                // A permit is returned when the joined task is dropped.  Fill
-                // newly available capacity immediately so a peer that was
-                // coalesced while the cap was full is never stranded.
-                spawn_pending_peer_reflexive_signal_workers(
-                    &slots,
-                    &mut workers,
-                    &worker_permits,
-                    &control,
-                    &udp,
-                    &peers,
-                )
-                .await;
+            }
+            claimed = wait_for_pending_peer_reflexive_signal_worker(
+                &slots,
+                &work_available,
+                &worker_permits,
+            ) => {
+                let Some((peer_id, permit)) = claimed else {
+                    return;
+                };
+                let worker_slots = slots.clone();
+                let worker_control = control.clone();
+                let worker_udp = udp.clone();
+                let worker_peers = peers.clone();
+                workers.spawn(async move {
+                    let _permit = permit;
+                    run_peer_reflexive_signal_worker(
+                        peer_id,
+                        worker_slots,
+                        worker_control,
+                        worker_udp,
+                        worker_peers,
+                    )
+                    .await;
+                });
             }
         }
     }

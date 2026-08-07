@@ -39,11 +39,14 @@ func (s *RelayServer) serveUDPObserver() {
 			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
 			continue
 		}
+		// Count a validated request before making the response observable to
+		// the caller. Otherwise a client can receive the response and read the
+		// metric before this goroutine is scheduled again.
+		atomic.AddUint64(&s.stats.udpObserverRequestsTotal, 1)
 		if _, err := s.udpObserverConn.WriteToUDP(response, addr); err != nil {
 			atomic.AddUint64(&s.stats.udpObserverErrorsTotal, 1)
 			continue
 		}
-		atomic.AddUint64(&s.stats.udpObserverRequestsTotal, 1)
 	}
 }
 

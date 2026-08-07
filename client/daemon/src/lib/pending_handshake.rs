@@ -112,6 +112,11 @@ struct PendingHandshakeState {
     /// Cancellation handles for slow event-triggered preparation work. A peer
     /// leave or identity replacement wakes a pre-commit STUN wait immediately.
     starting_cancellations: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    /// Cancellation handles transferred from `starting` when an event
+    /// initiator commits its pending transaction.  Keeping this sender alive
+    /// makes the subsequent control-plane offer wait cancellable by a
+    /// PeerLeft, crossing offer, or matching answer.
+    pending_cancellations: HashMap<String, tokio::sync::watch::Sender<bool>>,
     next_start_id: u64,
     pending_ids: HashMap<String, u64>,
     next_id: u64,
@@ -184,8 +189,14 @@ impl PendingHandshakeState {
             return None;
         }
         self.starting_ids.remove(&peer_id);
-        self.starting_cancellations.remove(&peer_id);
-        Some(self.insert(peer_id, initiator, session_id, probe_ephemeral))
+        let cancellation = self.starting_cancellations.remove(&peer_id);
+        Some(self.insert_with_cancellation(
+            peer_id,
+            initiator,
+            session_id,
+            probe_ephemeral,
+            cancellation,
+        ))
     }
 
     fn insert_reserved_if_current(
@@ -201,10 +212,17 @@ impl PendingHandshakeState {
         }
         self.starting.remove(&peer_id);
         self.starting_ids.remove(&peer_id);
-        self.starting_cancellations.remove(&peer_id);
-        Some(self.insert(peer_id, initiator, session_id, probe_ephemeral))
+        let cancellation = self.starting_cancellations.remove(&peer_id);
+        Some(self.insert_with_cancellation(
+            peer_id,
+            initiator,
+            session_id,
+            probe_ephemeral,
+            cancellation,
+        ))
     }
 
+    #[cfg(test)]
     fn insert(
         &mut self,
         peer_id: String,
@@ -212,6 +230,23 @@ impl PendingHandshakeState {
         session_id: Option<String>,
         probe_ephemeral: Option<DhKeyPair>,
     ) -> u64 {
+        self.insert_with_cancellation(peer_id, initiator, session_id, probe_ephemeral, None)
+    }
+
+    fn insert_with_cancellation(
+        &mut self,
+        peer_id: String,
+        initiator: HandshakeInitiator,
+        session_id: Option<String>,
+        probe_ephemeral: Option<DhKeyPair>,
+        cancellation: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> u64 {
+        // Defend against a direct replacement: wake the old owner before
+        // replacing its slot so a late slow POST cannot outlive the new
+        // transaction.
+        if let Some(previous) = self.pending_cancellations.remove(&peer_id) {
+            previous.send_replace(true);
+        }
         self.next_id = self.next_id.saturating_add(1);
         let pending_id = self.next_id;
         self.pending.insert(peer_id.clone(), initiator);
@@ -226,11 +261,17 @@ impl PendingHandshakeState {
         } else {
             self.pending_probe_ephemeral.remove(&peer_id);
         }
-        self.pending_ids.insert(peer_id, pending_id);
+        self.pending_ids.insert(peer_id.clone(), pending_id);
+        if let Some(cancellation) = cancellation {
+            self.pending_cancellations.insert(peer_id, cancellation);
+        }
         pending_id
     }
 
     fn remove(&mut self, peer_id: &str) -> Option<HandshakeInitiator> {
+        if let Some(cancellation) = self.pending_cancellations.remove(peer_id) {
+            cancellation.send_replace(true);
+        }
         self.pending_ids.remove(peer_id);
         self.pending_session_ids.remove(peer_id);
         self.pending_probe_ephemeral.remove(peer_id);

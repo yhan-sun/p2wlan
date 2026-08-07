@@ -6,7 +6,9 @@ use serde_json::Value;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+#[cfg(unix)]
+use std::io;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
