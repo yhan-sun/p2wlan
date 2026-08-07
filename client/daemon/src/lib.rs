@@ -160,6 +160,20 @@ const RESPONDER_HANDSHAKE_CACHE_TTL: Duration = Duration::from_secs(120);
 /// refresh publishes/trickles UDP candidates later, so a slow STUN or gateway
 /// probe must not hold the WireGuard session hostage for several seconds.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 300;
+/// Hard cap for the post-answer candidate refresh and endpoint publish.  The
+/// answer itself never waits for this work; the bound only limits how long the
+/// per-peer responder slot can be occupied by the best-effort refresh.
+const POST_ANSWER_REFRESH_DEADLINE_SECS: u64 = 4;
+/// Caller-side budget for the startup endpoint publish.  The publish travels
+/// the handshake control lane; a pathological lane must never stall UDP
+/// transport startup or the signal that follows a candidate refresh.
+const STARTUP_ENDPOINT_PUBLISH_BUDGET_MS: u64 = 1500;
+const PRE_SIGNAL_ENDPOINT_PUBLISH_BUDGET_MS: u64 = 1200;
+/// Budget for the initiator's pre-offer candidate refresh when a usable
+/// cached set already exists.  The fresh measurement is kept when it fits
+/// inside the budget; a slow STUN/prediction gather must never delay the
+/// offer's rendezvous window, so the cached snapshot is used instead.
+const HANDSHAKE_OFFER_REFRESH_BUDGET_MS: u64 = 1200;
 /// Public STUN fallbacks used when older configs do not specify STUN servers.
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",

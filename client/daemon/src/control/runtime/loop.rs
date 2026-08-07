@@ -5,6 +5,7 @@ async fn run_control_loop(
     cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
     config_path: Option<PathBuf>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    critical_auth_tx: watch::Sender<Option<CriticalControlAuth>>,
 ) {
     let http = reqwest::Client::new();
     let base_url = normalize_http_base_url(&config.control.server_url);
@@ -30,6 +31,9 @@ async fn run_control_loop(
 
     // Outer recovery loop: re-registers after transient disconnects.
     loop {
+        // The critical lane must never reuse a node id/token from a previous
+        // registration generation while this loop is reconnecting.
+        let _ = critical_auth_tx.send(None);
         // ---- Registration with exponential backoff ----
         let self_node_id = {
             let mut attempt: u32 = 0;
@@ -110,6 +114,17 @@ async fn run_control_loop(
                                 }
                             }
                         }
+
+                        // Publish only after credential issuance has had a
+                        // chance to replace the user token.  The independent
+                        // handshake worker must sign as this exact
+                        // server-assigned node identity, never config.node_id.
+                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            base_url: base_url.clone(),
+                            token: token.clone(),
+                            self_node_id: node_id.clone(),
+                            signal_signing_identity: signal_signing_identity.clone(),
+                        }));
 
                         break node_id;
                     }
@@ -386,6 +401,7 @@ async fn run_control_loop(
 
         // Reached here by breaking the poll loop (auth failure or consecutive poll failures).
         // Mark unregistered so peers are refreshed on next successful register/poll.
+        let _ = critical_auth_tx.send(None);
         {
             let mut s = state.write().await;
             s.registered = false;

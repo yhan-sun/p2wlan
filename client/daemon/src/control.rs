@@ -23,8 +23,9 @@ use crate::error::{DaemonError, Result};
 use crate::relay::RelaySelectionDiagnostics;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio::time;
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
 mod http;
@@ -35,8 +36,8 @@ pub(crate) use http::incarnation_fits_candidate_generation_encoding;
 use http::register_device_payload;
 use http::{
     create_tunnel, fetch_relay_ticket_http, normalize_http_base_url, obtain_device_credential,
-    poll_peers, poll_signals, register_device, send_signal, update_endpoint, SignalSigningIdentity,
-    SIGNAL_REST_PROTOCOL_VERSION,
+    poll_peers, poll_signals, prepare_signal_payload, register_device, send_prepared_signal,
+    send_signal, update_endpoint, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
 };
 use websocket::spawn_signal_websocket;
 

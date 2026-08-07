@@ -1631,3 +1631,228 @@ async fn test_daemon_port_mapping() {
     let list = daemon.port_mappings().list().await;
     assert_eq!(list.len(), 1);
 }
+
+/// A responder answer must use the cached candidate snapshot: while the
+/// candidate refresh lock is held (simulating a blocked live STUN refresh),
+/// the answer still reaches the control server with the cached candidates
+/// within a strict short timeout.  STUN/refresh and the endpoint update are
+/// NOT prerequisites of the answer.
+#[tokio::test]
+async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let answer_bodies = StdArc::new(StdMutex::new(Vec::<String>::new()));
+    let registered = StdArc::new(AtomicBool::new(false));
+    let server = {
+        let answer_bodies = answer_bodies.clone();
+        let registered = registered.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let answer_bodies = answer_bodies.clone();
+                let registered = registered.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let is_register =
+                        head.starts_with("POST") && head.contains("/api/v1/devices");
+                    let is_poll = head.starts_with("GET") && head.contains("/api/v1/signals");
+                    let is_signal =
+                        head.starts_with("POST") && head.contains("/api/v1/signals");
+                    let body = if is_signal {
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let head_end = buf
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .unwrap_or(0)
+                            + 4;
+                        while buf.len() < head_end + content_length {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                        String::from_utf8_lossy(&buf[head_end..head_end + content_length])
+                            .into_owned()
+                    } else {
+                        String::new()
+                    };
+                    if is_register {
+                        registered.store(true, AtomicOrdering::SeqCst);
+                        let body = r#"{"success":true,"node_id":"node-a","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if is_poll {
+                        let body = r#"{"signals":[],"server_time_ms":0}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if is_signal {
+                        answer_bodies.lock().unwrap().push(body);
+                        let body = r#"{"success":true,"protocol_version":1}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        })
+    };
+
+    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let daemon = Daemon::new(config);
+
+    // The local node is the designated responder for this peer.
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-cached-answer";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "FullCone".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    // The cached candidate snapshot the answer must use.
+    let cached = vec![
+        "203.0.113.120:55001".to_string(),
+        "127.0.0.1:55002".to_string(),
+    ];
+    *daemon.local_candidates.write().await = cached.clone();
+    *daemon.local_candidate_sources.write().await = HashMap::from([
+        (cached[0].clone(), "stun_observed".to_string()),
+        (cached[1].clone(), "host".to_string()),
+    ]);
+
+    // A blocked live refresh: any STUN/candidate refresh would stall here.
+    // The answer must not wait for it.
+    let refresh_guard = daemon.candidate_refresh_lock.clone().lock_owned().await;
+
+    let mut initiator = HandshakeInitiator::new(peer_identity.clone(), local_public, None);
+    let initiation = initiator.create_initiation().unwrap().to_bytes();
+    daemon
+        .control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec!["198.51.100.9:44001".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::new(),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: initiation,
+            punch_at_ms: Some(relay_assisted_punch_at_ms()),
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    let shutdown = daemon.shutdown_sender();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    // Registration must land before the critical lane publishes auth.
+    timeout(Duration::from_secs(5), async {
+        while !registered.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon must register against the mock control server");
+
+    // The answer must arrive with the CACHED candidates within a strict
+    // short timeout while the refresh lock is still held.
+    let answer_body = timeout(Duration::from_secs(5), async {
+        loop {
+            let bodies = answer_bodies.lock().unwrap().clone();
+            if let Some(body) = bodies
+                .iter()
+                .find(|body| body.contains("\"type\":\"peer_answer\""))
+            {
+                break body.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the responder answer must be sent while the refresh is blocked");
+
+    assert!(
+        answer_body.contains("203.0.113.120:55001"),
+        "the answer must carry the cached candidate, got: {answer_body}"
+    );
+    assert!(
+        answer_body.contains("127.0.0.1:55002"),
+        "the answer must carry the cached host candidate, got: {answer_body}"
+    );
+    assert!(
+        !answer_body.contains("198.51.100.9"),
+        "the answer must not mix the offer's remote candidates into its own set: {answer_body}"
+    );
+
+    // Release the refresh lock so the daemon can wind down.
+    drop(refresh_guard);
+    let _ = shutdown.send(true);
+    let _ = timeout(Duration::from_secs(3), loop_task).await;
+    server.abort();
+}

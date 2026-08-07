@@ -1,4 +1,7 @@
-use tokio::net::TcpListener;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 #[test]
 fn test_control_client_creation() {
@@ -485,4 +488,529 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
     .await
     .expect("the redelivered batch must still be ACKed");
     server.abort();
+}
+
+// ---------------------------------------------------------------
+// Handshake critical-lane tests.  The mock server decides each request's
+// fate with a closure so a test can stall candidate-only traffic, saturate
+// the offer lane, fail the first answer POST, or hold one answer open while
+// a newer owner is served.
+// ---------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum MockAction {
+    /// Respond with HTTP 200 success immediately.
+    Ok,
+    /// Hold the connection open without a response until the test aborts.
+    Stall,
+    /// Respond with HTTP 500 immediately.
+    Fail500,
+}
+
+struct HttpRequest {
+    line: String,
+    body: String,
+}
+
+struct MockControlServer {
+    address: String,
+    registered: Arc<AtomicBool>,
+    signal_posts: Arc<Mutex<Vec<String>>>,
+    endpoint_posts: Arc<Mutex<Vec<String>>>,
+    task: JoinHandle<()>,
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Option<HttpRequest> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => return None,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(head_end) = find_subsequence(&buf, b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let body_start = head_end + 4;
+                    while buf.len() < body_start + content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => return None,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => return None,
+                        }
+                    }
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let body = String::from_utf8_lossy(
+                        &buf[body_start..body_start + content_length],
+                    )
+                    .into_owned();
+                    return Some(HttpRequest { line, body });
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+async fn mock_respond(mut stream: TcpStream, status: u16, body: &str) {
+    let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+impl MockControlServer {
+    /// Serve registration, empty signal polls, and `POST /api/v1/signals` /
+    /// `PATCH .../endpoint` whose fate is decided per request by `decide`.
+    async fn spawn(
+        decide: impl Fn(&str, &str) -> MockAction + Send + Sync + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let registered = Arc::new(AtomicBool::new(false));
+        let signal_posts = Arc::new(Mutex::new(Vec::new()));
+        let endpoint_posts = Arc::new(Mutex::new(Vec::new()));
+        let decide = Arc::new(decide);
+        let task = {
+            let registered = registered.clone();
+            let signal_posts = signal_posts.clone();
+            let endpoint_posts = endpoint_posts.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let registered = registered.clone();
+                    let signal_posts = signal_posts.clone();
+                    let endpoint_posts = endpoint_posts.clone();
+                    let decide = decide.clone();
+                    tokio::spawn(async move {
+                        let Some(request) = read_http_request(&mut stream).await else {
+                            return;
+                        };
+                        let line = request.line.clone();
+                        let kind = if line.starts_with("POST") && line.contains("/api/v1/devices")
+                        {
+                            "register"
+                        } else if line.starts_with("GET") && line.contains("/api/v1/signals") {
+                            "poll"
+                        } else if line.starts_with("POST") && line.contains("/api/v1/signals") {
+                            signal_posts.lock().unwrap().push(request.body.clone());
+                            "signal"
+                        } else if line.starts_with("PATCH") && line.contains("/endpoint") {
+                            endpoint_posts.lock().unwrap().push(request.body.clone());
+                            "endpoint"
+                        } else {
+                            "other"
+                        };
+                        match kind {
+                            "register" => {
+                                registered.store(true, Ordering::SeqCst);
+                                mock_respond(
+                                    stream,
+                                    200,
+                                    r#"{"success":true,"node_id":"node-a","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#,
+                                )
+                                .await;
+                            }
+                            "poll" => {
+                                mock_respond(
+                                    stream,
+                                    200,
+                                    r#"{"signals":[],"server_time_ms":0}"#,
+                                )
+                                .await;
+                            }
+                            "signal" | "endpoint" => match decide(kind, &request.body) {
+                                MockAction::Ok => {
+                                    mock_respond(
+                                        stream,
+                                        200,
+                                        r#"{"success":true,"protocol_version":1}"#,
+                                    )
+                                    .await;
+                                }
+                                MockAction::Fail500 => mock_respond(stream, 500, "{}").await,
+                                MockAction::Stall => {
+                                    tokio::time::sleep(Duration::from_secs(120)).await;
+                                }
+                            },
+                            _ => {}
+                        }
+                    });
+                }
+            })
+        };
+        Self {
+            address,
+            registered,
+            signal_posts,
+            endpoint_posts,
+            task,
+        }
+    }
+
+    async fn wait_registered(&self) {
+        timeout(Duration::from_secs(5), async {
+            while !self.registered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("device registration must complete against the mock server");
+    }
+
+    fn answer_bodies(&self) -> Vec<String> {
+        self.signal_posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.contains("\"type\":\"peer_answer\""))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A candidate-only peer offer stalled on the ordinary lane must not delay a
+/// responder answer for another peer: the answer travels the independent
+/// answer-priority lane and reaches the server within a strict short timeout.
+#[tokio::test]
+async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal"
+            && body.contains("\"type\":\"peer_offer\"")
+            && body.contains("\"handshake\":\"\"")
+        {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    server.wait_registered().await;
+
+    let stalled = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-c",
+                    &["203.0.113.60:50000".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    // Give the ordinary lane time to enter the blocked POST.
+    sleep(Duration::from_millis(150)).await;
+
+    timeout(Duration::from_secs(2), client.send_peer_answer(
+        "peer-d",
+        &["203.0.113.61:50001".to_string()],
+        b"wg-answer-bytes",
+    ))
+    .await
+    .expect("the critical answer must not wait behind the stalled ordinary POST")
+    .expect("the critical answer must be delivered");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert!(
+        posts.iter().any(|body| {
+            body.contains("\"type\":\"peer_answer\"") && body.contains("peer-d")
+        }),
+        "the answer must reach the server: {posts:?}"
+    );
+    assert!(
+        posts
+            .iter()
+            .any(|body| body.contains("peer-c") && body.contains("\"handshake\":\"\"")),
+        "the stalled candidate-only offer must have reached the server: {posts:?}"
+    );
+
+    drop(client);
+    stalled.abort();
+    server.task.abort();
+}
+
+/// Critical offers fill their own lane budget (4 in flight + queued) and are
+/// stalled forever; a later answer for a different peer must still be
+/// delivered promptly because answers never wait behind offers.
+#[tokio::test]
+async fn critical_answer_not_blocked_by_slow_critical_offers() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal" && body.contains("\"type\":\"peer_offer\"") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    server.wait_registered().await;
+
+    let mut offers = Vec::new();
+    for index in 0..5 {
+        let client = client.clone();
+        offers.push(tokio::spawn(async move {
+            client
+                .send_peer_offer_with_sources_punch_and_session(
+                    &format!("peer-offer-{index}"),
+                    &[format!("203.0.113.70:{}", 51000 + index)],
+                    &HashMap::new(),
+                    b"wg-offer-bytes",
+                    None,
+                    Some(format!("sess-offer-{index}")),
+                    None,
+                )
+                .await
+        }));
+    }
+    // Let the offers occupy the offer lane (in flight + queued).
+    sleep(Duration::from_millis(250)).await;
+
+    timeout(Duration::from_secs(2), client.send_peer_answer(
+        "peer-answer-1",
+        &["203.0.113.71:52001".to_string()],
+        b"wg-answer-bytes",
+    ))
+    .await
+    .expect("a later answer must never wait behind slow critical offers")
+    .expect("the answer must be delivered");
+
+    assert_eq!(
+        server.answer_bodies().len(),
+        1,
+        "exactly one answer may reach the wire"
+    );
+
+    drop(client);
+    for offer in offers {
+        offer.abort();
+    }
+    server.task.abort();
+}
+
+/// A transient answer POST failure is retried with the EXACT same payload
+/// (one candidate generation, expiry, signature, session id, handshake bytes)
+/// and succeeds; no background retry leaks after success.
+#[tokio::test]
+async fn critical_answer_retries_exact_payload_then_succeeds() {
+    let answer_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = answer_attempts.clone();
+    let server = MockControlServer::spawn(move |kind, body| {
+        if kind == "signal"
+            && body.contains("\"type\":\"peer_answer\"")
+            && attempts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            MockAction::Fail500
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    server.wait_registered().await;
+
+    timeout(Duration::from_secs(3), client.send_peer_answer_with_sources_schedule_and_session(
+        "peer-e",
+        &["203.0.113.80:53000".to_string()],
+        &HashMap::from([("203.0.113.80:53000".to_string(), "host".to_string())]),
+        b"wg-answer-retry",
+        None,
+        None,
+        Some("session-retry-1".to_string()),
+        None,
+    ))
+    .await
+    .expect("the transient failure must be retried within the lane deadline")
+    .expect("the retry must succeed");
+
+    let posts = server.answer_bodies();
+    assert_eq!(
+        posts.len(),
+        2,
+        "one failed attempt plus one successful retry, no leak: {posts:?}"
+    );
+    assert_eq!(
+        posts[0], posts[1],
+        "the retry must re-send the exact same prepared payload"
+    );
+
+    // No background retry continues after success.
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server.answer_bodies().len(),
+        2,
+        "no retry may be launched after a successful delivery"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
+/// Cancelling an in-flight answer (owner dropped) aborts it: no retry and no
+/// further request from the stale owner.  A newer owner for the same peer is
+/// unaffected and is served normally.
+#[tokio::test]
+async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal"
+            && body.contains("\"type\":\"peer_answer\"")
+            && body.contains("60001")
+        {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    server.wait_registered().await;
+
+    // Owner A's answer is in flight against a stalled server connection.
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_answer(
+                    "peer-x",
+                    &["203.0.113.90:60001".to_string()],
+                    b"first-owner-answer",
+                )
+                .await
+        }
+    });
+    sleep(Duration::from_millis(250)).await;
+    first.abort();
+    sleep(Duration::from_millis(300)).await;
+
+    let stalled_posts = server
+        .signal_posts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.contains("60001"))
+        .count();
+    assert_eq!(
+        stalled_posts, 1,
+        "the cancelled owner may have sent at most the in-flight request; it must never retry"
+    );
+
+    // A new owner for the same peer is served normally.
+    timeout(Duration::from_secs(2), client.send_peer_answer(
+        "peer-x",
+        &["203.0.113.90:60002".to_string()],
+        b"new-owner-answer",
+    ))
+    .await
+    .expect("the new owner's answer must be delivered")
+    .expect("the new owner's answer must succeed");
+    assert_eq!(
+        server
+            .signal_posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.contains("60002"))
+            .count(),
+        1,
+        "the new owner's answer must reach the wire exactly once"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
+/// The endpoint publish used after a responder answer travels its own lane:
+/// a stalled candidate-only POST on the ordinary lane must not delay it.
+#[tokio::test]
+async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal"
+            && body.contains("\"type\":\"peer_offer\"")
+            && body.contains("\"handshake\":\"\"")
+        {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    server.wait_registered().await;
+
+    let stalled = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-c",
+                    &["203.0.113.60:50010".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    sleep(Duration::from_millis(150)).await;
+
+    timeout(Duration::from_secs(2), client.update_endpoint_for_handshake(
+        "203.0.113.99:54000",
+        "FullCone",
+    ))
+    .await
+    .expect("the handshake endpoint publish must not wait behind the ordinary lane")
+    .expect("the handshake endpoint publish must succeed");
+
+    let endpoints = server.endpoint_posts.lock().unwrap().clone();
+    assert!(
+        endpoints.iter().any(|body| body.contains("203.0.113.99:54000")),
+        "the endpoint publish must reach the server: {endpoints:?}"
+    );
+
+    drop(client);
+    stalled.abort();
+    server.task.abort();
 }

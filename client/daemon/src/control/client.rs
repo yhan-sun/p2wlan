@@ -17,6 +17,12 @@ impl ControlClient {
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (critical_offer_tx, critical_offer_rx) =
+            mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
+        let (critical_answer_tx, critical_answer_rx) =
+            mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
+        let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
+        let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
 
         let state = Arc::new(RwLock::new(ClientState {
             registered: false,
@@ -26,8 +32,11 @@ impl ControlClient {
         }));
 
         let client = Self {
-            event_tx,
+            event_tx: event_tx.clone(),
             cmd_tx,
+            critical_offer_tx,
+            critical_answer_tx,
+            critical_ctrl_tx,
             state: state.clone(),
         };
 
@@ -35,6 +44,19 @@ impl ControlClient {
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
+            let critical_event_tx = event_tx.clone();
+            let critical_relay_selection = relay_selection.clone();
+            tokio::spawn(async move {
+                run_critical_control_loop(
+                    critical_answer_rx,
+                    critical_offer_rx,
+                    critical_ctrl_rx,
+                    critical_auth_rx,
+                    critical_event_tx,
+                    critical_relay_selection,
+                )
+                .await;
+            });
             tokio::spawn(async move {
                 run_control_loop(
                     config,
@@ -43,6 +65,7 @@ impl ControlClient {
                     &mut cmd_rx,
                     cfg_path,
                     relay_selection,
+                    critical_auth_tx,
                 )
                 .await;
             });
@@ -65,6 +88,14 @@ impl ControlClient {
     pub(crate) fn disabled_for_test() -> Self {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (critical_offer_tx, critical_offer_rx) =
+            mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
+        let (critical_answer_tx, critical_answer_rx) =
+            mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
+        let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
+        drop(critical_offer_rx);
+        drop(critical_answer_rx);
+        drop(critical_ctrl_rx);
         let state = Arc::new(RwLock::new(ClientState {
             registered: false,
             peers: HashMap::new(),
@@ -74,6 +105,9 @@ impl ControlClient {
         Self {
             event_tx,
             cmd_tx,
+            critical_offer_tx,
+            critical_answer_tx,
+            critical_ctrl_tx,
             state,
         }
     }
@@ -100,6 +134,30 @@ impl ControlClient {
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
         response_rx.await.map_err(|_| {
             DaemonError::ControlPlane("endpoint update response channel closed".into())
+        })?
+    }
+
+    /// Publish an endpoint after a responder answer was issued.  This uses
+    /// the bounded handshake control lane so a normal candidate refresh can
+    /// never delay the answer's control signal.  The caller intentionally
+    /// treats failure as best-effort: the answer is sent with its cached
+    /// candidates regardless.
+    pub(crate) async fn update_endpoint_for_handshake(
+        &self,
+        endpoint: &str,
+        nat_type: &str,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.critical_ctrl_tx
+            .send(CriticalControlCommand::UpdateEndpoint {
+                endpoint: endpoint.to_string(),
+                nat_type: nat_type.to_string(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| DaemonError::ControlPlane("critical command channel closed".into()))?;
+        response_rx.await.map_err(|_| {
+            DaemonError::ControlPlane("critical endpoint update response channel closed".into())
         })?
     }
 
@@ -179,6 +237,22 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        // Candidate-only and fresh-mapping advertisements deliberately remain
+        // on the ordinary lane.  A payload carrying a WireGuard initiation is
+        // latency-sensitive and must bypass that FIFO.
+        if !handshake_init.is_empty() {
+            return self
+                .send_critical_peer_offer(
+                    to_node_id,
+                    candidates,
+                    candidate_sources,
+                    handshake_init,
+                    punch_at_ms,
+                    None,
+                    None,
+                )
+                .await;
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.cmd_tx
             .send(ControlCommand::SendPeerOffer {
@@ -254,27 +328,26 @@ impl ControlClient {
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
     ) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ControlCommand::SendPeerOffer {
-                to_node_id: to_node_id.to_string(),
-                candidates: candidates.to_vec(),
+        match self
+            .send_critical_peer_offer(
+                to_node_id,
+                candidates,
+                candidate_sources,
+                handshake_init,
+                punch_at_ms,
                 session_id,
                 probe_ephemeral_public_key,
-                candidate_sources: candidate_sources.clone(),
-                handshake_init: handshake_init.to_vec(),
-                punch_at_ms,
-                fresh_ownership: None,
-                response_tx,
-            })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        match response_rx.await {
-            Ok(PeerOfferSendOutcome::Sent) => Ok(()),
-            Ok(PeerOfferSendOutcome::Cancelled) => Ok(()),
-            Ok(PeerOfferSendOutcome::Failed) => Err(DaemonError::ControlPlane(
-                "peer offer send failed".into(),
-            )),
-            Err(_) => Err(DaemonError::ControlPlane("peer offer response channel closed".into())),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(PeerOfferSendFailure::Cancelled) => Ok(()),
+            Err(PeerOfferSendFailure::SendFailed) => {
+                Err(DaemonError::ControlPlane("peer offer send failed".into()))
+            }
+            Err(PeerOfferSendFailure::ChannelClosed) => {
+                Err(DaemonError::ControlPlane("critical command channel closed".into()))
+            }
         }
     }
 
@@ -344,23 +417,17 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         punch_at_server_ms: Option<u64>,
     ) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ControlCommand::SendPeerAnswer {
-                to_node_id: to_node_id.to_string(),
-                candidates: candidates.to_vec(),
-                session_id: None,
-                probe_ephemeral_public_key: None,
-                candidate_sources: candidate_sources.clone(),
-                handshake_response: handshake_response.to_vec(),
-                punch_at_ms,
-                punch_at_server_ms,
-                response_tx,
-            })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| DaemonError::ControlPlane("peer answer response channel closed".into()))?
+        self.send_critical_peer_answer(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_response,
+            punch_at_ms,
+            punch_at_server_ms,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Send a peer answer with an explicit traversal session ID.
@@ -376,23 +443,17 @@ impl ControlClient {
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
     ) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ControlCommand::SendPeerAnswer {
-                to_node_id: to_node_id.to_string(),
-                candidates: candidates.to_vec(),
-                session_id,
-                probe_ephemeral_public_key,
-                candidate_sources: candidate_sources.clone(),
-                handshake_response: handshake_response.to_vec(),
-                punch_at_ms,
-                punch_at_server_ms,
-                response_tx,
-            })
-            .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| DaemonError::ControlPlane("peer answer response channel closed".into()))?
+        self.send_critical_peer_answer(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_response,
+            punch_at_ms,
+            punch_at_server_ms,
+            session_id,
+            probe_ephemeral_public_key,
+        )
+        .await
     }
 
     /// Relay a peer-reflexive source address observed for the target peer.
@@ -441,9 +502,21 @@ impl ControlClient {
             .map_err(|_| DaemonError::ControlPlane("command channel closed".into()))
     }
 
+    /// Request an immediate peer-list refresh.
+    ///
+    /// Used when a signal arrives from a peer that is not registered yet, so
+    /// a cold-start handshake never waits out the regular poll cadence.
+    pub(crate) fn refresh_peers_now(&self) {
+        let _ = self.cmd_tx.send(ControlCommand::PollPeersNow);
+    }
+
     /// Shutdown the control client.
     pub async fn shutdown(&self) -> Result<()> {
         let _ = self.cmd_tx.send(ControlCommand::Shutdown);
+        let _ = self
+            .critical_ctrl_tx
+            .send(CriticalControlCommand::Shutdown)
+            .await;
         Ok(())
     }
 
@@ -462,5 +535,70 @@ impl ControlClient {
             .await
             .map_err(|_| DaemonError::ControlPlane("ticket fetch cancelled".into()))??;
         Ok((resp.ticket, resp.expires_at))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_critical_peer_offer(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.critical_offer_tx
+            .send(CriticalOfferCommand {
+                to_node_id: to_node_id.to_string(),
+                candidates: candidates.to_vec(),
+                session_id,
+                probe_ephemeral_public_key,
+                candidate_sources: candidate_sources.clone(),
+                handshake_init: handshake_init.to_vec(),
+                punch_at_ms,
+                response_tx,
+            })
+            .await
+            .map_err(|_| PeerOfferSendFailure::ChannelClosed)?;
+        match response_rx.await {
+            Ok(PeerOfferSendOutcome::Sent) => Ok(()),
+            Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),
+            Ok(PeerOfferSendOutcome::Failed) => Err(PeerOfferSendFailure::SendFailed),
+            Err(_) => Err(PeerOfferSendFailure::ChannelClosed),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_critical_peer_answer(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_response: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.critical_answer_tx
+            .send(CriticalAnswerCommand {
+                to_node_id: to_node_id.to_string(),
+                candidates: candidates.to_vec(),
+                session_id,
+                probe_ephemeral_public_key,
+                candidate_sources: candidate_sources.clone(),
+                handshake_response: handshake_response.to_vec(),
+                punch_at_ms,
+                punch_at_server_ms,
+                response_tx,
+            })
+            .await
+            .map_err(|_| DaemonError::ControlPlane("critical command channel closed".into()))?;
+        response_rx.await.map_err(|_| {
+            DaemonError::ControlPlane("critical peer answer response channel closed".into())
+        })?
     }
 }

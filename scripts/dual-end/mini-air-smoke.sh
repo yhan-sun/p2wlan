@@ -200,7 +200,7 @@ else
 fi
 
 # A matching semantic version is not enough here: a user can correctly upload
-# an older 0.1.107 build after the source tree has changed.  Refuse to run a
+# an older release build after the source tree has changed.  Refuse to run a
 # two-ended smoke test unless the Air executes the exact local release binary.
 REMOTE_DAEMON_SHA256=$($AIR_SSH "if command -v shasum >/dev/null 2>&1; then shasum -a 256 '$REMOTE_DAEMON_BIN' | awk '{print \$1}'; elif command -v sha256sum >/dev/null 2>&1; then sha256sum '$REMOTE_DAEMON_BIN' | awk '{print \$1}'; else exit 127; fi")
 if [[ "$REMOTE_DAEMON_SHA256" != "$LOCAL_DAEMON_SHA256" ]]; then

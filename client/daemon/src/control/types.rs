@@ -426,8 +426,113 @@ pub struct ControlClient {
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     /// Channel to send commands to the background task.
     cmd_tx: mpsc::UnboundedSender<ControlCommand>,
+    /// Bounded lane for initiator offers that carry real WireGuard handshake
+    /// bytes.  It is serviced by a separate worker so a slow
+    /// candidate-only/peer-reflexive POST can never hold an offer behind the
+    /// ordinary FIFO.
+    critical_offer_tx: mpsc::Sender<CriticalOfferCommand>,
+    /// Bounded, answer-priority lane for responder answers.  Answers have
+    /// their own concurrency budget and are dispatched ahead of offers, so a
+    /// slow offer or its retries can never delay a later answer.
+    critical_answer_tx: mpsc::Sender<CriticalAnswerCommand>,
+    /// Bounded lane for the short control transactions a handshake depends on
+    /// (endpoint publish) plus worker shutdown.
+    critical_ctrl_tx: mpsc::Sender<CriticalControlCommand>,
     /// Shared state.
     state: Arc<RwLock<ClientState>>,
+}
+
+/// Hard cap for handshake work admitted to the independent control lanes.
+/// Bounded queues are intentional: cancellation must release a reservation
+/// rather than allowing stale answers to accumulate without limit.
+const CRITICAL_OFFER_QUEUE_CAPACITY: usize = 32;
+const CRITICAL_ANSWER_QUEUE_CAPACITY: usize = 32;
+const CRITICAL_CTRL_QUEUE_CAPACITY: usize = 8;
+/// In-flight ceilings per lane.  The answer lane gets a dedicated budget so
+/// it is never blocked behind offer traffic; the two lane ceilings together
+/// are the global handshake hard cap.
+const CRITICAL_ANSWER_MAX_INFLIGHT: usize = 4;
+const CRITICAL_OFFER_MAX_INFLIGHT: usize = 4;
+const CRITICAL_CTRL_MAX_INFLIGHT: usize = 2;
+
+/// A failed handshake signal is delivery-ambiguous.  Retry a small, fixed
+/// number of times with the exact same prepared payload, then return the
+/// error to the owner.  This keeps a transient control-plane hiccup from
+/// losing the only responder answer without creating an unbounded storm.
+const CRITICAL_SIGNAL_MAX_ATTEMPTS: usize = 3;
+const CRITICAL_SIGNAL_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(250),
+];
+/// Hard wall-clock deadline for the whole critical send including its
+/// retries.  A successful round must never become a 3 x 5 s retry sequence:
+/// the overall deadline is the binding constraint, per-attempt timeouts are
+/// only incidental.
+const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(8);
+
+/// Authentication identity published by the registration loop to the
+/// latency-sensitive worker.  The server-assigned node id is authoritative;
+/// the configured local id is deliberately not used for signal sends.
+#[derive(Clone)]
+struct CriticalControlAuth {
+    base_url: String,
+    token: String,
+    self_node_id: String,
+    signal_signing_identity: Option<SignalSigningIdentity>,
+}
+
+impl CriticalControlAuth {
+    /// Whether this identity is still the one the registration loop last
+    /// published.  A re-registration replaces the auth atomically; stale
+    /// owners must never send a new session's signal with an old node id.
+    fn same_identity_as(&self, other: &CriticalControlAuth) -> bool {
+        self.base_url == other.base_url
+            && self.token == other.token
+            && self.self_node_id == other.self_node_id
+    }
+}
+
+/// An initiator offer that carries actual WireGuard handshake bytes.  These
+/// bypass the ordinary candidate-only FIFO.
+struct CriticalOfferCommand {
+    to_node_id: String,
+    candidates: Vec<String>,
+    session_id: Option<String>,
+    probe_ephemeral_public_key: Option<String>,
+    candidate_sources: HashMap<String, String>,
+    handshake_init: Vec<u8>,
+    punch_at_ms: Option<u64>,
+    response_tx: oneshot::Sender<PeerOfferSendOutcome>,
+}
+
+/// A responder answer carrying actual WireGuard handshake bytes.  The
+/// answer-priority lane guarantees a later answer never waits behind an
+/// earlier offer or answer; dropping the response receiver (owner cancelled
+/// or replaced) aborts queued and in-flight work without affecting a newer
+/// owner.
+struct CriticalAnswerCommand {
+    to_node_id: String,
+    candidates: Vec<String>,
+    session_id: Option<String>,
+    probe_ephemeral_public_key: Option<String>,
+    candidate_sources: HashMap<String, String>,
+    handshake_response: Vec<u8>,
+    punch_at_ms: Option<u64>,
+    punch_at_server_ms: Option<u64>,
+    response_tx: oneshot::Sender<Result<()>>,
+}
+
+/// Short control transactions used by handshake work, plus shutdown.
+enum CriticalControlCommand {
+    /// Publish the endpoint needed after a responder answer was issued.
+    UpdateEndpoint {
+        endpoint: String,
+        nat_type: String,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
+    /// Stop the worker during daemon shutdown.
+    Shutdown,
 }
 
 /// Response for a relay ticket fetch.
@@ -498,18 +603,6 @@ enum ControlCommand {
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
         response_tx: oneshot::Sender<PeerOfferSendOutcome>,
     },
-    /// Send a peer answer.
-    SendPeerAnswer {
-        to_node_id: String,
-        candidates: Vec<String>,
-        session_id: Option<String>,
-        probe_ephemeral_public_key: Option<String>,
-        candidate_sources: HashMap<String, String>,
-        handshake_response: Vec<u8>,
-        punch_at_ms: Option<u64>,
-        punch_at_server_ms: Option<u64>,
-        response_tx: oneshot::Sender<Result<()>>,
-    },
     /// Send a relay-assisted peer-reflexive observation.
     SendPeerReflexive {
         to_node_id: String,
@@ -517,6 +610,12 @@ enum ControlCommand {
         punch_at_ms: Option<u64>,
         response_tx: oneshot::Sender<Result<()>>,
     },
+    /// Immediately refresh the peer list.
+    ///
+    /// Sent when a signal arrives from a peer that is not yet registered:
+    /// the regular peer poll can be up to MIN_PEER_POLL_INTERVAL_SECS away,
+    /// and a cold-start handshake must not wait out that cadence.
+    PollPeersNow,
     /// Create a tunnel.
     CreateTunnel {
         protocol: String,
