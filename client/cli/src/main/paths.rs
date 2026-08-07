@@ -136,6 +136,7 @@ fn verified_recorded_daemon(pid_path: &Path) -> Result<Option<i32>, String> {
     }
 }
 
+#[cfg(unix)]
 fn terminate_daemon(pid: i32) -> Result<(), String> {
     if is_root() {
         if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
@@ -160,6 +161,11 @@ fn terminate_daemon(pid: i32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn terminate_daemon(_pid: i32) -> Result<(), String> {
+    Err("通过 PID 文件停止 daemon 仅支持 Unix；请使用诊断端点".to_string())
+}
+
 fn make_world_readable(file: &File) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -171,6 +177,10 @@ fn make_world_readable(file: &File) -> Result<(), String> {
         permissions.set_mode(0o644);
         file.set_permissions(permissions)
             .map_err(|error| format!("无法设置日志权限：{error}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
     }
     Ok(())
 }
