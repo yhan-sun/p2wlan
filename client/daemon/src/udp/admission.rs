@@ -116,31 +116,67 @@ impl UdpTransport {
         OutboundProbeAdmission::Accepted
     }
 
-    async fn notify_peer_reflexive_observation(
-        &self,
-        peer_id: &str,
-        observed_endpoint: SocketAddr,
-    ) {
-        let Some(tx) = self.peer_reflexive_tx.as_ref() else {
+    fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
+        let Some(ingress) = self.peer_reflexive_ingress.as_ref() else {
             return;
         };
-        let key = (peer_id.to_string(), observed_endpoint);
-        {
-            let mut notifications = self.peer_reflexive_notifications.lock().await;
-            notifications.retain(|_, sent_at| sent_at.elapsed() < PEER_REFLEXIVE_NOTIFY_COOLDOWN);
-            if notifications.contains_key(&key) {
-                return;
-            }
-            notifications.insert(key, Instant::now());
-        }
-
-        if let Err(err) = tx.try_send(PeerReflexiveObservation {
+        if !ingress.submit(PeerReflexiveObservation {
             peer_id: peer_id.to_string(),
             observed_endpoint,
         }) {
             debug!(
-                "Dropping peer-reflexive observation for {peer_id} at {observed_endpoint}: {err}"
+                peer_id = %peer_id,
+                observed_endpoint = %observed_endpoint,
+                max_pending_peers = MAX_PENDING_PEER_REFLEXIVE_INGRESS_PEERS,
+                "dropping peer-reflexive observation for a new peer because the coalesced ingress is full"
             );
+        }
+    }
+
+    /// Admit one reverse connectivity check for a peer.  Endpoint and socket
+    /// churn update the one peer record but cannot allocate another in-flight
+    /// check or bypass the peer-level cooldown.
+    fn admit_triggered_check(
+        checks: &mut HashMap<String, TriggeredCheckRecord>,
+        peer_id: &str,
+        observed_endpoint: SocketAddr,
+        now: Instant,
+    ) -> Option<SocketAddr> {
+        checks.retain(|_, record| {
+            record.in_flight
+                || now.saturating_duration_since(record.last_sent_at) < TRIGGERED_CHECK_COOLDOWN
+        });
+
+        let record = checks
+            .entry(peer_id.to_string())
+            .or_insert_with(|| TriggeredCheckRecord {
+                latest_endpoint: observed_endpoint,
+                last_sent_at: now
+                    .checked_sub(TRIGGERED_CHECK_COOLDOWN)
+                    .unwrap_or(now),
+                in_flight: false,
+            });
+        record.latest_endpoint = observed_endpoint;
+        if record.in_flight
+            || now.saturating_duration_since(record.last_sent_at) < TRIGGERED_CHECK_COOLDOWN
+        {
+            return None;
+        }
+        record.in_flight = true;
+        Some(record.latest_endpoint)
+    }
+
+    /// Complete the admitted reverse check.  The record remains until the
+    /// cooldown expires so a newer endpoint observed while the send was in
+    /// flight is retained for the next admission.
+    fn complete_triggered_check(
+        checks: &mut HashMap<String, TriggeredCheckRecord>,
+        peer_id: &str,
+        sent_at: Instant,
+    ) {
+        if let Some(record) = checks.get_mut(peer_id) {
+            record.in_flight = false;
+            record.last_sent_at = sent_at;
         }
     }
 
@@ -150,37 +186,44 @@ impl UdpTransport {
         peer_id: &str,
         observed_endpoint: SocketAddr,
     ) {
-        let key = (peer_id.to_string(), observed_endpoint, socket_index);
-        {
+        let admitted_endpoint = {
             let mut checks = self.triggered_checks.lock().await;
-            checks.retain(|_, sent_at| sent_at.elapsed() < TRIGGERED_CHECK_COOLDOWN);
-            if checks.contains_key(&key) {
-                return;
-            }
-            checks.insert(key, Instant::now());
-        }
+            Self::admit_triggered_check(
+                &mut checks,
+                peer_id,
+                observed_endpoint,
+                Instant::now(),
+            )
+        };
+        let Some(admitted_endpoint) = admitted_endpoint else {
+            return;
+        };
 
         let local_endpoint = self
             .socket_for_peer(Some(peer_id))
             .await
             .and_then(|(_, socket)| socket.local_addr().ok());
-        match self
-            .send_probe_from_socket(socket_index, Some(peer_id), observed_endpoint)
-            .await
+        let result = self
+            .send_probe_from_socket(socket_index, Some(peer_id), admitted_endpoint)
+            .await;
         {
+            let mut checks = self.triggered_checks.lock().await;
+            Self::complete_triggered_check(&mut checks, peer_id, Instant::now());
+        }
+        match result {
             Ok(_) => info!(
                 event = "candidate_pair_triggered_check",
                 peer_id = %peer_id,
                 local_endpoint = %local_endpoint.map(|endpoint| endpoint.to_string()).unwrap_or_else(|| "unknown".to_string()),
-                remote_endpoint = %observed_endpoint,
+                remote_endpoint = %admitted_endpoint,
                 candidate_source = "peer_reflexive",
                 reason = "authenticated inbound punch observed",
                 "candidate_pair_triggered_check peer_id={} remote_endpoint={} reason=authenticated inbound punch observed",
                 peer_id,
-                observed_endpoint
+                admitted_endpoint
             ),
             Err(err) => debug!(
-                "Failed triggered UDP check from socket {socket_index} to peer {peer_id} at {observed_endpoint}: {err}"
+                "Failed triggered UDP check from socket {socket_index} to peer {peer_id} at {admitted_endpoint}: {err}"
             ),
         }
     }
@@ -393,7 +436,13 @@ impl UdpTransport {
         // The send lease for a dynamic socket is registered in this same
         // critical section: the detach path can only drain after removing the
         // entry under this same lock, so it always observes this lease.
+        //
+        // The registration also holds the shared network-epoch gate: a
+        // generation advance can never bump the generation between the
+        // re-verification read and the pending insert, so an old-generation
+        // probe can never be registered once the generation moved on.
         let send_lease = {
+            let _epoch_gate = self.network_epoch_gate.lock().await;
             let state = self.socket_state.lock().await;
             if self.peers.current_network_generation_sync() != generation {
                 debug!(

@@ -12,7 +12,7 @@
 //! The control plane uses a simple JSON-over-WebSocket protocol for signaling,
 //! with protobuf available for higher performance in production.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 mod http;
 mod websocket;
 
+pub(crate) use http::incarnation_fits_candidate_generation_encoding;
 #[cfg(test)]
 use http::register_device_payload;
 use http::{

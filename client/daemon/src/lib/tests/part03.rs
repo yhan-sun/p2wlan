@@ -218,7 +218,7 @@ fn rekey_session_install_preserves_established_path_state() {
 #[tokio::test]
 async fn initiator_rekey_keeps_peer_in_direct_state() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-direct-rekey";
     let peer_identity = NodeIdentity::generate();
     let peer_public_key = peer_identity.public_key();
@@ -289,7 +289,7 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
 #[tokio::test]
 async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-stale-answer";
 
     let peer_identity = NodeIdentity::generate();
@@ -325,7 +325,7 @@ async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
 #[tokio::test]
 async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-incomplete-modern-answer";
 
     let old_local_identity = NodeIdentity::generate();
@@ -419,7 +419,7 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
 #[tokio::test]
 async fn modern_offer_rejects_missing_or_malformed_probe_ephemeral_key() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-invalid-modern-offer";
     let local_public = daemon.local_identity().unwrap().public_key();
     let peer_identity = loop {
@@ -506,6 +506,494 @@ fn handshake_start_reservation_prevents_concurrent_initiators() {
 
     state.cancel_reservation(peer_id);
     assert!(state.reserve_start(peer_id));
+}
+
+#[test]
+fn stale_handshake_start_owner_cannot_clear_replacement_reservation() {
+    let mut state = PendingHandshakeState::default();
+    let peer_id = "peer-owner-replacement";
+
+    let old = state
+        .reserve_start_with_owner(peer_id)
+        .expect("first reservation must be admitted");
+    state.clear_peer(peer_id);
+    let replacement = state
+        .reserve_start_with_owner(peer_id)
+        .expect("peer rejoin must admit a replacement reservation");
+
+    assert_ne!(old.owner, replacement.owner);
+    assert!(
+        !state.cancel_reservation_if_current(peer_id, old.owner),
+        "a late task from the old peer incarnation must not clear the replacement"
+    );
+    assert!(state.starting.contains(peer_id));
+    assert_eq!(state.starting_ids.get(peer_id), Some(&replacement.owner));
+}
+
+#[test]
+fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
+    fn offer(peer_id: &str, endpoint: &str) -> PendingPeerOffer {
+        PendingPeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![endpoint.to_string()],
+            candidate_sources: HashMap::from([(endpoint.to_string(), "stun".to_string())]),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            sender_public_key: None,
+            handshake_init: vec![1, 2, 3],
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            session_id: None,
+            probe_ephemeral_public_key: None,
+        }
+    }
+
+    let mut state = PendingHandshakeState::default();
+    let (reservation, first) = state
+        .enqueue_responder_work(offer("peer-deferred", "127.0.0.1:41000"))
+        .expect("first unknown offer starts one bounded waiter");
+    assert!(state
+        .enqueue_responder_work(offer("peer-deferred", "127.0.0.1:41001"))
+        .is_none());
+
+    let queued = state
+        .take_queued_responder_work("peer-deferred", reservation.owner)
+        .expect("newest offer replaces the deferred value before it is processed");
+    assert_eq!(queued.candidates, vec!["127.0.0.1:41001"]);
+    assert_eq!(first.candidates, vec!["127.0.0.1:41000"]);
+    assert!(
+        state
+            .finish_responder_work("peer-deferred", reservation.owner)
+            .is_none(),
+        "taking the newest queued offer must retain then release the same owner only once"
+    );
+
+    // A peer lifecycle cleanup invalidates the owner.  A late worker cannot
+    // consume a replacement slot after the peer rejoins.
+    state.clear_peer("peer-deferred");
+    assert!(state
+        .finish_responder_work("peer-deferred", reservation.owner)
+        .is_none());
+    let replacement = state
+        .enqueue_responder_work(offer("peer-deferred", "127.0.0.1:41002"))
+        .expect("rejoined peer gets a fresh owner");
+    assert_ne!(replacement.0.owner, reservation.owner);
+}
+
+#[test]
+fn peer_reflexive_work_is_newest_wins_and_owner_scoped() {
+    fn observation(peer_id: &str, endpoint: &str) -> PendingPeerReflexive {
+        PendingPeerReflexive {
+            from_node_id: peer_id.to_string(),
+            observed_endpoint: endpoint.to_string(),
+            punch_at_ms: None,
+        }
+    }
+
+    let mut state = PendingHandshakeState::default();
+    let peer_id = "peer-reflexive-owner";
+    let (reservation, first) = state
+        .enqueue_peer_reflexive_work(observation(peer_id, "198.51.100.10:41000"))
+        .expect("first observation starts one bounded worker");
+    assert!(state
+        .enqueue_peer_reflexive_work(observation(peer_id, "198.51.100.10:41001"))
+        .is_none());
+
+    let newest = state
+        .finish_peer_reflexive_work(peer_id, reservation.owner)
+        .expect("the worker must consume only the newest queued endpoint next");
+    assert_eq!(first.observed_endpoint, "198.51.100.10:41000");
+    assert_eq!(newest.observed_endpoint, "198.51.100.10:41001");
+
+    // Peer lifecycle cleanup cancels the old owner. A late completion cannot
+    // release or consume the replacement slot after a rejoin.
+    state.clear_peer(peer_id);
+    assert!(state
+        .finish_peer_reflexive_work(peer_id, reservation.owner)
+        .is_none());
+    let replacement = state
+        .enqueue_peer_reflexive_work(observation(peer_id, "198.51.100.10:41002"))
+        .expect("rejoined peer gets a fresh peer-reflexive owner");
+    assert_ne!(replacement.0.owner, reservation.owner);
+}
+
+#[tokio::test]
+async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join() {
+    let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let peer_identity = NodeIdentity::generate();
+    let peer_id = "peer-deferred-replay";
+    let candidate = "198.51.100.77:47000";
+    let offer = PendingPeerOffer {
+        from_node_id: peer_id.to_string(),
+        candidates: vec![candidate.to_string()],
+        candidate_sources: HashMap::from([(candidate.to_string(), "stun".to_string())]),
+        candidate_generation: 1,
+        candidates_expires_at_ms: None,
+        sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        handshake_init: Vec::new(),
+        punch_at_ms: None,
+        punch_at_server_ms: None,
+        session_id: None,
+        probe_ephemeral_public_key: None,
+    };
+    let (reservation, offer) = daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .enqueue_responder_work(offer)
+        .expect("unknown offer must acquire one deferred owner");
+
+    let join = async {
+        sleep(Duration::from_millis(25)).await;
+        daemon
+            .peers
+            .add_peer(&control::PeerInfo {
+                node_id: peer_id.to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: hex::encode(peer_identity.public_key()),
+                endpoint: String::new(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+    };
+    tokio::join!(
+        daemon.run_deferred_peer_offer_worker(offer, reservation),
+        join
+    );
+
+    let connection = daemon.peers.get_connection(peer_id).await.unwrap();
+    assert!(
+        connection.candidates.iter().any(|value| value == candidate),
+        "candidate admission must run after the peer exists"
+    );
+    assert!(!daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .responder_workers
+        .contains_key(peer_id));
+}
+
+#[tokio::test]
+async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_blocked() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-slow-candidate-refresh".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+
+    // The event worker will block acquiring this lock inside
+    // `local_candidate_set_for_signal`.  A serial inline handshake would keep
+    // the next ControlHealthy event behind that wait; the bounded work set must
+    // let the receiver consume it immediately.
+    let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
+    let candidate_guard = candidate_refresh_lock.lock().await;
+    let control = daemon.control.clone();
+    let health = daemon.health.clone();
+    let shutdown = daemon.shutdown_sender();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerJoined(peer_info))
+        .unwrap();
+    control
+        .event_sender()
+        .send(ControlEvent::ControlHealthy)
+        .unwrap();
+
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if health.snapshot(&[]).await.control_connected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ControlHealthy must not wait for the blocked candidate refresh");
+
+    drop(candidate_guard);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
+async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_waits() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-reflexive-blocked-answer";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    // Install a genuine pending initiator so the following PeerAnswer has to
+    // cross the real inbound answer handler and install a session. If
+    // PeerReflexive waited inline on candidate_refresh_lock, this answer would
+    // remain queued and the assertion below would time out.
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        peer_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(peer_identity.clone(), None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .insert(peer_id.to_string(), initiator, None, None);
+
+    let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
+    let candidate_guard = candidate_refresh_lock.lock().await;
+    let control = daemon.control.clone();
+    let transport = daemon.transport.clone();
+    let shutdown = daemon.shutdown_sender();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerReflexive {
+            from_node_id: peer_id.to_string(),
+            observed_endpoint: "198.51.100.10:41000".to_string(),
+            punch_at_ms: None,
+        })
+        .unwrap();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerAnswer {
+            from_node_id: peer_id.to_string(),
+            candidates: Vec::new(),
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::new(),
+            candidate_generation: 0,
+            candidates_expires_at_ms: None,
+            handshake_response: response.to_bytes(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    tokio::time::timeout(Duration::from_millis(350), async {
+        while !transport.has_session(peer_id).await {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("PeerAnswer must not wait for blocked peer-reflexive candidate work");
+
+    drop(candidate_guard);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
+async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-reflexive-blocked-offer";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
+    let candidate_guard = candidate_refresh_lock.lock().await;
+    let control = daemon.control.clone();
+    let peers = daemon.peers.clone();
+    let shutdown = daemon.shutdown_sender();
+    let offered_candidate = "198.51.100.11:42000".to_string();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerReflexive {
+            from_node_id: peer_id.to_string(),
+            observed_endpoint: "198.51.100.10:41000".to_string(),
+            punch_at_ms: None,
+        })
+        .unwrap();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![offered_candidate.clone()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::from([(offered_candidate.clone(), "stun".to_string())]),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    tokio::time::timeout(Duration::from_millis(350), async {
+        loop {
+            let installed = peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| connection.candidates.contains(&offered_candidate));
+            if installed {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("PeerOffer candidate admission must not wait for blocked peer-reflexive work");
+
+    drop(candidate_guard);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
+async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-arbiter-candidate-wait".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+    let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
+    let candidate_guard = candidate_refresh_lock.lock().await;
+    let mut reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .await
+        .expect("event initiator reservation must be admitted");
+    let mut worker = Box::pin(daemon.run_reserved_initiator_handshake(
+        &peer_info,
+        &mut reservation,
+    ));
+
+    // A direct poll reaches the blocked candidate lock. If the initiator still
+    // held its arbiter guard at this point, the acquisition below would time
+    // out; a crossing offer/answer could not make progress.
+    std::future::poll_fn(|context| match worker.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(result) => panic!("candidate-blocked worker completed unexpectedly: {result:?}"),
+    })
+    .await;
+    let guard = tokio::time::timeout(
+        Duration::from_millis(100),
+        daemon.handshake_arbiter.acquire(&peer_info.node_id),
+    )
+    .await
+    .expect("arbiter must be free while candidate gathering waits");
+    drop(guard);
+
+    daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .clear_peer(&peer_info.node_id);
+    drop(candidate_guard);
+    tokio::time::timeout(Duration::from_secs(1), &mut worker)
+        .await
+        .expect("cancelled candidate worker did not return")
+        .expect("cancelled candidate worker returned an error");
 }
 
 #[test]
@@ -617,7 +1105,7 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
 #[tokio::test]
 async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-cache-key-rotation";
     let token = "rotated-static-key-token";
     let local_public = daemon.local_identity().unwrap().public_key();
@@ -705,7 +1193,7 @@ async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
 #[tokio::test]
 async fn expired_responder_cache_conflict_does_not_poison_active_token() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
-    let mut daemon = Daemon::new(config);
+    let daemon = Daemon::new(config);
     let peer_id = "peer-expired-cache-conflict";
     let token = "same-active-token";
 

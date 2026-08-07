@@ -45,7 +45,45 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
-        if generation != self.current_network_generation().await {
+        // The whole promotion (state -> Direct, mirror update) runs under the
+        // shared network-epoch gate: the UDP eviction path re-verifies the
+        // Direct mirror inside the same gate, so a peer that becomes Direct
+        // here can never lose its working dynamic socket to a concurrent
+        // eviction that read the pre-promotion mirror.
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        self.record_direct_success_for_generation_with_local_endpoint_in_epoch(
+            &epoch_guard,
+            node_id,
+            endpoint,
+            generation,
+            local_endpoint,
+        )
+        .await
+    }
+
+    /// Record Direct success while the caller holds the shared network epoch
+    /// gate.  This is the ACK-commit primitive: token validation, expectation
+    /// consumption and the Direct state transition can use one uninterrupted
+    /// epoch transaction rather than checking a generation before acquiring
+    /// the lock and promoting after it has changed.
+    ///
+    /// The guard is deliberately an argument instead of an implicit lock: it
+    /// makes callers that compose the ACK transaction prove that they are
+    /// inside an epoch critical section.  `UdpTransport` and `PeerManager`
+    /// share this gate.
+    pub(crate) async fn record_direct_success_for_generation_with_local_endpoint_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        // The lock-free mirror is written while this very gate is held by a
+        // generation advance.  Reading it here therefore cannot race an
+        // advance between validation and mutation.
+        if generation != self.current_network_generation_sync() {
             return false;
         }
         let pair_success = {
@@ -165,6 +203,13 @@ impl PeerManager {
             }
             pair_success
         };
+        // A confirmed Direct path supersedes every outstanding validation
+        // lease for this peer.  This happens under the same epoch gate as the
+        // state transition, so a worker from the just-confirmed generation
+        // cannot keep sending requests or leave an ACK expectation behind.
+        if let Some(registry) = self.direct_validation_registry.read().await.clone() {
+            registry.cancel_peer(node_id).await;
+        }
         if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }

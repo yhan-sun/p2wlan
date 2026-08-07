@@ -36,7 +36,7 @@ impl PeerManager {
         &self,
         node_id: &str,
         relay_server: &str,
-        switch_to_relay: bool,
+        _switch_to_relay: bool,
         latency: Option<Duration>,
     ) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
@@ -48,7 +48,13 @@ impl PeerManager {
             } else {
                 conn.relay_health.record_success();
             }
-            if switch_to_relay || conn.state != ConnectionState::Direct {
+            // A relay validation packet must NEVER demote a confirmed Direct
+            // peer: the direct keepalive/probe machinery is the only
+            // authoritative demoter (it transitions Direct -> FallbackToRelay
+            // on ACK timeouts), after which the relay path can heal the peer
+            // back to Relay.  Relay keepalives arriving on a healthy Direct
+            // path only refresh the relay health bookkeeping.
+            if conn.state != ConnectionState::Direct {
                 let was_relay = conn.state == ConnectionState::Relay;
                 let relay_changed = previous_relay.as_deref() != Some(relay_server);
                 conn.transition(ConnectionState::Relay);

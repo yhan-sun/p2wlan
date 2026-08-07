@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/nodes", anyAuth(apiServer.ListNodes))
 	mux.HandleFunc("POST /api/v1/signals", anyAuth(apiServer.CreateSignal))
 	mux.HandleFunc("GET /api/v1/signals", anyAuth(apiServer.ListSignals))
+	mux.HandleFunc("POST /api/v1/signals/ack", anyAuth(apiServer.AckSignals))
 	mux.HandleFunc("POST /api/v1/tunnels", anyAuth(apiServer.CreateTunnel))
 	mux.HandleFunc("GET /api/v1/tunnels", anyAuth(apiServer.ListTunnels))
 	mux.HandleFunc("DELETE /api/v1/tunnels/{id}", anyAuth(apiServer.DeleteTunnel))

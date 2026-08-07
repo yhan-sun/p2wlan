@@ -216,6 +216,10 @@ pub enum ControlEvent {
         /// Server-clock deadline backing `punch_at_ms`, when supplied by the
         /// REST signaling endpoint. This keeps offer and answer on one window.
         punch_at_server_ms: Option<u64>,
+        /// Sender identity fingerprint (public key) bound to the signal at
+        /// send time by the control server.  A signal sent by an OLD identity
+        /// must never enter a NEW identity's fresh-prediction high-water.
+        sender_public_key: Option<String>,
     },
     /// Received a peer answer.
     PeerAnswer {
@@ -229,6 +233,8 @@ pub enum ControlEvent {
         handshake_response: Vec<u8>,
         punch_at_ms: Option<u64>,
         punch_at_server_ms: Option<u64>,
+        /// Sender identity fingerprint bound to the signal at send time.
+        sender_public_key: Option<String>,
     },
     /// A peer relayed back the UDP source endpoint it observed for us.
     PeerReflexive {
@@ -362,6 +368,17 @@ struct ListSignalsResponse {
     protocol_version: Option<u8>,
     #[serde(default)]
     server_time_ms: Option<u64>,
+    /// Present only in ACK mode: the delivery lease metadata of this batch.
+    #[serde(default)]
+    delivery: Option<SignalDelivery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignalDelivery {
+    #[serde(default)]
+    batch_token: String,
+    #[serde(default)]
+    lease_expires_at_ms: Option<u64>,
 }
 
 fn default_signal_rest_protocol_version() -> u8 {
@@ -370,6 +387,8 @@ fn default_signal_rest_protocol_version() -> u8 {
 
 #[derive(Debug, Deserialize)]
 struct SignalResponse {
+    #[serde(default)]
+    id: Option<String>,
     from_node_id: String,
     #[serde(rename = "type")]
     signal_type: String,
@@ -391,6 +410,10 @@ struct SignalResponse {
     handshake: String,
     #[serde(default)]
     punch_at_ms: Option<u64>,
+    #[serde(default)]
+    sender_public_key: Option<String>,
+    #[serde(default)]
+    delivery_token: Option<String>,
 }
 
 /// Control plane client.
@@ -411,6 +434,45 @@ pub struct ControlClient {
 struct FetchRelayTicketResponse {
     ticket: String,
     expires_at: i64,
+}
+
+/// Outcome of one peer-offer send attempt through the control plane.
+///
+/// The HTTP worker distinguishes "cancelled before anything reached the wire"
+/// from a real failure: a caller advertising a fresh-mapping prediction must
+/// never finalize a durable handoff for a socket whose prediction was never
+/// sent, and never treat a cancellation as a successful send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerOfferSendOutcome {
+    /// The HTTP request completed and the control server accepted the signal.
+    Sent,
+    /// The fresh-mapping ownership was revoked before the request reached the
+    /// wire: nothing was sent and nothing must be finalized.
+    Cancelled,
+    /// The request was attempted but failed (HTTP error, decode failure).
+    Failed,
+}
+
+/// Why a peer-offer send did not place the signal on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerOfferSendFailure {
+    /// The fresh-mapping ownership was revoked before the HTTP request: the
+    /// prediction was never sent and no durable handoff may be finalized.
+    Cancelled,
+    /// The HTTP request was attempted but the control server did not accept it.
+    SendFailed,
+    /// The command channel or response channel closed.
+    ChannelClosed,
+}
+
+impl std::fmt::Display for PeerOfferSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "peer offer cancelled before send"),
+            Self::SendFailed => write!(f, "peer offer send failed"),
+            Self::ChannelClosed => write!(f, "peer offer command channel closed"),
+        }
+    }
 }
 
 /// Commands sent to the control client background task.
@@ -434,7 +496,7 @@ enum ControlCommand {
         /// punch session's cancellation: the HTTP worker refuses to send once
         /// the session was superseded.
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
-        response_tx: oneshot::Sender<Result<()>>,
+        response_tx: oneshot::Sender<PeerOfferSendOutcome>,
     },
     /// Send a peer answer.
     SendPeerAnswer {

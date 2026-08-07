@@ -182,6 +182,10 @@ func migrate(db *sql.DB) error {
 		{"signals", "probe_ephemeral_public_key", "TEXT NOT NULL DEFAULT ''"},
 		{"signals", "punch_at_ms", "INTEGER NOT NULL DEFAULT 0"},
 		{"signals", "signal_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"signals", "sender_public_key", "TEXT NOT NULL DEFAULT ''"},
+		{"signals", "delivery_token", "TEXT NOT NULL DEFAULT ''"},
+		{"signals", "delivery_batch_token", "TEXT NOT NULL DEFAULT ''"},
+		{"signals", "lease_expires_at", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := ensureColumn(column.table, column.column, column.definition); err != nil {
 			return err
@@ -191,6 +195,12 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_signals_pair_seq ON signals(from_node_id, to_node_id, signal_seq)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_signals_delivery ON signals(to_node_id, lease_expires_at)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_signals_delivery_batch ON signals(to_node_id, delivery_batch_token, lease_expires_at)`); err != nil {
 		return err
 	}
 

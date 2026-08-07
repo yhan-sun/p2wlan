@@ -241,12 +241,12 @@ async fn run_inbound_accepts_authenticated_peer_reflexive_probe() {
         .await;
 
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
-    let (observation_tx, mut observation_rx) = mpsc::channel(4);
+    let observation_ingress = PeerReflexiveIngress::new();
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
         .with_local_node_id("peer-a")
-        .with_peer_reflexive_observer(observation_tx);
+        .with_peer_reflexive_observer(observation_ingress.clone());
     let local_addr = transport.local_addr().unwrap();
     let (tx, mut rx) = mpsc::channel(4);
     let worker = tokio::spawn(transport.run_inbound(tx));
@@ -295,9 +295,8 @@ async fn run_inbound_accepts_authenticated_peer_reflexive_probe() {
         .await
         .is_err());
 
-    let observation = timeout(Duration::from_secs(1), observation_rx.recv())
+    let observation = timeout(Duration::from_secs(1), observation_ingress.next())
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(observation.peer_id, "peer-b");
     assert_eq!(observation.observed_endpoint, sender_addr);

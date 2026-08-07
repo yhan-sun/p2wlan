@@ -114,7 +114,7 @@ impl SimulatedNat {
                         *next = next.wrapping_add(step as u16);
                     }
                     let existing = mappings.get(&(client_src, peer_public)).copied();
-                    let port = if let Some(port) = existing {
+                    let mut port = if let Some(port) = existing {
                         port
                     } else {
                         let port = *next;
@@ -122,21 +122,38 @@ impl SimulatedNat {
                         mappings.insert((client_src, peer_public), port);
                         port
                     };
-                    drop(mappings);
-                    mapping_sources.lock().await.insert(port, client_src);
+                    drop(next);
+                    // Reuse the forwarder of an existing mapping; otherwise
+                    // bind one for this port.  Another concurrent SimulatedNat
+                    // instance's ephemeral observer bind can transiently own
+                    // the port (both live on the shared NAT_IP): on AddrInUse
+                    // the NAT simply allocates the next mapping instead of
+                    // panicking.
                     let mut forwarders = forwarders.lock().await;
                     let forwarder = match forwarders.get(&port).cloned() {
                         Some(forwarder) => forwarder,
                         None => {
-                            let forwarder = Arc::new(
-                                UdpSocket::bind(SocketAddr::new(nat_ip, port))
-                                    .await
-                                    .expect("bind public forwarder"),
-                            );
+                            let forwarder = loop {
+                                match UdpSocket::bind(SocketAddr::new(nat_ip, port)).await {
+                                    Ok(forwarder) => break Arc::new(forwarder),
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::AddrInUse =>
+                                    {
+                                        let mut next = next_port.lock().await;
+                                        port = *next;
+                                        *next = next.wrapping_add(step as u16);
+                                        drop(next);
+                                        mappings.insert((client_src, peer_public), port);
+                                    }
+                                    Err(error) => panic!("bind public forwarder: {error}"),
+                                }
+                            };
                             forwarders.insert(port, forwarder.clone());
                             forwarder
                         }
                     };
+                    drop(mappings);
+                    mapping_sources.lock().await.insert(port, client_src);
                     // Forward the client's packet to the peer with the
                     // mapping's public source port.
                     let _ = forwarder.send_to(&data, peer_private).await;

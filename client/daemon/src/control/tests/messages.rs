@@ -111,6 +111,9 @@ fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
         candidates_expires_at_ms: None,
         handshake: String::new(),
         punch_at_ms: Some(77),
+        sender_public_key: None,
+        id: None,
+        delivery_token: None,
     };
 
     assert_eq!(
@@ -133,6 +136,9 @@ fn test_peer_reflexive_endpoint_falls_back_to_first_candidate() {
         candidates_expires_at_ms: None,
         handshake: String::new(),
         punch_at_ms: None,
+        sender_public_key: None,
+        id: None,
+        delivery_token: None,
     };
 
     assert_eq!(
@@ -225,15 +231,25 @@ fn candidate_generation_incarnation_values_stay_within_positive_int64() {
 }
 
 #[test]
-fn candidate_generation_refuses_to_mask_a_wrapped_incarnation() {
-    // A wall-clock-seeded incarnation above the 41-bit field limit must be
-    // refused, never masked: masking would let a boot from the year 2040
-    // encode as a *smaller* high half than a boot today, and receivers would
-    // judge its signals stale forever after a restart.
-    assert!(matches!(
-        next_candidate_generation_for_incarnation(1u64 << CANDIDATE_GENERATION_INCARNATION_BITS, 0),
-        Err(CandidateGenerationError::IncarnationExhausted(_))
-    ));
+fn candidate_generation_degrades_to_legacy_zero_when_incarnation_outgrows_field() {
+    // A wall-clock-seeded incarnation above the 41-bit field limit must
+    // degrade to the legacy no-metadata generation (0), never be masked
+    // (masking would let a boot from the year 2040 encode as a *smaller*
+    // high half than a boot today) and never fail the whole signal: ordinary
+    // offer/answer signaling keeps working; only fresh prediction is
+    // disabled (the fresh label path refuses to encode it).
+    assert_eq!(
+        next_candidate_generation_for_incarnation(1u64 << CANDIDATE_GENERATION_INCARNATION_BITS, 0)
+            .unwrap(),
+        0,
+        "an out-of-range incarnation must degrade to the legacy no-metadata value instead of failing signaling"
+    );
+    assert_eq!(
+        next_candidate_generation_for_incarnation(1u64 << CANDIDATE_GENERATION_INCARNATION_BITS, 7)
+            .unwrap(),
+        0,
+        "the degradation is independent of the previous generation"
+    );
     // Just below the limit still encodes.
     assert!(
         next_candidate_generation_for_incarnation(
@@ -242,6 +258,14 @@ fn candidate_generation_refuses_to_mask_a_wrapped_incarnation() {
         )
         .is_ok()
     );
+    // The encodability gate used by the fresh label path agrees.
+    assert!(!super::incarnation_fits_candidate_generation_encoding(
+        1u64 << CANDIDATE_GENERATION_INCARNATION_BITS
+    ));
+    assert!(!super::incarnation_fits_candidate_generation_encoding(0));
+    assert!(super::incarnation_fits_candidate_generation_encoding(
+        (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1
+    ));
 }
 
 #[test]

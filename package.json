@@ -1,7 +1,7 @@
 {
   "name": "p2wlan-desktop",
   "private": true,
-  "version": "0.1.68",
+  "version": "0.1.107",
   "type": "module",
   "scripts": {
     "dev": "vite",

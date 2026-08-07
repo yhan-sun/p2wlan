@@ -123,6 +123,16 @@ struct Cli {
     #[arg(long, name = "prefer-direct")]
     prefer_direct: bool,
 
+    /// Allow loopback endpoints in the fresh-mapping generation (NAT-sim
+    /// harnesses only; see config.network.fresh_mapping_harness_loopback).
+    #[arg(long, name = "fresh-mapping-harness-loopback")]
+    fresh_mapping_harness_loopback: bool,
+
+    /// Do not gather the local socket address as a Host candidate
+    /// (NAT-simulation harnesses only).
+    #[arg(long, name = "no-host-candidates")]
+    no_host_candidates: bool,
+
     /// Override device name
     #[arg(long, name = "device-name")]
     device_name: Option<String>,

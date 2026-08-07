@@ -32,7 +32,7 @@ impl UdpTransport {
         let config = IceConfig {
             stun_servers,
             stun_timeout,
-            gather_host: true,
+            gather_host: self.peers.gather_host_candidates().await,
             gather_srflx: true,
         };
 
@@ -65,7 +65,11 @@ impl UdpTransport {
             );
         }
 
-        let mut report = candidate_report_from_observations(local_addr, true, observations);
+        let mut report = candidate_report_from_observations(
+            local_addr,
+            self.peers.gather_host_candidates().await,
+            observations,
+        );
         self.set_socket_pool_active(socket_pool_is_eligible(&report));
         self.append_pool_socket_candidates_live(&mut report, &stun_servers, stun_timeout)
             .await;

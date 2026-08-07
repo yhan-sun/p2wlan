@@ -81,11 +81,20 @@ fn now_ms() -> u64 {
 }
 
 /// Pure monotonicity rule: the next incarnation is strictly greater than the
-/// loaded one and never below the wall clock, so clock rollback, same-ms
-/// restarts and forward clock jumps still advance the counter.
+/// loaded one.
+///
+/// The wall clock ONLY seeds the very first boot (`loaded == None`); every
+/// later boot strictly increments the persisted counter.  The counter never
+/// follows a forward wall-clock jump: `now` is diagnostics-only for
+/// subsequent boots, so an operator who sets the clock far into the future
+/// cannot make the incarnation jump (and thereby burn the 41-bit encoding
+/// headroom); a rollback stays harmless because the persisted counter is
+/// never below its previous value.
 fn next_incarnation(loaded: Option<u64>, now: u64) -> Option<u64> {
-    let floor = loaded.unwrap_or(0);
-    floor.max(now).checked_add(1)
+    match loaded {
+        Some(loaded) => loaded.checked_add(1),
+        None => now.checked_add(1),
+    }
 }
 
 /// Load the persisted incarnation state.
@@ -114,6 +123,12 @@ fn load(path: Option<&Path>) -> Result<Option<IncarnationState>, ()> {
 /// Persist the state atomically: write the fixed temporary file, fsync it,
 /// rename over the live file, then fsync the parent directory so the rename
 /// itself survives a crash.  Must run while holding the incarnation lock.
+///
+/// The directory fsync is platform-specific: POSIX opens the directory and
+/// calls `sync_all`, while Windows (which cannot open a directory for
+/// synchronous I/O) uses the platform helper that no-ops there — an atomic
+/// rename on NTFS is journaled, so the rename itself is durable once the file
+/// is fsynced.
 fn save(state: &IncarnationState, path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -125,7 +140,27 @@ fn save(state: &IncarnationState, path: &Path) -> std::io::Result<()> {
         tmp.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
+    sync_parent_directory(parent)
+}
+
+/// Fsync a directory so a completed rename survives a crash.
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
     fs::File::open(parent)?.sync_all()
+}
+
+/// Windows cannot open directories for synchronous I/O; the NTFS journal
+/// makes the rename durable once the file itself was fsynced.
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Windows keeps no directory-fsync step: the platform helper is a no-op
+/// (see [`sync_parent_directory`]).
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Reserve the next boot incarnation under the cross-process file lock,

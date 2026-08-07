@@ -159,6 +159,23 @@ pub struct NetworkConfig {
     /// same socket so the peer-facing mapping is the model's prediction.
     #[serde(default = "default_true")]
     pub fresh_mapping_punch_enabled: bool,
+    /// Whether the local socket address is gathered as a Host candidate.
+    ///
+    /// NAT-simulation harnesses disable host candidates so every punch must
+    /// traverse the simulated NATs (a loopback host candidate would otherwise
+    /// connect the two daemons directly).
+    #[serde(default = "default_true")]
+    pub gather_host_candidates: bool,
+    /// Allow loopback endpoints in the fresh-mapping measurement/punch flow
+    /// (NAT-simulation harnesses only).
+    ///
+    /// Production fresh-mapping generations only target public probe
+    /// endpoints; the deterministic dual-NAT harness (`scripts/nat-sim`)
+    /// simulates the NATs on loopback addresses and needs the fresh path to
+    /// accept them.  Like `P2WLAN_DISABLE_TUN`, this is a documented test
+    /// escape hatch and defaults to off.
+    #[serde(default)]
+    pub fresh_mapping_harness_loopback: bool,
 }
 
 fn default_cidr() -> String {

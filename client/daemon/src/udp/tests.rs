@@ -4,3 +4,4 @@ include!("tests/part02a.rs");
 include!("tests/part02b.rs");
 include!("tests/part03.rs");
 include!("tests/part04.rs");
+include!("tests/part05.rs");

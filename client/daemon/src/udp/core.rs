@@ -13,6 +13,12 @@ pub struct UdpTransport {
     /// affinity pins and the affinity epoch counter live under one mutex so
     /// every ownership transition is atomic and no lock ordering exists.
     socket_state: Arc<Mutex<SocketState>>,
+    /// Shared network-epoch gate (owned by the peer manager) serializing
+    /// generation advances against every generation-sensitive socket-state
+    /// mutation: commit, finalize, attach, affinity adoption and pending-probe
+    /// registration.  Lock order everywhere: network-epoch gate -> adoption
+    /// lock -> socket_state -> pending probes.
+    network_epoch_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-peer adoption locks serializing every pending-probe ACK adoption
     /// against `clear_pending_probes_for_peer`.
     ///
@@ -32,8 +38,24 @@ pub struct UdpTransport {
     dynamic_socket_counter: Arc<AtomicUsize>,
     dynamic_socket_diagnostics: Arc<Mutex<HashMap<usize, UdpSocketPoolMemberDiagnostics>>>,
     inbound_tx: Option<mpsc::Sender<ReceivedEncryptedPacket>>,
-    peer_reflexive_tx: Option<mpsc::Sender<PeerReflexiveObservation>>,
-    peer_reflexive_notifications: PeerReflexiveNotificationState,
+    /// Owner of the daemon publication currently allowed to turn an
+    /// authenticated UDP envelope into Direct-path state. Socket readers
+    /// stamp this on every envelope; WireGuard inbound compares it with the
+    /// live watch value after decryption so a packet queued by a withdrawn
+    /// transport cannot be attributed to a replacement socket.
+    inbound_publication_owner: Arc<AtomicU64>,
+    /// Bounded per-peer newest-wins ingress for authenticated endpoint
+    /// observations.  The daemon-side consumer owns the only receive loop;
+    /// UDP readers submit synchronously and never wait on a worker queue.
+    peer_reflexive_ingress: Option<PeerReflexiveIngress>,
+    /// Optional daemon-registered ingress for daemon-internal
+    /// direct-validation observations.
+    ///
+    /// The UDP layer cannot call the validation task directly (module
+    /// layering: `udp` is below `lib`), so the daemon registers a closure at
+    /// setup.  Both matched ACK and peer-reflexive paths call this same
+    /// ingress; it only queues/merges evidence and never spawns a worker.
+    validation_trigger: Option<Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>>,
     triggered_checks: TriggeredCheckState,
     nat_maintainers: NatMaintainerState,
     authenticated_punch_replay: AuthPunchReplayState,
@@ -42,6 +64,14 @@ pub struct UdpTransport {
     global_outbound_probe_budget: Option<Arc<GlobalOutboundProbeBudget>>,
     local_node_id: Option<String>,
     wireguard_transport: Option<WireGuardTransport>,
+    /// Outstanding daemon-internal direct-validation requests per peer: the
+    /// ACK handler only promotes Direct when the ACK token matches an
+    /// expectation registered by the validation task, so a stale request can
+    /// never confirm a new session.
+    /// Shared validation session/expectation registry.  `PeerManager` holds a
+    /// clone so a network-generation transition cancels old ownership while
+    /// it is still inside the shared epoch gate.
+    direct_validation: DirectValidationRegistry,
 }
 
 impl UdpTransport {
@@ -50,6 +80,12 @@ impl UdpTransport {
         let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
             DaemonError::Network(format!("failed to bind UDP socket at {bind_addr}: {e}"))
         })?;
+        let network_epoch_gate = peers.network_epoch_gate();
+
+        let direct_validation = DirectValidationRegistry::new();
+        peers
+            .register_direct_validation_registry(direct_validation.clone())
+            .await;
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -64,6 +100,7 @@ impl UdpTransport {
                 probe_cleanup_epochs: HashMap::new(),
                 committed_punch_generations: HashMap::new(),
             })),
+            network_epoch_gate,
             peer_adoption_locks: Arc::new(Mutex::new(HashMap::new())),
             socket_pool_active: Arc::new(AtomicBool::new(false)),
             socket_pool_diagnostics: Arc::new(Mutex::new(vec![UdpSocketPoolMemberDiagnostics {
@@ -73,8 +110,9 @@ impl UdpTransport {
             dynamic_socket_counter: Arc::new(AtomicUsize::new(0)),
             dynamic_socket_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx: None,
-            peer_reflexive_tx: None,
-            peer_reflexive_notifications: Arc::new(Mutex::new(HashMap::new())),
+            inbound_publication_owner: Arc::new(AtomicU64::new(0)),
+            peer_reflexive_ingress: None,
+            validation_trigger: None,
             triggered_checks: Arc::new(Mutex::new(HashMap::new())),
             nat_maintainers: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
@@ -83,6 +121,7 @@ impl UdpTransport {
             global_outbound_probe_budget: default_global_outbound_probe_budget(),
             local_node_id: None,
             wireguard_transport: None,
+            direct_validation,
         })
     }
 
@@ -398,42 +437,95 @@ impl UdpTransport {
     /// in-flight generation), and only while it matches the current network
     /// generation: an old generation's socket must never be adopted by stale
     /// inbound evidence.
+    ///
+    /// Every authenticated evidence observation (matched ACK, accepted
+    /// authenticated punch, decrypted WireGuard data) is ALSO recorded on the
+    /// dynamic socket entry itself: the watcher's post-commit rollback relies
+    /// on the entry's own evidence counter, never on the indirect affinity
+    /// epoch, so a socket that demonstrably carries the peer's traffic after
+    /// its commit can never be rolled back and deleted by a cancellation
+    /// that raced the commit.
+    ///
+    /// The whole adoption runs under the network-epoch gate: an advance can
+    /// never bump the generation between the ownership check and the affinity
+    /// insert, so an old generation's evidence can never become affinity.
     pub(crate) async fn remember_peer_socket(
         &self,
         peer_id: &str,
         socket_index: usize,
         evidence: SocketEvidence,
     ) {
+        let epoch_guard = self.network_epoch_gate.lock().await;
+        let generation = self.peers.current_network_generation_sync();
+        let _ = self
+            .remember_peer_socket_for_generation_in_epoch(
+                &epoch_guard,
+                peer_id,
+                socket_index,
+                generation,
+                evidence,
+            )
+            .await;
+    }
+
+    /// Adopt a socket as affinity evidence while the caller owns the shared
+    /// network-epoch gate and has already validated `generation`.
+    ///
+    /// Direct-validation ACK handling uses this together with expectation
+    /// consumption and Direct promotion so a generation advance cannot land
+    /// between a valid ACK and its affinity write.  The explicit generation
+    /// fence also makes a pool-socket affinity impossible for a stale ACK
+    /// (pool sockets do not themselves carry a generation field).
+    pub(crate) async fn remember_peer_socket_for_generation_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        peer_id: &str,
+        socket_index: usize,
+        generation: u64,
+        evidence: SocketEvidence,
+    ) -> bool {
+        if generation != self.peers.current_network_generation_sync() {
+            return false;
+        }
         let mut state = self.socket_state.lock().await;
         if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
-            let Some(entry) = state.dynamic.get(&socket_index) else {
-                return;
+            let Some(entry) = state.dynamic.get_mut(&socket_index) else {
+                return false;
             };
             // The network generation is read under the socket-state lock
             // (lock-free mirror): a generation advance can never slip between
             // the read and this ownership check.
             if entry.peer_id != peer_id
                 || !entry.phase.is_usable()
-                || entry.network_generation != self.peers.current_network_generation_sync()
+                || entry.network_generation != generation
             {
-                return;
+                return false;
             }
+            // The evidence belongs to THIS entry: peer identity, network
+            // generation and phase all matched.  Old sockets, old generations
+            // and old network epochs can never bump a new owner's counter
+            // because the entry itself is the evidence record.
+            entry.authenticated_evidence = entry.authenticated_evidence.saturating_add(1);
         } else if socket_index >= self.socket_count() {
-            return;
+            return false;
         }
         let current = state.affinity.get(peer_id).copied();
         match evidence {
             SocketEvidence::Stamped(epoch) => {
                 if current.is_some_and(|pin| epoch < pin.epoch) {
                     // Older evidence than the committed path: refuse.
-                    return;
+                    return false;
                 }
             }
             SocketEvidence::Fresh => {
                 if current.is_some_and(|pin| pin.socket_index == socket_index) {
-                    // Already pinned on this socket; keep the epoch stable so
-                    // repeated inbound evidence never races newer stamps away.
-                    return;
+                    // Already pinned on this socket: the authenticated
+                    // evidence was recorded on the entry above, so the
+                    // watcher can still see it and keep the socket instead of
+                    // restoring a predecessor.  The pin epoch stays stable so
+                    // repeated inbound evidence never races newer stamps
+                    // away.
+                    return true;
                 }
             }
         }
@@ -445,6 +537,7 @@ impl UdpTransport {
                 epoch,
             },
         );
+        true
     }
 
     /// The per-peer adoption lock serializing ACK adoption against peer
@@ -460,6 +553,19 @@ impl UdpTransport {
             .entry(peer_id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// Acquire the same per-peer lifecycle fence used by authenticated punch
+    /// ACKs and `PeerLeft` cleanup.  Encrypted direct-validation packets use
+    /// this before entering the network-epoch transaction, preserving the
+    /// global lock order `adoption -> epoch -> socket_state` and preventing a
+    /// late validation ACK from promoting a peer incarnation that was removed
+    /// and rejoined under the same node ID.
+    pub(crate) async fn lock_peer_adoption_for_direct_validation(
+        &self,
+        peer_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.adoption_lock_for(peer_id).await.lock_owned().await
     }
 
     /// The peer's current affinity pin, for tests in other modules.
@@ -480,6 +586,29 @@ impl UdpTransport {
 
     fn inbound_channel(&self) -> Option<mpsc::Sender<ReceivedEncryptedPacket>> {
         self.inbound_tx.clone()
+    }
+
+    /// Stamp this transport with the owner of the daemon publication that is
+    /// currently allowed to use it for Direct-path evidence. Owner zero is
+    /// deliberately reserved for unpublished transports.
+    pub(crate) fn set_inbound_publication_owner(&self, owner: u64) {
+        debug_assert_ne!(owner, 0, "UDP publication owner zero is reserved");
+        self.inbound_publication_owner.store(owner, Ordering::Release);
+    }
+
+    /// Revoke an owner only when this transport still carries that exact
+    /// publication. A late cleanup from a retired worker must never clear a
+    /// transport which has already been republished under a newer owner.
+    pub(crate) fn clear_inbound_publication_owner_if_matches(&self, owner: u64) -> bool {
+        self.inbound_publication_owner
+            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The owner token socket readers put on encrypted UDP envelopes. Zero
+    /// means the reader belongs to no live daemon publication.
+    pub(crate) fn inbound_publication_owner(&self) -> u64 {
+        self.inbound_publication_owner.load(Ordering::Acquire)
     }
 
     /// Allocate a fresh dynamic socket index that never collides with the pool.
@@ -528,6 +657,102 @@ impl UdpTransport {
         );
     }
 
+    /// One atomic per-peer lifecycle cleanup: PeerLeft / offline /
+    /// public-key-change removal is linearized against every ACK
+    /// match -> verify -> endpoint learn -> socket adopt -> Direct promotion
+    /// transaction for the same peer.
+    ///
+    /// The ENTIRE cleanup runs under the peer's adoption lock — the same lock
+    /// every ACK handler holds for its whole adoption sequence — so the two
+    /// can never interleave: either the ACK completes first and the cleanup
+    /// then removes everything it created (connection, affinity, dynamic
+    /// sockets, pending probes, endpoints, candidates), or the cleanup
+    /// completes first and the cleanup-epoch fence refuses every late ACK.
+    /// After this returns, no old ACK can leave pool affinity, an endpoint or
+    /// a candidate behind, and nothing can pollute a new identity that joins
+    /// under the same node ID.
+    ///
+    /// `remove_connection` controls whether the peer's connection entry is
+    /// deleted (PeerLeft) or kept (offline / public-key change, where
+    /// `add_peer` already reset the new identity's state).
+    ///
+    /// Lock order: adoption lock -> network-epoch gate -> socket_state ->
+    /// pending probes; the connection removal runs under the adoption lock
+    /// but never nests the other locks (no path takes adoption while holding
+    /// connections).
+    pub(crate) async fn cleanup_peer_lifecycle(
+        &self,
+        peer_id: &str,
+        reason: &str,
+        remove_connection: bool,
+    ) {
+        let adoption = self.adoption_lock_for(peer_id).await;
+        let _adoption_guard = adoption.lock().await;
+        // Revoke the validation owner before removing peer/socket state.  A
+        // worker that was waiting for a handshake or ACK immediately observes
+        // cancellation, and its owner-conditional cleanup cannot erase a
+        // future session if this node ID later rejoins.
+        self.peers
+            .cancel_active_direct_validation_for_peer(peer_id)
+            .await;
+        if remove_connection {
+            // The connection removal runs INSIDE the adoption-lock
+            // transaction: an ACK that already passed its peer-existence
+            // fence either completed before this removal (and the rest of
+            // this cleanup removes what it created) or is refused by the
+            // epoch fence below.
+            self.peers.remove_peer(peer_id).await;
+            // A rebind could have installed a new active registry between the
+            // first cancellation and this removal. Revoke that current owner
+            // as well; `begin_or_merge` also refuses the now-absent peer.
+            self.peers
+                .cancel_active_direct_validation_for_peer(peer_id)
+                .await;
+        }
+        // Bump the cleanup epoch and drop the peer's pending probes under the
+        // adoption lock: a late ACK can neither match nor re-insert.
+        {
+            let mut state = self.socket_state.lock().await;
+            let cleanup_epoch = state
+                .probe_cleanup_epochs
+                .entry(peer_id.to_string())
+                .or_insert(0);
+            *cleanup_epoch = cleanup_epoch.saturating_add(1);
+            let cleanup_epoch = *cleanup_epoch;
+            self.pending_probes
+                .lock()
+                .await
+                .retain(|_, pending| pending.peer_id.as_deref() != Some(peer_id));
+            // Remove every dynamic socket owned by the peer and clear the
+            // affinity inside the same transaction: an ACK adoption that
+            // raced the cleanup can never leave a stale pool pin or a dead
+            // dynamic entry behind.
+            let entries = {
+                let indices = state
+                    .dynamic
+                    .iter()
+                    .filter(|(_, entry)| entry.peer_id == peer_id)
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>();
+                let mut entries = Vec::with_capacity(indices.len());
+                for index in indices {
+                    if let Some(entry) = state.dynamic.remove(&index) {
+                        entries.push(entry);
+                    }
+                }
+                state.affinity.remove(peer_id);
+                entries
+            };
+            drop(state);
+            for entry in entries {
+                self.detach_dynamic_entry(entry, reason).await;
+            }
+            debug!(
+                "Cleaned up peer {peer_id} lifecycle (reason={reason}, remove_connection={remove_connection}, cleanup_epoch={cleanup_epoch})"
+            );
+        }
+    }
+
     /// The peer's current pending-probe cleanup epoch (0 when never cleaned).
     ///
     /// A pending probe is only eligible for re-insertion by an ACK handler
@@ -567,6 +792,318 @@ impl UdpTransport {
         self
     }
 
+    /// Allocate one direct-validation worker lease or merge an observation
+    /// into the currently owned worker.
+    ///
+    /// The registry is the single-flight authority.  For a matching peer and
+    /// generation it never returns a second lease: it only publishes the
+    /// newest endpoint through the existing worker's watch channel.  A new
+    /// generation revokes the old owner before installing the new one, so an
+    /// old worker can neither continue emitting packets nor remove the new
+    /// owner's expectation during cleanup.
+    pub(crate) async fn begin_or_merge_direct_validation(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+    ) -> DirectValidationSessionStart {
+        // Generation lookup + registry insertion must share the same epoch
+        // boundary as `PeerManager::advance_*`: otherwise a scheduler could
+        // read generation N, lose the race to an advance to N+1, then create
+        // an old owner after that advance had already cleared every old
+        // session.  The gate makes the check and insert one transaction.
+        let _epoch_gate = self.network_epoch_gate.lock().await;
+        if self.peers.current_network_generation_sync() != generation {
+            return DirectValidationSessionStart::IgnoredStaleGeneration;
+        }
+        // Direct promotion and its registry cancellation share this epoch
+        // gate. A queued observation that waited behind the promotion must
+        // therefore be suppressed instead of recreating the session it just
+        // cancelled.
+        if self.peers.is_direct_sync(peer_id)
+            || !self.peers.is_direct_validation_eligible(peer_id).await
+            || self.direct_validation.is_closed()
+        {
+            return DirectValidationSessionStart::IgnoredInactive;
+        }
+        let mut sessions = self.direct_validation.sessions.lock().await;
+        // `cancel_all` does not need the network epoch gate during transport
+        // teardown. Recheck after waiting for its sessions lock so a stale
+        // scheduler cannot create an owner after the terminal cancellation.
+        if self.direct_validation.is_closed() {
+            return DirectValidationSessionStart::IgnoredInactive;
+        }
+        if let Some((target_tx, current)) = sessions.get(peer_id).map(|session| {
+            (session.target_tx.clone(), *session.target_tx.borrow())
+        }) {
+            if !current.cancelled && current.generation == generation {
+                // Newest-wins applies to an in-flight request too.  Clear the
+                // old endpoint's expectation before publishing the new target
+                // so a delayed ACK from the superseded endpoint cannot win
+                // after this observation has linearized.
+                if current.endpoint != endpoint {
+                    let mut expectations = self.direct_validation.expectations.lock().await;
+                    if expectations.get(peer_id).is_some_and(|expectation| {
+                        expectation.owner_token == current.owner_token
+                    }) {
+                        expectations.remove(peer_id);
+                    }
+                }
+                let updated = DirectValidationTarget {
+                    endpoint,
+                    ..current
+                };
+                target_tx.send_replace(updated);
+                return DirectValidationSessionStart::Merged;
+            }
+
+            // The old receiver sees cancellation before this map entry is
+            // replaced.  Its owner-only cleanup becomes a no-op once the new
+            // entry below owns the peer.
+            target_tx.send_replace(DirectValidationTarget {
+                cancelled: true,
+                ..current
+            });
+            let mut expectations = self.direct_validation.expectations.lock().await;
+            if expectations
+                .get(peer_id)
+                .is_some_and(|expectation| expectation.owner_token == current.owner_token)
+            {
+                expectations.remove(peer_id);
+            }
+        }
+
+        let owner_token = next_direct_validation_owner_token();
+        let target = DirectValidationTarget {
+            endpoint,
+            generation,
+            owner_token,
+            cancelled: false,
+        };
+        let (target_tx, target_rx) = watch::channel(target);
+        sessions.insert(peer_id.to_string(), DirectValidationSession { target_tx });
+        DirectValidationSessionStart::Spawn(DirectValidationSessionLease {
+            peer_id: peer_id.to_string(),
+            owner_token,
+            target_rx,
+        })
+    }
+
+    /// Cancel all validation workers, for a UDP transport shutdown or
+    /// replacement.  This is intentionally stronger than the generation
+    /// helper: no expectation owned by the old transport may survive.
+    pub(crate) async fn cancel_all_direct_validation_sessions(&self) {
+        self.direct_validation.cancel_all().await;
+    }
+
+    /// Remove a session only when the completing worker is still its owner.
+    /// Returns whether the owner was current.  The expectation is cleared by
+    /// the same owner check, preventing a retired worker from deleting a new
+    /// session's request token.
+    pub(crate) async fn finish_direct_validation_session(
+        &self,
+        peer_id: &str,
+        owner_token: u64,
+    ) -> bool {
+        // A worker's session removal and owner-conditional expectation cleanup
+        // share one lock boundary. This prevents a replacement session from
+        // being observed between the two operations and keeps the registry
+        // lock order identical to registration and ACK consumption.
+        let mut sessions = self.direct_validation.sessions.lock().await;
+        let owned = sessions
+            .get(peer_id)
+            .is_some_and(|session| session.target_tx.borrow().owner_token == owner_token);
+        if owned {
+            sessions.remove(peer_id);
+        }
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        if expectations
+            .get(peer_id)
+            .is_some_and(|expectation| expectation.owner_token == owner_token)
+        {
+            expectations.remove(peer_id);
+        }
+        drop(sessions);
+        owned
+    }
+
+    /// Register the token an ACK must carry to confirm the direct-validation
+    /// request this daemon is about to send to `peer_id`.
+    ///
+    /// Compatibility helper for focused token tests.  Runtime validation uses
+    /// `expect_direct_validation_ack_owned` so cleanup is owner-bound.
+    #[cfg(test)]
+    pub(crate) async fn expect_direct_validation_ack(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+    ) {
+        self.direct_validation.expectations.lock().await.insert(
+            peer_id.to_string(),
+            DirectValidationExpectation {
+                request_id,
+                generation,
+                owner_token: 0,
+                expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
+            },
+        );
+    }
+
+    /// Register an ACK expectation for exactly one validation worker.
+    pub(crate) async fn expect_direct_validation_ack_owned(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+        owner_token: u64,
+        endpoint: SocketAddr,
+    ) -> bool {
+        // Keep the session lock while taking the expectation lock.  Lifecycle
+        // cancellation follows this same order, so an owner can never insert
+        // an expectation after it has already been removed from the session
+        // registry.
+        let sessions = self.direct_validation.sessions.lock().await;
+        let active_owner = sessions.get(peer_id).is_some_and(|session| {
+            let target = *session.target_tx.borrow();
+            !target.cancelled
+                && target.generation == generation
+                && target.owner_token == owner_token
+                && target.endpoint == endpoint
+        });
+        if !active_owner {
+            return false;
+        }
+        self.direct_validation.expectations.lock().await.insert(
+            peer_id.to_string(),
+            DirectValidationExpectation {
+                request_id,
+                generation,
+                owner_token,
+                expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
+            },
+        );
+        true
+    }
+
+    /// Drop an expectation only if `owner_token` still owns its slot.
+    #[cfg(test)]
+    pub(crate) async fn clear_direct_validation_expectation_if_owned(
+        &self,
+        peer_id: &str,
+        owner_token: u64,
+    ) -> bool {
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        if expectations
+            .get(peer_id)
+            .is_some_and(|expectation| expectation.owner_token == owner_token)
+        {
+            expectations.remove(peer_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume a matched direct-validation ACK only while the caller holds
+    /// the network epoch transaction for `current_generation`.
+    ///
+    /// The expectation's token generation, owner token and active registry
+    /// target are verified under the registry's session -> expectation lock
+    /// boundary.  The caller then uses the returned explicit generation for
+    /// Direct promotion; it must not re-read current generation after this
+    /// point.  Passing a stale `current_generation` is rejected before any
+    /// expectation is consumed.
+    pub(crate) async fn consume_direct_validation_ack(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        token_generation: u64,
+        token_owner: u64,
+        current_generation: u64,
+    ) -> Option<DirectValidationExpectation> {
+        if token_generation != current_generation {
+            return None;
+        }
+        let sessions = self.direct_validation.sessions.lock().await;
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        let now = Instant::now();
+        let expectation = expectations.get(peer_id).copied()?;
+        if expectation.expires_at <= now {
+            expectations.remove(peer_id);
+            return None;
+        }
+        if expectation.request_id != request_id
+            || expectation.generation != token_generation
+            || expectation.owner_token != token_owner
+        {
+            return None;
+        }
+        let target = sessions
+            .get(peer_id)
+            .map(|session| *session.target_tx.borrow())?;
+        if target.cancelled
+            || target.generation != current_generation
+            || target.owner_token != expectation.owner_token
+            || target.owner_token != token_owner
+        {
+            return None;
+        }
+        expectations.remove(peer_id)
+    }
+
+    /// Whether an ACK token confirms the outstanding validation request for
+    /// `peer_id`.  Retained for callers that only need a boolean; new inbound
+    /// transaction code should use `consume_direct_validation_ack` to retain
+    /// the owner token and explicit generation.
+    #[cfg(test)]
+    pub(crate) async fn confirm_direct_validation_ack(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+    ) -> bool {
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        let now = Instant::now();
+        let Some(expectation) = expectations.get(peer_id).copied() else {
+            return false;
+        };
+        if expectation.expires_at <= now {
+            expectations.remove(peer_id);
+            return false;
+        }
+        if expectation.request_id != request_id || expectation.generation != generation {
+            return false;
+        }
+        expectations.remove(peer_id);
+        true
+    }
+
+    /// Whether any direct-validation expectation is outstanding for a peer
+    /// (used by tests).
+    #[cfg(test)]
+    pub(crate) async fn has_direct_validation_expectation(&self, peer_id: &str) -> bool {
+        let expectations = self.direct_validation.expectations.lock().await;
+        let now = Instant::now();
+        expectations
+            .get(peer_id)
+            .is_some_and(|expectation| expectation.expires_at > now)
+    }
+
+    /// Snapshot the active validation target for a peer (test-only).
+    #[cfg(test)]
+    pub(crate) async fn direct_validation_target(
+        &self,
+        peer_id: &str,
+    ) -> Option<DirectValidationTarget> {
+        self.direct_validation
+            .sessions
+            .lock()
+            .await
+            .get(peer_id)
+            .map(|session| *session.target_tx.borrow())
+    }
+
     /// Attach the WireGuard session registry so an authenticated pending
     /// Probe-v2 packet confirms the matching responder session first.
     pub fn with_wireguard_transport(mut self, transport: WireGuardTransport) -> Self {
@@ -574,12 +1111,57 @@ impl UdpTransport {
         self
     }
 
-    /// Attach a best-effort channel for relay-assisted peer-reflexive observations.
+    /// Attach the daemon's bounded per-peer peer-reflexive ingress.
+    ///
+    /// The ingress replaces the old bounded `mpsc` channel: a peer's newest
+    /// endpoint always replaces its pending value, even when other peers have
+    /// filled the bound.  This keeps endpoint churn from either blocking the
+    /// UDP reader or silently discarding the value needed for the next check.
     pub fn with_peer_reflexive_observer(
         mut self,
-        tx: mpsc::Sender<PeerReflexiveObservation>,
+        ingress: PeerReflexiveIngress,
     ) -> Self {
-        self.peer_reflexive_tx = Some(tx);
+        self.peer_reflexive_ingress = Some(ingress);
         self
+    }
+
+    /// Register the daemon-side direct-validation trigger (see the field
+    /// docs).  Called once by the UDP direct task at setup.
+    pub fn with_validation_trigger(
+        mut self,
+        trigger: Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>,
+    ) -> Self {
+        self.validation_trigger = Some(trigger);
+        self
+    }
+
+    /// Submit any authenticated endpoint observation to the daemon's one
+    /// validation scheduler.  This is intentionally synchronous because the
+    /// registered implementation is a bounded `try_send`; callers on the UDP
+    /// receive path never await behind validation work.
+    pub(crate) fn enqueue_direct_validation_observation(
+        &self,
+        observation: PeerReflexiveObservation,
+    ) {
+        let Some(trigger) = self.validation_trigger.as_ref() else {
+            debug!(
+                peer_id = %observation.peer_id,
+                remote_endpoint = %observation.observed_endpoint,
+                "no direct-validation scheduler ingress registered"
+            );
+            return;
+        };
+        trigger(observation);
+    }
+
+    /// Feed a matched authenticated ACK into the same observation ingress as
+    /// the peer-reflexive loop.  The session registry, rather than a separate
+    /// endpoint cooldown, supplies the hard worker bound and newest-wins
+    /// endpoint policy.
+    async fn trigger_encrypted_validation(&self, peer_id: &str, endpoint: SocketAddr) {
+        self.enqueue_direct_validation_observation(PeerReflexiveObservation {
+            peer_id: peer_id.to_string(),
+            observed_endpoint: endpoint,
+        });
     }
 }

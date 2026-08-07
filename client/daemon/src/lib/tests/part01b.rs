@@ -2,7 +2,7 @@
 fn test_advertised_udp_endpoint_uses_configured_value() {
     let local = "0.0.0.0:51820".parse().unwrap();
     assert_eq!(
-        advertised_udp_endpoint(local, Some("203.0.113.10:51820"), &[]),
+        advertised_udp_endpoint(local, Some("203.0.113.10:51820"), &[], false),
         Some("203.0.113.10:51820".to_string())
     );
 }
@@ -17,7 +17,8 @@ fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
             &[
                 "192.168.1.10:51820".to_string(),
                 "stun.example.com:43000".to_string()
-            ]
+            ],
+            false,
         ),
         Some("stun.example.com:43000".to_string())
     );
@@ -27,9 +28,15 @@ fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
 fn test_advertised_udp_endpoint_uses_specific_bind_address() {
     let local = "127.0.0.1:51820".parse().unwrap();
     assert_eq!(
-        advertised_udp_endpoint(local, None, &[]),
+        advertised_udp_endpoint(local, None, &[], true),
         Some("127.0.0.1:51820".to_string())
     );
+}
+
+#[test]
+fn advertised_udp_endpoint_omits_specific_bind_when_host_candidates_are_disabled() {
+    let local = "127.0.0.1:51820".parse().unwrap();
+    assert_eq!(advertised_udp_endpoint(local, None, &[], false), None);
 }
 
 #[test]

@@ -214,13 +214,20 @@ async fn spawn_hole_punch_task(
                 debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
                 return;
             }
+            // No candidate set yet: the peer just joined and its candidates
+            // are still travelling through the control plane.  This is NOT a
+            // failed probe batch — nothing was even attempted — so the path
+            // must not degrade and force a relay selection while the
+            // candidate exchange is still in flight.
             debug!("No UDP candidates for {peer_id}; skipping hole punch");
             peers
-                .record_direct_failure_for_generation(
+                .record_direct_event(
                     &peer_id,
-                    generation,
-                    REASON_DIRECT_PROBE_FAILED,
-                    "no UDP candidates for hole punching",
+                    "punch_skipped_no_candidates",
+                    None,
+                    None,
+                    None,
+                    "skipped UDP punch because the peer candidate set is still being exchanged",
                 )
                 .await;
             return;
@@ -246,11 +253,13 @@ async fn spawn_hole_punch_task(
             }
             debug!("No UDP candidates for {peer_id}; skipping hole punch");
             peers
-                .record_direct_failure_for_generation(
+                .record_direct_event(
                     &peer_id,
-                    generation,
-                    REASON_DIRECT_PROBE_FAILED,
-                    "no UDP candidates for hole punching",
+                    "punch_skipped_no_candidates",
+                    None,
+                    None,
+                    None,
+                    "skipped UDP punch because the candidate set is empty",
                 )
                 .await;
             return;
@@ -585,12 +594,14 @@ async fn spawn_hole_punch_task(
 /// command is queued, and inside the HTTP worker just before the request;
 /// once the command is irrevocably on the wire the receiver's per-peer
 /// fresh-generation high-water rejects any superseded label, so a stale
-/// prediction can never overwrite a newer one.
+/// prediction can never overwrite a newer one.  A cancellation observed at
+/// any of these fences is reported distinctly from a send failure.
 ///
-/// Returns `true` only when the prediction was actually queued to the
-/// control plane: the caller then finalizes the generation's durable
-/// handoff.  A cancellation or a send failure leaves the generation's socket
-/// rollable, so the caller must drop the guard instead of finalizing.
+/// Returns `true` only when the prediction was really accepted by the control
+/// server while the session's ownership was still valid: the caller then
+/// finalizes the generation's durable handoff.  A cancellation or a send
+/// failure leaves the generation's socket rollable, so the caller must drop
+/// the guard instead of finalizing.
 async fn advertise_fresh_mapping_prediction(
     signal: &HolePunchSignalContext,
     peers: &Arc<PeerManager>,
@@ -632,7 +643,10 @@ async fn advertise_fresh_mapping_prediction(
             .await;
         return false;
     }
-    if let Err(error) = signal
+    // The command worker re-checks the ownership inside the queue AND again
+    // just before the HTTP request: a cancellation at either point surfaces
+    // as `Cancelled`, which must never be mistaken for a successful send.
+    match signal
         .control
         .send_fresh_peer_offer_with_sources_and_punch_at(
             peer_id,
@@ -644,9 +658,45 @@ async fn advertise_fresh_mapping_prediction(
         )
         .await
     {
-        warn!(
-            "Failed to advertise fresh-mapping prediction window to peer {peer_id}: {error}"
-        );
+        Ok(()) => {}
+        Err(PeerOfferSendFailure::Cancelled) => {
+            peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_skipped",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    "fresh-mapping prediction ownership was revoked before the HTTP request; the prediction was not sent",
+                )
+                .await;
+            debug!(
+                "Fresh-mapping prediction to peer {peer_id} was cancelled before the HTTP request; not finalizing the socket"
+            );
+            return false;
+        }
+        Err(PeerOfferSendFailure::SendFailed | PeerOfferSendFailure::ChannelClosed) => {
+            warn!(
+                "Failed to advertise fresh-mapping prediction window to peer {peer_id}"
+            );
+            return false;
+        }
+    }
+    // The HTTP request completed and the server accepted the signal, but the
+    // ownership may have been revoked while the request was in flight: only a
+    // still-valid ownership lets the caller finalize the socket, otherwise
+    // the watcher restores the predecessor.
+    if cancellation.is_cancelled() {
+        peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_skipped",
+                None,
+                Some(candidates.len()),
+                None,
+                "fresh-mapping prediction was sent but its punch session was superseded before the durable handoff; the socket rolls back",
+            )
+            .await;
         return false;
     }
     info!(

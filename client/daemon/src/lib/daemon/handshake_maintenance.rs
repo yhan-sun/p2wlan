@@ -43,7 +43,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             if !conn.online {
                 continue;
             }
-            let _handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
+            let handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
             // Establish missing sessions and refresh sessions that need rekey.
             let status = transport.session_status(&conn.node_id).await;
             if status.has_pending_responder {
@@ -138,6 +138,15 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 continue;
             };
             let initiation_bytes = initiation.to_bytes();
+            // The per-peer handshake reservation above is the actual
+            // mutual-exclusion primitive.  The arbiter guard must NOT be held
+            // across the slow steps below (STUN candidate refresh, control
+            // plane offer POST): a crossing inbound offer/answer handler
+            // waits on the same arbiter, and holding it through a multi-second
+            // refresh or POST stalls (or effectively deadlocks) the responder
+            // path — the peer never answers, the session never forms, and
+            // direct validation can never promote.
+            drop(handshake_guard);
             let refreshed = refresh_candidate_cache_for_maintenance_signal(
                 &peers,
                 &control,
@@ -362,8 +371,14 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     *nat_profile.write().await = Some(report.nat_profile.clone());
 
     let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+    let include_host_candidate = peers.gather_host_candidates().await;
     if let Some(endpoint) = udp.local_addr().ok().and_then(|local_addr| {
-        advertised_udp_endpoint(local_addr, udp_advertise, &candidates)
+        advertised_udp_endpoint(
+            local_addr,
+            udp_advertise,
+            &candidates,
+            include_host_candidate,
+        )
     }) {
         if !candidates.contains(&endpoint) {
             candidates.insert(0, endpoint.clone());
