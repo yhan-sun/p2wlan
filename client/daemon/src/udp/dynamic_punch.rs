@@ -906,6 +906,15 @@ impl UdpTransport {
                 );
                 break;
             }
+            if self.peers.is_direct(peer_id).await {
+                // Direct was confirmed while this generation was measuring or
+                // punching: stop emitting peer-facing probes from the
+                // generation's socket immediately.
+                debug!(
+                    "Fresh-mapping punch generation {punch_generation} aborted mid-punch; Direct was confirmed"
+                );
+                break;
+            }
             for target in &stable_targets {
                 match self
                     .send_probe_on_socket(
@@ -1119,6 +1128,14 @@ impl UdpTransport {
                 sleep(round.delay_before).await;
             }
             for candidate in round.endpoints {
+                if self.peers.is_direct_sync(peer_id) {
+                    // Direct was confirmed while this dedicated-socket sweep
+                    // was in flight: stop emitting peer-directed probes.
+                    trace!(
+                        "Aborting dynamic-socket UDP punch for peer {peer_id}: Direct was confirmed mid-session"
+                    );
+                    break;
+                }
                 match self
                     .send_probe_on_socket(
                         index,

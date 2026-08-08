@@ -169,11 +169,20 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[mini-air] building control server, relay and daemon (release)..."
-(
-  cd "$ROOT_DIR/server"
-  go build -o "$BASE_DIR/control-server" .
-  go build -o "$BASE_DIR/relay-server" ./relay
-)
+if [[ -n "$REMOTE_CONTROL_URL" ]]; then
+  # Remote test topology: the control server and relay already run on the
+  # designated relay host (e.g. http://47.109.40.237:28080), so no local
+  # servers are built or started and the whole control plane rides the public
+  # path instead of a Tailscale relay.  This matches the production topology:
+  # both daemons reach the control server at ~20ms instead of 400ms DERP.
+  echo "[mini-air] remote control/relay mode: $REMOTE_CONTROL_URL (local servers skipped)"
+else
+  (
+    cd "$ROOT_DIR/server"
+    go build -o "$BASE_DIR/control-server" .
+    go build -o "$BASE_DIR/relay-server" ./relay
+  )
+fi
 cargo build --release -p p2wlan-daemon --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" >/dev/null
 DAEMON_BIN="$ROOT_DIR/target/release/p2wlan-daemon"
 LOCAL_DAEMON_SHA256=$(sha256_file "$DAEMON_BIN")
@@ -185,7 +194,14 @@ echo "[mini-air] Mini public IPv4: $(curl -s4 --max-time 8 ifconfig.me || true)"
 
 # One relay keypair for the whole run. The helper uses only Go's standard
 # library, so the harness is portable to hosts without Python cryptography.
-read -r RELAY_SEED RELAY_PUB < <(go run "$ROOT_DIR/scripts/relay_keygen.go")
+# Remote mode reuses the keyring already deployed on the relay host, so the
+# generated pair is only needed for the local-server topology.
+if [[ -n "$REMOTE_CONTROL_URL" ]]; then
+  RELAY_SEED=""
+  RELAY_PUB=""
+else
+  read -r RELAY_SEED RELAY_PUB < <(go run "$ROOT_DIR/scripts/relay_keygen.go")
+fi
 
 # Copy the binary to the Air once unless the caller supplied an already
 # transferred executable. On constrained SSH links this avoids a redundant
@@ -195,8 +211,12 @@ if [[ -n "$AIR_DAEMON_BIN" ]]; then
   $AIR_SSH "test -f '$REMOTE_DAEMON_BIN' && chmod u+x '$REMOTE_DAEMON_BIN' && file '$REMOTE_DAEMON_BIN' && '$REMOTE_DAEMON_BIN' --version"
 else
   $AIR_SSH 'mkdir -p /tmp/p2wlan-miniair'
-  $AIR_SSH "cat > '$REMOTE_DAEMON_BIN'" < "$DAEMON_BIN"
-  $AIR_SSH "chmod +x '$REMOTE_DAEMON_BIN' && ls -la '$REMOTE_DAEMON_BIN'"
+  # Atomic replacement: the payload lands on a `.new` sibling and is swapped
+  # into place with a single `mv`, so a torn upload can never leave a
+  # half-written binary at the path a running smoke daemon (or an interrupted
+  # round) might exec.
+  $AIR_SSH "cat > '$REMOTE_DAEMON_BIN.new'" < "$DAEMON_BIN"
+  $AIR_SSH "chmod +x '$REMOTE_DAEMON_BIN.new' && mv -f '$REMOTE_DAEMON_BIN.new' '$REMOTE_DAEMON_BIN' && ls -la '$REMOTE_DAEMON_BIN'"
 fi
 
 # A matching semantic version is not enough here: a user can correctly upload
@@ -218,28 +238,47 @@ for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
   mkdir -p "$ROUND_DIR"
 
-  # Relay + control server on the Mini, reachable by the Air via Tailscale.
-  KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
-  RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" -bind "0.0.0.0:$RELAY_PORT" \
-    -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
-    >"$ROUND_DIR/relay.log" 2>&1 &
-  RELAY_PID=$!
-  PIDS+=($RELAY_PID)
-  export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
-    RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
-    RELAY_CATALOG_JSON="[{\"region\":\"local\",\"audience\":\"relay-sim\",\"endpoint\":\"tcp://$MINI_TAILSCALE_IP:$RELAY_PORT\"}]"
-  "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &
-  SERVER_PID=$!
-  PIDS+=($SERVER_PID)
-  for _ in {1..40}; do
-    curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 0.25
-  done
-  curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null
+  if [[ -n "$REMOTE_CONTROL_URL" ]]; then
+    # Remote topology: control and relay already run on the relay host.
+    CONTROL_URL="$REMOTE_CONTROL_URL"
+    RELAY_URL=""
+    for _ in {1..40}; do
+      curl -fsS --max-time 5 "$CONTROL_URL/health" >/dev/null 2>&1 && break
+      sleep 0.25
+    done
+    curl -fsS --max-time 5 "$CONTROL_URL/health" >/dev/null
+    # The remote control DB is persistent (unlike the per-round local DB), so
+    # each round needs a unique account.
+    REMOTE_EMAIL="smoke-$(date +%s)-${round}@example.com"
+    REGISTER_JSON=$(curl -fsS --max-time 8 -X POST "$CONTROL_URL/api/v1/register" \
+      -H 'Content-Type: application/json' \
+      -d "{\"email\":\"$REMOTE_EMAIL\",\"password\":\"passw0rd\"}")
+  else
+    # Relay + control server on the Mini, reachable by the Air via Tailscale.
+    KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
+    RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" -bind "0.0.0.0:$RELAY_PORT" \
+      -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
+      >"$ROUND_DIR/relay.log" 2>&1 &
+    RELAY_PID=$!
+    PIDS+=($RELAY_PID)
+    export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
+      RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
+      RELAY_CATALOG_JSON="[{\"region\":\"local\",\"audience\":\"relay-sim\",\"endpoint\":\"tcp://$MINI_TAILSCALE_IP:$RELAY_PORT\"}]"
+    "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &
+    SERVER_PID=$!
+    PIDS+=($SERVER_PID)
+    CONTROL_URL="http://127.0.0.1:$PORT"
+    RELAY_URL="tcp://$MINI_TAILSCALE_IP:$RELAY_PORT"
+    for _ in {1..40}; do
+      curl -fsS "$CONTROL_URL/health" >/dev/null 2>&1 && break
+      sleep 0.25
+    done
+    curl -fsS "$CONTROL_URL/health" >/dev/null
 
-  REGISTER_JSON=$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/register" \
-    -H 'Content-Type: application/json' \
-    -d '{"email":"smoke@example.com","password":"passw0rd"}')
+    REGISTER_JSON=$(curl -fsS -X POST "$CONTROL_URL/api/v1/register" \
+      -H 'Content-Type: application/json' \
+      -d '{"email":"smoke@example.com","password":"passw0rd"}')
+  fi
   TOKEN=$(printf '%s' "$REGISTER_JSON" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
   if [[ -z "$TOKEN" ]]; then
     echo "[mini-air] round $round: failed to parse auth token" >&2
@@ -251,7 +290,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # Daemon A on the Mini.
   P2WLAN_DISABLE_TUN=1 RUST_LOG="$HARNESS_RUST_LOG" "$DAEMON_BIN" \
     --config "$ROUND_DIR/node-a.json" \
-    --control "http://127.0.0.1:$PORT" \
+    --control "$CONTROL_URL" \
     --network default \
     --token "$TOKEN" \
     --device-name mini-a \
@@ -279,7 +318,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # file for precise teardown.
   $AIR_SSH "echo \$\$ > $REMOTE_NODE_B_PID_FILE; exec env P2WLAN_DISABLE_TUN=1 RUST_LOG='$HARNESS_RUST_LOG' '$REMOTE_DAEMON_BIN' \
     --config $AIR_CONFIG \
-    --control http://$MINI_TAILSCALE_IP:$PORT \
+    --control $CONTROL_URL \
     --network default \
     --token $TOKEN \
     --device-name air-b \
@@ -293,8 +332,22 @@ for round in $(seq 1 "$ROUNDS"); do
   PIDS+=($NODE_B_PID)
   echo "$NODE_B_PID" >"$ROUND_DIR/node-b.pid"
   # The daemon must actually be up before the Direct wait begins (a fresh
-  # config is generated on first start, which takes a beat).
-  sleep 3
+  # config is generated on first start, which takes a beat).  Instead of a
+  # fixed padding, wait for the daemon's diagnostics endpoint to answer so the
+  # measured cold-start window is not inflated by a constant sleep.
+  B_READY=0
+  for _ in $(seq 1 40); do
+    if $AIR_SSH "curl -fsS --max-time 3 http://127.0.0.1:$DIAG_B_PORT/status >/dev/null 2>&1" 2>/dev/null; then
+      B_READY=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ "$B_READY" -ne 1 ]]; then
+    echo "[mini-air] ROUND $round: FAIL (Air daemon diagnostics never became ready)" >&2
+    overall=1
+    continue
+  fi
 
   # Wait for BOTH sides to enter Direct. Diagnostics is the authority; logs
   # are deliberately not used as a state predicate because trace filtering is
@@ -405,7 +458,7 @@ for round in $(seq 1 "$ROUNDS"); do
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-b.log" | head -4
   } >"$ROUND_DIR/evidence.log" 2>&1 || true
 
-  if [[ "$direct_ok" -eq 1 ]] && is_public_ipv4_endpoint "$A_EP" && is_public_ipv4_endpoint "$B_EP"; then
+  if [[ "$direct_ok" -eq 1 ]] && is_public_ipv4_endpoint "$A_EP" && is_public_ipv4_endpoint "$B_EP" && [[ "$ELAPSED_MS" -le 10000 ]]; then
     echo "[mini-air] ROUND $round: PASS both_direct elapsed_ms=$ELAPSED_MS (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
   else
     echo "[mini-air] ROUND $round: NO-DIRECT-or-nonpublic-path a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
@@ -429,7 +482,11 @@ for round in $(seq 1 "$ROUNDS"); do
   kill "$NODE_B_PID" 2>/dev/null || true
   $AIR_SSH "pid_file='$REMOTE_NODE_B_PID_FILE'; if [ -r \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) ;; *) if ps -p \"\$pid\" -o command= 2>/dev/null | grep -F -- '$REMOTE_DAEMON_BIN' >/dev/null; then kill \"\$pid\" 2>/dev/null || true; fi ;; esac; fi; rm -f \"\$pid_file\" '$AIR_CONFIG'" 2>/dev/null || true
   REMOTE_NODE_B_PID_FILE=""
-  kill "$NODE_A_PID" "$RELAY_PID" "$SERVER_PID" 2>/dev/null || true
+  if [[ -n "$REMOTE_CONTROL_URL" ]]; then
+    kill "$NODE_A_PID" 2>/dev/null || true
+  else
+    kill "$NODE_A_PID" "$RELAY_PID" "$SERVER_PID" 2>/dev/null || true
+  fi
   PIDS=()
   sleep 0.5
 done

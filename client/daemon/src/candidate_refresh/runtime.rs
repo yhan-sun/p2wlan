@@ -258,6 +258,29 @@ pub(super) async fn publish_local_candidates_to_known_peers(
         if !peer_info.online {
             continue;
         }
+        // A healthy confirmed Direct peer is converged: neither a refreshed
+        // candidate offer nor a synchronized punch session may be re-created
+        // for it (the punch task would otherwise run a fresh-mapping
+        // measurement and a full candidate sweep on a live path every
+        // refresh).  Recovery re-opens the Exploring window when the Direct
+        // path loses health (keepalive/consent failure) or the network
+        // generation changes.
+        if peers.should_defer_relay_assisted_punch(&peer_id).await {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "candidate_publish_skipped_direct",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    "skipped candidate offer and synchronized punch for a healthy confirmed Direct peer",
+                )
+                .await;
+            debug!(
+                "Skipping {reason} candidate publication to peer {peer_id}: healthy confirmed Direct path is active"
+            );
+            continue;
+        }
         let punch_at_ms = Some(relay_assisted_punch_at_ms());
         if let Err(error) = control
             .send_peer_offer_with_sources_and_punch_at(

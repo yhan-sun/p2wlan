@@ -1143,6 +1143,13 @@ impl UdpTransport {
         &self,
         observation: PeerReflexiveObservation,
     ) {
+        // The registry refuses Direct peers anyway (IgnoredInactive), but
+        // gating at the source keeps a converged peer's observations from
+        // waking the scheduler at all: after Direct confirmation no new scan,
+        // validation request or expectation may be created for the peer.
+        if self.peers.is_direct_sync(&observation.peer_id) {
+            return;
+        }
         let Some(trigger) = self.validation_trigger.as_ref() else {
             debug!(
                 peer_id = %observation.peer_id,

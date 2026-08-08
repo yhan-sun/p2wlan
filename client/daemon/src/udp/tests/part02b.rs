@@ -376,3 +376,183 @@ async fn replayed_authenticated_punch_gets_idempotent_ack_without_state_update()
 
     worker.abort();
 }
+
+#[tokio::test]
+async fn direct_peer_authenticated_punch_produces_no_scan_no_observation_no_validation() {
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_identity.public_key()),
+            None,
+        ))
+        .await;
+
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let observation_ingress = PeerReflexiveIngress::new();
+    let validation_triggers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trigger_count = validation_triggers.clone();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a")
+        .with_peer_reflexive_observer(observation_ingress.clone())
+        .with_validation_trigger(Arc::new(move |_| {
+            trigger_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+
+    // The peer is already Direct: no traversal work may be re-created.
+    peers
+        .record_direct_success_for_generation("peer-b", Some(sender_addr), 0)
+        .await;
+    assert!(peers.is_direct("peer-b").await);
+
+    let (probe, nonce) = build_authenticated_punch_packet("peer-b", "peer-a", 0, &key);
+    sender.send_to(&probe, local_addr).await.unwrap();
+
+    // The immediate ACK burst must still be sent (the peer needs the
+    // confirmation), but no reverse connectivity check may follow.
+    let mut buf = [0u8; 512];
+    let (n, _from) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let ack = decode_authenticated_punch_packet(&buf[..n], &key).unwrap();
+    assert_eq!(ack.kind, PunchPacketKind::Ack);
+    assert_eq!(ack.nonce, nonce);
+
+    // Wait out the ACK retransmit window and assert no Punch-kind datagram
+    // (triggered check) ever leaves the transport toward the Direct peer.
+    let mut saw_probe_punch = false;
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        if let Ok(Ok((n, _))) = timeout(Duration::from_millis(60), sender.recv_from(&mut buf)).await {
+            if let Some(identity) = peek_authenticated_punch_identity(&buf[..n]) {
+                if identity.kind == PunchPacketKind::Punch {
+                    saw_probe_punch = true;
+                }
+            }
+        }
+    }
+    assert!(
+        !saw_probe_punch,
+        "a Direct peer must not receive a reverse triggered check after an inbound punch"
+    );
+
+    assert_eq!(
+        observation_ingress.pending_len(),
+        0,
+        "a Direct peer's observed endpoint must not be queued for the peer-reflexive signal loop"
+    );
+    assert_eq!(
+        validation_triggers.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a Direct peer's inbound punch must not enqueue direct validation"
+    );
+    assert!(!transport.has_direct_validation_expectation("peer-b").await);
+    assert!(transport.direct_validation_target("peer-b").await.is_none());
+    assert!(timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+
+    worker.abort();
+}
+
+#[tokio::test]
+async fn direct_peer_matched_ack_creates_no_validation_expectation_or_probe() {
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_identity.public_key()),
+            None,
+        ))
+        .await;
+
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let observation_ingress = PeerReflexiveIngress::new();
+    let validation_triggers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trigger_count = validation_triggers.clone();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a")
+        .with_peer_reflexive_observer(observation_ingress.clone())
+        .with_validation_trigger(Arc::new(move |_| {
+            trigger_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    peers
+        .record_direct_success_for_generation("peer-b", Some(sender_addr), 0)
+        .await;
+    assert!(peers.is_direct("peer-b").await);
+
+    // A probe that was sent before Direct confirmation gets ACKed after the
+    // promotion: the ACK must not re-create peer-reflexive signal work, a
+    // validation request/expectation or a reverse probe.
+    let nonce = transport
+        .send_probe(Some("peer-b"), sender_addr)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 512];
+    let (n, _from) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let probe_packet = decode_authenticated_punch_packet(&buf[..n], &key).unwrap();
+    assert_eq!(probe_packet.kind, PunchPacketKind::Punch);
+    assert_eq!(probe_packet.nonce, nonce);
+    // Drain the legacy v1 compatibility probe the same send emits.
+    while let Ok(Ok(_)) = timeout(Duration::from_millis(150), sender.recv_from(&mut buf)).await {}
+
+    let generation = peers.current_network_generation().await;
+    let ack = p2pnet_nat::build_authenticated_punch_ack(
+        nonce,
+        "peer-a",
+        "peer-b",
+        generation,
+        &key,
+    );
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    let mut buf = [0u8; 512];
+    assert!(
+        timeout(Duration::from_millis(400), sender.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a matched ACK for a Direct peer must not produce any outbound datagram"
+    );
+    assert_eq!(observation_ingress.pending_len(), 0);
+    assert_eq!(
+        validation_triggers.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a matched ACK for a Direct peer must not enqueue direct validation"
+    );
+    assert!(!transport.has_direct_validation_expectation("peer-b").await);
+    assert!(transport.direct_validation_target("peer-b").await.is_none());
+
+    worker.abort();
+}
