@@ -442,6 +442,11 @@ jobs:
           mkdir -p "$pkg"
           cp target/${{ matrix.target }}/release/p2wlan "$pkg/"
           cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/"
+          # The daemon was renamed p2pnet-daemon -> p2wlan-daemon in v0.1.67.
+          # CLIs released before the rename still look for the legacy name in
+          # the update tarball, so ship both names for the same binary to keep
+          # `p2wlan update` working for those installs.
+          cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/p2pnet-daemon"
           cp scripts/install-linux-cli.sh "$pkg/install.sh"
           cp LICENSE "$pkg/"
           cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
@@ -450,6 +455,8 @@ jobs:
           Contents:
           - p2wlan: user-facing command-line client
           - p2wlan-daemon: background daemon with real Linux TUN support
+          - p2pnet-daemon: legacy name of p2wlan-daemon (same binary; kept for
+            installers and update checks that predate the v0.1.67 rename)
           - install.sh: system-wide installer; also works as an online GitHub release installer
           - LICENSE
 
