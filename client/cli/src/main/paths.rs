@@ -60,9 +60,20 @@ fn locate_daemon() -> Result<PathBuf, String> {
     if sibling.is_file() {
         return Ok(sibling);
     }
-    find_in_path("p2wlan-daemon").ok_or_else(|| {
-        "找不到 p2wlan-daemon；请保持它与 p2wlan 位于同一目录，或设置 P2WLAN_DAEMON".to_string()
-    })
+    // The daemon was renamed p2pnet-daemon -> p2wlan-daemon in v0.1.67.
+    // Installations updated from a CLI released before the rename keep the
+    // legacy binary name, so fall back to it before giving up.
+    let legacy_sibling = env::current_exe()
+        .map_err(|error| format!("无法定位当前程序：{error}"))?
+        .with_file_name("p2pnet-daemon");
+    if legacy_sibling.is_file() {
+        return Ok(legacy_sibling);
+    }
+    find_in_path("p2wlan-daemon")
+        .or_else(|| find_in_path("p2pnet-daemon"))
+        .ok_or_else(|| {
+            "找不到 p2wlan-daemon；请保持它与 p2wlan 位于同一目录，或设置 P2WLAN_DAEMON".to_string()
+        })
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -121,7 +132,7 @@ fn verified_recorded_daemon(pid_path: &Path) -> Result<Option<i32>, String> {
             .filter_map(|part| std::str::from_utf8(part).ok())
             .collect::<Vec<_>>()
             .join(" ");
-        if !command_line.contains("p2wlan-daemon") {
+        if !command_line.contains("p2wlan-daemon") && !command_line.contains("p2pnet-daemon") {
             return Err(format!(
                 "PID 文件 {} 指向的不是 p2wlan-daemon，拒绝结束进程",
                 pid_path.display()
