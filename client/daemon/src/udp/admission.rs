@@ -117,6 +117,14 @@ impl UdpTransport {
     }
 
     fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
+        // A converged Direct peer needs no outbound peer-reflexive signal: the
+        // relayed HTTP signal and the fast punch would only re-create
+        // speculative traversal work on a path that is already confirmed.
+        // Recovery resumes through the Exploring window that opens on Direct
+        // health failure or a network-generation change.
+        if self.peers.is_direct_sync(peer_id) {
+            return;
+        }
         let Some(ingress) = self.peer_reflexive_ingress.as_ref() else {
             return;
         };
@@ -186,6 +194,15 @@ impl UdpTransport {
         peer_id: &str,
         observed_endpoint: SocketAddr,
     ) {
+        // The reverse connectivity check only serves the Exploring/Validating
+        // states: it probes the observed endpoint so the peer's pending probe
+        // gets ACKed and encrypted validation can promote. Once Direct is
+        // confirmed the check is pure post-convergence noise (one probe per
+        // cooldown window per inbound punch), so it is suppressed at the
+        // source instead of sending into a confirmed path.
+        if self.peers.is_direct_sync(peer_id) {
+            return;
+        }
         let admitted_endpoint = {
             let mut checks = self.triggered_checks.lock().await;
             Self::admit_triggered_check(

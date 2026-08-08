@@ -536,6 +536,59 @@ async fn test_peer_manager_direct_probe_targets_exclude_direct_peers() {
 }
 
 #[tokio::test]
+async fn synchronized_probe_targets_are_empty_for_direct_peer_even_with_public_candidates() {
+    // Regression: before convergence a Direct peer whose selected path is a
+    // public PeerReflexive pair (with unfrozen public candidate pairs still
+    // present) used to yield synchronized punch targets, so every candidate
+    // refresh scheduled a full post-Direct sweep (observed as hundreds of
+    // probes per Mini-Air round).  A Direct peer must never resolve
+    // synchronized targets: the Exploring window re-opens only on Direct
+    // health failure or a network-generation change.
+    let manager = PeerManager::new(test_config());
+    let selected_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
+    let mut candidates = vec![selected_endpoint.to_string()];
+    candidates.extend((0..96).map(|index| format!("9.9.9.9:{}", 40_000 + index)));
+    let candidate_sources = candidates
+        .iter()
+        .map(|candidate| {
+            let source = if candidate == &selected_endpoint.to_string() {
+                "peer_reflexive"
+            } else {
+                "stun_observed"
+            };
+            (candidate.clone(), source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &candidate_sources)
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint("peer1", Some(selected_endpoint), Some(local))
+        .await;
+    assert!(manager.is_direct("peer1").await);
+
+    assert!(
+        manager.direct_probe_target_set_for("peer1").await.is_none(),
+        "a Direct peer must never resolve synchronized punch targets"
+    );
+    assert!(manager.direct_probe_targets_for("peer1").await.is_empty());
+
+    // Direct health failure re-opens the Exploring window.
+    for _ in 0..DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+        manager
+            .record_direct_keepalive_timeout_for_generation("peer1", selected_endpoint, 0)
+            .await;
+    }
+    assert!(!manager.is_direct("peer1").await);
+    assert!(
+        manager.direct_probe_target_set_for("peer1").await.is_some(),
+        "a Direct health failure must re-open the bounded synchronized Exploring window"
+    );
+}
+
+#[tokio::test]
 async fn test_peer_manager_stats() {
     let config = test_config();
     let manager = PeerManager::new(config);

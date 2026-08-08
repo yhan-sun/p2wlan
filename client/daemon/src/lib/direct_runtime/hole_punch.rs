@@ -27,6 +27,25 @@ async fn spawn_hole_punch_task(
     fresh_prediction: Option<FreshPredictionId>,
     frozen_targets: Option<Vec<SocketAddr>>,
 ) {
+    // A peer that is already Direct must not schedule a synchronized punch
+    // session at all: the fresh-mapping measurement, the candidate sweep and
+    // the prediction advertisement are all post-convergence scans on a
+    // confirmed path.  The spawned task re-checks as well, because Direct can
+    // be confirmed between this fence and the rendezvous window.
+    if peers.is_direct(&peer_id).await {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_skipped_already_direct",
+                None,
+                None,
+                None,
+                "skipped UDP punch because Direct path is already confirmed",
+            )
+            .await;
+        debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+        return;
+    }
     let claimed = match fresh_prediction {
         Some(id) => punch_deduplicator.claim_fresh_prediction(&peer_id, id).await,
         None => punch_deduplicator.claim(&peer_id).await,
@@ -117,6 +136,21 @@ async fn spawn_hole_punch_task(
                             // The guard stays alive until this task ends; its
                             // watcher then rolls the peer back to its
                             // previous path (nothing was advertised).
+                        } else if peers.is_direct(&peer_id).await {
+                            // Direct was confirmed while the generation
+                            // measured: the prediction must not be advertised
+                            // (a post-convergence HTTP signal) and the socket
+                            // rolls back when the guard drops.
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "fresh_mapping_skipped",
+                                    None,
+                                    None,
+                                    None,
+                                    "fresh-mapping prediction was not advertised because Direct was confirmed while measuring",
+                                )
+                                .await;
                         } else {
                             // The durable handoff happens ONLY after the
                             // prediction is really advertised: a send failure
@@ -181,6 +215,24 @@ async fn spawn_hole_punch_task(
 
         if !punch_delay.is_zero() {
             sleep(punch_delay).await;
+        }
+
+        // Direct may have been confirmed while the fresh-mapping generation
+        // measured or while the rendezvous window was pending: a stale task
+        // must not start its candidate sweep on a confirmed path.
+        if peers.is_direct(&peer_id).await {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "punch_skipped_already_direct",
+                    None,
+                    None,
+                    None,
+                    "skipped UDP punch because Direct was confirmed while the punch session was pending",
+                )
+                .await;
+            debug!("Skipping UDP punch for {peer_id}; Direct path was confirmed while waiting");
+            return;
         }
 
         let generation = peers.current_network_generation().await;
@@ -325,7 +377,7 @@ async fn spawn_hole_punch_task(
                 )
                 .await
             } else if stable_remote_scatter {
-                udp.punch_candidates_stable_unique_scatter(
+                udp.punch_candidates_stable_unique_scatter_until_not_direct(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
@@ -333,7 +385,7 @@ async fn spawn_hole_punch_task(
                 )
                 .await
             } else if remote_scatter_pool {
-                udp.punch_candidates_remote_scatter_pool(
+                udp.punch_candidates_remote_scatter_pool_until_not_direct(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
@@ -345,12 +397,17 @@ async fn spawn_hole_punch_task(
                     unique_target_endpoints: 0,
                 })
             } else {
-                udp.punch_candidates(&peer_id, candidates.clone(), probe_interval, attempts)
-                    .await
-                    .map(|sent| PunchSendReport {
-                        packets_sent: sent,
-                        unique_target_endpoints: 0,
-                    })
+                udp.punch_candidates_until_not_direct(
+                    &peer_id,
+                    candidates.clone(),
+                    probe_interval,
+                    attempts,
+                )
+                .await
+                .map(|sent| PunchSendReport {
+                    packets_sent: sent,
+                    unique_target_endpoints: 0,
+                })
             };
 
             match punch_result {
@@ -643,6 +700,22 @@ async fn advertise_fresh_mapping_prediction(
             .await;
         return false;
     }
+    // Direct may have been confirmed while the generation measured: a
+    // post-convergence prediction advertisement would be pure HTTP noise and
+    // must not reach the wire.
+    if peers.is_direct(peer_id).await {
+        peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_skipped",
+                None,
+                Some(candidates.len()),
+                None,
+                "fresh-mapping prediction was not advertised because Direct was confirmed before the HTTP request",
+            )
+            .await;
+        return false;
+    }
     // The command worker re-checks the ownership inside the queue AND again
     // just before the HTTP request: a cancellation at either point surfaces
     // as `Cancelled`, which must never be mistaken for a successful send.
@@ -695,6 +768,22 @@ async fn advertise_fresh_mapping_prediction(
                 Some(candidates.len()),
                 None,
                 "fresh-mapping prediction was sent but its punch session was superseded before the durable handoff; the socket rolls back",
+            )
+            .await;
+        return false;
+    }
+    // Direct may have been confirmed while the advertisement HTTP request was
+    // in flight: the request was already on the wire (pre-Direct), but the
+    // socket must roll back and no post-convergence signal may be recorded.
+    if peers.is_direct(peer_id).await {
+        peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_skipped",
+                None,
+                Some(candidates.len()),
+                None,
+                "fresh-mapping prediction was sent pre-Direct but Direct was confirmed while the advertisement was in flight; the socket rolls back",
             )
             .await;
         return false;

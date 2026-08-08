@@ -53,9 +53,13 @@ impl PeerManager {
         if !conn.online {
             return None;
         }
-        if conn.state == ConnectionState::Direct
-            && !conn.should_probe_private_alternates_while_direct(generation)
-        {
+        if conn.state == ConnectionState::Direct {
+            // A Direct peer has converged: no synchronized punch targets may
+            // be derived from its candidate set.  Speculative probing of
+            // private/public alternates while Direct would keep re-creating
+            // traversal scans on a confirmed path; the Exploring window
+            // re-opens only after a Direct health failure or a
+            // network-generation change moves the connection out of Direct.
             conn.retire_speculative_pairs_when_direct_confirmed(generation);
             return None;
         }
@@ -136,9 +140,7 @@ impl PeerManager {
                 if !conn.online {
                     return None;
                 }
-                if conn.state == ConnectionState::Direct
-                    && !conn.should_probe_private_alternates_while_direct(generation)
-                {
+                if conn.state == ConnectionState::Direct {
                     conn.retire_speculative_pairs_when_direct_confirmed(generation);
                     return None;
                 }

@@ -467,6 +467,456 @@ async fn responder_promotes_on_request_with_different_local_generation() {
     wg_b_worker.abort();
 }
 
+#[tokio::test]
+async fn peer_reflexive_ingress_drops_observation_for_direct_peer() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let observed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let observed_addr = observed.local_addr().unwrap();
+    peers
+        .record_direct_success("node-b", Some(observed_addr))
+        .await;
+    assert!(peers.is_direct("node-b").await);
+
+    let ingress = PeerReflexiveIngress::new();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let permits = Arc::new(tokio::sync::Semaphore::new(2));
+    let loop_worker = tokio::spawn(run_peer_reflexive_signal_loop_with_worker_permits(
+        ingress.clone(),
+        ControlClient::disabled_for_test(),
+        udp,
+        peers.clone(),
+        permits,
+    ));
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: observed_addr,
+    });
+
+    // The loop consumes the observation and drops it without scheduling any
+    // signal work: no fast punch, no HTTP signal, no worker events.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if ingress.pending_len() == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the signal loop must consume the Direct peer's observation");
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_fast_punch_started"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_fast_punch_sent"));
+
+    let mut buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), observed.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a Direct peer's observation must not trigger a peer-reflexive fast punch"
+    );
+
+    loop_worker.abort();
+}
+
+#[tokio::test]
+async fn peer_reflexive_worker_rechecks_direct_before_http_and_fast_punch() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let observed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let observed_addr = observed.local_addr().unwrap();
+
+    // Seed the slot table directly (bypassing the ingress gate) and promote
+    // the peer to Direct BEFORE the worker picks the observation up: the
+    // worker's own fence must refuse the HTTP signal and the fast punch.
+    let slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
+    slots.lock().await.insert(
+        "node-b".to_string(),
+        PeerReflexiveSignalSlot {
+            latest: Some(PeerReflexiveObservation {
+                peer_id: "node-b".to_string(),
+                observed_endpoint: observed_addr,
+            }),
+            ..PeerReflexiveSignalSlot::default()
+        },
+    );
+    peers
+        .record_direct_success("node-b", Some(observed_addr))
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    run_peer_reflexive_signal_worker(
+        "node-b".to_string(),
+        slots,
+        ControlClient::disabled_for_test(),
+        udp,
+        peers.clone(),
+    )
+    .await;
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert!(conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_signal_skipped_direct"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_fast_punch_started"));
+
+    let mut buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), observed.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a Direct peer must not receive the peer-reflexive fast punch"
+    );
+}
+
+#[tokio::test]
+async fn peer_reflexive_signal_worker_fast_punches_a_non_direct_peer() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    assert!(!peers.is_direct("node-b").await);
+
+    let observed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let observed_addr = observed.local_addr().unwrap();
+    let ingress = PeerReflexiveIngress::new();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let permits = Arc::new(tokio::sync::Semaphore::new(2));
+    let loop_worker = tokio::spawn(run_peer_reflexive_signal_loop_with_worker_permits(
+        ingress.clone(),
+        ControlClient::disabled_for_test(),
+        udp,
+        peers.clone(),
+        permits,
+    ));
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: observed_addr,
+    });
+
+    let mut buf = [0u8; 512];
+    tokio::time::timeout(Duration::from_secs(2), observed.recv_from(&mut buf))
+        .await
+        .expect("a non-Direct peer's observation must reach the fast punch")
+        .expect("socket read failed");
+    assert_eq!(buf[0], b'P');
+    assert_eq!(&buf[..4], b"PNCH");
+
+    loop_worker.abort();
+}
+
+#[tokio::test]
+async fn post_direct_inbound_punch_and_matched_ack_create_no_new_traversal_work() {
+    // Dual-end harness: both sides converge to Direct through real
+    // authenticated punches and the daemon-internal encrypted validation,
+    // then post-convergence inbound traffic (punches, matched ACKs,
+    // peer-reflexive observations) must create no new validation session,
+    // expectation, trigger or probe.
+    let a_identity = NodeIdentity::generate();
+    let b_identity = NodeIdentity::generate();
+    let a_public_key = hex::encode(a_identity.public_key());
+    let b_public_key = hex::encode(b_identity.public_key());
+    let mut a_initiator = HandshakeInitiator::new(a_identity, b_identity.public_key(), None);
+    let initiation = a_initiator.create_initiation().unwrap();
+    let mut b_responder = HandshakeResponder::new(b_identity, None);
+    let (response, b_local_keys) = b_responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    let a_local_keys = a_initiator.consume_response(&response).unwrap();
+
+    let peers_a = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let peers_b = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers_a
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: b_public_key.clone(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers_b
+        .add_peer(&control::PeerInfo {
+            node_id: "node-a".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: a_public_key.clone(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.1".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (udp_inbound_tx_a, udp_inbound_rx_a) = mpsc::channel(64);
+    let (wg_a, _encrypted_rx_a) = WireGuardTransport::new();
+    wg_a.add_session("node-b", TransportSession::new(a_local_keys))
+        .await;
+    let peer_reflexive_ingress_a = PeerReflexiveIngress::new();
+    let trigger_a_fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let udp_a_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
+        .await
+        .unwrap()
+        .with_wireguard_transport(wg_a.clone())
+        .with_inbound_channel(udp_inbound_tx_a.clone())
+        .with_peer_reflexive_observer(peer_reflexive_ingress_a.clone());
+    let trigger_peers = peers_a.clone();
+    let trigger_wg = wg_a.clone();
+    let fired = trigger_a_fired.clone();
+    let trigger_udp = udp_a_base.clone();
+    let udp_a = udp_a_base.with_validation_trigger(Arc::new(move |observation| {
+        fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let udp = trigger_udp.clone();
+        let peers = trigger_peers.clone();
+        let wg = trigger_wg.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.1")
+                .await;
+        });
+    }));
+    let udp_a_worker = tokio::spawn(udp_a.clone().run_inbound(udp_inbound_tx_a));
+    let (inbound_tx_a, _inbound_rx_a) = mpsc::channel(64);
+    let wg_a_worker = {
+        let wg = wg_a.clone();
+        let peers = peers_a.clone();
+        let udp = udp_a.clone();
+        tokio::spawn(async move {
+            let _ = wg
+                .run_inbound_with_peers(udp_inbound_rx_a, inbound_tx_a, Some(peers), Some(udp))
+                .await;
+        })
+    };
+
+    let (udp_inbound_tx_b, udp_inbound_rx_b) = mpsc::channel(64);
+    let (wg_b, _encrypted_rx_b) = WireGuardTransport::new();
+    wg_b.add_session("node-a", TransportSession::new(b_local_keys))
+        .await;
+    let peer_reflexive_ingress_b = PeerReflexiveIngress::new();
+    let trigger_b_fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let udp_b_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+        .await
+        .unwrap()
+        .with_wireguard_transport(wg_b.clone())
+        .with_inbound_channel(udp_inbound_tx_b.clone())
+        .with_peer_reflexive_observer(peer_reflexive_ingress_b.clone());
+    let trigger_b_peers = peers_b.clone();
+    let trigger_b_wg = wg_b.clone();
+    let fired_b = trigger_b_fired.clone();
+    let trigger_b_udp = udp_b_base.clone();
+    let udp_b = udp_b_base.with_validation_trigger(Arc::new(move |observation| {
+        fired_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let udp = trigger_b_udp.clone();
+        let peers = trigger_b_peers.clone();
+        let wg = trigger_b_wg.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
+                .await;
+        });
+    }));
+    let udp_b_addr = udp_b.local_addr().unwrap();
+    let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
+    let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
+    let wg_b_worker = {
+        let wg = wg_b.clone();
+        let peers = peers_b.clone();
+        let udp = udp_b.clone();
+        tokio::spawn(async move {
+            let _ = wg
+                .run_inbound_with_peers(udp_inbound_rx_b, inbound_tx_b, Some(peers), Some(udp))
+                .await;
+        })
+    };
+
+    // Converge both sides to Direct via real punches and encrypted validation.
+    udp_a
+        .punch_candidates("node-b", vec![udp_b_addr], Duration::from_millis(50), 3)
+        .await
+        .unwrap();
+    udp_b
+        .punch_candidates(
+            "node-a",
+            vec![udp_a.local_addr().unwrap()],
+            Duration::from_millis(50),
+            3,
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if peers_a.is_direct("node-b").await && peers_b.is_direct("node-a").await {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("both sides must converge to Direct");
+
+    let triggers_a_before = trigger_a_fired.load(std::sync::atomic::Ordering::SeqCst);
+    let triggers_b_before = trigger_b_fired.load(std::sync::atomic::Ordering::SeqCst);
+    // Convergence may have been driven purely by encrypted validation (no
+    // matched UDP probe ACK required), so the counters themselves are not
+    // asserted; what matters is that they are frozen after the promotion.
+
+    // Drain observations that were queued DURING convergence (this harness
+    // runs no peer-reflexive signal consumer), so the post-Direct traffic can
+    // be judged strictly: any new ingress entry after this point is a gate
+    // violation.
+    while timeout(Duration::from_millis(100), peer_reflexive_ingress_a.next())
+        .await
+        .is_ok()
+    {}
+    while timeout(Duration::from_millis(100), peer_reflexive_ingress_b.next())
+        .await
+        .is_ok()
+    {}
+
+    // Post-Direct: A punches B again; B answers only with ACK bursts.  The
+    // ACKs and the punches must not create validation sessions, expectations,
+    // peer-reflexive observations or reverse checks on either side.
+    udp_a
+        .punch_candidates("node-b", vec![udp_b_addr], Duration::from_millis(20), 4)
+        .await
+        .unwrap();
+    udp_b
+        .punch_candidates(
+            "node-a",
+            vec![udp_a.local_addr().unwrap()],
+            Duration::from_millis(20),
+            4,
+        )
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(
+        trigger_a_fired.load(std::sync::atomic::Ordering::SeqCst),
+        triggers_a_before,
+        "post-Direct matched ACKs at A must not enqueue direct validation"
+    );
+    assert_eq!(
+        trigger_b_fired.load(std::sync::atomic::Ordering::SeqCst),
+        triggers_b_before,
+        "post-Direct inbound punches at B must not enqueue direct validation"
+    );
+    assert_eq!(
+        peer_reflexive_ingress_a.pending_len(),
+        0,
+        "post-Direct observations at A must not be queued for the peer-reflexive signal loop"
+    );
+    assert_eq!(
+        peer_reflexive_ingress_b.pending_len(),
+        0,
+        "post-Direct observations at B must not be queued for the peer-reflexive signal loop"
+    );
+    assert!(!udp_a.has_direct_validation_expectation("node-b").await);
+    assert!(udp_a.direct_validation_target("node-b").await.is_none());
+    assert!(!udp_b.has_direct_validation_expectation("node-a").await);
+    assert!(udp_b.direct_validation_target("node-a").await.is_none());
+
+    // No daemon-driven scan may have started after the promotion.
+    let conn_a = peers_a.get_connection("node-b").await.unwrap();
+    let direct_index_a = conn_a
+        .direct_events
+        .iter()
+        .rposition(|event| event.stage == "direct_path_promoted")
+        .unwrap_or(0);
+    assert!(!conn_a.direct_events[direct_index_a..]
+        .iter()
+        .any(|event| event.stage == "punch_started" || event.stage == "punch_probes_sent"));
+    let conn_b = peers_b.get_connection("node-a").await.unwrap();
+    let direct_index_b = conn_b
+        .direct_events
+        .iter()
+        .rposition(|event| event.stage == "direct_path_promoted")
+        .unwrap_or(0);
+    assert!(!conn_b.direct_events[direct_index_b..]
+        .iter()
+        .any(|event| event.stage == "punch_started" || event.stage == "punch_probes_sent"));
+
+    udp_a_worker.abort();
+    udp_b_worker.abort();
+    wg_a_worker.abort();
+    wg_b_worker.abort();
+}
+
 /// A stale (old-generation) validation ACK must never confirm a new session:
 /// the ACK token is only trusted when it matches the outstanding expectation's
 /// request id AND generation.

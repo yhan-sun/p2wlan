@@ -121,7 +121,7 @@ async fn candidate_pair_selection_prefers_selected_endpoint_for_send() {
 }
 
 #[tokio::test]
-async fn confirmed_public_direct_still_probes_waiting_private_candidate() {
+async fn confirmed_public_direct_defers_waiting_private_candidate_until_health_failure() {
     let config = test_config();
     let manager = PeerManager::new(config);
     let public_endpoint: SocketAddr = "8.8.8.8:51842".parse().unwrap();
@@ -146,12 +146,27 @@ async fn confirmed_public_direct_still_probes_waiting_private_candidate() {
     manager
         .record_direct_success("peer1", Some(public_endpoint))
         .await;
+    assert!(manager.is_direct("peer1").await);
 
+    // Direct is converged: even a waiting low-latency LAN candidate must not
+    // keep a traversal scan alive on the confirmed path.  The Exploring
+    // window re-opens only after a real Direct health failure.
     let targets = manager.direct_probe_targets_for("peer1").await;
+    assert!(
+        !targets.contains(&private_endpoint),
+        "a waiting LAN candidate must not be probed while Direct is confirmed"
+    );
 
+    for _ in 0..DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
+        manager
+            .record_direct_keepalive_timeout_for_generation("peer1", public_endpoint, 0)
+            .await;
+    }
+    assert!(!manager.is_direct("peer1").await);
+    let targets = manager.direct_probe_targets_for("peer1").await;
     assert!(
         targets.contains(&private_endpoint),
-        "waiting LAN candidate should still be probed while slow public Direct is active"
+        "a Direct health failure must re-open the bounded Exploring window including the LAN candidate"
     );
 }
 

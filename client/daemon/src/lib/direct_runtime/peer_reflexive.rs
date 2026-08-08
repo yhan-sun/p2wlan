@@ -205,6 +205,16 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
                 udp.enqueue_direct_validation_observation(observation.clone());
 
                 let peer_id = observation.peer_id.clone();
+                // A converged Direct peer must not schedule HTTP signal or
+                // fast-punch work at all; the worker re-checks again so a
+                // promotion racing this enqueue cannot slip through.
+                if peers.is_direct_sync(&peer_id) {
+                    debug!(
+                        peer_id = %peer_id,
+                        "dropping peer-reflexive signal for a Direct peer"
+                    );
+                    continue;
+                }
                 if !enqueue_peer_reflexive_signal_observation(&slots, observation).await {
                     debug!(
                         peer_id = %peer_id,
@@ -266,6 +276,23 @@ async fn run_peer_reflexive_signal_worker(
             if let Some(newest) = take_newest_peer_reflexive_observation(&slots, &peer_id).await {
                 observation = newest;
             }
+        }
+
+        // Direct may have been confirmed while this worker was paced: the
+        // fast punch and the relayed HTTP signal must not fire into a
+        // confirmed path.
+        if peers.is_direct(&peer_id).await {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "peer_reflexive_signal_skipped_direct",
+                    Some(observation.observed_endpoint),
+                    None,
+                    None,
+                    "peer is already Direct; skipping peer-reflexive HTTP signal and fast punch",
+                )
+                .await;
+            continue;
         }
 
         run_peer_reflexive_fast_punch(&udp, &peers, &observation).await;
@@ -395,7 +422,7 @@ async fn run_peer_reflexive_fast_punch(
         )
         .await;
     match udp
-        .punch_candidates(
+        .punch_candidates_until_not_direct(
             &observation.peer_id,
             vec![observation.observed_endpoint],
             PEER_REFLEXIVE_FAST_PUNCH_INTERVAL,

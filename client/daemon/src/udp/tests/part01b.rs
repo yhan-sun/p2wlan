@@ -265,7 +265,7 @@ async fn remote_scatter_pool_uses_all_bound_sockets_even_when_local_pool_inactiv
         .collect::<Vec<SocketAddr>>();
 
     let sent = transport
-        .punch_candidates_remote_scatter_pool("peer-b", candidates, Duration::ZERO, 1)
+        .punch_candidates_remote_scatter_pool_until_not_direct("peer-b", candidates, Duration::ZERO, 1)
         .await
         .unwrap();
 
@@ -331,7 +331,7 @@ async fn remote_scatter_pool_exceeds_primary_session_cap_under_sliding_budget() 
         .collect::<Vec<SocketAddr>>();
 
     let sent = transport
-        .punch_candidates_remote_scatter_pool("peer-b", candidates, Duration::from_secs(1), 5)
+        .punch_candidates_remote_scatter_pool_until_not_direct("peer-b", candidates, Duration::from_secs(1), 5)
         .await
         .unwrap();
 
@@ -419,7 +419,7 @@ async fn stable_unique_scatter_spends_budget_on_distinct_remote_ports() {
         .map(|offset| format!("127.0.0.1:{}", 23_000 + offset).parse().unwrap())
         .collect::<Vec<SocketAddr>>();
     let report = transport
-        .punch_candidates_stable_unique_scatter("peer-b", candidates.clone(), Duration::ZERO, 1)
+        .punch_candidates_stable_unique_scatter_until_not_direct("peer-b", candidates.clone(), Duration::ZERO, 1)
         .await
         .unwrap();
 
@@ -483,7 +483,7 @@ async fn stable_unique_scatter_retries_budget_skips_before_repeating_sent_endpoi
         .collect::<Vec<_>>();
 
     let report = transport
-        .punch_candidates_stable_unique_scatter(
+        .punch_candidates_stable_unique_scatter_until_not_direct(
             "peer-b",
             candidates.clone(),
             Duration::from_millis(900),

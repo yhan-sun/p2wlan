@@ -100,6 +100,24 @@ async fn run_direct_probe_loop(
                     if session.is_cancelled() {
                         return;
                     }
+                    // Direct may have been confirmed between target selection
+                    // and this cycle: the bounded retry must not send into a
+                    // confirmed path.  Recovery re-enters this loop through the
+                    // reclaim window after a Direct health failure or a
+                    // network-generation change.
+                    if peers.is_direct(&peer_id).await {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "retry_skipped_direct_confirmed",
+                                None,
+                                None,
+                                None,
+                                "skipped background UDP retry because Direct was confirmed after target selection",
+                            )
+                            .await;
+                        return;
+                    }
                     let punch_started_stage = if reclaim_active {
                         "direct_reclaim_punch_started"
                     } else {
@@ -261,7 +279,7 @@ async fn run_direct_probe_loop(
                         )
                         .await
                     } else if stable_remote_scatter {
-                        udp.punch_candidates_stable_unique_scatter(
+                        udp.punch_candidates_stable_unique_scatter_until_not_direct(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
@@ -269,7 +287,7 @@ async fn run_direct_probe_loop(
                         )
                         .await
                     } else if remote_scatter_pool {
-                        udp.punch_candidates_remote_scatter_pool(
+                        udp.punch_candidates_remote_scatter_pool_until_not_direct(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
@@ -281,7 +299,7 @@ async fn run_direct_probe_loop(
                             unique_target_endpoints: 0,
                         })
                     } else {
-                        udp.punch_candidates(
+                        udp.punch_candidates_until_not_direct(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,

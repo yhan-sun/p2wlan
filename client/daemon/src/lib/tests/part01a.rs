@@ -730,6 +730,91 @@ async fn encrypted_direct_validation_skips_when_direct_is_already_confirmed() {
 }
 
 #[tokio::test]
+async fn scheduled_hole_punch_skips_direct_peer_even_with_live_candidates() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = remote_socket.local_addr().unwrap();
+    let candidates = vec![endpoint.to_string()];
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers.add_candidates("node-b", &candidates).await;
+    peers.record_direct_success("node-b", Some(endpoint)).await;
+    assert!(peers.is_direct("node-b").await);
+    // Frozen targets bypass candidate resolution entirely (fresh-prediction
+    // sessions): even then the Direct gate must stop the task before any
+    // probe is sent, otherwise every late fresh signal would scan a
+    // confirmed path.
+    let frozen = Some(vec![endpoint]);
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        PunchAttemptDeduplicator::default(),
+        "node-b".to_string(),
+        Duration::from_millis(10),
+        2,
+        None,
+        None,
+        None,
+        frozen,
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let conn = peers.get_connection("node-b").await.unwrap();
+            if conn
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "punch_skipped_already_direct")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("scheduled hole punch must skip a Direct peer even with live candidates");
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_started"));
+    assert!(!conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "punch_probes_sent"));
+    assert_eq!(conn.state, ConnectionState::Direct);
+
+    // Nothing may have been emitted toward the peer endpoint.
+    let mut buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), remote_socket.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a Direct peer must not receive synchronized punch probes"
+    );
+}
+
+#[tokio::test]
 async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

@@ -265,47 +265,77 @@ impl UdpTransport {
         .map(|report| report.packets_sent)
     }
 
-    /// Send active UDP probes from every bound socket for a remote hard-NAT
-    /// scatter window even when this local NAT profile did not require the
-    /// socket pool for candidate gathering.
-    pub async fn punch_candidates_remote_scatter_pool(
+    /// Remote-scatter variant of [`Self::punch_candidates_until_not_direct`]:
+    /// wide sweeps must also stop within one probe once the peer turns
+    /// Direct instead of finishing their multi-thousand-probe window.
+    pub(crate) async fn punch_candidates_remote_scatter_pool_until_not_direct(
         &self,
         peer_id: &str,
         candidates: Vec<SocketAddr>,
         probe_interval: Duration,
         attempts: u32,
     ) -> Result<u32> {
-        self.punch_candidates_with_socket_policy(
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
             peer_id,
             candidates,
             probe_interval,
             attempts,
             PunchSocketPolicy::RemoteScatterPool,
+            &move || !peers.is_direct_sync(&gate_peer),
         )
         .await
         .map(|report| report.packets_sent)
     }
 
-    /// Sweep a remote hard-NAT port window from one stable local socket.
-    ///
-    /// Using every local socket here only repeats each remote port and consumes
-    /// the 3,072-packet cap three times faster. The hard-NAT peer separately
-    /// keeps all of its destination-specific socket mappings alive.
-    pub(crate) async fn punch_candidates_stable_unique_scatter(
+    /// Stable-unique-scatter variant of
+    /// [`Self::punch_candidates_until_not_direct`].
+    pub(crate) async fn punch_candidates_stable_unique_scatter_until_not_direct(
         &self,
         peer_id: &str,
         candidates: Vec<SocketAddr>,
         probe_interval: Duration,
         attempts: u32,
     ) -> Result<PunchSendReport> {
-        self.punch_candidates_with_socket_policy(
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
             peer_id,
             candidates,
             probe_interval,
             attempts,
             PunchSocketPolicy::StableUniqueScatter,
+            &move || !peers.is_direct_sync(&gate_peer),
         )
         .await
+    }
+
+    /// Punch through the active pool with a per-probe Direct gate.
+    ///
+    /// The synchronized punch tasks use this so a session scheduled before
+    /// Direct confirmation stops within one probe once the peer turns Direct:
+    /// the ordinary `punch_candidates` is not enough, because a 96-candidate
+    /// sweep can keep emitting for ~2 s after the promotion lands.
+    pub(crate) async fn punch_candidates_until_not_direct(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<u32> {
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::ActivePool,
+            &move || !peers.is_direct_sync(&gate_peer),
+        )
+        .await
+        .map(|report| report.packets_sent)
     }
 
     /// Send active UDP probes only from the primary socket.
@@ -340,6 +370,34 @@ impl UdpTransport {
         probe_interval: Duration,
         attempts: u32,
         socket_policy: PunchSocketPolicy,
+    ) -> Result<PunchSendReport> {
+        self.punch_candidates_with_socket_policy_and_direct_gate(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            socket_policy,
+            &|| true,
+        )
+        .await
+    }
+
+    /// The shared punch core with a per-probe Direct gate.
+    ///
+    /// `direct_gate` is re-evaluated before every probe emission so a session
+    /// that was scheduled before Direct confirmation stops within one probe
+    /// (~6 ms pacing) once the peer's state turns Direct.  The gate must be
+    /// cheap and synchronous; the punch loops pass
+    /// `peers.is_direct_sync(&peer_id)`, which only locks the peer-state
+    /// mirror.
+    async fn punch_candidates_with_socket_policy_and_direct_gate(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        socket_policy: PunchSocketPolicy,
+        direct_gate: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<PunchSendReport> {
         if candidates.is_empty() || attempts == 0 {
             return Ok(PunchSendReport::default());
@@ -406,6 +464,15 @@ impl UdpTransport {
             };
 
             for (socket_index, candidate) in probe_order {
+                if !direct_gate() {
+                    // Direct was confirmed while this session was in flight:
+                    // stop emitting peer-directed probes immediately instead
+                    // of completing the stale sweep on a confirmed path.
+                    trace!(
+                        "Aborting UDP punch session for peer {peer_id}: Direct was confirmed mid-session"
+                    );
+                    break 'schedule;
+                }
                 if packets_sent >= session_probe_cap {
                     session_capped = true;
                     break 'schedule;

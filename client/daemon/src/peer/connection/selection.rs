@@ -45,48 +45,6 @@ impl PeerConnection {
             .next()
     }
 
-    fn should_probe_private_alternates_while_direct(&self, local_generation: u64) -> bool {
-        if self.state != ConnectionState::Direct {
-            return true;
-        }
-
-        let selected_pair = self.selected_candidate_pair_for_diagnostics(local_generation);
-        if selected_pair.is_some_and(|pair| is_low_latency_direct_endpoint(pair.remote_endpoint)) {
-            return false;
-        }
-        if self.candidate_pairs.iter().any(|pair| {
-            pair.local_generation == local_generation
-                && is_low_latency_direct_endpoint(pair.remote_endpoint)
-                && !matches!(
-                    pair.state,
-                    CandidatePairState::Selected | CandidatePairState::Succeeded
-                )
-                && candidate_pair_probe_due(pair)
-        }) {
-            return true;
-        }
-        if selected_pair.is_some_and(|pair| {
-            pair.source == CandidatePairSource::PeerReflexive
-                && pair.consecutive_failures == 0
-                && pair
-                    .success_age()
-                    .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
-        }) {
-            return false;
-        }
-
-        self.candidate_pairs.iter().any(|pair| {
-            pair.local_generation == local_generation
-                && (is_low_latency_direct_endpoint(pair.remote_endpoint)
-                    || is_public_probe_endpoint(pair.remote_endpoint))
-                && !matches!(
-                    pair.state,
-                    CandidatePairState::Selected | CandidatePairState::Succeeded
-                )
-                && candidate_pair_probe_due(pair)
-        })
-    }
-
     fn direct_endpoint_for_send(&self, local_generation: u64) -> Option<SocketAddr> {
         self.best_candidate_pair_for_send(local_generation)
             .map(|pair| pair.remote_endpoint)
