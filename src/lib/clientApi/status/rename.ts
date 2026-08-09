@@ -1,12 +1,7 @@
 import { type ApiResult } from "../../../types/client";
 
 import { getSettings } from "../config";
-import {
-  isTauri,
-  normalizeControlServer,
-  readJsonBody,
-  tryInvoke,
-} from "../http";
+import { normalizeControlServer, readJsonBody } from "../http";
 import { appendLog } from "../log";
 
 export async function renamePeerDevice(
@@ -28,21 +23,6 @@ export async function renamePeerDevice(
 
   try {
     const controlServer = normalizeControlServer(settings.controlServer);
-    if (isTauri()) {
-      const response = await tryInvoke<{ deviceName: string }>("control_rename_device", {
-        request: {
-          controlServer,
-          authToken: settings.authToken,
-          deviceId: peerId,
-          deviceName,
-        },
-      });
-      if (response?.deviceName) {
-        appendLog(`device renamed (${peerId}) via native bridge`);
-        return { data: { deviceName: response.deviceName }, source: "live" };
-      }
-    }
-
     const response = await fetch(
       `${controlServer}/api/v1/devices/${encodeURIComponent(peerId)}`,
       {

@@ -9,7 +9,6 @@ members = [
     "client/cli",
     "client/desktop-host",
     "client/tray",
-    "src-tauri",
 ]
 resolver = "2"
 

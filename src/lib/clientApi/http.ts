@@ -1,20 +1,6 @@
-// Low-level HTTP / Tauri bridge helpers for the unified client API.
-//
-// Base layer for the other clientApi submodules: detects the Tauri runtime,
-// invokes Tauri commands, parses JSON responses, and fetches the diagnostics
-// snapshot from the daemon. Split out of `clientApi.ts`.
+// Low-level HTTP helpers for the unified client API.
 
 import type { DiagnosticsSnapshot } from "../../types/client";
-
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-export async function tryInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
-  if (!isTauri()) return null;
-  const { invoke } = await import("@tauri-apps/api/core");
-  return (await invoke<T>(command, args)) as T;
-}
 
 export async function readJsonBody<T>(res: Response): Promise<T | null> {
   const text = await res.text();
@@ -50,14 +36,5 @@ export async function fetchDiagnosticsSnapshot(url: string): Promise<Diagnostics
     return null;
   } finally {
     window.clearTimeout(timer);
-  }
-}
-
-export async function invokeDaemonStatusSnapshot(url: string): Promise<DiagnosticsSnapshot | null> {
-  if (!isTauri()) return null;
-  try {
-    return await tryInvoke<DiagnosticsSnapshot>("daemon_status", { diagnosticsUrl: url });
-  } catch {
-    return null;
   }
 }

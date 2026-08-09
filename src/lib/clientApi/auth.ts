@@ -2,29 +2,17 @@
 //
 // Split out of `clientApi.ts`.
 
-import type {
-  ApiResult,
-  DaemonOperationStatus,
-} from "../../types/client";
+import type { ApiResult } from "../../types/client";
 import type { AuthResponseBody, AuthMode, AuthSession } from "./types";
 
 import { appendLog } from "./log";
-import { getSettings, saveSettings, daemonStartOptions } from "./config";
-import { isTauri, normalizeControlServer, readJsonBody, tryInvoke } from "./http";
-
-export async function configureDaemon(): Promise<DaemonOperationStatus | null> {
-  if (!isTauri()) return null;
-  const settings = getSettings();
-  return tryInvoke<DaemonOperationStatus>("daemon_configure", {
-    options: daemonStartOptions(settings),
-  });
-}
+import { getSettings, saveSettings } from "./config";
+import { normalizeControlServer, readJsonBody } from "./http";
 
 export function clearControlSession(): void {
   const settings = getSettings();
   saveSettings({ ...settings, authToken: "" });
   localStorage.removeItem("token");
-  void configureDaemon();
 }
 
 function zhAuthError(message: string, status?: number): string {
@@ -53,39 +41,6 @@ export async function authenticateWithControl(
   if (!email) throw new Error("请输入邮箱");
   if (!password) throw new Error("请输入密码");
   if (password.length < 6) throw new Error("密码至少需要 6 个字符");
-
-  if (isTauri()) {
-    try {
-      const session = await tryInvoke<AuthSession>("control_authenticate", {
-        request: {
-          mode,
-          controlServer,
-          email,
-          password,
-        },
-      });
-      if (session?.token) {
-        const settings = getSettings();
-        const nextSettings = {
-          ...settings,
-          controlServer: session.controlServer,
-          authToken: session.token,
-        };
-        saveSettings(nextSettings);
-        localStorage.setItem("token", session.token);
-        appendLog(`${mode === "register" ? "registered" : "logged in"} control user (${email}) via native bridge`);
-        return {
-          data: session,
-          source: "live",
-        };
-      }
-    } catch (err) {
-      if (err instanceof Error) {
-        throw new Error(zhAuthError(err.message));
-      }
-      throw new Error(zhAuthError(String(err)));
-    }
-  }
 
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 8000);

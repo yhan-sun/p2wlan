@@ -13,12 +13,10 @@ Usage:
 Optional environment variables:
   SAMPLES              Number of snapshots to collect. Default: 1
   INTERVAL_SEC         Seconds between snapshots. Default: 5
-  TAURI_UI_PATTERN     Extended regex for the Tauri UI process.
   FLUTTER_UI_PATTERN   Extended regex for the Flutter UI process.
   CORE_PATTERN         Optional extended regex for an external core process.
 
 Defaults are tuned for this repository:
-  TAURI_UI_PATTERN='p2wlan.app/Contents/MacOS/p2wlan-desktop|p2wlan-desktop'
   FLUTTER_UI_PATTERN='P2WLAN.app|P2WLAN|p2wlan_flutter_client.app|p2wlan_flutter_client'
 
 This script prints PID, RSS, and process basename only. It reads the process
@@ -34,7 +32,6 @@ fi
 
 samples="${SAMPLES:-1}"
 interval_sec="${INTERVAL_SEC:-5}"
-tauri_pattern="${TAURI_UI_PATTERN:-p2wlan.app/Contents/MacOS/p2wlan-desktop|p2wlan-desktop}"
 flutter_pattern="${FLUTTER_UI_PATTERN:-P2WLAN.app|P2WLAN|p2wlan_flutter_client.app|p2wlan_flutter_client}"
 core_pattern="${CORE_PATTERN:-}"
 
@@ -57,7 +54,6 @@ for ((sample = 1; sample <= samples; sample += 1)); do
   date "+%Y-%m-%d %H:%M:%S %z"
 
   ps -axo pid=,rss=,comm= | awk \
-    -v tauri_pattern="$tauri_pattern" \
     -v flutter_pattern="$flutter_pattern" \
     -v core_pattern="$core_pattern" '
 function mib(kib) {
@@ -79,9 +75,7 @@ function add(category, pid, rss, command) {
   process_rss[process_count] = rss
   process_name[process_count] = basename(command)
 
-  if (category == "tauri-ui") {
-    tauri_rss += rss
-  } else if (category == "flutter-ui") {
+  if (category == "flutter-ui") {
     flutter_rss += rss
   } else if (category == "core") {
     core_rss += rss
@@ -107,8 +101,6 @@ function add(category, pid, rss, command) {
     add("core", pid, rss, command)
   } else if (command ~ flutter_pattern) {
     add("flutter-ui", pid, rss, command)
-  } else if (command ~ tauri_pattern) {
-    add("tauri-ui", pid, rss, command)
   }
 }
 
@@ -125,21 +117,15 @@ END {
   }
 
   printf "\n"
-  printf "%-24s %10.1f MiB\n", "Tauri UI RSS", mib(tauri_rss)
   printf "%-24s %10.1f MiB\n", "Flutter UI RSS", mib(flutter_rss)
-  printf "%-24s %10.1f MiB\n", "Flutter minus Tauri", mib(flutter_rss - tauri_rss)
 
   if (core_pattern != "") {
     printf "%-24s %10.1f MiB\n", "External core RSS", mib(core_rss)
-    printf "%-24s %10.1f MiB\n", "Tauri UI + core", mib(tauri_rss + core_rss)
     printf "%-24s %10.1f MiB\n", "Flutter UI + core", mib(flutter_rss + core_rss)
   }
 
-  if (tauri_rss == 0 || flutter_rss == 0 || (core_pattern != "" && core_rss == 0)) {
+  if (flutter_rss == 0 || (core_pattern != "" && core_rss == 0)) {
     printf "\n"
-    if (tauri_rss == 0) {
-      printf "note: no Tauri UI process matched TAURI_UI_PATTERN\n"
-    }
     if (flutter_rss == 0) {
       printf "note: no Flutter UI process matched FLUTTER_UI_PATTERN\n"
     }

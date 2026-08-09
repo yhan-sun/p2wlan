@@ -10,11 +10,8 @@ import {
 } from "react";
 import {
   appendLog,
-  clientStatusFromDesktopStatus,
-  configureDaemon,
   getClientStatusSnapshot,
   getSettings,
-  isTauri,
   startDaemon,
   startDaemonElevated,
   stopDaemon,
@@ -23,7 +20,6 @@ import type {
   ClientSettings,
   DaemonOperationStatus,
   DaemonStatus,
-  DesktopStatus,
   PeerStatus,
   RouteStatus,
   TunnelStatus,
@@ -71,7 +67,6 @@ function useClientStatusController(): ClientStatusState {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastFetchedAt, setLastFetchedAt] = useState<number | null>(null);
   const inFlight = useRef(false);
-  const eventFallbackInFlight = useRef(false);
   const lastOperationLogKey = useRef<string | null>(null);
 
   const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof getClientStatusSnapshot>>) => {
@@ -122,112 +117,42 @@ function useClientStatusController(): ClientStatusState {
     }
   }, [applySnapshot]);
 
-  const desktopMayStillHaveRunningDaemon = useCallback((desktop: DesktopStatus) => {
-    if (!isTauri() || desktop.diagnostics) return false;
-    if (desktop.diagnosticsAlive || desktop.operation.phase === "running") return true;
-    if (desktop.operation.phase === "waiting_for_daemon") return true;
-
-    const statusText = [
-      desktop.operation.message,
-      desktop.operation.lastError,
-      desktop.diagnosticsError,
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    return (
-      desktop.operation.phase === "error" &&
-      (statusText.includes("守护进程未响应") ||
-        statusText.includes("诊断端点") ||
-        statusText.includes("健康检查端点") ||
-        statusText.includes("本地健康检查"))
-    );
-  }, []);
-
-  const applyDesktopStatus = useCallback((desktop: DesktopStatus) => {
-    const shouldRecoverRunningStatus = desktopMayStillHaveRunningDaemon(desktop);
-
-    if (!shouldRecoverRunningStatus) {
-      applySnapshot(clientStatusFromDesktopStatus(desktop));
-      return;
-    }
-
-    if (eventFallbackInFlight.current) return;
-    eventFallbackInFlight.current = true;
-    void getClientStatusSnapshot()
-      .then(applySnapshot)
-      .catch(() => applySnapshot(clientStatusFromDesktopStatus(desktop)))
-      .finally(() => {
-        eventFallbackInFlight.current = false;
-      });
-  }, [applySnapshot, desktopMayStillHaveRunningDaemon]);
-
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | null = null;
     let timer: number | null = null;
 
-    const syncConfiguration = async () => {
-      try {
-        await configureDaemon();
-      } catch {
-        // The desktop bridge may not be ready during browser-only development.
-      }
-    };
-
-    const scheduleBrowserPoll = () => {
-      if (disposed || isTauri()) return;
+    const schedulePoll = () => {
+      if (disposed) return;
       const delay = document.visibilityState === "hidden" ? HIDDEN_POLL_MS : VISIBLE_POLL_MS;
       timer = window.setTimeout(async () => {
         await refresh();
-        scheduleBrowserPoll();
+        schedulePoll();
       }, delay);
     };
 
-    void syncConfiguration();
     void refresh();
-
-    if (isTauri()) {
-      void import("@tauri-apps/api/event")
-        .then(async ({ listen }) => {
-          const stopListening = await listen<DesktopStatus>("p2wlan-status", event => {
-            if (!disposed) applyDesktopStatus(event.payload);
-          });
-          if (disposed) {
-            stopListening();
-          } else {
-            unlisten = stopListening;
-          }
-        })
-        .catch(error => {
-          if (!disposed) setLastError(`无法订阅桌面状态：${String(error)}`);
-        });
-    } else {
-      scheduleBrowserPoll();
-    }
+    schedulePoll();
 
     const handleStorage = () => {
       setSettings(getSettings());
-      void syncConfiguration();
       void refresh();
     };
     const handleVisibility = () => {
       if (timer != null) window.clearTimeout(timer);
       timer = null;
       if (document.visibilityState === "visible") void refresh();
-      scheduleBrowserPoll();
+      schedulePoll();
     };
     window.addEventListener("storage", handleStorage);
     document.addEventListener("visibilitychange", handleVisibility);
 
     return () => {
       disposed = true;
-      if (unlisten) unlisten();
       if (timer != null) window.clearTimeout(timer);
       window.removeEventListener("storage", handleStorage);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [applyDesktopStatus, refresh]);
+  }, [refresh]);
 
   const connect = useCallback(async () => {
     const result = await startDaemon();
@@ -284,7 +209,6 @@ function useClientStatusController(): ClientStatusState {
 
   const reloadSettings = useCallback(() => {
     setSettings(getSettings());
-    void configureDaemon();
   }, []);
 
   return {

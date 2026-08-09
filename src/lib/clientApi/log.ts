@@ -2,8 +2,6 @@
 //
 // Split out of `clientApi.ts`.
 
-import { isTauri } from "./http";
-import { tryInvoke } from "./http";
 import { LOG_KEY, MAX_LOG_LINES } from "./types";
 
 export function appendLog(line: string): void {
@@ -27,16 +25,6 @@ export function getRecentLogs(limit = 300): string[] {
     const lines = existing.split("\n").filter(Boolean);
     return lines.slice(-Math.min(limit, MAX_LOG_LINES));
   } catch {
-    return [];
-  }
-}
-
-export async function getDaemonLogTail(limit = 120): Promise<string[]> {
-  if (!isTauri()) return [];
-  try {
-    return (await tryInvoke<string[]>("daemon_log_tail", { maxLines: limit })) ?? [];
-  } catch (err) {
-    appendLog(`daemon log tail unavailable: ${err}`);
     return [];
   }
 }

@@ -11,7 +11,7 @@ import type {
   DiagnosticsSnapshot,
 } from "../../types/client";
 
-import { appendLog, getDaemonLogTail, getRecentLogs } from "./log";
+import { appendLog, getRecentLogs } from "./log";
 import { getSettings } from "./config";
 import { fetchDiagnosticsSnapshot } from "./http";
 import {
@@ -343,8 +343,7 @@ export async function getDiagnostics(): Promise<ApiResult<DiagnosticsReport>> {
     appendLog(`diagnostics: ${statusResult.error}`);
   }
   const appLogs = getRecentLogs(300).length ? getRecentLogs(300) : logs;
-  const daemonLogs = (await getDaemonLogTail(120)).map(line => `daemon-log: ${line}`);
-  const combinedLogs = [...appLogs, ...daemonLogs].slice(-MAX_LOG_LINES);
+  const combinedLogs = appLogs.slice(-MAX_LOG_LINES);
 
   return {
     data: {

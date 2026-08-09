@@ -3,7 +3,6 @@
 //
 // Split out of `clientApi.ts`.
 
-export { clientStatusFromDesktopStatus } from "./status/desktop";
 export {
   getClientStatusSnapshot,
   getDaemonStatus,

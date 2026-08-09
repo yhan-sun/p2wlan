@@ -19,7 +19,7 @@ coverage.out
 server/bin/
 server/vendor/
 
-# Node/Tauri
+# Node
 node_modules/
 dist/
 build/
@@ -28,7 +28,6 @@ build/
 .turbo/
 desktop/node_modules/
 desktop/dist/
-desktop/src-tauri/target/
 
 # Coverage/test output
 coverage/

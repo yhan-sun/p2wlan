@@ -48,7 +48,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Rust Clippy (Windows)
-        run: cargo clippy --workspace --exclude p2wlan-desktop --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Rust Tests (Windows)
         # The daemon lib tests cover the platform-specific directory-fsync
         # path (incarnation persistence) and the full signal/lease flow on

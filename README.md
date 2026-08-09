@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="src-tauri/icons/icon.png" width="96" alt="P2WLAN icon" />
+  <img src="assets/p2wlan_icon.svg" width="96" alt="P2WLAN icon" />
   <h1>P2WLAN</h1>
   <p><strong>把分散在不同网络里的设备，连成一张真正可用的加密虚拟局域网。</strong></p>
   <p>Mac、Windows、Linux、云服务器、NAS、家庭设备，都可以拥有稳定的私有虚拟 IP。</p>
@@ -151,7 +151,7 @@ flowchart LR
 
 | 层级 | 实现 | 主要职责 |
 | --- | --- | --- |
-| 桌面客户端 | Flutter 诊断客户端 / Tauri 旧客户端 | 设备状态、诊断、迁移中的桌面体验 |
+| 客户端界面 | Flutter 原生客户端 / React 网页控制台 | 设备状态、诊断和控制面操作 |
 | 本地守护进程 | Rust | 虚拟网卡、加密会话、Peer 状态、NAT 探测、中继回退 |
 | 控制面 | Go, SQLite | 账号、设备注册、虚拟 IP 分配、凭据状态、中继票据、信令 |
 | 中继服务 | Go | 密文转发、票据校验、撤销信息同步 |
@@ -267,7 +267,7 @@ RELAY_AUTH_FAILURE_WINDOW="1m" \
 
 ## 从源码构建
 
-需要 Rust stable、Go 1.22+、Node.js 20+、pnpm 10+ 和 Flutter stable。Linux Flutter 桌面构建还需要 GTK 开发依赖；旧 Tauri 桌面构建仍需要 WebKit2GTK 开发依赖。
+需要 Rust stable、Go 1.22+、Node.js 20+、pnpm 10+ 和 Flutter stable。Linux Flutter 桌面构建还需要 GTK 开发依赖。
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
@@ -275,19 +275,14 @@ cd p2wlan
 pnpm install --frozen-lockfile
 
 cargo build -p p2wlan-daemon
-cargo tauri dev
+pnpm run dev
 
 cd apps/flutter_client
 flutter pub get
 flutter run -d macos
 ```
 
-macOS 打包建议使用项目脚本，确保 daemon 被放入应用资源目录：
-
-```bash
-pnpm run icons
-pnpm run package:macos
-```
+macOS 原生客户端打包请使用 `apps/flutter_client/scripts/package_macos.sh`。
 
 ## 质量检查
 
@@ -320,8 +315,7 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```text
 client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、CLI
 server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
-src/          React 桌面客户端界面
-src-tauri/    Tauri 外壳、托盘、权限、daemon 生命周期和平台打包
+src/          React 网页控制台
 apps/flutter_client/ Flutter 诊断客户端：Android、iOS、macOS、Windows、Linux
 scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
 fuzz/         协议与解析器模糊测试

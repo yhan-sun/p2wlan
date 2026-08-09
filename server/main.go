@@ -150,7 +150,7 @@ func main() {
 	log.Println("Server stopped")
 }
 
-// withCORS allows the desktop shell and local dev UI to call the control API.
+// withCORS allows the local development UI to call the control API.
 // Extra origins can be supplied with CONTROL_ALLOWED_ORIGINS as a comma list.
 func withCORS(next http.Handler) http.Handler {
 	allowed := parseAllowedOrigins(getEnv("CONTROL_ALLOWED_ORIGINS", ""))
@@ -184,11 +184,6 @@ func parseAllowedOrigins(raw string) map[string]struct{} {
 
 func isAllowedOrigin(origin string, extra map[string]struct{}) bool {
 	if _, ok := extra[origin]; ok {
-		return true
-	}
-	if strings.HasPrefix(origin, "tauri://") ||
-		strings.HasPrefix(origin, "http://tauri.") ||
-		strings.HasPrefix(origin, "https://tauri.") {
 		return true
 	}
 	if strings.HasPrefix(origin, "http://localhost:") ||

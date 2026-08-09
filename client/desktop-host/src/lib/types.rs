@@ -90,7 +90,8 @@ impl DesktopHostPermissionStatus {
                 "Desktop permission probing is not wired in this P2.1 helper crate.".to_string(),
             elevated_command_preview: None,
             details: vec![
-                "P2.1 exposes the serde model only; platform probes remain in Tauri.".to_string(),
+                "P2.1 exposes the serde model only; platform probes remain in the native client."
+                    .to_string(),
             ],
             checks: Vec::new(),
         }

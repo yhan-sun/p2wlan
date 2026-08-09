@@ -106,15 +106,9 @@
   gap: 0.5rem;
 }
 
-.logout-btn,
-.quit-btn {
+.logout-btn {
   justify-content: flex-start;
   color: var(--text-secondary);
-}
-
-.quit-btn:hover:not(:disabled) {
-  color: var(--danger);
-  border-color: color-mix(in oklch, var(--danger) 36%, transparent);
 }
 
 .full-width {

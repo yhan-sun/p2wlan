@@ -1,7 +1,7 @@
 # P2WLAN Flutter Client
 
-Flutter frontend for the Rust P2WLAN client. This app is intended to replace the
-legacy Tauri/WebView desktop shell while keeping the Rust networking core.
+Flutter frontend for the Rust P2WLAN client, paired with the Rust networking
+core.
 
 The split is:
 
@@ -120,4 +120,4 @@ cargo check -p p2wlan-daemon
   notarization/signing smoke.
 - [ ] Windows UAC, Linux elevation, and packaged tray behavior pass live smoke.
 - [ ] Flutter UI RSS is measured separately from daemon RSS.
-- [ ] Tauri/WebView is no longer required for the primary desktop client path.
+- [x] Flutter is the primary desktop client path.

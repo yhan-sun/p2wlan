@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestWithCORSAllowsDesktopAndLocalDevOrigins(t *testing.T) {
+func TestWithCORSAllowsLocalDevOrigins(t *testing.T) {
 	handler := withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -14,9 +14,6 @@ func TestWithCORSAllowsDesktopAndLocalDevOrigins(t *testing.T) {
 	for _, origin := range []string{
 		"http://localhost:1420",
 		"http://127.0.0.1:1420",
-		"tauri://localhost",
-		"http://tauri.localhost",
-		"https://tauri.localhost",
 	} {
 		req := httptest.NewRequest(http.MethodOptions, "/api/v1/login", nil)
 		req.Header.Set("Origin", origin)

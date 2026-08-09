@@ -7,7 +7,7 @@ import type {
   HealthStatus,
   PeerPath,
 } from "./base";
-import type { DiagnosticsSnapshot, TaskStatus } from "./diagnostics";
+import type { TaskStatus } from "./diagnostics";
 import type {
   CandidatePairDiagnostics,
   PathHealthDiagnostics,
@@ -20,15 +20,6 @@ export interface DaemonOperationStatus {
   message: string;
   startedAtMs: number;
   lastError: string | null;
-}
-
-export interface DesktopStatus {
-  operation: DaemonOperationStatus;
-  diagnostics: DiagnosticsSnapshot | null;
-  diagnosticsUrl?: string;
-  diagnosticsAlive?: boolean;
-  diagnosticsStale?: boolean;
-  diagnosticsError?: string | null;
 }
 
 export interface DaemonStatus {

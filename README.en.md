@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="src-tauri/icons/icon.png" width="96" alt="P2WLAN icon" />
+  <img src="assets/p2wlan_icon.svg" width="96" alt="P2WLAN icon" />
   <h1>P2WLAN</h1>
   <p><strong>An encrypted virtual LAN for real devices, real networks, and real diagnostics.</strong></p>
   <p>Connect Mac, Windows, Linux, cloud servers, NAS devices, and home machines with stable private virtual IPs.</p>
@@ -150,7 +150,7 @@ flowchart LR
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Desktop client | Flutter diagnostics client / legacy Tauri client | Device status, diagnostics, and the desktop migration path |
+| Client UI | Flutter native client / React web console | Device status, diagnostics, and control-plane actions |
 | Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
 | Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
 | Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
@@ -265,7 +265,7 @@ Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files,
 
 ## Build from Source
 
-Install Rust stable, Go 1.22+, Node.js 20+, pnpm 10+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies; legacy Tauri desktop builds still need WebKit2GTK development dependencies.
+Install Rust stable, Go 1.22+, Node.js 20+, pnpm 10+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies.
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
@@ -273,19 +273,14 @@ cd p2wlan
 pnpm install --frozen-lockfile
 
 cargo build -p p2wlan-daemon
-cargo tauri dev
+pnpm run dev
 
 cd apps/flutter_client
 flutter pub get
 flutter run -d macos
 ```
 
-For macOS packages, use the project scripts so the daemon is placed into the app resource directory:
-
-```bash
-pnpm run icons
-pnpm run package:macos
-```
+For native macOS packages, use `apps/flutter_client/scripts/package_macos.sh`.
 
 ## Quality Gates
 
@@ -318,8 +313,7 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```text
 client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon, CLI
 server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
-src/          React desktop client interface
-src-tauri/    Tauri shell, tray, permissions, daemon lifecycle, platform packaging
+src/          React web console
 apps/flutter_client/ Flutter diagnostics client for Android, iOS, macOS, Windows, and Linux
 scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
 fuzz/         Protocol and parser fuzzing

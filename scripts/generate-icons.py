@@ -19,7 +19,6 @@ from PIL import Image, ImageDraw, ImageFilter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TAURI_ICON_DIR = ROOT / "src-tauri" / "icons"
 FLUTTER_ROOT = ROOT / "apps" / "flutter_client"
 FLUTTER_ASSETS = FLUTTER_ROOT / "assets"
 MACOS_APPICON_DIR = (
@@ -75,7 +74,6 @@ APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 
 def ensure_dirs() -> None:
     for directory in [
-        TAURI_ICON_DIR,
         FLUTTER_ASSETS,
         MACOS_APPICON_DIR,
         IOS_APPICON_DIR,
@@ -343,23 +341,6 @@ def write_svg_assets() -> None:
         path.write_text(APP_ICON_SVG, encoding="utf-8")
 
 
-def generate_tauri_icons(app_icon: Image.Image, tray_icon: Image.Image) -> None:
-    app_icon.save(TAURI_ICON_DIR / "icon-source.png")
-    save_resized(app_icon, TAURI_ICON_DIR / "icon.png", 512)
-    save_resized(app_icon, TAURI_ICON_DIR / "32x32.png", 32)
-    save_resized(app_icon, TAURI_ICON_DIR / "128x128.png", 128)
-    save_resized(app_icon, TAURI_ICON_DIR / "128x128@2x.png", 256)
-    tray_icon_64 = tray_icon.resize((64, 64), Image.Resampling.LANCZOS)
-    tray_icon_64.save(TAURI_ICON_DIR / "tray-icon.png")
-    (TAURI_ICON_DIR / "tray-icon.rgba").write_bytes(tray_icon_64.convert("RGBA").tobytes())
-
-    for size in [30, 44, 71, 89, 107, 142, 150, 284, 310]:
-        save_resized(app_icon, TAURI_ICON_DIR / f"Square{size}x{size}Logo.png", size)
-    save_resized(app_icon, TAURI_ICON_DIR / "StoreLogo.png", 50)
-    generate_icns(app_icon, TAURI_ICON_DIR / "icon.icns")
-    generate_ico(app_icon, TAURI_ICON_DIR / "icon.ico")
-
-
 def generate_flutter_icons(app_icon: Image.Image, tray_icon: Image.Image) -> None:
     save_resized(tray_icon, FLUTTER_ASSETS / "tray_icon.png", 64)
     generate_ico(tray_icon, FLUTTER_ASSETS / "tray_icon.ico")
@@ -467,11 +448,9 @@ def main() -> None:
 
     app_icon = make_app_icon()
     tray_icon = make_tray_icon()
-    generate_tauri_icons(app_icon, tray_icon)
     generate_flutter_icons(app_icon, tray_icon)
     preview = make_preview(app_icon, tray_icon)
 
-    print(f"Generated Tauri icons in {TAURI_ICON_DIR}")
     print(f"Generated Flutter icons in {FLUTTER_ROOT}")
     print(f"Preview written to {preview}")
 
