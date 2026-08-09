@@ -82,6 +82,7 @@ impl UdpTransport {
         &self,
         peer_id: &str,
         peer_addr: SocketAddr,
+        socket_index: usize,
     ) -> OutboundProbeAdmission {
         let now = Instant::now();
         let network_key = OutboundProbeBudgetKey::Network;
@@ -104,7 +105,7 @@ impl UdpTransport {
         }
 
         if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
-            match global_budget.admit(peer_id, peer_addr).await {
+            match global_budget.admit(peer_id, peer_addr, socket_index).await {
                 OutboundProbeAdmission::Accepted => {}
                 limited => return limited,
             }

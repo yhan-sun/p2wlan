@@ -464,15 +464,28 @@ impl UdpTransport {
     /// Between the last request and the caller's first peer-directed punch
     /// this socket is exclusively owned by the generation: no refresh,
     /// maintainer or relay traffic may consume the next mapping.
+    ///
+    /// `keep_measuring` is re-evaluated before EVERY sample send and before
+    /// every waiter wait: a Direct promotion, a session cancellation or a
+    /// network-generation advance must stop the measurement immediately
+    /// instead of completing the remaining STUN samples (which would only
+    /// allocate more NAT mappings for a path that no longer needs them).
     async fn measure_fresh_mapping_batch(
         &self,
         socket: &Arc<UdpSocket>,
         observers: &[SocketAddr],
         stun_timeout: Duration,
+        keep_measuring: impl Fn() -> bool,
     ) -> Vec<MappingObservation> {
         let started_ms = monotonic_millis();
         let mut observations = Vec::with_capacity(observers.len());
         for (sequence, observer) in observers.iter().enumerate() {
+            if !keep_measuring() {
+                debug!(
+                    "Fresh-mapping STUN measurement aborted before sample {sequence}: Direct was confirmed, the session was cancelled or the network generation changed"
+                );
+                break;
+            }
             let budget_elapsed_ms = monotonic_millis().saturating_sub(started_ms) as u128;
             let remaining_budget_ms = FRESH_MAPPING_MEASURE_BUDGET
                 .as_millis()
@@ -498,7 +511,20 @@ impl UdpTransport {
                 );
                 continue;
             }
+            if !keep_measuring() {
+                self.stun_waiters.lock().await.remove(&transaction_id);
+                debug!(
+                    "Fresh-mapping STUN measurement aborted while waiting for sample {sequence}: Direct was confirmed, the session was cancelled or the network generation changed"
+                );
+                break;
+            }
             let result = tokio::time::timeout(per_sample_timeout, response_rx).await;
+            if result.is_err() {
+                // The waiter timed out without a response: remove its entry so
+                // a cancelled or stalled measurement never leaks waiters that
+                // can only be matched by the same (never-reused) transaction.
+                self.stun_waiters.lock().await.remove(&transaction_id);
+            }
             let responded_at_ms = monotonic_millis();
             let parsed = match result {
                 Ok(Ok((data, source))) if source == *observer => {
@@ -664,8 +690,18 @@ impl UdpTransport {
             .await;
 
         let started_ms = monotonic_millis();
+        let measurement_peer_id = peer_id.to_string();
         let observations = self
-            .measure_fresh_mapping_batch(&socket, &observers, stun_timeout)
+            .measure_fresh_mapping_batch(
+                &socket,
+                &observers,
+                stun_timeout,
+                || {
+                    !cancellation.is_some_and(|c| c.is_cancelled())
+                        && !self.peers.is_direct_sync(&measurement_peer_id)
+                        && self.peers.current_network_generation_sync() == network_generation
+                },
+            )
             .await;
         let finished_ms = monotonic_millis();
         if self
@@ -706,6 +742,43 @@ impl UdpTransport {
         }
 
         if sample_count < 3 {
+            // Direct confirmation, session cancellation and generation
+            // advances take precedence over the sample-count rejection: an
+            // aborted measurement (the peer went Direct mid-batch) must
+            // report the real reason instead of masking it as an insufficient
+            // sample count.
+            if self.peers.is_direct(peer_id).await {
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "fresh_mapping_skipped",
+                        None,
+                        None,
+                        None,
+                        "peer became Direct while the fresh-mapping generation measured; keeping the working data path",
+                    )
+                    .await;
+                self.detach_dynamic_socket_by_index(socket_index, "peer_became_direct")
+                    .await;
+                return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
+            }
+            if self.peers.current_network_generation().await != network_generation {
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "fresh_mapping_skipped",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "network generation changed during the fresh-mapping measurement (expected {network_generation}); discarding the batch"
+                        ),
+                    )
+                    .await;
+                self.detach_dynamic_socket_by_index(socket_index, "network_generation_changed")
+                    .await;
+                return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
+            }
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -912,6 +985,12 @@ impl UdpTransport {
                 // generation's socket immediately.
                 debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; Direct was confirmed"
+                );
+                break;
+            }
+            if self.peers.current_network_generation_sync() != network_generation {
+                debug!(
+                    "Fresh-mapping punch generation {punch_generation} aborted mid-punch; the network generation changed"
                 );
                 break;
             }

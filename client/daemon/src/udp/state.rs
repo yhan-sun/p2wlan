@@ -316,6 +316,12 @@ const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
 /// pace this over time; this cap only prevents the session from stopping after
 /// the first few hundred ports.
 const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
+/// Maximum number of probes emitted between scheduler yields in one punch
+/// session.  A large candidate set is split into these finite batches; each
+/// batch boundary yields and re-checks Direct, the network generation and the
+/// session cap, so a promotion or a network change always preempts the sweep
+/// before the next batch starts.
+pub(super) const OUTBOUND_PROBE_BATCH_SIZE: usize = 64;
 /// Two STUN observers per experimental socket are enough to publish that
 /// socket's observed mapping and infer a small per-socket port-delta prediction
 /// window without turning the bounded traversal experiment into a large STUN

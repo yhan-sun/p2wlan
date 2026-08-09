@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 type networkNodeKey struct {
@@ -17,6 +18,10 @@ type peer struct {
 	conn      net.Conn
 	send      chan []byte
 	done      chan struct{}
+	// writeFailed is set when the per-peer writer goroutine fails to write a
+	// frame; handleConn's deferred close logging uses it as the disconnect
+	// cause when a write failure raced the read loop's classification.
+	writeFailed atomic.Bool
 }
 
 type hub struct {

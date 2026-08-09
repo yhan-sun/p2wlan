@@ -863,11 +863,138 @@ async fn fresh_mapping_aborts_when_network_generation_changes_during_measurement
     );
 }
 
+/// Observers that count received STUN requests, respond slowly, and let the
+/// test prove a measurement stopped early (fewer requests than observers).
+async fn slow_observers_with_counter(
+    count: usize,
+    delay: Duration,
+    request_count: Arc<std::sync::atomic::AtomicU32>,
+) -> Vec<SocketAddr> {
+    let mut observers = Vec::new();
+    for _ in 0..count {
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                0,
+            ))
+            .await
+            .unwrap(),
+        );
+        observers.push(socket.local_addr().unwrap());
+        let socket = socket.clone();
+        let request_count = request_count.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((len, source)) = socket.recv_from(&mut buf).await {
+                if let Ok(_request) = StunMessage::decode(&buf[..len]) {
+                    request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sleep(delay).await;
+                    let mut response = StunMessage::new(p2pnet_nat::BINDING_RESPONSE);
+                    response.transaction_id = _request.transaction_id;
+                    response.add_attribute(StunAttribute::XorMappedAddress(
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42100),
+                    ));
+                    let _ = socket.send_to(&response.encode(), source).await;
+                }
+            }
+        });
+    }
+    observers
+}
+
+#[tokio::test]
+async fn direct_promotion_cancels_in_flight_fresh_mapping() {
+    let (peers, transport, nat) = generation_env().await;
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let slow = slow_observers_with_counter(4, Duration::from_millis(300), request_count.clone())
+        .await;
+    let outcome = {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            transport
+                .run_fresh_mapping_generation(
+                    "peer-b",
+                    &slow,
+                    Duration::from_millis(500),
+                    &[nat.peer_public],
+                    Duration::from_millis(10),
+                    2,
+                    None,
+                )
+                .await
+        })
+    };
+    // Let only the first STUN sample reach the observers, then confirm the
+    // peer Direct while the remaining samples are still in flight.
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        request_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "the measurement must have started before Direct was confirmed"
+    );
+    peers
+        .record_direct_success("peer-b", Some(nat.peer_public))
+        .await;
+    let outcome = timeout(Duration::from_secs(3), outcome)
+        .await
+        .expect("generation must return")
+        .expect("generation task panicked");
+    assert!(
+        matches!(
+            outcome,
+            FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded)
+        ),
+        "an in-flight fresh-mapping generation must be rejected when the peer becomes Direct, got {outcome:?}"
+    );
+    // The measurement stopped: no further STUN samples were sent after the
+    // Direct promotion landed (4 observers would otherwise be reached).
+    sleep(Duration::from_millis(500)).await;
+    let samples = request_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        samples <= 2,
+        "Direct promotion must cancel in-flight fresh mapping: {samples} samples were sent"
+    );
+    // No prediction HTTP, candidate publish or punch: the generation never
+    // reached the model/advertise/punch stages.
+    let diagnostics = peers.diagnostics().await;
+    let events = &diagnostics[0].direct_events;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.stage == "fresh_mapping_skipped"),
+        "the cancelled generation must be observable as a skipped fresh-mapping event"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.stage == "fresh_mapping_punch_sent"),
+        "no peer-facing punch may be sent after Direct promotion"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.stage == "fresh_mapping_model"),
+        "no prediction model may be advertised after Direct promotion"
+    );
+    // Waiter, provisional socket and reader task cleanup.
+    assert_eq!(
+        transport.stun_waiters.lock().await.len(),
+        0,
+        "no STUN waiter may remain after the cancelled generation"
+    );
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        transport.dynamic_socket_count().await,
+        0,
+        "the cancelled generation must not keep a provisional socket"
+    );
+    assert!(
+        peers.is_direct("peer-b").await,
+        "the just-confirmed Direct path must survive the generation"
+    );
+}
+
 #[tokio::test]
 async fn stale_ack_does_not_downgrade_committed_socket_affinity() {
-    // Two generations commit: the second replaces the first.  A late ACK that
-    // arrives on the first (older) socket must not re-pin the affinity to the
-    // soon-to-be-detached index, and a pool socket must not either.
     let (_, transport, nat) = generation_env().await;
     let first = transport
         .run_fresh_mapping_generation(

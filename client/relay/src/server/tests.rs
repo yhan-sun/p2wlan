@@ -1,6 +1,6 @@
 use super::*;
 use crate::client::RelayClient;
-use crate::{RelayClientConfig, RelayErrorCode, RelayMessage};
+use crate::{RelayClientConfig, RelayCloseReason, RelayErrorCode, RelayMessage};
 use std::time::Duration;
 
 /// Create a dev-mode config for localhost testing.

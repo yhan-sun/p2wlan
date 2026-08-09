@@ -23,7 +23,7 @@ async fn test_real_shutdown_lifecycle() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(closed_msg, RelayMessage::Closed);
+    assert_eq!(closed_msg, RelayMessage::Closed { reason: RelayCloseReason::ServerEof });
 }
 
 /// Deterministic registration cleanup test: shares the server's peer_table directly

@@ -59,7 +59,7 @@ pub use auth::{
     decode_auth_register, encode_auth_register, AuthenticatedPeer, NetworkNodeKey, TicketVerifier,
     VerifiedTicket, MAX_TICKET_LEN, MSG_AUTH_REGISTER, RELAY_PROTOCOL_VERSION,
 };
-pub use client::{RelayClient, RelayMessage};
+pub use client::{RelayClient, RelayCloseReason, RelayMessage};
 pub use error::{RelayError, RelayErrorCode, Result as RelayResult};
 pub use protocol::{Frame, MAX_PAYLOAD, VERSION as PROTOCOL_VERSION};
 pub use server::RelayServer;

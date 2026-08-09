@@ -1084,3 +1084,73 @@ async fn probe_ack_pins_peer_to_the_socket_that_received_it() {
 
     worker.abort();
 }
+
+#[tokio::test]
+async fn direct_promotion_preempts_zero_delay_probe_burst() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    // 600 candidates spread over four remote IPs so the per-remote-IP budget
+    // (384/s) cannot mask the preemption behavior; the per-peer short budget
+    // (512/s) and the session cap (512) bound the no-flip baseline.
+    let candidates = (0..600)
+        .map(|index| {
+            format!(
+                "127.{}.{}.{}:{}",
+                1 + (index % 4),
+                1 + ((index / 4) % 200),
+                1 + ((index / 800) % 200),
+                20_000 + index
+            )
+            .parse()
+            .unwrap()
+        })
+        .collect::<Vec<SocketAddr>>();
+
+    let task = {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            transport
+                .punch_candidates_until_not_direct(
+                    "peer-b",
+                    candidates,
+                    Duration::ZERO,
+                    1,
+                )
+                .await
+                .unwrap()
+        })
+    };
+    // Wait until at least two probe batches (64 probes each) were emitted,
+    // then promote the peer Direct.  The sweep must stop at the next batch
+    // boundary instead of completing the whole candidate set in one
+    // non-preemptible burst.
+    for _ in 0..2000 {
+        if transport.pending_probes.lock().await.len() >= 128 {
+            break;
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+    peers.update_state("peer-b", ConnectionState::Direct).await;
+    let sent = timeout(Duration::from_secs(10), task)
+        .await
+        .expect("punch session must return after Direct promotion")
+        .expect("punch session panicked");
+    assert!(
+        sent >= 128,
+        "the burst must have started before the promotion (sent {sent})"
+    );
+    assert!(
+        sent < 512,
+        "the zero-delay probe burst must be preempted by Direct promotion (sent {sent})"
+    );
+    let after = transport.pending_probes.lock().await.len();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        transport.pending_probes.lock().await.len(),
+        after,
+        "no probes may be emitted after Direct promotion"
+    );
+}

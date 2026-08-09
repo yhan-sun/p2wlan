@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -55,6 +56,17 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		send: make(chan []byte, s.config.SendQueueCapacity),
 		done: make(chan struct{}),
 	}
+	connStarted := time.Now()
+	// First-writer-wins disconnect cause, shared by the read loop, the
+	// registration phase, the ticket-expiry timer and the writer goroutine.
+	var closeCause atomic.Value
+	closeCause.Store("unknown")
+
+	setCloseCause := func(cause string) {
+		if closeCause.Load() == "unknown" {
+			closeCause.Store(cause)
+		}
+	}
 
 	var writerWg sync.WaitGroup
 	writerWg.Add(1)
@@ -65,6 +77,13 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		_ = conn.Close()
 		writerWg.Wait()
 		atomic.AddInt64(&s.activeConnections, -1)
+		if p.writeFailed.Load() {
+			setCloseCause("write_failed")
+		}
+		remote := authFailureSource(conn.RemoteAddr())
+		cause, _ := closeCause.Load().(string)
+		log.Printf("relay connection closed: node=%q device=%q network=%q remote=%s cause=%s duration=%s",
+			p.id, p.deviceID, p.networkID, remote, cause, time.Since(connStarted).Round(time.Millisecond))
 	}()
 
 	go func() {
@@ -76,6 +95,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 					return
 				}
 				if _, err := conn.Write(frame); err != nil {
+					p.writeFailed.Store(true)
 					_ = conn.Close()
 					return
 				}
@@ -87,6 +107,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 	source := authFailureSource(conn.RemoteAddr())
 	if s.rejectAuthRateLimited(conn, source) {
+		setCloseCause("auth_rate_limited")
 		return
 	}
 
@@ -97,13 +118,19 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			setCloseCause("register_timeout")
 			_, _ = conn.Write(errorFrame(4003, "registration timed out"))
 		} else if err == ErrInvalidMagic {
+			setCloseCause("register_invalid_magic")
 			_, _ = conn.Write(errorFrame(4000, "invalid magic"))
 		} else if err == ErrUnsupportedVers {
+			setCloseCause("register_unsupported_version")
 			_, _ = conn.Write(errorFrame(4001, "unsupported version"))
 		} else if err == ErrFrameTooLarge {
+			setCloseCause("register_frame_too_large")
 			_, _ = conn.Write(errorFrame(4006, "frame too large"))
+		} else {
+			setCloseCause("register_read_error")
 		}
 		return
 	}
@@ -112,6 +139,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	if typ == msgRegister {
 		if s.config.RequireAuthentication && !s.config.AllowLegacyUnauthenticated {
 			s.recordAuthFailure(source)
+			setCloseCause("auth_required")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
 			return
@@ -120,6 +148,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		nodeID := string(payload)
 		if nodeID == "" || len(nodeID) > 255 || !utf8.Valid(payload) {
 			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
+			setCloseCause("register_invalid_node_id")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(4000, "invalid node ID"))
 			return
@@ -129,7 +158,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		s.hub.register(p, "", nodeID)
 		atomic.AddUint64(&s.stats.legacyRegistrationsTotal, 1)
 		queue(p, makeFrame(msgRegistered, []byte(nodeID)))
-		s.handlePostRegister(conn, p, nodeID, "")
+		s.handlePostRegister(conn, p, nodeID, "", setCloseCause)
 		return
 	}
 
@@ -138,6 +167,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		nodeID, ticket, err := parseAuthRegister(payload)
 		if err != nil {
 			s.recordAuthFailure(source)
+			setCloseCause("auth_invalid_ticket")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errInvalidTicket, err.Error()))
 			return
@@ -147,6 +177,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		claims, err := s.verifyTicket(ticket)
 		if err != nil {
 			s.recordAuthFailure(source)
+			setCloseCause("auth_ticket_rejected")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			code := errInvalidTicket
 			msg := err.Error()
@@ -172,6 +203,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		// Verify node_id from frame matches ticket
 		if nodeID != claims.NodeID {
 			s.recordAuthFailure(source)
+			setCloseCause("auth_identity_mismatch")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_, _ = conn.Write(errorFrame(errIdentityMismatch, "node_id does not match ticket"))
 			return
@@ -189,11 +221,20 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 			remaining := time.Until(ticketExpiry.Time)
 			if remaining > 0 {
 				expiryTimer = time.AfterFunc(remaining, func() {
+					// Ticket expiry is a scheduled server-side close: every
+					// client whose ticket was issued with the default 5-minute
+					// TTL reconnects here.  Logged distinctly so the regular
+					// 300-second reconnect cadence is attributable and never
+					// confused with idle timeouts or network failures.
+					log.Printf("relay ticket expiry: node=%q network=%q remaining=%s closing connection",
+						nodeID, claims.NetworkID, remaining.Round(time.Millisecond))
+					setCloseCause("ticket_expiry")
 					_ = conn.Close()
 				})
 			} else {
 				// Ticket already expired
 				s.recordAuthFailure(source)
+				setCloseCause("ticket_expired_at_register")
 				_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 				_, _ = conn.Write(errorFrame(errTicketExpired, "ticket expired"))
 				return
@@ -206,7 +247,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		}
 
 		atomic.AddUint64(&s.stats.authenticatedRegistrationsTotal, 1)
-		s.handlePostRegister(conn, p, nodeID, claims.NetworkID)
+		s.handlePostRegister(conn, p, nodeID, claims.NetworkID, setCloseCause)
 		return
 	}
 
@@ -214,15 +255,17 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 	if s.config.RequireAuthentication {
 		s.recordAuthFailure(source)
+		setCloseCause("auth_required")
 		_, _ = conn.Write(errorFrame(errAuthRequired, "authentication required"))
 	} else {
 		atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
+		setCloseCause("register_required")
 		_, _ = conn.Write(errorFrame(4002, "registration required"))
 	}
 }
 
 // handlePostRegister handles the read loop after registration completes.
-func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, networkID string) {
+func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, networkID string, setCloseCause func(string)) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
@@ -230,13 +273,19 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				setCloseCause("idle_timeout")
 				_, _ = conn.Write(errorFrame(4009, "idle timeout"))
 			} else if err == ErrInvalidMagic {
+				setCloseCause("invalid_magic")
 				_, _ = conn.Write(errorFrame(4000, "invalid magic"))
 			} else if err == ErrUnsupportedVers {
+				setCloseCause("unsupported_version")
 				_, _ = conn.Write(errorFrame(4001, "unsupported version"))
 			} else if err == ErrFrameTooLarge {
+				setCloseCause("frame_too_large")
 				_, _ = conn.Write(errorFrame(4006, "frame too large"))
+			} else {
+				setCloseCause("read_error")
 			}
 			return
 		}
@@ -248,6 +297,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 				atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
 				queue(p, errorFrame(4004, "already registered with a different node ID"))
 				time.Sleep(50 * time.Millisecond)
+				setCloseCause("duplicate_register_conflict")
 				return
 			}
 			queue(p, makeFrame(msgRegistered, []byte(newID)))
@@ -271,6 +321,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 			queue(p, makeFrame(msgPong, payload))
 
 		case msgClose:
+			setCloseCause("client_close")
 			return
 
 		default:

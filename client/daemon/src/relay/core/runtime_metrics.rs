@@ -65,3 +65,21 @@ fn relay_error_peer_id(message: &str) -> Option<&str> {
         .map(str::trim)
         .filter(|peer_id| !peer_id.is_empty())
 }
+
+/// Machine-readable label for a classified relay close reason, surfaced in
+/// the relay selection diagnostics and the supervisor's reconnect warning so
+/// the production "relay connection closed; reconnecting" line can be
+/// attributed (server EOF, TCP reset, idle timeout, server close frame,
+/// local write failure, ticket-expiry close arrives as a server EOF).
+fn relay_close_reason_label(reason: p2pnet_relay::RelayCloseReason) -> &'static str {
+    match reason {
+        p2pnet_relay::RelayCloseReason::ServerCloseFrame => "server_close_frame",
+        p2pnet_relay::RelayCloseReason::ServerEof => "server_eof",
+        p2pnet_relay::RelayCloseReason::TcpReset => "tcp_reset",
+        p2pnet_relay::RelayCloseReason::IdleTimeout => "idle_timeout",
+        p2pnet_relay::RelayCloseReason::LocalWriteFailed => "local_write_failed",
+        p2pnet_relay::RelayCloseReason::LocalShutdown => "local_shutdown",
+        p2pnet_relay::RelayCloseReason::IoError => "io_error",
+        p2pnet_relay::RelayCloseReason::Unknown => "unknown",
+    }
+}

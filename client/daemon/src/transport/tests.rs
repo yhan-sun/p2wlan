@@ -2150,4 +2150,77 @@ socket_index: None,
             "a colliding old ACK must not establish affinity"
         );
     }
+    #[tokio::test]
+    async fn hedge_duplicate_replay_is_safe_and_observable() {
+        // The same WireGuard ciphertext is legitimately delivered twice during
+        // the Direct trial window (once per Direct path, once per relay
+        // hedge).  The second copy must be dropped by WireGuard replay
+        // protection, attributed as a hedge duplicate, and must not change
+        // any path state.
+        let (node_a_session, mut node_b_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-b", node_a_session).await;
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x4321,
+            1,
+            b"hedge",
+        );
+        let wire = node_b_session.encrypt_to_bytes(&packet).unwrap();
+
+        // First delivery decrypts normally.
+        let first = transport
+            .decrypt_inbound(&wire)
+            .await
+            .expect("first delivery must decrypt")
+            .expect("must be decrypted for the peer session");
+        assert_eq!(first.peer_id, "peer-b");
+        assert_eq!(transport.hedge_replay_count("peer-b"), 0);
+
+        // Second delivery of the identical ciphertext is replay-classified:
+        // observable (counted) and safe (an error, no state mutation).
+        let second = transport.decrypt_inbound(&wire).await;
+        assert!(
+            second.is_err(),
+            "the duplicate ciphertext must be rejected by WireGuard replay protection"
+        );
+        assert!(
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("replay detected"),
+            "the rejection must be classified as replay detected"
+        );
+        assert_eq!(
+            transport.hedge_replay_count("peer-b"),
+            1,
+            "the hedge duplicate must be attributed and counted per peer"
+        );
+
+        // A third duplicate increments the counter; the classification stays
+        // safe and does not consume any future counter.
+        let third = transport.decrypt_inbound(&wire).await;
+        assert!(third.is_err());
+        assert_eq!(transport.hedge_replay_count("peer-b"), 2);
+
+        // The session is untouched: a NEW packet with the next counter still
+        // decrypts, and the transport never learned any path state from the
+        // duplicates.
+        let next_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x4322,
+            1,
+            b"next",
+        );
+        let next_wire = node_b_session.encrypt_to_bytes(&next_packet).unwrap();
+        let next = transport
+            .decrypt_inbound(&next_wire)
+            .await
+            .expect("a fresh packet must still decrypt after hedge duplicates")
+            .expect("fresh packet decrypts");
+        assert_eq!(next.peer_id, "peer-b");
+    }
 }

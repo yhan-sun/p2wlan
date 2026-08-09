@@ -225,7 +225,6 @@ impl RelaySupervisor {
         let mut retry_delay = Duration::from_secs(1);
         let max_retry_delay = Duration::from_secs(30);
         let mut cooldowns: HashMap<String, Instant> = HashMap::new();
-
         loop {
             let now = Instant::now();
             cooldowns.retain(|_, until| *until > now);
@@ -352,10 +351,37 @@ impl RelaySupervisor {
                 );
             }
 
-            sleep(retry_delay).await;
+            // Bounded exponential backoff with full-range jitter: every retry
+            // sleeps base + U(0, base) so multiple nodes that fail together
+            // (e.g. a relay-side close of many connections) do not reconnect
+            // synchronously in lockstep.
+            let jittered = relay_retry_delay_with_jitter(retry_delay);
+            debug!(
+                "Relay supervisor sleeping {jittered:?} before the next selection attempt (base={retry_delay:?})"
+            );
+            sleep(jittered).await;
             retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
         }
     }
+}
+
+/// Bounded exponential backoff with full jitter.
+///
+/// Returns a delay in `[base, 2*base)` (bounded by the caller's cap applied
+/// to `base` before the jitter is added).  The jitter range equals the base,
+/// so two nodes that fail at the same instant spread their retries over one
+/// full backoff interval instead of reconnecting in lockstep.
+fn relay_retry_delay_with_jitter(base: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let base_ms = base.as_millis().min(u64::MAX as u128) as u64;
+    if base_ms == 0 {
+        return Duration::from_millis(1);
+    }
+    use rand::Rng;
+    let jitter_ms = rand::thread_rng().gen_range(0..=base_ms);
+    Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
 
 fn relay_failure_summary(diagnostics: &RelaySelectionDiagnostics) -> String {
@@ -488,4 +514,47 @@ pub(super) async fn send_relay_validation_packet(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_reconnect_backoff_is_bounded_and_jittered() {
+        // Full-jitter backoff: every retry sleeps in [base, 2*base) so nodes
+        // that fail together do not reconnect in lockstep.
+        for _ in 0..200 {
+            let delay = relay_retry_delay_with_jitter(Duration::from_secs(1));
+            assert!(
+                delay >= Duration::from_secs(1) && delay < Duration::from_secs(2),
+                "jittered delay must stay in [base, 2*base), got {delay:?}"
+            );
+        }
+        let mut observed = std::collections::HashSet::new();
+        for _ in 0..50 {
+            observed.insert(relay_retry_delay_with_jitter(Duration::from_secs(1)).as_millis());
+        }
+        assert!(
+            observed.len() > 1,
+            "the jitter must actually spread the retry delays, got {observed:?}"
+        );
+        assert_eq!(
+            relay_retry_delay_with_jitter(Duration::ZERO),
+            Duration::ZERO
+        );
+
+        // The supervisor's exponential doubling is capped: simulate the
+        // sequence of bases after repeated failures (1s, 2s, 4s, ... capped at
+        // the 30s max) and verify each jittered delay respects its own bound.
+        let mut retry_delay = Duration::from_secs(1);
+        let max_retry_delay = Duration::from_secs(30);
+        for _ in 0..10 {
+            let jittered = relay_retry_delay_with_jitter(retry_delay);
+            assert!(jittered >= retry_delay);
+            assert!(jittered < retry_delay.saturating_mul(2));
+            retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+        }
+        assert_eq!(retry_delay, max_retry_delay, "the backoff must be capped");
+    }
 }

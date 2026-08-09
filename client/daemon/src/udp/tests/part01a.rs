@@ -355,14 +355,14 @@ async fn global_outbound_probe_budget_limits_across_transports() {
 
     for _ in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
         assert_eq!(
-            global_budget.admit(peer_id, endpoint).await,
+            global_budget.admit(peer_id, endpoint, 0).await,
             OutboundProbeAdmission::Accepted
         );
     }
 
     assert_eq!(
         transport_b
-            .admit_outbound_connectivity_probe(peer_id, endpoint)
+            .admit_outbound_connectivity_probe(peer_id, endpoint, 0)
             .await,
         OutboundProbeAdmission::GlobalRemoteIpRateLimited
     );
@@ -385,7 +385,7 @@ async fn outbound_probe_budget_limits_across_peers_on_same_network() {
 
     assert_eq!(
         transport
-            .admit_outbound_connectivity_probe("peer-extra", "127.9.9.9:49999".parse().unwrap(),)
+            .admit_outbound_connectivity_probe("peer-extra", "127.9.9.9:49999".parse().unwrap(), 0)
             .await,
         OutboundProbeAdmission::NetworkRateLimited
     );
@@ -475,4 +475,70 @@ fn establish_sessions() -> (TransportSession, TransportSession) {
         TransportSession::new(node_a_keys),
         TransportSession::new(node_b_keys),
     )
+}
+
+#[tokio::test]
+async fn persistent_probe_budget_spans_retries() {
+    let global_budget = Arc::new(GlobalOutboundProbeBudget::new());
+    let peer_id = "peer-persistent";
+    let endpoint: SocketAddr = "203.0.113.5:45000".parse().unwrap();
+
+    // Fill the persistent peer budget with entries that are older than the
+    // 1-second short window but inside the 60-second persistent window: the
+    // short window refills every second, so without the persistent layer a
+    // retry cycle could re-emit the same volume forever across retries.
+    {
+        let now = Instant::now();
+        let mut state = global_budget.state.lock().await;
+        state.insert(
+            OutboundProbeBudgetKey::PeerPersistent(peer_id.to_string()),
+            std::iter::repeat_n(
+                now - OUTBOUND_PROBE_PERSISTENT_WINDOW + Duration::from_secs(5),
+                OUTBOUND_PROBE_PERSISTENT_PER_PEER,
+            )
+            .collect(),
+        );
+    }
+
+    // The short window is empty (all entries are older than 1s), yet the
+    // persistent layer must still reject: retries cannot bypass the long-term
+    // allowance through per-second window refills.
+    assert_eq!(
+        global_budget.admit(peer_id, endpoint, 0).await,
+        OutboundProbeAdmission::GlobalPeerPersistentRateLimited
+    );
+
+    // A different peer still has its own persistent allowance (per-peer
+    // isolation): a failing peer cannot exhaust the shared NAT's probe
+    // allowance for a healthy peer.
+    assert_eq!(
+        global_budget
+            .admit("peer-healthy", "203.0.113.6:45001".parse().unwrap(), 0)
+            .await,
+        OutboundProbeAdmission::Accepted
+    );
+
+    // The per-(peer, socket) persistent layer isolates local NAT sockets too.
+    let socket_peer = "peer-socket-bound";
+    {
+        let now = Instant::now();
+        let mut state = global_budget.state.lock().await;
+        state.insert(
+            OutboundProbeBudgetKey::PeerSocketPersistent(socket_peer.to_string(), 2),
+            std::iter::repeat_n(
+                now - OUTBOUND_PROBE_PERSISTENT_WINDOW + Duration::from_secs(5),
+                OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET,
+            )
+            .collect(),
+        );
+    }
+    assert_eq!(
+        global_budget.admit(socket_peer, endpoint, 2).await,
+        OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited
+    );
+    // The same peer on a different socket still has its own allowance.
+    assert_eq!(
+        global_budget.admit(socket_peer, endpoint, 3).await,
+        OutboundProbeAdmission::Accepted
+    );
 }

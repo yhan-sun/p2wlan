@@ -1,5 +1,5 @@
 use super::*;
-use crate::server::RelayServer;
+use crate::{RelayClientConfig, RelayServer, RelayServerConfig};
 use std::time::Duration;
 
 #[tokio::test]
@@ -245,4 +245,263 @@ async fn test_bidirectional_stream() {
         .all(|m| matches!(m, RelayMessage::Data { from_node, .. } if from_node == "streamB")));
 
     server.shutdown().await;
+}
+
+/// Keepalive pings keep the connection alive across many idle windows: with
+/// keepalive 50ms and a server idle timeout of 200ms, the connection must
+/// survive 600ms (3 idle windows) and keep receiving pongs.
+#[tokio::test]
+async fn relay_ping_pong_survives_idle_window() {
+    let server_config = RelayServerConfig {
+        idle_timeout: Duration::from_millis(200),
+        allow_insecure_plaintext: true,
+        require_authentication: false,
+        allow_legacy_unauthenticated: true,
+        ..Default::default()
+    };
+    let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    let addr = server.addr;
+
+    let (_client, mut rx) = RelayClient::connect_to_addr_with_keepalive(
+        addr,
+        "survive-idle",
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    let mut pong_count = 0u32;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(RelayMessage::Pong { .. })) => pong_count += 1,
+            Ok(Some(other)) => {
+                panic!("unexpected message while keepalive should survive: {other:?}")
+            }
+            Ok(None) => panic!("relay connection closed while keepalive is healthy"),
+            Err(_) => {
+                // The keepalive interval may not align with the deadline; a
+                // timeout right at the end is fine as long as the connection
+                // survived the whole window.
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                panic!("no pong within the keepalive interval");
+            }
+        }
+    }
+    assert!(
+        pong_count >= 3,
+        "the keepalive must produce regular pongs across multiple idle windows, got {pong_count}"
+    );
+    server.shutdown().await;
+}
+
+/// Force an RST on the connection: SO_LINGER(0) is the only portable way to
+/// make the kernel send RST instead of a clean FIN on close.
+#[allow(deprecated)]
+fn force_rst(stream: &tokio::net::TcpStream) {
+    stream
+        .set_linger(Some(std::time::Duration::from_millis(0)))
+        .unwrap();
+}
+
+/// Minimal raw TCP server harness that behaves like a relay for
+/// close-classification tests.
+async fn raw_relay_peer<F, Fut>(handler: F) -> std::net::SocketAddr
+where
+    F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            handler(stream).await;
+        }
+    });
+    addr
+}
+
+/// The client classifies every disconnect: server EOF, TCP reset, explicit
+/// server Close frame, idle timeout and a local shutdown are distinguishable.
+#[tokio::test]
+async fn relay_disconnect_reason_is_classified() {
+    use tokio::io::AsyncWriteExt;
+
+    // 1. Server drops the connection after consuming the register frame
+    //    (clean FIN) -> ServerEof.
+    let addr = raw_relay_peer(|mut stream| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(&Frame::registered("eof-node").encode())
+            .await
+            .unwrap();
+        drop(stream);
+    })
+    .await;
+    let (_client, mut rx) = RelayClient::connect(&addr.to_string(), "eof-node")
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        RelayMessage::Closed { reason } => assert_eq!(reason, RelayCloseReason::ServerEof),
+        other => panic!("expected ServerEof classification, got {other:?}"),
+    }
+
+    // 2. Server resets the TCP connection -> TcpReset.
+    let addr = raw_relay_peer(|mut stream| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(&Frame::registered("rst-node").encode())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        force_rst(&stream);
+        drop(stream);
+    })
+    .await;
+    let (_client, mut rx) = RelayClient::connect(&addr.to_string(), "rst-node")
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        RelayMessage::Closed { reason } => assert_eq!(reason, RelayCloseReason::TcpReset),
+        other => panic!("expected TcpReset classification, got {other:?}"),
+    }
+
+    // 3. Server sends an explicit Close frame -> ServerCloseFrame.
+    let addr = raw_relay_peer(|mut stream| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(&Frame::registered("close-node").encode())
+            .await
+            .unwrap();
+        stream
+            .write_all(&Frame::close(CLOSE_NORMAL).encode())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+    })
+    .await;
+    let (_client, mut rx) = RelayClient::connect(&addr.to_string(), "close-node")
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        RelayMessage::Closed { reason } => assert_eq!(reason, RelayCloseReason::ServerCloseFrame),
+        other => panic!("expected ServerCloseFrame classification, got {other:?}"),
+    }
+
+    // 4. Idle timeout -> the Error{4009} frame is followed by Closed with the
+    //    IdleTimeout classification.
+    let addr = raw_relay_peer(|mut stream| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(&Frame::registered("idle-node").encode())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        eprintln!("[idle-server] sleeping 500ms");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eprintln!("[idle-server] dropping");
+    })
+    .await;
+    let config = RelayClientConfig {
+        idle_timeout: Duration::from_millis(100),
+        keepalive_interval: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let (_client, mut rx) =
+        RelayClient::connect_with_config(&addr.to_string(), "idle-node", config)
+            .await
+            .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    eprintln!("idle-case first message: {first:?}");
+    assert_eq!(
+        first,
+        RelayMessage::Error {
+            code: ERR_IDLE_TIMEOUT,
+            message: "idle timeout".to_string()
+        }
+    );
+    let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match second {
+        RelayMessage::Closed { reason } => assert_eq!(reason, RelayCloseReason::IdleTimeout),
+        other => panic!("expected IdleTimeout classification, got {other:?}"),
+    }
+
+    // 5. Local shutdown via the client Close command -> LocalShutdown.
+    let server_config = RelayServerConfig {
+        allow_insecure_plaintext: true,
+        require_authentication: false,
+        allow_legacy_unauthenticated: true,
+        ..Default::default()
+    };
+    let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "local-node")
+        .await
+        .unwrap();
+    client.close().await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        RelayMessage::Closed { reason } => assert_eq!(reason, RelayCloseReason::LocalShutdown),
+        other => panic!("expected LocalShutdown classification, got {other:?}"),
+    }
+    server.shutdown().await;
+}
+
+/// The first close-reason attribution wins: a write failure that races the
+/// read task's close observation is never mislabeled as a server close.
+#[test]
+fn close_reason_first_writer_wins_for_write_failure() {
+    let reason = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
+    note_close_reason(&reason, RelayCloseReason::LocalWriteFailed);
+    note_close_reason(&reason, RelayCloseReason::ServerEof);
+    assert_eq!(*reason.lock().unwrap(), RelayCloseReason::LocalWriteFailed);
+    assert_eq!(
+        resolve_close_reason(&reason),
+        RelayCloseReason::LocalWriteFailed
+    );
+
+    let unclassified = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
+    assert_eq!(
+        resolve_close_reason(&unclassified),
+        RelayCloseReason::LocalShutdown
+    );
 }

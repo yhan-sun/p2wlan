@@ -20,6 +20,83 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) boot_epoch_ms: u64,
 }
 
+/// Volatile candidate churn (source-only or short-lived port changes on the
+/// same public IP) is coalesced newest-wins and published at most once per
+/// debounce window.  Pure port jitter must not fan out an offer plus a
+/// synchronized punch session to every non-Direct peer on every refresh.
+const VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// Decision a volatile churn takes against the coalescer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VolatileChurnAction {
+    /// The churn produced the exact set that was already published: nothing
+    /// to schedule, no fan-out.
+    SuppressIdentical,
+    /// A newer volatile set replaced the pending one while the debounce
+    /// window is still open: newest-wins, still no immediate fan-out.
+    CoalescedNewest,
+    /// The churn opened a new debounce window; the pending set publishes once
+    /// when the window elapses.
+    SchedulePublish,
+}
+
+/// Newest-wins coalescing for volatile-only candidate publications.
+///
+/// Kept as a pure state machine so the "no fan-out per refresh" invariant is
+/// directly testable without a control plane.
+#[derive(Debug, Default)]
+pub(super) struct VolatilePublishCoalescer {
+    last_published_hash: Option<u64>,
+    pending_hash: Option<u64>,
+    debounce_until: Option<Instant>,
+}
+
+impl VolatilePublishCoalescer {
+    /// Apply one volatile churn.  `now` is only used for debounce window
+    /// expiry; the coalescer never publishes itself.
+    pub(super) fn on_churn(&mut self, hash: u64, now: Instant) -> VolatileChurnAction {
+        if self.last_published_hash == Some(hash) {
+            return VolatileChurnAction::SuppressIdentical;
+        }
+        if self.pending_hash.is_some() {
+            // Newest-wins: any churn inside the open debounce window replaces
+            // the pending set and slides the window; still no fan-out.
+            self.pending_hash = Some(hash);
+            self.debounce_until = Some(now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE);
+            return VolatileChurnAction::CoalescedNewest;
+        }
+        self.pending_hash = Some(hash);
+        self.debounce_until = Some(now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE);
+        VolatileChurnAction::SchedulePublish
+    }
+
+    /// Whether a pending publication's debounce window has elapsed.
+    pub(super) fn pending_due(&self, now: Instant) -> bool {
+        self.pending_hash.is_some() && self.debounce_until.is_some_and(|until| now >= until)
+    }
+
+    /// Take the pending hash whose window elapsed.
+    pub(super) fn take_due(&mut self, now: Instant) -> Option<u64> {
+        if !self.pending_due(now) {
+            return None;
+        }
+        self.debounce_until = None;
+        self.pending_hash.take()
+    }
+
+    /// Remember a hash that was actually published.
+    pub(super) fn record_published(&mut self, hash: u64) {
+        self.last_published_hash = Some(hash);
+    }
+}
+
+/// Newest-wins pending publication for volatile-only candidate changes.
+struct VolatileCandidatePublish {
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    debounce_until: Instant,
+}
+
 pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
     let UdpCandidateRefreshContext {
         udp,
@@ -44,9 +121,52 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
     } = context;
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
     ticker.tick().await;
+    let mut pending_volatile: Option<VolatileCandidatePublish> = None;
+    let mut volatile_coalescer = VolatilePublishCoalescer::default();
 
     loop {
         ticker.tick().await;
+
+        // Flush a coalesced volatile publication whose debounce window
+        // elapsed.  The pending set is the newest committed candidate set;
+        // identical re-publication is suppressed via the published hash.
+        if let Some(hash) = volatile_coalescer.take_due(Instant::now()) {
+            let pending = pending_volatile
+                .take()
+                .expect("pending volatile publication verified above");
+            let payload_hash = candidate_set_hash(&pending.candidates, &pending.candidate_sources);
+            if payload_hash == hash {
+                publish_local_candidates_to_known_peers(
+                    &control,
+                    peers.clone(),
+                    udp.clone(),
+                    punch_deduplicator.clone(),
+                    &pending.candidates,
+                    &pending.candidate_sources,
+                    probe_interval,
+                    punch_attempts,
+                    "UDP volatile candidate refresh",
+                    Some(HolePunchSignalContext {
+                        control: control.clone(),
+                        local_candidates: local_candidates.clone(),
+                        local_candidate_sources: local_candidate_sources.clone(),
+                        stun_servers: stun_servers.clone(),
+                        stun_timeout,
+                        boot_epoch_ms,
+                    }),
+                )
+                .await;
+                volatile_coalescer.record_published(hash);
+                info!(
+                    "Published coalesced volatile UDP candidate refresh (hash={hash}, candidates={})",
+                    pending.candidates.len()
+                );
+            } else {
+                debug!(
+                    "Suppressed volatile UDP candidate publication: coalesced set is identical to the last published set (hash={payload_hash})"
+                );
+            }
+        }
 
         let refresh_guard = candidate_refresh_lock.lock().await;
 
@@ -183,26 +303,44 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     published_endpoint = Some(endpoint);
                 }
             }
-            publish_local_candidates_to_known_peers(
-                &control,
-                peers.clone(),
-                udp.clone(),
-                punch_deduplicator.clone(),
-                &candidates,
-                &candidate_sources,
-                probe_interval,
-                punch_attempts,
-                "UDP volatile candidate refresh",
-                Some(HolePunchSignalContext {
-                    control: control.clone(),
-                    local_candidates: local_candidates.clone(),
-                    local_candidate_sources: local_candidate_sources.clone(),
-                    stun_servers: stun_servers.clone(),
-                    stun_timeout,
-                    boot_epoch_ms,
-                }),
-            )
-            .await;
+            // Volatile-only churn is coalesced newest-wins and published at
+            // most once per debounce window instead of fanning out an offer
+            // plus a synchronized punch session to every non-Direct peer on
+            // every refresh.  The committed candidate set above is already
+            // the newest state; only the offer/punch publication is deferred.
+            let hash = candidate_set_hash(&candidates, &candidate_sources);
+            let now = Instant::now();
+            match volatile_coalescer.on_churn(hash, now) {
+                VolatileChurnAction::SuppressIdentical => {
+                    debug!(
+                        "Volatile candidate refresh suppressed: candidate set is identical to the last published set (hash={hash}); no offer fan-out"
+                    );
+                }
+                VolatileChurnAction::CoalescedNewest => {
+                    let pending = pending_volatile
+                        .as_mut()
+                        .expect("coalesced pending verified above");
+                    pending.candidates = candidates.clone();
+                    pending.candidate_sources = candidate_sources.clone();
+                    pending.debounce_until =
+                        now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE;
+                    debug!(
+                        "Volatile candidate churn coalesced newest-wins (hash={hash}); resetting the {}-s debounce window without offer fan-out",
+                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_secs()
+                    );
+                }
+                VolatileChurnAction::SchedulePublish => {
+                    pending_volatile = Some(VolatileCandidatePublish {
+                        candidates: candidates.clone(),
+                        candidate_sources: candidate_sources.clone(),
+                        debounce_until: now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE,
+                    });
+                    debug!(
+                        "Volatile candidate churn (hash={hash}) will be published once after the {}-s debounce window",
+                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_secs()
+                    );
+                }
+            }
             continue;
         }
         if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {

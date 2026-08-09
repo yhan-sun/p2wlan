@@ -133,13 +133,17 @@ impl RelayClient {
         let (msg_tx, msg_rx) = mpsc::channel::<RelayMessage>(config.inbound_queue_capacity);
         let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<Result<()>>();
         let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+        // Shared close-reason attribution shared by both background tasks.
+        let close_reason = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
 
         // Write task
         let write_close_tx = close_tx.clone();
         let mut write_close_rx = close_rx.clone();
         let max_payload = config.max_frame_payload;
+        let write_reason = close_reason.clone();
+        let keepalive_interval = config.keepalive_interval;
         let _write_task = tokio::spawn(async move {
-            let mut keepalive = tokio::time::interval(config.keepalive_interval);
+            let mut keepalive = tokio::time::interval(keepalive_interval);
             keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             keepalive.tick().await;
 
@@ -150,32 +154,53 @@ impl RelayClient {
                         match cmd {
                             ClientCommand::SendFrame(frame) => {
                                 if frame.payload.len() > max_payload { continue; }
-                                if writer.write_all(&frame.encode()).await.is_err() { break; }
+                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                    warn!("Relay write error: {}", err);
+                                    note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
+                                    break;
+                                }
                             }
                             ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
                                 Ok(frame) => {
                                     if frame.payload.len() > max_payload { continue; }
-                                    if writer.write_all(&frame.encode()).await.is_err() { break; }
+                                    if let Err(err) = writer.write_all(&frame.encode()).await {
+                                        warn!("Relay write error: {}", err);
+                                        note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
+                                        break;
+                                    }
                                 }
                                 Err(e) => { warn!("Failed to build forward frame: {}", e); }
                             },
                             ClientCommand::Ping => {
                                 let frame = Frame::ping();
-                                if writer.write_all(&frame.encode()).await.is_err() { break; }
+                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                    warn!("Relay ping write error: {}", err);
+                                    note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
+                                    break;
+                                }
                             }
                             ClientCommand::Close => {
                                 let frame = Frame::close(CLOSE_NORMAL);
                                 let _ = writer.write_all(&frame.encode()).await;
+                                note_close_reason(&write_reason, RelayCloseReason::LocalShutdown);
                                 break;
                             }
                         }
                     }
                     _ = keepalive.tick() => {
                         let frame = Frame::ping();
-                        if writer.write_all(&frame.encode()).await.is_err() { break; }
+                        if let Err(err) = writer.write_all(&frame.encode()).await {
+                            warn!("Relay keepalive write error: {}", err);
+                            note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
+                            break;
+                        }
+                        debug!("Relay keepalive ping sent (interval={:?})", keepalive_interval);
                     }
                     changed = write_close_rx.changed() => {
-                        if changed.is_ok() && *write_close_rx.borrow() { break; }
+                        if changed.is_ok() && *write_close_rx.borrow() {
+                            note_close_reason(&write_reason, RelayCloseReason::LocalShutdown);
+                            break;
+                        }
                     }
                 }
             }
@@ -189,6 +214,7 @@ impl RelayClient {
         let read_close_tx = close_tx.clone();
         let mut read_close_rx = close_rx.clone();
         let idle_timeout = config.idle_timeout;
+        let read_reason = close_reason.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
@@ -209,11 +235,22 @@ impl RelayClient {
 
                 match read_res {
                     Ok(true) => {}
-                    Ok(false) => break,
+                    Ok(false) => {
+                        // The write task already attributed the end (or the
+                        // connection was shut down locally); leave the first
+                        // attribution in place.
+                        break;
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        note_close_reason(&read_reason, RelayCloseReason::ServerEof);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                        note_close_reason(&read_reason, RelayCloseReason::TcpReset);
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
                         let _ = msg_tx_clone.try_send(RelayMessage::Error {
                             code: ERR_IDLE_TIMEOUT,
                             message: "idle timeout".to_string(),
@@ -222,6 +259,7 @@ impl RelayClient {
                     }
                     Err(e) => {
                         warn!("Relay read error: {}", e);
+                        note_close_reason(&read_reason, RelayCloseReason::IoError);
                         break;
                     }
                 }
@@ -264,6 +302,7 @@ impl RelayClient {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
                             let _ = msg_tx_clone.try_send(RelayMessage::Error {
                                 code: ERR_IDLE_TIMEOUT,
                                 message: "idle timeout during payload".to_string(),
@@ -272,6 +311,7 @@ impl RelayClient {
                         }
                         Err(e) => {
                             warn!("Relay payload read error: {}", e);
+                            note_close_reason(&read_reason, RelayCloseReason::IoError);
                             break;
                         }
                     }
@@ -334,6 +374,7 @@ impl RelayClient {
                         }
                     }
                     MSG_CLOSE => {
+                        note_close_reason(&read_reason, RelayCloseReason::ServerCloseFrame);
                         break;
                     }
                     _ => {
@@ -342,9 +383,10 @@ impl RelayClient {
                 }
             }
 
-            let _ = msg_tx_clone.try_send(RelayMessage::Closed);
+            let reason = resolve_close_reason(&read_reason);
+            let _ = msg_tx_clone.try_send(RelayMessage::Closed { reason });
             let _ = read_close_tx.send(true);
-            debug!("Relay read task ended");
+            debug!("Relay read task ended; close_reason={reason:?}");
         });
 
         // Wait for registration confirmation

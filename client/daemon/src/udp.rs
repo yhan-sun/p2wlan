@@ -39,6 +39,11 @@ use probe_budget::{
     OutboundProbeBudgetKey, OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK,
     OUTBOUND_PROBE_BUDGET_PER_PEER, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
 };
+#[cfg(test)]
+use probe_budget::{
+    OUTBOUND_PROBE_PERSISTENT_PER_PEER, OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET,
+    OUTBOUND_PROBE_PERSISTENT_WINDOW,
+};
 include!("udp/state.rs");
 include!("udp/core.rs");
 include!("udp/admission.rs");

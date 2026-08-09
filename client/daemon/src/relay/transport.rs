@@ -155,15 +155,18 @@ impl RelayTransport {
     ) -> Result<()> {
         while let Some(message) = relay_rx.recv().await {
             match message {
-                RelayMessage::Closed => {
+                RelayMessage::Closed { reason } => {
+                    let reason_label = relay_close_reason_label(reason);
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
                         d.selected_error_count = d.selected_error_count.saturating_add(1);
-                        d.last_error = Some("relay connection closed by remote".to_string());
-                        d.last_error_code = Some("transport_closed".to_string());
+                        d.last_error = Some(format!(
+                            "relay connection closed: reason={reason_label}"
+                        ));
+                        d.last_error_code = Some(reason_label.to_string());
                     }
                     return Err(DaemonError::Relay(format!(
-                        "relay {} connection closed",
+                        "relay {} connection closed; reason={reason_label}",
                         self.relay_endpoint
                     )));
                 }
