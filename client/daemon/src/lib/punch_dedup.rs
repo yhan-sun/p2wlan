@@ -12,6 +12,11 @@ struct PunchAttemptState {
 struct PunchAttemptRecord {
     session_id: u64,
     priority: u8,
+    /// Recovery epoch the claim belongs to (0 for epoch-less legacy claims).
+    /// A claim from a different non-zero epoch supersedes the active session:
+    /// a new `(peer_id, network_generation, recovery_epoch)` plan is the only
+    /// thing that may preempt an active session at equal priority.
+    epoch: u64,
     /// Identity of the fresh-mapping prediction backing this session, when
     /// the session is a fresh-prediction claim.  Ordering is lexicographic on
     /// (incarnation boot epoch, generation): a newer incarnation supersedes
@@ -101,16 +106,35 @@ impl Drop for PunchSessionPermit {
 }
 
 impl PunchAttemptDeduplicator {
+    #[cfg(test)]
     async fn claim(&self, peer_id: &str) -> Option<PunchSessionPermit> {
-        self.claim_with_priority(peer_id, PUNCH_PRIORITY_SYNCHRONIZED, None)
+        self.claim_with_priority(peer_id, 0, PUNCH_PRIORITY_SYNCHRONIZED, None)
     }
 
+    #[cfg(test)]
     async fn claim_with_window(
         &self,
         peer_id: &str,
         _window: Duration,
     ) -> Option<PunchSessionPermit> {
-        self.claim_with_priority(peer_id, PUNCH_PRIORITY_BACKGROUND, None)
+        self.claim_with_priority(peer_id, 0, PUNCH_PRIORITY_BACKGROUND, None)
+    }
+
+    /// Claim the punch session for a recovery-epoch-scoped trigger.
+    ///
+    /// All production punch entry points (offers, fresh predictions,
+    /// background retries, peer-reflexive observations) claim through here:
+    /// the epoch is the authoritative `(peer_id, generation, epoch)` plan
+    /// identity, so a new plan always supersedes the active session while
+    /// triggers inside the SAME plan follow the priority rules below.
+    async fn claim_for_epoch(
+        &self,
+        peer_id: &str,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+    ) -> Option<PunchSessionPermit> {
+        self.claim_with_priority(peer_id, epoch, priority, fresh_generation)
     }
 
     /// Claim the punch session for a fresh-mapping prediction signal.
@@ -120,23 +144,27 @@ impl PunchAttemptDeduplicator {
     /// supersedes an older one at the same priority (including one from an
     /// older daemon incarnation); any older ordinary or background session is
     /// cancelled immediately.
+    #[cfg(test)]
     async fn claim_fresh_prediction(
         &self,
         peer_id: &str,
         signal_id: crate::FreshPredictionId,
     ) -> Option<PunchSessionPermit> {
-        self.claim_with_priority(peer_id, PUNCH_PRIORITY_FRESH_PREDICTION, Some(signal_id))
+        self.claim_with_priority(peer_id, 0, PUNCH_PRIORITY_FRESH_PREDICTION, Some(signal_id))
     }
 
     fn claim_with_priority(
         &self,
         peer_id: &str,
+        epoch: u64,
         priority: u8,
         fresh_generation: Option<crate::FreshPredictionId>,
     ) -> Option<PunchSessionPermit> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(active) = state.active.get(peer_id) {
-            let preempt = active.priority < priority
+            let epoch_preempts = active.epoch != 0 && epoch != 0 && active.epoch != epoch;
+            let preempt = epoch_preempts
+                || active.priority < priority
                 || (active.priority == priority
                     && priority == PUNCH_PRIORITY_FRESH_PREDICTION
                     && active
@@ -156,6 +184,7 @@ impl PunchAttemptDeduplicator {
             PunchAttemptRecord {
                 session_id,
                 priority,
+                epoch,
                 fresh_generation,
                 cancellation: cancellation.clone(),
             },

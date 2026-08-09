@@ -63,13 +63,20 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
+        let reason = reason.into();
+        // NOTE: a no-ACK probe batch must NOT move the recovery stage into
+        // RelayBackoff — the stage machine advances Initial -> Predicted ->
+        // ScatterSmall -> ScatterExtended on no-ACK feedback (see
+        // `record_direct_probe_batch_failure_for_generation`), and marking
+        // RelayBackoff here would short-circuit that progression and cap the
+        // scan at 96 ports forever.  Only true hard failures (send errors,
+        // handshake timeouts) call `mark_recovery_relay_backoff` explicitly.
         let probed_sources = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
             let code = code.into();
-            let reason = reason.into();
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
             conn.record_direct_event(
@@ -154,6 +161,10 @@ impl PeerManager {
                 return true;
             }
         }
+        // A batch with zero matched ACKs is the explicit feedback that widens
+        // the recovery stage: initial -> predicted -> small scatter -> extended
+        // scatter.  The epoch's hard probe credit still caps the total.
+        self.advance_recovery_stage_after_no_ack(node_id, &reason).await;
 
         self.record_direct_failure_for_generation(
             node_id,

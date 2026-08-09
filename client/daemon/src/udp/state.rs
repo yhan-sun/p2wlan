@@ -881,6 +881,9 @@ struct PendingProbe {
     /// when the peer was not cleaned up since then, so a racing cleanup can
     /// never be undone by a late re-insertion.
     cleanup_epoch: u64,
+    /// Direct-commit sequence at the moment this probe was sent.  A matched
+    /// ACK can prove whether any newer Direct commit superseded the send.
+    direct_commit_seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

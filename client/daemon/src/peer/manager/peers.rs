@@ -201,6 +201,7 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(node_id);
+        self.recovery_epoch_end(node_id, "peer_removed").await;
         self.clear_fresh_mapping(node_id, "peer_removed").await;
     }
 

@@ -6,6 +6,13 @@ pub struct RelayTransport {
     connect_latency_ms: u64,
     client: Arc<Mutex<RelayClient>>,
     peers: Arc<PeerManager>,
+    /// Ticket audience of the connection's auth ticket, when authenticated.
+    ticket_audience: Option<String>,
+    /// Ticket region of the connection's auth ticket, when authenticated.
+    ticket_region: Option<String>,
+    /// Ticket expiry (unix seconds) the server will enforce; the supervisor
+    /// schedules the make-before-break renewal from this deadline.
+    ticket_expires_at_unix: Option<i64>,
 }
 
 impl RelayTransport {
@@ -100,9 +107,60 @@ impl RelayTransport {
                 connect_latency_ms: duration_millis(started.elapsed()),
                 client: Arc::new(Mutex::new(client)),
                 peers,
+                ticket_audience: None,
+                ticket_region: None,
+                ticket_expires_at_unix: None,
             },
             relay_rx,
         ))
+    }
+
+    /// Attach the auth ticket metadata so the supervisor can schedule the
+    /// proactive make-before-break renewal.
+    pub(crate) fn with_ticket_metadata(
+        mut self,
+        audience: &str,
+        region: &str,
+        expires_at_ms: i64,
+    ) -> Self {
+        self.ticket_audience = Some(audience.to_string());
+        self.ticket_region = Some(region.to_string());
+        self.ticket_expires_at_unix = Some(expires_at_ms);
+        self
+    }
+
+    /// Whether this connection is authenticated with a ticket.
+    pub(crate) fn ticket_expiry(&self) -> Option<(String, String, i64)> {
+        match (
+            self.ticket_audience.as_ref(),
+            self.ticket_region.as_ref(),
+            self.ticket_expires_at_unix,
+        ) {
+            (Some(audience), Some(region), Some(expires_at_unix)) => {
+                Some((audience.clone(), region.clone(), expires_at_unix))
+            }
+            _ => None,
+        }
+    }
+
+    /// Test-only transport shell for unit tests that exercise ticket
+    /// metadata without a live relay connection.
+    #[cfg(test)]
+    pub(crate) fn connect_for_test(
+        relay_region: &str,
+        relay_endpoint: &str,
+        peers: Arc<PeerManager>,
+    ) -> Self {
+        Self {
+            relay_region: relay_region.to_string(),
+            relay_endpoint: relay_endpoint.to_string(),
+            connect_latency_ms: 0,
+            client: Arc::new(Mutex::new(p2pnet_relay::client::RelayClient::new_for_test())),
+            peers,
+            ticket_audience: None,
+            ticket_region: None,
+            ticket_expires_at_unix: None,
+        }
     }
 
     /// Selected relay region label.

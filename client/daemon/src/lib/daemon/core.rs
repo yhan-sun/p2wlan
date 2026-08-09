@@ -27,6 +27,15 @@ pub struct Daemon {
     /// Serializes candidate gathering/commit so endpoints, sources, identity,
     /// and generation advance as one coherent snapshot.
     candidate_refresh_lock: Arc<Mutex<()>>,
+    /// Shared candidate snapshot lease: within its TTL no signaling path may
+    /// re-run a live STUN gather (single-flight); expired snapshots are still
+    /// used as a bounded old snapshot so a slow refresh never blocks an
+    /// answer/offer.
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
+    /// Per-peer offer-ingress dedup / rate-limit records.  Decided BEFORE any
+    /// candidate-plane state is touched, so repeated/old offers from a
+    /// churning peer cannot trigger candidate applies or fresh transactions.
+    offer_ingress: Arc<std::sync::Mutex<HashMap<String, OfferIngressRecord>>>,
     /// Latest local NAT behavior profile inferred from STUN observations.
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Cached gateway mapping lifecycle and structured diagnostics.
@@ -136,6 +145,8 @@ impl Daemon {
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             local_network_identity: Arc::new(RwLock::new(Vec::new())),
             candidate_refresh_lock: Arc::new(Mutex::new(())),
+            candidate_snapshot: Arc::new(RwLock::new(None)),
+            offer_ingress: Arc::new(std::sync::Mutex::new(HashMap::new())),
             nat_profile: Arc::new(RwLock::new(None)),
             gateway_mapping_runtime: Arc::new(RwLock::new(GatewayMappingRuntime::default())),
             gateway_mapping_diagnostics: Arc::new(RwLock::new(GatewayMappingDiagnostics {

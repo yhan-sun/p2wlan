@@ -111,6 +111,18 @@ impl UdpTransport {
             }
         }
 
+        // The recovery-epoch credit is the hard per-epoch TOTAL: it cannot be
+        // refilled by per-second windows or new candidate offers, so a failing
+        // peer's whole recovery episode stays bounded regardless of how many
+        // punch sessions or fresh-mapping generations start.
+        if !self
+            .peers
+            .try_consume_recovery_probe_credit(peer_id)
+            .await
+        {
+            return OutboundProbeAdmission::EpochCreditExhausted;
+        }
+
         budget.entry(network_key).or_default().push_back(now);
         budget.entry(peer_key).or_default().push_back(now);
         budget.entry(remote_ip_key).or_default().push_back(now);
@@ -513,6 +525,9 @@ impl UdpTransport {
                     accepts_legacy_ack,
                     socket_epoch,
                     cleanup_epoch,
+                    direct_commit_seq: peer_id
+                        .and_then(|peer_id| self.peers.direct_commit_seq_sync(peer_id))
+                        .unwrap_or(0),
                 },
             );
             send_lease

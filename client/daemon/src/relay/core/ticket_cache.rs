@@ -89,4 +89,65 @@ impl RelayTicketCache {
             }
         })
     }
+
+    /// The expiry (unix seconds) of the cached ticket for `(audience, region)`,
+    /// if a valid ticket is cached.  The proactive renewal uses this to
+    /// schedule the make-before-break connection swap BEFORE the server closes
+    /// the current connection at ticket expiry.
+    pub(crate) async fn ticket_expiry_for(&self, audience: &str, region: &str) -> Option<i64> {
+        let key = RelayTicketKey {
+            audience: audience.to_string(),
+            region: region.to_string(),
+        };
+        self.entries
+            .lock()
+            .await
+            .get(&key)
+            .filter(|entry| entry.expires_at > now_unix() + RELAY_TICKET_REFRESH_MARGIN_SECS)
+            .map(|entry| entry.expires_at)
+    }
+
+    /// Force-refresh the cached ticket for `(audience, region)` and return the
+    /// new (ticket, expiry) pair.  Used by the proactive renewal so the new
+    /// connection always registers with a ticket that outlives the old one.
+    pub(crate) async fn refresh_ticket(
+        &self,
+        audience: &str,
+        region: &str,
+    ) -> Result<(String, i64)> {
+        let key = RelayTicketKey {
+            audience: audience.to_string(),
+            region: region.to_string(),
+        };
+        let refresh_lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = refresh_lock.lock().await;
+        let (ticket, expires_at) = self
+            .control_client
+            .fetch_relay_ticket(&key.audience, &key.region)
+            .await?;
+        if ticket.trim().is_empty() {
+            return Err(DaemonError::ControlPlane(
+                "relay ticket response contained an empty ticket".into(),
+            ));
+        }
+        if expires_at <= now_unix() + RELAY_TICKET_REFRESH_MARGIN_SECS {
+            return Err(DaemonError::ControlPlane(
+                "relay ticket expires too soon".into(),
+            ));
+        }
+        self.entries.lock().await.insert(
+            key.clone(),
+            CachedRelayTicket {
+                ticket: ticket.clone(),
+                expires_at,
+            },
+        );
+        Ok((ticket, expires_at))
+    }
 }

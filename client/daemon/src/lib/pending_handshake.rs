@@ -39,6 +39,11 @@ struct PendingPeerOffer {
     punch_at_server_ms: Option<u64>,
     session_id: Option<String>,
     probe_ephemeral_public_key: Option<String>,
+    /// Set when the offer-ingress verdict suppressed the candidate plane
+    /// (duplicate or rate-limited): the worker still answers the handshake
+    /// (crossing rekeys must never be dropped) but skips the fresh-prediction
+    /// transaction and the punch trigger.
+    ingress_suppressed: bool,
 }
 
 /// A peer-reflexive control-plane observation awaiting its bounded worker.

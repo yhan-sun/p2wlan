@@ -48,6 +48,29 @@ pub struct PeerDiagnostics {
     pub direct_events: Vec<DirectTraversalEventDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fresh_mapping: Vec<FreshMappingDiag>,
+    /// Failure-recovery epoch budget report (probe credit, fresh-mapping
+    /// generations, HTTP publishes remaining), when a recovery epoch is
+    /// active for the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryEpochDiagnostics>,
+}
+
+/// Serialized failure-recovery epoch budget report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecoveryEpochDiagnostics {
+    pub epoch: u64,
+    pub stage: String,
+    pub stage_age_ms: u64,
+    pub epoch_age_ms: u64,
+    /// Remaining outbound probe credit for the epoch.
+    pub probe_credit_remaining: u32,
+    /// Remaining fresh-mapping generations (fresh sockets) for the epoch.
+    pub fresh_generation_quota_remaining: u32,
+    /// Remaining HTTP publishes for the epoch.
+    pub http_quota_remaining: u32,
+    /// Scatter windows sent this epoch.
+    pub scatter_windows_sent: u32,
+    pub ack_feedback_seen: bool,
 }
 
 impl PeerDiagnostics {
@@ -252,6 +275,7 @@ impl PeerDiagnostics {
                         .collect()
                 })
                 .unwrap_or_default(),
+            recovery: None,
         }
     }
 }

@@ -29,6 +29,9 @@ impl PeerManager {
             pending_fresh_applies: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_identity_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_peers: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
+            direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            direct_commit_notify: Arc::new(Notify::new()),
             config,
         }
     }

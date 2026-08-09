@@ -136,6 +136,18 @@ pub struct RelayClient {
     cmd_tx: mpsc::Sender<ClientCommand>,
 }
 
+impl RelayClient {
+    /// Test-only shell: a client handle backed by a closed command channel,
+    /// for unit tests that only exercise transport metadata and lifecycle
+    /// logic without a live relay connection.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn new_for_test() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self { cmd_tx: tx }
+    }
+}
+
 mod commands;
 mod connect;
 mod legacy_tcp;

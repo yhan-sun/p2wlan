@@ -1374,6 +1374,10 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
     );
 
     // 3. An idempotent retry of the committed identity starts no re-apply.
+    // The offer-ingress dedup window (2s) suppresses the byte-identical
+    // payload first; after the window the retry reaches the fresh
+    // transaction's AlreadyRecorded path.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     send_offer(&control, None);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

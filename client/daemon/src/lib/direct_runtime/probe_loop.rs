@@ -37,13 +37,12 @@ async fn run_direct_probe_loop(
             let stable_remote_scatter = target.stable_remote_scatter;
             let birthday_plan = target.birthday_plan;
             let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
-            let dedup_window = if reclaim_active {
-                DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW
-            } else {
-                PUNCH_SESSION_DEDUP_WINDOW
-            };
+            // Every retry trigger enters the authoritative recovery-epoch
+            // scheduler: one plan per (peer_id, generation, epoch), shared
+            // budgets, newest-wins pending targets.
+            let epoch = target.recovery_epoch;
             let Some(session) = punch_deduplicator
-                .claim_with_window(&peer_id, dedup_window)
+                .claim_for_epoch(&peer_id, epoch, PUNCH_PRIORITY_BACKGROUND, None)
                 .await
             else {
                 peers
@@ -63,6 +62,18 @@ async fn run_direct_probe_loop(
                             "suppressed overlapping UDP retry session for this peer"
                         },
                     )
+                    .await;
+                // Newest-wins: the newest target stays stashed for the running
+                // session's next stage boundary instead of being dropped.
+                peers
+                    .stash_recovery_target(PendingRecoveryTarget {
+                        peer_id: peer_id.clone(),
+                        candidates: candidates.clone(),
+                        frozen_targets: None,
+                        fresh_prediction: None,
+                        punch_at_ms: None,
+                        seen_at: Instant::now(),
+                    })
                     .await;
                 continue;
             };
@@ -151,6 +162,7 @@ async fn run_direct_probe_loop(
                     let success_count_before = peers
                         .direct_probe_success_count_for_generation(&peer_id, generation)
                         .await;
+                    let commit_seq_before = peers.direct_commit_seq_sync(&peer_id);
                     peers
                         .record_direct_event(
                             &peer_id,
@@ -172,11 +184,26 @@ async fn run_direct_probe_loop(
 
                     // Fresh-mapping generation: measure a fresh socket and
                     // create a predictable peer-facing mapping before the
-                    // ordinary candidate sweep.
+                    // ordinary candidate sweep.  The recovery epoch allows at
+                    // most one fresh generation per epoch.
                     let fresh_generation = {
                         let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
-                        let mut generation = udp
-                            .run_fresh_mapping_generation(
+                        let mut generation = if !peers.try_begin_fresh_generation(&peer_id).await {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "fresh_mapping_epoch_quota_exhausted",
+                                    None,
+                                    None,
+                                    None,
+                                    format!(
+                                        "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
+                                    ),
+                                )
+                                .await;
+                            FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded)
+                        } else {
+                            udp.run_fresh_mapping_generation(
                                 &peer_id,
                                 &signal.stun_servers,
                                 signal.stun_timeout,
@@ -185,7 +212,8 @@ async fn run_direct_probe_loop(
                                 attempts.min(2),
                                 Some(&session.cancellation_handle()),
                             )
-                            .await;
+                            .await
+                        };
                         match &mut generation {
                             FreshMappingOutcome::Accepted(result, handoff) => {
                                 if session.is_cancelled() {
@@ -205,14 +233,33 @@ async fn run_direct_probe_loop(
                                     // send failure or a cancellation during
                                     // the advertise keeps the socket
                                     // rollable.
-                                    let advertised = advertise_fresh_mapping_prediction(
-                                        &signal,
-                                        &peers,
-                                        &peer_id,
-                                        &*result,
-                                        &session.cancellation_handle(),
-                                    )
-                                    .await;
+                                    let advertised = if !peers
+                                        .try_consume_recovery_http_quota(&peer_id)
+                                        .await
+                                    {
+                                        peers
+                                            .record_direct_event(
+                                                &peer_id,
+                                                "fresh_mapping_epoch_http_quota_exhausted",
+                                                None,
+                                                None,
+                                                None,
+                                                format!(
+                                                    "fresh-mapping prediction was not advertised: the recovery epoch {epoch} used its HTTP publish quota"
+                                                ),
+                                            )
+                                            .await;
+                                        false
+                                    } else {
+                                        advertise_fresh_mapping_prediction(
+                                            &signal,
+                                            &peers,
+                                            &peer_id,
+                                            &*result,
+                                            &session.cancellation_handle(),
+                                        )
+                                        .await
+                                    };
                                     if advertised {
                                         if !handoff.finalize().await {
                                             peers
@@ -361,7 +408,30 @@ async fn run_direct_probe_loop(
                                     format!("sent {sent} {retry_label} probes"),
                                 )
                                 .await;
-                            sleep(direct_probe_ack_grace(probe_interval)).await;
+                            // Bounded feedback window: wait for a matched ACK
+                            // (or a Direct commit) instead of a bare sleep so
+                            // a promotion reliably preempts the next retry
+                            // stage.
+                            let promoted = peers
+                                .wait_for_direct_commit_or_timeout(
+                                    &peer_id,
+                                    commit_seq_before,
+                                    RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW
+                                        .max(direct_probe_ack_grace(probe_interval)),
+                                )
+                                .await;
+                            if promoted {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "retry_ack_feedback_commit",
+                                        candidates.first().copied(),
+                                        Some(candidates.len()),
+                                        Some(sent),
+                                        "Direct commit observed during the ACK feedback window; ending the retry session",
+                                    )
+                                    .await;
+                            }
                             let success_count_after = peers
                                 .direct_probe_success_count_for_generation(&peer_id, generation)
                                 .await;
@@ -458,6 +528,12 @@ async fn run_direct_probe_loop(
                                     &peer_id,
                                     generation,
                                     format!("{retry_label} failed: {err}"),
+                                )
+                                .await;
+                            peers
+                                .mark_recovery_relay_backoff(
+                                    &peer_id,
+                                    &format!("{retry_label} failed: {err}"),
                                 )
                                 .await;
                             warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");

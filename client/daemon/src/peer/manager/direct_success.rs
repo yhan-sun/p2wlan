@@ -106,13 +106,22 @@ impl PeerManager {
             conn.direct_health.record_success();
             conn.clear_direct_reclaim_window();
             if direct_confirmation_changed {
+                // The direct-commit sequence is bumped inside the SAME
+                // network-epoch critical section as the state transition, so
+                // an outbound punch loop that gates every UDP send on this
+                // sequence can never miss a promotion that already committed.
+                conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
+                self.bump_direct_commit_seq(node_id);
                 conn.record_direct_event(
                     generation,
                     "direct_confirmed",
                     selected_endpoint,
                     selected_endpoint.map(|_| 1),
                     None,
-                    "encrypted data path confirmed Direct UDP",
+                    format!(
+                        "encrypted data path confirmed Direct UDP; direct_commit_seq={}",
+                        conn.direct_commit_seq
+                    ),
                 );
             }
             conn.transition(ConnectionState::Direct);
@@ -210,6 +219,9 @@ impl PeerManager {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry.cancel_peer(node_id).await;
         }
+        // The recovery epoch for this peer is over: Direct is confirmed, so
+        // no traversal work may continue under the old plan.
+        self.recovery_epoch_end(node_id, "direct_confirmed").await;
         if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }
@@ -326,6 +338,10 @@ impl PeerManager {
                 Some(latency) => {
                     conn.direct_health.record_success_with_latency(latency);
                     if let Some((source, true)) = pair_success {
+                        // Matched-ACK feedback: the recovery stage machine
+                        // resets to Initial so a live path is never expanded
+                        // by a later no-ACK batch.
+                        self.record_recovery_ack_feedback(node_id, endpoint).await;
                         conn.record_direct_event(
                             generation,
                             "probe_ack_received",

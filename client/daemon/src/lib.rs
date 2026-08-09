@@ -43,7 +43,7 @@ mod network_outbound;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
-mod relay_runtime;
+pub(crate) mod relay_runtime;
 pub mod route;
 pub mod tasks;
 pub mod transport;
@@ -108,8 +108,9 @@ use p2pnet_wireguard::{
     TransportSession,
 };
 use peer::{
-    CandidateSetApplyResult, ConnectionState, DirectProbeTargetSet, PeerManager, ProbeBindingStage,
-    DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT,
+    CandidateSetApplyResult, ConnectionState, DirectProbeTargetSet, PeerManager,
+    PendingRecoveryTarget, ProbeBindingStage, RecoveryAdmission, DIRECT_RETRY_BASE_INTERVAL,
+    REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT, RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW,
 };
 use port_mapping::PortMappingManager;
 #[cfg(test)]
@@ -296,7 +297,11 @@ const REKEY_CONFIRMATION_PAYLOAD: &[u8] = b"p2wlan-rekey-confirmation";
 /// Avoid overlapping offer/answer, refresh, and retry bursts for one peer.
 /// Competing bursts can create distinct NAT mappings and reduce, rather than
 /// improve, the chance that both peers hit the same opening window.
+#[cfg(test)]
+#[allow(dead_code)]
 const PUNCH_SESSION_DEDUP_WINDOW: Duration = Duration::from_secs(3);
+#[cfg(test)]
+#[allow(dead_code)]
 const DIRECT_RECLAIM_PUNCH_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 /// A traversal task must release its per-peer lease even if a transport call
 /// stalls or an unexpectedly large candidate set reaches the scheduler.
@@ -375,6 +380,7 @@ pub(crate) fn fresh_prediction_source_label(id: FreshPredictionId) -> String {
 include!("lib/punch_dedup.rs");
 include!("lib/daemon/udp_transport_slot.rs");
 include!("lib/daemon/core.rs");
+include!("lib/daemon/candidate_snapshot.rs");
 include!("lib/daemon/udp_direct.rs");
 include!("lib/daemon/handshake_maintenance.rs");
 include!("lib/daemon/relay_spawn.rs");

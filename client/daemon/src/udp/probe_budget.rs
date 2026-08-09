@@ -160,6 +160,11 @@ pub(super) enum OutboundProbeAdmission {
     GlobalPeerPersistentRateLimited,
     GlobalRemoteIpPersistentRateLimited,
     GlobalPeerSocketPersistentRateLimited,
+    /// The peer's recovery-epoch probe credit is exhausted: the hard
+    /// per-`(peer_id, generation, epoch)` total was reached, so no further
+    /// probes may be emitted until the epoch rotates (generation advance,
+    /// Direct confirmation or the age-based re-arm).
+    EpochCreditExhausted,
 }
 
 pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission) -> &'static str {
@@ -183,6 +188,7 @@ pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission)
         OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited => {
             "global_peer_socket_persistent_rate_limited"
         }
+        OutboundProbeAdmission::EpochCreditExhausted => "recovery_epoch_credit_exhausted",
     }
 }
 

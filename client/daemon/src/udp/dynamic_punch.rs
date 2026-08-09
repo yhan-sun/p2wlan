@@ -1201,7 +1201,10 @@ impl UdpTransport {
         };
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
+        let mut budget_skipped = 0u32;
+        let mut last_budget_reason = None;
         let mut sent_endpoints = HashSet::new();
+        let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         for round in schedule {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
@@ -1214,6 +1217,27 @@ impl UdpTransport {
                         "Aborting dynamic-socket UDP punch for peer {peer_id}: Direct was confirmed mid-session"
                     );
                     break;
+                }
+                if self.peers.direct_commit_seq_sync(peer_id) != commit_seq_at_start {
+                    trace!(
+                        "Aborting dynamic-socket UDP punch for peer {peer_id}: direct_commit_seq advanced past {commit_seq_at_start:?} mid-session"
+                    );
+                    break;
+                }
+                match self
+                    .admit_outbound_connectivity_probe(peer_id, candidate, index)
+                    .await
+                {
+                    OutboundProbeAdmission::Accepted => {}
+                    limited => {
+                        // The dedicated-socket sweep now shares the same
+                        // admission as the pool sweeps: per-second windows,
+                        // the persistent budgets AND the recovery-epoch probe
+                        // credit all apply to fresh-mapping punches.
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some(outbound_probe_admission_reason(limited));
+                        continue;
+                    }
                 }
                 match self
                     .send_probe_on_socket(
@@ -1230,6 +1254,10 @@ impl UdpTransport {
                         packets_sent = packets_sent.saturating_add(1);
                         sent_endpoints.insert(candidate);
                         self.peers.record_direct_probe_sent(peer_id, candidate).await;
+                        trace!(
+                            "Sent dynamic-socket punch probe to peer {peer_id} candidate {} commit_seq={commit_seq_at_start:?}",
+                            candidate
+                        );
                         if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
                             sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
                         }
@@ -1241,6 +1269,21 @@ impl UdpTransport {
                     }
                 }
             }
+        }
+        if budget_skipped > 0 {
+            let reason = last_budget_reason.unwrap_or("probe_budget_limited");
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_probe_budget_limited",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "skipped {budget_skipped} dedicated-socket punch probes due to outbound {reason}; sent {packets_sent}"
+                    ),
+                )
+                .await;
         }
         Ok(PunchSendReport {
             packets_sent,

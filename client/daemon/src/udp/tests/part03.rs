@@ -699,6 +699,7 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
             accepts_legacy_ack: true,
             socket_epoch: 0,
             cleanup_epoch: 0,
+            direct_commit_seq: 0,
         },
     );
 
@@ -762,6 +763,7 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
             accepts_legacy_ack: false,
             socket_epoch: 0,
             cleanup_epoch: 0,
+            direct_commit_seq: 0,
         },
     );
 

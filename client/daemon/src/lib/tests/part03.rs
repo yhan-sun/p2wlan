@@ -545,6 +545,7 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
             punch_at_server_ms: None,
             session_id: None,
             probe_ephemeral_public_key: None,
+            ingress_suppressed: false,
         }
     }
 
@@ -635,6 +636,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         punch_at_server_ms: None,
         session_id: None,
         probe_ephemeral_public_key: None,
+        ingress_suppressed: false,
     };
     let (reservation, offer) = daemon
         .pending_handshakes

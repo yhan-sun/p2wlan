@@ -19,6 +19,36 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
         )
         .await;
 
+    // The recovery stage machine gates wide scatter: the first due pass (the
+    // epoch's Initial stage) must NOT build a birthday plan.  Only after
+    // explicit no-ACK feedback reaches the ScatterExtended stage may the
+    // due targets include the birthday window.
+    let initial_targets = manager
+        .direct_probe_targets_due(Duration::from_secs(0))
+        .await;
+    assert_eq!(initial_targets.len(), 1);
+    assert_eq!(initial_targets[0].peer_id, "peer1");
+    assert!(
+        initial_targets[0].birthday_plan.is_none(),
+        "the Initial recovery stage must not build a birthday plan"
+    );
+    assert!(
+        initial_targets[0].candidates.iter().all(|target| {
+            *target == stable_endpoint || *target == second_observed
+        }),
+        "the Initial recovery stage only probes trusted endpoints"
+    );
+
+    manager
+        .advance_recovery_stage_after_no_ack("peer1", "test: no ack -> predicted")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer1", "test: no ack -> scatter_small")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer1", "test: no ack -> scatter_extended")
+        .await;
+
     let due_targets = manager
         .direct_probe_targets_due(Duration::from_secs(0))
         .await;

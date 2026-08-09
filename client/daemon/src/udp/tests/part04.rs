@@ -2198,6 +2198,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
             accepts_legacy_ack: false,
             socket_epoch: 0,
             cleanup_epoch: 0,
+            direct_commit_seq: 0,
         },
     );
 

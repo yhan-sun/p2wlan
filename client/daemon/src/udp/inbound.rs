@@ -776,6 +776,7 @@ impl UdpTransport {
                                         pending.purpose,
                                         pending.socket_epoch,
                                         pending.cleanup_epoch,
+                                        pending.direct_commit_seq,
                                     )
                                 });
                             if matched.is_some() {
@@ -786,7 +787,7 @@ impl UdpTransport {
                         let ack_matched = ack_match.is_some();
                         let pending_peer_id = ack_match
                             .as_ref()
-                            .and_then(|(_, _, peer_id, _, _, _, _)| peer_id.clone());
+                            .and_then(|(_, _, peer_id, _, _, _, _, _)| peer_id.clone());
                         // The peer identity comes from the matched pending
                         // probe (never from the source address alone, which
                         // would let a spoofed ACK drive endpoint learning).
@@ -805,7 +806,7 @@ impl UdpTransport {
                             let adoption = self.adoption_lock_for(&peer_id).await;
                             let _adoption_guard = adoption.lock().await;
                             let pending_cleanup_epoch =
-                                ack_match.as_ref().map(|(_, _, _, _, _, _, epoch)| *epoch);
+                                ack_match.as_ref().map(|(_, _, _, _, _, _, epoch, _)| *epoch);
                             let still_clean = match pending_cleanup_epoch {
                                 Some(stamped) => {
                                     self.peer_probe_cleanup_epoch(&peer_id).await == stamped
@@ -826,6 +827,7 @@ impl UdpTransport {
                                 purpose,
                                 socket_epoch,
                                 _,
+                                direct_commit_seq_at_send,
                             )) = ack_match
                             {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
@@ -872,7 +874,7 @@ impl UdpTransport {
                                             .await;
                                     }
                                     debug!(
-                                        "Received UDP punch ACK from peer {peer_id} at {source} (rtt={latency:?})"
+                                        "Received UDP punch ACK from peer {peer_id} at {source} (rtt={latency:?} direct_commit_seq_at_send={direct_commit_seq_at_send})"
                                     );
                                 } else {
                                     trace!(

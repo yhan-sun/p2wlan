@@ -416,12 +416,19 @@ impl UdpTransport {
         let mut last_budget_reason = None;
         let mut session_capped = false;
         let mut generation_changed_abort = false;
+        let mut commit_seq_changed_abort = false;
         let mut sent_endpoints = HashSet::new();
         let mut sent_ports = HashSet::new();
         let mut socket0_sent = 0u32;
         let mut alt_socket_sent = 0u32;
         let socket_count = socket_policy.socket_count(self);
         let generation_at_start = self.peers.current_network_generation_sync();
+        // Monotonic direct-commit sequence snapshot: a promotion (or a
+        // direct-endpoint change) bumps this sequence synchronously inside
+        // the network-epoch critical section, so the per-probe gate below can
+        // abort the sweep within one probe even when `yield_now()` would not
+        // have let the inbound handler preempt this task.
+        let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let session_probe_cap = match socket_policy {
             PunchSocketPolicy::RemoteScatterPool | PunchSocketPolicy::StableUniqueScatter => {
                 MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION
@@ -429,6 +436,11 @@ impl UdpTransport {
             PunchSocketPolicy::ActivePool | PunchSocketPolicy::PrimaryOnly => {
                 MAX_PUNCH_PROBES_PER_SESSION
             }
+        };
+        // The combined gate: Direct confirmed, a newer direct commit, or a
+        // network-generation change aborts the sweep immediately.
+        let commit_aborted = |transport: &UdpTransport| {
+            transport.peers.direct_commit_seq_sync(peer_id) != commit_seq_at_start
         };
         'schedule: for (round_index, round) in schedule.iter().enumerate() {
             if !round.delay_before.is_zero() {
@@ -482,6 +494,17 @@ impl UdpTransport {
                     );
                     break 'schedule;
                 }
+                if commit_aborted(self) {
+                    // The direct-commit sequence advanced (promotion or
+                    // direct-endpoint change): every later probe would be a
+                    // post-promotion send, so the sweep stops within one
+                    // probe of the commit.
+                    commit_seq_changed_abort = true;
+                    trace!(
+                        "Aborting UDP punch session for peer {peer_id}: direct_commit_seq advanced past {commit_seq_at_start:?} mid-session"
+                    );
+                    break 'schedule;
+                }
                 if self.peers.current_network_generation_sync() != generation_at_start {
                     generation_changed_abort = true;
                     break 'schedule;
@@ -505,6 +528,13 @@ impl UdpTransport {
                         // on a confirmed path.
                         trace!(
                             "Aborting UDP punch session for peer {peer_id}: Direct was confirmed mid-session"
+                        );
+                        break 'schedule;
+                    }
+                    if commit_aborted(self) {
+                        commit_seq_changed_abort = true;
+                        trace!(
+                            "Aborting UDP punch session for peer {peer_id}: direct_commit_seq advanced past {commit_seq_at_start:?} mid-session"
                         );
                         break 'schedule;
                     }
@@ -613,6 +643,15 @@ impl UdpTransport {
                             );
                             continue;
                         }
+                        OutboundProbeAdmission::EpochCreditExhausted => {
+                            budget_skipped = budget_skipped.saturating_add(1);
+                            last_budget_reason = Some("recovery_epoch_credit_exhausted");
+                            trace!(
+                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: recovery-epoch probe credit exhausted",
+                                socket_index, peer_id, candidate
+                            );
+                            continue;
+                        }
                     }
 
                     match self
@@ -633,11 +672,12 @@ impl UdpTransport {
                                 .record_direct_probe_sent(peer_id, candidate)
                                 .await;
                             trace!(
-                                "Sent adaptive punch probe round {} from socket {} to peer {} candidate {}",
+                                "Sent adaptive punch probe round {} from socket {} to peer {} candidate {} commit_seq={:?}",
                                 round_index + 1,
                                 socket_index,
                                 peer_id,
-                                candidate
+                                candidate,
+                                commit_seq_at_start
                             );
                             if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
                                 sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
@@ -669,6 +709,21 @@ impl UdpTransport {
                     Some(packets_sent),
                     format!(
                         "stopped UDP punch after the network generation changed mid-session (expected {generation_at_start}); sent {packets_sent}"
+                    ),
+                )
+                .await;
+        }
+
+        if commit_seq_changed_abort {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "probe_batch_commit_seq_changed",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "stopped UDP punch after direct_commit_seq advanced past {commit_seq_at_start:?} mid-session; sent {packets_sent} (all sends carried commit_seq={commit_seq_at_start:?})"
                     ),
                 )
                 .await;
@@ -723,7 +778,7 @@ impl UdpTransport {
                 Some(candidates.len()),
                 Some(packets_sent),
                 format!(
-                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={}",
+                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
                     socket_policy.label(),
                     self.socket_count(),
                     socket_count,
@@ -740,7 +795,7 @@ impl UdpTransport {
             )
             .await;
         info!(
-            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} budget_skipped={} session_capped={}",
+            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} budget_skipped={} session_capped={} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
             peer_id,
             socket_policy.label(),
             self.socket_count(),

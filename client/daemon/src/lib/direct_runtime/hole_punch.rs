@@ -46,10 +46,31 @@ async fn spawn_hole_punch_task(
         debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
         return;
     }
-    let claimed = match fresh_prediction {
-        Some(id) => punch_deduplicator.claim_fresh_prediction(&peer_id, id).await,
-        None => punch_deduplicator.claim(&peer_id).await,
+    // Every trigger enters the authoritative recovery-epoch scheduler: one
+    // traversal plan per (peer_id, generation, epoch) with shared hard
+    // budgets.  A trigger inside the current epoch can never spawn a parallel
+    // session; it only updates the newest-wins pending target.
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "punch_suppressed_superseded",
+                None,
+                None,
+                None,
+                "suppressed punch trigger: peer is Direct, offline or gone",
+            )
+            .await;
+        return;
     };
+    let claim_priority = if fresh_prediction.is_some() {
+        PUNCH_PRIORITY_FRESH_PREDICTION
+    } else {
+        PUNCH_PRIORITY_SYNCHRONIZED
+    };
+    let claimed = punch_deduplicator
+        .claim_for_epoch(&peer_id, epoch, claim_priority, fresh_prediction)
+        .await;
     let Some(session) = claimed else {
         peers
             .record_direct_event(
@@ -81,7 +102,7 @@ async fn spawn_hole_punch_task(
                 None,
                 None,
                 format!(
-                    "scheduled relay-assisted UDP punch delay_ms={} punch_at_ms={punch_at_ms:?}",
+                    "scheduled relay-assisted UDP punch delay_ms={} punch_at_ms={punch_at_ms:?} recovery_epoch={epoch}",
                     punch_delay.as_millis()
                 ),
             )
@@ -90,6 +111,8 @@ async fn spawn_hole_punch_task(
         // Run the fresh-mapping generation before waiting for the rendezvous
         // window: the measurement needs ~1s, and the peer-facing mapping must
         // already exist when the stable side starts probing at punch_at.
+        // The recovery epoch allows at most one fresh generation (one fresh
+        // socket) per epoch; a newer offer can never spawn another one.
         let fresh_generation = if let Some(signal) = signal.as_ref() {
             if signal.boot_epoch_ms == 0 {
                 peers
@@ -103,6 +126,20 @@ async fn spawn_hole_punch_task(
                     )
                     .await;
                 FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
+            } else if !peers.try_begin_fresh_generation(&peer_id).await {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "fresh_mapping_epoch_quota_exhausted",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
+                        ),
+                    )
+                    .await;
+                FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded)
             } else {
                 let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
                 let mut generation = udp
@@ -158,7 +195,21 @@ async fn spawn_hole_punch_task(
                             // socket rollable, so the guard is dropped without
                             // finalizing instead of leaving an un-advertised
                             // socket as the peer's long-term path.
-                            let advertised =
+                            let advertised = if !peers.try_consume_recovery_http_quota(&peer_id).await {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "fresh_mapping_epoch_http_quota_exhausted",
+                                        None,
+                                        None,
+                                        None,
+                                        format!(
+                                            "fresh-mapping prediction was not advertised: the recovery epoch {epoch} used its HTTP publish quota"
+                                        ),
+                                    )
+                                    .await;
+                                false
+                            } else {
                                 advertise_fresh_mapping_prediction(
                                     signal,
                                     &peers,
@@ -166,7 +217,8 @@ async fn spawn_hole_punch_task(
                                     &*result,
                                     &session.cancellation_handle(),
                                 )
-                                .await;
+                                .await
+                            };
                             if advertised {
                                 if !handoff.finalize().await {
                                     peers
@@ -241,15 +293,42 @@ async fn spawn_hole_punch_task(
         // sessions read the shared candidate set at session time.  A later
         // ordinary refresh may update the shared set, but it must never change
         // the target of a running fresh session.
-        let target = match frozen_targets {
-            Some(frozen) => Some(DirectProbeTargetSet {
-                peer_id: peer_id.clone(),
-                candidates: frozen,
-                remote_scatter_pool: false,
-                stable_remote_scatter: false,
-                birthday_plan: None,
-            }),
-            None => peers.direct_probe_target_set_for(&peer_id).await,
+        //
+        // The newest-wins pending target (stashed by a trigger that was
+        // suppressed while another session ran) wins over a freshly computed
+        // target: new candidates update the plan's target without ever
+        // resetting its budgets or starting a parallel session.
+        let pending_target = peers.take_recovery_target(&peer_id).await;
+        let target = match pending_target {
+            Some(pending) => {
+                if let Some(punch_at) = pending.punch_at_ms {
+                    debug!(
+                        "Punch session for {peer_id} picked up a newest-wins pending target (fresh_prediction={:?} punch_at_ms={punch_at} candidates={})",
+                        pending.fresh_prediction,
+                        pending.candidates.len()
+                    );
+                }
+                let candidates = pending.frozen_targets.or(Some(pending.candidates));
+                Some(DirectProbeTargetSet {
+                    peer_id: peer_id.clone(),
+                    candidates: candidates.unwrap_or_default(),
+                    remote_scatter_pool: false,
+                    stable_remote_scatter: false,
+                    birthday_plan: None,
+                    recovery_epoch: epoch,
+                })
+            }
+            None => match frozen_targets {
+                Some(frozen) => Some(DirectProbeTargetSet {
+                    peer_id: peer_id.clone(),
+                    candidates: frozen,
+                    remote_scatter_pool: false,
+                    stable_remote_scatter: false,
+                    birthday_plan: None,
+                    recovery_epoch: epoch,
+                }),
+                None => peers.direct_probe_target_set_for(&peer_id).await,
+            },
         };
         let Some(target) = target else {
             if peers.is_direct(&peer_id).await {
@@ -348,6 +427,7 @@ async fn spawn_hole_punch_task(
         let success_count_before = peers
             .direct_probe_success_count_for_generation(&peer_id, generation)
             .await;
+        let commit_seq_before = peers.direct_commit_seq_sync(&peer_id);
 
         let rx_before = udp.probe_rx_snapshot().await;
         let mut last_punch_report: Option<PunchSendReport> = None;
@@ -462,7 +542,30 @@ async fn spawn_hole_punch_task(
                             ),
                         )
                         .await;
-                    sleep(direct_probe_ack_grace(probe_interval)).await;
+                    // Bounded feedback window: wait for a matched ACK (or a
+                    // Direct commit) instead of a bare sleep, so a promotion
+                    // reliably preempts the next sweep stage without relying
+                    // on scheduler preemption of `yield_now()`.
+                    let promoted = peers
+                        .wait_for_direct_commit_or_timeout(
+                            &peer_id,
+                            commit_seq_before,
+                            RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW
+                                .max(direct_probe_ack_grace(probe_interval)),
+                        )
+                        .await;
+                    if promoted {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "punch_ack_feedback_commit",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                Some(sent),
+                                "Direct commit observed during the ACK feedback window; ending the punch session",
+                            )
+                            .await;
+                    }
                     let success_count_after = peers
                         .direct_probe_success_count_for_generation(&peer_id, generation)
                         .await;
@@ -543,6 +646,12 @@ async fn spawn_hole_punch_task(
                             REASON_DIRECT_PROBE_FAILED,
                             format!("hole punch failed: {err}"),
                         )
+                        .await;
+                    // A real send error is a hard failure: the recovery stage
+                    // moves into relay-backoff where the exponential retry
+                    // backoff paces further work.
+                    peers
+                        .mark_recovery_relay_backoff(&peer_id, &format!("hole punch failed: {err}"))
                         .await;
                     warn!("Failed to punch peer {peer_id}: {err}");
                 }

@@ -8,8 +8,9 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use p2pnet_relay::RelayMessage;
 use p2pnet_tun::Ipv4Packet;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
@@ -220,6 +221,90 @@ pub(super) struct RelaySupervisor {
     pub(super) ca_cert_path: Option<String>,
 }
 
+/// How long before ticket expiry (unix seconds) the make-before-break renewal
+/// connects the replacement.  The server's ticket-expiry close fires exactly
+/// at expiry, so renewing well before the deadline leaves a full data-path
+/// margin.
+const RELAY_TICKET_RENEWAL_MARGIN_SECS: i64 = 60;
+/// Retry cadence for a failed renewal fetch.
+const RELAY_TICKET_RENEWAL_RETRY: Duration = Duration::from_secs(5);
+
+/// Time until the renewal deadline: `expiry - margin` (clamped to at least
+/// 1s so the renewal task always has a bounded wait and never spins).
+pub(crate) fn relay_renewal_deadline(expires_at_unix: i64, now_unix: i64) -> Duration {
+    let remaining = expires_at_unix.saturating_sub(now_unix);
+    Duration::from_secs(
+        remaining
+            .saturating_sub(RELAY_TICKET_RENEWAL_MARGIN_SECS)
+            .max(1) as u64,
+    )
+}
+
+impl RelaySupervisor {
+    /// Spawn the make-before-break renewal task for an authenticated relay
+    /// connection, returning its result oneshot receiver.
+    ///
+    /// The task sleeps until `expiry - margin`, fetches a fresh ticket and
+    /// connects the replacement transport — all CONCURRENTLY with the current
+    /// connection's inbound drain, so the swap (which the caller performs
+    /// atomically) never produces a data-path gap.  A fetch or connect
+    /// failure sends `None` and leaves the current connection untouched; the
+    /// supervisor then falls back to its existing reconnect path at expiry.
+    ///
+    /// Returns `None` when the connection has no ticket (legacy relay).
+    async fn spawn_relay_renewal_task(
+        &self,
+        transport: RelayTransport,
+    ) -> Option<oneshot::Receiver<Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>>> {
+        let (audience, region, expires_at_unix) = transport.ticket_expiry()?;
+        let ticket_cache = self.ticket_cache.clone()?;
+        let node_id = self.node_id.clone();
+        let peers = self.peers.clone();
+        let allow_insecure_plaintext = self.allow_insecure_plaintext;
+        let ca_cert_path = self.ca_cert_path.clone();
+        let endpoint = transport.endpoint().to_string();
+        let region = region.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            // Sleep until the renewal deadline (expiry - margin), re-checking
+            // in bounded steps so the wait always ends before the server's
+            // expiry close.
+            loop {
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let step = relay_renewal_deadline(expires_at_unix, now_unix);
+                if step <= RELAY_TICKET_RENEWAL_RETRY {
+                    break;
+                }
+                sleep(RELAY_TICKET_RENEWAL_RETRY).await;
+            }
+            // Fetch a fresh ticket and connect the replacement; the caller
+            // swaps it in only after this succeeded, so the old connection
+            // keeps serving until the new one is ready.
+            let result = async {
+                let (ticket, _expires_at) =
+                    ticket_cache.refresh_ticket(&audience, &region).await.ok()?;
+                RelayTransport::connect_secure(
+                    &endpoint,
+                    &region,
+                    &node_id,
+                    peers,
+                    Some(ticket),
+                    allow_insecure_plaintext,
+                    ca_cert_path,
+                )
+                .await
+                .ok()
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Some(rx)
+    }
+}
+
 impl RelaySupervisor {
     pub(super) async fn run(self) {
         let mut retry_delay = Duration::from_secs(1);
@@ -264,13 +349,101 @@ impl RelaySupervisor {
                 retry_delay = Duration::from_secs(1);
 
                 let endpoint = relay.endpoint().to_string();
-                let ended = relay
-                    .run_inbound(
-                        relay_rx,
-                        self.inbound_tx.clone(),
-                        Some(self.relay_selection.clone()),
-                    )
+                // The proactive ticket renewal runs make-before-break: a
+                // replacement connection with a fresh ticket is established
+                // BEFORE the old ticket expires, and the swap is atomic
+                // (relay_transport is replaced, the hub's newest-wins register
+                // closes the old connection).  The inbound drain runs in a
+                // background task so a renewal swap never interrupts it: the
+                // OLD connection keeps draining until the hub closes it, so
+                // there is no data-path gap.  A renewal failure leaves the
+                // current connection untouched and the supervisor falls back
+                // to the existing reconnect path.
+                type RelayRenewalResult = Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>;
+                let mut current_transport = relay;
+                let mut renewal: Option<oneshot::Receiver<RelayRenewalResult>> = self
+                    .spawn_relay_renewal_task(current_transport.clone())
                     .await;
+                let mut inbound_task = {
+                    let (ended_tx, ended_rx) = oneshot::channel();
+                    let transport = current_transport.clone();
+                    let rx = relay_rx;
+                    let inbound_tx = self.inbound_tx.clone();
+                    let diags = self.relay_selection.clone();
+                    let handle = tokio::spawn(async move {
+                        let result = transport.run_inbound(rx, inbound_tx, Some(diags)).await;
+                        let _ = ended_tx.send(result);
+                    });
+                    (handle, ended_rx)
+                };
+                let ended = loop {
+                    let Some(mut renewal_rx) = renewal.take() else {
+                        // No ticket on this connection (legacy relay): await
+                        // the inbound drain directly.
+                        let result = inbound_task.1.await;
+                        break match result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err(DaemonError::Network(
+                                "relay inbound task ended unexpectedly".into(),
+                            )),
+                        };
+                    };
+                    tokio::select! {
+                        ended = &mut inbound_task.1 => {
+                            break match ended {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(error)) => Err(error),
+                                Err(_) => Err(DaemonError::Network(
+                                    "relay inbound task ended unexpectedly".into(),
+                                )),
+                            };
+                        }
+                        result = &mut renewal_rx => {
+                            // The renewal task finished (success or failure);
+                            // the inbound stream kept draining the whole time,
+                            // so there is no data-path gap.
+                            let result = result.ok().flatten();
+                            match result {
+                                Some((new_transport, new_rx)) => {
+                                    let new_endpoint = new_transport.endpoint().to_string();
+                                    info!(
+                                        "Renewed relay ticket: swapped {} -> {} before ticket expiry",
+                                        endpoint, new_endpoint
+                                    );
+                                    *self.relay_transport.write().await =
+                                        Some(new_transport.clone());
+                                    // Start the replacement's inbound drain;
+                                    // the old task keeps draining until the
+                                    // hub closes the old connection.
+                                    let (ended_tx, ended_rx) = oneshot::channel();
+                                    let transport = new_transport.clone();
+                                    let inbound_tx = self.inbound_tx.clone();
+                                    let diags = self.relay_selection.clone();
+                                    inbound_task = (
+                                        tokio::spawn(async move {
+                                            let result =
+                                                transport.run_inbound(new_rx, inbound_tx, Some(diags)).await;
+                                            let _ = ended_tx.send(result);
+                                        }),
+                                        ended_rx,
+                                    );
+                                    current_transport = new_transport;
+                                }
+                                None => {
+                                    warn!(
+                                        "Relay ticket renewal for {} failed; the current connection stays until expiry and the supervisor reconnects if needed",
+                                        endpoint
+                                    );
+                                }
+                            }
+                            // Re-arm the next renewal for the (possibly
+                            // swapped) connection.
+                            renewal = self.spawn_relay_renewal_task(current_transport.clone()).await;
+                        }
+                    }
+                };
+                let _ = inbound_task.0.await;
                 *self.relay_transport.write().await = None;
                 let (peer_failure_code, peer_failure_reason) = match &ended {
                     Ok(()) => (
@@ -380,7 +553,10 @@ fn relay_retry_delay_with_jitter(base: Duration) -> Duration {
         return Duration::from_millis(1);
     }
     use rand::Rng;
-    let jitter_ms = rand::thread_rng().gen_range(0..=base_ms);
+    // The jitter is drawn from [0, base_ms) so the delay stays strictly
+    // below 2*base (the `..=` variant could yield exactly base_ms and the
+    // caller's bounds would be violated).
+    let jitter_ms = rand::thread_rng().gen_range(0..base_ms);
     Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
 
@@ -519,6 +695,61 @@ pub(super) async fn send_relay_validation_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_ticket_renewal_deadline_precedes_expiry_with_margin() {
+        // With a 5-minute ticket the renewal fires 60s before expiry: the
+        // old connection is still fully valid while the replacement connects
+        // (make-before-break), so there is no transport gap.
+        let now = 1_000_000i64;
+        let expires = now + 300; // 5-minute ticket
+        let deadline = relay_renewal_deadline(expires, now);
+        assert_eq!(deadline, Duration::from_secs(240));
+        // The deadline is always at least 1s (never a spin).
+        assert_eq!(
+            relay_renewal_deadline(now + 60, now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            relay_renewal_deadline(now + 10, now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(relay_renewal_deadline(now, now), Duration::from_secs(1));
+        // An already-expired ticket has no future deadline.
+        assert_eq!(relay_renewal_deadline(now - 5, now), Duration::from_secs(1));
+        // A short ticket still leaves a real margin: renew at T-60 is
+        // impossible, so the renewal waits only for the bounded retry step.
+        let deadline_short = relay_renewal_deadline(now + 120, now);
+        assert_eq!(deadline_short, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn relay_ticket_expiry_metadata_roundtrip_is_auditable() {
+        use crate::Config;
+        // The transport's ticket metadata is what the supervisor reads to
+        // schedule the renewal; it must survive the clone the supervisor
+        // hands to the renewal task.
+        let mut transport = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay.test:18081",
+            Arc::new(PeerManager::new(
+                Config::generate_default("http://ctrl.test", "net1").unwrap(),
+            )),
+        );
+        transport = transport.with_ticket_metadata("aud-1", "default", 1_000_300);
+        let (audience, region, expires) = transport
+            .ticket_expiry()
+            .expect("ticket metadata must be attached");
+        assert_eq!(audience, "aud-1");
+        assert_eq!(region, "default");
+        assert_eq!(expires, 1_000_300);
+        let transport2 = transport.clone();
+        assert_eq!(
+            transport2.ticket_expiry(),
+            Some(("aud-1".to_string(), "default".to_string(), 1_000_300)),
+            "the cloned transport (handed to the renewal task) must carry the same ticket deadline"
+        );
+    }
 
     #[test]
     fn relay_reconnect_backoff_is_bounded_and_jittered() {

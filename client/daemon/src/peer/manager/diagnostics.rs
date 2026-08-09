@@ -60,13 +60,14 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let recovery_reports = self.recovery_epoch_diagnostics().await;
         let mut peers: Vec<_> = self
             .connections
             .read()
             .await
             .values()
             .map(|conn| {
-                PeerDiagnostics::from_connection_with_path_selection(
+                let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
                     conn,
                     None,
                     None,
@@ -74,7 +75,9 @@ impl PeerManager {
                     None,
                     Some(&traversal_history),
                     Some(&fresh_mapping_history),
-                )
+                );
+                diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                diagnostics
             })
             .collect();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -100,6 +103,7 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let recovery_reports = self.recovery_epoch_diagnostics().await;
         let mut peers: Vec<_> = self
             .connections
             .read()
@@ -108,7 +112,7 @@ impl PeerManager {
             .map(|conn| {
                 let current_selection =
                     conn.select_path_for_data(generation, prefer_direct, relay_available);
-                PeerDiagnostics::from_connection_with_path_selection(
+                let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
                     conn,
                     Some(&current_selection),
                     Some(direct_retry_after),
@@ -116,11 +120,39 @@ impl PeerManager {
                     local_endpoint,
                     Some(&traversal_history),
                     Some(&fresh_mapping_history),
-                )
+                );
+                diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                diagnostics
             })
             .collect();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         peers
+    }
+
+    /// Serialized recovery-epoch budget reports for every peer with an active
+    /// recovery epoch: the hard per-epoch ceilings (probe credit,
+    /// fresh-mapping generations, HTTP publishes) are surfaced in status.
+    async fn recovery_epoch_diagnostics(&self) -> HashMap<String, RecoveryEpochDiagnostics> {
+        let now = Instant::now();
+        let epochs = self.recovery_epochs.read().await;
+        let mut reports = HashMap::new();
+        for (peer_id, state) in epochs.iter() {
+            reports.insert(
+                peer_id.clone(),
+                RecoveryEpochDiagnostics {
+                    epoch: state.epoch,
+                    stage: state.stage.label().to_string(),
+                    stage_age_ms: duration_millis(now.saturating_duration_since(state.stage_started_at)),
+                    epoch_age_ms: duration_millis(now.saturating_duration_since(state.epoch_started_at)),
+                    probe_credit_remaining: state.epoch_probe_credit_remaining,
+                    fresh_generation_quota_remaining: state.epoch_fresh_generation_quota_remaining,
+                    http_quota_remaining: state.epoch_http_quota_remaining,
+                    scatter_windows_sent: state.epoch_scatter_windows_sent,
+                    ack_feedback_seen: state.ack_feedback_seen,
+                },
+            );
+        }
+        reports
     }
 
     /// Get connection statistics.

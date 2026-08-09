@@ -60,6 +60,15 @@ impl Daemon {
         &self,
         reason: &str,
     ) -> (Vec<String>, HashMap<String, String>) {
+        // Signal paths prefer the shared snapshot lease: cached candidates
+        // are never re-gathered inside the TTL, so concurrent initiators,
+        // rekeys and offers share ONE gather instead of each running a live
+        // STUN refresh (which would churn the local source/port mapping).
+        if let Some(leased) = self.leased_candidate_set().await {
+            if !leased.0.is_empty() {
+                return leased;
+            }
+        }
         if let Some(udp) = self.udp_transport.read().await.clone() {
             if let Some(refreshed) = self
                 .refresh_local_candidates_for_imminent_signal(&udp, reason)
@@ -105,7 +114,13 @@ impl Daemon {
             );
             return;
         };
-        let (candidates, candidate_sources) = if let Some(refreshed) = self
+        // Publication reuses the snapshot lease: a fresh lease means the
+        // current committed set is already live — no re-gather, no endpoint
+        // re-publish (the gather path already published it).
+        let (candidates, candidate_sources) = if let Some(leased) = self.leased_candidate_set().await
+        {
+            leased
+        } else if let Some(refreshed) = self
             .refresh_local_candidates_for_imminent_signal(&udp, reason)
             .await
         {
@@ -170,6 +185,22 @@ impl Daemon {
         udp: &UdpTransport,
         reason: &str,
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
+        // Single-flight lease: cached candidates are never re-gathered inside
+        // the TTL, so multiple peers' offers cannot rewrite the local
+        // source/port mapping in a tight loop.  An expired lease still
+        // permits a live gather, but the committed set remains the bounded
+        // old snapshot until the gather succeeds.
+        if self.candidate_snapshot_is_fresh().await {
+            if let Some(leased) = self.leased_candidate_set().await {
+                if !leased.0.is_empty() {
+                    debug!(
+                        "Pre-signal UDP candidates reused from the snapshot lease for {reason} ({} candidates); no live STUN gather",
+                        leased.0.len()
+                    );
+                    return Some(leased);
+                }
+            }
+        }
         let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
         if let Some(endpoint) =
             control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1)
@@ -202,22 +233,20 @@ impl Daemon {
     /// answer has been issued.  The answer itself uses the cached candidate
     /// snapshot; this background step keeps future candidate-only publishes
     /// and the server-side endpoint fresh.  It never blocks the answer, never
-    /// waits on the ordinary control FIFO (the endpoint publish travels the
-    /// handshake control lane), and is aborted by the caller when PeerLeft or
-    /// an owner replacement fires.
+    /// re-gathers (the snapshot lease is reused, so a slow refresh failure
+    /// falls back to the bounded old snapshot), and is aborted by the caller
+    /// when PeerLeft or an owner replacement fires.
     async fn post_answer_candidate_refresh_and_endpoint_publish(&self) {
         let _deadline_guard = tokio::time::timeout(
             Duration::from_secs(POST_ANSWER_REFRESH_DEADLINE_SECS),
             async {
-                let Some(udp) = self.udp_transport.read().await.clone() else {
-                    return;
-                };
-                let Some((candidates, candidate_sources)) = self
-                    .refresh_local_candidates_core(&udp, "post-answer")
-                    .await
+                let Some((candidates, candidate_sources)) = self.leased_candidate_set().await
                 else {
                     return;
                 };
+                if candidates.is_empty() {
+                    return;
+                }
                 if let Some(endpoint) =
                     control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
                 {
@@ -317,7 +346,15 @@ impl Daemon {
         if candidate_refresh_requires_commit(real_change, should_advance_generation) {
             *self.local_candidates.write().await = candidates.clone();
             *self.local_candidate_sources.write().await = candidate_sources.clone();
-            *self.local_network_identity.write().await = next_network_identity;
+            *self.local_network_identity.write().await = next_network_identity.clone();
+            // The committed set becomes the shared snapshot lease: every
+            // signaling path for the next TTL reuses it without a live gather.
+            self.publish_candidate_snapshot(
+                candidates.clone(),
+                candidate_sources.clone(),
+                next_network_identity,
+            )
+            .await;
             if should_advance_generation {
                 self.peers
                     .advance_candidate_refresh_generation("pre-signal UDP candidate refresh")
@@ -337,6 +374,14 @@ impl Daemon {
                 "Pre-signal UDP candidate refresh for {reason} kept the existing {} candidates (old_hash={old_hash} new_hash={new_hash} changed_reason={change_reason})",
                 candidates.len()
             );
+            // Even an unchanged gather refreshes the lease so later signals
+            // reuse this snapshot instead of gathering again.
+            self.publish_candidate_snapshot(
+                candidates.clone(),
+                candidate_sources.clone(),
+                next_network_identity,
+            )
+            .await;
         }
 
         Some((candidates, candidate_sources))

@@ -241,6 +241,7 @@ use diagnostics::candidate_pair_source_stats;
 pub use diagnostics::{
     CandidatePairDiagnostics, CandidatePairSourceStats, DirectTraversalEventDiagnostics,
     PathHealthDiagnostics, PathSelectionEventDiagnostics, PeerDiagnostics, PeerManagerStats,
+    RecoveryEpochDiagnostics,
 };
 pub(crate) use endpoint::is_overlay_endpoint;
 pub(crate) use endpoint::is_public_probe_endpoint;
@@ -276,6 +277,7 @@ include!("peer/manager/direct_success.rs");
 include!("peer/manager/direct_failure.rs");
 include!("peer/manager/relay.rs");
 include!("peer/manager/fresh_mapping.rs");
+include!("peer/manager/recovery_epoch.rs");
 include!("peer/manager/diagnostics.rs");
 include!("peer/utils.rs");
 

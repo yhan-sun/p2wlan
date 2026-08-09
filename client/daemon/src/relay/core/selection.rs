@@ -115,19 +115,30 @@ pub(crate) async fn select_relay_with_cooldowns(
         tasks.spawn(async move {
             let started = Instant::now();
             let result = timeout(selection_timeout, async {
-                let ticket =
-                    relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket).await?;
-                RelayTransport::connect_in_region(
+                let ticket: Option<(String, i64)> =
+                    relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket)
+                        .await?;
+                let (transport, relay_rx) = RelayTransport::connect_in_region(
                     &candidate.endpoint,
                     &candidate.region,
                     &node_id,
                     peers,
-                    ticket,
+                    ticket.as_ref().map(|(ticket, _)| ticket.clone()),
                     allow_insecure_plaintext,
                     ca_path,
                 )
                 .await
-                .map_err(RelayAttemptError::Relay)
+                .map_err(RelayAttemptError::Relay)?;
+                // Attach the ticket deadline so the supervisor can renew
+                // BEFORE the server closes the connection at expiry.  The
+                // audience is the ticket's audience.
+                let transport = match (ticket, candidate.audience.clone()) {
+                    (Some((_, expires_at_unix)), Some(audience)) if expires_at_unix > 0 => {
+                        transport.with_ticket_metadata(&audience, &candidate.region, expires_at_unix)
+                    }
+                    _ => transport,
+                };
+                Ok::<_, RelayAttemptError>((transport, relay_rx))
             })
             .await;
             let latency_ms = duration_millis(started.elapsed());
@@ -199,22 +210,30 @@ pub(crate) async fn select_relay_with_cooldowns(
     }
 }
 
+/// Fetch the ticket for a candidate together with its server-side expiry
+/// (unix seconds), so the connected transport can schedule the proactive
+/// renewal before the server closes the connection at expiry.
 async fn relay_ticket_for_candidate(
     candidate: &RelayCandidate,
     ticket_cache: Option<Arc<RelayTicketCache>>,
     static_relay_ticket: Option<String>,
-) -> std::result::Result<Option<String>, RelayAttemptError> {
+) -> std::result::Result<Option<(String, i64)>, RelayAttemptError> {
     if let (Some(cache), Some((audience, region))) =
         (ticket_cache, relay_ticket_lookup_key(candidate))
     {
-        return cache
-            .ticket_for(audience, region)
+        let expiry = cache.ticket_expiry_for(audience, region).await;
+        let ticket = cache.ticket_for(audience, region).await.map_err(RelayAttemptError::Daemon)?;
+        // ticket_for may have refreshed the cache: read the authoritative
+        // expiry after the fetch.
+        let expiry = cache
+            .ticket_expiry_for(audience, region)
             .await
-            .map(Some)
-            .map_err(RelayAttemptError::Daemon);
+            .or(expiry)
+            .unwrap_or(0);
+        return Ok(Some((ticket, expiry)));
     }
 
-    Ok(static_relay_ticket)
+    Ok(static_relay_ticket.map(|ticket| (ticket, 0)))
 }
 
 fn relay_ticket_lookup_key(candidate: &RelayCandidate) -> Option<(&str, &str)> {

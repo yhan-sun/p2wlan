@@ -5,6 +5,8 @@ pub(crate) struct DirectProbeTargetSet {
     pub remote_scatter_pool: bool,
     pub stable_remote_scatter: bool,
     pub birthday_plan: Option<BirthdayProbePlan>,
+    /// Recovery epoch this target set was planned for.
+    pub recovery_epoch: u64,
 }
 
 impl PeerManager {
@@ -48,7 +50,11 @@ impl PeerManager {
         let generation = self.current_network_generation().await;
         let history = self.traversal_history.read().await.clone();
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
-        let mut conns = self.connections.write().await;
+        let recovery_stage = if self.recovery_epoch_active(node_id).await {
+            Some(self.recovery_stage_for(node_id).await)
+        } else {
+            None
+        };        let mut conns = self.connections.write().await;
         let conn = conns.get_mut(node_id)?;
         if !conn.online {
             return None;
@@ -85,7 +91,22 @@ impl PeerManager {
         if endpoints.is_empty() {
             None
         } else {
-            let remote_scatter_pool = conn.candidate_targets_need_remote_scatter_pool(&endpoints);
+            let mut remote_scatter_pool =
+                conn.candidate_targets_need_remote_scatter_pool(&endpoints);
+            let mut birthday_plan = birthday_plan;
+            let mut endpoints = endpoints;
+            // The recovery stage machine bounds the target set: wide scatter
+            // plans are only reachable after explicit no-ACK feedback, and
+            // every stage has a hard probe ceiling.
+            if let Some(stage) = recovery_stage {
+                cap_targets_by_recovery_stage(
+                    conn,
+                    &mut endpoints,
+                    &mut birthday_plan,
+                    &mut remote_scatter_pool,
+                    stage,
+                );
+            }
             Some(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
                 stable_remote_scatter: remote_scatter_pool
@@ -95,6 +116,11 @@ impl PeerManager {
                 remote_scatter_pool,
                 candidates: endpoints,
                 birthday_plan,
+                recovery_epoch: if recovery_stage.is_some() {
+                    self.recovery_epoch_for(node_id).await
+                } else {
+                    0
+                },
             })
         }
     }
@@ -206,84 +232,109 @@ impl PeerManager {
         let generation = self.current_network_generation().await;
         let history = self.traversal_history.read().await.clone();
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
-        self.connections
-            .write()
-            .await
-            .values_mut()
-            .filter_map(|conn| {
-                if !conn.online {
-                    return None;
-                }
-                if conn.state == ConnectionState::Direct {
-                    conn.retire_speculative_pairs_when_direct_confirmed(generation);
-                    return None;
-                }
-                let reclaim_active = conn.direct_reclaim_active();
-                if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
-                    return None;
-                }
-                if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
-                    if conn
-                        .direct_events
-                        .last()
-                        .is_none_or(|event| {
-                            event.network_generation != generation
-                                || event.stage != "retry_skipped_no_viable_nat_window"
-                        })
-                    {
-                        conn.record_direct_event(
-                            generation,
-                            "retry_skipped_no_viable_nat_window",
-                            conn.endpoint,
-                            None,
-                            None,
-                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
-                        );
-                    }
-                    return None;
-                }
-                let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
-                    generation,
-                    &history,
-                    local_nat_profile.as_ref(),
-                    if reclaim_active {
-                        ProbeTargetMode::Reclaim
-                    } else {
-                        ProbeTargetMode::Background
-                    },
-                );
-
-                if endpoints.is_empty() {
-                    None
-                } else {
-                    if reclaim_active {
-                        conn.record_direct_event(
-                            generation,
-                            "direct_reclaim_targets_due",
-                            endpoints.first().copied(),
-                            Some(endpoints.len()),
-                            None,
-                            format!(
-                                "selected {} UDP candidates for generation-change Direct reclaim",
-                                endpoints.len()
-                            ),
-                        );
-                    }
-                    let remote_scatter_pool =
-                        conn.candidate_targets_need_remote_scatter_pool(&endpoints);
-                    Some(DirectProbeTargetSet {
-                        peer_id: conn.node_id.clone(),
-                        stable_remote_scatter: remote_scatter_pool
-                            && birthday_plan
-                                .as_ref()
-                                .is_some_and(|plan| plan.stable_side_unique_scatter),
-                        remote_scatter_pool,
-                        candidates: endpoints,
-                        birthday_plan,
+        // Pre-admit every online non-Direct peer into the recovery scheduler:
+        // the target sets below are then planned inside the epoch's stage
+        // caps, so background retries can never build a wide scatter plan
+        // without explicit no-ACK feedback.
+        let eligible = {
+            let conns = self.connections.read().await;
+            conns
+                .values()
+                .filter(|conn| conn.online && conn.state != ConnectionState::Direct)
+                .map(|conn| conn.node_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut sets = Vec::new();
+        for peer_id in eligible {
+            let RecoveryAdmission::Accepted { epoch } =
+                self.recovery_epoch_admit(&peer_id).await
+            else {
+                continue;
+            };
+            let stage = self.recovery_stage_for(&peer_id).await;
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(&peer_id) else {
+                continue;
+            };
+            if !conn.online || conn.state == ConnectionState::Direct {
+                continue;
+            }
+            let reclaim_active = conn.direct_reclaim_active();
+            if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
+                continue;
+            }
+            if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
+                if conn
+                    .direct_events
+                    .last()
+                    .is_none_or(|event| {
+                        event.network_generation != generation
+                            || event.stage != "retry_skipped_no_viable_nat_window"
                     })
+                {
+                    conn.record_direct_event(
+                        generation,
+                        "retry_skipped_no_viable_nat_window",
+                        conn.endpoint,
+                        None,
+                        None,
+                        "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                    );
                 }
-            })
-            .collect()
+                continue;
+            }
+            let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
+                generation,
+                &history,
+                local_nat_profile.as_ref(),
+                if reclaim_active {
+                    ProbeTargetMode::Reclaim
+                } else {
+                    ProbeTargetMode::Background
+                },
+            );
+            if endpoints.is_empty() {
+                continue;
+            }
+            if reclaim_active {
+                conn.record_direct_event(
+                    generation,
+                    "direct_reclaim_targets_due",
+                    endpoints.first().copied(),
+                    Some(endpoints.len()),
+                    None,
+                    format!(
+                        "selected {} UDP candidates for generation-change Direct reclaim",
+                        endpoints.len()
+                    ),
+                );
+            }
+            let mut remote_scatter_pool =
+                conn.candidate_targets_need_remote_scatter_pool(&endpoints);
+            let mut birthday_plan = birthday_plan;
+            let mut endpoints = endpoints;
+            // The recovery stage machine bounds the background target set the
+            // same way it bounds synchronized targets.
+            cap_targets_by_recovery_stage(
+                conn,
+                &mut endpoints,
+                &mut birthday_plan,
+                &mut remote_scatter_pool,
+                stage,
+            );
+            sets.push(DirectProbeTargetSet {
+                peer_id: conn.node_id.clone(),
+                stable_remote_scatter: remote_scatter_pool
+                    && birthday_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.stable_side_unique_scatter),
+                remote_scatter_pool,
+                candidates: endpoints,
+                birthday_plan,
+                recovery_epoch: epoch,
+            });
+        }
+        sets
     }
 
     pub(crate) async fn record_birthday_probe_plan_started(
@@ -394,7 +445,13 @@ impl PeerManager {
         if current_public_ips != plan.public_ips {
             return false;
         }
-        conn.commit_birthday_probe_cursor(plan.start_rank, plan.end_rank)
+        let advanced = conn.commit_birthday_probe_cursor(plan.start_rank, plan.end_rank);
+        if advanced {
+            // A fully covered scatter-extended window counts toward the
+            // epoch's window report.
+            self.record_recovery_scatter_window(node_id).await;
+        }
+        advanced
     }
 
     /// Record that a UDP probe datagram was actually sent to a candidate.
@@ -409,5 +466,45 @@ impl PeerManager {
         };
         conn.mark_candidate_pair_probing(endpoint, generation);
         true
+    }
+}
+
+/// Bound a target set by the recovery stage machine.
+///
+/// - Wide scatter (birthday plans / remote scatter pool) is only built at
+///   [`RecoveryStage::ScatterExtended`], which is only reachable after the
+///   smaller stages produced explicit zero-matched-ACK feedback.
+/// - Every stage has a hard probe ceiling (`RecoveryStage::max_probes`).
+/// - The Initial stage drops only locally-generated Birthday speculation
+///   (never peer-signaled Predicted ports: for an address/port-dependent
+///   peer the predicted window IS the only viable target set, so dropping it
+///   would leave only LAN hosts that cannot traverse the NATs).
+fn cap_targets_by_recovery_stage(
+    conn: &PeerConnection,
+    endpoints: &mut Vec<SocketAddr>,
+    birthday_plan: &mut Option<BirthdayProbePlan>,
+    remote_scatter_pool: &mut bool,
+    stage: RecoveryStage,
+) {
+    if stage < RecoveryStage::ScatterExtended {
+        *birthday_plan = None;
+        *remote_scatter_pool = false;
+    }
+    if stage == RecoveryStage::Initial {
+        let trusted = endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| {
+                conn.candidate_source_for_endpoint(*endpoint)
+                    != CandidatePairSource::Birthday
+            })
+            .collect::<Vec<_>>();
+        if !trusted.is_empty() {
+            *endpoints = trusted;
+        }
+    }
+    let max_probes = stage.max_probes() as usize;
+    if endpoints.len() > max_probes {
+        endpoints.truncate(max_probes);
     }
 }

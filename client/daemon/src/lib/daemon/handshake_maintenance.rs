@@ -147,21 +147,44 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // path — the peer never answers, the session never forms, and
             // direct validation can never promote.
             drop(handshake_guard);
-            let refreshed = refresh_candidate_cache_for_maintenance_signal(
-                &peers,
-                &control,
-                &udp_transport,
-                &runtime_stun_servers,
-                &runtime_stun_timeout,
-                udp_advertise.as_deref(),
-                &local_candidates,
-                &local_candidate_sources,
-                &local_network_identity,
-                &candidate_refresh_lock,
-                &nat_profile,
-                "handshake maintenance",
-            )
-            .await;
+            // Rekey defaults to the cached candidate snapshot: a live STUN
+            // gather is only run when no snapshot exists yet (first boot), so
+            // a healthy Direct peer's rekey never re-triggers traversal churn.
+            let refreshed = {
+                let _lease_guard = candidate_refresh_lock.lock().await;
+                let leased = {
+                    let candidates = local_candidates.read().await.clone();
+                    let sources = local_candidate_sources.read().await.clone();
+                    if !candidates.is_empty() {
+                        Some((candidates, sources))
+                    } else {
+                        None
+                    }
+                };
+                drop(_lease_guard);
+                if let Some(leased) = leased {
+                    debug!(
+                        "Handshake maintenance reuses the cached candidate snapshot; no live STUN gather"
+                    );
+                    Some(leased)
+                } else {
+                    refresh_candidate_cache_for_maintenance_signal(
+                        &peers,
+                        &control,
+                        &udp_transport,
+                        &runtime_stun_servers,
+                        &runtime_stun_timeout,
+                        udp_advertise.as_deref(),
+                        &local_candidates,
+                        &local_candidate_sources,
+                        &local_network_identity,
+                        &candidate_refresh_lock,
+                        &nat_profile,
+                        "handshake maintenance",
+                    )
+                    .await
+                }
+            };
             let (candidates, candidate_sources) = if let Some(refreshed) = refreshed {
                 refreshed
             } else {
@@ -306,6 +329,9 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                             REASON_HANDSHAKE_TIMEOUT,
                             "handshake timed out",
                         )
+                        .await;
+                    peers2
+                        .mark_recovery_relay_backoff(&timeout_peer, "handshake timed out")
                         .await;
                 }
                 let removed = {

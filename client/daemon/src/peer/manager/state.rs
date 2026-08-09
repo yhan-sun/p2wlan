@@ -85,6 +85,19 @@ pub struct PeerManager {
     /// re-verify "is this peer Direct?" inside its socket-state lock without
     /// ever awaiting the async peer manager there.
     direct_peers: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// The authoritative failure-recovery scheduler: one traversal plan per
+    /// `(peer_id, network_generation, recovery_epoch)` with hard per-epoch
+    /// budgets (probe credit, fresh generations, HTTP publishes) and the
+    /// feedback-driven stage machine.
+    recovery_epochs: Arc<RwLock<HashMap<String, RecoveryEpochState>>>,
+    /// Lock-free per-peer direct-commit sequence mirror.  Bumped inside the
+    /// network-epoch critical section together with the Direct state
+    /// transition, so outbound punch loops can gate every actual UDP send on
+    /// it and prove post-promotion sends are impossible.
+    direct_commit_seq_mirror: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Wake-up for any direct-commit bump.  Waiters re-check the peer's
+    /// sequence after waking.
+    direct_commit_notify: Arc<Notify>,
     /// Configuration.
     config: Config,
 }

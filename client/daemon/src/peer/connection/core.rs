@@ -87,6 +87,11 @@ pub struct PeerConnection {
     pub relay_health: PathHealth,
     /// Local network generation in which the direct path was last confirmed.
     pub direct_generation: u64,
+    /// Monotonic direct-commit sequence.  Bumped inside the network-epoch
+    /// critical section every time the Direct confirmation changes (promotion
+    /// or endpoint change); outbound punch loops gate every actual UDP send
+    /// on this sequence.
+    pub direct_commit_seq: u64,
     /// Short window after a local generation change where previous Direct peers
     /// are reprobed aggressively before returning to normal retry backoff.
     direct_reclaim_until: Option<Instant>,
@@ -142,6 +147,7 @@ impl PeerConnection {
             direct_health: PathHealth::default(),
             relay_health: PathHealth::default(),
             direct_generation: 0,
+            direct_commit_seq: 0,
             direct_reclaim_until: None,
             candidate_pairs: Vec::new(),
             birthday_probe_cursor: 0,
