@@ -39,6 +39,17 @@ void main() {
       );
     });
 
+    test('rejects diagnostics endpoints that would expose local control', () {
+      expect(
+        () => normalizeDiagnosticsUrl('http://0.0.0.0:39277/status'),
+        throwsFormatException,
+      );
+      expect(
+        () => normalizeDiagnosticsUrl('http://192.0.2.12:39277/status'),
+        throwsFormatException,
+      );
+    });
+
     test('rejects missing URL, unsupported scheme, and missing host', () {
       expect(() => normalizeDiagnosticsUrl(''), throwsFormatException);
       expect(

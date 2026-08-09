@@ -24,7 +24,6 @@ void _registerDashboardTests() {
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
-    expect(find.byKey(const Key('auto-refresh-toggle')), findsOneWidget);
   });
 
   testWidgets('Dashboard shows stop only when daemon is reachable', (
@@ -54,89 +53,8 @@ void _registerDashboardTests() {
     expect(find.textContaining('Max probability'), findsNothing);
     expect(find.text('NAT probabilities'), findsNothing);
     expect(find.byIcon(Icons.info_outline_rounded), findsNothing);
-    expect(find.byKey(const Key('dashboard-speedtest-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
-  });
-
-  testWidgets('Dashboard runs speed test for confirmed direct peer', (
-    tester,
-  ) async {
-    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final api = _FakeDiagnosticsApi(
-      health: true,
-      snapshot: snapshot,
-      speedTestResult: SpeedTestResult(
-        peerVirtualIp: '10.20.0.11',
-        durationMs: 10000,
-        downloadMbps: 123.4,
-        uploadMbps: 56.7,
-        downloadBytes: 154250000,
-        uploadBytes: 70875000,
-      ),
-    );
-    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    final speedTestButton = find.byKey(const Key('dashboard-speedtest-button'));
-    await tester.ensureVisible(speedTestButton);
-    await tester.pumpAndSettle();
-    await tester.tap(speedTestButton);
-    await tester.pumpAndSettle();
-    await tester.runAsync(() async {});
-    await tester.pumpAndSettle();
-
-    expect(api.speedTestCount, 1);
-    expect(find.textContaining('Down 123.4 Mbps'), findsOneWidget);
-    expect(find.textContaining('Up 56.7 Mbps'), findsOneWidget);
-  });
-
-  testWidgets('Dashboard shows speed test failure without stale result', (
-    tester,
-  ) async {
-    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final api = _FakeDiagnosticsApi(
-      health: true,
-      snapshot: snapshot,
-      speedTestError: const DiagnosticsApiException('speed fixture failed'),
-    );
-    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    final speedTestButton = find.byKey(const Key('dashboard-speedtest-button'));
-    await tester.ensureVisible(speedTestButton);
-    await tester.pumpAndSettle();
-    await tester.tap(speedTestButton);
-    await tester.pump();
-    await tester.runAsync(() async {});
-    await tester.pumpAndSettle();
-
-    expect(api.speedTestCount, 1);
-    expect(
-      find.textContaining('Speed test failed: speed fixture failed'),
-      findsOneWidget,
-    );
-    expect(find.textContaining('Down 123.4 Mbps'), findsNothing);
   });
 
   testWidgets('StatusStore settles peer catalog after daemon start', (
@@ -227,7 +145,6 @@ void _registerDashboardTests() {
 
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
-    expect(find.byKey(const Key('auto-refresh-toggle')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

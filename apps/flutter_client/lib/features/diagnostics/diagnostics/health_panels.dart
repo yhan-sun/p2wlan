@@ -128,6 +128,15 @@ class _IssuesPanel extends StatelessWidget {
 
   List<_IssueRow> _collectIssues(AppStrings strings) {
     final issues = <_IssueRow>[];
+    if (statusStore.snapshotStale) {
+      issues.add(
+        _IssueRow(
+          title: strings.snapshot,
+          detail: strings.staleSnapshotMessage,
+          tone: StatusTone.warn,
+        ),
+      );
+    }
     if (!statusStore.healthReachable) {
       issues.add(
         _IssueRow(

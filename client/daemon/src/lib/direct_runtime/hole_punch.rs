@@ -465,32 +465,59 @@ async fn spawn_hole_punch_task(
                 )
                 .await
             } else if remote_scatter_pool {
-                udp.punch_candidates_remote_scatter_pool_until_not_direct(
+                udp.punch_candidates_remote_scatter_pool_until_not_direct_report(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
                     attempts,
                 )
                 .await
-                .map(|sent| PunchSendReport {
-                    packets_sent: sent,
-                    unique_target_endpoints: 0,
-                })
             } else {
-                udp.punch_candidates_until_not_direct(
+                udp.punch_candidates_until_not_direct_report(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
                     attempts,
                 )
                 .await
-                .map(|sent| PunchSendReport {
-                    packets_sent: sent,
-                    unique_target_endpoints: 0,
-                })
             };
 
             match punch_result {
+                Ok(report) if report.packets_sent == 0 => {
+                    // Zero-send is NOT a silent success: with a non-empty
+                    // candidate set every probe was rejected by the admission
+                    // layer.  Record the structured verdict and freeze the
+                    // recovery epoch with a controlled backoff so the next
+                    // 1-second tick cannot rebuild the same wide plan.
+                    let (visited, skipped, reason) = if report.epoch_budget_exhausted {
+                        (
+                            report.budget_skipped as u64,
+                            report.budget_skipped as u64,
+                            "recovery_epoch_credit_exhausted",
+                        )
+                    } else if report.candidate_iteration_capped {
+                        (
+                            candidates.len() as u64,
+                            report.budget_skipped as u64,
+                            "recovery_candidate_iteration_budget_exhausted",
+                        )
+                    } else {
+                        (
+                            candidates.len() as u64,
+                            report.budget_skipped as u64,
+                            "all_probes_rejected_by_budget",
+                        )
+                    };
+                    peers
+                        .record_zero_send_recovery_session(
+                            &peer_id,
+                            candidates.len() as u64,
+                            visited,
+                            skipped,
+                            reason,
+                        )
+                        .await;
+                }
                 Ok(report) => {
                     last_punch_report = Some(report);
                     let sent = report.packets_sent;

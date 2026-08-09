@@ -48,7 +48,7 @@ class DiagnosticsApi {
       request.headers.set(HttpHeaders.acceptHeader, 'text/plain');
       request.headers.contentLength = 0;
       final response = await request.close().timeout(_requestTimeout);
-      await response.drain<void>();
+      await response.drain<void>().timeout(_requestTimeout);
       return response.statusCode >= 200 && response.statusCode < 300;
     } catch (_) {
       return false;
@@ -97,7 +97,7 @@ class DiagnosticsApi {
     final request = await _client.getUrl(uri).timeout(_requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, accept);
     final response = await request.close().timeout(_requestTimeout);
-    final body = await utf8.decodeStream(response);
+    final body = await utf8.decodeStream(response).timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw DiagnosticsApiException(
         'GET ${uri.path} returned HTTP ${response.statusCode}',
@@ -155,8 +155,20 @@ String normalizeDiagnosticsUrl(String value) {
   if (parsed.host.isEmpty) {
     throw const FormatException('Diagnostics URL must include a host');
   }
+  if (!_isLoopbackDiagnosticsHost(parsed.host)) {
+    throw const FormatException(
+      'Diagnostics URL must use localhost or a loopback address',
+    );
+  }
   final path = parsed.path.isEmpty || parsed.path == '/'
       ? '/status'
       : parsed.path;
   return parsed.replace(path: path, fragment: null).toString();
+}
+
+bool _isLoopbackDiagnosticsHost(String host) {
+  final normalized = host.trim().toLowerCase();
+  if (normalized == 'localhost' || normalized == '::1') return true;
+  final address = InternetAddress.tryParse(normalized);
+  return address?.isLoopback ?? false;
 }

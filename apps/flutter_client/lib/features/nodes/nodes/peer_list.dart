@@ -9,6 +9,7 @@ class _PeerList extends StatelessWidget {
     required this.onDetails,
     required this.onEdit,
     required this.onDelete,
+    required this.onSpeedTest,
   });
 
   final List<PeerSnapshot> peers;
@@ -18,6 +19,7 @@ class _PeerList extends StatelessWidget {
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
   final Future<void> Function(PeerSnapshot peer) onDelete;
+  final Future<void> Function(PeerSnapshot peer) onSpeedTest;
 
   @override
   Widget build(BuildContext context) {
@@ -78,6 +80,7 @@ class _PeerList extends StatelessWidget {
                       onDetails: onDetails,
                       onEdit: onEdit,
                       onDelete: onDelete,
+                      onSpeedTest: onSpeedTest,
                     ),
                   );
                 },
@@ -166,6 +169,7 @@ class _PeerListRow extends StatelessWidget {
     required this.onDetails,
     required this.onEdit,
     required this.onDelete,
+    required this.onSpeedTest,
   });
 
   final PeerSnapshot peer;
@@ -178,6 +182,7 @@ class _PeerListRow extends StatelessWidget {
   final Future<void> Function(PeerSnapshot peer) onDetails;
   final Future<void> Function(PeerSnapshot peer) onEdit;
   final Future<void> Function(PeerSnapshot peer) onDelete;
+  final Future<void> Function(PeerSnapshot peer) onSpeedTest;
 
   @override
   Widget build(BuildContext context) {
@@ -185,6 +190,7 @@ class _PeerListRow extends StatelessWidget {
     final ipKey = '${peer.nodeId}:ip';
     final pingKey = '${peer.nodeId}:ping';
     final menu = _actionsMenu(ipKey, pingKey);
+    final speedTestAction = _speedTestAction();
     final rowColor = shaded
         ? theme.colorScheme.surfaceContainerHighest
         : theme.colorScheme.surface;
@@ -211,6 +217,7 @@ class _PeerListRow extends StatelessWidget {
                       children: [
                         Expanded(child: _PeerPrimaryText(peer: peer)),
                         const SizedBox(width: 8),
+                        speedTestAction,
                         menu,
                       ],
                     ),
@@ -249,6 +256,7 @@ class _PeerListRow extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(width: 4),
+                    speedTestAction,
                     menu,
                   ],
                 ),
@@ -291,12 +299,23 @@ class _PeerListRow extends StatelessWidget {
                 onDetails(peer);
               });
               break;
+            case 'speed_test':
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                onSpeedTest(peer);
+              });
+              break;
           }
         },
         itemBuilder: (context) => [
           PopupMenuItem(
             value: 'details',
             child: Text(strings.isZh ? '查看详情' : 'View details'),
+          ),
+          PopupMenuItem(
+            key: ValueKey('node-speedtest-action-${peer.nodeId}'),
+            value: 'speed_test',
+            enabled: _canRunSpeedTest(peer),
+            child: Text(strings.speedTest),
           ),
           PopupMenuItem(
             value: 'copy_ip',
@@ -315,6 +334,18 @@ class _PeerListRow extends StatelessWidget {
             child: Text(strings.isZh ? '移除设备' : 'Remove device'),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _speedTestAction() {
+    return SizedBox.square(
+      dimension: AppTokens.minTouchTarget,
+      child: IconButton(
+        key: Key('node-speedtest-button-${peer.nodeId}'),
+        tooltip: strings.speedTestTooltip,
+        onPressed: _canRunSpeedTest(peer) ? () => onSpeedTest(peer) : null,
+        icon: const Icon(Icons.speed_rounded, size: 19),
       ),
     );
   }

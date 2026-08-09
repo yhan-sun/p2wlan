@@ -205,6 +205,14 @@ impl RelayTransport {
     }
 
     /// Convert relay messages into inbound encrypted datagrams for WireGuard.
+    ///
+    /// A `RelayMessage::Closed` ends the inbound drain with a typed error that
+    /// embeds the close-reason label, but it does NOT record relay-selection
+    /// diagnostics here: the EOF may belong to a SUPERSEDED connection that a
+    /// make-before-break renewal already replaced (the hub's newest-wins close
+    /// of the old connection).  Only the supervisor can tell that apart, so it
+    /// attributes the diagnostics after classifying the end (see
+    /// [`crate::relay_runtime::RelaySupervisor`]).
     pub async fn run_inbound(
         self,
         mut relay_rx: mpsc::Receiver<RelayMessage>,
@@ -215,14 +223,6 @@ impl RelayTransport {
             match message {
                 RelayMessage::Closed { reason } => {
                     let reason_label = relay_close_reason_label(reason);
-                    if let Some(ref diags) = relay_selection {
-                        let mut d = diags.write().await;
-                        d.selected_error_count = d.selected_error_count.saturating_add(1);
-                        d.last_error = Some(format!(
-                            "relay connection closed: reason={reason_label}"
-                        ));
-                        d.last_error_code = Some(reason_label.to_string());
-                    }
                     return Err(DaemonError::Relay(format!(
                         "relay {} connection closed; reason={reason_label}",
                         self.relay_endpoint

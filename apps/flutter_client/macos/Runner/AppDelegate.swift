@@ -7,9 +7,7 @@ class AppDelegate: FlutterAppDelegate {
     let raw = ProcessInfo.processInfo.environment["P2WLAN_ENABLE_FLUTTER_TRAY"]?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
-    guard let raw, !raw.isEmpty else {
-      return true
-    }
+    guard let raw, !raw.isEmpty else { return false }
     return raw != "0" && raw != "false" && raw != "no"
   }
 

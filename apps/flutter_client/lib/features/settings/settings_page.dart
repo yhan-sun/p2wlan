@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/api/diagnostics_api.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -48,7 +49,7 @@ class _SettingsPageState extends State<SettingsPage> {
   var _saving = false;
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
-  var _closeBehavior = defaultCloseBehavior;
+  var _restartRequired = false;
 
   void _updateState(VoidCallback fn) => setState(fn);
 
@@ -80,7 +81,6 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     _manualMode = settings.manualMode;
     _socketPool = normalizeSocketPool(settings.socketPool);
-    _closeBehavior = normalizeCloseBehavior(settings.closeBehavior);
   }
 
   @override
@@ -115,6 +115,13 @@ class _SettingsPageState extends State<SettingsPage> {
           children: [
             if (_formError != null) ...[
               _ErrorBanner(message: _formError!),
+              const SizedBox(height: 14),
+            ],
+            if (_restartRequired) ...[
+              _PendingRestartNotice(
+                busy: _saving || widget.statusStore.daemonBusy,
+                onRestart: _restartDaemonToApply,
+              ),
               const SizedBox(height: 14),
             ],
             AppPanel(
@@ -297,51 +304,6 @@ class _SettingsPageState extends State<SettingsPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  RadioGroup<String>(
-                    groupValue: _closeBehavior,
-                    onChanged: (value) {
-                      if (!_saving && value != null) {
-                        setState(() => _closeBehavior = value);
-                      }
-                    },
-                    child: Column(
-                      children: [
-                        Material(
-                          type: MaterialType.transparency,
-                          child: RadioListTile<String>(
-                            contentPadding: EdgeInsets.zero,
-                            value: 'keep-running',
-                            enabled: !_saving,
-                            title: Text(
-                              strings.isZh ? '后台静默运行' : 'Keep running',
-                            ),
-                            subtitle: Text(
-                              strings.isZh
-                                  ? '关闭主窗口时隐藏到系统托盘，不中断虚拟内网。'
-                                  : 'Close hides the window to tray without stopping the tunnel.',
-                            ),
-                          ),
-                        ),
-                        Material(
-                          type: MaterialType.transparency,
-                          child: RadioListTile<String>(
-                            contentPadding: EdgeInsets.zero,
-                            value: 'stop-and-quit',
-                            enabled: !_saving,
-                            title: Text(
-                              strings.isZh ? '完全停止并退出' : 'Stop and quit',
-                            ),
-                            subtitle: Text(
-                              strings.isZh
-                                  ? '退出时先停止 daemon 并清理 TUN/路由。'
-                                  : 'Quit stops the daemon and cleans up TUN/routes first.',
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const Divider(height: 24),
                   DropdownButtonFormField<String>(
                     initialValue: AppLanguage.fromCode(
                       widget.settingsStore.settings.languageCode,

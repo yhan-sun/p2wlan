@@ -18,7 +18,7 @@ class P2WlanApp extends StatefulWidget {
   const P2WlanApp({
     super.key,
     this.initialRefresh = true,
-    this.autoStartPolling = false,
+    this.autoStartPolling = true,
     this.settingsStore,
     this.diagnosticsApi,
     this.daemonController,
@@ -36,7 +36,7 @@ class P2WlanApp extends StatefulWidget {
   State<P2WlanApp> createState() => _P2WlanAppState();
 }
 
-class _P2WlanAppState extends State<P2WlanApp> {
+class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   late final SettingsStore _settingsStore;
   late final StatusStore _statusStore;
   DesktopTrayController? _desktopTrayController;
@@ -51,8 +51,15 @@ class _P2WlanAppState extends State<P2WlanApp> {
       settingsStore: _settingsStore,
       diagnosticsApi: widget.diagnosticsApi ?? DiagnosticsApi(),
       daemonController: widget.daemonController,
+      enableFreshnessTimer: true,
     );
+    WidgetsBinding.instance.addObserver(this);
     _bootstrap();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _statusStore.updateAppLifecycleState(state);
   }
 
   Future<void> _bootstrap() async {
@@ -60,24 +67,20 @@ class _P2WlanAppState extends State<P2WlanApp> {
     _authenticated =
         _settingsStore.settings.authToken.trim().isNotEmpty ||
         _settingsStore.settings.manualMode;
+    if (mounted) {
+      setState(() => _ready = true);
+    }
     if (widget.enableDesktopTray && DesktopTrayController.isSupported) {
       _desktopTrayController = DesktopTrayController(
         settingsStore: _settingsStore,
         statusStore: _statusStore,
       );
-      await _desktopTrayController!.initialize();
-    }
-    if (widget.initialRefresh) {
-      await _statusStore.refresh();
-      unawaited(
-        _statusStore.refreshUntilPeerCatalogSettled(skipInitialRefresh: true),
-      );
+      unawaited(_desktopTrayController!.initialize());
     }
     if (widget.autoStartPolling) {
       _statusStore.startPolling();
-    }
-    if (mounted) {
-      setState(() => _ready = true);
+    } else if (widget.initialRefresh) {
+      unawaited(_statusStore.refreshUntilPeerCatalogSettled());
     }
   }
 
@@ -96,6 +99,7 @@ class _P2WlanAppState extends State<P2WlanApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_desktopTrayController?.dispose());
     _statusStore.dispose();
     _settingsStore.dispose();

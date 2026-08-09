@@ -141,14 +141,17 @@ class _SummaryStrip extends StatelessWidget {
         runSpacing: 10,
         children: [
           MetricTile(
-            label: strings.isZh ? '网卡' : 'Interface',
+            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
             value: settings.effectiveTunInterface,
           ),
           MetricTile(
             label: strings.virtualIp,
             value: _dash(snapshot?.virtualIp),
           ),
-          MetricTile(label: 'MTU', value: settings.mtu.toString()),
+          MetricTile(
+            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
+            value: settings.mtu.toString(),
+          ),
           MetricTile(
             label: strings.isZh ? '状态' : 'State',
             value: running ? strings.connected : strings.offline,
@@ -182,12 +185,15 @@ class _TunnelPanel extends StatelessWidget {
       child: Column(
         children: [
           _Kv(
-            label: strings.isZh ? '网卡名称' : 'Interface',
+            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
             value: settings.effectiveTunInterface,
           ),
           _Kv(label: 'Overlay CIDR', value: settings.overlayCidr),
           _Kv(label: strings.virtualIp, value: _dash(snapshot?.virtualIp)),
-          _Kv(label: 'MTU', value: settings.mtu.toString()),
+          _Kv(
+            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
+            value: settings.mtu.toString(),
+          ),
           _Kv(
             label: strings.udpLocalAddr,
             value: _dash(snapshot?.udpLocalAddr ?? settings.udpBind),
@@ -220,14 +226,15 @@ class _RoutePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final installed = running && snapshot?.virtualIp.trim().isNotEmpty == true;
+    final daemonManagingRoutes =
+        running && snapshot?.virtualIp.trim().isNotEmpty == true;
     return AppPanel(
       title: strings.route,
       trailing: StatusBadge(
-        label: installed
-            ? (strings.isZh ? '已安装' : 'Installed')
+        label: daemonManagingRoutes
+            ? (strings.isZh ? '由 daemon 管理' : 'Daemon managed')
             : (strings.isZh ? '未知' : 'Unknown'),
-        tone: installed ? StatusTone.good : StatusTone.neutral,
+        tone: daemonManagingRoutes ? StatusTone.good : StatusTone.neutral,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -242,10 +249,10 @@ class _RoutePanel extends StatelessWidget {
           ),
           _Kv(
             label: strings.isZh ? '状态说明' : 'Detail',
-            value: installed
+            value: daemonManagingRoutes
                 ? (strings.isZh
-                      ? '守护进程在线，Overlay 路由应由 daemon 维护。'
-                      : 'Daemon is online; overlay routes are maintained by the daemon.')
+                      ? '守护进程在线；路由由 daemon 维护，当前版本不会直接读取系统路由表。'
+                      : 'Daemon is online and manages routes; this client does not read the system route table directly.')
                 : (strings.isZh
                       ? '守护进程离线或尚未分配虚拟 IP。'
                       : 'Daemon is offline or virtual IP is not assigned.'),

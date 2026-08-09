@@ -316,6 +316,12 @@ const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
 /// pace this over time; this cap only prevents the session from stopping after
 /// the first few hundred ports.
 const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
+/// A punch session stops after this many consecutive budget rejections
+/// without a single send: the whole candidate window is being refused by the
+/// admission layer, so continuing to enumerate it only burns CPU and log
+/// capacity.  The recovery epoch's budget-exhausted backoff then freezes the
+/// plan instead of rebuilding it on the next tick.
+pub(super) const MAX_BUDGET_REJECTIONS_PER_SESSION: u32 = 3_072;
 /// Maximum number of probes emitted between scheduler yields in one punch
 /// session.  A large candidate set is split into these finite batches; each
 /// batch boundary yields and re-checks Direct, the network generation and the
@@ -924,6 +930,17 @@ impl PunchSocketPolicy {
 pub(crate) struct PunchSendReport {
     pub packets_sent: u32,
     pub unique_target_endpoints: u32,
+    /// How many candidate probes were rejected by the admission layer
+    /// (rate limits, epoch credit, quarantine) during this session.
+    pub budget_skipped: u32,
+    /// The session ended because the recovery-epoch probe credit was
+    /// exhausted: no further probe may be emitted this epoch, and the caller
+    /// must treat a zero-send session as a budget-exhausted verdict instead
+    /// of an empty success.
+    pub epoch_budget_exhausted: bool,
+    /// The session stopped enumerating candidates because the epoch's hard
+    /// candidate-iteration budget was reached.
+    pub candidate_iteration_capped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

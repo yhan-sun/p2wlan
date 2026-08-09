@@ -114,11 +114,15 @@ class DaemonController {
       logPath: logPath,
       pidPath: pidPath,
     );
-    final manualCommand = _manualCommandForPlatform(
-      elevatedShell: elevatedShell,
-      binary: binary,
-      args: args,
-    );
+    // Managed launches include an auth token. Never expose a token-bearing
+    // command in UI error messages or the clipboard.
+    final manualCommand = useManualMode
+        ? _manualCommandForPlatform(
+            elevatedShell: elevatedShell,
+            binary: binary,
+            args: args,
+          )
+        : null;
 
     try {
       if (Platform.isMacOS && !_isRootUser()) {

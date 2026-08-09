@@ -5,11 +5,13 @@ class _DashboardMetrics extends StatelessWidget {
     required this.snapshot,
     required this.lastFetchedAt,
     required this.requestDuration,
+    required this.snapshotStale,
   });
 
   final DiagnosticsSnapshot? snapshot;
   final DateTime? lastFetchedAt;
   final Duration? requestDuration;
+  final bool snapshotStale;
 
   @override
   Widget build(BuildContext context) {
@@ -53,7 +55,9 @@ class _DashboardMetrics extends StatelessWidget {
       _MetricItem(
         label: strings.lastRefresh,
         value: formatDateTime(lastFetchedAt),
-        detail: formatDuration(requestDuration),
+        detail: snapshotStale
+            ? strings.snapshotExpired
+            : formatDuration(requestDuration),
       ),
     ];
 

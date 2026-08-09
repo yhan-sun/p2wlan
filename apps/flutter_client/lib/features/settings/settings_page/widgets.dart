@@ -79,3 +79,75 @@ class _ErrorBanner extends StatelessWidget {
     );
   }
 }
+
+class _PendingRestartNotice extends StatelessWidget {
+  const _PendingRestartNotice({required this.busy, required this.onRestart});
+
+  final bool busy;
+  final Future<void> Function() onRestart;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.secondaryContainer,
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final message = Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  strings.restartRequired,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSecondaryContainer,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  strings.restartRequiredDetail,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSecondaryContainer,
+                    fontSize: 12,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            );
+            final action = FilledButton.icon(
+              onPressed: busy ? null : onRestart,
+              icon: busy
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.restart_alt_rounded, size: 17),
+              label: Text(strings.restartNow),
+            );
+            if (constraints.maxWidth < 540) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [message, const SizedBox(height: 10), action],
+              );
+            }
+            return Row(
+              children: [
+                Expanded(child: message),
+                const SizedBox(width: 14),
+                action,
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}

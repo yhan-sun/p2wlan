@@ -50,6 +50,6 @@ bool get _enableFlutterTray {
 @visibleForTesting
 bool enableFlutterTrayForEnvironment(Map<String, String> environment) {
   final value = environment['P2WLAN_ENABLE_FLUTTER_TRAY']?.trim().toLowerCase();
-  if (value == null || value.isEmpty) return true;
+  if (value == null || value.isEmpty) return false;
   return value != '0' && value != 'false' && value != 'no' && value != 'off';
 }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -20,6 +21,7 @@ part 'nodes/peer_table.dart';
 part 'nodes/peer_list.dart';
 part 'nodes/peer_details_widgets.dart';
 part 'nodes/helpers.dart';
+part 'nodes/speed_test.dart';
 
 class NodesPage extends StatefulWidget {
   const NodesPage({
@@ -120,6 +122,7 @@ class _NodesPageState extends State<NodesPage> {
                 onDetails: _showPeerDetails,
                 onEdit: _editPeer,
                 onDelete: _deletePeer,
+                onSpeedTest: _showSpeedTest,
               ),
           ],
         );
@@ -293,6 +296,18 @@ class _NodesPageState extends State<NodesPage> {
       context: context,
       builder: (dialogContext) =>
           _PeerDetailsDialog(peer: peer, strings: strings),
+    );
+  }
+
+  Future<void> _showSpeedTest(PeerSnapshot peer) async {
+    final strings = AppStringsScope.of(context);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _SpeedTestDialog(
+        peer: peer,
+        statusStore: widget.statusStore,
+        strings: strings,
+      ),
     );
   }
 

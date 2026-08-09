@@ -275,11 +275,17 @@ pub(super) fn truncate_signal_candidates(
             })
             .cloned()
             .collect::<Vec<_>>();
-        warn!(
-            "Truncating {} gathered UDP candidates to the signaling limit of {}",
-            candidates.len(),
-            MAX_SIGNAL_CANDIDATES
-        );
+        // The truncation warning is deduplicated by the canonical content of
+        // the truncated set: the same 98→96 refresh must not log per cycle.
+        let truncation_dedup = truncation_reporter();
+        let canonical_hash = canonical_candidate_set_hash(candidates, candidate_sources);
+        if truncation_dedup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).report(canonical_hash) {
+            warn!(
+                "Truncating {} gathered UDP candidates to the signaling limit of {} (canonical set hash={canonical_hash})",
+                candidates.len(),
+                MAX_SIGNAL_CANDIDATES
+            );
+        }
         let public_budget = MAX_SIGNAL_CANDIDATES
             .saturating_sub(fresh_budget)
             .saturating_sub(retained_lan_hosts.len());
@@ -622,6 +628,81 @@ pub(super) fn candidate_set_hash(
         entry.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Canonical (order-insensitive) hash of the truncated top-N candidate set.
+///
+/// This is the identity used to deduplicate the truncation warning and the
+/// volatile publication gate: if the canonical top-N content is unchanged,
+/// the refresh produced no semantic change and must not warn, offer, publish
+/// or punch again.
+pub(super) fn canonical_candidate_set_hash(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> u64 {
+    let mut entries = candidates
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "{}={}",
+                endpoint,
+                candidate_sources
+                    .get(endpoint)
+                    .map(String::as_str)
+                    .unwrap_or("signaled")
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    for entry in &entries {
+        entry.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Process-wide truncation warning deduplicator.
+///
+/// A gathered set that stays over the signaling limit across refreshes
+/// (e.g. the same 98 gathered candidates truncating to the same top-96)
+/// must warn exactly once per canonical content, then only update a
+/// counter.  The event remains observable as a structured counter instead
+/// of a log flood.
+#[derive(Debug, Default)]
+pub(super) struct TruncationReporter {
+    last_canonical_hash: Option<u64>,
+    identical_truncations: u64,
+    total_truncations: u64,
+}
+
+impl TruncationReporter {
+    /// Report one truncation event; returns `true` when this canonical
+    /// content was NOT seen before (the caller should surface the warning).
+    pub(super) fn report(&mut self, canonical_hash: u64) -> bool {
+        self.total_truncations = self.total_truncations.saturating_add(1);
+        if self.last_canonical_hash == Some(canonical_hash) {
+            self.identical_truncations = self.identical_truncations.saturating_add(1);
+            false
+        } else {
+            self.last_canonical_hash = Some(canonical_hash);
+            true
+        }
+    }
+
+    /// Counters exposed for diagnostics and tests.
+    #[cfg(test)]
+    pub(super) fn counters(&self) -> (u64, u64) {
+        (self.total_truncations, self.identical_truncations)
+    }
+}
+
+/// Process-wide singleton truncation reporter (the reporter itself holds no
+/// candidate content, only hashes and counters).
+fn truncation_reporter() -> &'static std::sync::Mutex<TruncationReporter> {
+    use std::sync::OnceLock;
+    static REPORTER: OnceLock<std::sync::Mutex<TruncationReporter>> = OnceLock::new();
+    REPORTER.get_or_init(|| std::sync::Mutex::new(TruncationReporter::default()))
 }
 
 pub(super) fn stable_network_candidate_signature(

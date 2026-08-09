@@ -202,6 +202,7 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   String _statusLabel(AppStrings strings) {
     if (statusStore.daemonBusy) return strings.daemonWorking;
+    if (statusStore.snapshotStale) return strings.stale;
     if (!statusStore.daemonReachable) return strings.offline;
     final health = statusStore.snapshot?.health.status;
     if (health == null || health.isEmpty) return strings.degraded;
@@ -214,6 +215,7 @@ class DesktopTrayController with TrayListener, WindowListener {
       return Platform.isWindows ? _windowsTrayIconAsset : _linuxTrayIconAsset;
     }
     if (statusStore.daemonBusy) return _macosBusyIconAsset;
+    if (statusStore.snapshotStale) return _macosAttentionIconAsset;
     if (!statusStore.daemonReachable) return _macosOffIconAsset;
     final health = statusStore.snapshot?.health.status.toLowerCase();
     if (health == 'healthy') return _macosOnIconAsset;

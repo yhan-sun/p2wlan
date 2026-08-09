@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 
 import '../api/diagnostics_api.dart';
 import '../daemon/daemon_controller.dart';
@@ -12,16 +13,23 @@ class StatusStore extends ChangeNotifier {
     required this.settingsStore,
     required this.diagnosticsApi,
     DaemonController? daemonController,
-    this.autoRefreshInterval = defaultAutoRefreshInterval,
+    this.autoRefreshInterval = defaultActivePollingInterval,
+    this.backgroundRefreshInterval = defaultBackgroundPollingInterval,
+    this.maxSnapshotAge = defaultMaxSnapshotAge,
+    this.enableFreshnessTimer = false,
     this.startupCatalogRefreshTimeout = defaultStartupCatalogRefreshTimeout,
     this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
   }) : daemonController =
            daemonController ??
            DaemonController(diagnosticsApi: diagnosticsApi) {
+    _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     settingsStore.addListener(_handleSettingsChanged);
   }
 
-  static const defaultAutoRefreshInterval = Duration(seconds: 30);
+  /// A near-real-time view while the app is visible, without a push protocol.
+  static const defaultActivePollingInterval = Duration(seconds: 5);
+  static const defaultBackgroundPollingInterval = Duration(seconds: 60);
+  static const defaultMaxSnapshotAge = Duration(seconds: 90);
   static const defaultStartupCatalogRefreshTimeout = Duration(seconds: 6);
   static const defaultStartupCatalogRefreshInterval = Duration(
     milliseconds: 500,
@@ -33,27 +41,38 @@ class StatusStore extends ChangeNotifier {
   final DiagnosticsApi diagnosticsApi;
   final DaemonController daemonController;
   final Duration autoRefreshInterval;
+  final Duration backgroundRefreshInterval;
+  final Duration maxSnapshotAge;
+  final bool enableFreshnessTimer;
   final Duration startupCatalogRefreshTimeout;
   final Duration startupCatalogRefreshInterval;
 
   Timer? _timer;
+  Timer? _staleTimer;
   DiagnosticsSnapshot? _snapshot;
   var _healthReachable = false;
   var _refreshing = false;
   var _daemonBusy = false;
   var _autoRefreshEnabled = false;
+  var _appInForeground = true;
+  var _snapshotStale = false;
+  var _refreshPending = false;
+  var _refreshGeneration = 0;
+  Future<void>? _refreshFuture;
   String? _lastError;
   String? _lastHealthError;
   String? _lastStatusError;
   String? _lastDaemonMessage;
   String? _lastDaemonManualCommand;
   DateTime? _lastFetchedAt;
+  DateTime? _lastSuccessfulStatusAt;
   Duration? _lastRequestDuration;
   var _speedTestRunning = false;
   SpeedTestResult? _lastSpeedTestResult;
   String? _lastSpeedTestError;
   String? _speedTestPeerVirtualIp;
-  late String _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
+  DateTime? _speedTestStartedAt;
+  late String _lastDiagnosticsUrl;
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
   bool get healthReachable => _healthReachable;
@@ -63,17 +82,21 @@ class StatusStore extends ChangeNotifier {
   bool get refreshing => _refreshing;
   bool get daemonBusy => _daemonBusy;
   bool get autoRefreshEnabled => _autoRefreshEnabled;
+  bool get appInForeground => _appInForeground;
+  bool get snapshotStale => _snapshotStale;
   String? get lastError => _lastError;
   String? get lastHealthError => _lastHealthError;
   String? get lastStatusError => _lastStatusError;
   String? get lastDaemonMessage => _lastDaemonMessage;
   String? get lastDaemonManualCommand => _lastDaemonManualCommand;
   DateTime? get lastFetchedAt => _lastFetchedAt;
+  DateTime? get lastSuccessfulStatusAt => _lastSuccessfulStatusAt;
   Duration? get lastRequestDuration => _lastRequestDuration;
   bool get speedTestRunning => _speedTestRunning;
   SpeedTestResult? get lastSpeedTestResult => _lastSpeedTestResult;
   String? get lastSpeedTestError => _lastSpeedTestError;
   String? get speedTestPeerVirtualIp => _speedTestPeerVirtualIp;
+  DateTime? get speedTestStartedAt => _speedTestStartedAt;
 
   void startPolling() {
     setAutoRefresh(enabled: true, refreshImmediately: true);
@@ -90,55 +113,144 @@ class StatusStore extends ChangeNotifier {
       return;
     }
     _autoRefreshEnabled = enabled;
-    _timer?.cancel();
-    _timer = null;
-    if (enabled) {
-      _timer = Timer.periodic(autoRefreshInterval, (_) => unawaited(refresh()));
-      if (refreshImmediately) unawaited(refreshUntilPeerCatalogSettled());
+    _schedulePolling();
+    if (enabled && refreshImmediately) {
+      unawaited(refreshUntilPeerCatalogSettled());
     }
     notifyListeners();
   }
 
-  Future<void> refresh() async {
-    if (_refreshing) return;
+  void updateAppLifecycleState(AppLifecycleState state) {
+    final appInForeground = state == AppLifecycleState.resumed;
+    if (_appInForeground == appInForeground) return;
+    _appInForeground = appInForeground;
+    _schedulePolling();
+    if (_autoRefreshEnabled && appInForeground) {
+      unawaited(refresh());
+    }
+    notifyListeners();
+  }
+
+  void _schedulePolling() {
+    _timer?.cancel();
+    _timer = null;
+    if (!_autoRefreshEnabled) return;
+    final interval = _appInForeground
+        ? autoRefreshInterval
+        : backgroundRefreshInterval;
+    _timer = Timer.periodic(interval, (_) => unawaited(refresh()));
+  }
+
+  Future<void> refresh() {
+    _refreshPending = true;
+    final activeRefresh = _refreshFuture;
+    if (activeRefresh != null) return activeRefresh;
+
+    final completer = Completer<void>();
+    _refreshFuture = completer.future;
+    unawaited(_runRefreshLoop(completer));
+    return completer.future;
+  }
+
+  Future<void> _runRefreshLoop(Completer<void> completer) async {
     _refreshing = true;
     notifyListeners();
-    final url = settingsStore.settings.diagnosticsUrl;
+    try {
+      do {
+        _refreshPending = false;
+        final generation = _refreshGeneration;
+        final url = settingsStore.settings.diagnosticsUrl;
+        await _refreshOnce(url, generation);
+      } while (_refreshPending);
+      completer.complete();
+    } catch (error, stackTrace) {
+      completer.completeError(error, stackTrace);
+    } finally {
+      if (identical(_refreshFuture, completer.future)) {
+        _refreshFuture = null;
+      }
+      _refreshing = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _refreshOnce(String url, int generation) async {
     final stopwatch = Stopwatch()..start();
     try {
+      final health = await diagnosticsApi.fetchHealth(url);
+      if (generation != _refreshGeneration) {
+        _refreshPending = true;
+        return;
+      }
+
       _lastHealthError = null;
       _lastStatusError = null;
-      final health = await diagnosticsApi.fetchHealth(url);
       _healthReachable = health;
       if (!health) {
-        _snapshot = null;
+        _clearSnapshot();
         _lastHealthError = 'GET /health is offline or unreadable';
         _lastStatusError = 'GET /status skipped because /health is offline';
         _lastError = _lastHealthError;
-      } else {
-        try {
-          _snapshot = await diagnosticsApi.fetchStatus(url);
-          _lastError = null;
-        } catch (error) {
-          _snapshot = null;
-          _lastStatusError = 'GET /status failed: $error';
-          _lastError = _lastStatusError;
-        }
+        _lastFetchedAt = DateTime.now();
+        return;
       }
-      _lastFetchedAt = DateTime.now();
+
+      try {
+        final snapshot = await diagnosticsApi.fetchStatus(url);
+        if (generation != _refreshGeneration) {
+          _refreshPending = true;
+          return;
+        }
+        _snapshot = snapshot;
+        _lastError = null;
+        _lastFetchedAt = DateTime.now();
+        _lastSuccessfulStatusAt = _lastFetchedAt;
+        _markSnapshotFresh();
+      } catch (error) {
+        if (generation != _refreshGeneration) {
+          _refreshPending = true;
+          return;
+        }
+        _clearSnapshot();
+        _lastStatusError = 'GET /status failed: $error';
+        _lastError = _lastStatusError;
+        _lastFetchedAt = DateTime.now();
+      }
     } catch (error) {
+      if (generation != _refreshGeneration) {
+        _refreshPending = true;
+        return;
+      }
       _healthReachable = false;
-      _snapshot = null;
+      _clearSnapshot();
       _lastHealthError = 'GET /health failed: $error';
       _lastStatusError = 'GET /status skipped because /health failed';
       _lastError = _lastHealthError;
       _lastFetchedAt = DateTime.now();
     } finally {
       stopwatch.stop();
-      _lastRequestDuration = stopwatch.elapsed;
-      _refreshing = false;
-      notifyListeners();
+      if (generation == _refreshGeneration) {
+        _lastRequestDuration = stopwatch.elapsed;
+      }
     }
+  }
+
+  void _clearSnapshot() {
+    _snapshot = null;
+    _snapshotStale = false;
+    _staleTimer?.cancel();
+    _staleTimer = null;
+  }
+
+  void _markSnapshotFresh() {
+    _snapshotStale = false;
+    _staleTimer?.cancel();
+    if (!enableFreshnessTimer) return;
+    _staleTimer = Timer(maxSnapshotAge, () {
+      if (_snapshot == null || _snapshotStale) return;
+      _snapshotStale = true;
+      notifyListeners();
+    });
   }
 
   Future<void> refreshUntilPeerCatalogSettled({
@@ -212,6 +324,7 @@ class StatusStore extends ChangeNotifier {
     if (peerVirtualIp.isEmpty) return;
     _speedTestRunning = true;
     _speedTestPeerVirtualIp = peerVirtualIp;
+    _speedTestStartedAt = DateTime.now();
     _lastSpeedTestResult = null;
     _lastSpeedTestError = null;
     notifyListeners();
@@ -228,6 +341,17 @@ class StatusStore extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  bool speedTestMatches(PeerSnapshot peer) {
+    final peerVirtualIp = peer.virtualIp.trim();
+    return peerVirtualIp.isNotEmpty && peerVirtualIp == _speedTestPeerVirtualIp;
+  }
+
+  SpeedTestResult? speedTestResultFor(PeerSnapshot peer) =>
+      speedTestMatches(peer) ? _lastSpeedTestResult : null;
+
+  String? speedTestErrorFor(PeerSnapshot peer) =>
+      speedTestMatches(peer) ? _lastSpeedTestError : null;
 
   Future<DaemonCommandResult> _runDaemonCommand(
     Future<DaemonCommandResult> Function() command, {
@@ -314,15 +438,27 @@ class StatusStore extends ChangeNotifier {
     final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     if (nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
+    _refreshGeneration += 1;
+    _refreshPending = true;
+    _healthReachable = false;
+    _clearSnapshot();
+    _lastError = null;
+    _lastHealthError = null;
+    _lastStatusError = null;
+    _lastFetchedAt = null;
+    _lastRequestDuration = null;
     _speedTestPeerVirtualIp = null;
+    _speedTestStartedAt = null;
     _lastSpeedTestResult = null;
     _lastSpeedTestError = null;
+    notifyListeners();
     unawaited(refresh());
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _staleTimer?.cancel();
     settingsStore.removeListener(_handleSettingsChanged);
     diagnosticsApi.close();
     super.dispose();

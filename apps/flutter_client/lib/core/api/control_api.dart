@@ -27,8 +27,10 @@ class DeviceUpdateResult {
 
 class ControlApi {
   ControlApi({HttpClient? client}) : _client = client ?? HttpClient() {
-    _client.connectionTimeout = const Duration(seconds: 8);
+    _client.connectionTimeout = _requestTimeout;
   }
+
+  static const _requestTimeout = Duration(seconds: 8);
 
   final HttpClient _client;
 
@@ -183,7 +185,7 @@ class ControlApi {
     try {
       final request = await _client
           .openUrl(method, uri)
-          .timeout(const Duration(seconds: 8));
+          .timeout(_requestTimeout);
       request.persistentConnection = false;
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (authToken != null && authToken.trim().isNotEmpty) {
@@ -196,10 +198,8 @@ class ControlApi {
         request.headers.contentType = ContentType.json;
         request.write(jsonEncode(payload));
       }
-      final response = await request.close().timeout(
-        const Duration(seconds: 8),
-      );
-      final text = await utf8.decodeStream(response);
+      final response = await request.close().timeout(_requestTimeout);
+      final text = await utf8.decodeStream(response).timeout(_requestTimeout);
       final decoded = text.trim().isEmpty
           ? <String, dynamic>{}
           : jsonDecode(text);

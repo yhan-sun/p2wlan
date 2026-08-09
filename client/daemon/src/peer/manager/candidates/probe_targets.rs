@@ -50,11 +50,25 @@ impl PeerManager {
         let generation = self.current_network_generation().await;
         let history = self.traversal_history.read().await.clone();
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
+        // A quarantined peer's candidate set is authoritative-stale (relay
+        // 404): no synchronized target may be derived from it until new
+        // control-plane evidence re-opens recovery.
+        if self.peer_quarantined_sync(node_id) {
+            return None;
+        }
         let recovery_stage = if self.recovery_epoch_active(node_id).await {
             Some(self.recovery_stage_for(node_id).await)
         } else {
             None
-        };        let mut conns = self.connections.write().await;
+        };
+        // The relay safety net is read BEFORE the connection-map write guard:
+        // `has_relay_safety_net` takes the connection map read lock, which
+        // would deadlock while the write guard below is held.
+        let relay_safety_net = match recovery_stage {
+            Some(_) => self.has_relay_safety_net(node_id).await,
+            None => false,
+        };
+        let mut conns = self.connections.write().await;
         let conn = conns.get_mut(node_id)?;
         if !conn.online {
             return None;
@@ -97,7 +111,8 @@ impl PeerManager {
             let mut endpoints = endpoints;
             // The recovery stage machine bounds the target set: wide scatter
             // plans are only reachable after explicit no-ACK feedback, and
-            // every stage has a hard probe ceiling.
+            // every stage has a hard probe ceiling.  A relay-backed peer is
+            // capped to the bounded heartbeat even in the wide stage.
             if let Some(stage) = recovery_stage {
                 cap_targets_by_recovery_stage(
                     conn,
@@ -105,6 +120,7 @@ impl PeerManager {
                     &mut birthday_plan,
                     &mut remote_scatter_pool,
                     stage,
+                    relay_safety_net,
                 );
             }
             Some(DirectProbeTargetSet {
@@ -225,6 +241,14 @@ impl PeerManager {
     /// after the peer-level retry cooldown has elapsed, except during the
     /// short generation-change reclaim window for peers with previous Direct
     /// success.
+    ///
+    /// This is the per-tick recovery scheduler: every tick at most
+    /// `RECOVERY_WORK_SLOTS_PER_TICK` peers may enter a recovery session,
+    /// served by priority (recently-Direct reclaim first, then peers with
+    /// prior Direct success, then the rest), so a failing stale peer can
+    /// never starve the main peer's recovery.  Quarantined peers, budget-
+    /// frozen epochs and plan/session-quota-exhausted epochs are skipped
+    /// here — they must not rebuild a plan on this tick.
     pub(crate) async fn direct_probe_targets_due(
         &self,
         base_retry_after: Duration,
@@ -235,23 +259,96 @@ impl PeerManager {
         // Pre-admit every online non-Direct peer into the recovery scheduler:
         // the target sets below are then planned inside the epoch's stage
         // caps, so background retries can never build a wide scatter plan
-        // without explicit no-ACK feedback.
+        // without explicit no-ACK feedback.  Quarantined peers are excluded
+        // at the source: their relay 404 is authoritative and no candidate
+        // plan may be derived from their stale set.
         let eligible = {
             let conns = self.connections.read().await;
             conns
                 .values()
-                .filter(|conn| conn.online && conn.state != ConnectionState::Direct)
+                .filter(|conn| {
+                    conn.online
+                        && conn.state != ConnectionState::Direct
+                        && !self.peer_quarantined_sync(&conn.node_id)
+                })
                 .map(|conn| conn.node_id.clone())
                 .collect::<Vec<_>>()
         };
-        let mut sets = Vec::new();
+        // Priority order for the per-tick work slots: recently-Direct
+        // reclaim first, then peers with prior Direct success (the most
+        // probable live path), then the rest.
+        let mut ordered = Vec::new();
         for peer_id in eligible {
-            let RecoveryAdmission::Accepted { epoch } =
-                self.recovery_epoch_admit(&peer_id).await
+            let priority = {
+                let conns = self.connections.read().await;
+                let Some(conn) = conns.get(&peer_id) else {
+                    continue;
+                };
+                if conn.direct_reclaim_active() {
+                    0
+                } else if conn.has_direct_success_history() {
+                    1
+                } else {
+                    2
+                }
+            };
+            ordered.push((priority, peer_id));
+        }
+        ordered.sort_by_key(|(priority, peer_id)| (*priority, peer_id.clone()));
+
+        let mut granted = 0usize;
+        let mut sets = Vec::new();
+        for (_, peer_id) in ordered {
+            if granted >= RECOVERY_WORK_SLOTS_PER_TICK {
+                // The per-tick work budget is spent: remaining peers are
+                // deferred to the next tick.  One exhausted peer must not
+                // consume the whole shared scheduler.
+                self.record_direct_event(
+                    &peer_id,
+                    "scheduler_fairness_deferred",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "deferred recovery work to the next tick: {granted} peer(s) already hold this tick's {} work slot(s)",
+                        RECOVERY_WORK_SLOTS_PER_TICK
+                    ),
+                )
+                .await;
+                continue;
+            }
+            let RecoveryAdmission::Accepted { epoch } = self.recovery_epoch_admit(&peer_id).await
             else {
                 continue;
             };
+            // A frozen budget epoch cannot build a plan this tick.
+            if !self.try_consume_recovery_plan_build(&peer_id).await {
+                self.record_direct_event(
+                    &peer_id,
+                    "recovery_plan_build_quota_exhausted",
+                    None,
+                    None,
+                    None,
+                    format!("recovery epoch {epoch} used its plan-build quota; no new plan until the epoch rotates"),
+                )
+                .await;
+                continue;
+            }
+            if !self.try_consume_recovery_session(&peer_id).await {
+                self.record_direct_event(
+                    &peer_id,
+                    "recovery_session_quota_exhausted",
+                    None,
+                    None,
+                    None,
+                    format!("recovery epoch {epoch} used its session quota; no new session until the epoch rotates"),
+                )
+                .await;
+                continue;
+            }
+            granted += 1;
             let stage = self.recovery_stage_for(&peer_id).await;
+            let relay_safety_net = self.has_relay_safety_net(&peer_id).await;
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(&peer_id) else {
                 continue;
@@ -314,13 +411,17 @@ impl PeerManager {
             let mut birthday_plan = birthday_plan;
             let mut endpoints = endpoints;
             // The recovery stage machine bounds the background target set the
-            // same way it bounds synchronized targets.
+            // same way it bounds synchronized targets.  A relay-backed peer
+            // gets the bounded trusted-endpoint heartbeat even in the wide
+            // scatter stage (cold-start capability is reserved for peers
+            // without a relay safety net).
             cap_targets_by_recovery_stage(
                 conn,
                 &mut endpoints,
                 &mut birthday_plan,
                 &mut remote_scatter_pool,
                 stage,
+                relay_safety_net,
             );
             sets.push(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
@@ -479,12 +580,17 @@ impl PeerManager {
 ///   (never peer-signaled Predicted ports: for an address/port-dependent
 ///   peer the predicted window IS the only viable target set, so dropping it
 ///   would leave only LAN hosts that cannot traverse the NATs).
+/// - A relay-backed peer (`relay_safety_net == true`) is capped at the
+///   bounded trusted-endpoint ceiling even in the wide-scatter stage: relay
+///   is the data plane, so traversal is a low-frequency heartbeat and the
+///   wide birthday capability is reserved for cold starts without a relay.
 fn cap_targets_by_recovery_stage(
     conn: &PeerConnection,
     endpoints: &mut Vec<SocketAddr>,
     birthday_plan: &mut Option<BirthdayProbePlan>,
     remote_scatter_pool: &mut bool,
     stage: RecoveryStage,
+    relay_safety_net: bool,
 ) {
     if stage < RecoveryStage::ScatterExtended {
         *birthday_plan = None;
@@ -503,7 +609,14 @@ fn cap_targets_by_recovery_stage(
             *endpoints = trusted;
         }
     }
-    let max_probes = stage.max_probes() as usize;
+    let max_probes = if relay_safety_net && stage >= RecoveryStage::ScatterExtended {
+        // Relay is available: wide scatter is downgraded to a bounded
+        // trusted-endpoint heartbeat (the full cold-start capability stays
+        // reachable for peers without a relay safety net).
+        RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES
+    } else {
+        stage.max_probes()
+    } as usize;
     if endpoints.len() > max_probes {
         endpoints.truncate(max_probes);
     }

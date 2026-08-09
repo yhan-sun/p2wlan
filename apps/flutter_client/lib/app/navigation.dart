@@ -75,8 +75,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
     return LayoutBuilder(
       builder: (context, constraints) {
-        final wide = constraints.maxWidth >= 900;
-        final desktop = _usesDesktopNavigation;
+        final wide = constraints.maxWidth >= 960;
         final body = _buildBody();
         final dragWindowFromAppBar = _canDragWindowFromAppBar;
         final macosChrome = _usesMacosChrome;
@@ -97,7 +96,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
               SizedBox(width: windowsChrome ? 148 : 8),
             ],
           ),
-          body: desktop || wide
+          body: wide
               ? _WideShell(
                   body: body,
                   selected: _section,
@@ -105,7 +104,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
                   onSelect: _select,
                 )
               : body,
-          bottomNavigationBar: desktop || wide
+          bottomNavigationBar: wide
               ? null
               : NavigationBar(
                   selectedIndex: _section.index,
@@ -173,11 +172,6 @@ class _P2WlanShellState extends State<P2WlanShell> {
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
 bool get _usesWindowsChrome => false;
-
-bool get _usesDesktopNavigation {
-  return !kIsWeb &&
-      (Platform.isMacOS || Platform.isLinux || Platform.isWindows);
-}
 
 bool get _canDragWindowFromAppBar {
   return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
@@ -290,6 +284,7 @@ class _ShellStatusActions extends StatelessWidget {
 
   String _statusLabel(AppStrings strings) {
     if (statusStore.daemonBusy) return strings.daemonWorking;
+    if (statusStore.snapshotStale) return strings.stale;
     if (!statusStore.daemonReachable) return strings.offline;
     final health = statusStore.snapshot?.health.status;
     if (health == null || health.isEmpty) return strings.degraded;
@@ -297,6 +292,7 @@ class _ShellStatusActions extends StatelessWidget {
   }
 
   StatusTone _statusTone() {
+    if (statusStore.snapshotStale) return StatusTone.warn;
     if (!statusStore.daemonReachable) return StatusTone.neutral;
     return switch (statusStore.snapshot?.health.status.toLowerCase()) {
       'healthy' => StatusTone.good,

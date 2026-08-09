@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -241,68 +242,450 @@ pub(crate) fn relay_renewal_deadline(expires_at_unix: i64, now_unix: i64) -> Dur
 }
 
 impl RelaySupervisor {
-    /// Spawn the make-before-break renewal task for an authenticated relay
-    /// connection, returning its result oneshot receiver.
+    /// Supervise one relay connection through its renewal lifecycle.
     ///
-    /// The task sleeps until `expiry - margin`, fetches a fresh ticket and
-    /// connects the replacement transport — all CONCURRENTLY with the current
-    /// connection's inbound drain, so the swap (which the caller performs
-    /// atomically) never produces a data-path gap.  A fetch or connect
-    /// failure sends `None` and leaves the current connection untouched; the
-    /// supervisor then falls back to its existing reconnect path at expiry.
+    /// Deterministic handling of the renewal-vs-old-EOF race:
     ///
-    /// Returns `None` when the connection has no ticket (legacy relay).
-    async fn spawn_relay_renewal_task(
+    /// - Every inbound task is tagged with the connection generation that
+    ///   spawned it.  When the relay hub's newest-wins register closes the
+    ///   OLD connection after a renewal registered the replacement, the old
+    ///   inbound task ends with the OLD generation: that EOF is an expected
+    ///   handoff, never a reconnect trigger.
+    /// - The renewal result and the old EOF may be ready simultaneously;
+    ///   whichever branch the scheduler picks, the outcome is the same: the
+    ///   replacement transport is swapped in atomically (with its own ticket
+    ///   metadata for the next renewal), the replacement inbound drain is
+    ///   started BEFORE the old one is allowed to exit, and an old-generation
+    ///   EOF can never abort a successful renewal.  When the old EOF races in
+    ///   while its renewal is already connecting, it is held until the
+    ///   renewal resolves instead of aborting the handoff; a renewal failure
+    ///   then surfaces the held EOF unchanged.
+    /// - Renewal tasks carry the generation token their connection was armed
+    ///   with and re-check it immediately before connecting; a stale renewal
+    ///   of an ended connection (real failure or a newer handoff) aborts and
+    ///   can never "newest-wins" over the supervisor's current link.
+    /// - Only the CURRENT generation's inbound end (no registered
+    ///   replacement) is a real connection failure; its close reason is
+    ///   preserved and classified by the caller.  With no ticket (legacy
+    ///   relay) the renewal branch stays disarmed, so the end branch is the
+    ///   only live one: a bounded select, never a spin.
+    ///
+    /// Returns the end of the CURRENT connection: `Ok(())` for a clean
+    /// server-side close, `Err` for a real transport failure.  Renewal
+    /// handoffs never surface here.
+    async fn supervise_relay_connection<F>(
         &self,
-        transport: RelayTransport,
-    ) -> Option<oneshot::Receiver<Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>>> {
-        let (audience, region, expires_at_unix) = transport.ticket_expiry()?;
-        let ticket_cache = self.ticket_cache.clone()?;
-        let node_id = self.node_id.clone();
-        let peers = self.peers.clone();
-        let allow_insecure_plaintext = self.allow_insecure_plaintext;
-        let ca_cert_path = self.ca_cert_path.clone();
-        let endpoint = transport.endpoint().to_string();
-        let region = region.clone();
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            // Sleep until the renewal deadline (expiry - margin), re-checking
-            // in bounded steps so the wait always ends before the server's
-            // expiry close.
-            loop {
-                let now_unix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let step = relay_renewal_deadline(expires_at_unix, now_unix);
-                if step <= RELAY_TICKET_RENEWAL_RETRY {
-                    break;
+        endpoint: &str,
+        current_transport: RelayTransport,
+        relay_rx: mpsc::Receiver<RelayMessage>,
+        connection_generation: Arc<std::sync::atomic::AtomicU64>,
+        mut spawn_renewal: F,
+    ) -> Result<()>
+    where
+        F: FnMut(
+            u64,
+            RelayTransport,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = Option<ArmedRelayRenewal>> + Send>>,
+    {
+        // `generation` is the local label of the connection currently serving;
+        // `connection_generation` is the SHARED token the renewal tasks check
+        // right before connecting.  Bumping it aborts any still-sleeping or
+        // half-connecting renewal of a connection that has since ended, so a
+        // stale renewal can never "newest-wins" over the supervisor's current
+        // link after a real failure.
+        let mut generation: u64 = 0;
+        let mut current_transport = current_transport;
+        let mut inbound_ended =
+            self.spawn_inbound_task(generation, current_transport.clone(), relay_rx);
+        let mut renewal = spawn_renewal(
+            connection_generation.load(std::sync::atomic::Ordering::SeqCst),
+            current_transport.clone(),
+        )
+        .await;
+        // An end of the CURRENT connection that arrived while its renewal was
+        // already connecting.  This is almost always the hub's newest-wins
+        // close of the superseded connection racing the handoff; it is held
+        // until the renewal resolves so a successful handoff is never aborted
+        // by its own predecessor's EOF.
+        let mut pending_current_end: Option<Result<()>> = None;
+        loop {
+            tokio::select! {
+                ended = relay_oneshot_wait(&mut inbound_ended), if inbound_ended.is_some() => {
+                    match ended {
+                        Some(Ok((ended_generation, result))) => {
+                            if ended_generation != generation {
+                                // An OLD-generation EOF: the hub closed the
+                                // connection this generation superseded during
+                                // a renewal handoff.  Expected — not a
+                                // reconnect.
+                                debug!(
+                                    event = "relay_renewal_superseded_close_ignored",
+                                    relay_endpoint = %endpoint,
+                                    superseded_generation = ended_generation,
+                                    current_generation = generation,
+                                    "ignored EOF of relay connection generation {} superseded by renewal handoff (current generation {})",
+                                    ended_generation,
+                                    generation,
+                                );
+                                inbound_ended = None;
+                            } else if renewal.as_ref().is_some_and(|armed| {
+                                armed.connecting.load(std::sync::atomic::Ordering::SeqCst)
+                            }) {
+                                // The renewal is already connecting its
+                                // replacement: this EOF is the handoff's own
+                                // superseded-close racing in.  Hold it; the
+                                // renewal result is imminent.
+                                pending_current_end = Some(result);
+                                inbound_ended = None;
+                            } else {
+                                // No renewal in flight, or it is still sleeping
+                                // toward its deadline: a genuine end.  Abort
+                                // any orphaned renewal before leaving, and
+                                // attribute the close diagnostics NOW that it
+                                // is classified as a real failure (a superseded
+                                // connection's expected EOF never reaches
+                                // here).
+                                connection_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                self.record_connection_close_diagnostics(&result)
+                                    .await;
+                                return result;
+                            }
+                        }
+                        Some(Err(_)) | None => {
+                            // The inbound task vanished without a classified
+                            // close.  Hold a synthetic end while a renewal is
+                            // connecting; otherwise this is a real failure.
+                            if renewal.as_ref().is_some_and(|armed| {
+                                armed.connecting.load(std::sync::atomic::Ordering::SeqCst)
+                            }) {
+                                pending_current_end = Some(Err(DaemonError::Relay(
+                                    "relay inbound task ended without a classified close"
+                                        .to_string(),
+                                )));
+                                inbound_ended = None;
+                            } else {
+                                connection_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                return Err(DaemonError::Relay(
+                                    "relay inbound task ended without a classified close"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
-                sleep(RELAY_TICKET_RENEWAL_RETRY).await;
+                renewal_result = relay_renewal_wait(&mut renewal), if renewal.is_some() => {
+                    let result = renewal_result;
+                    match result {
+                        Some(Ok(Some((new_transport, new_rx)))) => {
+                            // The replacement is connected AND its ticket
+                            // metadata (including the new expiry) is attached:
+                            // swap it in, start its inbound drain, and only
+                            // then is the old connection allowed to exit.
+                            let new_endpoint = new_transport.endpoint().to_string();
+                            generation = generation.wrapping_add(1);
+                            let new_expiry = new_transport.ticket_expiry();
+                            let ttl_secs = new_expiry
+                                .as_ref()
+                                .map(|(_, _, expires_at_unix)| {
+                                    let now_unix = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64;
+                                    expires_at_unix.saturating_sub(now_unix).max(0)
+                                })
+                                .unwrap_or(0);
+                            info!(
+                                event = "relay_renewal_handoff_completed",
+                                relay_endpoint = %endpoint,
+                                replacement_endpoint = %new_endpoint,
+                                swap_generation = generation,
+                                ticket_ttl_secs = ttl_secs,
+                                audience = ?new_expiry.as_ref().map(|(audience, _, _)| audience),
+                                "relay_renewal_handoff_completed relay_endpoint={} replacement_endpoint={} swap_generation={} ticket_ttl_secs={}",
+                                endpoint,
+                                new_endpoint,
+                                generation,
+                                ttl_secs,
+                            );
+                            connection_generation.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            *self.relay_transport.write().await = Some(new_transport.clone());
+                            inbound_ended = self.spawn_inbound_task(
+                                generation,
+                                new_transport.clone(),
+                                new_rx,
+                            );
+                            current_transport = new_transport;
+                            pending_current_end = None;
+                            renewal = spawn_renewal(
+                                connection_generation.load(std::sync::atomic::Ordering::SeqCst),
+                                current_transport.clone(),
+                            )
+                            .await;
+                        }
+                        Some(Ok(None)) => {
+                            // Renewal fetch/connect failed: the current
+                            // connection keeps serving until its REAL expiry,
+                            // then the caller's bounded reconnect path runs.
+                            warn!(
+                                event = "relay_renewal_failed",
+                                relay_endpoint = %endpoint,
+                                generation = generation,
+                                "relay ticket renewal failed; the current connection stays until expiry and the supervisor reconnects if needed",
+                            );
+                            if let Some(ended) = pending_current_end.take() {
+                                // The renewal failed and the connection really
+                                // ended: the held close is now confirmed as a
+                                // genuine failure, so attribute it.
+                                connection_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                self.record_connection_close_diagnostics(&ended).await;
+                                return ended;
+                            }
+                            renewal = spawn_renewal(
+                                connection_generation.load(std::sync::atomic::Ordering::SeqCst),
+                                current_transport.clone(),
+                            )
+                            .await;
+                        }
+                        Some(Err(_)) | None => {
+                            // The renewal task was dropped without a result;
+                            // the current connection stays and a new renewal
+                            // is armed from the current deadline.
+                            if let Some(ended) = pending_current_end.take() {
+                                // Same attribution: the renewal is gone and
+                                // the connection really ended, so the held
+                                // close is a genuine failure.
+                                connection_generation.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                self.record_connection_close_diagnostics(&ended).await;
+                                return ended;
+                            }
+                            renewal = spawn_renewal(
+                                connection_generation.load(std::sync::atomic::Ordering::SeqCst),
+                                current_transport.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
-            // Fetch a fresh ticket and connect the replacement; the caller
-            // swaps it in only after this succeeded, so the old connection
-            // keeps serving until the new one is ready.
-            let result = async {
-                let (ticket, _expires_at) =
-                    ticket_cache.refresh_ticket(&audience, &region).await.ok()?;
-                RelayTransport::connect_secure(
-                    &endpoint,
-                    &region,
-                    &node_id,
-                    peers,
-                    Some(ticket),
-                    allow_insecure_plaintext,
-                    ca_cert_path,
-                )
-                .await
-                .ok()
-            }
-            .await;
-            let _ = tx.send(result);
-        });
-        Some(rx)
+        }
     }
+
+    /// Spawn the inbound drain for one connection generation, returning the
+    /// oneshot that reports `(generation, end result)`.
+    fn spawn_inbound_task(
+        &self,
+        generation: u64,
+        transport: RelayTransport,
+        relay_rx: mpsc::Receiver<RelayMessage>,
+    ) -> Option<oneshot::Receiver<RelayInboundEnd>> {
+        let (ended_tx, ended_rx) = oneshot::channel();
+        let inbound_tx = self.inbound_tx.clone();
+        let diags = self.relay_selection.clone();
+        tokio::spawn(async move {
+            let result = transport
+                .run_inbound(relay_rx, inbound_tx, Some(diags))
+                .await;
+            let _ = ended_tx.send((generation, result));
+        });
+        Some(ended_rx)
+    }
+
+    /// Record relay-selection diagnostics for a GENUINE end of the CURRENT
+    /// connection — the deferred counterpart of the inbound task's close
+    /// handling.  The inbound task no longer writes close diagnostics itself,
+    /// because a hub newest-wins EOF of a SUPERSEDED connection is expected
+    /// and must never count as a failure; only the supervisor, after
+    /// classifying the end (current generation, no in-flight renewal that can
+    /// resolve it), knows it is real.  Non-close failures (transport errors
+    /// without a close reason) keep their original behavior and are not
+    /// counted here.
+    async fn record_connection_close_diagnostics(&self, result: &Result<()>) {
+        let Some(label) = result
+            .as_ref()
+            .err()
+            .and_then(relay_close_reason_label_from_error)
+        else {
+            return;
+        };
+        let mut d = self.relay_selection.write().await;
+        d.selected_error_count = d.selected_error_count.saturating_add(1);
+        d.last_error = Some(format!("relay connection closed: reason={label}"));
+        d.last_error_code = Some(label);
+    }
+}
+
+/// End signal of one relay inbound drain: `(connection generation, result)`.
+type RelayInboundEnd = (u64, Result<()>);
+
+/// Result of a renewal attempt: the replacement transport (with its new
+/// ticket metadata attached) plus its inbound receiver.
+type RelayRenewalResult = Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>;
+
+/// An armed make-before-break renewal.
+struct ArmedRelayRenewal {
+    /// Result of the renewal task (awaited BY REFERENCE when the select branch
+    /// polls it, so an un-selected branch future never consumes the receiver).
+    result: Option<oneshot::Receiver<RelayRenewalResult>>,
+    /// Set by the renewal task immediately BEFORE it connects the replacement
+    /// transport.  The supervisor uses it to tell a genuine connection end
+    /// apart from the hub's newest-wins close of the superseded connection:
+    /// an EOF that arrives while the renewal is already connecting is held
+    /// until the renewal resolves instead of aborting a successful handoff.
+    connecting: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Await an optional inbound-end oneshot receiver (used inside `tokio::select!`
+/// where the branch must be a future): `None` when no receiver is armed.
+async fn relay_oneshot_wait(
+    rx: &mut Option<oneshot::Receiver<RelayInboundEnd>>,
+) -> Option<std::result::Result<RelayInboundEnd, oneshot::error::RecvError>> {
+    match rx {
+        Some(receiver) => Some(receiver.await),
+        None => None,
+    }
+}
+
+/// Extract the close-reason label from a transport-close error produced by
+/// [`RelayTransport::run_inbound`] for `RelayMessage::Closed` (the message
+/// format is `relay {endpoint} connection closed; reason={label}`), or `None`
+/// for any other failure.  The supervisor uses this to attribute the deferred
+/// close diagnostics only to GENUINE ends of the current connection.
+fn relay_close_reason_label_from_error(error: &DaemonError) -> Option<String> {
+    let message = error.to_string();
+    let marker = "closed; reason=";
+    let label = message
+        .rfind(marker)
+        .map(|idx| message[idx + marker.len()..].trim())
+        .filter(|label| !label.is_empty())?;
+    Some(label.to_string())
+}
+
+/// Await the armed renewal result (see [`ArmedRelayRenewal`]) by reference,
+/// without taking the receiver out of the armed struct.  `tokio::select!` may
+/// poll this branch future and then drop it un-selected when another branch
+/// (e.g. an inbound EOF) wins the same round; taking the receiver at poll time
+/// would drop the pending renewal result and leave `armed.result` consumed,
+/// tripping the caller's next round.  Awaiting by reference means a dropped
+/// branch future loses nothing and the receiver stays re-pollable.
+async fn relay_renewal_wait(
+    renewal: &mut Option<ArmedRelayRenewal>,
+) -> Option<std::result::Result<RelayRenewalResult, oneshot::error::RecvError>> {
+    match renewal {
+        Some(armed) => {
+            let receiver = armed.result.as_mut().expect("renewal result missing");
+            Some(receiver.await)
+        }
+        None => None,
+    }
+}
+
+/// Implementation of the make-before-break renewal task.  A free function so
+/// the supervisor can hand a `'static`-captured closure (cloned configuration,
+/// no `&self` borrow) to the generation-tagged connection supervisor.
+///
+/// The task sleeps until `expiry - margin`, then — after verifying that its
+/// connection generation is still the current one — fetches a fresh ticket and
+/// connects the replacement transport CONCURRENTLY with the current
+/// connection's inbound drain, so the swap (which the caller performs
+/// atomically) never produces a data-path gap.  A fetch or connect failure
+/// sends `None` and leaves the current connection untouched; the supervisor
+/// then falls back to its existing reconnect path at expiry.
+///
+/// The replacement transport carries the NEW ticket metadata (audience,
+/// region, expires-at) attached before it is returned, so the next renewal is
+/// scheduled from the replacement's own deadline instead of being lost after
+/// the first swap.
+///
+/// Returns `None` when the connection has no ticket (legacy relay).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_relay_renewal_task_impl(
+    ticket_cache: Option<Arc<RelayTicketCache>>,
+    node_id: String,
+    peers: Arc<PeerManager>,
+    allow_insecure_plaintext: bool,
+    ca_cert_path: Option<String>,
+    generation_token: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    transport: RelayTransport,
+) -> Option<ArmedRelayRenewal> {
+    let (audience, region, expires_at_unix) = transport.ticket_expiry()?;
+    let ticket_cache = ticket_cache?;
+    let endpoint = transport.endpoint().to_string();
+    let region = region.clone();
+    let (tx, rx) = oneshot::channel();
+    let connecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connecting_task = connecting.clone();
+    tokio::spawn(async move {
+        // Sleep until the renewal deadline (expiry - margin), re-checking
+        // in bounded steps so the wait always ends before the server's
+        // expiry close.
+        loop {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let step = relay_renewal_deadline(expires_at_unix, now_unix);
+            if step <= RELAY_TICKET_RENEWAL_RETRY {
+                break;
+            }
+            sleep(RELAY_TICKET_RENEWAL_RETRY).await;
+        }
+        // The connection this renewal belongs to may have ended (a real
+        // failure or a superseding handoff) while the renewal was sleeping.
+        // Abort instead of registering an orphaned replacement that would
+        // "newest-wins" over the supervisor's current link.
+        if generation_token.load(std::sync::atomic::Ordering::SeqCst) != expected_generation {
+            let _ = tx.send(None);
+            return;
+        }
+        connecting_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Fetch a fresh ticket and connect the replacement; the caller
+        // swaps it in only after this succeeded, so the old connection
+        // keeps serving until the new one is ready.  The replacement
+        // keeps the ticket expiry metadata attached so the NEXT renewal
+        // is scheduled from the new deadline.
+        let result = async {
+            let (ticket, expires_at) =
+                ticket_cache.refresh_ticket(&audience, &region).await.ok()?;
+            let (transport, relay_rx) = RelayTransport::connect_secure(
+                &endpoint,
+                &region,
+                &node_id,
+                peers,
+                Some(ticket),
+                allow_insecure_plaintext,
+                ca_cert_path,
+            )
+            .await
+            .ok()?;
+            Some((
+                transport.with_ticket_metadata(&audience, &region, expires_at),
+                relay_rx,
+            ))
+        }
+        .await;
+        let _ = tx.send(result);
+    });
+    Some(ArmedRelayRenewal {
+        result: Some(rx),
+        connecting,
+    })
 }
 
 impl RelaySupervisor {
@@ -359,91 +742,40 @@ impl RelaySupervisor {
                 // there is no data-path gap.  A renewal failure leaves the
                 // current connection untouched and the supervisor falls back
                 // to the existing reconnect path.
-                type RelayRenewalResult = Option<(RelayTransport, mpsc::Receiver<RelayMessage>)>;
-                let mut current_transport = relay;
-                let mut renewal: Option<oneshot::Receiver<RelayRenewalResult>> = self
-                    .spawn_relay_renewal_task(current_transport.clone())
+                //
+                // The whole lifecycle is generation-tagged so the old EOF
+                // that the hub sends after a successful renewal can never be
+                // misclassified as a connection failure.
+                let renewal_ticket_cache = self.ticket_cache.clone();
+                let renewal_node_id = self.node_id.clone();
+                let renewal_peers = self.peers.clone();
+                let renewal_allow_insecure = self.allow_insecure_plaintext;
+                let renewal_ca_cert_path = self.ca_cert_path.clone();
+                let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let ended = self
+                    .supervise_relay_connection(
+                        &endpoint,
+                        relay,
+                        relay_rx,
+                        connection_generation.clone(),
+                        move |expected_generation, transport| {
+                            // Re-arm the next renewal from the (possibly
+                            // swapped) connection's own ticket deadline,
+                            // bound to the current generation so a stale
+                            // renewal can never register over a newer link.
+                            Box::pin(spawn_relay_renewal_task_impl(
+                                renewal_ticket_cache.clone(),
+                                renewal_node_id.clone(),
+                                renewal_peers.clone(),
+                                renewal_allow_insecure,
+                                renewal_ca_cert_path.clone(),
+                                connection_generation.clone(),
+                                expected_generation,
+                                transport,
+                            ))
+                        },
+                    )
                     .await;
-                let mut inbound_task = {
-                    let (ended_tx, ended_rx) = oneshot::channel();
-                    let transport = current_transport.clone();
-                    let rx = relay_rx;
-                    let inbound_tx = self.inbound_tx.clone();
-                    let diags = self.relay_selection.clone();
-                    let handle = tokio::spawn(async move {
-                        let result = transport.run_inbound(rx, inbound_tx, Some(diags)).await;
-                        let _ = ended_tx.send(result);
-                    });
-                    (handle, ended_rx)
-                };
-                let ended = loop {
-                    let Some(mut renewal_rx) = renewal.take() else {
-                        // No ticket on this connection (legacy relay): await
-                        // the inbound drain directly.
-                        let result = inbound_task.1.await;
-                        break match result {
-                            Ok(Ok(())) => Ok(()),
-                            Ok(Err(error)) => Err(error),
-                            Err(_) => Err(DaemonError::Network(
-                                "relay inbound task ended unexpectedly".into(),
-                            )),
-                        };
-                    };
-                    tokio::select! {
-                        ended = &mut inbound_task.1 => {
-                            break match ended {
-                                Ok(Ok(())) => Ok(()),
-                                Ok(Err(error)) => Err(error),
-                                Err(_) => Err(DaemonError::Network(
-                                    "relay inbound task ended unexpectedly".into(),
-                                )),
-                            };
-                        }
-                        result = &mut renewal_rx => {
-                            // The renewal task finished (success or failure);
-                            // the inbound stream kept draining the whole time,
-                            // so there is no data-path gap.
-                            let result = result.ok().flatten();
-                            match result {
-                                Some((new_transport, new_rx)) => {
-                                    let new_endpoint = new_transport.endpoint().to_string();
-                                    info!(
-                                        "Renewed relay ticket: swapped {} -> {} before ticket expiry",
-                                        endpoint, new_endpoint
-                                    );
-                                    *self.relay_transport.write().await =
-                                        Some(new_transport.clone());
-                                    // Start the replacement's inbound drain;
-                                    // the old task keeps draining until the
-                                    // hub closes the old connection.
-                                    let (ended_tx, ended_rx) = oneshot::channel();
-                                    let transport = new_transport.clone();
-                                    let inbound_tx = self.inbound_tx.clone();
-                                    let diags = self.relay_selection.clone();
-                                    inbound_task = (
-                                        tokio::spawn(async move {
-                                            let result =
-                                                transport.run_inbound(new_rx, inbound_tx, Some(diags)).await;
-                                            let _ = ended_tx.send(result);
-                                        }),
-                                        ended_rx,
-                                    );
-                                    current_transport = new_transport;
-                                }
-                                None => {
-                                    warn!(
-                                        "Relay ticket renewal for {} failed; the current connection stays until expiry and the supervisor reconnects if needed",
-                                        endpoint
-                                    );
-                                }
-                            }
-                            // Re-arm the next renewal for the (possibly
-                            // swapped) connection.
-                            renewal = self.spawn_relay_renewal_task(current_transport.clone()).await;
-                        }
-                    }
-                };
-                let _ = inbound_task.0.await;
                 *self.relay_transport.write().await = None;
                 let (peer_failure_code, peer_failure_reason) = match &ended {
                     Ok(()) => (
@@ -787,5 +1119,625 @@ mod tests {
             retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
         }
         assert_eq!(retry_delay, max_retry_delay, "the backoff must be capped");
+    }
+
+    fn test_supervisor(ticket_cache: Option<Arc<RelayTicketCache>>) -> RelaySupervisor {
+        let config = crate::Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let peers = Arc::new(PeerManager::new(config));
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        RelaySupervisor {
+            relay_candidates: Vec::new(),
+            preferred_regions: Vec::new(),
+            selection_timeout: Duration::from_millis(500),
+            node_id: "node-a".to_string(),
+            peers,
+            relay_transport: Arc::new(RwLock::new(None)),
+            relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
+            inbound_tx,
+            ticket_cache,
+            relay_ticket: None,
+            allow_insecure_plaintext: true,
+            ca_cert_path: None,
+        }
+    }
+
+    /// Deterministic arm/release for the fake renewal closure: the closure
+    /// signals when the supervisor has invoked it (via `armed`), then blocks
+    /// until the test sends the `go` watch value, then pops the next armed
+    /// renewal (or returns `None` when the queue is exhausted).
+    struct FakeRenewalQueue {
+        armed: mpsc::Sender<()>,
+        go: tokio::sync::watch::Sender<bool>,
+        go_rx: tokio::sync::watch::Receiver<bool>,
+        queue: std::sync::Mutex<Vec<ArmedRelayRenewal>>,
+    }
+
+    impl FakeRenewalQueue {
+        fn new(queue: Vec<ArmedRelayRenewal>) -> (Arc<Self>, mpsc::Receiver<()>) {
+            let (armed, armed_rx) = mpsc::channel(1);
+            let (go, go_rx) = tokio::sync::watch::channel(false);
+            (
+                Arc::new(Self {
+                    armed,
+                    go,
+                    go_rx,
+                    queue: std::sync::Mutex::new(queue),
+                }),
+                armed_rx,
+            )
+        }
+
+        fn release(&self) {
+            self.go.send(true).unwrap();
+        }
+
+        fn closure(
+            self: &Arc<Self>,
+        ) -> impl FnMut(
+            u64,
+            RelayTransport,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = Option<ArmedRelayRenewal>> + Send>>
+               + '_ {
+            let queue = self.clone();
+            move |_expected: u64, _transport: RelayTransport| {
+                let queue = queue.clone();
+                let mut go_rx = queue.go_rx.clone();
+                Box::pin(async move {
+                    queue.armed.send(()).await.unwrap();
+                    while !*go_rx.borrow() {
+                        if go_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    queue.queue.lock().unwrap().pop()
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_legacy_connection_ends_promptly_without_renewal_spin() {
+        // A legacy (no-ticket) relay arms no renewal: the renewal branch of
+        // the supervisor's select must stay DISARMED so a server EOF is served
+        // immediately.  Previously the always-pending renewal branch starved
+        // the EOF and the supervisor spun forever.
+        let supervisor = test_supervisor(None);
+        let transport = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay.test:18081",
+            supervisor.peers.clone(),
+        );
+        let endpoint = transport.endpoint().to_string();
+        let (relay_tx, relay_rx) = mpsc::channel(4);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport,
+                    relay_rx,
+                    connection_generation,
+                    |_expected, _transport| Box::pin(async move { None::<ArmedRelayRenewal> }),
+                )
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        drop(relay_tx);
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after a legacy connection ends, not spin")
+            .expect("the supervisor task must not panic");
+        assert!(
+            result.is_ok(),
+            "a clean end must surface Ok, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_renewal_handoff_survives_superseded_connection_eof() {
+        // Make-before-break handoff with the full race: the OLD connection's
+        // EOF arrives while its renewal is already connecting (the hub's
+        // newest-wins close of the superseded connection).  The supervisor
+        // must hold that EOF, swap in the replacement, and only then surface
+        // the replacement's own end — the handoff can never be aborted by its
+        // predecessor's EOF.
+        let supervisor = test_supervisor(None);
+        let relay_transport = supervisor.relay_transport.clone();
+        let relay_selection = supervisor.relay_selection.clone();
+        let transport_a = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-a.test:18081",
+            supervisor.peers.clone(),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_300);
+        let endpoint = transport_a.endpoint().to_string();
+        let (relay_tx_a, relay_rx_a) = mpsc::channel(4);
+        let (renewal_tx, renewal_rx) = oneshot::channel();
+        let connecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
+            result: Some(renewal_rx),
+            connecting: connecting.clone(),
+        }]);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fake_task = fake.clone();
+
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport_a,
+                    relay_rx_a,
+                    connection_generation,
+                    fake_task.closure(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), armed_rx.recv())
+            .await
+            .expect("supervisor must arm the renewal closure")
+            .expect("armed channel closed");
+        // The renewal begins connecting...
+        connecting.store(true, std::sync::atomic::Ordering::SeqCst);
+        // ...and the superseded connection ends WHILE it is connecting: this
+        // EOF is the handoff's own close racing in and must be held, never
+        // treated as a real failure.
+        relay_tx_a
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+        fake.release();
+        // The renewal resolves with the replacement connection.
+        let peers_b =
+            PeerManager::new(crate::Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let transport_b = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-b.test:18081",
+            Arc::new(peers_b),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_600);
+        let (relay_tx_b, relay_rx_b) = mpsc::channel(4);
+        assert!(
+            renewal_tx
+                .send(Some((transport_b.clone(), relay_rx_b)))
+                .is_ok(),
+            "the supervisor must still be awaiting the renewal result"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = relay_transport.read().await.clone();
+                if current
+                    .as_ref()
+                    .is_some_and(|t| t.endpoint() == transport_b.endpoint())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the supervisor must publish the renewal replacement");
+        // The replacement's own stream ends cleanly: that end surfaces, not
+        // the held superseded EOF.
+        drop(relay_tx_b);
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after the replacement ends")
+            .expect("the supervisor task must not panic");
+        assert!(
+            result.is_ok(),
+            "the handoff must end cleanly, got {result:?}"
+        );
+        // The superseded connection's EOF was an EXPECTED handoff close: it
+        // must never surface as a relay failure in the diagnostics.
+        let diags = relay_selection.read().await;
+        assert_eq!(
+            diags.selected_error_count, 0,
+            "a superseded connection's expected EOF must not count as an error"
+        );
+        assert_eq!(
+            diags.last_error, None,
+            "a superseded connection's expected EOF must not set last_error"
+        );
+        assert_eq!(
+            diags.last_error_code, None,
+            "a superseded connection's expected EOF must not set last_error_code"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_renewal_failure_surfaces_held_connection_end() {
+        // When the renewal fails WHILE its connection is ending, the held EOF
+        // is a real failure: it must be surfaced with its close reason intact
+        // (never swallowed, never converted into a spurious reconnect).
+        let supervisor = test_supervisor(None);
+        let relay_selection = supervisor.relay_selection.clone();
+        let transport_a = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-a.test:18081",
+            supervisor.peers.clone(),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_300);
+        let endpoint = transport_a.endpoint().to_string();
+        let (relay_tx_a, relay_rx_a) = mpsc::channel(4);
+        let (renewal_tx, renewal_rx) = oneshot::channel();
+        let connecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
+            result: Some(renewal_rx),
+            connecting: connecting.clone(),
+        }]);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fake_task = fake.clone();
+
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport_a,
+                    relay_rx_a,
+                    connection_generation,
+                    fake_task.closure(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), armed_rx.recv())
+            .await
+            .expect("supervisor must arm the renewal closure")
+            .expect("armed channel closed");
+        connecting.store(true, std::sync::atomic::Ordering::SeqCst);
+        relay_tx_a
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+        fake.release();
+        assert!(
+            renewal_tx.send(None).is_ok(),
+            "the supervisor must still be awaiting the renewal result"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after a failed renewal with a held end")
+            .expect("the supervisor task must not panic");
+        let error =
+            result.expect_err("a failed renewal with an ending connection must surface an error");
+        assert!(
+            error.to_string().contains("server_eof"),
+            "the held close reason must be preserved, got {error}"
+        );
+        // The held end was a GENUINE failure of the current connection (the
+        // renewal did not resolve it), so the deferred attribution must record
+        // it exactly once with the real close reason.
+        let diags = relay_selection.read().await;
+        assert_eq!(
+            diags.selected_error_count, 1,
+            "a genuine close with a failed renewal must be counted exactly once"
+        );
+        assert_eq!(
+            diags.last_error.as_deref(),
+            Some("relay connection closed: reason=server_eof"),
+            "the deferred diagnostics must attribute the real close"
+        );
+        assert_eq!(
+            diags.last_error_code.as_deref(),
+            Some("server_eof"),
+            "the deferred diagnostics must keep the real close code"
+        );
+    }
+
+    async fn wait_for_relay_transport(
+        relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+        endpoint: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = relay_transport.read().await.clone();
+                if current.as_ref().is_some_and(|t| t.endpoint() == endpoint) {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the supervisor must publish the renewal replacement");
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_superseded_connection_eof_after_handoff_keeps_diagnostics_clean() {
+        // The field-reported scenario: the hub's newest-wins close of the
+        // SUPERSEDED connection arrives AFTER the renewal handoff already
+        // published the replacement.  The old-generation EOF is expected and
+        // must be ignored — no diagnostics entry, no reconnect, no panic —
+        // while the replacement keeps serving.
+        let supervisor = test_supervisor(None);
+        let relay_transport = supervisor.relay_transport.clone();
+        let relay_selection = supervisor.relay_selection.clone();
+        let transport_a = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-a.test:18081",
+            supervisor.peers.clone(),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_300);
+        let endpoint = transport_a.endpoint().to_string();
+        let (relay_tx_a, relay_rx_a) = mpsc::channel(4);
+        let (renewal_tx, renewal_rx) = oneshot::channel();
+        let connecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
+            result: Some(renewal_rx),
+            connecting: connecting.clone(),
+        }]);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fake_task = fake.clone();
+
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport_a,
+                    relay_rx_a,
+                    connection_generation,
+                    fake_task.closure(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), armed_rx.recv())
+            .await
+            .expect("supervisor must arm the renewal closure")
+            .expect("armed channel closed");
+        fake.release();
+        let peers_b =
+            PeerManager::new(crate::Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let transport_b = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-b.test:18081",
+            Arc::new(peers_b),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_600);
+        let (relay_tx_b, relay_rx_b) = mpsc::channel(4);
+        assert!(
+            renewal_tx
+                .send(Some((transport_b.clone(), relay_rx_b)))
+                .is_ok(),
+            "the supervisor must still be awaiting the renewal result"
+        );
+        wait_for_relay_transport(&relay_transport, transport_b.endpoint()).await;
+
+        // The hub now closes the superseded connection (old-generation EOF).
+        relay_tx_a
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !ended.is_finished(),
+            "a superseded EOF must not end the supervisor (no reconnect)"
+        );
+        let current = relay_transport.read().await.clone();
+        assert!(
+            current.is_some_and(|t| t.endpoint() == transport_b.endpoint()),
+            "the replacement must keep serving after a superseded EOF"
+        );
+        let diags = relay_selection.read().await;
+        assert_eq!(
+            diags.selected_error_count, 0,
+            "an old-generation EOF after handoff must not count as an error"
+        );
+        assert_eq!(diags.last_error, None);
+        assert_eq!(diags.last_error_code, None);
+
+        // The replacement's own stream ends cleanly.
+        drop(relay_tx_b);
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after the replacement ends")
+            .expect("the supervisor task must not panic");
+        assert!(result.is_ok(), "clean end, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_genuine_server_eof_records_diagnostics_once() {
+        // A REAL close of the CURRENT connection (no renewal in flight) is a
+        // genuine failure: it must return the failure AND record exactly one
+        // diagnostics entry with the server_eof attribution — never swallowed,
+        // never duplicated.
+        let supervisor = test_supervisor(None);
+        let relay_selection = supervisor.relay_selection.clone();
+        let transport = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay.test:18081",
+            supervisor.peers.clone(),
+        );
+        let endpoint = transport.endpoint().to_string();
+        let (relay_tx, relay_rx) = mpsc::channel(4);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport,
+                    relay_rx,
+                    connection_generation,
+                    |_expected, _transport| Box::pin(async move { None::<ArmedRelayRenewal> }),
+                )
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        relay_tx
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after a genuine server EOF")
+            .expect("the supervisor task must not panic");
+        let error = result.expect_err("a genuine server EOF must surface as a failure");
+        assert!(
+            error.to_string().contains("server_eof"),
+            "the close reason must be preserved, got {error}"
+        );
+        let diags = relay_selection.read().await;
+        assert_eq!(
+            diags.selected_error_count, 1,
+            "a genuine server EOF must be counted exactly once"
+        );
+        assert_eq!(
+            diags.last_error.as_deref(),
+            Some("relay connection closed: reason=server_eof"),
+            "the last_error must attribute the real close"
+        );
+        assert_eq!(
+            diags.last_error_code.as_deref(),
+            Some("server_eof"),
+            "the error code must attribute server_eof"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_supervisor_two_renewal_cycles_preserve_ticket_metadata_and_diagnostics() {
+        // Two consecutive make-before-break cycles: each handoff publishes the
+        // replacement WITH its own ticket expiry (so the next renewal is
+        // scheduled from the new deadline), superseded connections' EOFs are
+        // ignored, and the diagnostics accumulate NO false errors across the
+        // whole lifecycle.
+        let supervisor = test_supervisor(None);
+        let relay_transport = supervisor.relay_transport.clone();
+        let relay_selection = supervisor.relay_selection.clone();
+        let transport_a = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-a.test:18081",
+            supervisor.peers.clone(),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_300);
+        let endpoint = transport_a.endpoint().to_string();
+        let (relay_tx_a, relay_rx_a) = mpsc::channel(4);
+        let (renewal_tx_1, renewal_rx_1) = oneshot::channel();
+        let (renewal_tx_2, renewal_rx_2) = oneshot::channel();
+        let connecting_1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connecting_2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The queue is popped LIFO, so the FIRST pop is renewal 1.
+        let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![
+            ArmedRelayRenewal {
+                result: Some(renewal_rx_2),
+                connecting: connecting_2.clone(),
+            },
+            ArmedRelayRenewal {
+                result: Some(renewal_rx_1),
+                connecting: connecting_1.clone(),
+            },
+        ]);
+        let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fake_task = fake.clone();
+
+        let ended = tokio::spawn(async move {
+            supervisor
+                .supervise_relay_connection(
+                    &endpoint,
+                    transport_a,
+                    relay_rx_a,
+                    connection_generation,
+                    fake_task.closure(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), armed_rx.recv())
+            .await
+            .expect("supervisor must arm the first renewal")
+            .expect("armed channel closed");
+        fake.release();
+
+        // Cycle 1: renewal resolves with a replacement carrying its OWN expiry.
+        let peers_b =
+            PeerManager::new(crate::Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let transport_b = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-b.test:18081",
+            Arc::new(peers_b),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_000_600);
+        let (relay_tx_b, relay_rx_b) = mpsc::channel(4);
+        assert!(
+            renewal_tx_1
+                .send(Some((transport_b.clone(), relay_rx_b)))
+                .is_ok(),
+            "the supervisor must still be awaiting the first renewal result"
+        );
+        wait_for_relay_transport(&relay_transport, transport_b.endpoint()).await;
+        // The hub closes the superseded connection A after handoff 1.
+        relay_tx_a
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+
+        // Cycle 2: the supervisor re-armed (queue pop 2); resolve it.
+        tokio::time::timeout(Duration::from_secs(2), armed_rx.recv())
+            .await
+            .expect("supervisor must re-arm the second renewal")
+            .expect("armed channel closed");
+        let peers_c =
+            PeerManager::new(crate::Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let transport_c = RelayTransport::connect_for_test(
+            "default",
+            "tcp://relay-c.test:18081",
+            Arc::new(peers_c),
+        )
+        .with_ticket_metadata("aud-1", "default", 1_001_200);
+        let (relay_tx_c, relay_rx_c) = mpsc::channel(4);
+        assert!(
+            renewal_tx_2
+                .send(Some((transport_c.clone(), relay_rx_c)))
+                .is_ok(),
+            "the supervisor must still be awaiting the second renewal result"
+        );
+        wait_for_relay_transport(&relay_transport, transport_c.endpoint()).await;
+        // The hub closes the superseded connection B after handoff 2.
+        relay_tx_b
+            .send(RelayMessage::Closed {
+                reason: p2pnet_relay::RelayCloseReason::ServerEof,
+            })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        // The current replacement still carries its own ticket expiry so the
+        // NEXT renewal is scheduled from the new deadline.
+        let current = relay_transport
+            .read()
+            .await
+            .clone()
+            .expect("the second replacement must be published");
+        assert_eq!(
+            current.ticket_expiry(),
+            Some(("aud-1".to_string(), "default".to_string(), 1_001_200)),
+            "the second replacement must keep its own ticket expiry for the next renewal"
+        );
+        // Two handoffs and two superseded EOFs: NO false errors accumulated.
+        let diags = relay_selection.read().await;
+        assert_eq!(
+            diags.selected_error_count, 0,
+            "successful renewal cycles must not accumulate false errors"
+        );
+        assert_eq!(diags.last_error, None);
+        assert_eq!(diags.last_error_code, None);
+
+        // The current connection ends cleanly.
+        drop(relay_tx_c);
+        let result = tokio::time::timeout(Duration::from_secs(2), ended)
+            .await
+            .expect("the supervisor must return after the current connection ends")
+            .expect("the supervisor task must not panic");
+        assert!(result.is_ok(), "clean end, got {result:?}");
     }
 }

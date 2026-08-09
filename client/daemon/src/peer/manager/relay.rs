@@ -125,11 +125,21 @@ impl PeerManager {
         code: impl Into<String>,
         reason: impl Into<String>,
     ) {
+        let code = code.into();
+        let reason = reason.into();
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.relay_health.record_failure(code, reason);
+            conn.relay_health.record_failure(code.clone(), reason.clone());
             if conn.state == ConnectionState::Relay {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
+        }
+        // A relay 404 is authoritative proof the destination is not
+        // registered: quarantine the peer's whole recovery (session,
+        // candidates, fresh mapping) so it cannot keep burning shared NAT
+        // and scheduler capacity.  Only new control-plane evidence re-opens
+        // recovery.
+        if code == "peer_not_found" {
+            self.quarantine_peer(node_id, &reason).await;
         }
     }
 

@@ -1288,6 +1288,9 @@ impl UdpTransport {
         Ok(PunchSendReport {
             packets_sent,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
+            budget_skipped,
+            epoch_budget_exhausted: false,
+            candidate_iteration_capped: false,
         })
     }
 }

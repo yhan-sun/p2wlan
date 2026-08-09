@@ -67,6 +67,12 @@ impl PeerManager {
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
         let generation = self.current_network_generation().await;
+        // Un-quarantine evidence is computed under the connection lock but the
+        // quarantine map is re-opened only AFTER the lock is dropped:
+        // `unquarantine_peer` records a diagnostics event that re-locks the
+        // connection map, so awaiting it while holding the write guard would
+        // deadlock.
+        let mut unquarantine_after_lock: Option<&'static str> = None;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -174,7 +180,28 @@ impl PeerManager {
             conn.transition(ConnectionState::Idle);
         }
 
+        // Authoritative control-plane evidence (online transition, endpoint
+        // or identity/incarnation change) re-opens recovery for a quarantined
+        // peer.  A plain refresh with unchanged evidence does not unquarantine
+        // a peer whose relay 404 is still authoritative.  The re-open is
+        // deferred until the connection map guard is released to avoid
+        // re-locking it inside `unquarantine_peer`.
+        if !is_new
+            && endpoint_changed
+            && info.online
+            && self.peer_quarantined_sync(&info.node_id)
+        {
+            unquarantine_after_lock = Some("authoritative endpoint/online update");
+        } else if identity_changed && info.online && self.peer_quarantined_sync(&info.node_id) {
+            unquarantine_after_lock = Some("identity/incarnation change");
+        }
+
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
+        drop(conns);
+        drop(ip_map);
+        if let Some(reason) = unquarantine_after_lock {
+            self.unquarantine_peer(&info.node_id, reason).await;
+        }
         PeerUpdate {
             is_new,
             virtual_ip_changed,

@@ -11,6 +11,17 @@ extension _SettingsPageActions on _SettingsPageState {
       _formError = null;
     });
     try {
+      final currentSettings = widget.settingsStore.settings;
+      final daemonWasRunning = widget.statusStore.daemonReachable;
+      final nextDiagnosticsUrl = normalizeDiagnosticsUrl(
+        _diagnosticsUrlController.text,
+      );
+      if (daemonWasRunning &&
+          nextDiagnosticsUrl != currentSettings.diagnosticsUrl) {
+        throw const FormatException(
+          'Stop P2WLAN before changing the Diagnostics URL.',
+        );
+      }
       final mtu = int.tryParse(_mtuController.text.trim()) ?? defaultMtu;
       final deviceName = _deviceNameController.text.trim().isEmpty
           ? await resolveDefaultDeviceName()
@@ -30,10 +41,23 @@ extension _SettingsPageActions on _SettingsPageState {
         udpAdvertise: _udpAdvertiseController.text,
         socketPool: _socketPool,
         relayServers: _relayServersController.text,
-        closeBehavior: _closeBehavior,
+        closeBehavior: currentSettings.closeBehavior,
       );
+      final restartRequired =
+          daemonWasRunning &&
+          _daemonLaunchSettingsChanged(
+            currentSettings,
+            widget.settingsStore.settings,
+          );
       await widget.statusStore.refresh();
-      _showSnackBar(strings.diagnosticsUrlSaved);
+      if (mounted) {
+        _updateState(() => _restartRequired = restartRequired);
+      }
+      _showSnackBar(
+        restartRequired
+            ? strings.settingsSavedRestartRequired
+            : strings.diagnosticsUrlSaved,
+      );
     } on FormatException catch (error) {
       final message = error.message;
       _updateState(() {
@@ -56,6 +80,44 @@ extension _SettingsPageActions on _SettingsPageState {
         _updateState(() => _saving = false);
       }
     }
+  }
+
+  Future<void> _restartDaemonToApply() async {
+    final strings = AppStrings.fromCode(
+      widget.settingsStore.settings.languageCode,
+    );
+    _updateState(() => _saving = true);
+    try {
+      final stopped = await widget.statusStore.stopDaemon();
+      if (!stopped.ok) {
+        _showSnackBar(stopped.message);
+        return;
+      }
+      final started = await widget.statusStore.startDaemon();
+      if (!started.ok) {
+        _showSnackBar(started.message);
+        return;
+      }
+      if (mounted) _updateState(() => _restartRequired = false);
+      _showSnackBar(strings.settingsApplied);
+    } finally {
+      if (mounted) _updateState(() => _saving = false);
+    }
+  }
+
+  bool _daemonLaunchSettingsChanged(AppSettings before, AppSettings after) {
+    return before.controlServer != after.controlServer ||
+        before.authToken != after.authToken ||
+        before.networkId != after.networkId ||
+        before.virtualIp != after.virtualIp ||
+        before.deviceName != after.deviceName ||
+        before.manualMode != after.manualMode ||
+        before.tunInterface != after.tunInterface ||
+        before.mtu != after.mtu ||
+        before.udpBind != after.udpBind ||
+        before.udpAdvertise != after.udpAdvertise ||
+        before.socketPool != after.socketPool ||
+        before.relayServers != after.relayServers;
   }
 
   Future<void> _resetDiagnosticsUrl() async {

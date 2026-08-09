@@ -1,6 +1,6 @@
 import 'dart:io';
-import 'dart:ui';
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
@@ -50,6 +50,20 @@ void main() {
     expect(find.text('Settings'), findsWidgets);
     expect(find.text('Diagnostics endpoint'), findsWidgets);
     expect(find.text('Daemon control'), findsOneWidget);
+  });
+
+  testWidgets('uses compact navigation below the desktop rail breakpoint', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(700, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+
+    expect(find.byType(NavigationBar), findsOneWidget);
+    expect(find.byType(NavigationRail), findsNothing);
   });
 }
 

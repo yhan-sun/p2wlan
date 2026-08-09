@@ -32,7 +32,8 @@ impl PeerManager {
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
-            config,
+            quarantined_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),            config,
         }
     }
 

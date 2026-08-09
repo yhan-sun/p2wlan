@@ -7,6 +7,7 @@ class _ConnectionOverview extends StatelessWidget {
     required this.tone,
     required this.healthReachable,
     required this.statusReachable,
+    required this.snapshotStale,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -14,6 +15,7 @@ class _ConnectionOverview extends StatelessWidget {
   final StatusTone tone;
   final bool healthReachable;
   final bool statusReachable;
+  final bool snapshotStale;
 
   @override
   Widget build(BuildContext context) {
@@ -37,6 +39,8 @@ class _ConnectionOverview extends StatelessWidget {
         : strings.virtualNetworkStopped;
     final subtitle = snapshot == null
         ? strings.virtualNetworkStoppedDetail
+        : snapshotStale
+        ? strings.staleSnapshotMessage
         : '${strings.networkId} ${dash(snapshot!.networkId)} · ${strings.endpointState} ${healthReachable || statusReachable ? strings.reachable : strings.unavailable}';
 
     return DecoratedBox(
@@ -54,7 +58,11 @@ class _ConnectionOverview extends StatelessWidget {
               runSpacing: 8,
               children: [
                 StatusBadge(
-                  label: daemonAvailable ? strings.connected : strings.offline,
+                  label: snapshotStale
+                      ? strings.stale
+                      : daemonAvailable
+                      ? strings.connected
+                      : strings.offline,
                   tone: tone,
                 ),
                 if (daemonAvailable)

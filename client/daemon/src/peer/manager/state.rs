@@ -98,6 +98,11 @@ pub struct PeerManager {
     /// Wake-up for any direct-commit bump.  Waiters re-check the peer's
     /// sequence after waking.
     direct_commit_notify: Arc<Notify>,
+    /// Authoritative stale-peer quarantine state (relay 404 isolation).
+    quarantined_peers: Arc<tokio::sync::Mutex<HashMap<String, PeerQuarantineState>>>,
+    /// Hook cancelling an active punch session when a peer is quarantined;
+    /// registered by the daemon with its `PunchAttemptDeduplicator`.
+    punch_cancel_hook: PunchCancelHookSlot,
     /// Configuration.
     config: Config,
 }

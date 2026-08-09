@@ -268,6 +268,7 @@ impl UdpTransport {
     /// Remote-scatter variant of [`Self::punch_candidates_until_not_direct`]:
     /// wide sweeps must also stop within one probe once the peer turns
     /// Direct instead of finishing their multi-thousand-probe window.
+    #[cfg(test)]
     pub(crate) async fn punch_candidates_remote_scatter_pool_until_not_direct(
         &self,
         peer_id: &str,
@@ -275,6 +276,27 @@ impl UdpTransport {
         probe_interval: Duration,
         attempts: u32,
     ) -> Result<u32> {
+        self.punch_candidates_remote_scatter_pool_until_not_direct_report(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+        )
+        .await
+        .map(|report| report.packets_sent)
+    }
+
+    /// Report-preserving variant of
+    /// [`Self::punch_candidates_remote_scatter_pool_until_not_direct`]: the
+    /// caller needs the budget/epoch verdicts to schedule the next recovery
+    /// step instead of swallowing a zero-send session.
+    pub(crate) async fn punch_candidates_remote_scatter_pool_until_not_direct_report(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
         let gate_peer = peer_id.to_string();
         let peers = self.peers.clone();
         self.punch_candidates_with_socket_policy_and_direct_gate(
@@ -286,7 +308,6 @@ impl UdpTransport {
             &move || !peers.is_direct_sync(&gate_peer),
         )
         .await
-        .map(|report| report.packets_sent)
     }
 
     /// Stable-unique-scatter variant of
@@ -324,6 +345,22 @@ impl UdpTransport {
         probe_interval: Duration,
         attempts: u32,
     ) -> Result<u32> {
+        self.punch_candidates_until_not_direct_report(peer_id, candidates, probe_interval, attempts)
+            .await
+            .map(|report| report.packets_sent)
+    }
+
+    /// Report-preserving variant of
+    /// [`Self::punch_candidates_until_not_direct`]: the caller needs the
+    /// budget/epoch verdicts to schedule the next recovery step instead of
+    /// swallowing a zero-send session.
+    pub(crate) async fn punch_candidates_until_not_direct_report(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
         let gate_peer = peer_id.to_string();
         let peers = self.peers.clone();
         self.punch_candidates_with_socket_policy_and_direct_gate(
@@ -335,7 +372,6 @@ impl UdpTransport {
             &move || !peers.is_direct_sync(&gate_peer),
         )
         .await
-        .map(|report| report.packets_sent)
     }
 
     /// Send active UDP probes only from the primary socket.
@@ -413,8 +449,11 @@ impl UdpTransport {
 
         let mut packets_sent = 0;
         let mut budget_skipped = 0u32;
+        let mut wholesale_rejections = 0u32;
         let mut last_budget_reason = None;
         let mut session_capped = false;
+        let mut epoch_budget_exhausted = false;
+        let mut candidate_iteration_capped = false;
         let mut generation_changed_abort = false;
         let mut commit_seq_changed_abort = false;
         let mut sent_endpoints = HashSet::new();
@@ -542,6 +581,32 @@ impl UdpTransport {
                         session_capped = true;
                         break 'schedule;
                     }
+                    // The recovery epoch's hard candidate-iteration budget:
+                    // every endpoint enumerated here consumes one unit, so a
+                    // budget-rejected session can never keep traversing the
+                    // whole 778/3072-entry endpoint list.  A capped epoch
+                    // stops enumerating immediately.
+                    if !self
+                        .peers
+                        .try_consume_recovery_candidate_iterations(peer_id, 1)
+                        .await
+                    {
+                        candidate_iteration_capped = true;
+                        break 'schedule;
+                    }
+                    // A wholesale-rejected sweep must not keep enumerating
+                    // candidates: after this many consecutive persistent
+                    // rejections without a single send the window is refused
+                    // across the whole epoch and the caller must enter the
+                    // budget-exhausted backoff instead of re-planning.  The
+                    // short 1-second sliding budgets (network/peer/remote-IP)
+                    // refill while a wide scatter sweep is still in flight, so
+                    // their pacing rejections must NOT trip this abort; only
+                    // the persistent long-window limits never refill within
+                    // the session.
+                    if wholesale_rejections >= MAX_BUDGET_REJECTIONS_PER_SESSION {
+                        break 'schedule;
+                    }
                     if socket_policy == PunchSocketPolicy::StableUniqueScatter
                         && sent_endpoints.len() < candidates.len()
                         && sent_endpoints.contains(&candidate)
@@ -552,7 +617,9 @@ impl UdpTransport {
                         .admit_outbound_connectivity_probe(peer_id, candidate, socket_index)
                         .await
                     {
-                        OutboundProbeAdmission::Accepted => {}
+                        OutboundProbeAdmission::Accepted => {
+                            wholesale_rejections = 0;
+                        }
                         OutboundProbeAdmission::NetworkRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
                             last_budget_reason = Some("network_rate_limited");
@@ -609,6 +676,7 @@ impl UdpTransport {
                         }
                         OutboundProbeAdmission::GlobalNetworkPersistentRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
+                            wholesale_rejections = wholesale_rejections.saturating_add(1);
                             last_budget_reason = Some("global_network_persistent_rate_limited");
                             trace!(
                                 "Skipped UDP punch probe from socket {} to peer {} candidate {}: persistent network probe budget exhausted",
@@ -618,6 +686,7 @@ impl UdpTransport {
                         }
                         OutboundProbeAdmission::GlobalPeerPersistentRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
+                            wholesale_rejections = wholesale_rejections.saturating_add(1);
                             last_budget_reason = Some("global_peer_persistent_rate_limited");
                             trace!(
                                 "Skipped UDP punch probe from socket {} to peer {} candidate {}: persistent peer probe budget exhausted",
@@ -627,6 +696,7 @@ impl UdpTransport {
                         }
                         OutboundProbeAdmission::GlobalRemoteIpPersistentRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
+                            wholesale_rejections = wholesale_rejections.saturating_add(1);
                             last_budget_reason = Some("global_remote_ip_persistent_rate_limited");
                             trace!(
                                 "Skipped UDP punch probe from socket {} to peer {} candidate {}: persistent remote IP probe budget exhausted",
@@ -636,6 +706,7 @@ impl UdpTransport {
                         }
                         OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
+                            wholesale_rejections = wholesale_rejections.saturating_add(1);
                             last_budget_reason = Some("global_peer_socket_persistent_rate_limited");
                             trace!(
                                 "Skipped UDP punch probe from socket {} to peer {} candidate {}: persistent peer socket probe budget exhausted",
@@ -644,13 +715,17 @@ impl UdpTransport {
                             continue;
                         }
                         OutboundProbeAdmission::EpochCreditExhausted => {
-                            budget_skipped = budget_skipped.saturating_add(1);
+                            // The recovery-epoch probe credit is a hard total:
+                            // it cannot refill within the epoch, so the whole
+                            // sweep must stop now instead of enumerating the
+                            // rest of the window.  The caller turns this into
+                            // the budget-exhausted backoff.
+                            epoch_budget_exhausted = true;
                             last_budget_reason = Some("recovery_epoch_credit_exhausted");
                             trace!(
-                                "Skipped UDP punch probe from socket {} to peer {} candidate {}: recovery-epoch probe credit exhausted",
-                                socket_index, peer_id, candidate
+                                "Stopping UDP punch session for peer {peer_id}: recovery-epoch probe credit exhausted"
                             );
-                            continue;
+                            break 'schedule;
                         }
                     }
 
@@ -742,6 +817,36 @@ impl UdpTransport {
                 .await;
         }
 
+        if candidate_iteration_capped {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "recovery_candidate_iteration_budget_exhausted",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "stopped enumerating UDP candidates after the recovery epoch's candidate-iteration budget was exhausted; sent {packets_sent}"
+                    ),
+                )
+                .await;
+        }
+
+        if epoch_budget_exhausted {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "recovery_epoch_credit_exhausted",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(packets_sent),
+                    format!(
+                        "stopped UDP punch after the recovery epoch's probe credit was exhausted; sent {packets_sent} skipped {budget_skipped}"
+                    ),
+                )
+                .await;
+        }
+
         if budget_skipped > 0 {
             let reason = last_budget_reason.unwrap_or("probe_budget_limited");
             self.peers
@@ -778,7 +883,7 @@ impl UdpTransport {
                 Some(candidates.len()),
                 Some(packets_sent),
                 format!(
-                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
+                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
                     socket_policy.label(),
                     self.socket_count(),
                     socket_count,
@@ -795,7 +900,7 @@ impl UdpTransport {
             )
             .await;
         info!(
-            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_probes={} budget_skipped={} session_capped={} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
+            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} session_capped={session_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
             peer_id,
             socket_policy.label(),
             self.socket_count(),
@@ -808,13 +913,14 @@ impl UdpTransport {
             sent_endpoints.len(),
             sent_ports.len(),
             repeated_target_ports,
-            budget_skipped,
-            session_capped
         );
 
         Ok(PunchSendReport {
             packets_sent,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
+            budget_skipped,
+            epoch_budget_exhausted,
+            candidate_iteration_capped,
         })
     }
 

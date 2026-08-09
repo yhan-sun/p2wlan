@@ -40,10 +40,21 @@ class AppStrings {
   String get tunnels => isZh ? '隧道' : 'Tunnels';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
+  String get restartRequired =>
+      isZh ? '需要重启 P2WLAN' : 'P2WLAN restart required';
+  String get restartRequiredDetail => isZh
+      ? '已保存的网络配置会在重启 daemon 后应用。'
+      : 'The saved network configuration is applied when the daemon restarts.';
+  String get restartNow => isZh ? '立即重启并应用' : 'Restart and apply';
+  String get settingsSavedRestartRequired => isZh
+      ? '配置已保存；重启 P2WLAN 后生效。'
+      : 'Configuration saved. Restart P2WLAN to apply it.';
+  String get settingsApplied => isZh ? '已重启并应用配置。' : 'Configuration applied.';
 
   String get online => isZh ? '在线' : 'Online';
   String get offline => isZh ? '离线' : 'Offline';
   String get degraded => isZh ? '降级' : 'Degraded';
+  String get stale => isZh ? '数据已过期' : 'Stale';
   String get healthy => isZh ? '健康' : 'Healthy';
   String get unhealthy => isZh ? '异常' : 'Unhealthy';
   String get unavailable => isZh ? '不可用' : 'Unavailable';
@@ -59,11 +70,6 @@ class AppStrings {
   String get refresh => isZh ? '刷新' : 'Refresh';
   String get refreshNow => isZh ? '手动同步数据' : 'Refresh now';
   String get refreshing => isZh ? '同步数据中...' : 'Refreshing...';
-  String get autoRefreshTooltip => isZh
-      ? '开启后每 5 秒自动更新一次网络与设备连接状态'
-      : 'Automatically sync status every 5 seconds';
-  String autoRefresh(int seconds) =>
-      isZh ? '自动轮询 (${seconds}s)' : 'Auto sync (${seconds}s)';
   String get startP2wlan => isZh ? '启动 P2WLAN' : 'Start P2WLAN';
   String get stopP2wlan => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
@@ -136,6 +142,10 @@ class AppStrings {
   String get offlineSnapshotMessage => isZh
       ? '当前没有运行快照。点击“启动 P2WLAN”启动本机 p2wlan-daemon。'
       : 'No runtime snapshot is available. Click Start P2WLAN to launch the local p2wlan-daemon.';
+  String get staleSnapshotMessage => isZh
+      ? '运行状态已超过 90 秒未更新。请检查本机 daemon 后手动刷新。'
+      : 'Runtime status has not updated for over 90 seconds. Check the local daemon, then refresh.';
+  String get snapshotExpired => isZh ? '数据已过期' : 'Snapshot expired';
   String get runtimeSnapshot => isZh ? '运行快照' : 'Runtime snapshot';
   String get nodeId => isZh ? '节点 ID' : 'Node ID';
   String get virtualIp => isZh ? '虚拟 IP' : 'Virtual IP';
@@ -172,17 +182,27 @@ class AppStrings {
       : 'P2WLAN classifies the local network from UDP/STUN observations. Earlier types are easier for direct paths; later types may need coordinated punching or relay.';
   String get speedTest => isZh ? '测速' : 'Speed test';
   String get speedTesting => isZh ? '测速中 10s...' : 'Testing 10s...';
-  String get speedTestReady => isZh ? '直连已就绪，可测试链路速度' : 'Direct path ready';
+  String get speedTestTitle => isZh ? '设备测速' : 'Device speed test';
+  String get startSpeedTest => isZh ? '开始 10 秒测速' : 'Start 10s test';
+  String get speedTestDuration =>
+      isZh ? '测试时长：10 秒' : 'Test duration: 10 seconds';
+  String get speedTestUnavailable => isZh
+      ? '设备离线或没有虚拟 IP，暂时无法测速。'
+      : 'This device is offline or has no virtual IP.';
+  String speedTestRunningOn(String peer) => isZh
+      ? '正在测试 $peer；其他设备请等待本次完成。'
+      : 'Testing $peer. Wait for this test to finish.';
+  String get speedTestDownload => isZh ? '下行' : 'Download';
+  String get speedTestUpload => isZh ? '上行' : 'Upload';
+  String get speedTestTransferred => isZh ? '传输数据' : 'Transferred';
+  String get speedTestElapsed => isZh ? '已用时间' : 'Elapsed';
+  String speedTestProgress(int elapsedSeconds) =>
+      isZh ? '$elapsedSeconds / 10 秒' : '$elapsedSeconds / 10 s';
+  String get retrySpeedTest => isZh ? '重新测速' : 'Run again';
+  String get speedTestTooltip =>
+      isZh ? '测试此设备的链路速度' : 'Test this device connection';
   String speedTestPeer(String peer) =>
-      isZh ? '直连测速 · $peer' : 'Direct speed test · $peer';
-  String speedTestResult(double downloadMbps, double uploadMbps) {
-    final down = downloadMbps.toStringAsFixed(1);
-    final up = uploadMbps.toStringAsFixed(1);
-    return isZh
-        ? '下行 $down Mbps · 上行 $up Mbps'
-        : 'Down $down Mbps · Up $up Mbps';
-  }
-
+      isZh ? '链路测速 · $peer' : 'Connection test · $peer';
   String speedTestFailed(String message) =>
       isZh ? '测速失败：$message' : 'Speed test failed: $message';
 

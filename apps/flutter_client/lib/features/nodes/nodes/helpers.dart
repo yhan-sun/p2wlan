@@ -99,6 +99,9 @@ bool _peerNeedsAttention(PeerSnapshot peer) {
 bool _peerIsOffline(PeerSnapshot peer) =>
     !peer.online || peer.path == 'offline';
 
+bool _canRunSpeedTest(PeerSnapshot peer) =>
+    peer.online && peer.virtualIp.trim().isNotEmpty;
+
 String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return strings.offline;
   if (peer.path == 'relay') return strings.relay;

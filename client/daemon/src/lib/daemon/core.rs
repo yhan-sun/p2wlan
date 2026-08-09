@@ -132,11 +132,24 @@ impl Daemon {
 
         let udp_transport = Arc::new(RwLock::new(None));
 
+        // Register the punch-session canceller on the peer manager so a
+        // stale/404 quarantined peer's in-flight recovery session is
+        // cancelled authoritatively (the daemon's own `punch_attempts` is
+        // the same deduplicator the daemon hands to the punch tasks).
+        let punch_attempts = PunchAttemptDeduplicator::default();
+        let peers = Arc::new(PeerManager::new(config.clone()));
+        {
+            let punch_attempts = punch_attempts.clone();
+            peers.set_punch_cancel_hook(Arc::new(move |peer_id| {
+                punch_attempts.cancel(peer_id);
+            }));
+        }
+
         Self {
             config: Arc::new(config.clone()),
             control,
             control_rx,
-            peers: Arc::new(PeerManager::new(config.clone())),
+            peers,
             transport,
             encrypted_rx: Some(encrypted_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
@@ -154,7 +167,7 @@ impl Daemon {
                 lease_seconds: PORT_MAPPING_LEASE_SECS,
                 ..GatewayMappingDiagnostics::default()
             })),
-            punch_attempts: PunchAttemptDeduplicator::default(),
+            punch_attempts,
             udp_transport: udp_transport.clone(),
             udp_transport_publication: UdpTransportPublication::new(udp_transport),
             runtime_stun_servers: Arc::new(RwLock::new(Vec::new())),

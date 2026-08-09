@@ -64,4 +64,65 @@ void _registerSettingsTests() {
     expect(find.text('UDP advertise'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'Settings marks daemon configuration changes as pending restart',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      expect(stores.statusStore.daemonReachable, isTrue);
+
+      await tester.pumpWidget(
+        _TestApp(
+          child: SettingsPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      final mtuField = find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.labelText == 'MTU',
+      );
+      await tester.enterText(mtuField, '1280');
+      await tester.tap(find.byKey(const Key('settings-save-button')));
+      await tester.pump();
+      for (
+        var attempt = 0;
+        attempt < 30 && stores.settingsStore.settings.mtu != 1280;
+        attempt += 1
+      ) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)),
+        );
+        await tester.pump();
+      }
+      for (
+        var attempt = 0;
+        attempt < 30 && find.text('P2WLAN restart required').evaluate().isEmpty;
+        attempt += 1
+      ) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)),
+        );
+        await tester.pump();
+      }
+
+      expect(stores.settingsStore.settings.mtu, 1280);
+      expect(find.text('P2WLAN restart required'), findsOneWidget);
+      expect(find.text('Restart and apply'), findsOneWidget);
+    },
+  );
 }

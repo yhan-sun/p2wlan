@@ -8,22 +8,16 @@ class _ConnectionBanner extends StatelessWidget {
     required this.statusReachable,
     required this.refreshing,
     required this.daemonBusy,
-    required this.autoRefreshEnabled,
     required this.error,
     required this.healthError,
     required this.statusError,
     required this.daemonManualCommand,
+    required this.snapshotStale,
     required this.lastFetchedAt,
     required this.requestDuration,
-    required this.speedTestRunning,
-    required this.speedTestResult,
-    required this.speedTestError,
-    required this.speedTestPeerVirtualIp,
     required this.onStartDaemon,
     required this.onStopDaemon,
     required this.onRefresh,
-    required this.onRunSpeedTest,
-    required this.onAutoRefreshChanged,
   });
 
   final DiagnosticsSnapshot? snapshot;
@@ -32,22 +26,16 @@ class _ConnectionBanner extends StatelessWidget {
   final bool statusReachable;
   final bool refreshing;
   final bool daemonBusy;
-  final bool autoRefreshEnabled;
   final String? error;
   final String? healthError;
   final String? statusError;
   final String? daemonManualCommand;
+  final bool snapshotStale;
   final DateTime? lastFetchedAt;
   final Duration? requestDuration;
-  final bool speedTestRunning;
-  final SpeedTestResult? speedTestResult;
-  final String? speedTestError;
-  final String? speedTestPeerVirtualIp;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
   final Future<void> Function() onRefresh;
-  final Future<void> Function(PeerSnapshot peer) onRunSpeedTest;
-  final ValueChanged<bool> onAutoRefreshChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -69,25 +57,16 @@ class _ConnectionBanner extends StatelessWidget {
             tone: tone,
             healthReachable: healthReachable,
             statusReachable: statusReachable,
+            snapshotStale: snapshotStale,
           ),
           const SizedBox(height: 16),
           _DashboardActions(
             daemonAvailable: daemonAvailable,
             daemonBusy: daemonBusy,
             refreshing: refreshing,
-            autoRefreshEnabled: autoRefreshEnabled,
             onStartDaemon: () => _handleStart(context),
             onStopDaemon: onStopDaemon,
             onRefresh: onRefresh,
-            onAutoRefreshChanged: onAutoRefreshChanged,
-          ),
-          _SpeedTestPanel(
-            snapshot: snapshot,
-            running: speedTestRunning,
-            result: speedTestResult,
-            error: speedTestError,
-            runningPeerVirtualIp: speedTestPeerVirtualIp,
-            onRun: onRunSpeedTest,
           ),
           if (daemonAvailable) ...[
             const SizedBox(height: 16),
@@ -97,6 +76,7 @@ class _ConnectionBanner extends StatelessWidget {
               snapshot: snapshot,
               lastFetchedAt: lastFetchedAt,
               requestDuration: requestDuration,
+              snapshotStale: snapshotStale,
             ),
           ],
           const SizedBox(height: 16),
@@ -122,6 +102,7 @@ class _ConnectionBanner extends StatelessWidget {
 
   String? _statusMessage(AppStrings strings, bool daemonAvailable) {
     if (!daemonAvailable) return strings.offlineSnapshotMessage;
+    if (snapshotStale) return strings.staleSnapshotMessage;
     if (!statusReachable && statusError != null) {
       return strings.statusMessage(statusError) ?? statusError;
     }
@@ -174,6 +155,7 @@ class _ConnectionBanner extends StatelessWidget {
 
   StatusTone _overallTone() {
     if (!_daemonAvailable) return StatusTone.neutral;
+    if (snapshotStale) return StatusTone.warn;
     if (!healthReachable) return StatusTone.bad;
     if (!statusReachable) return StatusTone.warn;
     return switch (snapshot?.health.status.toLowerCase()) {

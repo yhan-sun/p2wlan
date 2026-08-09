@@ -293,4 +293,112 @@ void _registerNodesTests() {
     expect(find.byType(SelectableText), findsWidgets);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('Nodes runs a ten-second speed test for the selected device', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final api = _FakeDiagnosticsApi(
+      health: true,
+      snapshot: snapshot,
+      speedTestResult: SpeedTestResult(
+        peerVirtualIp: '10.20.0.11',
+        durationMs: 10000,
+        downloadMbps: 123.4,
+        uploadMbps: 56.7,
+        downloadBytes: 154250000,
+        uploadBytes: 70875000,
+      ),
+    );
+    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    final speedTestButton = find.byKey(
+      const Key('node-speedtest-button-peer-direct-001'),
+    );
+    await tester.ensureVisible(speedTestButton);
+    await tester.tap(speedTestButton);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('node-speedtest-dialog')), findsOneWidget);
+    expect(find.text('Test duration: 10 seconds'), findsOneWidget);
+    expect(find.text('direct-laptop'), findsWidgets);
+
+    await tester.tap(find.byKey(const Key('node-speedtest-start')));
+    await tester.pump();
+    await tester.runAsync(() async {});
+    await tester.pumpAndSettle();
+
+    expect(api.speedTestCount, 1);
+    expect(find.text('123.4 Mbps'), findsOneWidget);
+    expect(find.text('56.7 Mbps'), findsOneWidget);
+    expect(find.text('147.1 MB / 67.6 MB'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Nodes shows a speed-test failure and allows retry', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final api = _FakeDiagnosticsApi(
+      health: true,
+      snapshot: snapshot,
+      speedTestError: const DiagnosticsApiException('speed fixture failed'),
+    );
+    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    final speedTestButton = find.byKey(
+      const Key('node-speedtest-button-peer-direct-001'),
+    );
+    await tester.ensureVisible(speedTestButton);
+    await tester.tap(speedTestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('node-speedtest-start')));
+    await tester.pump();
+    await tester.runAsync(() async {});
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('Speed test failed: speed fixture failed'),
+      findsOneWidget,
+    );
+    expect(find.text('Run again'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('node-speedtest-start')));
+    await tester.pump();
+    await tester.runAsync(() async {});
+    await tester.pumpAndSettle();
+    expect(api.speedTestCount, 2);
+  });
 }
