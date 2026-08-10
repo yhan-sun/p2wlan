@@ -145,54 +145,56 @@ impl UdpTransport {
                         }
                     }
 
-                    match transport
-                        .admit_outbound_connectivity_probe(&peer_id, endpoint, socket_index)
+                    // The maintainer uses its own dedicated small budget and
+                    // never consumes the recovery-epoch traversal credit or
+                    // the shared outbound probe budgets: binding maintenance
+                    // is not traversal work, and burning the epoch credit
+                    // here would starve the real punches within minutes.
+                    if transport
+                        .admit_nat_maintainer_probe(&peer_id, socket_index)
                         .await
                     {
-                        OutboundProbeAdmission::Accepted => {
-                            match transport
-                                .send_probe_from_socket(socket_index, Some(&peer_id), endpoint)
-                                .await
-                            {
-                                Ok(_) => {
-                                    sent = sent.saturating_add(1);
-                                    transport
-                                        .update_socket_diagnostics(socket_index, |metrics| {
-                                            metrics.nat_maintainer_probes_sent = metrics
-                                                .nat_maintainer_probes_sent
-                                                .saturating_add(1);
-                                        })
-                                        .await;
-                                    peers.record_direct_probe_sent(&peer_id, endpoint).await;
-                                }
-                                Err(err) => {
-                                    stop_reason = "send_error";
-                                    peers
-                                        .record_direct_event(
-                                            &peer_id,
-                                            "nat_maintainer_send_error",
-                                            Some(endpoint),
-                                            Some(socket_count),
-                                            Some(sent),
-                                            format!(
-                                                "NAT-state maintainer send failed socket_index={socket_index} target={endpoint}: {err}"
-                                            ),
-                                        )
-                                        .await;
-                                    break;
-                                }
+                        match transport
+                            .send_probe_from_socket(socket_index, Some(&peer_id), endpoint)
+                            .await
+                        {
+                            Ok(_) => {
+                                sent = sent.saturating_add(1);
+                                transport
+                                    .update_socket_diagnostics(socket_index, |metrics| {
+                                        metrics.nat_maintainer_probes_sent = metrics
+                                            .nat_maintainer_probes_sent
+                                            .saturating_add(1);
+                                    })
+                                    .await;
+                                peers.record_direct_probe_sent(&peer_id, endpoint).await;
+                            }
+                            Err(err) => {
+                                stop_reason = "send_error";
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "nat_maintainer_send_error",
+                                        Some(endpoint),
+                                        Some(socket_count),
+                                        Some(sent),
+                                        format!(
+                                            "NAT-state maintainer send failed socket_index={socket_index} target={endpoint}: {err}"
+                                        ),
+                                    )
+                                    .await;
+                                break;
                             }
                         }
-                        limited => {
-                            skipped = skipped.saturating_add(1);
-                            last_skip_reason = Some(outbound_probe_admission_reason(limited));
-                            transport
-                                .update_socket_diagnostics(socket_index, |metrics| {
-                                    metrics.nat_maintainer_probe_skips =
-                                        metrics.nat_maintainer_probe_skips.saturating_add(1);
-                                })
-                                .await;
-                        }
+                    } else {
+                        skipped = skipped.saturating_add(1);
+                        last_skip_reason = Some("nat_maintainer_budget_limited");
+                        transport
+                            .update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.nat_maintainer_probe_skips =
+                                    metrics.nat_maintainer_probe_skips.saturating_add(1);
+                            })
+                            .await;
                     }
 
                     let lease_status = {
@@ -306,6 +308,7 @@ impl UdpTransport {
             attempts,
             PunchSocketPolicy::RemoteScatterPool,
             &move || !peers.is_direct_sync(&gate_peer),
+            &|| true,
         )
         .await
     }
@@ -328,6 +331,7 @@ impl UdpTransport {
             attempts,
             PunchSocketPolicy::StableUniqueScatter,
             &move || !peers.is_direct_sync(&gate_peer),
+            &|| true,
         )
         .await
     }
@@ -370,6 +374,7 @@ impl UdpTransport {
             attempts,
             PunchSocketPolicy::ActivePool,
             &move || !peers.is_direct_sync(&gate_peer),
+            &|| true,
         )
         .await
     }
@@ -414,6 +419,7 @@ impl UdpTransport {
             attempts,
             socket_policy,
             &|| true,
+            &|| true,
         )
         .await
     }
@@ -426,6 +432,13 @@ impl UdpTransport {
     /// cheap and synchronous; the punch loops pass
     /// `peers.is_direct_sync(&peer_id)`, which only locks the peer-state
     /// mirror.
+    ///
+    /// `owner_gate` is an additional per-probe gate that ordinary punches
+    /// pass as `&|| true`.  The relay-backoff heartbeat worker passes its
+    /// owner/cancel/peer/relay revalidation here so the sweep aborts within
+    /// one probe once the worker's ownership was revoked, and re-checks it
+    /// immediately before every actual UDP send.
+    #[allow(clippy::too_many_arguments)]
     async fn punch_candidates_with_socket_policy_and_direct_gate(
         &self,
         peer_id: &str,
@@ -434,6 +447,7 @@ impl UdpTransport {
         attempts: u32,
         socket_policy: PunchSocketPolicy,
         direct_gate: &(dyn Fn() -> bool + Send + Sync),
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<PunchSendReport> {
         if candidates.is_empty() || attempts == 0 {
             return Ok(PunchSendReport::default());
@@ -475,19 +489,27 @@ impl UdpTransport {
             PunchSocketPolicy::ActivePool | PunchSocketPolicy::PrimaryOnly => {
                 MAX_PUNCH_PROBES_PER_SESSION
             }
+            PunchSocketPolicy::RelayBackoffHeartbeat => {
+                RELAY_BACKOFF_HEARTBEAT_MAX_PROBES_PER_BEAT
+            }
         };
         // The combined gate: Direct confirmed, a newer direct commit, or a
-        // network-generation change aborts the sweep immediately.
+        // network-generation change aborts the sweep immediately.  The
+        // heartbeat's owner gate is part of every gate decision so a revoked
+        // owner stops at the same probe boundary.
         let commit_aborted = |transport: &UdpTransport| {
             transport.peers.direct_commit_seq_sync(peer_id) != commit_seq_at_start
         };
+        let gates_ok = || direct_gate() && owner_gate();
         'schedule: for (round_index, round) in schedule.iter().enumerate() {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
             }
 
             let probe_order = match socket_policy {
-                PunchSocketPolicy::ActivePool | PunchSocketPolicy::RemoteScatterPool
+                PunchSocketPolicy::ActivePool
+                | PunchSocketPolicy::RemoteScatterPool
+                | PunchSocketPolicy::RelayBackoffHeartbeat
                     if socket_count > 1 =>
                 {
                     // Hard NAT traversal needs the alternate sockets to send real
@@ -524,12 +546,13 @@ impl UdpTransport {
             // batch starts.
             let mut cursor = 0usize;
             loop {
-                if !direct_gate() {
-                    // Direct was confirmed while this session was in flight:
-                    // stop emitting peer-directed probes immediately instead
-                    // of completing the stale sweep on a confirmed path.
+                if !gates_ok() {
+                    // Direct was confirmed or the heartbeat owner was revoked
+                    // while this session was in flight: stop emitting
+                    // peer-directed probes immediately instead of completing
+                    // the stale sweep on a confirmed/revoked path.
                     trace!(
-                        "Aborting UDP punch session for peer {peer_id}: Direct was confirmed mid-session"
+                        "Aborting UDP punch session for peer {peer_id}: Direct was confirmed or owner revoked mid-session"
                     );
                     break 'schedule;
                 }
@@ -560,13 +583,14 @@ impl UdpTransport {
                 while cursor < probe_order.len() && batch_sent < OUTBOUND_PROBE_BATCH_SIZE {
                     let (socket_index, candidate) = probe_order[cursor];
                     cursor += 1;
-                    if !direct_gate() {
-                        // Direct was confirmed while this session was in
-                        // flight: stop emitting peer-directed probes
-                        // immediately instead of completing the stale sweep
-                        // on a confirmed path.
+                    if !gates_ok() {
+                        // Direct was confirmed or the heartbeat owner was
+                        // revoked while this session was in flight: stop
+                        // emitting peer-directed probes immediately instead
+                        // of completing the stale sweep on a
+                        // confirmed/revoked path.
                         trace!(
-                            "Aborting UDP punch session for peer {peer_id}: Direct was confirmed mid-session"
+                            "Aborting UDP punch session for peer {peer_id}: Direct was confirmed or owner revoked mid-session"
                         );
                         break 'schedule;
                     }
@@ -586,10 +610,11 @@ impl UdpTransport {
                     // budget-rejected session can never keep traversing the
                     // whole 778/3072-entry endpoint list.  A capped epoch
                     // stops enumerating immediately.
-                    if !self
-                        .peers
-                        .try_consume_recovery_candidate_iterations(peer_id, 1)
-                        .await
+                    if socket_policy != PunchSocketPolicy::RelayBackoffHeartbeat
+                        && !self
+                            .peers
+                            .try_consume_recovery_candidate_iterations(peer_id, 1)
+                            .await
                     {
                         candidate_iteration_capped = true;
                         break 'schedule;
@@ -613,10 +638,22 @@ impl UdpTransport {
                     {
                         continue;
                     }
-                    match self
-                        .admit_outbound_connectivity_probe(peer_id, candidate, socket_index)
-                        .await
-                    {
+                    let admission = if socket_policy == PunchSocketPolicy::RelayBackoffHeartbeat {
+                        // The heartbeat uses its own dedicated per-peer budget
+                        // and never consumes the recovery-epoch credit.
+                        if self
+                            .admit_relay_backoff_heartbeat_probe(peer_id, candidate)
+                            .await
+                        {
+                            OutboundProbeAdmission::Accepted
+                        } else {
+                            OutboundProbeAdmission::HeartbeatBudgetLimited
+                        }
+                    } else {
+                        self.admit_outbound_connectivity_probe(peer_id, candidate, socket_index)
+                            .await
+                    };
+                    match admission {
                         OutboundProbeAdmission::Accepted => {
                             wholesale_rejections = 0;
                         }
@@ -727,12 +764,61 @@ impl UdpTransport {
                             );
                             break 'schedule;
                         }
+                        OutboundProbeAdmission::HeartbeatBudgetLimited => {
+                            // The heartbeat's dedicated budget is spent for
+                            // this window; the next beat retries.  This is
+                            // NOT a zero-send failure of the recovery epoch.
+                            budget_skipped = budget_skipped.saturating_add(1);
+                            last_budget_reason = Some("relay_backoff_heartbeat_budget_limited");
+                            trace!(
+                                "Skipped UDP heartbeat probe from socket {} to peer {} candidate {}: heartbeat budget exhausted",
+                                socket_index, peer_id, candidate
+                            );
+                            continue;
+                        }
                     }
 
-                    match self
-                        .send_probe_from_socket(socket_index, Some(peer_id), candidate)
-                        .await
-                    {
+                    let send_result = if socket_policy == PunchSocketPolicy::RelayBackoffHeartbeat {
+                        // The owner gate is re-validated immediately before
+                        // the actual UDP send: a cancel that landed between
+                        // the batch checks and this point must still abort
+                        // the beat without emitting one more packet.
+                        if !owner_gate() {
+                            trace!(
+                                "Aborting heartbeat beat for peer {peer_id}: owner revoked before send"
+                            );
+                            break 'schedule;
+                        }
+                        #[cfg(test)]
+                        {
+                            let gate = self
+                                .heartbeat_send_gate
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            if let Some(gate) = gate {
+                                // Park the worker right before the send. The
+                                // deterministic tests cancel the owner while
+                                // it is parked and then release it: the
+                                // re-validation below proves a cancelled
+                                // worker never emits a post-cancel packet.
+                                gate.reached.notify_one();
+                                let _ = gate.release.wait().await;
+                                if !owner_gate() {
+                                    trace!(
+                                        "Aborting heartbeat beat for peer {peer_id}: owner revoked while parked before send"
+                                    );
+                                    break 'schedule;
+                                }
+                            }
+                        }
+                        self.send_heartbeat_probe_from_socket(socket_index, peer_id, candidate)
+                            .await
+                    } else {
+                        self.send_probe_from_socket(socket_index, Some(peer_id), candidate)
+                            .await
+                    };
+                    match send_result {
                         Ok(_) => {
                             packets_sent += 1;
                             batch_sent = batch_sent.saturating_add(1);
@@ -874,6 +960,7 @@ impl UdpTransport {
             PunchSocketPolicy::RemoteScatterPool => "single_socket_scan_completed",
             PunchSocketPolicy::StableUniqueScatter => "stable_unique_scan_completed",
             PunchSocketPolicy::PrimaryOnly => "primary_socket_scan_completed",
+            PunchSocketPolicy::RelayBackoffHeartbeat => "relay_backoff_heartbeat_beat_completed",
         };
         self.peers
             .record_direct_event_with_probe_coverage(
@@ -924,7 +1011,329 @@ impl UdpTransport {
         })
     }
 
-    /// Send a single encrypted packet.
+    /// Low-rate relay-backed recovery heartbeat for one peer.
+    ///
+    /// The relay carries the data plane while the direct path is down, so a
+    /// double-NAT / rotating-egress pair can wait a long time for the rare
+    /// five-tuple match that re-establishes Direct.  This task keeps probing
+    /// the peer's trusted endpoints at a small sustained rate, independent of
+    /// the recovery epoch's one-time credit and plan quotas (a frozen or
+    /// quota-exhausted epoch can never silence it).  The heartbeat stops when
+    /// the peer turns Direct or the relay safety net closes.
+    pub(crate) async fn spawn_relay_backoff_heartbeat(
+        &self,
+        peer_id: &str,
+        interval: Duration,
+    ) -> bool {
+        self.try_spawn_relay_backoff_heartbeat_worker(peer_id, interval)
+    }
+
+    /// Sync spawn entry point shared by the public async wrapper and the
+    /// worker's own pending-restart path.
+    ///
+    /// It must be a plain function: the worker task that a pending restart
+    /// spawns calls back into this same function, and a nested async block
+    /// calling its own enclosing async fn would make the future type
+    /// recursive (the worker block's future would contain the spawn
+    /// function's future, which contains the worker block's future, ...)
+    /// and could never satisfy `Send`.
+    fn try_spawn_relay_backoff_heartbeat_worker(
+        &self,
+        peer_id: &str,
+        interval: Duration,
+    ) -> bool {
+        if interval.is_zero() {
+            return false;
+        }
+        let Some((owner_token, mut cancel_rx)) =
+            self.register_relay_backoff_heartbeat(peer_id, interval)
+        else {
+            return false;
+        };
+
+        let transport = self.clone();
+        let peers = self.peers.clone();
+        let peer_id = peer_id.to_string();
+        tokio::spawn(async move {
+            let mut beats = 0u32;
+            loop {
+                if *cancel_rx.borrow()
+                    || peers.is_direct_sync(&peer_id)
+                    || !peers.peer_exists_sync(&peer_id)
+                {
+                    break;
+                }
+                let targets = peers.relay_backoff_heartbeat_targets_for(&peer_id).await;
+                let Some(targets) = targets else {
+                    // No relay safety net / peer gone: nothing to keep warm.
+                    break;
+                };
+                if targets.is_empty() {
+                    // A Relay peer without a trusted target has nothing for
+                    // a heartbeat to maintain. Stop and release the owner so
+                    // a later candidate signal can safely start a fresh one.
+                    break;
+                }
+                // Per-send owner gate: before EVERY probe the sweep
+                // re-validates that this worker is still the registered
+                // owner, was not cancelled, and the peer/relay conditions
+                // still hold.  A cancelled owner's lease has already been
+                // moved to the registry's quitting set, so the gate fails at
+                // the next probe boundary even if the worker was inside a
+                // beat when the cancellation was requested.
+                let owner_gate = {
+                    let transport = transport.clone();
+                    let peers = peers.clone();
+                    let cancel_rx = cancel_rx.clone();
+                    let peer_id = peer_id.clone();
+                    move || {
+                        if *cancel_rx.borrow() {
+                            return false;
+                        }
+                        if !peers.peer_exists_sync(&peer_id)
+                            || peers.is_direct_sync(&peer_id)
+                            || !peers.relay_backoff_heartbeat_available_sync(&peer_id)
+                        {
+                            return false;
+                        }
+                        transport.relay_backoff_heartbeat_owner_valid_sync(
+                            &peer_id,
+                            owner_token,
+                        )
+                    }
+                };
+                let _ = transport
+                    .punch_candidates_relay_backoff_heartbeat_gated(
+                        &peer_id,
+                        targets,
+                        1,
+                        &owner_gate,
+                    )
+                    .await;
+                beats = beats.saturating_add(1);
+                if beats.is_multiple_of(15) {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "relay_backoff_heartbeat_active",
+                            None,
+                            None,
+                            None,
+                            format!(
+                                "relay-backed recovery heartbeat beat {beats}: keeping the direct punch windows warm at {}ms cadence",
+                                interval.as_millis()
+                            ),
+                        )
+                        .await;
+                }
+                tokio::select! {
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    _ = sleep(interval) => {}
+                }
+            }
+            if let Some(interval) =
+                transport.complete_relay_backoff_heartbeat_exit(&peer_id, owner_token)
+            {
+                // A recovery trigger arrived while this worker was quitting:
+                // the old worker has now confirmed it stopped sending, so
+                // exactly one replacement may take over.
+                transport.try_spawn_relay_backoff_heartbeat_worker(&peer_id, interval);
+            }
+        });
+        true
+    }
+
+    /// Registration transaction for one heartbeat worker.
+    ///
+    /// Returns `Some((owner_token, cancel_rx))` only when the registry can
+    /// make this worker send-capable immediately: no other worker is active
+    /// for the peer, none is still quitting, and the transport has not been
+    /// withdrawn.  A recovery trigger arriving while the old worker is still
+    /// quitting is NOT lost: it is recorded as a pending restart and the old
+    /// worker's exit path starts exactly one replacement.
+    fn register_relay_backoff_heartbeat(
+        &self,
+        peer_id: &str,
+        interval: Duration,
+    ) -> Option<(u64, watch::Receiver<bool>)> {
+        let mut registry = self
+            .relay_backoff_heartbeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.is_closed() {
+            return None;
+        }
+        if registry.active.contains_key(peer_id) {
+            return None;
+        }
+        if registry.quitting.contains_key(peer_id) {
+            registry.pending_restarts.insert(
+                peer_id.to_string(),
+                PendingRelayBackoffHeartbeatRestart { interval },
+            );
+            return None;
+        }
+        let owner_token = next_relay_backoff_heartbeat_owner_token();
+        #[cfg(test)]
+        let started_at = Instant::now();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        registry.active.insert(
+            peer_id.to_string(),
+            RelayBackoffHeartbeatLease {
+                owner_token,
+                #[cfg(test)]
+                started_at,
+                cancel_tx,
+            },
+        );
+        Some((owner_token, cancel_rx))
+    }
+
+    #[cfg(test)]
+    fn age_relay_backoff_heartbeat_for_test(&self, peer_id: &str, age: Duration) {
+        let mut registry = self
+            .relay_backoff_heartbeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lease) = registry.active.get_mut(peer_id) {
+            lease.started_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// Cancel a peer's heartbeat immediately.
+    ///
+    /// The lease is moved from the send-capable set to the quitting set
+    /// BEFORE the worker is signalled: the old worker's per-send owner gate
+    /// fails from that instant, and a replacement can only be requested by a
+    /// caller or a pending restart after the old worker has confirmed exit.
+    /// Returns whether an active lease was revoked.
+    pub(crate) fn cancel_relay_backoff_heartbeat(&self, peer_id: &str) -> bool {
+        let mut registry = self
+            .relay_backoff_heartbeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(lease) = registry.active.remove(peer_id) else {
+            return false;
+        };
+        let _ = lease.cancel_tx.send(true);
+        registry.quitting.insert(peer_id.to_string(), lease);
+        true
+    }
+
+    /// Cancel every heartbeat owned by this UDP transport instance during
+    /// rebind or shutdown.  The registry is closed permanently: no worker may
+    /// start or restart after the transport is withdrawn.
+    pub(crate) fn cancel_all_relay_backoff_heartbeats(&self) {
+        let leases = {
+            let mut registry = self
+                .relay_backoff_heartbeats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.mark_closed();
+            registry.pending_restarts.clear();
+            let mut leases = registry
+                .active
+                .drain()
+                .map(|(_, lease)| lease)
+                .collect::<Vec<_>>();
+            leases.extend(registry.quitting.drain().map(|(_, lease)| lease));
+            leases
+        };
+        for lease in leases {
+            let _ = lease.cancel_tx.send(true);
+        }
+    }
+
+    /// Worker exit handshake.
+    ///
+    /// Called exactly once by a worker that has stopped sending.  Removes the
+    /// worker's own lease (from the active or the quitting set, owner-typed so
+    /// a late exit can never erase a replacement) and returns the interval of
+    /// a pending restart that arrived during the quit handshake, so the
+    /// caller starts exactly one replacement.
+    fn complete_relay_backoff_heartbeat_exit(
+        &self,
+        peer_id: &str,
+        owner_token: u64,
+    ) -> Option<Duration> {
+        let mut registry = self
+            .relay_backoff_heartbeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = remove_heartbeat_lease_if_owned(&mut registry.active, peer_id, owner_token)
+            || remove_heartbeat_lease_if_owned(&mut registry.quitting, peer_id, owner_token);
+        if !removed {
+            return None;
+        }
+        registry
+            .pending_restarts
+            .remove(peer_id)
+            .map(|pending| pending.interval)
+    }
+
+    /// Whether `owner_token` is the current send-capable owner for the peer.
+    ///
+    /// The heartbeat's per-send gate calls this synchronously; once the lease
+    /// leaves the active set (cancel, shutdown), the worker must stop sending
+    /// at the next probe boundary.
+    fn relay_backoff_heartbeat_owner_valid_sync(&self, peer_id: &str, owner_token: u64) -> bool {
+        let registry = self
+            .relay_backoff_heartbeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry
+            .active
+            .get(peer_id)
+            .is_some_and(|lease| lease.owner_token == owner_token)
+    }
+
+    /// One heartbeat beat: a bounded single-attempt sweep of the peer's
+    /// trusted endpoints using the dedicated heartbeat budget.  Only tests
+    /// call this owner-less variant; the worker uses the gated variant.
+    #[cfg(test)]
+    pub(crate) async fn punch_candidates_relay_backoff_heartbeat(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
+        self.punch_candidates_relay_backoff_heartbeat_gated(peer_id, candidates, attempts, &|| true)
+            .await
+    }
+
+    /// One heartbeat beat with a per-send owner gate.
+    ///
+    /// The gate is re-validated before every actual UDP probe: owner token
+    /// still current, not cancelled, peer exists and is not Direct, and the
+    /// relay safety net still stands.
+    pub(crate) async fn punch_candidates_relay_backoff_heartbeat_gated(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        attempts: u32,
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<PunchSendReport> {
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
+            peer_id,
+            candidates,
+            Duration::from_millis(20),
+            attempts,
+            PunchSocketPolicy::RelayBackoffHeartbeat,
+            &move || {
+                peers.peer_exists_sync(&gate_peer) && !peers.is_direct_sync(&gate_peer)
+            },
+            owner_gate,
+        )
+        .await
+    }
+
+    /// Send one encrypted packet.
     ///
     /// Returns `Ok(Some(bytes))` when sent, `Ok(None)` when no endpoint is known
     /// for the destination peer, and `Err` for socket-level failures.

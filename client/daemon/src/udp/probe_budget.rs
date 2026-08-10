@@ -127,7 +127,100 @@ impl GlobalOutboundProbeBudget {
             .push_back(now);
         OutboundProbeAdmission::Accepted
     }
+
+    pub(super) async fn foreground_burst_active(&self) -> bool {
+        let state = self.state.lock().await;
+        short_window_len(&state, &OutboundProbeBudgetKey::Network)
+            >= OUTBOUND_PROBE_BUDGET_PER_NETWORK
+                .saturating_sub(RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE)
+    }
 }
+
+/// Low-priority process-wide budget for relay-backed heartbeat probes.
+///
+/// This is intentionally separate from recovery-epoch credit: a frozen epoch
+/// must not silence a relay heartbeat, and the heartbeat must not consume the
+/// foreground traversal allowance. It is still global and counts each actual
+/// (socket, candidate) admission, so adding peers cannot multiply traffic
+/// without bound.
+#[derive(Debug, Default)]
+pub(crate) struct GlobalRelayBackoffHeartbeatBudget {
+    pub(super) state: Mutex<HashMap<RelayBackoffHeartbeatBudgetKey, VecDeque<Instant>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum RelayBackoffHeartbeatBudgetKey {
+    Network,
+    Peer(String),
+    RemoteIp(IpAddr),
+}
+
+impl GlobalRelayBackoffHeartbeatBudget {
+    #[cfg(test)]
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve the actual UDP datagrams emitted for one socket/target pair.
+    /// The caller invokes this once for every pair, never once for a candidate
+    /// list. Compatibility with legacy peers can cost two datagrams.
+    pub(super) async fn admit(&self, peer_id: &str, remote_ip: IpAddr, packet_cost: usize) -> bool {
+        if packet_cost == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        state.retain(|_, sent| {
+            while sent.front().is_some_and(|sent_at| {
+                now.duration_since(*sent_at) >= RELAY_BACKOFF_HEARTBEAT_BUDGET_WINDOW
+            }) {
+                sent.pop_front();
+            }
+            !sent.is_empty()
+        });
+
+        let network_key = RelayBackoffHeartbeatBudgetKey::Network;
+        let peer_key = RelayBackoffHeartbeatBudgetKey::Peer(peer_id.to_string());
+        let remote_ip_key = RelayBackoffHeartbeatBudgetKey::RemoteIp(remote_ip);
+        if state
+            .get(&network_key)
+            .map_or(0, VecDeque::len)
+            .saturating_add(packet_cost)
+            > RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW
+            || state
+                .get(&peer_key)
+                .map_or(0, VecDeque::len)
+                .saturating_add(packet_cost)
+                > RELAY_BACKOFF_HEARTBEAT_PER_PEER_PER_WINDOW
+            || state
+                .get(&remote_ip_key)
+                .map_or(0, VecDeque::len)
+                .saturating_add(packet_cost)
+                > RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW
+        {
+            return false;
+        }
+
+        for _ in 0..packet_cost {
+            state.entry(network_key.clone()).or_default().push_back(now);
+            state.entry(peer_key.clone()).or_default().push_back(now);
+            state
+                .entry(remote_ip_key.clone())
+                .or_default()
+                .push_back(now);
+        }
+        true
+    }
+}
+
+/// Heartbeats may use only the low-priority reserve while a foreground burst
+/// is active. Foreground traversal never waits for or competes with this
+/// budget.
+pub(super) const RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE: usize = 128;
+pub(super) const RELAY_BACKOFF_HEARTBEAT_BUDGET_WINDOW: Duration = Duration::from_secs(60);
+pub(super) const RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW: usize = 240;
+pub(super) const RELAY_BACKOFF_HEARTBEAT_PER_PEER_PER_WINDOW: usize = 24;
+pub(super) const RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW: usize = 120;
 
 pub(super) const OUTBOUND_PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
 pub(super) const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 1024;
@@ -165,6 +258,9 @@ pub(super) enum OutboundProbeAdmission {
     /// probes may be emitted until the epoch rotates (generation advance,
     /// Direct confirmation or the age-based re-arm).
     EpochCreditExhausted,
+    /// The relay-backoff heartbeat's dedicated per-peer budget is exhausted;
+    /// the next beat retries.
+    HeartbeatBudgetLimited,
 }
 
 pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission) -> &'static str {
@@ -189,6 +285,7 @@ pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission)
             "global_peer_socket_persistent_rate_limited"
         }
         OutboundProbeAdmission::EpochCreditExhausted => "recovery_epoch_credit_exhausted",
+        OutboundProbeAdmission::HeartbeatBudgetLimited => "relay_backoff_heartbeat_budget_limited",
     }
 }
 
@@ -208,6 +305,21 @@ pub(super) fn default_global_outbound_probe_budget() -> Option<Arc<GlobalOutboun
                 .get_or_init(|| Arc::new(GlobalOutboundProbeBudget::default()))
                 .clone(),
         )
+    }
+}
+
+pub(super) fn default_global_relay_backoff_heartbeat_budget(
+) -> Arc<GlobalRelayBackoffHeartbeatBudget> {
+    #[cfg(test)]
+    {
+        Arc::new(GlobalRelayBackoffHeartbeatBudget::default())
+    }
+    #[cfg(not(test))]
+    {
+        static PROCESS_BUDGET: OnceLock<Arc<GlobalRelayBackoffHeartbeatBudget>> = OnceLock::new();
+        PROCESS_BUDGET
+            .get_or_init(|| Arc::new(GlobalRelayBackoffHeartbeatBudget::default()))
+            .clone()
     }
 }
 

@@ -5,3 +5,5 @@ include!("tests/part02b.rs");
 include!("tests/part03.rs");
 include!("tests/part04.rs");
 include!("tests/part05.rs");
+include!("tests/part06.rs");
+include!("tests/part07.rs");

@@ -212,6 +212,10 @@ impl PeerManager {
             }
             pair_success
         };
+        // Direct confirmation is the terminal condition for the relay-backed
+        // recovery worker. Revoke its lease before any later recovery trigger
+        // can attempt to start another owner.
+        self.cancel_relay_backoff_heartbeat(node_id);
         // A confirmed Direct path supersedes every outstanding validation
         // lease for this peer.  This happens under the same epoch gate as the
         // state transition, so a worker from the just-confirmed generation

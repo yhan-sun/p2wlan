@@ -103,6 +103,9 @@ pub struct PeerManager {
     /// Hook cancelling an active punch session when a peer is quarantined;
     /// registered by the daemon with its `PunchAttemptDeduplicator`.
     punch_cancel_hook: PunchCancelHookSlot,
+    /// Hook cancelling the transport-owned relay-backoff heartbeat when a
+    /// peer becomes Direct, leaves, or loses its relay safety net.
+    relay_backoff_heartbeat_cancel_hook: PunchCancelHookSlot,
     /// Configuration.
     config: Config,
 }

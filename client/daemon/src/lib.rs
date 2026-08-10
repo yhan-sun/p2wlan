@@ -242,6 +242,10 @@ const PEER_REFLEXIVE_FAST_PUNCH_ATTEMPTS: u32 = 2;
 /// public ports. This is a NAT-state maintainer, not a data-path keepalive.
 const HARD_NAT_MAINTAINER_CONNECTING_INTERVAL: Duration = Duration::from_millis(150);
 const HARD_NAT_MAINTAINER_CONNECTING_DURATION: Duration = Duration::from_secs(60);
+/// Cadence of the relay-backed recovery heartbeat: one bounded beat over the
+/// peer's trusted endpoints every few seconds, for as long as the relay
+/// carries the data plane.
+const RELAY_BACKOFF_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// Send a few encrypted direct-validation requests over a freshly observed
 /// UDP path and wait for the peer's daemon-internal ACK.
 ///
@@ -385,6 +389,7 @@ include!("lib/daemon/udp_direct.rs");
 include!("lib/daemon/handshake_maintenance.rs");
 include!("lib/daemon/relay_spawn.rs");
 include!("lib/daemon/dataplane_tasks.rs");
+include!("lib/daemon/overlay_validate.rs");
 include!("lib/daemon/control_events.rs");
 include!("lib/daemon/run.rs");
 include!("lib/daemon/handshake.rs");

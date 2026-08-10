@@ -169,20 +169,106 @@ impl PeerConnection {
         let target_endpoints = endpoints.iter().copied().collect::<HashSet<_>>();
         let before = self.candidate_pairs.len();
         self.candidate_pairs.retain(|pair| {
-            if pair.local_generation != local_generation {
-                return true;
-            }
             if target_endpoints.contains(&pair.remote_endpoint) {
                 return true;
             }
-            matches!(
-                pair.state,
-                CandidatePairState::Selected | CandidatePairState::Succeeded
-            ) && pair
-                .last_success_at
-                .is_some_and(|at| at.elapsed() < DIRECT_TRIAL_WINDOW)
+            if pair.local_generation == local_generation {
+                return matches!(
+                    pair.state,
+                    CandidatePairState::Selected | CandidatePairState::Succeeded
+                ) && pair
+                    .last_success_at
+                    .is_some_and(|at| at.elapsed() < DIRECT_TRIAL_WINDOW);
+            }
+            // Pairs from older generations are diagnostics only: retain just
+            // the ones carrying success evidence, because the Direct-reclaim
+            // window and `has_direct_success_history` read the pair table
+            // across generations.  Everything else (the retired birthday and
+            // predicted windows of previous generations) is dropped so
+            // candidate state cannot balloon across generations.
+            pair.success_count > 0
+                || pair.selected_at.is_some()
+                || matches!(
+                    pair.state,
+                    CandidatePairState::Selected | CandidatePairState::Succeeded
+                )
         });
-        before.saturating_sub(self.candidate_pairs.len())
+        before
+            .saturating_sub(self.candidate_pairs.len())
+            .saturating_add(self.retire_candidate_pairs_over_cap(local_generation))
+    }
+
+    /// Enforce the hard per-peer candidate-pair bound.  Retires the oldest
+    /// non-target pairs without any success evidence (old generations first,
+    /// then least-probed, then least recently observed) until the table fits.
+    /// Returns the number of pairs retired.
+    fn retire_candidate_pairs_over_cap(&mut self, local_generation: u64) -> usize {
+        if self.candidate_pairs.len() <= MAX_CANDIDATE_PAIRS_PER_PEER {
+            return 0;
+        }
+        let mut removable = self
+            .candidate_pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, pair)| {
+                pair.success_count == 0
+                    && pair.selected_at.is_none()
+                    && pair.last_success_at.is_none()
+                    && !matches!(
+                        pair.state,
+                        CandidatePairState::Selected | CandidatePairState::Succeeded
+                    )
+            })
+            .map(|(index, pair)| {
+                (
+                    index,
+                    pair.local_generation != local_generation,
+                    pair.probe_count,
+                    pair.source_observed_at.map(|at| at.elapsed()),
+                )
+            })
+            .collect::<Vec<_>>();
+        removable.sort_by(|left, right| {
+            // `true` means an old generation: retire it before current
+            // generation pairs. Within a generation, lower probe value and
+            // older observation are the weaker evidence.
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| {
+                    right
+                        .3
+                        .unwrap_or(Duration::MAX)
+                        .cmp(&left.3.unwrap_or(Duration::MAX))
+                })
+        });
+        let mut indices = removable
+            .into_iter()
+            .map(|(index, _, _, _)| index)
+            .collect::<Vec<_>>();
+        indices.sort_unstable_by(|left, right| right.cmp(left));
+        let mut removed = 0usize;
+        for index in indices {
+            if self.candidate_pairs.len() <= MAX_CANDIDATE_PAIRS_PER_PEER {
+                break;
+            }
+            self.candidate_pairs.remove(index);
+            removed += 1;
+        }
+        if removed > 0 {
+            self.record_direct_event(
+                local_generation,
+                "candidate_pair_state_bounded",
+                None,
+                Some(self.candidate_pairs.len()),
+                None,
+                format!(
+                    "retired {removed} candidate pairs to stay within the {MAX_CANDIDATE_PAIRS_PER_PEER}-pair per-peer cap"
+                ),
+            );
+        }
+        removed
     }
 
     /// Retire unsuccessful speculative probe pairs while a confirmed Direct
@@ -258,6 +344,7 @@ impl PeerConnection {
         history: &TraversalHistory,
         local_nat_profile: Option<&NatProfile>,
         mode: ProbeTargetMode,
+        max_targets: Option<usize>,
     ) -> (Vec<SocketAddr>, Option<BirthdayProbePlan>) {
         self.ensure_current_candidate_pairs(local_generation);
         let use_asymmetric_stable_role =
@@ -269,15 +356,26 @@ impl PeerConnection {
         } else {
             self.probe_candidate_endpoints()
         };
-        let mut birthday_plan = self.ensure_birthday_candidate_pairs(
-            local_generation,
-            history,
-            local_nat_profile,
-            mode.allows_local_nat_birthday() && !use_asymmetric_stable_role,
-            mode.allows_failed_prediction_fallback() && !use_asymmetric_stable_role,
-            stable_side_unique_scatter,
-            &mut endpoints,
-        );
+        // The asymmetric role NEVER birthday-sweeps: the easy peer's
+        // multi-port set was already accepted as a stable socket pool (the
+        // role gate bounds it), and scanning it as "port churn" would turn
+        // the hard side's compact stable-endpoint burst into a wide sweep
+        // against a peer that only has 3-4 live mappings.  The easy side is
+        // the one that scans this side's moving port window.
+        let mut birthday_plan = if use_asymmetric_stable_role {
+            None
+        } else {
+            self.ensure_birthday_candidate_pairs(
+                local_generation,
+                history,
+                local_nat_profile,
+                mode.allows_local_nat_birthday() && !use_asymmetric_stable_role,
+                mode.allows_failed_prediction_fallback() && !use_asymmetric_stable_role,
+                stable_side_unique_scatter,
+                &mut endpoints,
+                max_targets,
+            )
+        };
         self.prune_candidate_pairs_outside_targets(local_generation, &endpoints);
         let source_stats =
             candidate_pair_source_stats(&self.candidate_pairs, local_generation, None);
@@ -369,6 +467,15 @@ impl PeerConnection {
         .into_iter()
         .map(|pair| pair.remote_endpoint)
         .collect::<Vec<_>>();
+        // The recovery stage cap is applied to the FINAL list as well: when
+        // `max_targets` is set, the plan must not carry candidates beyond the
+        // stage's real scan window, or `planned != selected` would stall the
+        // birthday cursor forever on a truncated plan.
+        let endpoints = if let Some(max_targets) = max_targets {
+            endpoints.into_iter().take(max_targets).collect::<Vec<_>>()
+        } else {
+            endpoints
+        };
         let selected_birthday_candidates = endpoints
             .iter()
             .filter(|endpoint| {
@@ -531,8 +638,18 @@ impl PeerConnection {
                 .cmp(&birthday_base_rank(self, *right, local_generation))
                 .then_with(|| left.cmp(right))
         });
-        if let Some(endpoint) = public.first().copied() {
-            endpoints.push(endpoint);
+        // Cover EVERY advertised stable public mapping in the bounded initial
+        // burst.  The easy peer's socket-pool bindings expire independently
+        // (only one may be alive right now), so ranking alone is never enough:
+        // `public.first()` would freeze the punch on whatever endpoint was
+        // learned most recently even when its mapping is dead.  The pool-size
+        // gate (`public_endpoints_fit_stable_socket_pool`) keeps this set
+        // small; the truncation below is the final hard bound.
+        public.truncate(ASYMMETRIC_STABLE_MAX_PUBLIC_ENDPOINTS);
+        for endpoint in public {
+            if !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
         }
         endpoints
     }
@@ -547,6 +664,7 @@ impl PeerConnection {
         allow_failed_prediction_fallback: bool,
         stable_side_unique_scatter: bool,
         endpoints: &mut Vec<SocketAddr>,
+        max_targets: Option<usize>,
     ) -> Option<BirthdayProbePlan> {
         let bases = self.birthday_probe_bases(endpoints, local_generation);
 
@@ -577,6 +695,19 @@ impl PeerConnection {
         } else {
             per_base_budget.saturating_mul(bases.len().min(BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE))
         };
+        // Slice the plan to the window that will actually be sent this
+        // session.  The stage cap (`max_targets`) and the per-plan slice keep
+        // the generated window inside the real scan window, so the plan
+        // never persists hundreds of birthday pairs that the stage caps
+        // truncate away, and the cursor can advance rank-by-rank.
+        let slice = max_targets
+            .unwrap_or(usize::MAX)
+            .min(if stable_side_unique_scatter {
+                STABLE_SCATTER_PLAN_SLICE
+            } else {
+                BIRTHDAY_PLAN_SLICE
+            });
+        let budget = budget.min(slice.saturating_sub(endpoints.len()));
         if budget == 0 {
             return None;
         }

@@ -108,6 +108,7 @@ impl Config {
                 fresh_mapping_punch_enabled: true,
                 fresh_mapping_harness_loopback: false,
                 gather_host_candidates: true,
+                validate_overlay: false,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),

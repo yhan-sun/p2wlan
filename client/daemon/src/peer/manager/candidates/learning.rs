@@ -43,6 +43,13 @@ impl PeerManager {
                 ),
             );
         }
+        drop(conns);
+        // An authenticated inbound punch is authoritative live-path evidence:
+        // the peer can reach us RIGHT NOW, so a frozen or quota-exhausted
+        // recovery epoch must re-open for one bounded retry instead of
+        // waiting out the 30-minute epoch.  The re-open is capped per epoch.
+        self.recovery_reopen_on_evidence(node_id, "authenticated_punch")
+            .await;
         true
     }
 

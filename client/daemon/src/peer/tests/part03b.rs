@@ -328,7 +328,11 @@ async fn stable_side_wide_scatter_rotates_unique_birthday_windows() {
         .expect("stable side should produce a wide target set");
     assert!(first.remote_scatter_pool);
     assert!(first.stable_remote_scatter);
-    assert!(first.candidates.len() >= 3_000);
+    // The wide window is generated rank-by-rank in bounded slices: the first
+    // plan is exactly one slice, never the full 3,072-candidate budget, so
+    // resident candidate-pair state matches what this session actually sends.
+    assert!(first.candidates.len() <= STABLE_SCATTER_PLAN_SLICE);
+    assert!(first.candidates.len() >= STABLE_SCATTER_PLAN_SLICE / 2);
     assert!(first.candidates.len() <= STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET);
     let first_plan = first.birthday_plan.unwrap();
     assert!(first_plan.stable_side_unique_scatter);
@@ -367,6 +371,13 @@ async fn stable_side_wide_scatter_rotates_unique_birthday_windows() {
     let second_plan = second.birthday_plan.unwrap();
     assert_eq!(second_plan.start_rank, first_plan.end_rank);
     assert_ne!(second.candidates, first.candidates);
+    // Resident candidate pairs stay bounded across the windowed rotation.
+    let diagnostics = manager.diagnostics().await;
+    assert!(
+        diagnostics[0].candidate_pairs.len() <= MAX_CANDIDATE_PAIRS_PER_PEER,
+        "windowed generation must keep candidate-pair state bounded, got {}",
+        diagnostics[0].candidate_pairs.len()
+    );
 }
 
 fn stable_scatter_signal(
@@ -613,17 +624,18 @@ async fn remote_port_churn_triggers_birthday_probe_targets() {
         .iter()
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
         .collect::<Vec<_>>();
-    let expected_birthday_targets = birthday_probe_endpoints_for_bases(
-        &bases,
-        birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len()),
-    )
-    .into_iter()
-    .filter(|target| {
-        target.ip().to_string() == "203.0.113.10"
-            && !candidates.contains(&target.to_string())
-            && *target != registry_endpoint
-    })
-    .count();
+    // The birthday window is generated in bounded per-plan slices: the
+    // expected set mirrors the sliced budget exactly.
+    let sliced_budget = birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
+        .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
+    let expected_birthday_targets = birthday_probe_endpoints_for_bases(&bases, sliced_budget)
+        .into_iter()
+        .filter(|target| {
+            target.ip().to_string() == "203.0.113.10"
+                && !candidates.contains(&target.to_string())
+                && *target != registry_endpoint
+        })
+        .count();
 
     assert!(!targets.contains(&registry_endpoint));
     assert_eq!(birthday_targets.len(), expected_birthday_targets);
@@ -673,17 +685,18 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
         .iter()
         .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
         .collect::<Vec<_>>();
-    let expected_birthday_targets = birthday_probe_endpoints_for_bases(
-        &bases,
-        birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len()),
-    )
-    .into_iter()
-    .filter(|target| {
-        target.ip().to_string() == "203.0.113.10"
-            && !candidates.contains(&target.to_string())
-            && *target != registry_endpoint
-    })
-    .count();
+    // The birthday window is generated in bounded per-plan slices: the
+    // expected set mirrors the sliced budget exactly.
+    let sliced_budget = birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
+        .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
+    let expected_birthday_targets = birthday_probe_endpoints_for_bases(&bases, sliced_budget)
+        .into_iter()
+        .filter(|target| {
+            target.ip().to_string() == "203.0.113.10"
+                && !candidates.contains(&target.to_string())
+                && *target != registry_endpoint
+        })
+        .count();
 
     assert!(!targets.contains(&registry_endpoint));
     assert_eq!(birthday_targets.len(), expected_birthday_targets);
@@ -762,10 +775,10 @@ async fn hard_local_nat_treats_small_stun_pool_as_stable_remote() {
     let targets = manager.direct_probe_targets_for("peer1").await;
     assert_eq!(
         targets.len(),
-        1,
-        "a small authoritative STUN pool should not trigger birthday expansion"
+        stable_pool.len(),
+        "a small authoritative STUN pool is fully covered: only one of the peer's socket mappings may be live, so the first burst must probe every advertised mapping"
     );
-    assert!(stable_pool.contains(&targets[0]));
+    assert!(stable_pool.iter().all(|endpoint| targets.contains(endpoint)));
 
     let maintainer_targets = manager.direct_nat_maintainer_targets_for("peer1").await;
     assert_eq!(maintainer_targets, targets);
@@ -773,7 +786,7 @@ async fn hard_local_nat_treats_small_stun_pool_as_stable_remote() {
     let target_set = manager
         .direct_probe_target_set_for("peer1")
         .await
-        .expect("stable pool should still produce one direct target");
+        .expect("stable pool should still produce direct targets");
     assert!(!target_set.remote_scatter_pool);
 }
 

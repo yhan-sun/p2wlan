@@ -58,6 +58,21 @@ pub struct UdpTransport {
     validation_trigger: Option<Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>>,
     triggered_checks: TriggeredCheckState,
     nat_maintainers: NatMaintainerState,
+    /// Dedicated per-(peer, socket) budget for NAT-state binding maintainer
+    /// probes, fully isolated from the recovery-epoch traversal credit and
+    /// the shared outbound probe budgets.
+    nat_maintainer_budget: NatMaintainerBudgetState,
+    /// Dedicated per-peer budget for the relay-backed recovery heartbeat.
+    relay_backoff_heartbeat_budget: RelayBackoffHeartbeatBudgetState,
+    /// Send-capability registry for relay-backoff heartbeat tasks: at most
+    /// one send-capable worker per peer, with a quit handshake before
+    /// replacement.
+    relay_backoff_heartbeats: RelayBackoffHeartbeatState,
+    /// Test-only hook that parks a heartbeat worker immediately before a UDP
+    /// send, letting a deterministic test cancel the owner and assert that
+    /// the worker re-validates its ownership before the actual send.
+    #[cfg(test)]
+    heartbeat_send_gate: Arc<std::sync::Mutex<Option<Arc<HeartbeatSendGate>>>>,
     authenticated_punch_replay: AuthPunchReplayState,
     authenticated_punch_rate: AuthPunchRateState,
     outbound_probe_budget: OutboundProbeBudgetState,
@@ -115,6 +130,13 @@ impl UdpTransport {
             validation_trigger: None,
             triggered_checks: Arc::new(Mutex::new(HashMap::new())),
             nat_maintainers: Arc::new(Mutex::new(HashMap::new())),
+            nat_maintainer_budget: Arc::new(Mutex::new(HashMap::new())),
+            relay_backoff_heartbeat_budget: default_global_relay_backoff_heartbeat_budget(),
+            relay_backoff_heartbeats: Arc::new(std::sync::Mutex::new(
+                RelayBackoffHeartbeatRegistry::default(),
+            )),
+            #[cfg(test)]
+            heartbeat_send_gate: Arc::new(std::sync::Mutex::new(None)),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
             outbound_probe_budget: Arc::new(Mutex::new(HashMap::new())),
@@ -128,6 +150,24 @@ impl UdpTransport {
     #[cfg(test)]
     fn with_global_probe_budget(mut self, budget: Arc<GlobalOutboundProbeBudget>) -> Self {
         self.global_outbound_probe_budget = Some(budget);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_global_heartbeat_budget(
+        mut self,
+        budget: Arc<GlobalRelayBackoffHeartbeatBudget>,
+    ) -> Self {
+        self.relay_backoff_heartbeat_budget = budget;
+        self
+    }
+
+    /// Park every heartbeat worker right before its next UDP send until the
+    /// test releases the gate. The worker re-validates its ownership after
+    /// the release, so a cancelled owner never sends a post-cancel packet.
+    #[cfg(test)]
+    fn with_heartbeat_send_gate(mut self, gate: Arc<HeartbeatSendGate>) -> Self {
+        self.heartbeat_send_gate = Arc::new(std::sync::Mutex::new(Some(gate)));
         self
     }
 

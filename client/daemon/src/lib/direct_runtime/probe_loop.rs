@@ -91,6 +91,13 @@ async fn run_direct_probe_loop(
                     boot_epoch_ms,
                 }
             };
+            // A multi-socket peer may probe ANY of our advertised socket-pool
+            // mappings: temporarily activate the pool so every socket sends
+            // peer-directed probes and every advertised mapping stays alive
+            // for the peer's first punch (see `peer_needs_local_socket_pool`).
+            if peers.peer_needs_local_socket_pool(&peer_id).await {
+                udp.set_socket_pool_active(true);
+            }
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
@@ -315,6 +322,15 @@ async fn run_direct_probe_loop(
                         )
                         .await;
                     }
+                    // The relay-backed heartbeat keeps the direct punch windows
+                    // warm at a low sustained rate for as long as the relay
+                    // carries the data plane, independent of the recovery
+                    // epoch's one-time credit/plan quotas.
+                    udp.spawn_relay_backoff_heartbeat(
+                        &peer_id,
+                        RELAY_BACKOFF_HEARTBEAT_INTERVAL,
+                    )
+                    .await;
                     let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                         && udp.has_dynamic_socket_for_peer(&peer_id).await
                     {

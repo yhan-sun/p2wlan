@@ -176,6 +176,19 @@ pub struct NetworkConfig {
     /// escape hatch and defaults to off.
     #[serde(default)]
     pub fresh_mapping_harness_loopback: bool,
+    /// Drive a real encrypted overlay payload through the production
+    /// dataplane (DataPlane -> WireGuard encrypt -> direct UDP -> WireGuard
+    /// decrypt -> DataPlane) using an in-memory mock TUN instead of a system
+    /// interface (independent validation harnesses only).
+    ///
+    /// This is NOT a test-only plaintext bypass: every payload byte goes
+    /// through the exact production outbound/inbound pipeline, and the flag
+    /// is off by default so production daemons never create the mock
+    /// interface or the validation loop.  The loopback virtual interface
+    /// requires no privileges and is the documented alternative used when
+    /// macOS TUN creation is unavailable to the validation harness.
+    #[serde(default)]
+    pub validate_overlay: bool,
 }
 
 fn default_cidr() -> String {

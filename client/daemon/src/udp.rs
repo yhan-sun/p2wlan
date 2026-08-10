@@ -34,10 +34,11 @@ use crate::transport::{
 
 mod probe_budget;
 use probe_budget::{
-    default_global_outbound_probe_budget, outbound_probe_admission_reason,
-    retain_live_budget_entries, GlobalOutboundProbeBudget, OutboundProbeAdmission,
-    OutboundProbeBudgetKey, OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK,
-    OUTBOUND_PROBE_BUDGET_PER_PEER, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP,
+    default_global_outbound_probe_budget, default_global_relay_backoff_heartbeat_budget,
+    outbound_probe_admission_reason, retain_live_budget_entries, GlobalOutboundProbeBudget,
+    GlobalRelayBackoffHeartbeatBudget, OutboundProbeAdmission, OutboundProbeBudgetKey,
+    OutboundProbeBudgetState, OUTBOUND_PROBE_BUDGET_PER_NETWORK, OUTBOUND_PROBE_BUDGET_PER_PEER,
+    OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP, RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE,
 };
 #[cfg(test)]
 use probe_budget::{

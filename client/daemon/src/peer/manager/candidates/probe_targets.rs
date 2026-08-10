@@ -88,6 +88,7 @@ impl PeerManager {
             &history,
             local_nat_profile.as_ref(),
             ProbeTargetMode::Synchronized,
+            recovery_target_cap(recovery_stage, relay_safety_net),
         );
         if !endpoints.is_empty() {
             conn.record_direct_event(
@@ -141,9 +142,15 @@ impl PeerManager {
         }
     }
 
-    /// Return the preferred stable public endpoint that every active local UDP
-    /// socket should continuously probe while the easier peer scans this side's
-    /// moving public-port window.
+    /// Return the preferred stable public endpoints that every active local
+    /// UDP socket should continuously probe while the easier peer scans this
+    /// side's moving public-port window.
+    ///
+    /// ALL advertised stable public mappings are maintained, never just the
+    /// top-ranked one: the easy peer's socket-pool bindings expire
+    /// independently, and a maintainer locked onto a single stale port leaves
+    /// the live mapping's binding dead.  The set is already bounded by the
+    /// stable-pool role gate (≤ `ASYMMETRIC_STABLE_MAX_PUBLIC_ENDPOINTS`).
     pub async fn direct_nat_maintainer_targets_for(&self, node_id: &str) -> Vec<SocketAddr> {
         let generation = self.current_network_generation().await;
         let local_nat_profile = self.local_nat_profile_for_probe_budget().await;
@@ -165,7 +172,6 @@ impl PeerManager {
             .filter(|endpoint| is_public_probe_endpoint(*endpoint))
             .collect::<Vec<_>>();
         endpoints.dedup();
-        endpoints.truncate(1);
         endpoints
     }
 
@@ -213,6 +219,7 @@ impl PeerManager {
                     &history,
                     local_nat_profile.as_ref(),
                     ProbeTargetMode::Background,
+                    None,
                 );
 
                 if endpoints.is_empty() {
@@ -233,6 +240,93 @@ impl PeerManager {
                 }
             })
             .collect()
+    }
+
+    /// Whether probing this peer should activate the local UDP socket pool
+    /// even when the NAT profile alone would keep it dormant.
+    ///
+    /// An easy NAT with a bound (but dormant) socket pool advertises every
+    /// pool socket's STUN-observed mapping to the peer.  A multi-socket peer
+    /// (≥2 public ports on one IP, i.e. its own pool / hard-NAT profile) may
+    /// probe ANY of those advertised mappings, but the easy side's secondary
+    /// socket bindings expire while the pool is dormant because only STUN
+    /// traffic refreshes them.  Activating the pool makes the next punch send
+    /// peer-directed traffic from every pool socket, keeping every advertised
+    /// mapping alive for the first punch.
+    pub(crate) async fn peer_needs_local_socket_pool(&self, node_id: &str) -> bool {
+        let Some(profile) = self.local_nat_profile_for_probe_budget().await else {
+            return false;
+        };
+        if profile.udp_blocked || is_hard_nat_profile(&profile) {
+            // A hard local NAT already runs the pool; a UDP-blocked network
+            // cannot benefit from it.
+            return false;
+        }
+        let conns = self.connections.read().await;
+        let Some(conn) = conns.get(node_id) else {
+            return false;
+        };
+        if !conn.online || conn.state == ConnectionState::Direct {
+            return false;
+        }
+        let mut ports_by_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+        for endpoint in conn
+            .candidate_endpoints()
+            .into_iter()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+        {
+            ports_by_ip
+                .entry(endpoint.ip())
+                .or_default()
+                .insert(endpoint.port());
+        }
+        ports_by_ip.values().any(|ports| ports.len() >= 2)
+    }
+
+    /// Trusted-endpoint target set for the relay-backed recovery heartbeat.
+    ///
+    /// Returns `None` when the peer has no relay safety net (the heartbeat
+    /// must not probe during a cold start without relay — that is the
+    /// recovery epoch's job), is Direct, or is quarantined.  The returned
+    /// set is capped to the bounded relay-backoff ceiling so one beat stays
+    /// small; it deliberately bypasses the epoch's plan/session quotas.
+    pub(crate) async fn relay_backoff_heartbeat_targets_for(
+        &self,
+        node_id: &str,
+    ) -> Option<Vec<SocketAddr>> {
+        let relay_available = self
+            .connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|conn| {
+                conn.state == ConnectionState::Relay
+                    || (conn.state == ConnectionState::FallbackToRelay
+                        && conn.relay_server.is_some())
+            });
+        if !relay_available {
+            return None;
+        }
+        let mut set = self.direct_probe_target_set_for(node_id).await?;
+        set.candidates.truncate(RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES as usize);
+        Some(set.candidates)
+    }
+
+    /// Lock-free relay safety-net check for the heartbeat's per-send owner
+    /// gate.  A transient `try_read` failure while the connection map is
+    /// being written aborts the beat conservatively; the worker re-verifies
+    /// on the next beat with the authoritative async check.
+    pub(crate) fn relay_backoff_heartbeat_available_sync(&self, node_id: &str) -> bool {
+        self.connections
+            .try_read()
+            .map(|connections| {
+                connections.get(node_id).is_some_and(|conn| {
+                    conn.state == ConnectionState::Relay
+                        || (conn.state == ConnectionState::FallbackToRelay
+                            && conn.relay_server.is_some())
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Return candidate endpoints that are due for direct-path reprobe.
@@ -321,32 +415,84 @@ impl PeerManager {
             else {
                 continue;
             };
-            // A frozen budget epoch cannot build a plan this tick.
+            // Eligibility (retry due, reclaim window, viable NAT window) is
+            // checked BEFORE any recovery quota is consumed: a peer that is
+            // still in its retry backoff must not burn a plan-build/session
+            // slot on a tick where nothing will be sent.  The old ordering
+            // drained the 16-plan quota in ~16 idle seconds and then locked
+            // the peer out of re-planning for the rest of the epoch.
+            let reclaim_active = {
+                let conns = self.connections.read().await;
+                let Some(conn) = conns.get(&peer_id) else {
+                    continue;
+                };
+                if !conn.online || conn.state == ConnectionState::Direct {
+                    continue;
+                }
+                let reclaim_active = conn.direct_reclaim_active();
+                if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
+                    continue;
+                }
+                if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
+                    let needs_record = conn
+                        .direct_events
+                        .last()
+                        .is_none_or(|event| {
+                            event.network_generation != generation
+                                || event.stage != "retry_skipped_no_viable_nat_window"
+                        });
+                    let endpoint = conn.endpoint;
+                    drop(conns);
+                    if needs_record {
+                        self.record_direct_event(
+                            &peer_id,
+                            "retry_skipped_no_viable_nat_window",
+                            endpoint,
+                            None,
+                            None,
+                            "skipped background Direct retry because local/peer NAT signals show no viable punch window",
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                reclaim_active
+            };
+            granted += 1;
             if !self.try_consume_recovery_plan_build(&peer_id).await {
-                self.record_direct_event(
-                    &peer_id,
-                    "recovery_plan_build_quota_exhausted",
-                    None,
-                    None,
-                    None,
-                    format!("recovery epoch {epoch} used its plan-build quota; no new plan until the epoch rotates"),
-                )
-                .await;
+                if self
+                    .recovery_quota_event_report_due(&peer_id, "plan_build")
+                    .await
+                {
+                    self.record_direct_event(
+                        &peer_id,
+                        "recovery_plan_build_quota_exhausted",
+                        None,
+                        None,
+                        None,
+                        format!("recovery epoch {epoch} used its plan-build quota; no new plan until the epoch rotates"),
+                    )
+                    .await;
+                }
                 continue;
             }
             if !self.try_consume_recovery_session(&peer_id).await {
-                self.record_direct_event(
-                    &peer_id,
-                    "recovery_session_quota_exhausted",
-                    None,
-                    None,
-                    None,
-                    format!("recovery epoch {epoch} used its session quota; no new session until the epoch rotates"),
-                )
-                .await;
+                if self
+                    .recovery_quota_event_report_due(&peer_id, "session")
+                    .await
+                {
+                    self.record_direct_event(
+                        &peer_id,
+                        "recovery_session_quota_exhausted",
+                        None,
+                        None,
+                        None,
+                        format!("recovery epoch {epoch} used its session quota; no new session until the epoch rotates"),
+                    )
+                    .await;
+                }
                 continue;
             }
-            granted += 1;
             let stage = self.recovery_stage_for(&peer_id).await;
             let relay_safety_net = self.has_relay_safety_net(&peer_id).await;
             let mut conns = self.connections.write().await;
@@ -354,30 +500,6 @@ impl PeerManager {
                 continue;
             };
             if !conn.online || conn.state == ConnectionState::Direct {
-                continue;
-            }
-            let reclaim_active = conn.direct_reclaim_active();
-            if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
-                continue;
-            }
-            if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
-                if conn
-                    .direct_events
-                    .last()
-                    .is_none_or(|event| {
-                        event.network_generation != generation
-                            || event.stage != "retry_skipped_no_viable_nat_window"
-                    })
-                {
-                    conn.record_direct_event(
-                        generation,
-                        "retry_skipped_no_viable_nat_window",
-                        conn.endpoint,
-                        None,
-                        None,
-                        "skipped background Direct retry because local/peer NAT signals show no viable punch window",
-                    );
-                }
                 continue;
             }
             let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
@@ -389,6 +511,7 @@ impl PeerManager {
                 } else {
                     ProbeTargetMode::Background
                 },
+                recovery_target_cap(Some(stage), relay_safety_net),
             );
             if endpoints.is_empty() {
                 continue;
@@ -511,19 +634,20 @@ impl PeerManager {
         plan: &BirthdayProbePlan,
         covered_all_selected_candidates: bool,
     ) -> bool {
-        // Only the public IPs and the actual probing coverage matter.  The
-        // candidate base ports churn every refresh cycle (peer STUN ports
-        // move), and `generated_candidates` excludes bases that were already
-        // in the endpoint set, so comparing it against the selected birthday
-        // count would stall the cursor forever on a healthy scan.
-        // The budget check is strict: `planned_candidates` is the full target
-        // list before cooldown/budget filtering, so a plan whose endpoints
-        // were dropped before sending must not advance the cursor past ports
-        // that were never probed.
+        // The cursor advances only when every selected candidate was really
+        // sent (`covered_all_selected_candidates`) AND birthday candidates
+        // were generated and selected.  The plan generation is sliced by the
+        // recovery stage cap and the per-plan window slice, so the generated
+        // window is exactly what this session sends: `planned == selected`
+        // is guaranteed by construction instead of being re-checked here.
+        // Cooldown filtering can legally drop a candidate between planning
+        // and sending without making the cursor skip unprobed ports: the
+        // whole remote-port window is re-swept rank-by-rank across plans, so
+        // a skipped port is simply covered by a later slice (or the wrap).
         if !plan.stable_side_unique_scatter
             || !covered_all_selected_candidates
             || plan.selected_birthday_candidates == 0
-            || plan.selected_candidates != plan.planned_candidates
+            || plan.generated_candidates == 0
         {
             return false;
         }
@@ -568,6 +692,26 @@ impl PeerManager {
         conn.mark_candidate_pair_probing(endpoint, generation);
         true
     }
+}
+
+/// The recovery stage's probe ceiling as a candidate-count cap for plan
+/// construction.
+///
+/// This is applied BEFORE `candidate_probe_endpoints` generates the birthday
+/// window so the plan never persists candidates beyond the stage's real scan:
+/// `cap_targets_by_recovery_stage` below remains as the post-selection safety
+/// net with identical numbers.
+fn recovery_target_cap(
+    stage: Option<RecoveryStage>,
+    relay_safety_net: bool,
+) -> Option<usize> {
+    let stage = stage?;
+    let max_probes = if relay_safety_net && stage >= RecoveryStage::ScatterExtended {
+        RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES
+    } else {
+        stage.max_probes()
+    };
+    Some(max_probes as usize)
 }
 
 /// Bound a target set by the recovery stage machine.

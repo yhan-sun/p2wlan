@@ -133,6 +133,12 @@ struct Cli {
     #[arg(long, name = "no-host-candidates")]
     no_host_candidates: bool,
 
+    /// Drive a real encrypted overlay payload through the production
+    /// dataplane via an in-memory mock TUN (independent validation
+    /// harnesses only; off by default in production).
+    #[arg(long, name = "validate-overlay")]
+    validate_overlay: bool,
+
     /// Override device name
     #[arg(long, name = "device-name")]
     device_name: Option<String>,

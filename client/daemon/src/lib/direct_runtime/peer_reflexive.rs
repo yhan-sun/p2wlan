@@ -215,6 +215,13 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
                     );
                     continue;
                 }
+                // Authenticated peer-reflexive evidence re-opens a frozen or
+                // quota-exhausted recovery epoch for one bounded retry (capped
+                // per epoch), so the peer's newest mapping can be probed
+                // immediately instead of waiting out the 30-minute epoch.
+                peers
+                    .recovery_reopen_on_evidence(&peer_id, "authenticated_peer_reflexive")
+                    .await;
                 if !enqueue_peer_reflexive_signal_observation(&slots, observation).await {
                     debug!(
                         peer_id = %peer_id,

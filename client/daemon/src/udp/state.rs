@@ -26,6 +26,109 @@ pub(crate) struct TriggeredCheckRecord {
 type TriggeredCheckState = Arc<Mutex<HashMap<String, TriggeredCheckRecord>>>;
 type NatMaintainerKey = (String, SocketAddr, usize);
 type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease>>>;
+/// Dedicated per-(peer, local socket) NAT maintainer probe budget, isolated
+/// from the recovery-epoch traversal credit and the shared outbound budgets.
+pub(super) type NatMaintainerBudgetState =
+    Arc<Mutex<HashMap<(String, usize), VecDeque<Instant>>>>;
+/// Process-wide low-priority relay-backoff heartbeat budget. It is separate
+/// from the recovery epoch, but still accounts for every actual socket/target
+/// send globally.
+pub(super) type RelayBackoffHeartbeatBudgetState =
+    Arc<GlobalRelayBackoffHeartbeatBudget>;
+/// One owner lease for a relay-backoff heartbeat worker. The sender is kept in
+/// a synchronous registry so lifecycle hooks can cancel without awaiting while
+/// holding a peer-manager lock.
+#[derive(Clone)]
+pub(super) struct RelayBackoffHeartbeatLease {
+    pub(super) owner_token: u64,
+    #[cfg(test)]
+    pub(super) started_at: Instant,
+    pub(super) cancel_tx: watch::Sender<bool>,
+}
+
+/// A recovery trigger that arrived while the peer still had an exiting
+/// heartbeat worker. The trigger is remembered so exactly one replacement
+/// worker starts after the old worker confirms it stopped sending.
+pub(super) struct PendingRelayBackoffHeartbeatRestart {
+    pub(super) interval: Duration,
+}
+
+/// Send-capability registry for relay-backoff heartbeat workers.
+///
+/// The invariant this registry enforces is stronger than "one map entry per
+/// peer": a worker is send-capable only while its lease sits in `active`.
+/// Cancellation moves the lease to `quitting` before a replacement can be
+/// requested, so the old worker's per-send owner gate fails immediately and a
+/// replacement can only become send-capable after the old worker confirmed it
+/// stopped sending (`complete_relay_backoff_heartbeat_exit`).  Recovery
+/// triggers arriving during the quit handshake are recorded in
+/// `pending_restarts` and start exactly one replacement after the old worker
+/// exits.
+#[derive(Default)]
+pub(super) struct RelayBackoffHeartbeatRegistry {
+    pub(super) active: HashMap<String, RelayBackoffHeartbeatLease>,
+    pub(super) quitting: HashMap<String, RelayBackoffHeartbeatLease>,
+    pub(super) pending_restarts: HashMap<String, PendingRelayBackoffHeartbeatRestart>,
+    /// Set permanently when the transport is withdrawn (rebind/shutdown):
+    /// nothing may start or restart a worker afterwards.
+    pub(super) closed: Arc<AtomicBool>,
+}
+
+impl RelayBackoffHeartbeatRegistry {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn mark_closed(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+/// Registry for relay-backoff heartbeat tasks: at most one send-capable
+/// worker per peer, with a quit handshake before replacement.
+pub(super) type RelayBackoffHeartbeatState =
+    Arc<std::sync::Mutex<RelayBackoffHeartbeatRegistry>>;
+
+fn remove_heartbeat_lease_if_owned(
+    leases: &mut HashMap<String, RelayBackoffHeartbeatLease>,
+    peer_id: &str,
+    owner_token: u64,
+) -> bool {
+    if !leases
+        .get(peer_id)
+        .is_some_and(|lease| lease.owner_token == owner_token)
+    {
+        return false;
+    }
+    leases.remove(peer_id);
+    true
+}
+
+#[cfg(test)]
+pub(crate) struct HeartbeatSendGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl HeartbeatSendGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
+static NEXT_RELAY_BACKOFF_HEARTBEAT_OWNER_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_relay_backoff_heartbeat_owner_token() -> u64 {
+    NEXT_RELAY_BACKOFF_HEARTBEAT_OWNER_TOKEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("relay-backoff heartbeat owner token space exhausted")
+}
 type AuthPunchReplayKey = (String, u64, ProbeNonce, u8);
 type AuthPunchReplayState = Arc<Mutex<HashMap<AuthPunchReplayKey, Instant>>>;
 type AuthPunchRateState = Arc<Mutex<HashMap<(String, SocketAddr), VecDeque<Instant>>>>;
@@ -334,6 +437,23 @@ pub(super) const OUTBOUND_PROBE_BATCH_SIZE: usize = 64;
 /// burst. The primary socket still uses the complete configured observer set
 /// for NAT profiling.
 const SOCKET_POOL_STUN_OBSERVERS_PER_SOCKET: usize = 2;
+
+/// Dedicated small budget for NAT-state binding maintainer probes.
+///
+/// The maintainer keeps destination-specific bindings warm while the easier
+/// peer scans this side's moving port window.  It runs at a fixed cadence
+/// (tens of probes per second across the socket pool) and must NEVER consume
+/// the recovery epoch's one-time traversal credit: on a failing hard-NAT
+/// peer the maintainer would otherwise burn the whole 4,000-probe epoch in a
+/// few minutes and starve the real punches that could actually connect.
+/// This budget is per (peer, local socket), small, and independent of every
+/// other probe budget; a skipped maintainer beat just repeats at the next
+/// interval.
+const NAT_MAINTAINER_BUDGET_WINDOW: Duration = Duration::from_secs(60);
+const NAT_MAINTAINER_BUDGET_PER_PEER_SOCKET: usize = 1_200;
+
+/// Per-beat probe cap and per-beat socket policy session cap.
+pub(super) const RELAY_BACKOFF_HEARTBEAT_MAX_PROBES_PER_BEAT: u32 = 16;
 
 /// Fresh punch sockets are indexed from this base so their indices never
 /// collide with the fixed pool sockets (0..socket_count).
@@ -773,6 +893,8 @@ pub struct UdpSocketPoolMemberDiagnostics {
     pub encrypted_packets_sent: u64,
     /// Encrypted direct datagrams received on this socket.
     pub encrypted_packets_received: u64,
+    /// Relay-backoff heartbeat probe datagrams sent from this socket.
+    pub relay_backoff_heartbeat_probes_sent: u64,
     /// Server-reflexive mappings learned for this socket and published to peers.
     pub stun_mappings_discovered: u64,
 }
@@ -896,6 +1018,7 @@ struct PendingProbe {
 enum PendingProbePurpose {
     ConnectivityCheck,
     ConsentCheck,
+    RelayBackoffHeartbeat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -904,6 +1027,12 @@ enum PunchSocketPolicy {
     RemoteScatterPool,
     StableUniqueScatter,
     PrimaryOnly,
+    /// Low-rate relay-backed recovery heartbeat: the relay is the data plane,
+    /// so this policy probes the trusted endpoints with a small dedicated
+    /// budget that never touches the recovery-epoch traversal credit.  It
+    /// keeps the five-tuple punch windows alive for hours while a
+    /// double-NAT / rotating-egress pair waits for a rare match.
+    RelayBackoffHeartbeat,
 }
 
 impl PunchSocketPolicy {
@@ -913,6 +1042,7 @@ impl PunchSocketPolicy {
             Self::RemoteScatterPool => transport.socket_count(),
             Self::StableUniqueScatter => 1,
             Self::PrimaryOnly => 1,
+            Self::RelayBackoffHeartbeat => transport.socket_count(),
         }
     }
 
@@ -922,6 +1052,7 @@ impl PunchSocketPolicy {
             Self::RemoteScatterPool => "remote_scatter_pool",
             Self::StableUniqueScatter => "stable_unique_scatter",
             Self::PrimaryOnly => "primary_only",
+            Self::RelayBackoffHeartbeat => "relay_backoff_heartbeat",
         }
     }
 }

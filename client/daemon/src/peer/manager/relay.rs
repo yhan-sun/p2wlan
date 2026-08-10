@@ -152,16 +152,24 @@ impl PeerManager {
     ) {
         let code = code.into();
         let reason = reason.into();
-        for conn in self.connections.write().await.values_mut() {
-            if conn.relay_server.as_deref() != Some(relay_server) {
-                continue;
+        let cancelled = {
+            let mut cancelled = Vec::new();
+            for conn in self.connections.write().await.values_mut() {
+                if conn.relay_server.as_deref() != Some(relay_server) {
+                    continue;
+                }
+                conn.relay_health
+                    .record_failure(code.clone(), reason.clone());
+                conn.relay_server = None;
+                if conn.state == ConnectionState::Relay {
+                    conn.transition(ConnectionState::FallbackToRelay);
+                }
+                cancelled.push(conn.node_id.clone());
             }
-            conn.relay_health
-                .record_failure(code.clone(), reason.clone());
-            conn.relay_server = None;
-            if conn.state == ConnectionState::Relay {
-                conn.transition(ConnectionState::FallbackToRelay);
-            }
+            cancelled
+        };
+        for node_id in cancelled {
+            self.cancel_relay_backoff_heartbeat(&node_id);
         }
     }
 }

@@ -76,6 +76,28 @@ const STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET: usize = 3_072;
 /// birthday strategy.
 const STABLE_PUBLIC_POOL_MAX_PORTS_PER_IP: usize = 4;
 const REMOTE_SCATTER_POOL_MIN_PUBLIC_PORTS: usize = 16;
+/// The asymmetric stable role must cover EVERY advertised stable public
+/// mapping of the easy peer in the first bounded burst, never only the
+/// top-ranked one.  A multi-socket easy peer may have exactly one live
+/// mapping at any instant (the other socket bindings expire while its pool is
+/// dormant), so locking onto `public.first()` freezes the punch on a stale
+/// port while the live mapping is never probed.
+const ASYMMETRIC_STABLE_MAX_PUBLIC_ENDPOINTS: usize = 4;
+/// Per-plan slice of the wide stable-side unique-target scatter window.
+///
+/// The full `STABLE_WIDE_SCATTER_UNIQUE_TARGET_BUDGET` window is still
+/// reachable, but only rank-by-rank: each plan generates (and persists) at
+/// most this many birthday candidates, the session sends them, and the cursor
+/// advances to the next slice.  This keeps the resident candidate-pair state
+/// bounded to what is actually scanned in one recovery session instead of
+/// persisting 3,072 pairs while the stage caps truncate the real scan.
+const STABLE_SCATTER_PLAN_SLICE: usize = 512;
+/// Per-plan slice of ordinary per-base birthday windows (non-stable side).
+const BIRTHDAY_PLAN_SLICE: usize = 512;
+/// Hard bound on resident candidate pairs per peer.  The prune path retires
+/// the oldest non-selected pairs (never pairs with success history) whenever
+/// the bound is exceeded, so birthday/predicted state can never balloon.
+const MAX_CANDIDATE_PAIRS_PER_PEER: usize = 640;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
 const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);

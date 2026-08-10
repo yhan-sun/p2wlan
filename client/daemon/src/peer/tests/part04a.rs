@@ -64,9 +64,16 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
                 && target.ip() == stable_endpoint.ip()
         })
         .count();
+    // The wide window is generated in bounded per-plan slices: the expected
+    // set mirrors the sliced budget exactly.
+    let sliced_budget = birthday_budget.min(
+        BIRTHDAY_PLAN_SLICE.saturating_sub(
+            [stable_endpoint, second_observed].len(),
+        ),
+    );
     let expected_birthday_count = birthday_probe_endpoints_for_bases(
         &[stable_endpoint, second_observed],
-        birthday_budget,
+        sliced_budget,
     )
     .into_iter()
     .filter(|target| *target != stable_endpoint && *target != second_observed)

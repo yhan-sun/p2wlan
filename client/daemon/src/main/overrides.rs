@@ -110,6 +110,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.no_host_candidates {
         config.network.gather_host_candidates = false;
     }
+    if cli.validate_overlay {
+        config.network.validate_overlay = true;
+    }
     if let Some(ref name) = cli.device_name {
         config.node.device_name = name.clone();
     }

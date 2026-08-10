@@ -73,6 +73,7 @@ impl PeerManager {
         // connection map, so awaiting it while holding the write guard would
         // deadlock.
         let mut unquarantine_after_lock: Option<&'static str> = None;
+        let mut cancel_heartbeat_after_lock = false;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -111,6 +112,7 @@ impl PeerManager {
         }
         if public_key_changed {
             conn.reset_for_identity_change();
+            cancel_heartbeat_after_lock = true;
         }
         // The remote fresh-prediction space is bound to the peer's identity
         // (public key): a rejoin with a NEW key — including a PeerLeft
@@ -171,6 +173,7 @@ impl PeerManager {
         if !info.online {
             conn.transition(ConnectionState::Closed);
             conn.relay_server = None;
+            cancel_heartbeat_after_lock = true;
             conn.probe_session_id = None;
             conn.probe_ephemeral_shared = None;
             conn.probe_binding_token = None;
@@ -199,6 +202,9 @@ impl PeerManager {
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
         drop(conns);
         drop(ip_map);
+        if cancel_heartbeat_after_lock {
+            self.cancel_relay_backoff_heartbeat(&info.node_id);
+        }
         if let Some(reason) = unquarantine_after_lock {
             self.unquarantine_peer(&info.node_id, reason).await;
         }
@@ -224,6 +230,7 @@ impl PeerManager {
             ip_map.remove(&conn.virtual_ip);
         }
         drop(conns);
+        self.cancel_relay_backoff_heartbeat(node_id);
         self.direct_peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -244,8 +251,17 @@ impl PeerManager {
 
     /// Update a peer's connection state.
     pub async fn update_state(&self, node_id: &str, state: ConnectionState) {
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.transition(state);
+        let updated = {
+            let mut conns = self.connections.write().await;
+            if let Some(conn) = conns.get_mut(node_id) {
+                conn.transition(state);
+                true
+            } else {
+                false
+            }
+        };
+        if updated && !matches!(state, ConnectionState::Relay | ConnectionState::FallbackToRelay) {
+            self.cancel_relay_backoff_heartbeat(node_id);
         }
     }
 

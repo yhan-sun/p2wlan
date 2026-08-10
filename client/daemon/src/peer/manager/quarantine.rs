@@ -98,6 +98,7 @@ impl PeerManager {
         {
             hook(peer_id);
         }
+        self.cancel_relay_backoff_heartbeat(peer_id);
 
         if fresh {
             let consecutive = self.quarantine_consecutive(peer_id).await;
@@ -210,6 +211,34 @@ impl PeerManager {
             .punch_cancel_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Register the transport hook that revokes one relay-backoff heartbeat
+    /// owner. The hook must be nonblocking: callers may invoke it immediately
+    /// after releasing a peer-manager lock, and the transport only signals a
+    /// cancellation channel plus removes its owner lease.
+    pub(crate) fn set_relay_backoff_heartbeat_cancel_hook(
+        &self,
+        hook: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        *self
+            .relay_backoff_heartbeat_cancel_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Revoke the current heartbeat owner for a peer, if a transport has
+    /// registered one. Owner cleanup is conditional in the transport, so an
+    /// old worker that is still unwinding cannot remove a replacement owner.
+    pub(crate) fn cancel_relay_backoff_heartbeat(&self, peer_id: &str) {
+        if let Some(hook) = self
+            .relay_backoff_heartbeat_cancel_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(peer_id);
+        }
     }
 }
 

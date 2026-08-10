@@ -129,6 +129,76 @@ impl UdpTransport {
         OutboundProbeAdmission::Accepted
     }
 
+    /// Admit one NAT-state binding maintainer probe.
+    ///
+    /// The maintainer uses its own small per-(peer, socket) budget and never
+    /// touches the recovery-epoch traversal credit or the shared outbound
+    /// probe budgets: keeping bindings warm is not traversal work, and on a
+    /// failing hard-NAT peer it would otherwise exhaust the epoch's whole
+    /// one-time probe credit within minutes, starving the real punches.
+    /// A skipped beat simply repeats at the next maintainer interval.
+    async fn admit_nat_maintainer_probe(&self, peer_id: &str, socket_index: usize) -> bool {
+        let now = Instant::now();
+        let mut budget = self.nat_maintainer_budget.lock().await;
+        budget.retain(|_, sent| {
+            while sent
+                .front()
+                .is_some_and(|sent_at| now.duration_since(*sent_at) >= NAT_MAINTAINER_BUDGET_WINDOW)
+            {
+                sent.pop_front();
+            }
+            !sent.is_empty()
+        });
+        let key = (peer_id.to_string(), socket_index);
+        let sent = budget.entry(key).or_default();
+        if sent.len() >= NAT_MAINTAINER_BUDGET_PER_PEER_SOCKET {
+            return false;
+        }
+        sent.push_back(now);
+        true
+    }
+
+    /// Admit one relay-backoff heartbeat probe.
+    ///
+    /// Heartbeats never consume recovery-epoch credit or the foreground
+    /// per-peer budgets. They do consume a process-wide low-priority reserve,
+    /// keyed by actual remote IP and peer, so socket-pool/target multiplication
+    /// and many relay peers cannot create an unbounded probe storm.
+    async fn admit_relay_backoff_heartbeat_probe(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+    ) -> bool {
+        let local_busy = {
+            let budget = self.outbound_probe_budget.lock().await;
+            budget
+                .get(&OutboundProbeBudgetKey::Network)
+                .map_or(0, VecDeque::len)
+                >= OUTBOUND_PROBE_BUDGET_PER_NETWORK
+                    .saturating_sub(RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE)
+        };
+        if local_busy {
+            return false;
+        }
+        if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
+            if global_budget.foreground_burst_active().await {
+                return false;
+            }
+        }
+        // A legacy-compatible peer receives both the authenticated probe and
+        // a PNCH-v1 compatibility datagram. Reserve both before the send so
+        // the aggregate cap is expressed in actual UDP packets, not logical
+        // candidates.
+        let packet_cost = if self.peers.peer_requires_legacy_probe(peer_id).await {
+            2
+        } else {
+            1
+        };
+        self.relay_backoff_heartbeat_budget
+            .admit(peer_id, peer_addr.ip(), packet_cost)
+            .await
+    }
+
     fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
         // A converged Direct peer needs no outbound peer-reflexive signal: the
         // relayed HTTP signal and the fast punch would only re-create
@@ -287,6 +357,22 @@ impl UdpTransport {
         .await
     }
 
+    async fn send_heartbeat_probe_from_socket(
+        &self,
+        socket_index: usize,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+    ) -> Result<ProbeNonce> {
+        self.send_probe_from_socket_with_nomination(
+            socket_index,
+            Some(peer_id),
+            peer_addr,
+            false,
+            PendingProbePurpose::RelayBackoffHeartbeat,
+        )
+        .await
+    }
+
     async fn send_probe_from_socket_with_nomination(
         &self,
         socket_index: usize,
@@ -408,6 +494,7 @@ impl UdpTransport {
             None => true,
         };
         let should_retransmit = use_candidate || purpose == PendingProbePurpose::ConsentCheck;
+        let heartbeat_probe = purpose == PendingProbePurpose::RelayBackoffHeartbeat;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
             (Some(peer_id), Some(local_node_id))
                 if local_node_id.len() <= u8::MAX as usize && peer_id.len() <= u8::MAX as usize =>
@@ -546,6 +633,14 @@ impl UdpTransport {
 
         self.update_socket_diagnostics(socket_index, |metrics| metrics.probes_sent += 1)
             .await;
+        if heartbeat_probe {
+            self.update_socket_diagnostics(socket_index, |metrics| {
+                metrics.relay_backoff_heartbeat_probes_sent = metrics
+                    .relay_backoff_heartbeat_probes_sent
+                    .saturating_add(1);
+            })
+            .await;
+        }
 
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
             match socket.send_to(&legacy_probe, peer_addr).await {
@@ -554,6 +649,14 @@ impl UdpTransport {
                         metrics.probes_sent += 1
                     })
                     .await;
+                    if heartbeat_probe {
+                        self.update_socket_diagnostics(socket_index, |metrics| {
+                            metrics.relay_backoff_heartbeat_probes_sent = metrics
+                                .relay_backoff_heartbeat_probes_sent
+                                .saturating_add(1);
+                        })
+                        .await;
+                    }
                     trace!(
                         "Sent compatibility legacy UDP punch probe to peer {} at {}",
                         peer_id.unwrap_or("unknown"),

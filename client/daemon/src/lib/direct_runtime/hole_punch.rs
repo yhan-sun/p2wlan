@@ -408,6 +408,13 @@ async fn spawn_hole_punch_task(
                 ),
             )
             .await;
+        // A multi-socket peer may probe ANY of our advertised socket-pool
+        // mappings: temporarily activate the pool so every socket sends
+        // peer-directed probes and every advertised mapping stays alive for
+        // the peer's first punch (see `peer_needs_local_socket_pool`).
+        if peers.peer_needs_local_socket_pool(&peer_id).await {
+            udp.set_socket_pool_active(true);
+        }
         if let Some(plan) = birthday_plan.as_ref() {
             peers
                 .record_birthday_probe_plan_started(&peer_id, plan)
@@ -423,6 +430,11 @@ async fn spawn_hole_punch_task(
             )
             .await;
         }
+        // The relay-backed heartbeat keeps the direct punch windows warm at a
+        // low sustained rate for as long as the relay carries the data plane,
+        // independent of the recovery epoch's one-time credit/plan quotas.
+        udp.spawn_relay_backoff_heartbeat(&peer_id, RELAY_BACKOFF_HEARTBEAT_INTERVAL)
+            .await;
 
         let success_count_before = peers
             .direct_probe_success_count_for_generation(&peer_id, generation)

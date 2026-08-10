@@ -15,3 +15,4 @@ include!("tests/part08.rs");
 include!("tests/part09.rs");
 include!("tests/part10.rs");
 include!("tests/part11.rs");
+include!("tests/part12.rs");

@@ -42,6 +42,7 @@ fn predicted_candidates_probe_in_signal_rank_order_not_port_order() {
         &history,
         None,
         ProbeTargetMode::Synchronized,
+        None,
     );
     assert_eq!(endpoints.len(), 3);
     assert_eq!(
@@ -99,6 +100,7 @@ fn explicit_predicted_window_defers_birthday_fallback() {
         &history,
         Some(&birthday_profile),
         ProbeTargetMode::Synchronized,
+        None,
     );
     assert!(
         plan.is_none(),
@@ -120,6 +122,7 @@ fn explicit_predicted_window_defers_birthday_fallback() {
         &history,
         Some(&birthday_profile),
         ProbeTargetMode::Synchronized,
+        None,
     );
     assert!(!endpoints.is_empty());
     assert!(

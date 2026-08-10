@@ -81,6 +81,26 @@ pub(crate) const RECOVERY_EPOCH_HTTP_PUBLISHES: u32 = 8;
 /// candidate-driven, so churn can never reset the budget.
 pub(crate) const RECOVERY_EPOCH_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// Bounded re-opens of a frozen/exhausted epoch driven by NEW authenticated
+/// evidence (an inbound authenticated punch, a peer-reflexive observation, a
+/// matched ACK already has its own unfreeze path).  Each re-open grants a
+/// small retry allowance so the evidence can actually be acted on, but the
+/// per-epoch cap keeps repeated evidence from turning into an endless
+/// re-planning loop.
+pub(crate) const RECOVERY_EPOCH_MAX_EVIDENCE_REOPENS: u32 = 8;
+
+/// Probe credit granted by one evidence-driven re-open: enough for one
+/// targeted retry of the stable socket-pool mappings (3-4 endpoints x a few
+/// attempts plus the triggered check), never a full-epoch refill.
+pub(crate) const RECOVERY_EVIDENCE_RETRY_CREDIT: u32 = 96;
+
+/// Plan builds regranted by one evidence-driven re-open (one plan for the
+/// retry plus one for the stage follow-up).
+pub(crate) const RECOVERY_EVIDENCE_REGRANT_PLAN_BUILDS: u32 = 2;
+
+/// Sessions regranted by one evidence-driven re-open.
+pub(crate) const RECOVERY_EVIDENCE_REGRANT_SESSIONS: u32 = 1;
+
 /// Per-stage probe ceilings (the stage target construction enforces these in
 /// addition to the epoch credit).
 pub(crate) const RECOVERY_STAGE_INITIAL_MAX_PROBES: u32 = 96;
@@ -219,6 +239,16 @@ pub(crate) struct RecoveryEpochState {
     /// exponential backoff.
     pub zero_send_streak: u32,
     pub last_budget_exhausted_at: Option<Instant>,
+    /// Number of bounded evidence-driven re-opens spent this epoch.  New
+    /// authenticated evidence (inbound punch, peer-reflexive observation)
+    /// can re-open a frozen epoch this many times; after the cap, the epoch
+    /// stays frozen until its backoff/age rotation.
+    pub evidence_reopens: u32,
+    /// The last quota-exhausted event stage reported for this epoch
+    /// (`plan_build` / `session`).  Used to deduplicate the per-tick
+    /// `recovery_plan_build_quota_exhausted` / `recovery_session_quota_exhausted`
+    /// events so a frozen epoch does not log them once per second.
+    pub last_quota_event: Option<String>,
     /// Structured summary of the last budget-exhausted session (counts only,
     /// no sensitive content), surfaced once per freeze instead of once per
     /// rejected probe.
@@ -261,6 +291,8 @@ impl RecoveryEpochState {
             budget_backoff_until: None,
             zero_send_streak: 0,
             last_budget_exhausted_at: None,
+            evidence_reopens: 0,
+            last_quota_event: None,
             last_budget_event: None,
         }
     }
@@ -715,6 +747,103 @@ impl PeerManager {
                 state.epoch,
             );
         }
+    }
+
+    /// Re-open a frozen or quota-exhausted recovery epoch on NEW
+    /// authenticated evidence.
+    ///
+    /// A matched ACK already unfreezes through [`Self::recovery_unfreeze_on_ack`].
+    /// This is the bounded re-open for the other authoritative live-path
+    /// signals: an inbound authenticated punch, a new authenticated
+    /// peer-reflexive observation, or real candidate change.  Without it, a
+    /// peer whose epoch froze after the maintainer/sweep burned its budget
+    /// stays unable to retry for the whole 30-minute epoch even when the
+    /// peer is actively punching us right now.
+    ///
+    /// Each re-open:
+    /// - unfreezes the epoch and clears the budget backoff,
+    /// - grants a small retry allowance (probe credit, plan builds,
+    ///   sessions) so the retry can actually run,
+    /// - resets the stage to Initial so the retry is compact,
+    /// - is counted and capped at [`RECOVERY_EPOCH_MAX_EVIDENCE_REOPENS`]
+    ///   per epoch so evidence cannot churn re-plans endlessly.
+    ///
+    /// Re-opens never refill a healthy epoch: when nothing is frozen or
+    /// exhausted, this is a no-op.
+    pub(crate) async fn recovery_reopen_on_evidence(&self, peer_id: &str, reason: &str) {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return;
+        };
+        let frozen = state.budget_exhausted;
+        let credit_empty = state.epoch_probe_credit_remaining == 0;
+        let plans_empty = state.epoch_plan_builds_remaining == 0;
+        let sessions_empty = state.epoch_sessions_remaining == 0;
+        if !frozen && !credit_empty && !plans_empty && !sessions_empty {
+            return;
+        }
+        if state.evidence_reopens >= RECOVERY_EPOCH_MAX_EVIDENCE_REOPENS {
+            debug!(
+                event = "recovery_evidence_reopen_capped",
+                peer_id = %peer_id,
+                epoch = state.epoch,
+                "recovery evidence re-open capped: epoch {} already used its {RECOVERY_EPOCH_MAX_EVIDENCE_REOPENS} evidence re-opens",
+                state.epoch,
+            );
+            return;
+        }
+        state.evidence_reopens = state.evidence_reopens.saturating_add(1);
+        state.budget_exhausted = false;
+        state.budget_backoff_until = None;
+        state.zero_send_streak = 0;
+        state.epoch_probe_credit_remaining = state
+            .epoch_probe_credit_remaining
+            .max(RECOVERY_EVIDENCE_RETRY_CREDIT);
+        state.epoch_plan_builds_remaining = state
+            .epoch_plan_builds_remaining
+            .max(RECOVERY_EVIDENCE_REGRANT_PLAN_BUILDS);
+        state.epoch_sessions_remaining = state
+            .epoch_sessions_remaining
+            .max(RECOVERY_EVIDENCE_REGRANT_SESSIONS);
+        // A live-path signal means a compact retry is the right next plan.
+        if state.stage != RecoveryStage::Initial {
+            state.stage = RecoveryStage::Initial;
+            state.stage_started_at = Instant::now();
+        }
+        // Quota-exhausted events may be reported again after the re-open.
+        state.last_quota_event = None;
+        info!(
+            event = "recovery_budget_reopened",
+            peer_id = %peer_id,
+            epoch = state.epoch,
+            reason = %reason,
+            evidence_reopens = state.evidence_reopens,
+            "recovery_budget_reopened peer_id={} epoch={} reason={} evidence_reopens={}",
+            peer_id,
+            state.epoch,
+            reason,
+            state.evidence_reopens,
+        );
+    }
+
+    /// Whether a quota-exhausted event for `stage` should be surfaced for
+    /// this peer's epoch.  Returns `true` only the first time per epoch (or
+    /// after an evidence re-open cleared the marker), so a frozen epoch
+    /// cannot emit `recovery_plan_build_quota_exhausted` once per second.
+    pub(crate) async fn recovery_quota_event_report_due(
+        &self,
+        peer_id: &str,
+        stage: &str,
+    ) -> bool {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return false;
+        };
+        if state.last_quota_event.as_deref() == Some(stage) {
+            return false;
+        }
+        state.last_quota_event = Some(stage.to_string());
+        true
     }
 
     /// Record a zero-send probe session as an observable verdict.
