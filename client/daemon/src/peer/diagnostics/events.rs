@@ -40,6 +40,26 @@ impl From<&PathSelectionEvent> for PathSelectionEventDiagnostics {
 pub struct DirectTraversalEventDiagnostics {
     pub age_ms: u64,
     pub network_generation: u64,
+    /// Daemon-local encrypted validation worker owner, when this event belongs
+    /// to a validation lifecycle.  It is intentionally separate from the
+    /// signaling probe session ID: the owner is the token the encrypted
+    /// request/ACK exchange must match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_session_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_validation_owner: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_ack_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_endpoint_authenticated: Option<bool>,
     pub stage: String,
     pub endpoint: Option<String>,
     pub candidate_count: Option<usize>,
@@ -56,6 +76,16 @@ impl From<&DirectTraversalEvent> for DirectTraversalEventDiagnostics {
         Self {
             age_ms: duration_millis(event.recorded_at.elapsed()),
             network_generation: event.network_generation,
+            validation_session_id: event.validation_session_id,
+            remote_validation_owner: event.remote_validation_owner,
+            request_id: event.request_id,
+            socket_index: event.socket_index,
+            expected_endpoint: event.expected_endpoint.map(|endpoint| endpoint.to_string()),
+            observed_ack_endpoint: event
+                .observed_ack_endpoint
+                .map(|endpoint| endpoint.to_string()),
+            selected_endpoint: event.selected_endpoint.map(|endpoint| endpoint.to_string()),
+            ack_endpoint_authenticated: event.ack_endpoint_authenticated,
             stage: event.stage.clone(),
             endpoint: event.endpoint.map(|endpoint| endpoint.to_string()),
             candidate_count: event.candidate_count,

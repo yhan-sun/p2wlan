@@ -323,13 +323,38 @@ pub(crate) enum DirectValidationSessionStart {
 
 /// The token a daemon-internal direct-validation ACK must carry to confirm a
 /// request this daemon sent.
-#[derive(Debug, Clone, Copy)]
+///
+/// The expectation owns the send lease of the exact socket that carried the
+/// request.  The lease is acquired in the same critical section that resolves
+/// the sending socket (see `UdpTransport::prepare_direct_validation_send`), so
+/// a dynamic socket detach or affinity switch can never separate the socket
+/// the ACK arrives on from the socket the request actually left on: the ACK
+/// handler consumes this expectation on the receiving socket's index, and the
+/// lease keeps that socket's reader alive until the ACK, a cancellation, a
+/// timeout or a generation invalidation releases it.
+///
+/// Not `Clone`: the lease is moved exactly once and every release is paired
+/// with the single acquire inside the prepare path.
+#[derive(Debug)]
 pub(crate) struct DirectValidationExpectation {
     pub(crate) request_id: u16,
     pub(crate) generation: u64,
     /// The validation worker that registered this request.  Conditional
     /// cleanup prevents an old worker from deleting a newer worker's slot.
     pub(crate) owner_token: u64,
+    /// Exact direct tuple used by the owned request.  Peer/generation matching
+    /// alone cannot distinguish a retired socket or a stale endpoint.
+    pub(crate) endpoint: Option<SocketAddr>,
+    /// Index of the UDP socket that actually sent the request.  The ACK's
+    /// receive socket must match it exactly.
+    pub(crate) socket_index: Option<usize>,
+    /// Send lease of the resolved socket.  Holding it through the ACK wait
+    /// guarantees the socket's reader stays alive even when the socket is
+    /// detached right after the send, so a legitimate ACK can still be
+    /// matched.  Released when the expectation is consumed, cleared, expired
+    /// or removed by owner cancellation.
+    #[allow(dead_code)]
+    pub(crate) lease: Option<DynamicSocketSendLease>,
     pub(crate) expires_at: Instant,
 }
 
@@ -996,6 +1021,9 @@ struct PendingProbe {
     local_endpoint: Option<SocketAddr>,
     socket_index: usize,
     generation: u64,
+    /// Active Probe session at send time. It binds receive diagnostics to the
+    /// same handshake generation without changing protocol matching rules.
+    probe_session_id: Option<String>,
     peer_id: Option<String>,
     purpose: PendingProbePurpose,
     accepts_authenticated_ack: bool,
@@ -1057,10 +1085,20 @@ impl PunchSocketPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PunchSendReport {
     pub packets_sent: u32,
     pub unique_target_endpoints: u32,
+    /// Wall-clock UNIX milliseconds captured immediately after the first
+    /// successful kernel UDP send in this punch session.  `None` means the
+    /// session emitted no datagram; dispatch timestamps must never be used as
+    /// a substitute for this field.
+    pub first_send_at_ms: Option<u64>,
+    /// Physical datagrams accepted by the kernel, grouped by the actual
+    /// socket index used for each send.  Legacy compatibility copies count as
+    /// separate datagrams here even though `packets_sent` remains the logical
+    /// probe count for recovery accounting.
+    pub per_socket_sent: Vec<(usize, u32)>,
     /// How many candidate probes were rejected by the admission layer
     /// (rate limits, epoch credit, quarantine) during this session.
     pub budget_skipped: u32,
@@ -1084,6 +1122,22 @@ pub struct UdpProbeRxSnapshot {
     pub legacy_probe_acks_unmatched: u64,
     pub probe_acks_received: u64,
 }
+
+/// Bounded, authenticated receive counters scoped to one remote peer, local
+/// network generation and Probe session. Socket-pool diagnostics intentionally
+/// remain topology-free and aggregate; recovery timeout diagnostics must
+/// instead use this map so traffic for peer B or an older peer-A handshake
+/// cannot be presented as current peer-A ACK evidence.
+type PeerProbeRxDiagnostics =
+    Arc<Mutex<HashMap<(String, u64, Option<String>), PeerProbeRxEntry>>>;
+
+struct PeerProbeRxEntry {
+    snapshot: UdpProbeRxSnapshot,
+    last_updated: Instant,
+}
+
+const PEER_PROBE_RX_DIAGNOSTICS_MAX_ENTRIES: usize = 512;
+const PEER_PROBE_RX_DIAGNOSTICS_RETENTION: Duration = Duration::from_secs(90);
 
 impl UdpProbeRxSnapshot {
     pub fn delta_since(self, earlier: Self) -> Self {

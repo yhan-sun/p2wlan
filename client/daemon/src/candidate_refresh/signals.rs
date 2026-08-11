@@ -230,6 +230,7 @@ pub(super) fn truncate_signal_candidates(
     candidate_sources: &mut HashMap<String, String>,
 ) {
     if candidates.len() > MAX_SIGNAL_CANDIDATES {
+        let original_candidate_count = candidates.len();
         let original_order = candidates
             .iter()
             .enumerate()
@@ -248,10 +249,9 @@ pub(super) fn truncate_signal_candidates(
             .collect::<Vec<_>>();
         retained_lan_hosts.sort();
         retained_lan_hosts.truncate(MAX_SIGNAL_LAN_HOST_CANDIDATES);
-        let retained_lan_host_set = retained_lan_hosts.iter().cloned().collect::<HashSet<_>>();
 
         // Fresh-mapping prediction windows are time-sensitive: reserve their
-        // whole window (bounded by the model's MAX_PREDICTED_PORTS) so a full
+        // whole window (bounded by the model's widest window) so a full
         // ordinary candidate set cannot crowd them out.  The window keeps its
         // sender order (top-1 first, then the successor window).
         let fresh_window = candidates
@@ -267,6 +267,11 @@ pub(super) fn truncate_signal_candidates(
             .collect::<Vec<_>>();
         let fresh_window_set = fresh_window.iter().cloned().collect::<HashSet<_>>();
         let fresh_budget = fresh_window.len();
+        // The reservations share one signaling budget: a full fresh window may
+        // consume the whole budget, in which case LAN hosts must yield before
+        // ordinary candidates.  Never emit more than MAX_SIGNAL_CANDIDATES.
+        retained_lan_hosts.truncate(MAX_SIGNAL_CANDIDATES.saturating_sub(fresh_budget));
+        let retained_lan_host_set = retained_lan_hosts.iter().cloned().collect::<HashSet<_>>();
 
         let mut others = candidates
             .iter()
@@ -275,17 +280,6 @@ pub(super) fn truncate_signal_candidates(
             })
             .cloned()
             .collect::<Vec<_>>();
-        // The truncation warning is deduplicated by the canonical content of
-        // the truncated set: the same 98→96 refresh must not log per cycle.
-        let truncation_dedup = truncation_reporter();
-        let canonical_hash = canonical_candidate_set_hash(candidates, candidate_sources);
-        if truncation_dedup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).report(canonical_hash) {
-            warn!(
-                "Truncating {} gathered UDP candidates to the signaling limit of {} (canonical set hash={canonical_hash})",
-                candidates.len(),
-                MAX_SIGNAL_CANDIDATES
-            );
-        }
         let public_budget = MAX_SIGNAL_CANDIDATES
             .saturating_sub(fresh_budget)
             .saturating_sub(retained_lan_hosts.len());
@@ -303,6 +297,23 @@ pub(super) fn truncate_signal_candidates(
         retained.extend(others);
         retained.extend(retained_lan_hosts);
         *candidates = retained;
+
+        // Deduplicate by the exact retained payload, not the over-limit input.
+        // Different gathered tails that compact to the same 96 candidates must
+        // not keep invalidating the same published snapshot.
+        let truncation_dedup = truncation_reporter();
+        let canonical_hash = canonical_candidate_set_hash(candidates, candidate_sources);
+        if truncation_dedup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .report(canonical_hash)
+        {
+            warn!(
+                "Truncating {} gathered UDP candidates to the signaling limit of {} (retained canonical set hash={canonical_hash})",
+                original_candidate_count,
+                MAX_SIGNAL_CANDIDATES
+            );
+        }
     }
     let retained = candidates.iter().cloned().collect::<HashSet<_>>();
     candidate_sources.retain(|endpoint, _| retained.contains(endpoint));

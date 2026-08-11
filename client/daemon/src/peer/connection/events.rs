@@ -1,5 +1,5 @@
 impl PeerConnection {
-    fn record_path_selection_event(
+    pub(super) fn record_path_selection_event(
         &mut self,
         local_generation: u64,
         selection: &PathSelection,
@@ -202,6 +202,61 @@ impl PeerConnection {
             sent_probes,
             detail,
         ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_direct_event_with_socket(
+        &mut self,
+        local_generation: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        self.push_direct_event(
+            DirectTraversalEvent::new(
+                local_generation,
+                stage,
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+            )
+            .with_socket_index(socket_index),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_direct_validation_event_with_metadata(
+        &mut self,
+        generation: u64,
+        metadata: DirectValidationEventMetadata,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        let mut event = DirectTraversalEvent::new(
+            generation,
+            stage,
+            endpoint,
+            candidate_count,
+            sent_probes,
+            detail,
+        );
+        event.validation_session_id = metadata.local_validation_session_id;
+        event.remote_validation_owner = metadata.remote_validation_owner;
+        event.request_id = metadata.request_id;
+        event.expected_endpoint = metadata.expected_endpoint;
+        event.observed_ack_endpoint = metadata.observed_ack_endpoint;
+        event.selected_endpoint = metadata.selected_endpoint;
+        event.ack_endpoint_authenticated = metadata.ack_endpoint_authenticated;
+        event.socket_index = socket_index;
+        self.push_direct_event(event);
     }
 
     #[allow(clippy::too_many_arguments)]

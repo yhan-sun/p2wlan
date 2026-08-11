@@ -84,6 +84,16 @@ impl PeerDiagnostics {
         traversal_history: Option<&TraversalHistory>,
         fresh_mapping_history: Option<&HashMap<String, VecDeque<FreshMappingPredictionResult>>>,
     ) -> Self {
+        // The connection state and its selected pair are committed under the
+        // same peer lock.  Once that snapshot says confirmed Direct, an older
+        // selector result (usually a Relay decision captured before the ACK)
+        // is stale and must not be allowed to describe the active path.
+        let snapshot_direct_pair = conn.current_direct_pair_for_diagnostics(local_generation, None);
+        let confirmed_direct_snapshot = conn.state == ConnectionState::Direct
+            && snapshot_direct_pair.is_some_and(|pair| {
+                pair.state == CandidatePairState::Selected
+                    && is_public_probe_endpoint(pair.remote_endpoint)
+            });
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
                 Some(NetworkPath::Direct) if selection.direct_confirmed => {
@@ -116,6 +126,9 @@ impl PeerDiagnostics {
                 path => path,
             },
         };
+        if confirmed_direct_snapshot {
+            active_path = Some(NetworkPath::Direct);
+        }
         let selected_pair = conn.selected_candidate_pair_for_diagnostics(local_generation);
         if active_path.is_none()
             && conn.state == ConnectionState::Direct
@@ -128,14 +141,18 @@ impl PeerDiagnostics {
         {
             active_path = Some(NetworkPath::Direct);
         }
-        let current_pair =
-            conn.current_direct_pair_for_diagnostics(local_generation, current_selection);
+        let current_pair = if confirmed_direct_snapshot {
+            snapshot_direct_pair
+        } else {
+            conn.current_direct_pair_for_diagnostics(local_generation, current_selection)
+        };
         let current_pair_endpoint = current_pair.map(|pair| pair.remote_endpoint);
         let consent_endpoint = conn.selected_direct_endpoint_for_consent(local_generation);
-        let direct_selection_confirmed = active_path == Some(NetworkPath::Direct)
+        let direct_selection_confirmed = confirmed_direct_snapshot
+            || (active_path == Some(NetworkPath::Direct)
             && current_selection
                 .map(|selection| selection.direct_confirmed)
-                .unwrap_or(conn.state == ConnectionState::Direct);
+                .unwrap_or(conn.state == ConnectionState::Direct));
         let direct_confirmed = direct_selection_confirmed
             && current_pair.is_some_and(|pair| pair.state == CandidatePairState::Selected);
         let direct_type = classify_candidate_pair_path(active_path, current_pair, direct_confirmed);
@@ -242,11 +259,32 @@ impl PeerDiagnostics {
                 .map(|base| duration_millis(conn.direct_retry_after(base))),
             direct_retry_remaining_ms: direct_retry_after
                 .map(|base| duration_millis(conn.direct_retry_remaining(base))),
-            current_path_selection: current_selection.map(PathSelectionDiagnostics::from),
-            last_path_selection: conn
-                .last_path_selection
-                .as_ref()
-                .map(PathSelectionDiagnostics::from),
+            current_path_selection: if confirmed_direct_snapshot {
+                current_pair.map(|pair| {
+                    PathSelectionDiagnostics::from(&PathSelection::direct(
+                        pair.remote_endpoint,
+                        REASON_PATH_DIRECT_CONFIRMED,
+                        "confirmed Direct snapshot",
+                        true,
+                    ))
+                })
+            } else {
+                current_selection.map(PathSelectionDiagnostics::from)
+            },
+            last_path_selection: if confirmed_direct_snapshot {
+                current_pair.map(|pair| {
+                    PathSelectionDiagnostics::from(&PathSelection::direct(
+                        pair.remote_endpoint,
+                        REASON_PATH_DIRECT_CONFIRMED,
+                        "confirmed Direct snapshot",
+                        true,
+                    ))
+                })
+            } else {
+                conn.last_path_selection
+                    .as_ref()
+                    .map(PathSelectionDiagnostics::from)
+            },
             path_events: conn
                 .path_events
                 .iter()

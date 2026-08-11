@@ -8,6 +8,7 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) local_candidates: Arc<RwLock<Vec<String>>>,
     pub(super) local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     pub(super) local_network_identity: Arc<RwLock<Vec<String>>>,
+    pub(super) candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
     pub(super) candidate_refresh_lock: Arc<Mutex<()>>,
     pub(super) nat_profile: Arc<RwLock<Option<NatProfile>>>,
     pub(super) gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
@@ -108,6 +109,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         local_candidates,
         local_candidate_sources,
         local_network_identity,
+        candidate_snapshot,
         candidate_refresh_lock,
         nat_profile,
         gateway_mapping_runtime,
@@ -148,8 +150,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     "UDP volatile candidate refresh",
                     Some(HolePunchSignalContext {
                         control: control.clone(),
-                        local_candidates: local_candidates.clone(),
-                        local_candidate_sources: local_candidate_sources.clone(),
+                        candidate_snapshot: candidate_snapshot.clone(),
                         stun_servers: stun_servers.clone(),
                         stun_timeout,
                         boot_epoch_ms,
@@ -228,15 +229,25 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             )
             .await;
         }
-        let previous_candidates = local_candidates.read().await.clone();
-        let previous_candidate_sources = local_candidate_sources.read().await.clone();
+        let previous_snapshot = candidate_snapshot.read().await.clone();
+        let previous_candidates = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.candidates.clone())
+            .unwrap_or_default();
+        let previous_candidate_sources = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.candidate_sources.clone())
+            .unwrap_or_default();
         let next_network_identity = prepare_signal_candidates_and_network_identity(
             &previous_candidates,
             &previous_candidate_sources,
             &mut candidates,
             &mut candidate_sources,
         );
-        let previous_network_identity = local_network_identity.read().await.clone();
+        let previous_network_identity = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.network_identity.clone())
+            .unwrap_or_default();
         let should_advance_generation = !previous_network_identity.is_empty()
             && previous_network_identity != next_network_identity;
 
@@ -266,12 +277,19 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             continue;
         }
 
-        {
-            let mut current = local_candidates.write().await;
-            *current = candidates.clone();
-            *local_candidate_sources.write().await = candidate_sources.clone();
-            *local_network_identity.write().await = next_network_identity.clone();
-        }
+        publish_candidate_snapshot_to_store(
+            &candidate_snapshot,
+            candidates.clone(),
+            candidate_sources.clone(),
+            next_network_identity.clone(),
+        )
+        .await;
+        // These mirrors remain for legacy diagnostics and readiness checks;
+        // all coherent candidate/source/identity reads use the committed
+        // snapshot above.
+        *local_candidates.write().await = candidates.clone();
+        *local_candidate_sources.write().await = candidate_sources.clone();
+        *local_network_identity.write().await = next_network_identity.clone();
 
         info!(
             "UDP candidates changed after network update; refreshed {} candidates (mapping={:?}, public={:?}, old_hash={old_hash}, new_hash={new_hash}, changed_reason={change_reason}, old_candidate_count={old_candidate_count}, new_candidate_count={new_candidate_count})",
@@ -361,8 +379,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             "UDP candidate refresh",
             Some(HolePunchSignalContext {
                 control: control.clone(),
-                local_candidates: local_candidates.clone(),
-                local_candidate_sources: local_candidate_sources.clone(),
+                        candidate_snapshot: candidate_snapshot.clone(),
                 stun_servers: stun_servers.clone(),
                 stun_timeout,
                 boot_epoch_ms,
@@ -392,6 +409,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
 
     let attempts = peers.recommended_punch_attempts(attempts).await;
 
+    let fanout_permits = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut fanout_workers = tokio::task::JoinSet::new();
     for (peer_id, peer_info) in control.peers().await {
         if !peer_info.online {
             continue;
@@ -419,37 +438,56 @@ pub(super) async fn publish_local_candidates_to_known_peers(
             );
             continue;
         }
-        let punch_at_ms = Some(relay_assisted_punch_at_ms());
-        if let Err(error) = control
-            .send_peer_offer_with_sources_and_punch_at(
-                &peer_id,
-                candidates,
-                candidate_sources,
-                &[],
+        let Ok(permit) = fanout_permits.clone().acquire_owned().await else {
+            break;
+        };
+        let control = control.clone();
+        let peers = peers.clone();
+        let udp = udp.clone();
+        let punch_deduplicator = punch_deduplicator.clone();
+        let candidates = candidates.to_vec();
+        let candidate_sources = candidate_sources.clone();
+        let signal = signal.clone();
+        let reason = reason.to_string();
+        fanout_workers.spawn(async move {
+            let _permit = permit;
+            let punch_at_ms = Some(relay_assisted_punch_at_ms());
+            if let Err(error) = control
+                .send_peer_offer_with_sources_and_punch_at(
+                    &peer_id,
+                    &candidates,
+                    &candidate_sources,
+                    &[],
+                    punch_at_ms,
+                    None,
+                )
+                .await
+            {
+                warn!("Failed to publish {reason} UDP candidates to peer {peer_id}: {error}");
+                return;
+            }
+
+            debug!(
+                "Published {reason} UDP candidates to peer {peer_id} with punch_at_ms={punch_at_ms:?}"
+            );
+            spawn_hole_punch_task(
+                udp,
+                peers,
+                punch_deduplicator,
+                peer_id,
+                probe_interval,
+                attempts,
                 punch_at_ms,
+                signal,
+                None,
                 None,
             )
-            .await
-        {
-            warn!("Failed to publish {reason} UDP candidates to peer {peer_id}: {error}");
-            continue;
+            .await;
+        });
+    }
+    while let Some(result) = fanout_workers.join_next().await {
+        if let Err(error) = result {
+            debug!(?error, "background candidate fan-out worker stopped");
         }
-
-        debug!(
-            "Published {reason} UDP candidates to peer {peer_id} with punch_at_ms={punch_at_ms:?}"
-        );
-        spawn_hole_punch_task(
-            udp.clone(),
-            peers.clone(),
-            punch_deduplicator.clone(),
-            peer_id,
-            probe_interval,
-            attempts,
-            punch_at_ms,
-            signal.clone(),
-            None,
-            None,
-        )
-        .await;
     }
 }

@@ -6,6 +6,7 @@ struct UdpDirectTaskContext {
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: Arc<RwLock<Vec<String>>>,
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
     candidate_refresh_lock: Arc<Mutex<()>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
@@ -129,6 +130,7 @@ async fn run_udp_direct_instance(
         local_candidates,
         local_candidate_sources: udp_local_candidate_sources,
         local_network_identity,
+        candidate_snapshot,
         candidate_refresh_lock,
         nat_profile,
         gateway_mapping_runtime,
@@ -211,6 +213,7 @@ async fn run_udp_direct_instance(
         control.clone(),
         udp.clone(),
         peers.clone(),
+        punch_deduplicator.clone(),
         peer_reflexive_signal_worker_permits,
         lease.shutdown_receiver(),
     ));
@@ -309,7 +312,6 @@ async fn run_udp_direct_instance(
                 &mut candidate_endpoints,
                 &mut candidate_sources,
             );
-            *local_network_identity.write().await = initial_network_identity;
             // Commit the candidate snapshot BEFORE the endpoint publish and
             // any gateway-mapping discovery.  A congested control lane or a
             // silent SSDP gateway must never delay the local candidate commit
@@ -318,8 +320,16 @@ async fn run_udp_direct_instance(
                 "Prepared {} UDP candidate endpoints for signaling",
                 candidate_endpoints.len()
             );
+            publish_candidate_snapshot_to_store(
+                &candidate_snapshot,
+                candidate_endpoints.clone(),
+                candidate_sources.clone(),
+                initial_network_identity.clone(),
+            )
+            .await;
             *local_candidates.write().await = candidate_endpoints.clone();
             *udp_local_candidate_sources.write().await = candidate_sources.clone();
+            *local_network_identity.write().await = initial_network_identity.clone();
             if upnp_enabled {
                 // Gateway mapping discovery (SSDP/IGD/PCP/NAT-PMP) can take
                 // seconds on gateways without a mapping service.  It must
@@ -329,6 +339,8 @@ async fn run_udp_direct_instance(
                 let local_addr = udp.local_addr().ok();
                 let local_candidates = local_candidates.clone();
                 let local_sources = udp_local_candidate_sources.clone();
+                let candidate_snapshot = candidate_snapshot.clone();
+                let candidate_refresh_lock = candidate_refresh_lock.clone();
                 let runtime = gateway_mapping_runtime.clone();
                 let diagnostics = gateway_mapping_diagnostics.clone();
                 tokio::spawn(async move {
@@ -345,8 +357,12 @@ async fn run_udp_direct_instance(
                     if discovered.is_empty() {
                         return;
                     }
-                    let mut candidates = local_candidates.write().await;
-                    let mut sources = local_sources.write().await;
+                    let _refresh_guard = candidate_refresh_lock.lock().await;
+                    let Some(current) = candidate_snapshot.read().await.clone() else {
+                        return;
+                    };
+                    let mut candidates = current.candidates;
+                    let mut sources = current.candidate_sources;
                     for endpoint in discovered {
                         if !candidates.contains(&endpoint) {
                             candidates.push(endpoint.clone());
@@ -355,6 +371,15 @@ async fn run_udp_direct_instance(
                             sources.insert(endpoint, source.clone());
                         }
                     }
+                    publish_candidate_snapshot_to_store(
+                        &candidate_snapshot,
+                        candidates.clone(),
+                        sources.clone(),
+                        current.network_identity,
+                    )
+                    .await;
+                    *local_candidates.write().await = candidates;
+                    *local_sources.write().await = sources;
                 });
             }
             let mut published_endpoint = None;
@@ -382,28 +407,44 @@ async fn run_udp_direct_instance(
             }
             drop(initial_refresh_guard);
 
-            publish_local_candidates_to_known_peers(
-                &control,
-                peers.clone(),
-                udp.clone(),
-                punch_deduplicator.clone(),
-                &candidate_endpoints,
-                &candidate_sources,
-                udp_punch_interval,
-                udp_punch_attempts,
-                "initial UDP candidates ready",
-                Some(HolePunchSignalContext {
-                    control: control.clone(),
-                    local_candidates: local_candidates.clone(),
-                    local_candidate_sources: udp_local_candidate_sources.clone(),
-                    stun_servers: stun_servers.clone(),
-                    stun_timeout,
-                    boot_epoch_ms,
-                }),
-            )
-            .await;
+            // Candidate-only fan-out is background work.  Starting the UDP
+            // reader and validation workers must not wait behind a serial
+            // control lane servicing a large peer roster; a foreground
+            // handshake can then use the critical offer lane immediately.
+            let initial_publication_worker = tokio::spawn({
+                let control = control.clone();
+                let peers = peers.clone();
+                let udp = udp.clone();
+                let punch_deduplicator = punch_deduplicator.clone();
+                let candidates = candidate_endpoints.clone();
+                let candidate_sources = candidate_sources.clone();
+                let candidate_snapshot = candidate_snapshot.clone();
+                let stun_servers = stun_servers.clone();
+                let signal_control = control.clone();
+                async move {
+                    publish_local_candidates_to_known_peers(
+                        &control,
+                        peers,
+                        udp,
+                        punch_deduplicator,
+                        &candidates,
+                        &candidate_sources,
+                        udp_punch_interval,
+                        udp_punch_attempts,
+                        "initial UDP candidates ready",
+                        Some(HolePunchSignalContext {
+                            control: signal_control,
+                            candidate_snapshot: candidate_snapshot.clone(),
+                            stun_servers,
+                            stun_timeout,
+                            boot_epoch_ms,
+                        }),
+                    )
+                    .await;
+                }
+            });
 
-            if keepalive_interval.is_zero() {
+            let outcome = if keepalive_interval.is_zero() {
                 let refresh_udp = udp.clone();
                 tokio::select! {
                     result = udp.clone().run_inbound(udp_inbound_tx) => result,
@@ -414,9 +455,10 @@ async fn run_udp_direct_instance(
                         udp_advertise,
                         upnp_enabled,
                         published_endpoint,
-                        local_candidates,
-                        local_candidate_sources: udp_local_candidate_sources.clone(),
-                        local_network_identity: local_network_identity.clone(),
+                         local_candidates,
+                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                         local_network_identity: local_network_identity.clone(),
+                         candidate_snapshot: candidate_snapshot.clone(),
                         candidate_refresh_lock: candidate_refresh_lock.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
@@ -443,9 +485,10 @@ async fn run_udp_direct_instance(
                         udp_advertise,
                         upnp_enabled,
                         published_endpoint,
-                        local_candidates,
-                        local_candidate_sources: udp_local_candidate_sources.clone(),
-                        local_network_identity: local_network_identity.clone(),
+                         local_candidates,
+                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                         local_network_identity: local_network_identity.clone(),
+                         candidate_snapshot: candidate_snapshot.clone(),
                         candidate_refresh_lock: candidate_refresh_lock.clone(),
                         nat_profile,
                         gateway_mapping_runtime,
@@ -460,6 +503,10 @@ async fn run_udp_direct_instance(
                     _ = wait_for_udp_direct_stop(shutdown_rx.clone(), lease.shutdown_receiver()) => Ok(()),
                 }
             }
+            ;
+            initial_publication_worker.abort();
+            let _ = initial_publication_worker.await;
+            outcome
     } else {
         Ok(())
     };
@@ -591,11 +638,12 @@ async fn run_peer_reflexive_signal_loop_until_cancelled(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     worker_permits: Arc<tokio::sync::Semaphore>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::select! {
-        _ = run_peer_reflexive_signal_loop(ingress, control, udp, peers, worker_permits) => {},
+        _ = run_peer_reflexive_signal_loop(ingress, control, udp, peers, punch_deduplicator, worker_permits) => {},
         _ = wait_for_udp_direct_shutdown(shutdown_rx) => {},
     }
 }
@@ -630,6 +678,7 @@ mod udp_direct_tests {
             local_candidates: daemon.local_candidates.clone(),
             local_candidate_sources: daemon.local_candidate_sources.clone(),
             local_network_identity: daemon.local_network_identity.clone(),
+            candidate_snapshot: daemon.candidate_snapshot.clone(),
             candidate_refresh_lock: daemon.candidate_refresh_lock.clone(),
             nat_profile: daemon.nat_profile.clone(),
             gateway_mapping_runtime: daemon.gateway_mapping_runtime.clone(),

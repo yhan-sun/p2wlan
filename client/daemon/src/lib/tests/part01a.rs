@@ -47,39 +47,65 @@ fn only_applied_candidate_only_signals_start_synchronized_punch() {
 }
 
 #[tokio::test]
-async fn candidate_snapshot_reader_waits_for_atomic_refresh_commit() {
-    let daemon = Arc::new(Daemon::new(
+async fn candidate_snapshot_reader_observes_only_committed_tuple() {
+    let daemon = Daemon::new(
         Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
-    ));
-    let (candidate_written_tx, candidate_written_rx) = tokio::sync::oneshot::channel();
-    let (finish_commit_tx, finish_commit_rx) = tokio::sync::oneshot::channel();
+    );
+    let candidates = vec!["192.168.1.20:40000".to_string()];
+    let sources = HashMap::from([("192.168.1.20:40000".to_string(), "host".to_string())]);
+    daemon
+        .publish_candidate_snapshot(
+            candidates.clone(),
+            sources.clone(),
+            vec!["host:192.168.1.20".to_string()],
+        )
+        .await;
 
-    let writer_daemon = daemon.clone();
-    let writer = tokio::spawn(async move {
-        let _guard = writer_daemon.candidate_refresh_lock.lock().await;
-        *writer_daemon.local_candidates.write().await = vec!["192.168.1.20:40000".to_string()];
-        let _ = candidate_written_tx.send(());
-        let _ = finish_commit_rx.await;
-        *writer_daemon.local_candidate_sources.write().await = HashMap::from([(
-            "192.168.1.20:40000".to_string(),
-            "host".to_string(),
-        )]);
-        *writer_daemon.local_network_identity.write().await =
-            vec!["host:192.168.1.20".to_string()];
-    });
+    let (read_candidates, read_sources) = daemon.current_local_candidate_set().await;
+    assert_eq!(read_candidates, candidates);
+    assert_eq!(read_sources, sources);
+    let snapshot = daemon.cached_candidate_snapshot().await.unwrap();
+    assert_eq!(snapshot.network_identity, vec!["host:192.168.1.20".to_string()]);
+    assert_eq!(snapshot.hash, candidate_set_hash(&read_candidates, &read_sources));
+}
 
-    candidate_written_rx.await.unwrap();
-    let reader_daemon = daemon.clone();
-    let mut reader = tokio::spawn(async move { reader_daemon.current_local_candidate_set().await });
-    assert!(tokio::time::timeout(Duration::from_millis(20), &mut reader)
+#[tokio::test]
+async fn peer_reflexive_candidate_refreshes_the_committed_snapshot() {
+    let daemon = Daemon::new(
+        Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
+    );
+    let initial = vec!["198.51.100.10:40000".to_string()];
+    let initial_sources = HashMap::from([(
+        initial[0].clone(),
+        "stun_observed".to_string(),
+    )]);
+    daemon
+        .publish_candidate_snapshot(
+            initial.clone(),
+            initial_sources.clone(),
+            vec!["public:198.51.100.10".to_string()],
+        )
+        .await;
+
+    assert!(daemon.add_local_peer_reflexive_candidate("198.51.100.11:40001").await);
+
+    let snapshot = daemon
+        .cached_candidate_snapshot()
         .await
-        .is_err());
-    let _ = finish_commit_tx.send(());
-    writer.await.unwrap();
-
-    let (candidates, sources) = reader.await.unwrap();
-    assert_eq!(candidates, vec!["192.168.1.20:40000".to_string()]);
-    assert_eq!(sources.get("192.168.1.20:40000").map(String::as_str), Some("host"));
+        .expect("peer-reflexive update must publish a new snapshot");
+    assert!(snapshot
+        .candidates
+        .contains(&"198.51.100.11:40001".to_string()));
+    assert_eq!(
+        snapshot
+            .candidate_sources
+            .get("198.51.100.11:40001")
+            .map(String::as_str),
+        Some("peer_reflexive")
+    );
+    assert_eq!(snapshot.network_identity, vec!["public:198.51.100.10".to_string()]);
+    assert!(snapshot.version > 1, "the update must advance snapshot version");
+    assert_ne!(snapshot.hash, candidate_set_hash(&initial, &initial_sources));
 }
 
 #[tokio::test]
@@ -120,6 +146,135 @@ async fn punch_attempt_deduplicator_lets_synchronized_punch_override_background(
     assert_eq!(deduplicator.active_session_count(), 1);
     drop(synchronized);
     assert_eq!(deduplicator.active_session_count(), 0);
+}
+
+#[tokio::test]
+async fn same_epoch_candidate_refresh_preserves_scheduled_rendezvous_permit() {
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let scheduled_at = unix_time_millis() + 600;
+    let first = match deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            17,
+            3,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(scheduled_at),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(permit) => permit,
+        RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+    };
+
+    // A same-generation ordinary offer/candidate refresh is useful input, but
+    // must never cancel and re-clock the already synchronized first window.
+    let refresh = deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            17,
+            3,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(scheduled_at + 400),
+        )
+        .await;
+    let RendezvousPunchClaim::Deferred(deferred) = refresh else {
+        panic!("same epoch refresh must merge into the active rendezvous");
+    };
+    assert_eq!(deferred.reason, PunchClaimDeferredReason::SameEpochActive);
+    assert_eq!(deferred.active_session_id, first.session_id());
+    assert_eq!(deferred.active_network_generation, 17);
+    assert_eq!(deferred.active_epoch, 3);
+    assert_eq!(deferred.active_punch_at_ms, Some(scheduled_at));
+    assert!(
+        !first.is_cancelled(),
+        "same epoch candidate refresh must preserve the scheduled first window"
+    );
+}
+
+#[tokio::test]
+async fn fresh_prediction_inside_rendezvous_lead_preserves_first_window() {
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let scheduled_at = unix_time_millis() + RELAY_ASSISTED_PUNCH_LEAD.as_millis() as u64;
+    let first = match deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            17,
+            3,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(scheduled_at),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(permit) => permit,
+        RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+    };
+    let fresh_id = FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 42,
+    };
+
+    let fresh = deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            17,
+            3,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            Some(fresh_id),
+            Some(scheduled_at + 400),
+        )
+        .await;
+    let RendezvousPunchClaim::Deferred(deferred) = fresh else {
+        panic!("fresh prediction inside the lead must defer behind first send");
+    };
+    assert_eq!(
+        deferred.reason,
+        PunchClaimDeferredReason::RendezvousLeadProtected
+    );
+    assert_eq!(deferred.active_session_id, first.session_id());
+    assert!(
+        !first.is_cancelled(),
+        "fresh prediction must not cancel a first rendezvous in its lead window"
+    );
+}
+
+#[tokio::test]
+async fn generation_change_can_replace_protected_rendezvous_with_reason() {
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let scheduled_at = unix_time_millis() + RELAY_ASSISTED_PUNCH_LEAD.as_millis() as u64;
+    let first = match deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            17,
+            3,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(scheduled_at),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(permit) => permit,
+        RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+    };
+
+    let replacement = deduplicator
+        .claim_for_epoch_with_rendezvous(
+            "peer-a",
+            18,
+            4,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(scheduled_at + 400),
+        )
+        .await;
+    assert!(matches!(replacement, RendezvousPunchClaim::Claimed(_)));
+    assert!(first.is_cancelled(), "new network generation must replace old plan");
+    assert_eq!(
+        first.cancellation_reason(),
+        Some(PunchCancellationReason::NetworkGenerationChanged)
+    );
 }
 
 #[tokio::test]
@@ -420,10 +575,27 @@ async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_sessio
         .is_some_and(|data| data.starts_with(DIRECT_VALIDATION_REQUEST_PAYLOAD)));
 
     let diagnostics = peers.diagnostics().await;
+    let validation_session_id = diagnostics[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "direct_validation_started")
+        .and_then(|event| event.validation_session_id);
+    assert!(validation_session_id.is_some(), "validation start must expose its owner session");
+    assert!(diagnostics[0].direct_events.iter().any(|event| {
+        event.stage == "direct_validation_request_sent"
+            && event.network_generation == 0
+            && event.validation_session_id == validation_session_id
+    }));
     assert!(diagnostics[0]
         .direct_events
         .iter()
         .any(|event| event.stage == "encrypted_trial_sent" && event.sent_probes == Some(3)));
+    assert!(diagnostics[0].direct_events.iter().any(|event| {
+        event.stage == "direct_validation_timed_out"
+            && event.network_generation == 0
+            && event.validation_session_id == validation_session_id
+            && event.sent_probes == Some(3)
+    }));
 }
 
 #[tokio::test]
@@ -513,6 +685,92 @@ async fn encrypted_direct_validation_waits_for_delayed_wireguard_session() {
 }
 
 #[tokio::test]
+async fn encrypted_validation_cancellation_keeps_lease_generation_and_owner_in_diagnostics() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let observed_endpoint: SocketAddr = "127.0.0.1:45801".parse().unwrap();
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-validation-cancel".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "peer-public-key".to_string(),
+            endpoint: observed_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let (transport, _encrypted_rx) = WireGuardTransport::new();
+    let worker_peers = peers.clone();
+    let worker = tokio::spawn(async move {
+        run_direct_encrypted_validation(
+            PeerReflexiveObservation {
+                peer_id: "node-validation-cancel".to_string(),
+                observed_endpoint,
+            },
+            udp,
+            worker_peers,
+            transport,
+            "10.20.0.1",
+        )
+        .await;
+    });
+
+    let owner = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(owner) = peers
+                .diagnostics()
+                .await
+                .into_iter()
+                .find(|peer| peer.node_id == "node-validation-cancel")
+                .and_then(|peer| {
+                    peer.direct_events
+                        .iter()
+                        .find(|event| event.stage == "direct_validation_started")
+                        .and_then(|event| event.validation_session_id)
+                })
+            {
+                break owner;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("validation worker must publish its owner before waiting for WireGuard");
+
+    assert_eq!(peers.advance_network_generation("test validation cancellation").await, 1);
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("generation advance must wake the validation worker")
+        .unwrap();
+
+    let diagnostics = peers.diagnostics().await;
+    let events = &diagnostics
+        .iter()
+        .find(|peer| peer.node_id == "node-validation-cancel")
+        .expect("peer must remain visible after generation advance")
+        .direct_events;
+    assert!(events.iter().any(|event| {
+        event.stage == "direct_validation_cancelled"
+            && event.network_generation == 0
+            && event.validation_session_id == Some(owner)
+            && event.detail.contains("owner was revoked")
+    }));
+    assert!(!events.iter().any(|event| {
+        event.stage == "direct_validation_timed_out"
+            && event.network_generation == 0
+            && event.validation_session_id == Some(owner)
+    }));
+}
+
+#[tokio::test]
 async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
@@ -543,7 +801,7 @@ async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() 
         peers.clone(),
         udp_transport,
         local_candidates.clone(),
-        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(None)),
         PunchAttemptDeduplicator::default(),
         ControlClient::disabled_for_test(),
         Arc::new(RwLock::new(Vec::new())),
@@ -979,6 +1237,96 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         .direct_events
         .iter()
         .any(|event| event.stage == REASON_DIRECT_PROBE_FAILED));
+}
+
+#[tokio::test]
+async fn suppressed_same_epoch_offer_stashes_latest_targets_without_reclocking_first_window() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let initial_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let refreshed_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let initial_endpoint = initial_socket.local_addr().unwrap();
+    let refreshed_endpoint = refreshed_socket.local_addr().unwrap();
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: initial_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .add_candidates("node-b", &[initial_endpoint.to_string()])
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let first_punch_at = unix_time_millis() + 2_000;
+    spawn_hole_punch_task(
+        udp.clone(),
+        peers.clone(),
+        deduplicator.clone(),
+        "node-b".to_string(),
+        Duration::from_millis(10),
+        1,
+        Some(first_punch_at),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // This models a newer trusted offer arriving before the first rendezvous.
+    // It changes the target set but must not replace/re-clock the active
+    // session; it is stashed for that same owner's dispatch instead.
+    peers
+        .add_candidates("node-b", &[refreshed_endpoint.to_string()])
+        .await;
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        deduplicator,
+        "node-b".to_string(),
+        Duration::from_millis(10),
+        1,
+        Some(first_punch_at + 500),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let pending = peers
+        .take_recovery_target("node-b")
+        .await
+        .expect("suppressed same-epoch offer must stash its trusted target");
+    assert_eq!(pending.candidates, vec![refreshed_endpoint]);
+    assert!(
+        pending.punch_at_ms.is_none(),
+        "the active rendezvous owns its original punch_at and must not be re-clocked"
+    );
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    let preserved = conn
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "punch_window_preserved")
+        .expect("the preserved rendezvous must be visible in diagnostics");
+    assert!(preserved.detail.contains("reason=same_epoch_active_session"));
+    assert!(preserved
+        .detail
+        .contains(&format!("active_punch_at_ms=Some({first_punch_at})")));
+    assert!(preserved.detail.contains("candidate_snapshot_hash="));
+    assert!(preserved.detail.contains("candidate_source_counts="));
 }
 
 #[tokio::test]
@@ -1498,11 +1846,17 @@ async fn frozen_fresh_target_snapshot_survives_later_ordinary_refresh() {
         boot_epoch: 1_742_987_654_321,
         generation: 1,
     };
-    let candidates = vec!["203.0.113.10:45393".to_string()];
-    let sources = HashMap::from([(
+    let candidates = vec![
         "203.0.113.10:45393".to_string(),
-        fresh_prediction_source_label(id),
-    )]);
+        "203.0.113.10:45394".to_string(),
+    ];
+    let sources = HashMap::from([
+        (
+            "203.0.113.10:45393".to_string(),
+            fresh_prediction_source_label(id),
+        ),
+        ("203.0.113.10:45394".to_string(), "predicted".to_string()),
+    ]);
     assert!(matches!(
         daemon
             .peers
@@ -1522,7 +1876,11 @@ async fn frozen_fresh_target_snapshot_survives_later_ordinary_refresh() {
         .freeze_fresh_punch_targets("node-b", id)
         .await
         .expect("the committed fresh snapshot must freeze");
-    assert_eq!(frozen, vec!["203.0.113.10:45393".parse::<SocketAddr>().unwrap()]);
+    assert_eq!(
+        frozen,
+        vec!["203.0.113.10:45393".parse::<SocketAddr>().unwrap()],
+        "ordinary predicted candidates in a fresh signal must not expand the frozen fresh window"
+    );
 
     // An ordinary refresh replaces the shared candidate set entirely.
     daemon

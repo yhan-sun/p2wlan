@@ -2,6 +2,7 @@
 mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use p2pnet_crypto::NodeIdentity;
@@ -1877,6 +1878,102 @@ socket_index: None,
             stale_udp.affinity_pin_for_test("peer-a").await.is_none(),
             "a retired reader packet must not retain old transport affinity"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_validation_request_is_ingress_only_until_local_ack() {
+        let (_remote_session, local_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", local_session).await;
+        let peers = Arc::new(PeerManager::new(Config::generate_default(
+            "https://ctrl.test",
+            "net1",
+        )
+        .unwrap()));
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+        let trigger_count = Arc::new(AtomicUsize::new(0));
+        let trigger_count_clone = trigger_count.clone();
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_validation_trigger(Arc::new(move |_| {
+                trigger_count_clone.fetch_add(1, Ordering::SeqCst);
+            }));
+        let source: std::net::SocketAddr = "198.51.100.73:51820".parse().unwrap();
+        let token = crate::transport::DirectValidationToken {
+            kind: crate::transport::DirectValidationKind::Request,
+            generation: 0,
+            request_id: 0x4102,
+            sequence: 0,
+            owner_token: 9,
+        };
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            token.request_id,
+            0,
+            &crate::transport::build_direct_validation_payload(
+                crate::transport::DirectValidationKind::Request,
+                token.generation,
+                token.request_id,
+                token.sequence,
+                token.owner_token,
+            ),
+        );
+
+        transport
+            .handle_direct_validation_packet(
+                &peers,
+                Some(&udp),
+                "peer-a",
+                &packet,
+                Some(source),
+                udp.local_addr().ok(),
+                Some(0),
+                token,
+            )
+            .await;
+
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_ne!(connection.state, ConnectionState::Direct);
+        assert_eq!(connection.direct_health.success_count, 0);
+        assert_eq!(trigger_count.load(Ordering::SeqCst), 1);
+        assert!(connection
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_validation_request_received"));
+        assert!(!connection
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_validation_promoted"));
+
+        let request_event = connection
+            .direct_events
+            .iter()
+            .find(|event| event.stage == "direct_validation_request_received")
+            .expect("the request event must be present");
+        assert_eq!(
+            request_event.validation_session_id, None,
+            "a remote request owner must never be reported as this daemon's local validation session"
+        );
+        assert_eq!(
+            request_event.remote_validation_owner,
+            Some(token.owner_token),
+            "remote validation ownership needs an explicit structured field"
+        );
+        assert_eq!(
+            request_event.request_id,
+            Some(token.request_id),
+            "request_id must remain structured rather than only appearing in detail text"
+        );
+
     }
 
     #[tokio::test]

@@ -127,6 +127,79 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
 }
 
 #[tokio::test]
+async fn validation_ack_requires_exact_endpoint_and_socket() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let endpoint: SocketAddr = "198.51.100.20:51820".parse().unwrap();
+    let owner = match udp
+        .begin_or_merge_direct_validation("peer-b", endpoint, 0)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the first validation observation must own the session"),
+    };
+    assert!(udp
+        .expect_direct_validation_ack_owned_on_socket(
+            "peer-b",
+            0x4101,
+            0,
+            owner,
+            endpoint,
+            Some(0),
+        )
+        .await);
+
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x4101,
+            0,
+            owner,
+            0,
+            "198.51.100.21:51820".parse().unwrap(),
+            Some(0),
+            false,
+        )
+        .await
+        .is_none());
+    assert!(udp.has_direct_validation_expectation("peer-b").await);
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x4101,
+            0,
+            owner,
+            0,
+            endpoint,
+            Some(1),
+            false,
+        )
+        .await
+        .is_none());
+    assert!(udp.has_direct_validation_expectation("peer-b").await);
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x4101,
+            0,
+            owner,
+            0,
+            endpoint,
+            Some(0),
+            false,
+        )
+        .await
+        .is_some());
+}
+
+#[tokio::test]
 async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_owner() {
     // Offline and public-key-change events use the same lifecycle cleanup
     // with `remove_connection = false`. Exercise both after a rebind so the

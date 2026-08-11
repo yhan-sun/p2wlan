@@ -1,3 +1,24 @@
+use probe_budget::{
+    RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct ProbeSendResult {
+    nonce: ProbeNonce,
+    /// Physical datagrams accepted by the UDP socket during this synchronous
+    /// send transaction.  Heartbeats have no retransmit burst, so this is the
+    /// exact quantity that must be committed to their low-rate budget.
+    datagrams_sent: u8,
+    /// Actual socket selected after dynamic-socket resolution.  Keeping this
+    /// beside the send result lets session telemetry account for the socket
+    /// that really emitted the packet, even if a requested dynamic index was
+    /// detached and fell back to a pool member.
+    socket_index: usize,
+    /// Wall-clock timestamp sampled immediately after the first successful
+    /// kernel send.  This is deliberately not the dispatch timestamp.
+    first_send_at_ms: Option<u64>,
+}
+
 impl UdpTransport {
     async fn admit_authenticated_punch(
         &self,
@@ -158,17 +179,20 @@ impl UdpTransport {
         true
     }
 
-    /// Admit one relay-backoff heartbeat probe.
+    /// Reserve one relay-backoff heartbeat endpoint/socket send.
     ///
     /// Heartbeats never consume recovery-epoch credit or the foreground
     /// per-peer budgets. They do consume a process-wide low-priority reserve,
     /// keyed by actual remote IP and peer, so socket-pool/target multiplication
     /// and many relay peers cannot create an unbounded probe storm.
-    async fn admit_relay_backoff_heartbeat_probe(
+    async fn reserve_relay_backoff_heartbeat_probe(
         &self,
         peer_id: &str,
         peer_addr: SocketAddr,
-    ) -> bool {
+    ) -> std::result::Result<
+        RelayBackoffHeartbeatReservation,
+        RelayBackoffHeartbeatReservationRejection,
+    > {
         let local_busy = {
             let budget = self.outbound_probe_budget.lock().await;
             budget
@@ -178,11 +202,11 @@ impl UdpTransport {
                     .saturating_sub(RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE)
         };
         if local_busy {
-            return false;
+            return Err(RelayBackoffHeartbeatReservationRejection::ForegroundYield);
         }
         if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
             if global_budget.foreground_burst_active().await {
-                return false;
+                return Err(RelayBackoffHeartbeatReservationRejection::ForegroundYield);
             }
         }
         // A legacy-compatible peer receives both the authenticated probe and
@@ -195,8 +219,18 @@ impl UdpTransport {
             1
         };
         self.relay_backoff_heartbeat_budget
-            .admit(peer_id, peer_addr.ip(), packet_cost)
+            .reserve(peer_id, peer_addr.ip(), packet_cost)
+    }
+
+    #[cfg(test)]
+    async fn admit_relay_backoff_heartbeat_probe(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+    ) -> bool {
+        self.reserve_relay_backoff_heartbeat_probe(peer_id, peer_addr)
             .await
+            .is_ok()
     }
 
     fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
@@ -362,8 +396,8 @@ impl UdpTransport {
         socket_index: usize,
         peer_id: &str,
         peer_addr: SocketAddr,
-    ) -> Result<ProbeNonce> {
-        self.send_probe_from_socket_with_nomination(
+    ) -> Result<ProbeSendResult> {
+        self.send_probe_from_socket_with_nomination_result(
             socket_index,
             Some(peer_id),
             peer_addr,
@@ -381,6 +415,25 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeNonce> {
+        self.send_probe_from_socket_with_nomination_result(
+            socket_index,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+        )
+        .await
+        .map(|result| result.nonce)
+    }
+
+    async fn send_probe_from_socket_with_nomination_result(
+        &self,
+        socket_index: usize,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+    ) -> Result<ProbeSendResult> {
         let (actual_index, socket, _lease) = self
             .socket_for_index_or_dynamic(socket_index, peer_id)
             .await
@@ -392,7 +445,7 @@ impl UdpTransport {
         // The pending probe records the ACTUAL sending socket: when the
         // requested dynamic socket was detached concurrently, the resolver
         // falls back to the peer's pool socket and the ACK will arrive there.
-        self.send_probe_on_socket(
+        self.send_probe_on_socket_result(
             actual_index,
             socket,
             peer_id,
@@ -471,6 +524,27 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeNonce> {
+        self.send_probe_on_socket_result(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+        )
+        .await
+        .map(|result| result.nonce)
+    }
+
+    async fn send_probe_on_socket_result(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+    ) -> Result<ProbeSendResult> {
         // Consistent peer snapshot under one lock acquisition: generation
         // (lock-free mirror), affinity evidence epoch and cleanup epoch.
         let (generation, socket_epoch, cleanup_epoch) = {
@@ -499,16 +573,19 @@ impl UdpTransport {
             (Some(peer_id), Some(local_node_id))
                 if local_node_id.len() <= u8::MAX as usize && peer_id.len() <= u8::MAX as usize =>
             {
-                self.peers.probe_key_for_peer(peer_id).await.map(|key| {
-                    let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
-                        local_node_id,
-                        peer_id,
-                        generation,
-                        use_candidate,
-                        &key,
-                    );
-                    (bytes, nonce)
-                })
+                self.peers
+                    .probe_key_and_session_for_peer(peer_id)
+                    .await
+                    .map(|(key, probe_session_id)| {
+                        let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
+                            local_node_id,
+                            peer_id,
+                            generation,
+                            use_candidate,
+                            &key,
+                        );
+                        (bytes, nonce, probe_session_id)
+                    })
             }
             _ => None,
         };
@@ -519,8 +596,9 @@ impl UdpTransport {
             accepts_authenticated_ack,
             accepts_legacy_ack,
             compat_legacy_probe,
+            probe_session_id,
         ) =
-            if let Some((bytes, nonce)) = authenticated_probe {
+            if let Some((bytes, nonce, probe_session_id)) = authenticated_probe {
                 // Compatibility bridge for pre-v2 peers. v0.1.24 and older only
                 // understand PNCH v1 and otherwise forward PNCH v2 into the
                 // WireGuard parser, producing "invalid message type: 80".
@@ -534,6 +612,7 @@ impl UdpTransport {
                     requires_legacy_probe,
                     requires_legacy_probe
                         .then(|| build_punch_packet_with_nonce(nonce).to_vec()),
+                    probe_session_id,
                 )
             } else {
                 let bytes = build_punch_packet();
@@ -542,7 +621,7 @@ impl UdpTransport {
                     .ok_or_else(|| {
                         DaemonError::Network("failed to create UDP probe".to_string())
                     })?;
-                (bytes.to_vec(), nonce, false, true, None)
+                (bytes.to_vec(), nonce, false, true, None, None)
             };
 
         // Re-verify the snapshot and register the pending probe as one
@@ -606,6 +685,7 @@ impl UdpTransport {
                     local_endpoint: socket.local_addr().ok(),
                     socket_index,
                     generation,
+                    probe_session_id,
                     peer_id: peer_id.map(str::to_string),
                     purpose,
                     accepts_authenticated_ack,
@@ -626,6 +706,7 @@ impl UdpTransport {
                 "UDP probe send to {peer_addr} failed: {error}"
             )));
         }
+        let first_send_at_ms = Some(monotonic_millis());
         // The send completed: release the in-flight send lease.  The pending
         // entry itself keeps the detach waiting until the ACK arrives or the
         // bounded drain timeout expires.
@@ -642,9 +723,11 @@ impl UdpTransport {
             .await;
         }
 
+        let mut datagrams_sent = 1u8;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
             match socket.send_to(&legacy_probe, peer_addr).await {
                 Ok(_) => {
+                    datagrams_sent = datagrams_sent.saturating_add(1);
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.probes_sent += 1
                     })
@@ -692,7 +775,12 @@ impl UdpTransport {
                 peer_id.map(str::to_string),
             );
         }
-        Ok(nonce)
+        Ok(ProbeSendResult {
+            nonce,
+            datagrams_sent,
+            socket_index,
+            first_send_at_ms,
+        })
     }
 
     /// Send an authenticated ICE-style nominated connectivity check for a direct trial.

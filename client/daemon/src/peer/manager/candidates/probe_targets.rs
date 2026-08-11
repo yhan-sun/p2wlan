@@ -9,6 +9,29 @@ pub(crate) struct DirectProbeTargetSet {
     pub recovery_epoch: u64,
 }
 
+/// Trusted relay-backoff heartbeat targets, separated before the UDP sender
+/// chooses a local socket.  The groups retain the candidate ranking within
+/// each source class while allowing a bounded heartbeat to revisit an
+/// authenticated/selected endpoint without repeatedly pinning the whole beat
+/// to the first predicted port.
+#[derive(Debug, Clone)]
+pub(crate) struct RelayBackoffHeartbeatTargetSet {
+    pub generation: u64,
+    pub priority: Vec<SocketAddr>,
+    pub predicted: Vec<SocketAddr>,
+    pub fallback: Vec<SocketAddr>,
+}
+
+impl RelayBackoffHeartbeatTargetSet {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.priority.is_empty() && self.predicted.is_empty() && self.fallback.is_empty()
+    }
+
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.priority.len() + self.predicted.len() + self.fallback.len()
+    }
+}
+
 impl PeerManager {
     /// Return the best current direct endpoint for encrypted UDP data.
     pub async fn direct_endpoint_for_send(&self, node_id: &str) -> Option<SocketAddr> {
@@ -293,7 +316,8 @@ impl PeerManager {
     pub(crate) async fn relay_backoff_heartbeat_targets_for(
         &self,
         node_id: &str,
-    ) -> Option<Vec<SocketAddr>> {
+    ) -> Option<RelayBackoffHeartbeatTargetSet> {
+        let generation = self.current_network_generation().await;
         let relay_available = self
             .connections
             .read()
@@ -309,7 +333,51 @@ impl PeerManager {
         }
         let mut set = self.direct_probe_target_set_for(node_id).await?;
         set.candidates.truncate(RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES as usize);
-        Some(set.candidates)
+        // A network generation transition invalidates every candidate pair
+        // and its cursor.  Return no mixed-generation snapshot; the next beat
+        // rebuilds against the authoritative generation.
+        if self.current_network_generation().await != generation {
+            return None;
+        }
+        let connections = self.connections.read().await;
+        let conn = connections.get(node_id)?;
+        let mut priority = Vec::new();
+        let mut predicted = Vec::new();
+        let mut fallback = Vec::new();
+        for endpoint in set.candidates {
+            let source = conn.candidate_source_for_endpoint(endpoint);
+            let authenticated_or_successful = conn.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == generation
+                    && pair.remote_endpoint == endpoint
+                    && (matches!(
+                        pair.source,
+                        CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
+                    ) || pair.last_success_at.is_some()
+                        || matches!(
+                            pair.state,
+                            CandidatePairState::Selected | CandidatePairState::Succeeded
+                        ))
+            });
+            if authenticated_or_successful
+                || matches!(
+                    source,
+                    CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
+                )
+            {
+                priority.push(endpoint);
+            } else if source == CandidatePairSource::Predicted {
+                predicted.push(endpoint);
+            } else {
+                fallback.push(endpoint);
+            }
+        }
+        let targets = RelayBackoffHeartbeatTargetSet {
+            generation,
+            priority,
+            predicted,
+            fallback,
+        };
+        (!targets.is_empty()).then_some(targets)
     }
 
     /// Lock-free relay safety-net check for the heartbeat's per-send owner

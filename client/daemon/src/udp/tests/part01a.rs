@@ -78,6 +78,7 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
         local_endpoint: None,
         socket_index: 2,
         generation: 7,
+        probe_session_id: None,
         peer_id: Some("peer-b".to_string()),
         purpose: PendingProbePurpose::ConnectivityCheck,
         accepts_authenticated_ack: true,
@@ -139,6 +140,87 @@ fn probe_rx_snapshot_delta_is_saturating() {
             legacy_probe_acks_unmatched: 0,
             probe_acks_received: 0,
         }
+    );
+}
+
+#[tokio::test]
+async fn peer_probe_rx_snapshot_does_not_cross_peer_or_generation() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-a", "10.20.0.2", None)).await;
+    assert!(
+        peers
+            .set_probe_session_id("peer-a", Some("session-current".to_string()))
+            .await
+    );
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 7, Some("session-current"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 1;
+            snapshot.probe_acks_received = 1;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 7, Some("session-old"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 12;
+            snapshot.probe_acks_received = 12;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-b", 7, None, |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 9;
+            snapshot.probe_acks_received = 9;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 8, Some("session-current"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 4;
+        })
+        .await;
+
+    let peer_a = transport.probe_rx_snapshot_for_peer("peer-a", 7).await;
+    assert_eq!(peer_a.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_a.probe_acks_received, 1);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-b", 7)
+            .await
+            .probe_acks_received,
+        9
+    );
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-a", 8)
+            .await
+            .authenticated_probe_acks_observed,
+        4
+    );
+
+    // A punch that started under session-current keeps its own receive
+    // evidence when a control-plane rekey installs session-new.  Reading the
+    // current binding here would otherwise make its timeout delta compare
+    // different sessions.
+    assert!(
+        peers
+            .set_probe_session_id("peer-a", Some("session-new".to_string()))
+            .await
+    );
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-a", 7)
+            .await,
+        UdpProbeRxSnapshot::default(),
+        "the new current session must not inherit old-session ACK evidence"
+    );
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer_session("peer-a", 7, Some("session-current"))
+            .await
+            .probe_acks_received,
+        1,
+        "an already-admitted punch must retain its original session attribution"
     );
 }
 
@@ -212,6 +294,7 @@ async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
 async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
     let local_identity = NodeIdentity::generate();
     let peer_identity = NodeIdentity::generate();
+    let unrelated_peer_identity = NodeIdentity::generate();
     let known_candidate: SocketAddr = "127.0.0.1:50999".parse().unwrap();
 
     let peers = Arc::new(PeerManager::new(config_for_identity(
@@ -224,6 +307,14 @@ async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
             "10.20.0.2",
             hex::encode(peer_identity.public_key()),
             Some(known_candidate),
+        ))
+        .await;
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-c",
+            "10.20.0.3",
+            hex::encode(unrelated_peer_identity.public_key()),
+            None,
         ))
         .await;
     assert!(
@@ -249,7 +340,16 @@ async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
     let generation = peers.current_network_generation().await;
 
-    let ack = build_authenticated_punch_ack([42u8; 8], "peer-b", "peer-a", generation, &key);
+    // The frame carries peer-b's generation, which deliberately differs from
+    // peer-a's local punch generation. Its diagnostics must still land under
+    // peer-a/generation, and cannot be presented as evidence for peer-c.
+    let ack = build_authenticated_punch_ack(
+        [42u8; 8],
+        "peer-b",
+        "peer-a",
+        generation + 41,
+        &key,
+    );
     sender.send_to(&ack, local_addr).await.unwrap();
 
     timeout(Duration::from_secs(1), async {
@@ -272,6 +372,21 @@ async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
     assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
     assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
     assert_eq!(diagnostics[0].probe_acks_received, 0);
+    let peer_b_snapshot = transport
+        .probe_rx_snapshot_for_peer("peer-b", generation)
+        .await;
+    assert_eq!(peer_b_snapshot.known_peer_ip_datagrams_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_packets_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_unmatched, 1);
+    assert_eq!(peer_b_snapshot.probe_acks_received, 0);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-c", generation)
+            .await,
+        UdpProbeRxSnapshot::default(),
+        "an ACK authenticated for peer-b must never advance peer-c's timeout evidence"
+    );
 
     // An invalid-MAC authenticated probe from the same known peer IP is counted
     // at the raw-IP and Probe v2 framing layers, then fails MAC validation.
@@ -298,6 +413,153 @@ async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
     assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
     assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
     assert_eq!(diagnostics[0].probe_acks_received, 0);
+
+    worker.abort();
+}
+
+#[tokio::test]
+async fn matched_authenticated_ack_is_scoped_to_its_peer_and_enqueues_validation_only() {
+    let local_identity = NodeIdentity::generate();
+    let peer_b_identity = NodeIdentity::generate();
+    let peer_c_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_b_identity.public_key()),
+            None,
+        ))
+        .await;
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-c",
+            "10.20.0.3",
+            hex::encode(peer_c_identity.public_key()),
+            None,
+        ))
+        .await;
+    assert!(
+        peers
+            .set_probe_session_id("peer-b", Some("session-current".to_string()))
+            .await
+    );
+
+    let validation_observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_by_trigger = validation_observations.clone();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a")
+        .with_validation_trigger(Arc::new(move |observation| {
+            observed_by_trigger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((observation.peer_id, observation.observed_endpoint));
+        }));
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    let generation = peers.current_network_generation().await;
+    let nonce = transport.send_probe(Some("peer-b"), sender_addr).await.unwrap();
+    let mut sent_probe = [0u8; 512];
+    timeout(Duration::from_secs(1), sender.recv_from(&mut sent_probe))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let ack = build_authenticated_punch_ack(
+        nonce,
+        "peer-b",
+        "peer-a",
+        generation + 17,
+        &key,
+    );
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if validation_observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        validation_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_slice(),
+        &[("peer-b".to_string(), sender_addr)],
+        "a matched peer-b ACK must enqueue validation for peer-b only"
+    );
+    let peer_b_snapshot = transport
+        .probe_rx_snapshot_for_peer("peer-b", generation)
+        .await;
+    assert_eq!(peer_b_snapshot.authenticated_probe_packets_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_unmatched, 0);
+    assert_eq!(peer_b_snapshot.probe_acks_received, 1);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-c", generation)
+            .await,
+        UdpProbeRxSnapshot::default(),
+        "peer-b's matched ACK must not modify peer-c diagnostics"
+    );
+    let diagnostics = peers.diagnostics().await;
+    let peer_b_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-b")
+        .expect("peer-b diagnostics must remain available");
+    let ingress = peer_b_diagnostics
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "direct_validation_ingress_requested")
+        .expect("a matched peer-b ACK must leave an attributed validation ingress event");
+    assert_eq!(ingress.network_generation, generation);
+    let sender_addr_text = sender_addr.to_string();
+    assert_eq!(ingress.endpoint.as_deref(), Some(sender_addr_text.as_str()));
+    assert_eq!(ingress.socket_index, Some(0));
+    assert!(
+        ingress.detail.contains("probe_session_id=session-current")
+            && ingress.detail.contains("socket_index=0"),
+        "the validation ingress event must retain the pending session and receiving socket: {}",
+        ingress.detail
+    );
+    let peer_c_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-c")
+        .expect("peer-c diagnostics must remain available");
+    assert!(
+        !peer_c_diagnostics
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_validation_ingress_requested"),
+        "peer-b's ACK must not create a validation ingress event for peer-c"
+    );
+    assert!(
+        !peers.is_direct("peer-b").await,
+        "a probe ACK is evidence for encrypted validation, never a Direct promotion"
+    );
+    assert!(
+        !transport.has_direct_validation_expectation("peer-b").await,
+        "the ACK callback alone must not manufacture a validation ACK expectation"
+    );
 
     worker.abort();
 }

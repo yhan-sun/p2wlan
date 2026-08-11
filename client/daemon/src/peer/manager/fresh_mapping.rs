@@ -68,6 +68,11 @@ pub(crate) struct FreshPredictionSnapshot {
     /// The candidate payload the identity was committed with: an idempotent
     /// retry can only ever punch toward this snapshot.
     pub(crate) candidates: Vec<String>,
+    /// Only candidates carrying this prediction identity are valid fresh
+    /// punch targets. Ordinary candidates may remain in `candidates` for
+    /// signaling compatibility, but must not expand the synchronized fresh
+    /// window back into a full 96-entry sweep.
+    pub(crate) fresh_candidates: Vec<String>,
     /// Fingerprint of the full payload (candidates + sources + expiry); the
     /// retry verification compares hashes, never re-applies the payload.
     pub(crate) payload_hash: [u8; 32],
@@ -134,6 +139,7 @@ pub(crate) struct FreshApplyPreviousState {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFreshApply {
     pub(crate) candidates: Vec<String>,
+    pub(crate) fresh_candidates: Vec<String>,
     pub(crate) payload_hash: [u8; 32],
     pub(crate) candidates_expires_at_ms: Option<u64>,
     /// The candidate generation value this apply set on the connection (0
@@ -324,6 +330,12 @@ impl PeerManager {
         if result == CandidateSetApplyResult::Applied {
             let payload_hash =
                 fresh_payload_hash(candidates, candidate_sources, candidates_expires_at_ms);
+            let fresh_label = crate::fresh_prediction_source_label(id);
+            let fresh_candidates = candidates
+                .iter()
+                .filter(|candidate| candidate_sources.get(*candidate) == Some(&fresh_label))
+                .cloned()
+                .collect();
             self.pending_fresh_applies
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -331,6 +343,7 @@ impl PeerManager {
                     (peer_id.to_string(), id),
                     PendingFreshApply {
                         candidates: candidates.to_vec(),
+                        fresh_candidates,
                         payload_hash,
                         candidates_expires_at_ms,
                         candidate_generation,
@@ -398,6 +411,7 @@ impl PeerManager {
             (peer_id.to_string(), id),
             FreshPredictionSnapshot {
                 candidates: apply.candidates,
+                fresh_candidates: apply.fresh_candidates,
                 payload_hash: apply.payload_hash,
                 candidates_expires_at_ms: apply.candidates_expires_at_ms,
             },

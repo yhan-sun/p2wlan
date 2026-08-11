@@ -128,6 +128,10 @@ pub(crate) enum ProbeKeyRole {
 pub(crate) struct ProbeKeyCandidate {
     pub(crate) key: ProbeMacKey,
     pub(crate) role: ProbeKeyRole,
+    /// Probe session that derived this key. This is diagnostics metadata only:
+    /// authentication still relies exclusively on the MAC key and existing
+    /// pending-binding transaction checks.
+    pub(crate) session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,8 +285,8 @@ use probe_budget::{
 };
 pub use types::{
     CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState, DirectPathType,
-    DirectTraversalEvent, NetworkPath, PathHealth, PathScore, PathScoreDiagnostics, PathSelection,
-    PathSelectionDiagnostics, PathSelectionEvent,
+    DirectTraversalEvent, DirectValidationEventMetadata, NetworkPath, PathHealth, PathScore,
+    PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
 };
 
 include!("peer/connection/core.rs");

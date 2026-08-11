@@ -11,9 +11,13 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# The standalone local control DB provisions only `default`; the real dual-end
+# harness uses NETWORK_ID explicitly and requires a provisioned test network.
+NETWORK_ID=${NETWORK_ID:-default}
+NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info}
 ROUNDS=${ROUNDS:-5}
-PORT=${PORT:-18080}
-RELAY_PORT=${RELAY_PORT:-18081}
+PORT=${PORT:-38080}
+RELAY_PORT=${RELAY_PORT:-38081}
 DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 301))}
 DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 302))}
 STEP_A=${STEP_A:-1}
@@ -33,12 +37,12 @@ cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
-  pkill -f "$BASE_DIR" 2>/dev/null || true
   echo "[nat-sim] artifacts retained: $BASE_DIR" >&2
 }
 trap cleanup EXIT
 
 echo "[nat-sim] building control server, relay and daemon..."
+echo "[nat-sim] isolated network id: $NETWORK_ID"
 (
   cd "$ROOT_DIR/server"
   go build -o "$BASE_DIR/control-server" .
@@ -115,10 +119,10 @@ for round in $(seq 1 "$ROUNDS"); do
 
   START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  P2WLAN_DISABLE_TUN=1 RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-a.json" \
     --control "http://127.0.0.1:$PORT" \
-    --network default \
+    --network "$NETWORK_ID" \
     --token "$TOKEN" \
     --device-name node-a \
     --udp-bind 127.0.0.1:0 \
@@ -136,10 +140,10 @@ for round in $(seq 1 "$ROUNDS"); do
     sleep 0.25
   done
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  P2WLAN_DISABLE_TUN=1 RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-b.json" \
     --control "http://127.0.0.1:$PORT" \
-    --network default \
+    --network "$NETWORK_ID" \
     --token "$TOKEN" \
     --device-name node-b \
     --udp-bind 127.0.0.1:0 \
@@ -164,6 +168,8 @@ for round in $(seq 1 "$ROUNDS"); do
   done
   END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   ELAPSED_MS=$((END_MS - START_MS))
+  curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status" >"$ROUND_DIR/node-a.status.json" || printf '{}\n' >"$ROUND_DIR/node-a.status.json"
+  curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_B_PORT/status" >"$ROUND_DIR/node-b.status.json" || printf '{}\n' >"$ROUND_DIR/node-b.status.json"
 
   # Record the evidence stream for this round.
   {
@@ -178,7 +184,7 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "== matched punch ACKs =="
     grep -h 'received authenticated UDP punch ACK\|received UDP punch ACK' "$ROUND_DIR"/node-*.log 2>/dev/null | head -2
     echo "== direct validation request/ack =="
-    grep -h 'direct_validation_request_sent\|direct_validation_request_received\|direct_validation_ack_received' "$ROUND_DIR"/node-*.log 2>/dev/null | head -4
+    grep -h 'direct_validation_request_sent\|direct_validation_request_received\|direct_validation_ack_received\|direct_validation_promoted' "$ROUND_DIR"/node-*.log 2>/dev/null | head -4
     echo "== promotion times =="
     grep -h 'direct_path_promoted\|candidate_pair_selected' "$ROUND_DIR"/node-*.log 2>/dev/null | head -2
     echo "== relay hedge =="

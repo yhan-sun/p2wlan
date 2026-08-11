@@ -230,6 +230,118 @@ async fn candidate_refresh_retains_confirmed_peer_reflexive_direct() {
 }
 
 #[tokio::test]
+async fn confirmed_public_peer_reflexive_direct_survives_peer_updated() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.4.4:51843".parse().unwrap();
+    let private: SocketAddr = "192.168.0.159:51843".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager
+        .learn_authenticated_endpoint("peer1", public)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", public, Some(Duration::from_millis(9)))
+        .await;
+    manager.record_direct_success("peer1", Some(public)).await;
+    let before = manager.get_connection("peer1").await.unwrap();
+    let mut update = test_peer("peer1", private);
+    update.last_seen = 1;
+    manager.add_peer(&update).await;
+
+    let after = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(after.state, ConnectionState::Direct);
+    assert_eq!(after.endpoint, Some(public));
+    assert_eq!(after.direct_generation, before.direct_generation);
+    assert_eq!(after.direct_commit_seq, before.direct_commit_seq);
+    assert!(after.direct_events.len() >= before.direct_events.len());
+    assert!(after.candidate_pairs.iter().any(|pair| {
+        pair.remote_endpoint == public
+            && pair.state == CandidatePairState::Selected
+            && pair.source == CandidatePairSource::PeerReflexive
+    }));
+}
+
+#[tokio::test]
+async fn stale_hole_punch_transition_cannot_overwrite_direct() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "8.8.8.8:51844".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let stale_generation = manager.current_network_generation().await;
+    let stale_commit_seq = manager.direct_commit_seq_sync("peer1");
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    assert!(!manager
+        .begin_hole_punch_if_current("peer1", stale_generation, stale_commit_seq)
+        .await);
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
+    assert_eq!(conn.endpoint, Some(endpoint));
+    assert!(conn.direct_commit_seq > stale_commit_seq.unwrap_or(0));
+}
+
+#[tokio::test]
+async fn diagnostics_current_pair_prefers_confirmed_public_pair() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51845".parse().unwrap();
+    let private: SocketAddr = "192.168.0.159:51845".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager
+        .learn_authenticated_endpoint("peer1", public)
+        .await;
+    manager.record_direct_success("peer1", Some(public)).await;
+    manager.learn_authenticated_endpoint("peer1", private).await;
+
+    let peer = manager.diagnostics().await.pop().unwrap();
+    assert_eq!(peer.state, ConnectionState::Direct);
+    assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+    assert_eq!(
+        peer.current_direct_pair.unwrap().remote_endpoint,
+        public.to_string()
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_direct_state_overrides_stale_relay_selection() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51846".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager.record_direct_success("peer1", Some(public)).await;
+    {
+        let mut conns = manager.connections.write().await;
+        conns.get_mut("peer1").unwrap().last_path_selection =
+            Some(PathSelection::relay("stale", "stale relay selector snapshot"));
+    }
+
+    let peer = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(peer.state, ConnectionState::Direct);
+    assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+    assert!(matches!(peer.direct_type, DirectPathType::PublicUdp | DirectPathType::PeerReflexive));
+    assert_eq!(peer.selected_pair.as_ref().unwrap().remote_endpoint, public.to_string());
+    assert_eq!(peer.current_direct_pair.as_ref().unwrap().remote_endpoint, public.to_string());
+    assert_eq!(peer.last_path_selection.as_ref().unwrap().path, Some(NetworkPath::Direct));
+}
+
+#[tokio::test]
+async fn direct_promotion_updates_selection_atomically() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51847".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager.record_direct_success("peer1", Some(public)).await;
+    let conn = manager.get_connection("peer1").await.unwrap();
+    let selection = conn.last_path_selection.expect("promotion selector snapshot");
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
+    assert!(selection.direct_confirmed);
+    assert_eq!(selection.direct_endpoint, Some(public));
+}
+
+#[tokio::test]
 async fn path_selector_prefers_relay_when_confirmed_direct_quality_is_poor() {
     let config = test_config();
     let manager = PeerManager::new(config);
@@ -309,4 +421,104 @@ async fn degraded_direct_is_retained_until_relay_peer_path_is_confirmed() {
             .unwrap()
             .relay_hedged
     );
+}
+
+#[tokio::test]
+async fn in_flight_hole_punch_completion_after_direct_promotion_is_refused() {
+    // Chained regression for the stale hole-punch transition: a hole-punch
+    // task captures (generation, commit_seq) before setup, enters HolePunching
+    // through the gate, then Direct is confirmed while the task is in flight.
+    // Every later write-back attempt using the pre-promotion observations must
+    // be refused: no state demotion, no selection change, no recovery restart.
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "8.8.8.8:51850".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let task_generation = manager.current_network_generation().await;
+    let task_commit_seq = manager.direct_commit_seq_sync("peer1");
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(4)))
+        .await;
+    assert!(manager
+        .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
+        .await);
+    let started = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(started.state, ConnectionState::HolePunching);
+
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    let promoted = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(promoted.state, ConnectionState::Direct);
+    assert_eq!(promoted.active_path(), Some(NetworkPath::Direct));
+    let promoted_seq = promoted.direct_commit_seq;
+    assert!(!manager.recovery_epoch_active("peer1").await);
+    drop(promoted);
+
+    assert!(!manager
+        .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
+        .await);
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
+    assert_eq!(conn.endpoint, Some(endpoint));
+    assert_eq!(conn.direct_commit_seq, promoted_seq);
+    assert!(conn.direct_commit_seq > task_commit_seq.unwrap_or(0));
+    assert!(!manager.recovery_epoch_active("peer1").await);
+}
+
+#[tokio::test]
+async fn relay_connection_metadata_survives_direct_promotion_for_recovery() {
+    // The relay path must remain available as a recovery mechanism after
+    // Direct is confirmed: the relay server binding and relay health are
+    // retained, relay keepalives keep refreshing relay bookkeeping, and none
+    // of that may demote the confirmed Direct path or change the endpoint.
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "8.8.8.8:51851".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_relay_success("peer1", "tcp://relay.test:18081", true)
+        .await;
+    let relay = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(relay.state, ConnectionState::Relay);
+    assert_eq!(relay.relay_server.as_deref(), Some("tcp://relay.test:18081"));
+
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    let promoted = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(promoted.state, ConnectionState::Direct);
+    assert_eq!(promoted.active_path(), Some(NetworkPath::Direct));
+    assert_eq!(promoted.endpoint, Some(endpoint));
+    assert_eq!(
+        promoted.relay_server.as_deref(),
+        Some("tcp://relay.test:18081"),
+        "relay binding must survive Direct promotion"
+    );
+
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "tcp://relay.test:18081",
+            false,
+            Duration::from_millis(3),
+        )
+        .await;
+    let keepalive = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(keepalive.state, ConnectionState::Direct);
+    assert_eq!(keepalive.active_path(), Some(NetworkPath::Direct));
+    assert_eq!(keepalive.endpoint, Some(endpoint));
+    assert_eq!(
+        keepalive.relay_server.as_deref(),
+        Some("tcp://relay.test:18081")
+    );
+    assert!(
+        keepalive
+            .relay_health
+            .rtt_ewma_ms
+            .or(keepalive.relay_health.latency_ms)
+            .is_some(),
+        "relay health must keep refreshing while Direct is confirmed"
+    );
+
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+        .await;
+    assert_eq!(diagnostics[0].state, ConnectionState::Direct);
+    assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
 }

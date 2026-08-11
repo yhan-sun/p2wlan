@@ -335,7 +335,7 @@ impl PeerConnection {
 
     /// Whether the peer is on a confirmed Direct path with recent success and
     /// no consecutive failures, making relay-assisted punching unnecessary.
-    pub(super) fn direct_is_healthy_confirmed(&self) -> bool {
+    pub(crate) fn direct_is_healthy_confirmed(&self) -> bool {
         if self.state != ConnectionState::Direct
             || self.direct_health.consecutive_failures != 0
             || !self

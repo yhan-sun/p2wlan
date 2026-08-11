@@ -527,20 +527,302 @@ async fn relay_backoff_heartbeat_global_budget_counts_actual_packets_across_peer
         diagnostics_sent as usize <= RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
         "actual successful UDP sends must obey the process cap: {diagnostics_sent}"
     );
-    let heartbeat_state = transport.relay_backoff_heartbeat_budget.state.lock().await;
+    let heartbeat_state = transport
+        .relay_backoff_heartbeat_budget
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for endpoint in &endpoints {
         let key = crate::udp::probe_budget::RelayBackoffHeartbeatBudgetKey::RemoteIp(endpoint.ip());
         assert!(
-            heartbeat_state.get(&key).map_or(0, VecDeque::len)
+            heartbeat_state.committed.get(&key).map_or(0, VecDeque::len)
                 <= RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW,
             "remote IP {} exceeded its heartbeat cap",
             endpoint.ip()
         );
     }
+    assert!(
+        diagnostics_sent as usize <= RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
+        "the service-slot scheduler may defer a peer, but must never exceed the global reserve"
+    );
+}
+
+#[test]
+fn relay_backoff_heartbeat_cursor_rotates_predicted_endpoints_and_sockets() {
+    let budget = GlobalRelayBackoffHeartbeatBudget::new();
+    let predicted = (0..96)
+        .map(|offset| format!("127.0.0.1:{}", 40_000 + offset).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let choices = (0..8)
+        .map(|_| {
+            budget
+                .next_target("hard-nat-peer", 9, &[], &predicted, &[], 3)
+                .expect("predicted target should be available")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        diagnostics_sent as usize,
-        RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
-        "round-robin peer triggers should fill, but not exceed, the global reserve"
+        choices.iter().map(|choice| choice.endpoint).collect::<Vec<_>>(),
+        predicted[..8].to_vec(),
+        "the predicted cursor must progress beyond the fixed head of a 96-port window"
+    );
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.socket_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 0, 1, 2, 0, 1],
+        "one endpoint group is paired with one rotating local socket per beat"
+    );
+
+    let next = budget
+        .next_target("hard-nat-peer", 9, &[], &predicted, &[], 3)
+        .unwrap();
+    assert_eq!(next.endpoint, predicted[8]);
+    let generation_reset = budget
+        .next_target("hard-nat-peer", 10, &[], &predicted, &[], 3)
+        .unwrap();
+    assert_eq!(
+        generation_reset.endpoint, predicted[0],
+        "only a real network generation change resets the persistent cursor"
+    );
+
+    let priority: SocketAddr = "127.0.0.1:49999".parse().unwrap();
+    let priority_choice = budget
+        .next_target("priority-peer", 9, &[priority], &predicted, &[], 3)
+        .unwrap();
+    assert_eq!(priority_choice.endpoint, priority);
+    assert_eq!(
+        priority_choice.group,
+        crate::udp::probe_budget::RelayBackoffHeartbeatTargetGroup::Priority
+    );
+}
+
+#[test]
+fn relay_backoff_heartbeat_reservation_commits_only_actual_datagrams() {
+    let budget = Arc::new(GlobalRelayBackoffHeartbeatBudget::new());
+    let remote_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    let abandoned = budget
+        .reserve("peer-a", remote_ip, 2)
+        .expect("initial reservation should fit");
+    drop(abandoned);
+    {
+        let state = budget
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.committed.is_empty(),
+            "a dropped reservation must not leave attempted packets in the budget"
+        );
+    }
+
+    let committed = budget
+        .reserve("peer-a", remote_ip, 2)
+        .expect("dropped capacity must be immediately reusable");
+    committed.commit(1);
+    let state = budget
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        state
+            .committed
+            .get(&crate::udp::probe_budget::RelayBackoffHeartbeatBudgetKey::Network)
+            .map_or(0, VecDeque::len),
+        1,
+        "only the one actual kernel datagram is charged after a two-packet reservation"
+    );
+}
+
+#[test]
+fn relay_backoff_heartbeat_fairness_roster_rotates_a_deferred_peer_into_the_next_slot() {
+    let budget = Arc::new(GlobalRelayBackoffHeartbeatBudget::new());
+    let remote_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let peers = (0..13)
+        .map(|index| format!("fair-peer-{index:02}"))
+        .collect::<Vec<_>>();
+
+    // The thirteenth peer is discovered while the first slot is already
+    // filling.  The service roster must defer exactly the peer outside this
+    // slot's twelve-peer window, then rotate that peer into the next slot.
+    // Dropping accepted reservations deliberately leaves no packet charge,
+    // so this exercises arbitration rather than the rate cap.
+    budget.set_service_slot_for_test(0);
+    let mut deferred = None;
+    for peer_id in &peers {
+        match budget.reserve(peer_id, remote_ip, 1) {
+            Ok(reservation) => drop(reservation),
+            Err(crate::udp::probe_budget::RelayBackoffHeartbeatReservationRejection::FairnessDeferred) => {
+                assert!(
+                    deferred.is_none(),
+                    "only one of thirteen peers may be deferred from a twelve-peer service slot"
+                );
+                deferred = Some(peer_id.clone());
+            }
+            Err(other) => panic!("unexpected heartbeat roster rejection: {other:?}"),
+        }
+    }
+    let deferred = deferred.expect("one of thirteen peers should yield one 3-second slot");
+
+    budget.set_service_slot_for_test(2);
+    drop(
+        budget
+            .reserve(&deferred, remote_ip, 1)
+            .expect("the previously deferred peer must receive the next rotating service slot"),
+    );
+}
+
+#[tokio::test]
+async fn relay_backoff_heartbeat_target_set_prioritizes_authenticated_peer_reflexive_evidence() {
+    let peers = peer_manager();
+    let predicted: SocketAddr = "8.8.8.8:41000".parse().unwrap();
+    let peer_reflexive: SocketAddr = "8.8.8.8:42000".parse().unwrap();
+    peers
+        .add_peer(&peer("priority-peer", "10.20.3.1", Some(predicted)))
+        .await;
+    peers
+        .add_candidates_with_sources(
+            "priority-peer",
+            &[predicted.to_string()],
+            &HashMap::from([(predicted.to_string(), "predicted".to_string())]),
+        )
+        .await;
+    assert!(
+        peers
+            .learn_authenticated_endpoint("priority-peer", peer_reflexive)
+            .await
+    );
+    peers
+        .update_state("priority-peer", ConnectionState::Relay)
+        .await;
+
+    let targets = peers
+        .relay_backoff_heartbeat_targets_for("priority-peer")
+        .await
+        .expect("relay peer with trusted candidates should produce a heartbeat target set");
+    assert!(targets.priority.contains(&peer_reflexive));
+    assert!(targets.predicted.contains(&predicted));
+    let budget = GlobalRelayBackoffHeartbeatBudget::new();
+    let selected = budget
+        .next_target(
+            "priority-peer",
+            targets.generation,
+            &targets.priority,
+            &targets.predicted,
+            &targets.fallback,
+            3,
+        )
+        .unwrap();
+    assert_eq!(selected.endpoint, peer_reflexive);
+    assert_eq!(
+        selected.group,
+        crate::udp::probe_budget::RelayBackoffHeartbeatTargetGroup::Priority
+    );
+}
+
+#[tokio::test]
+async fn relay_backoff_heartbeat_hard_nat_slice_serves_all_eleven_peers_without_socket_cartesian_burst() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let mut candidates = vec![receiver_addr];
+    for port in 40_000..40_150 {
+        let endpoint: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        if endpoint != receiver_addr {
+            candidates.push(endpoint);
+        }
+        if candidates.len() == 96 {
+            break;
+        }
+    }
+    assert_eq!(candidates.len(), 96);
+
+    let peers = peer_manager();
+    for index in 0..11 {
+        let node_id = format!("hard-nat-{index}");
+        let mut info = peer(&node_id, &format!("10.20.2.{}", index + 1), Some(receiver_addr));
+        info.app_version = "0.1.25".to_string();
+        peers.add_peer(&info).await;
+    }
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap()
+        .with_global_heartbeat_budget(Arc::new(GlobalRelayBackoffHeartbeatBudget::new()));
+
+    let mut reported_packets = 0u32;
+    // Each peer owns its endpoint/socket cursor, so three service slots are
+    // required to prove that all three local sockets participate.  Advancing
+    // the deterministic slot also verifies that a completed beat does not
+    // accidentally permit a second candidate×socket sweep in the same beat.
+    for slot in 0..3 {
+        transport
+            .relay_backoff_heartbeat_budget
+            .set_service_slot_for_test(slot);
+        for index in 0..11 {
+            let report = transport
+                .punch_candidates_relay_backoff_heartbeat(
+                    &format!("hard-nat-{index}"),
+                    candidates.clone(),
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                report.packets_sent, 1,
+                "every serviceable hard-NAT peer must receive a nonzero bounded heartbeat beat"
+            );
+            assert_eq!(report.budget_skipped, 0);
+            reported_packets = reported_packets.saturating_add(report.packets_sent);
+        }
+    }
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    let actual_packets = diagnostics
+        .iter()
+        .map(|member| member.relay_backoff_heartbeat_probes_sent)
+        .sum::<u64>();
+    assert_eq!(actual_packets, u64::from(reported_packets));
+    assert_eq!(
+        actual_packets, 33,
+        "one packet per peer per beat, never a 96 × 3 Cartesian burst"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|member| member.relay_backoff_heartbeat_probes_sent > 0),
+        "the endpoint-group scheduler must rotate all three local sockets"
+    );
+
+    let mut received = 0u32;
+    let mut buf = [0u8; 256];
+    while let Ok(Ok(_)) = timeout(Duration::from_millis(20), receiver.recv_from(&mut buf)).await {
+        received = received.saturating_add(1);
+    }
+    // Only the first candidate points at `receiver`; the next two beats move
+    // the 96-port cursor onward.  A receiver count below total sends is thus
+    // expected and demonstrates that the candidate cursor did not pin every
+    // heartbeat to the list head.
+    assert_eq!(received, 11);
+    let state = transport
+        .relay_backoff_heartbeat_budget
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        state
+            .committed
+            .get(&crate::udp::probe_budget::RelayBackoffHeartbeatBudgetKey::Network)
+            .map_or(0, VecDeque::len),
+        reported_packets as usize,
+        "the global heartbeat budget must contain only actual sent packets"
+    );
+    assert!(
+        reported_packets as usize <= RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
+        "the global reserve stays bounded under 96 candidates × 3 sockets × 11 peers"
     );
 }
 

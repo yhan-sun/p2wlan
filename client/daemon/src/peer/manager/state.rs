@@ -100,6 +100,12 @@ pub struct PeerManager {
     direct_commit_notify: Arc<Notify>,
     /// Authoritative stale-peer quarantine state (relay 404 isolation).
     quarantined_peers: Arc<tokio::sync::Mutex<HashMap<String, PeerQuarantineState>>>,
+    /// Short-lived relay registration grace state. A relay `peer_not_found`
+    /// can race a reconnect/handoff while control still reports the same
+    /// incarnation online; keep the active recovery alive until this bounded
+    /// confirmation window expires.
+    relay_not_found_grace:
+        Arc<tokio::sync::Mutex<HashMap<String, RelayNotFoundGraceState>>>,
     /// Hook cancelling an active punch session when a peer is quarantined;
     /// registered by the daemon with its `PunchAttemptDeduplicator`.
     punch_cancel_hook: PunchCancelHookSlot,

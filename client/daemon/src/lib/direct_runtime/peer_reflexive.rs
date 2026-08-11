@@ -170,6 +170,7 @@ async fn run_peer_reflexive_signal_loop(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
     run_peer_reflexive_signal_loop_with_worker_permits(
@@ -177,6 +178,7 @@ async fn run_peer_reflexive_signal_loop(
         control,
         udp,
         peers,
+        punch_deduplicator,
         worker_permits,
     )
     .await;
@@ -190,6 +192,7 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
     worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
     let slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
@@ -248,6 +251,7 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
                 let worker_control = control.clone();
                 let worker_udp = udp.clone();
                 let worker_peers = peers.clone();
+                let worker_punch_deduplicator = punch_deduplicator.clone();
                 workers.spawn(async move {
                     let _permit = permit;
                     run_peer_reflexive_signal_worker(
@@ -256,6 +260,7 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
                         worker_control,
                         worker_udp,
                         worker_peers,
+                        worker_punch_deduplicator,
                     )
                     .await;
                 });
@@ -270,6 +275,7 @@ async fn run_peer_reflexive_signal_worker(
     control: ControlClient,
     udp: UdpTransport,
     peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
 ) {
     loop {
         let Some((mut observation, delay)) = take_peer_reflexive_observation(&slots, &peer_id).await
@@ -304,17 +310,33 @@ async fn run_peer_reflexive_signal_worker(
 
         run_peer_reflexive_fast_punch(&udp, &peers, &observation).await;
         let endpoint = observation.observed_endpoint.to_string();
+        let punch_at_ms = relay_assisted_punch_at_ms();
         let result = control
             .send_peer_reflexive(
                 &observation.peer_id,
                 &endpoint,
-                Some(relay_assisted_punch_at_ms()),
+                Some(punch_at_ms),
             )
             .await;
 
         let now = Instant::now();
         let (next_signal_at, next_backoff, retry_after_rate_limit) = match result {
             Ok(()) => {
+                // The fast punch above is only a two-packet NAT warmer. Once
+                // the relay accepted its signal, schedule the actual shared
+                // micro-window at the same advertised deadline. The helper
+                // owns the common punch deduplicator, so this cannot overlap
+                // a foreground rendezvous or outlive cancellation.
+                spawn_peer_reflexive_micro_window(
+                    udp.clone(),
+                    peers.clone(),
+                    punch_deduplicator.clone(),
+                    observation.peer_id.clone(),
+                    vec![observation.observed_endpoint],
+                    Some(punch_at_ms),
+                    "peer_reflexive_observer",
+                )
+                .await;
                 debug!(
                     peer_id = %observation.peer_id,
                     remote_endpoint = %endpoint,

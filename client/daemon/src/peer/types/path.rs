@@ -263,10 +263,49 @@ pub struct PathSelectionEvent {
 }
 
 /// One recorded direct traversal event for a peer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectValidationEventMetadata {
+    /// The local daemon-owned validation worker, if this event belongs to one.
+    pub(crate) local_validation_session_id: Option<u64>,
+    /// Owner token echoed from a remote validation Request. This is never a
+    /// local session identifier and must remain separately attributable.
+    pub(crate) remote_validation_owner: Option<u64>,
+    /// Structured validation request identifier.
+    pub(crate) request_id: Option<u16>,
+    /// Endpoint selected before the owned Request was sent.
+    pub(crate) expected_endpoint: Option<SocketAddr>,
+    /// Endpoint observed on the consumed encrypted ACK.
+    pub(crate) observed_ack_endpoint: Option<SocketAddr>,
+    /// Endpoint accepted by the Direct promotion transaction.
+    pub(crate) selected_endpoint: Option<SocketAddr>,
+    /// Whether the observed ACK endpoint passed authenticated endpoint
+    /// admission. Required when it differs from `expected_endpoint`.
+    pub(crate) ack_endpoint_authenticated: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectTraversalEvent {
     pub recorded_at: Instant,
     pub network_generation: u64,
+    /// Owner token of the daemon-internal encrypted direct-validation worker
+    /// that emitted this event.  The token is a bounded diagnostic handle,
+    /// not authentication material; it lets a peer's timeline distinguish
+    /// overlapping generations and stale worker cleanup.
+    pub validation_session_id: Option<u64>,
+    /// Owner token carried by a remote validation Request. It is deliberately
+    /// separate from this daemon's local validation session identifier.
+    pub remote_validation_owner: Option<u64>,
+    /// Structured identifier of the validation Request/ACK exchange.
+    pub request_id: Option<u16>,
+    /// Index of the UDP socket that actually received or emitted the event,
+    /// when the receive/send path can identify it. This is deliberately an
+    /// index rather than a local address, so diagnostics do not expose
+    /// sensitive endpoint material.
+    pub socket_index: Option<usize>,
+    pub expected_endpoint: Option<SocketAddr>,
+    pub observed_ack_endpoint: Option<SocketAddr>,
+    pub selected_endpoint: Option<SocketAddr>,
+    pub ack_endpoint_authenticated: Option<bool>,
     pub stage: String,
     pub endpoint: Option<SocketAddr>,
     pub candidate_count: Option<usize>,
@@ -290,6 +329,14 @@ impl DirectTraversalEvent {
         Self {
             recorded_at: Instant::now(),
             network_generation,
+            validation_session_id: None,
+            remote_validation_owner: None,
+            request_id: None,
+            socket_index: None,
+            expected_endpoint: None,
+            observed_ack_endpoint: None,
+            selected_endpoint: None,
+            ack_endpoint_authenticated: None,
             stage: stage.into(),
             endpoint,
             candidate_count,
@@ -300,6 +347,11 @@ impl DirectTraversalEvent {
             probe_tx_repeated_target_ports: None,
             detail: detail.into(),
         }
+    }
+
+    pub(super) fn with_socket_index(mut self, socket_index: Option<usize>) -> Self {
+        self.socket_index = socket_index;
+        self
     }
 
     pub(super) fn with_probe_coverage(

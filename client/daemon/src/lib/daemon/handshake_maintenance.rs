@@ -7,6 +7,7 @@ struct HandshakeMaintenanceContext {
     local_candidates: Arc<RwLock<Vec<String>>>,
     local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: Arc<RwLock<Vec<String>>>,
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
     candidate_refresh_lock: Arc<Mutex<()>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
@@ -26,6 +27,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         local_candidates,
         local_candidate_sources,
         local_network_identity,
+        candidate_snapshot,
         candidate_refresh_lock,
         nat_profile,
         udp_transport,
@@ -152,15 +154,10 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // a healthy Direct peer's rekey never re-triggers traversal churn.
             let refreshed = {
                 let _lease_guard = candidate_refresh_lock.lock().await;
-                let leased = {
-                    let candidates = local_candidates.read().await.clone();
-                    let sources = local_candidate_sources.read().await.clone();
-                    if !candidates.is_empty() {
-                        Some((candidates, sources))
-                    } else {
-                        None
-                    }
-                };
+                let leased = candidate_snapshot.read().await.as_ref().and_then(|snapshot| {
+                    (!snapshot.candidates.is_empty())
+                        .then(|| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()))
+                });
                 drop(_lease_guard);
                 if let Some(leased) = leased {
                     debug!(
@@ -178,6 +175,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         &local_candidates,
                         &local_candidate_sources,
                         &local_network_identity,
+                        &candidate_snapshot,
                         &candidate_refresh_lock,
                         &nat_profile,
                         "handshake maintenance",
@@ -371,6 +369,7 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     local_candidates: &Arc<RwLock<Vec<String>>>,
     local_candidate_sources: &Arc<RwLock<HashMap<String, String>>>,
     local_network_identity: &Arc<RwLock<Vec<String>>>,
+    candidate_snapshot: &Arc<RwLock<Option<CandidateSnapshotLease>>>,
     candidate_refresh_lock: &Arc<Mutex<()>>,
     nat_profile: &Arc<RwLock<Option<NatProfile>>>,
     reason: &str,
@@ -420,15 +419,25 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         });
     }
 
-    let previous_candidates = local_candidates.read().await.clone();
-    let previous_candidate_sources = local_candidate_sources.read().await.clone();
+    let previous_snapshot = candidate_snapshot.read().await.clone();
+    let previous_candidates = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.candidates.clone())
+        .unwrap_or_default();
+    let previous_candidate_sources = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.candidate_sources.clone())
+        .unwrap_or_default();
     let next_network_identity = prepare_signal_candidates_and_network_identity(
         &previous_candidates,
         &previous_candidate_sources,
         &mut candidates,
         &mut candidate_sources,
     );
-    let previous_network_identity = local_network_identity.read().await.clone();
+    let previous_network_identity = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.network_identity.clone())
+        .unwrap_or_default();
     let should_advance_generation =
         !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
     let changed = previous_candidates != candidates
@@ -436,6 +445,13 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         || previous_network_identity != next_network_identity;
 
     if changed {
+        publish_candidate_snapshot_to_store(
+            candidate_snapshot,
+            candidates.clone(),
+            candidate_sources.clone(),
+            next_network_identity.clone(),
+        )
+        .await;
         *local_candidates.write().await = candidates.clone();
         *local_candidate_sources.write().await = candidate_sources.clone();
         *local_network_identity.write().await = next_network_identity;

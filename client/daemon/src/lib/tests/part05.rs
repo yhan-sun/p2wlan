@@ -2,13 +2,9 @@
 /// exchange must bring BOTH sides to Direct with no TUN device and no user
 /// traffic.
 ///
-/// A validates its direct path to B (real WireGuard sessions, real UDP
-/// sockets, no control plane, no relay): A sends an encrypted validation
-/// request to B's observed endpoint; B decrypts it, promotes ITSELF to Direct
-/// (the authenticated request is direct-path evidence) and returns an
-/// idempotent ACK; A validates the ACK token against its outstanding
-/// expectation and promotes itself too.  Both sides end Direct even though no
-/// ICMP echo reply, TUN forward or user packet ever flows.
+/// Both sides run the owned encrypted validation worker.  An inbound request
+/// is only ingress evidence and an idempotent ACK response; each side must
+/// complete its own request/ACK transaction before promotion.
 #[tokio::test]
 async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
     let a_identity = NodeIdentity::generate();
@@ -81,18 +77,33 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
         })
     };
 
-    // --- Side B wiring.
+    // --- Side B wiring. The responder must feed an inbound validation request
+    // into its own worker; receiving the other side's request is not local
+    // request/ACK proof.
     let (udp_inbound_tx_b, udp_inbound_rx_b) = mpsc::channel(64);
-    let udp_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
-        .await
-        .unwrap()
-        .with_inbound_channel(udp_inbound_tx_b.clone());
-    let udp_b_addr = udp_b.local_addr().unwrap();
-    let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
-    let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
     let (wg_b, _encrypted_rx_b) = WireGuardTransport::new();
     wg_b.add_session("node-a", TransportSession::new(b_local_keys))
         .await;
+    let udp_b_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+        .await
+        .unwrap()
+        .with_wireguard_transport(wg_b.clone())
+        .with_inbound_channel(udp_inbound_tx_b.clone());
+    let trigger_udp_b = udp_b_base.clone();
+    let trigger_peers_b = peers_b.clone();
+    let trigger_wg_b = wg_b.clone();
+    let udp_b = udp_b_base.with_validation_trigger(Arc::new(move |observation| {
+        let udp = trigger_udp_b.clone();
+        let peers = trigger_peers_b.clone();
+        let wg = trigger_wg_b.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
+                .await;
+        });
+    }));
+    let udp_b_addr = udp_b.local_addr().unwrap();
+    let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
+    let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
     let wg_b_worker = {
         let wg = wg_b.clone();
         let peers = peers_b.clone();
@@ -133,12 +144,20 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
     .expect("both sides must converge to Direct via the validation request/ACK exchange");
 
     let diagnostics_a = peers_a.diagnostics().await;
+    let validation_ack = diagnostics_a[0]
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "direct_validation_ack_received")
+        .expect("the initiator must record the matched validation ACK");
     assert!(
-        diagnostics_a[0]
-            .direct_events
-            .iter()
-            .any(|event| event.stage == "direct_validation_ack_received"),
-        "the initiator must record the matched validation ACK"
+        validation_ack.validation_session_id.is_some(),
+        "the promotion ACK must remain tied to its owned encrypted validation worker"
+    );
+    assert_eq!(validation_ack.socket_index, Some(0));
+    assert!(
+        validation_ack.detail.contains("socket_index=0"),
+        "the promotion ACK event must retain the UDP socket that carried the encrypted ACK: {}",
+        validation_ack.detail
     );
     let diagnostics_b = peers_b.diagnostics().await;
     assert!(
@@ -148,6 +167,25 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
             .any(|event| event.stage == "direct_validation_request_received"),
         "the responder must record the validated request"
     );
+    for (label, diagnostics) in [("initiator", diagnostics_a), ("responder", diagnostics_b)] {
+        let events = &diagnostics[0].direct_events;
+        let request = events
+            .iter()
+            .find(|event| event.stage == "direct_validation_request_sent")
+            .unwrap_or_else(|| panic!("{label} must send its own validation request"));
+        let ack = events
+            .iter()
+            .find(|event| event.stage == "direct_validation_ack_received")
+            .unwrap_or_else(|| panic!("{label} must consume its own matching validation ACK"));
+        let promoted = events
+            .iter()
+            .find(|event| event.stage == "direct_validation_promoted")
+            .unwrap_or_else(|| panic!("{label} promotion must be tied to validation"));
+        assert_eq!(request.validation_session_id, ack.validation_session_id);
+        assert_eq!(ack.validation_session_id, promoted.validation_session_id);
+        assert_eq!(ack.endpoint, promoted.endpoint);
+        assert_eq!(ack.socket_index, promoted.socket_index);
+    }
 
     udp_a_worker.abort();
     udp_b_worker.abort();
@@ -254,11 +292,23 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
     let (wg_b, _encrypted_rx_b) = WireGuardTransport::new();
     wg_b.add_session("node-a", TransportSession::new(b_local_keys))
         .await;
-    let udp_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+    let udp_b_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
         .await
         .unwrap()
         .with_wireguard_transport(wg_b.clone())
         .with_inbound_channel(udp_inbound_tx_b.clone());
+    let trigger_udp_b = udp_b_base.clone();
+    let trigger_peers_b = peers_b.clone();
+    let trigger_wg_b = wg_b.clone();
+    let udp_b = udp_b_base.with_validation_trigger(Arc::new(move |observation| {
+        let udp = trigger_udp_b.clone();
+        let peers = trigger_peers_b.clone();
+        let wg = trigger_wg_b.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
+                .await;
+        });
+    }));
     let udp_b_addr = udp_b.local_addr().unwrap();
     let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
     let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
@@ -410,11 +460,23 @@ async fn responder_promotes_on_request_with_different_local_generation() {
     let (wg_b, _encrypted_rx_b) = WireGuardTransport::new();
     wg_b.add_session("node-a", TransportSession::new(b_local_keys))
         .await;
-    let udp_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+    let udp_b_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
         .await
         .unwrap()
         .with_wireguard_transport(wg_b.clone())
         .with_inbound_channel(udp_inbound_tx_b.clone());
+    let trigger_udp_b = udp_b_base.clone();
+    let trigger_peers_b = peers_b.clone();
+    let trigger_wg_b = wg_b.clone();
+    let udp_b = udp_b_base.with_validation_trigger(Arc::new(move |observation| {
+        let udp = trigger_udp_b.clone();
+        let peers = trigger_peers_b.clone();
+        let wg = trigger_wg_b.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
+                .await;
+        });
+    }));
     let udp_b_addr = udp_b.local_addr().unwrap();
     let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
     let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
@@ -505,6 +567,7 @@ async fn peer_reflexive_ingress_drops_observation_for_direct_peer() {
         ControlClient::disabled_for_test(),
         udp,
         peers.clone(),
+        PunchAttemptDeduplicator::default(),
         permits,
     ));
     ingress.submit(PeerReflexiveObservation {
@@ -597,6 +660,7 @@ async fn peer_reflexive_worker_rechecks_direct_before_http_and_fast_punch() {
         ControlClient::disabled_for_test(),
         udp,
         peers.clone(),
+        PunchAttemptDeduplicator::default(),
     )
     .await;
 
@@ -653,6 +717,7 @@ async fn peer_reflexive_signal_worker_fast_punches_a_non_direct_peer() {
         ControlClient::disabled_for_test(),
         udp,
         peers.clone(),
+        PunchAttemptDeduplicator::default(),
         permits,
     ));
     ingress.submit(PeerReflexiveObservation {
@@ -669,6 +734,94 @@ async fn peer_reflexive_signal_worker_fast_punches_a_non_direct_peer() {
     assert_eq!(&buf[..4], b"PNCH");
 
     loop_worker.abort();
+}
+
+#[tokio::test]
+async fn peer_reflexive_micro_window_is_deduplicated_bounded_and_records_actual_send() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = receiver.local_addr().unwrap();
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            // Avoid a legacy compatibility copy: this test's cap is the
+            // logical micro-window send count as seen by the UDP receiver.
+            app_version: "0.1.25".to_string(),
+            public_key: "pk".to_string(),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("node-a");
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let punch_at_ms = unix_time_millis().saturating_add(400);
+
+    spawn_peer_reflexive_micro_window(
+        udp,
+        peers.clone(),
+        deduplicator.clone(),
+        "node-b".to_string(),
+        vec![endpoint, endpoint],
+        Some(punch_at_ms),
+        "test_observer",
+    )
+    .await;
+    // The same relay window must fold rather than create a second owner or a
+    // second two-attempt burst.
+    spawn_peer_reflexive_micro_window(
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_local_node_id("node-a"),
+        peers.clone(),
+        deduplicator,
+        "node-b".to_string(),
+        vec![endpoint],
+        Some(punch_at_ms),
+        "test_duplicate",
+    )
+    .await;
+
+    let mut buf = [0u8; 512];
+    timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+        .await
+        .expect("the scheduled micro-window must emit a probe")
+        .unwrap();
+    let mut received = 1u32;
+    while let Ok(Ok(_)) = timeout(Duration::from_millis(80), receiver.recv_from(&mut buf)).await {
+        received = received.saturating_add(1);
+    }
+    assert!(
+        received <= PEER_REFLEXIVE_MICRO_WINDOW_ATTEMPTS,
+        "one endpoint/one owner micro-window must stay bounded, got {received} packets"
+    );
+    let events = peers.get_connection("node-b").await.unwrap().direct_events;
+    assert!(events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_micro_window_scheduled"));
+    let sent = events
+        .iter()
+        .find(|event| event.stage == "peer_reflexive_micro_window_first_packet_sent")
+        .expect("actual kernel send must be recorded separately from dispatch");
+    assert_eq!(sent.socket_index, Some(0));
+    assert!(sent.detail.contains("actual_first_send_at_ms=Some"));
+    assert!(events
+        .iter()
+        .any(|event| event.stage == "peer_reflexive_micro_window_deferred"));
+    assert!(
+        !peers.is_direct("node-b").await,
+        "a probe micro-window is only validation ingress, never Direct promotion"
+    );
 }
 
 #[tokio::test]

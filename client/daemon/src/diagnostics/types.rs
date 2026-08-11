@@ -97,6 +97,11 @@ pub struct DiagnosticsSnapshot {
     /// Per-socket counters for the bounded UDP traversal experiment.
     pub udp_socket_pool: Vec<UdpSocketPoolMemberDiagnostics>,
     pub local_candidates: Vec<String>,
+    /// Version and canonical hash of the atomic candidate snapshot backing
+    /// `local_candidates`. `None` means initial UDP gathering has not yet
+    /// committed a snapshot.
+    pub candidate_snapshot_version: Option<u64>,
+    pub candidate_snapshot_hash: Option<u64>,
     pub nat_profile: Option<NatProfile>,
     pub gateway_mapping: GatewayMappingDiagnostics,
     pub relay_servers: Vec<String>,
@@ -108,13 +113,26 @@ pub struct DiagnosticsSnapshot {
     pub health: crate::tasks::HealthSnapshot,
 }
 
+/// Lightweight, peer-scoped diagnostics response used by the dual-end
+/// harness. It intentionally omits the large local/network-wide sections of
+/// `/status` while retaining all fields needed to validate one Direct chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerScopedDiagnosticsSnapshot {
+    pub node_id: String,
+    pub network_id: String,
+    pub network_generation: u64,
+    pub network_peer_count: usize,
+    pub captured_at_ms: u64,
+    pub peer: Option<PeerDiagnostics>,
+}
+
 /// Shared state needed to build diagnostics responses.
 #[derive(Clone)]
 pub struct DiagnosticsContext {
     config: Arc<Config>,
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
-    local_candidates: Arc<RwLock<Vec<String>>>,
+    candidate_snapshot: Arc<RwLock<Option<crate::CandidateSnapshotLease>>>,
     nat_profile: Arc<RwLock<Option<NatProfile>>>,
     gateway_mapping: Arc<RwLock<GatewayMappingDiagnostics>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
@@ -126,11 +144,11 @@ pub struct DiagnosticsContext {
 
 impl DiagnosticsContext {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<Config>,
         peers: Arc<PeerManager>,
         udp_transport: Arc<RwLock<Option<UdpTransport>>>,
-        local_candidates: Arc<RwLock<Vec<String>>>,
+        candidate_snapshot: Arc<RwLock<Option<crate::CandidateSnapshotLease>>>,
         nat_profile: Arc<RwLock<Option<NatProfile>>>,
         gateway_mapping: Arc<RwLock<GatewayMappingDiagnostics>>,
         relay_transport: Arc<RwLock<Option<RelayTransport>>>,
@@ -143,7 +161,7 @@ impl DiagnosticsContext {
             config,
             peers,
             udp_transport,
-            local_candidates,
+            candidate_snapshot,
             nat_profile,
             gateway_mapping,
             relay_transport,

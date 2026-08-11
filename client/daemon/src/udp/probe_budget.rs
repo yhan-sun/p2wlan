@@ -19,9 +19,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -143,9 +146,153 @@ impl GlobalOutboundProbeBudget {
 /// foreground traversal allowance. It is still global and counts each actual
 /// (socket, candidate) admission, so adding peers cannot multiply traffic
 /// without bound.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct GlobalRelayBackoffHeartbeatBudget {
-    pub(super) state: Mutex<HashMap<RelayBackoffHeartbeatBudgetKey, VecDeque<Instant>>>,
+    /// One short-held synchronous mutex covers both committed packets and
+    /// in-flight reservations.  A reservation must be visible to another
+    /// heartbeat worker before its UDP send awaits, otherwise concurrent
+    /// workers could each observe spare capacity and oversubscribe the cap.
+    pub(super) state: StdMutex<RelayBackoffHeartbeatBudgetState>,
+    next_reservation_id: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(super) struct RelayBackoffHeartbeatBudgetState {
+    /// Only packets which actually entered the kernel send path live here.
+    /// Diagnostics and the sliding limits are intentionally based on this
+    /// map, not on attempted candidate/socket pairs.
+    pub(super) committed: HashMap<RelayBackoffHeartbeatBudgetKey, VecDeque<Instant>>,
+    /// Capacity temporarily held by a send that has not yet reported its
+    /// actual datagram count.  Dropping the reservation releases it.
+    reserved: HashMap<RelayBackoffHeartbeatBudgetKey, usize>,
+    reservations: HashMap<u64, RelayBackoffHeartbeatPendingReservation>,
+    /// A peer may receive at most one heartbeat endpoint group in one normal
+    /// 3-second service slot.  This is both a storm guard and the basis for
+    /// fair sharing when more than twelve relay peers are active.
+    service_slots: HashMap<(String, u64), RelayBackoffHeartbeatServiceSlot>,
+    active_peers: HashMap<String, u64>,
+    scheduler: RelayBackoffHeartbeatScheduler,
+    service_epoch: Instant,
+}
+
+impl Default for RelayBackoffHeartbeatBudgetState {
+    fn default() -> Self {
+        Self {
+            committed: HashMap::new(),
+            reserved: HashMap::new(),
+            reservations: HashMap::new(),
+            service_slots: HashMap::new(),
+            active_peers: HashMap::new(),
+            scheduler: RelayBackoffHeartbeatScheduler::default(),
+            service_epoch: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RelayBackoffHeartbeatPendingReservation {
+    keys: [RelayBackoffHeartbeatBudgetKey; 3],
+    packet_capacity: usize,
+    peer_id: String,
+    service_slot: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayBackoffHeartbeatServiceSlot {
+    Reserved(u64),
+    Committed,
+}
+
+/// A provisional heartbeat-budget allocation.  It reserves enough room for
+/// the authenticated packet and, when required, its legacy compatibility
+/// packet.  `commit` records only datagrams that were actually sent; dropping
+/// an uncommitted reservation returns all of its capacity.
+pub(super) struct RelayBackoffHeartbeatReservation {
+    budget: Arc<GlobalRelayBackoffHeartbeatBudget>,
+    id: Option<u64>,
+}
+
+impl RelayBackoffHeartbeatReservation {
+    pub(super) fn commit(mut self, actual_packets: usize) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        self.budget.finish_reservation(id, actual_packets);
+    }
+}
+
+impl Drop for RelayBackoffHeartbeatReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.budget.finish_reservation(id, 0);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayBackoffHeartbeatReservationRejection {
+    BudgetLimited,
+    FairnessDeferred,
+    ForegroundYield,
+}
+
+impl RelayBackoffHeartbeatReservationRejection {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::BudgetLimited => "relay_backoff_heartbeat_budget_limited",
+            Self::FairnessDeferred => "relay_backoff_heartbeat_fairness_deferred",
+            Self::ForegroundYield => "relay_backoff_heartbeat_foreground_reserved",
+        }
+    }
+}
+
+/// A categorized endpoint selected for exactly one low-rate heartbeat send.
+/// The endpoint group is chosen before a local socket, avoiding the old
+/// candidate × all-sockets expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RelayBackoffHeartbeatTarget {
+    pub(super) endpoint: SocketAddr,
+    pub(super) socket_index: usize,
+    pub(super) group: RelayBackoffHeartbeatTargetGroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayBackoffHeartbeatTargetGroup {
+    Priority,
+    Predicted,
+    Fallback,
+}
+
+impl RelayBackoffHeartbeatTargetGroup {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Predicted => "predicted",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RelayBackoffHeartbeatCursor {
+    priority: usize,
+    predicted: usize,
+    fallback: usize,
+    socket: usize,
+    beat: u64,
+}
+
+/// One normal heartbeat cadence is three seconds.  A 60-second 240 packet
+/// reserve therefore has twelve packet slots per cadence.  The rotating
+/// roster only matters above that peer count; with Mini/Air's current eleven
+/// peers every serviceable peer can receive one packet on every beat.
+const RELAY_BACKOFF_HEARTBEAT_SERVICE_SLOT: Duration = Duration::from_secs(3);
+const RELAY_BACKOFF_HEARTBEAT_PEERS_PER_SERVICE_SLOT: usize = 12;
+const RELAY_BACKOFF_HEARTBEAT_ACTIVE_PEER_RETENTION_SLOTS: u64 = 40;
+
+#[derive(Debug, Default)]
+struct RelayBackoffHeartbeatScheduler {
+    cursors: HashMap<(String, u64), RelayBackoffHeartbeatCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -161,16 +308,138 @@ impl GlobalRelayBackoffHeartbeatBudget {
         Self::default()
     }
 
-    /// Reserve the actual UDP datagrams emitted for one socket/target pair.
-    /// The caller invokes this once for every pair, never once for a candidate
-    /// list. Compatibility with legacy peers can cost two datagrams.
-    pub(super) async fn admit(&self, peer_id: &str, remote_ip: IpAddr, packet_cost: usize) -> bool {
-        if packet_cost == 0 {
-            return false;
+    #[cfg(test)]
+    pub(super) fn set_service_slot_for_test(&self, slot: u64) {
+        let elapsed = RELAY_BACKOFF_HEARTBEAT_SERVICE_SLOT
+            .checked_mul(u32::try_from(slot).unwrap_or(u32::MAX))
+            .unwrap_or(RELAY_BACKOFF_HEARTBEAT_BUDGET_WINDOW);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.service_epoch = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// Select exactly one endpoint group and one local socket for a heartbeat
+    /// beat.  The cursor belongs to `(peer, generation)`, not to a worker, so
+    /// a cancellation/replacement handshake cannot reset a 96-port sweep back
+    /// to its first few candidates.
+    pub(super) fn next_target(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        priority: &[SocketAddr],
+        predicted: &[SocketAddr],
+        fallback: &[SocketAddr],
+        socket_count: usize,
+    ) -> Option<RelayBackoffHeartbeatTarget> {
+        if socket_count == 0 || (priority.is_empty() && predicted.is_empty() && fallback.is_empty())
+        {
+            return None;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .scheduler
+            .cursors
+            .retain(|(known_peer, known_generation), _| {
+                known_peer != peer_id || *known_generation == generation
+            });
+        let cursor = state
+            .scheduler
+            .cursors
+            .entry((peer_id.to_string(), generation))
+            .or_default();
+
+        // A current authenticated/selected endpoint gets the first chance,
+        // while a five-beat cadence still spends most of its packets moving
+        // through the predicted window and periodically reaches fallbacks.
+        // This avoids a permanent priority-only loop after a port changes.
+        let preferred_group = match cursor.beat % 5 {
+            0 => RelayBackoffHeartbeatTargetGroup::Priority,
+            4 => RelayBackoffHeartbeatTargetGroup::Fallback,
+            _ => RelayBackoffHeartbeatTargetGroup::Predicted,
+        };
+        cursor.beat = cursor.beat.saturating_add(1);
+
+        let group_order = [
+            preferred_group,
+            RelayBackoffHeartbeatTargetGroup::Priority,
+            RelayBackoffHeartbeatTargetGroup::Predicted,
+            RelayBackoffHeartbeatTargetGroup::Fallback,
+        ];
+        let mut selected = None;
+        for group in group_order {
+            let endpoints = match group {
+                RelayBackoffHeartbeatTargetGroup::Priority => priority,
+                RelayBackoffHeartbeatTargetGroup::Predicted => predicted,
+                RelayBackoffHeartbeatTargetGroup::Fallback => fallback,
+            };
+            if endpoints.is_empty()
+                || selected
+                    .as_ref()
+                    .is_some_and(|(_, selected_group)| *selected_group == group)
+            {
+                continue;
+            }
+            let endpoint = match group {
+                RelayBackoffHeartbeatTargetGroup::Priority => {
+                    let index = cursor.priority % endpoints.len();
+                    cursor.priority = cursor.priority.saturating_add(1);
+                    endpoints[index]
+                }
+                RelayBackoffHeartbeatTargetGroup::Predicted => {
+                    let index = cursor.predicted % endpoints.len();
+                    cursor.predicted = cursor.predicted.saturating_add(1);
+                    endpoints[index]
+                }
+                RelayBackoffHeartbeatTargetGroup::Fallback => {
+                    let index = cursor.fallback % endpoints.len();
+                    cursor.fallback = cursor.fallback.saturating_add(1);
+                    endpoints[index]
+                }
+            };
+            selected = Some((endpoint, group));
+            break;
+        }
+
+        let (endpoint, group) = selected?;
+        let socket_index = cursor.socket % socket_count;
+        cursor.socket = cursor.socket.saturating_add(1);
+        Some(RelayBackoffHeartbeatTarget {
+            endpoint,
+            socket_index,
+            group,
+        })
+    }
+
+    /// Provisionally reserve room for one endpoint/socket heartbeat send.
+    /// The send path commits the exact physical datagram count after the
+    /// kernel accepted it.  A send error or cancelled owner drops this handle
+    /// and leaves no phantom budget entry behind.
+    pub(super) fn reserve(
+        self: &Arc<Self>,
+        peer_id: &str,
+        remote_ip: IpAddr,
+        packet_capacity: usize,
+    ) -> std::result::Result<
+        RelayBackoffHeartbeatReservation,
+        RelayBackoffHeartbeatReservationRejection,
+    > {
+        if packet_capacity == 0 {
+            return Err(RelayBackoffHeartbeatReservationRejection::BudgetLimited);
         }
         let now = Instant::now();
-        let mut state = self.state.lock().await;
-        state.retain(|_, sent| {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.committed.retain(|_, sent| {
             while sent.front().is_some_and(|sent_at| {
                 now.duration_since(*sent_at) >= RELAY_BACKOFF_HEARTBEAT_BUDGET_WINDOW
             }) {
@@ -178,38 +447,154 @@ impl GlobalRelayBackoffHeartbeatBudget {
             }
             !sent.is_empty()
         });
+        let service_slot = now
+            .saturating_duration_since(state.service_epoch)
+            .as_nanos()
+            .checked_div(RELAY_BACKOFF_HEARTBEAT_SERVICE_SLOT.as_nanos())
+            .and_then(|slot| u64::try_from(slot).ok())
+            .unwrap_or(u64::MAX);
+        state.active_peers.insert(peer_id.to_string(), service_slot);
+        state.active_peers.retain(|_, last_seen| {
+            service_slot.saturating_sub(*last_seen)
+                <= RELAY_BACKOFF_HEARTBEAT_ACTIVE_PEER_RETENTION_SLOTS
+        });
+        state.service_slots.retain(|(_, slot), value| {
+            *slot == service_slot || matches!(value, RelayBackoffHeartbeatServiceSlot::Reserved(_))
+        });
+        if state
+            .service_slots
+            .contains_key(&(peer_id.to_string(), service_slot))
+        {
+            return Err(RelayBackoffHeartbeatReservationRejection::FairnessDeferred);
+        }
+
+        let mut active_peers = state.active_peers.keys().collect::<Vec<_>>();
+        active_peers.sort_unstable();
+        if active_peers.len() > RELAY_BACKOFF_HEARTBEAT_PEERS_PER_SERVICE_SLOT {
+            let start = (service_slot as usize) % active_peers.len();
+            let selected = (0..RELAY_BACKOFF_HEARTBEAT_PEERS_PER_SERVICE_SLOT).any(|offset| {
+                active_peers[(start + offset) % active_peers.len()].as_str() == peer_id
+            });
+            if !selected {
+                return Err(RelayBackoffHeartbeatReservationRejection::FairnessDeferred);
+            }
+        }
 
         let network_key = RelayBackoffHeartbeatBudgetKey::Network;
         let peer_key = RelayBackoffHeartbeatBudgetKey::Peer(peer_id.to_string());
         let remote_ip_key = RelayBackoffHeartbeatBudgetKey::RemoteIp(remote_ip);
         if state
+            .committed
             .get(&network_key)
             .map_or(0, VecDeque::len)
-            .saturating_add(packet_cost)
+            .saturating_add(state.reserved.get(&network_key).copied().unwrap_or(0))
+            .saturating_add(packet_capacity)
             > RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW
             || state
+                .committed
                 .get(&peer_key)
                 .map_or(0, VecDeque::len)
-                .saturating_add(packet_cost)
+                .saturating_add(state.reserved.get(&peer_key).copied().unwrap_or(0))
+                .saturating_add(packet_capacity)
                 > RELAY_BACKOFF_HEARTBEAT_PER_PEER_PER_WINDOW
             || state
+                .committed
                 .get(&remote_ip_key)
                 .map_or(0, VecDeque::len)
-                .saturating_add(packet_cost)
+                .saturating_add(state.reserved.get(&remote_ip_key).copied().unwrap_or(0))
+                .saturating_add(packet_capacity)
                 > RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW
         {
-            return false;
+            return Err(RelayBackoffHeartbeatReservationRejection::BudgetLimited);
         }
 
-        for _ in 0..packet_cost {
-            state.entry(network_key.clone()).or_default().push_back(now);
-            state.entry(peer_key.clone()).or_default().push_back(now);
+        let id = self
+            .next_reservation_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("relay-backoff heartbeat reservation ID space exhausted");
+        let keys = [network_key, peer_key, remote_ip_key];
+        for key in &keys {
+            let current = state.reserved.get(key).copied().unwrap_or(0);
             state
-                .entry(remote_ip_key.clone())
-                .or_default()
-                .push_back(now);
+                .reserved
+                .insert(key.clone(), current.saturating_add(packet_capacity));
         }
-        true
+        state.reservations.insert(
+            id,
+            RelayBackoffHeartbeatPendingReservation {
+                keys,
+                packet_capacity,
+                peer_id: peer_id.to_string(),
+                service_slot,
+            },
+        );
+        state.service_slots.insert(
+            (peer_id.to_string(), service_slot),
+            RelayBackoffHeartbeatServiceSlot::Reserved(id),
+        );
+        Ok(RelayBackoffHeartbeatReservation {
+            budget: self.clone(),
+            id: Some(id),
+        })
+    }
+
+    fn finish_reservation(&self, id: u64, actual_packets: usize) {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(reservation) = state.reservations.remove(&id) else {
+            return;
+        };
+        let committed_packets = actual_packets.min(reservation.packet_capacity);
+        for key in &reservation.keys {
+            let remaining = state
+                .reserved
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(reservation.packet_capacity);
+            if remaining == 0 {
+                state.reserved.remove(key);
+            } else {
+                state.reserved.insert(key.clone(), remaining);
+            }
+            for _ in 0..committed_packets {
+                state
+                    .committed
+                    .entry(key.clone())
+                    .or_default()
+                    .push_back(now);
+            }
+        }
+        let service_key = (reservation.peer_id, reservation.service_slot);
+        match committed_packets {
+            0 => {
+                if matches!(
+                    state.service_slots.get(&service_key),
+                    Some(RelayBackoffHeartbeatServiceSlot::Reserved(owner)) if *owner == id
+                ) {
+                    state.service_slots.remove(&service_key);
+                }
+            }
+            _ => {
+                state
+                    .service_slots
+                    .insert(service_key, RelayBackoffHeartbeatServiceSlot::Committed);
+            }
+        }
+    }
+}
+
+impl Default for GlobalRelayBackoffHeartbeatBudget {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(RelayBackoffHeartbeatBudgetState::default()),
+            next_reservation_id: AtomicU64::new(1),
+        }
     }
 }
 

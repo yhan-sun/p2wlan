@@ -435,16 +435,27 @@ pub fn build_model(
     // Treat only *small* monotonic jumps as a low-confidence adjacent-port
     // window. The bound is exactly the wire/probe cap, so this cannot turn a
     // weak sample into an unbounded birthday scan or claim a false step.
+    //
+    // Later Mini-Air runs observed single-sample bursts far beyond that cap
+    // (+123 and +43 on otherwise steady +1..+23 allocations): the burst is
+    // other subscribers of the shared CGNAT consuming mappings, not a loss of
+    // allocator order. Same-direction jumps up to the bounded
+    // `MAX_MONOTONIC_WINDOW_JUMP` still produce a bounded adjacent-port
+    // window; the wider window is advertised when any sample exceeded the
+    // small window, so the peer can still probe the likely allocation region.
     if same_direction
         && deltas
             .iter()
-            .all(|delta| delta.unsigned_abs() as usize <= MAX_PREDICTED_PORTS)
+            .all(|delta| delta.unsigned_abs() as usize <= MAX_MONOTONIC_WINDOW_JUMP)
     {
+        let wide = deltas
+            .iter()
+            .any(|delta| delta.unsigned_abs() as usize > MAX_PREDICTED_PORTS);
         return PortModel {
             kind: PortModelKind::MonotonicWindow {
                 direction: if positive { 1 } else { -1 },
             },
-            confidence: 60,
+            confidence: if wide { 45 } else { 60 },
             public_ip,
             sequence: sequence.to_vec(),
             deltas,
@@ -497,6 +508,27 @@ pub fn build_model_for_batch(
 
 /// Maximum total predicted candidates emitted by `predict_ports`.
 pub const MAX_PREDICTED_PORTS: usize = 24;
+
+/// Largest same-direction single-sample jump a monotonic allocation window
+/// still accepts.  Shared CGNATs interleave other subscribers' mappings
+/// between our own STUN requests (Mini-Air observed +123 and +43 bursts);
+/// anything beyond this bound is treated as an unpredictable allocator.
+pub const MAX_MONOTONIC_WINDOW_JUMP: usize = 512;
+
+/// Wide fallback window emitted for noisy-but-monotonic allocations.
+///
+/// The receiver probes the fresh window inside its recovery budgets (the
+/// Predicted stage alone allows hundreds of probes), and the daemon's
+/// signaling layer reserves the same number of candidate slots for the fresh
+/// window, so the whole window survives candidate truncation.
+pub const MAX_MONOTONIC_WINDOW_PORTS: usize = 96;
+
+/// Whether a model's deltas show a burst beyond the small adjacent window.
+fn is_wide_monotonic_window(deltas: &[i16]) -> bool {
+    deltas
+        .iter()
+        .any(|delta| delta.unsigned_abs() as usize > MAX_PREDICTED_PORTS)
+}
 
 /// Build the rank-ordered candidate distribution for the next mapping.
 ///
@@ -592,9 +624,17 @@ pub fn predict_ports_for_elapsed(
         PortModelKind::MonotonicWindow { direction } => {
             // There is no justified top-1 stride here. Probe the bounded
             // adjacent window in the observed allocation direction, retaining
-            // the rank only as a deterministic send order.
+            // the rank only as a deterministic send order.  A wide window is
+            // used when any sample jumped beyond the small window: the burst
+            // proves the CGNAT is busy, so the peer-facing allocation can
+            // land farther away.
             let step = i16::from(direction);
-            for distance in 1..=MAX_PREDICTED_PORTS {
+            let window = if is_wide_monotonic_window(&model.deltas) {
+                MAX_MONOTONIC_WINDOW_PORTS
+            } else {
+                MAX_PREDICTED_PORTS
+            };
+            for distance in 1..=window {
                 candidates.push(PredictionCandidate {
                     port: modular_add(last, step.saturating_mul(distance as i16)),
                     rank: (distance - 1) as u8,
@@ -607,7 +647,14 @@ pub fn predict_ports_for_elapsed(
         PortModelKind::Unpredictable { .. } => {}
     }
 
-    candidates.truncate(MAX_PREDICTED_PORTS);
+    let window_cap = if matches!(model.kind, PortModelKind::MonotonicWindow { .. })
+        && is_wide_monotonic_window(&model.deltas)
+    {
+        MAX_MONOTONIC_WINDOW_PORTS
+    } else {
+        MAX_PREDICTED_PORTS
+    };
+    candidates.truncate(window_cap);
     candidates
 }
 
@@ -997,12 +1044,69 @@ mod tests {
     }
 
     #[test]
-    fn wide_monotonic_jitter_is_still_rejected() {
-        // Same direction alone is insufficient when the observed jumps exceed
-        // the hard 24-port prediction/probe window.
-        let model = build_model(&[1000u16, 1025, 1053], Some(ip()), 1000);
+    fn shared_cgnat_burst_beyond_small_window_builds_wide_monotonic_window() {
+        // Mini-Air round-8 capture on the AddressOrPortDependent side: a
+        // +123 single-sample burst on an otherwise steady +23/+3 allocation.
+        // Same direction, no reusable stride, but the allocator order is
+        // intact: the fallback must advertise a wide bounded window instead
+        // of rejecting the batch and signaling nothing.
+        let ports = [16311u16, 16434, 16457, 16460];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(
+            model.kind,
+            PortModelKind::MonotonicWindow { direction: 1 }
+        ));
+        assert_eq!(model.confidence, 45);
+
+        let predicted = predict_ports(&model, 16460);
+        assert_eq!(predicted.len(), MAX_MONOTONIC_WINDOW_PORTS);
+        assert_eq!(predicted[0].port, 16461);
+        assert_eq!(predicted[0].rank, 0);
+        assert_eq!(predicted.last().unwrap().port, 16556);
+        assert!(predicted
+            .iter()
+            .all(|candidate| candidate.port > 16460 && candidate.port <= 16556));
+    }
+
+    #[test]
+    fn shared_cgnat_moderate_burst_builds_wide_monotonic_window() {
+        // Mini-Air round-9 capture: +43 burst, then steady +4/+4.
+        let ports = [23356u16, 23399, 23403, 23407];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(
+            model.kind,
+            PortModelKind::MonotonicWindow { direction: 1 }
+        ));
+        let predicted = predict_ports(&model, 23407);
+        assert_eq!(predicted.len(), MAX_MONOTONIC_WINDOW_PORTS);
+        assert_eq!(predicted[0].port, 23408);
+    }
+
+    #[test]
+    fn monotonic_jump_beyond_wide_bound_is_still_rejected() {
+        // A jump beyond the bounded window means the allocator order itself
+        // cannot be trusted; the model must not claim a window for it.
+        let model = build_model(&[1000u16, 1025, 1565], Some(ip()), 1000);
         assert!(!model.kind.clone().is_predictable(), "{:?}", model.kind);
-        assert!(predict_ports(&model, 1053).is_empty());
+        assert!(predict_ports(&model, 1565).is_empty());
+
+        let mixed = build_model(&[1000u16, 1025, 1004], Some(ip()), 1000);
+        assert!(!mixed.kind.clone().is_predictable(), "{:?}", mixed.kind);
+        assert!(predict_ports(&mixed, 1004).is_empty());
+    }
+
+    #[test]
+    fn wide_window_respects_negative_monotonic_direction() {
+        let ports = [20000u16, 19999, 19970, 19960];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(
+            model.kind,
+            PortModelKind::MonotonicWindow { direction: -1 }
+        ));
+        let predicted = predict_ports(&model, 19960);
+        assert_eq!(predicted.len(), MAX_MONOTONIC_WINDOW_PORTS);
+        assert_eq!(predicted[0].port, 19959);
+        assert_eq!(predicted.last().unwrap().port, 19864);
     }
 
     #[test]

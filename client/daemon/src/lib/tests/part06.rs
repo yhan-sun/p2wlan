@@ -3,6 +3,7 @@
 // ============================================================
 
 use std::time::Duration;
+use std::sync::Arc;
 
 use p2pnet_crypto::NodeIdentity;
 use crate::relay_runtime::relay_renewal_deadline;
@@ -16,7 +17,9 @@ use tokio::time::{sleep, timeout};
 /// instead of the lease).
 #[tokio::test]
 async fn concurrent_initiators_share_one_candidate_snapshot_refresh() {
-    let daemon = Daemon::new(Config::generate_default("http://ctrl.test", "net1").unwrap());
+    let daemon = Arc::new(Daemon::new(
+        Config::generate_default("http://ctrl.test", "net1").unwrap(),
+    ));
     let candidates = vec!["203.0.113.10:45393".to_string(), "203.0.113.10:45394".to_string()];
     let sources = HashMap::from([
         ("203.0.113.10:45393".to_string(), "stun_observed".to_string()),
@@ -31,15 +34,22 @@ async fn concurrent_initiators_share_one_candidate_snapshot_refresh() {
         "a freshly published snapshot is inside its lease"
     );
 
-    // Two "concurrent initiators" both receive the identical snapshot.
-    let (a, b) = tokio::join!(
-        daemon.local_candidate_set_for_signal("initiator-a"),
-        daemon.local_candidate_set_for_signal("initiator-b"),
-    );
-    assert_eq!(a.0, candidates);
-    assert_eq!(b.0, candidates);
-    assert_eq!(a.1, sources);
-    assert_eq!(b.1, sources);
+    // A contention cohort of 64 concurrent initiators all receives the same
+    // committed snapshot without entering live gather or the refresh lock.
+    let mut workers = tokio::task::JoinSet::new();
+    for index in 0..64 {
+        let daemon = daemon.clone();
+        workers.spawn(async move {
+            daemon
+                .local_candidate_set_for_signal(&format!("initiator-{index}"))
+                .await
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        let (received_candidates, received_sources) = result.unwrap();
+        assert_eq!(received_candidates, candidates);
+        assert_eq!(received_sources, sources);
+    }
     assert!(
         daemon.candidate_snapshot_is_fresh().await,
         "reads must not consume or age the lease"

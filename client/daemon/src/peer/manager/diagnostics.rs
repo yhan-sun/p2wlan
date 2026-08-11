@@ -129,6 +129,61 @@ impl PeerManager {
         peers
     }
 
+    /// Return one peer's diagnostics from a single connection-lock snapshot.
+    ///
+    /// The diagnostics HTTP fast path uses this instead of materializing every
+    /// peer in a large control network.  The selector decision is deliberately
+    /// computed from the same immutable connection snapshot as state, pair,
+    /// validation events, and the persisted selection.
+    pub async fn diagnostic_with_path_selection(
+        &self,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+        direct_retry_after: Duration,
+        local_endpoint: Option<SocketAddr>,
+    ) -> Option<(u64, PeerDiagnostics)> {
+        let traversal_history = self.traversal_history.read().await.clone();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let recovery = self.recovery_epoch_diagnostics().await.remove(node_id);
+        // Freeze generation advancement while selecting and serializing this
+        // peer. This shares the same epoch boundary as Direct promotion, so a
+        // response cannot combine a new generation header with an old pair.
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let generation = self.current_network_generation_sync();
+        let conns = self.connections.read().await;
+        let conn = conns.get(node_id)?;
+        let current_selection =
+            conn.select_path_for_data(generation, prefer_direct, relay_available);
+        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+            conn,
+            Some(&current_selection),
+            Some(direct_retry_after),
+            generation,
+            local_endpoint,
+            Some(&traversal_history),
+            Some(&fresh_mapping_history),
+        );
+        diagnostics.recovery = recovery;
+        Some((generation, diagnostics))
+    }
+
+    /// Number of active peers. Offline control records do not count toward
+    /// the isolated two-device acceptance guard.
+    pub async fn active_connection_count(&self) -> usize {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|connection| connection.is_active())
+            .count()
+    }
+
     /// Serialized recovery-epoch budget reports for every peer with an active
     /// recovery epoch: the hard per-epoch ceilings (probe credit,
     /// fresh-mapping generations, HTTP publishes) are surfaced in status.

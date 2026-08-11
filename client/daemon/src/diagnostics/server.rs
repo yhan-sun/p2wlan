@@ -110,6 +110,21 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .unwrap_or(("GET", "/"));
     let (path, query) = split_request_target(target);
 
+    if method == "GET" {
+        if let Some(peer_id) = path.strip_prefix("/status/peer/") {
+            if peer_id.is_empty() || peer_id.contains('/') {
+                write_response(&mut stream, 400, "text/plain", "invalid peer id\n", cors_origin)
+                    .await?;
+                return Ok(());
+            }
+            let snapshot = build_peer_scoped_snapshot(context, peer_id).await;
+            let status = if snapshot.peer.is_some() { 200 } else { 404 };
+            let body = serde_json::to_string_pretty(&snapshot)?;
+            write_response(&mut stream, status, "application/json", &body, cors_origin).await?;
+            return Ok(());
+        }
+    }
+
     match (method, path) {
         ("GET", "/health") => {
             write_response(&mut stream, 200, "text/plain", "ok\n", cors_origin).await?

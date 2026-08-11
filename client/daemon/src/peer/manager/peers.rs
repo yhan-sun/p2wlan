@@ -43,9 +43,14 @@ fn push_unique_probe_key(
     candidates: &mut Vec<ProbeKeyCandidate>,
     key: ProbeMacKey,
     role: ProbeKeyRole,
+    session_id: Option<String>,
 ) {
     if !candidates.iter().any(|candidate| candidate.key == key) {
-        candidates.push(ProbeKeyCandidate { key, role });
+        candidates.push(ProbeKeyCandidate {
+            key,
+            role,
+            session_id,
+        });
     }
 }
 
@@ -59,6 +64,7 @@ fn push_probe_binding_compatibility_keys(
             candidates,
             derive_session_probe_mac_key(&base_key, session_id),
             ProbeKeyRole::Compatibility,
+            binding.session_id.clone(),
         );
     }
 }
@@ -89,6 +95,8 @@ impl PeerManager {
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
         let old_signaled_endpoint = conn.signaled_endpoint;
+        let old_online = conn.online;
+        let old_last_seen = conn.last_seen;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
 
@@ -163,7 +171,15 @@ impl PeerManager {
             }
         };
         let endpoint_changed = !is_new && old_signaled_endpoint != signaled_endpoint;
-        if (endpoint_changed && conn.endpoint == old_signaled_endpoint) || conn.endpoint.is_none() {
+        // PeerUpdated may carry a new host/private endpoint while an
+        // encrypted-confirmed public pair is live. Keep the confirmed pair as
+        // the active endpoint; the new value remains in signaled_endpoint and
+        // can enter the candidate/probing set after Direct health fails.
+        if (endpoint_changed
+            && conn.endpoint == old_signaled_endpoint
+            && !conn.direct_is_healthy_confirmed())
+            || conn.endpoint.is_none()
+        {
             conn.endpoint = signaled_endpoint;
         }
         conn.signaled_endpoint = signaled_endpoint;
@@ -182,6 +198,17 @@ impl PeerManager {
         } else if conn.state == ConnectionState::Closed {
             conn.transition(ConnectionState::Idle);
         }
+
+        // A control-plane online transition, a newer last-seen sample, or a
+        // new endpoint/identity is fresh evidence that an in-flight relay 404
+        // may belong to a reconnect/handoff.  It starts a new bounded grace
+        // window without touching any active recovery state.
+        let clear_relay_not_found_grace_after_lock = info.online
+            && (is_new
+                || !old_online
+                || info.last_seen > old_last_seen
+                || endpoint_changed
+                || public_key_changed);
 
         // Authoritative control-plane evidence (online transition, endpoint
         // or identity/incarnation change) re-opens recovery for a quarantined
@@ -204,6 +231,9 @@ impl PeerManager {
         drop(ip_map);
         if cancel_heartbeat_after_lock {
             self.cancel_relay_backoff_heartbeat(&info.node_id);
+        }
+        if clear_relay_not_found_grace_after_lock {
+            self.clear_relay_not_found_grace(&info.node_id).await;
         }
         if let Some(reason) = unquarantine_after_lock {
             self.unquarantine_peer(&info.node_id, reason).await;
@@ -231,6 +261,7 @@ impl PeerManager {
         }
         drop(conns);
         self.cancel_relay_backoff_heartbeat(node_id);
+        self.clear_relay_not_found_grace(node_id).await;
         self.direct_peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -265,6 +296,37 @@ impl PeerManager {
         }
     }
 
+    /// Atomically re-check the state observed before an asynchronous punch
+    /// setup and, if it is still current, enter HolePunching.  The caller
+    /// must not make this decision from a cloned `PeerConnection`: Direct
+    /// promotion may have committed while candidate refresh or HTTP work was
+    /// in flight.
+    pub(crate) async fn begin_hole_punch_if_current(
+        &self,
+        node_id: &str,
+        observed_generation: u64,
+        observed_commit_seq: Option<u64>,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if self.current_network_generation_sync() != observed_generation
+            || self.direct_commit_seq_sync(node_id) != observed_commit_seq
+        {
+            return false;
+        }
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        if conn.state == ConnectionState::Direct && conn.direct_is_healthy_confirmed() {
+            return false;
+        }
+        if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
+            conn.transition(ConnectionState::HolePunching);
+        }
+        true
+    }
+
     /// Record a direct traversal timeline event for diagnostics.
     pub async fn record_direct_event(
         &self,
@@ -281,6 +343,123 @@ impl PeerManager {
                 generation,
                 stage,
                 endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+            );
+        }
+    }
+
+    /// Generation-stable direct-event recorder with the actual UDP socket
+    /// index when receive-side code can identify it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_event_for_generation_with_socket(
+        &self,
+        node_id: &str,
+        generation: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.record_direct_event_with_socket(
+                generation,
+                stage,
+                endpoint,
+                socket_index,
+                candidate_count,
+                sent_probes,
+                detail,
+            );
+        }
+    }
+
+    /// Record a lifecycle event for one owned encrypted direct-validation
+    /// worker.  The worker's lease supplies `generation` and
+    /// `validation_session_id`; do not substitute the manager's current
+    /// generation here because this method is also used to explain a worker
+    /// that was cancelled by a generation advance.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_validation_event(
+        &self,
+        node_id: &str,
+        generation: u64,
+        validation_session_id: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        self.record_direct_validation_event_with_socket(
+            node_id,
+            generation,
+            validation_session_id,
+            stage,
+            endpoint,
+            None,
+            candidate_count,
+            sent_probes,
+            detail,
+        )
+        .await;
+    }
+
+    /// Generation- and owner-stable validation lifecycle recorder with the
+    /// actual UDP socket index where it is available.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_validation_event_with_socket(
+        &self,
+        node_id: &str,
+        generation: u64,
+        validation_session_id: u64,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        self.record_direct_validation_event_with_metadata(
+            node_id,
+            generation,
+            DirectValidationEventMetadata {
+                local_validation_session_id: Some(validation_session_id),
+                ..DirectValidationEventMetadata::default()
+            },
+            stage,
+            endpoint,
+            socket_index,
+            candidate_count,
+            sent_probes,
+            detail,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_validation_event_with_metadata(
+        &self,
+        node_id: &str,
+        generation: u64,
+        metadata: DirectValidationEventMetadata,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            conn.record_direct_validation_event_with_metadata(
+                generation,
+                metadata,
+                stage,
+                endpoint,
+                socket_index,
                 candidate_count,
                 sent_probes,
                 detail,
@@ -553,11 +732,37 @@ impl PeerManager {
     /// New peers with an explicit signaling session ID receive a session-bound
     /// key; legacy peers without a session ID retain the static v2 skeleton key.
     pub async fn probe_key_for_peer(&self, node_id: &str) -> Option<ProbeMacKey> {
+        self.probe_key_and_session_for_peer(node_id)
+            .await
+            .map(|(key, _)| key)
+    }
+
+    /// Return the active Probe v2 MAC key together with the session that
+    /// derived it under one connection snapshot.  The session is carried by a
+    /// pending outbound probe solely for diagnostics attribution; it is never
+    /// trusted in place of MAC verification.
+    pub(crate) async fn probe_key_and_session_for_peer(
+        &self,
+        node_id: &str,
+    ) -> Option<(ProbeMacKey, Option<String>)> {
         self.connections
             .read()
             .await
             .get(node_id)
-            .and_then(effective_probe_mac_key)
+            .and_then(|connection| {
+                effective_probe_mac_key(connection)
+                    .map(|key| (key, connection.probe_session_id.clone()))
+            })
+    }
+
+    /// Snapshot the active Probe session for peer-scoped receive diagnostics.
+    /// The value is not sent on the wire and cannot influence authentication.
+    pub(crate) async fn probe_session_id_for_peer(&self, node_id: &str) -> Option<String> {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|connection| connection.probe_session_id.clone())
     }
 
     /// Return role-tagged Probe-v2 keys for inbound authentication. Only an
@@ -583,6 +788,7 @@ impl PeerManager {
             &mut candidates,
             probe_mac_key_for_binding(base_key, &active),
             ProbeKeyRole::Active,
+            active.session_id.clone(),
         );
         for pending in pending.values() {
             let role = if pending.promote_on_match {
@@ -600,6 +806,7 @@ impl PeerManager {
                 &mut candidates,
                 probe_mac_key_for_binding(base_key, &pending.binding),
                 role,
+                pending.binding.session_id.clone(),
             );
         }
         if let Some(previous) = previous.as_ref() {
@@ -607,6 +814,7 @@ impl PeerManager {
                 &mut candidates,
                 probe_mac_key_for_binding(base_key, &previous.binding),
                 ProbeKeyRole::Previous,
+                previous.binding.session_id.clone(),
             );
         }
         push_probe_binding_compatibility_keys(&mut candidates, base_key, &active);
@@ -628,6 +836,7 @@ impl PeerManager {
             &mut candidates,
             base_key,
             ProbeKeyRole::Compatibility,
+            None,
         );
         candidates
     }

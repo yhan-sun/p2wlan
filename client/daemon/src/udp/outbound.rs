@@ -404,6 +404,33 @@ impl UdpTransport {
         .map(|report| report.packets_sent)
     }
 
+    /// Send a deliberately tiny, cancellation-owned rendezvous window from
+    /// one socket.  Peer-reflexive signaling uses this instead of the normal
+    /// active-pool sweep: a shared rendezvous must not expand one fresh
+    /// endpoint into candidate × socket traffic, and a revoked owner must
+    /// stop before the next physical send.
+    pub(crate) async fn punch_candidates_primary_socket_until_not_direct_gated_report(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<PunchSendReport> {
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::PrimaryOnly,
+            &move || !peers.is_direct_sync(&gate_peer),
+            owner_gate,
+        )
+        .await
+    }
+
     async fn punch_candidates_with_socket_policy(
         &self,
         peer_id: &str,
@@ -474,6 +501,12 @@ impl UdpTransport {
         let mut sent_ports = HashSet::new();
         let mut socket0_sent = 0u32;
         let mut alt_socket_sent = 0u32;
+        // `packets_sent` intentionally remains the logical probe count used
+        // by recovery accounting.  Keep actual kernel datagrams separately
+        // so diagnostics can distinguish a legacy compatibility copy from a
+        // second candidate attempt and report the socket that really sent.
+        let mut first_send_at_ms = None;
+        let mut per_socket_sent = HashMap::<usize, u32>::new();
         let socket_count = socket_policy.socket_count(self);
         let generation_at_start = self.peers.current_network_generation_sync();
         // Monotonic direct-commit sequence snapshot: a promotion (or a
@@ -639,16 +672,14 @@ impl UdpTransport {
                         continue;
                     }
                     let admission = if socket_policy == PunchSocketPolicy::RelayBackoffHeartbeat {
-                        // The heartbeat uses its own dedicated per-peer budget
-                        // and never consumes the recovery-epoch credit.
-                        if self
-                            .admit_relay_backoff_heartbeat_probe(peer_id, candidate)
-                            .await
-                        {
-                            OutboundProbeAdmission::Accepted
-                        } else {
-                            OutboundProbeAdmission::HeartbeatBudgetLimited
-                        }
+                        // Relay-backoff heartbeats deliberately do not use
+                        // this generic candidate × socket sweep. Their
+                        // dedicated path picks one endpoint group and one
+                        // rotating local socket, then commits the budget only
+                        // after the UDP send succeeds. Keep this branch
+                        // closed so a future caller cannot restore the old
+                        // multiplication storm.
+                        OutboundProbeAdmission::HeartbeatBudgetLimited
                     } else {
                         self.admit_outbound_connectivity_probe(peer_id, candidate, socket_index)
                             .await
@@ -815,13 +846,25 @@ impl UdpTransport {
                         self.send_heartbeat_probe_from_socket(socket_index, peer_id, candidate)
                             .await
                     } else {
-                        self.send_probe_from_socket(socket_index, Some(peer_id), candidate)
-                            .await
+                        self.send_probe_from_socket_with_nomination_result(
+                            socket_index,
+                            Some(peer_id),
+                            candidate,
+                            false,
+                            PendingProbePurpose::ConnectivityCheck,
+                        )
+                        .await
                     };
                     match send_result {
-                        Ok(_) => {
+                        Ok(sent) => {
                             packets_sent += 1;
                             batch_sent = batch_sent.saturating_add(1);
+                            if let Some(sent_at_ms) = sent.first_send_at_ms {
+                                first_send_at_ms.get_or_insert(sent_at_ms);
+                            }
+                            let socket_datagrams = per_socket_sent.entry(sent.socket_index).or_default();
+                            *socket_datagrams = socket_datagrams
+                                .saturating_add(u32::from(sent.datagrams_sent));
                             if socket_index == 0 {
                                 socket0_sent = socket0_sent.saturating_add(1);
                             } else {
@@ -951,6 +994,13 @@ impl UdpTransport {
 
         let unique_target_ports = u32::try_from(sent_ports.len()).unwrap_or(u32::MAX);
         let repeated_target_ports = packets_sent.saturating_sub(unique_target_ports);
+        let mut per_socket_sent = per_socket_sent.into_iter().collect::<Vec<_>>();
+        per_socket_sent.sort_unstable_by_key(|(socket_index, _)| *socket_index);
+        let per_socket_summary = per_socket_sent
+            .iter()
+            .map(|(socket_index, sent)| format!("{socket_index}:{sent}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let stage = match socket_policy {
             PunchSocketPolicy::ActivePool if socket_count > 1 => "active_pool_scan_completed",
             PunchSocketPolicy::RemoteScatterPool if socket_count > 1 => {
@@ -970,7 +1020,7 @@ impl UdpTransport {
                 Some(candidates.len()),
                 Some(packets_sent),
                 format!(
-                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
+                    "scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} first_send_at_ms={first_send_at_ms:?} per_socket_actual_datagrams={per_socket_summary} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
                     socket_policy.label(),
                     self.socket_count(),
                     socket_count,
@@ -987,7 +1037,7 @@ impl UdpTransport {
             )
             .await;
         info!(
-            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} session_capped={session_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
+            "{stage} peer_id={} scan_socket_policy={} active_sockets={} punch_sockets={} candidate_count={} attempts={} sent={} socket0_sent={} alt_socket_sent={} unique_target_endpoints={} unique_target_ports={} repeated_target_ports={} first_send_at_ms={first_send_at_ms:?} per_socket_actual_datagrams={per_socket_summary} budget_skipped={budget_skipped} epoch_budget_exhausted={epoch_budget_exhausted} candidate_iteration_capped={candidate_iteration_capped} session_capped={session_capped} commit_seq={commit_seq_at_start:?} commit_seq_changed_abort={commit_seq_changed_abort}",
             peer_id,
             socket_policy.label(),
             self.socket_count(),
@@ -1005,6 +1055,8 @@ impl UdpTransport {
         Ok(PunchSendReport {
             packets_sent,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
+            first_send_at_ms,
+            per_socket_sent,
             budget_skipped,
             epoch_budget_exhausted,
             candidate_iteration_capped,
@@ -1106,7 +1158,6 @@ impl UdpTransport {
                     .punch_candidates_relay_backoff_heartbeat_gated(
                         &peer_id,
                         targets,
-                        1,
                         &owner_gate,
                     )
                     .await;
@@ -1291,44 +1342,266 @@ impl UdpTransport {
             .is_some_and(|lease| lease.owner_token == owner_token)
     }
 
-    /// One heartbeat beat: a bounded single-attempt sweep of the peer's
-    /// trusted endpoints using the dedicated heartbeat budget.  Only tests
-    /// call this owner-less variant; the worker uses the gated variant.
+    /// Park at the final heartbeat send boundary in deterministic tests, then
+    /// re-check ownership.  This preserves the quit-handshake invariant: a
+    /// replacement is never allowed to overlap an old owner's UDP sends, and
+    /// a cancellation while a worker is parked cannot leak one last packet.
+    async fn relay_backoff_heartbeat_send_allowed(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
+    ) -> bool {
+        let path_valid = || {
+            owner_gate()
+                && self.peers.peer_exists_sync(peer_id)
+                && !self.peers.is_direct_sync(peer_id)
+                && self.peers.current_network_generation_sync() == generation
+        };
+        if !path_valid() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            let gate = self
+                .heartbeat_send_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(gate) = gate {
+                gate.reached.notify_one();
+                let _ = gate.release.wait().await;
+                if !path_valid() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Emit diagnostics for exactly one relay-backoff heartbeat service beat.
+    /// `packets_sent` is physical UDP datagrams accepted by the socket, not a
+    /// candidate/socket attempt count.
+    async fn record_relay_backoff_heartbeat_beat(
+        &self,
+        peer_id: &str,
+        targets: &crate::peer::RelayBackoffHeartbeatTargetSet,
+        target: Option<probe_budget::RelayBackoffHeartbeatTarget>,
+        packets_sent: u32,
+        budget_skipped: u32,
+        reason: &str,
+    ) {
+        let endpoint = target.map(|target| target.endpoint);
+        let socket_index = target.map(|target| target.socket_index);
+        let target_group = target
+            .map(|target| target.group.label())
+            .unwrap_or("none");
+        let socket0_sent = if socket_index == Some(0) {
+            packets_sent
+        } else {
+            0
+        };
+        let alt_socket_sent = if socket_index.is_some_and(|index| index != 0) {
+            packets_sent
+        } else {
+            0
+        };
+        let unique_target_endpoints = u32::from(endpoint.is_some() && packets_sent > 0);
+        let unique_target_ports = unique_target_endpoints;
+        let stage = if budget_skipped > 0 {
+            "relay_backoff_heartbeat_beat_deferred"
+        } else if packets_sent == 0 {
+            "relay_backoff_heartbeat_send_error"
+        } else {
+            "relay_backoff_heartbeat_beat_completed"
+        };
+        self.peers
+            .record_direct_event_with_probe_coverage(
+                peer_id,
+                stage,
+                endpoint,
+                Some(targets.candidate_count()),
+                Some(packets_sent),
+                format!(
+                    "scan_socket_policy=relay_backoff_heartbeat candidate_count={} priority_candidates={} predicted_candidates={} fallback_candidates={} selected_target_group={target_group} selected_socket_index={} actual_kernel_datagrams={packets_sent} unique_target_endpoints={unique_target_endpoints} budget_skipped={budget_skipped} reason={reason} generation={}",
+                    targets.candidate_count(),
+                    targets.priority.len(),
+                    targets.predicted.len(),
+                    targets.fallback.len(),
+                    socket_index.map_or_else(|| "none".to_string(), |index| index.to_string()),
+                    targets.generation,
+                ),
+                socket0_sent,
+                alt_socket_sent,
+                unique_target_ports,
+                0,
+            )
+            .await;
+    }
+
+    /// One bounded relay-backed heartbeat beat.  This intentionally selects
+    /// the endpoint group before the local socket and sends at most one
+    /// logical probe transaction (one or two physical datagrams only for a
+    /// legacy peer).  It never constructs a candidate × socket work list.
+    async fn punch_relay_backoff_heartbeat_target_set_gated(
+        &self,
+        peer_id: &str,
+        targets: crate::peer::RelayBackoffHeartbeatTargetSet,
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<PunchSendReport> {
+        if targets.is_empty()
+            || !self.peers.peer_exists_sync(peer_id)
+            || self.peers.is_direct_sync(peer_id)
+            || self.peers.current_network_generation_sync() != targets.generation
+            || !owner_gate()
+        {
+            return Ok(PunchSendReport::default());
+        }
+
+        let Some(target) = self.relay_backoff_heartbeat_budget.next_target(
+            peer_id,
+            targets.generation,
+            &targets.priority,
+            &targets.predicted,
+            &targets.fallback,
+            self.socket_count(),
+        ) else {
+            return Ok(PunchSendReport::default());
+        };
+
+        let reservation = match self
+            .reserve_relay_backoff_heartbeat_probe(peer_id, target.endpoint)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(rejection) => {
+                self.record_relay_backoff_heartbeat_beat(
+                    peer_id,
+                    &targets,
+                    Some(target),
+                    0,
+                    1,
+                    rejection.reason(),
+                )
+                .await;
+                trace!(
+                    peer_id,
+                    target = %target.endpoint,
+                    socket_index = target.socket_index,
+                    target_group = target.group.label(),
+                    reason = rejection.reason(),
+                    "Deferred relay-backoff heartbeat endpoint group"
+                );
+                return Ok(PunchSendReport {
+                    budget_skipped: 1,
+                    ..PunchSendReport::default()
+                });
+            }
+        };
+
+        // Reservation is deliberately obtained before this final owner gate
+        // so concurrent workers cannot oversubscribe.  A revoked owner drops
+        // it without committing a phantom packet.
+        if !self
+            .relay_backoff_heartbeat_send_allowed(peer_id, targets.generation, owner_gate)
+            .await
+        {
+            self.record_relay_backoff_heartbeat_beat(
+                peer_id,
+                &targets,
+                Some(target),
+                0,
+                0,
+                "heartbeat_owner_or_path_revoked_before_send",
+            )
+            .await;
+            return Ok(PunchSendReport::default());
+        }
+
+        match self
+            .send_heartbeat_probe_from_socket(target.socket_index, peer_id, target.endpoint)
+            .await
+        {
+                Ok(sent) => {
+                    let packets_sent = u32::from(sent.datagrams_sent);
+                    reservation.commit(usize::from(sent.datagrams_sent));
+                self.peers
+                    .record_direct_probe_sent(peer_id, target.endpoint)
+                    .await;
+                self.record_relay_backoff_heartbeat_beat(
+                    peer_id,
+                    &targets,
+                    Some(target),
+                    packets_sent,
+                    0,
+                    "actual_kernel_datagrams_committed",
+                )
+                .await;
+                Ok(PunchSendReport {
+                    packets_sent,
+                    unique_target_endpoints: 1,
+                    first_send_at_ms: sent.first_send_at_ms,
+                    per_socket_sent: vec![(sent.socket_index, packets_sent)],
+                    ..PunchSendReport::default()
+                })
+            }
+            Err(error) => {
+                // The reservation's Drop implementation releases every
+                // packet slot because no UDP datagram was accepted.
+                debug!(
+                    peer_id,
+                    target = %target.endpoint,
+                    socket_index = target.socket_index,
+                    target_group = target.group.label(),
+                    error = %error,
+                    "Relay-backoff heartbeat UDP send failed"
+                );
+                self.record_relay_backoff_heartbeat_beat(
+                    peer_id,
+                    &targets,
+                    Some(target),
+                    0,
+                    0,
+                    "udp_send_error_reservation_released",
+                )
+                .await;
+                Ok(PunchSendReport::default())
+            }
+        }
+    }
+
+    /// One heartbeat beat with a per-send owner gate.  The worker passes the
+    /// categorized target snapshot so candidate refreshes cannot recreate the
+    /// old generic sweep.
+    pub(crate) async fn punch_candidates_relay_backoff_heartbeat_gated(
+        &self,
+        peer_id: &str,
+        targets: crate::peer::RelayBackoffHeartbeatTargetSet,
+        owner_gate: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<PunchSendReport> {
+        self.punch_relay_backoff_heartbeat_target_set_gated(peer_id, targets, owner_gate)
+            .await
+    }
+
+    /// Test-only convenience wrapper.  Its raw endpoint list is treated as a
+    /// predicted window, which lets deterministic tests exercise cursor
+    /// coverage without needing a control-plane candidate snapshot.
     #[cfg(test)]
     pub(crate) async fn punch_candidates_relay_backoff_heartbeat(
         &self,
         peer_id: &str,
         candidates: Vec<SocketAddr>,
-        attempts: u32,
+        _attempts: u32,
     ) -> Result<PunchSendReport> {
-        self.punch_candidates_relay_backoff_heartbeat_gated(peer_id, candidates, attempts, &|| true)
-            .await
-    }
-
-    /// One heartbeat beat with a per-send owner gate.
-    ///
-    /// The gate is re-validated before every actual UDP probe: owner token
-    /// still current, not cancelled, peer exists and is not Direct, and the
-    /// relay safety net still stands.
-    pub(crate) async fn punch_candidates_relay_backoff_heartbeat_gated(
-        &self,
-        peer_id: &str,
-        candidates: Vec<SocketAddr>,
-        attempts: u32,
-        owner_gate: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<PunchSendReport> {
-        let gate_peer = peer_id.to_string();
-        let peers = self.peers.clone();
-        self.punch_candidates_with_socket_policy_and_direct_gate(
+        self.punch_relay_backoff_heartbeat_target_set_gated(
             peer_id,
-            candidates,
-            Duration::from_millis(20),
-            attempts,
-            PunchSocketPolicy::RelayBackoffHeartbeat,
-            &move || {
-                peers.peer_exists_sync(&gate_peer) && !peers.is_direct_sync(&gate_peer)
+            crate::peer::RelayBackoffHeartbeatTargetSet {
+                generation: self.peers.current_network_generation_sync(),
+                priority: Vec::new(),
+                predicted: candidates,
+                fallback: Vec::new(),
             },
-            owner_gate,
+            &|| true,
         )
         .await
     }
@@ -1363,6 +1636,24 @@ impl UdpTransport {
                 packet.peer_id
             ))),
         };
+        self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
+            .await
+    }
+
+    /// Send one encrypted packet on an EXPLICIT socket that was resolved and
+    /// leased by the caller (`prepare_direct_validation_send`).
+    ///
+    /// No re-resolution happens here: the validation expectation is keyed to
+    /// `socket_index`, so the send must use exactly the resolved socket or a
+    /// detach/affinity switch between registration and send would make the
+    /// ACK unmatchable.
+    pub(crate) async fn send_encrypted_packet_on_socket(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+    ) -> Result<usize> {
         let sent = socket
             .send_to(&packet.wire_bytes, endpoint)
             .await

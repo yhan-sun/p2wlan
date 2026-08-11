@@ -1,3 +1,27 @@
+/// The resolved socket for one owned encrypted direct-validation request.
+///
+/// Produced by `UdpTransport::prepare_direct_validation_send`: the index and
+/// the socket are the exact ones recorded in the ACK expectation, so the send
+/// uses this socket directly instead of re-resolving (which could observe a
+/// detach or an affinity switch between the expectation registration and the
+/// actual kernel send).
+#[derive(Debug)]
+pub(crate) struct PreparedDirectValidationSend {
+    pub(crate) socket_index: usize,
+    pub(crate) socket: Arc<UdpSocket>,
+}
+
+/// Why a validation send could not be prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationSendError {
+    /// The validation owner no longer owns the endpoint (revoked, replaced
+    /// or the network generation advanced): nothing was registered and the
+    /// resolved socket lease was released.
+    OwnerRevoked,
+    /// No UDP socket could be resolved for the peer.
+    NoSocket,
+}
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
@@ -37,6 +61,10 @@ pub struct UdpTransport {
     socket_pool_diagnostics: Arc<Mutex<Vec<UdpSocketPoolMemberDiagnostics>>>,
     dynamic_socket_counter: Arc<AtomicUsize>,
     dynamic_socket_diagnostics: Arc<Mutex<HashMap<usize, UdpSocketPoolMemberDiagnostics>>>,
+    /// Authenticated probe receive counters keyed by `(peer_id, generation)`.
+    /// Aggregate socket counters remain available for topology-free diagnostics,
+    /// but they must never be used as evidence for a single peer's timeout.
+    peer_probe_rx_diagnostics: PeerProbeRxDiagnostics,
     inbound_tx: Option<mpsc::Sender<ReceivedEncryptedPacket>>,
     /// Owner of the daemon publication currently allowed to turn an
     /// authenticated UDP envelope into Direct-path state. Socket readers
@@ -124,6 +152,7 @@ impl UdpTransport {
             }])),
             dynamic_socket_counter: Arc::new(AtomicUsize::new(0)),
             dynamic_socket_diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            peer_probe_rx_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx: None,
             inbound_publication_owner: Arc::new(AtomicU64::new(0)),
             peer_reflexive_ingress: None,
@@ -225,7 +254,19 @@ impl UdpTransport {
 
     /// A stable, endpoint-free view of the bounded socket pool activity.
     pub async fn socket_pool_diagnostics(&self) -> Vec<UdpSocketPoolMemberDiagnostics> {
-        self.socket_pool_diagnostics.lock().await.clone()
+        let mut sockets = self.socket_pool_diagnostics.lock().await.clone();
+        // A fresh-mapping socket can become the adopted Direct socket. It is
+        // just as relevant to an audited traversal run as the static pool,
+        // so expose its counters in the same stable, endpoint-free view.
+        sockets.extend(
+            self.dynamic_socket_diagnostics
+                .lock()
+                .await
+                .values()
+                .cloned(),
+        );
+        sockets.sort_by_key(|member| member.socket_index);
+        sockets
     }
 
     /// Aggregate receive-side probe counters across every bound UDP socket.
@@ -265,6 +306,87 @@ impl UdpTransport {
         )
     }
 
+    /// Return authenticated probe receive counters for exactly one peer in one
+    /// local network generation and current Probe session. Unlike
+    /// `probe_rx_snapshot`, this cannot be advanced by another peer sharing a
+    /// socket pool or an older session for the same peer.
+    #[allow(dead_code)] // retained for focused attribution tests; live loops pin a session below.
+    pub(crate) async fn probe_rx_snapshot_for_peer(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) -> UdpProbeRxSnapshot {
+        let session_id = self.peers.probe_session_id_for_peer(peer_id).await;
+        self.probe_rx_snapshot_for_peer_session(peer_id, generation, session_id.as_deref())
+            .await
+    }
+
+    /// Read counters for the exact Probe-v2 session which was active when a
+    /// punch task started.  Callers that take a before/after delta must keep
+    /// this session value stable for the lifetime of that task: looking up
+    /// the *current* binding at the end would otherwise accidentally compare
+    /// two different rekey epochs.
+    pub(crate) async fn probe_rx_snapshot_for_peer_session(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        session_id: Option<&str>,
+    ) -> UdpProbeRxSnapshot {
+        let now = Instant::now();
+        let mut diagnostics = self.peer_probe_rx_diagnostics.lock().await;
+        diagnostics.retain(|_, entry| {
+            now.saturating_duration_since(entry.last_updated) < PEER_PROBE_RX_DIAGNOSTICS_RETENTION
+        });
+        diagnostics
+            .get(&(
+                peer_id.to_string(),
+                generation,
+                session_id.map(str::to_string),
+            ))
+            .map(|entry| entry.snapshot)
+            .unwrap_or_default()
+    }
+
+    /// Update bounded authenticated probe counters for one verified peer and
+    /// generation.  The key is derived from the authenticated Probe-v2 source
+    /// identity (or a matched pending probe for legacy compatibility), never
+    /// from an unauthenticated source address.
+    async fn update_peer_probe_rx_diagnostics(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        session_id: Option<&str>,
+        update: impl FnOnce(&mut UdpProbeRxSnapshot),
+    ) {
+        let now = Instant::now();
+        let key = (
+            peer_id.to_string(),
+            generation,
+            session_id.map(str::to_string),
+        );
+        let mut diagnostics = self.peer_probe_rx_diagnostics.lock().await;
+        diagnostics.retain(|_, entry| {
+            now.saturating_duration_since(entry.last_updated) < PEER_PROBE_RX_DIAGNOSTICS_RETENTION
+        });
+        if !diagnostics.contains_key(&key)
+            && diagnostics.len() >= PEER_PROBE_RX_DIAGNOSTICS_MAX_ENTRIES
+        {
+            if let Some(oldest) = diagnostics
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_updated)
+                .map(|(key, _)| key.clone())
+            {
+                diagnostics.remove(&oldest);
+            }
+        }
+        let entry = diagnostics.entry(key).or_insert_with(|| PeerProbeRxEntry {
+            snapshot: UdpProbeRxSnapshot::default(),
+            last_updated: now,
+        });
+        update(&mut entry.snapshot);
+        entry.last_updated = now;
+    }
+
     async fn update_socket_diagnostics(
         &self,
         socket_index: usize,
@@ -299,7 +421,7 @@ impl UdpTransport {
         }
     }
 
-    async fn socket_index_for_peer(&self, peer_id: Option<&str>) -> usize {
+    pub(crate) async fn socket_index_for_peer(&self, peer_id: Option<&str>) -> usize {
         let socket_count = self.socket_count();
         let Some(peer_id) = peer_id else {
             return 0;
@@ -331,6 +453,17 @@ impl UdpTransport {
             return 0;
         }
         0
+    }
+
+    pub(crate) async fn is_authenticated_direct_endpoint(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+    ) -> bool {
+        self.peers
+            .is_authenticated_direct_endpoint(peer_id, endpoint, generation)
+            .await
     }
 
     /// Resolve the UDP socket that should carry traffic for `peer_id` together
@@ -985,12 +1118,16 @@ impl UdpTransport {
                 request_id,
                 generation,
                 owner_token: 0,
+                endpoint: None,
+                socket_index: None,
+                lease: None,
                 expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
             },
         );
     }
 
     /// Register an ACK expectation for exactly one validation worker.
+    #[cfg(test)]
     pub(crate) async fn expect_direct_validation_ack_owned(
         &self,
         peer_id: &str,
@@ -998,6 +1135,55 @@ impl UdpTransport {
         generation: u64,
         owner_token: u64,
         endpoint: SocketAddr,
+    ) -> bool {
+        self.expect_direct_validation_ack_owned_on_socket(
+            peer_id,
+            request_id,
+            generation,
+            owner_token,
+            endpoint,
+            None,
+        )
+        .await
+    }
+
+    /// Register an ACK expectation with the exact UDP socket used by the
+    /// owned encrypted request.
+    #[cfg(test)]
+    pub(crate) async fn expect_direct_validation_ack_owned_on_socket(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+        owner_token: u64,
+        endpoint: SocketAddr,
+        socket_index: Option<usize>,
+    ) -> bool {
+        self.register_direct_validation_expectation(
+            peer_id,
+            DirectValidationExpectation {
+                request_id,
+                generation,
+                owner_token,
+                endpoint: Some(endpoint),
+                socket_index,
+                lease: None,
+                expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
+            },
+        )
+        .await
+    }
+
+    /// Register an ACK expectation while holding the send lease of the exact
+    /// socket that will carry the request.  `expectations` then owns the
+    /// lease until the ACK, a cancellation, a timeout or a generation
+    /// invalidation removes the expectation, which guarantees the socket's
+    /// reader stays alive for the whole ACK window even if the socket is
+    /// detached immediately after the send.
+    async fn register_direct_validation_expectation(
+        &self,
+        peer_id: &str,
+        expectation: DirectValidationExpectation,
     ) -> bool {
         // Keep the session lock while taking the expectation lock.  Lifecycle
         // cancellation follows this same order, so an owner can never insert
@@ -1007,27 +1193,119 @@ impl UdpTransport {
         let active_owner = sessions.get(peer_id).is_some_and(|session| {
             let target = *session.target_tx.borrow();
             !target.cancelled
-                && target.generation == generation
-                && target.owner_token == owner_token
-                && target.endpoint == endpoint
+                && target.generation == expectation.generation
+                && target.owner_token == expectation.owner_token
+                && expectation.endpoint == Some(target.endpoint)
         });
         if !active_owner {
             return false;
         }
         self.direct_validation.expectations.lock().await.insert(
             peer_id.to_string(),
-            DirectValidationExpectation {
-                request_id,
-                generation,
-                owner_token,
-                expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
-            },
+            expectation,
         );
         true
     }
 
-    /// Drop an expectation only if `owner_token` still owns its slot.
-    #[cfg(test)]
+    /// Resolve the socket that will actually carry one encrypted
+    /// direct-validation request and hold its send lease.
+    ///
+    /// The resolution and the expectation registration happen in ONE logic
+    /// path: the returned index is the exact socket the ACK must arrive on
+    /// and the send uses the returned socket directly (never a re-resolution
+    /// that could observe a detach or an affinity switch in between).  For a
+    /// dynamic socket the lease is stored inside the expectation, so the
+    /// socket's reader stays alive until the ACK or the expectation cleanup;
+    /// a pool socket uses a noop lease.  When the owner no longer owns the
+    /// endpoint, the lease is dropped and no expectation is left behind.
+    pub(crate) async fn prepare_direct_validation_send(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+        owner_token: u64,
+        endpoint: SocketAddr,
+    ) -> std::result::Result<PreparedDirectValidationSend, DirectValidationSendError> {
+        let (socket_index, socket, lease) = self
+            .resolve_send_socket_with_lease(peer_id)
+            .await
+            .ok_or(DirectValidationSendError::NoSocket)?;
+        let registered = self
+            .register_direct_validation_expectation(
+                peer_id,
+                DirectValidationExpectation {
+                    request_id,
+                    generation,
+                    owner_token,
+                    endpoint: Some(endpoint),
+                    socket_index: Some(socket_index),
+                    lease: Some(lease),
+                    expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
+                },
+            )
+            .await;
+        if !registered {
+            return Err(DirectValidationSendError::OwnerRevoked);
+        }
+        Ok(PreparedDirectValidationSend {
+            socket_index,
+            socket,
+        })
+    }
+
+    /// Resolve the socket for a direct-validation send under ONE
+    /// socket-state critical section: a per-peer dynamic socket (with a real
+    /// send lease) or the affinity-pinned pool socket (noop lease).  The
+    /// peer falls back to pool index 0 when the pin is stale or detached.
+    async fn resolve_send_socket_with_lease(
+        &self,
+        peer_id: &str,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        let mut state = self.socket_state.lock().await;
+        let socket_count = self.socket_count();
+        let pin = state.affinity.get(peer_id).copied();
+        if let Some(pin) = pin {
+            if pin.socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
+                if let Some(dynamic) = state.dynamic.get(&pin.socket_index) {
+                    if dynamic.peer_id == peer_id
+                        && dynamic.phase.is_usable()
+                        && dynamic.network_generation
+                            == self.peers.current_network_generation_sync()
+                    {
+                        let leases = dynamic.send_leases.clone();
+                        let socket = dynamic.socket.clone();
+                        let index = pin.socket_index;
+                        leases.acquire();
+                        drop(state);
+                        return Some((
+                            index,
+                            socket,
+                            DynamicSocketSendLease {
+                                state: leases,
+                                socket_index: index,
+                            },
+                        ));
+                    }
+                }
+                state.affinity.remove(peer_id);
+            } else if pin.socket_index < socket_count {
+                let index = pin.socket_index;
+                let socket = self.active_sockets().get(index).cloned();
+                drop(state);
+                return socket
+                    .map(|socket| (index, socket, DynamicSocketSendLease::noop(index)));
+            }
+        }
+        let index = 0usize;
+        let socket = self.active_sockets().get(index).cloned();
+        drop(state);
+        socket.map(|socket| (index, socket, DynamicSocketSendLease::noop(index)))
+    }
+
+    /// Drop an expectation only if `owner_token` still owns its slot.  Used
+    /// by the validation worker to withdraw a request that failed to send, so
+    /// a late ACK can never match a request that never left this daemon.
+    /// Dropping the expectation releases the socket send lease it held.
     pub(crate) async fn clear_direct_validation_expectation_if_owned(
         &self,
         peer_id: &str,
@@ -1054,6 +1332,7 @@ impl UdpTransport {
     /// Direct promotion; it must not re-read current generation after this
     /// point.  Passing a stale `current_generation` is rejected before any
     /// expectation is consumed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn consume_direct_validation_ack(
         &self,
         peer_id: &str,
@@ -1061,6 +1340,9 @@ impl UdpTransport {
         token_generation: u64,
         token_owner: u64,
         current_generation: u64,
+        source: SocketAddr,
+        socket_index: Option<usize>,
+        endpoint_authenticated: bool,
     ) -> Option<DirectValidationExpectation> {
         if token_generation != current_generation {
             return None;
@@ -1068,27 +1350,41 @@ impl UdpTransport {
         let sessions = self.direct_validation.sessions.lock().await;
         let mut expectations = self.direct_validation.expectations.lock().await;
         let now = Instant::now();
-        let expectation = expectations.get(peer_id).copied()?;
-        if expectation.expires_at <= now {
-            expectations.remove(peer_id);
-            return None;
-        }
-        if expectation.request_id != request_id
-            || expectation.generation != token_generation
-            || expectation.owner_token != token_owner
         {
-            return None;
+            let expectation = expectations.get(peer_id)?;
+            if expectation.expires_at <= now {
+                expectations.remove(peer_id);
+                return None;
+            }
+            if expectation.request_id != request_id
+                || expectation.generation != token_generation
+                || expectation.owner_token != token_owner
+                || (expectation
+                    .endpoint
+                    .is_some_and(|endpoint| endpoint != source)
+                    && !endpoint_authenticated)
+                || expectation
+                    .socket_index
+                    .is_some_and(|expected| Some(expected) != socket_index)
+            {
+                return None;
+            }
         }
         let target = sessions
             .get(peer_id)
             .map(|session| *session.target_tx.borrow())?;
+        // `expectation.owner_token` equals `token_owner` (verified above), so
+        // the active target is checked against the same owner the consumed
+        // expectation carried.
         if target.cancelled
             || target.generation != current_generation
-            || target.owner_token != expectation.owner_token
             || target.owner_token != token_owner
         {
             return None;
         }
+        // Move the expectation out: it owns the send lease of the socket that
+        // carried the request, released exactly when the caller drops the
+        // consumed expectation after the promotion transaction.
         expectations.remove(peer_id)
     }
 
@@ -1105,7 +1401,7 @@ impl UdpTransport {
     ) -> bool {
         let mut expectations = self.direct_validation.expectations.lock().await;
         let now = Instant::now();
-        let Some(expectation) = expectations.get(peer_id).copied() else {
+        let Some(expectation) = expectations.get(peer_id) else {
             return false;
         };
         if expectation.expires_at <= now {

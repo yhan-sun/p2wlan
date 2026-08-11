@@ -1695,28 +1695,43 @@ impl WireGuardTransport {
                                 peers
                                     .learn_authenticated_endpoint(&inbound.peer_id, source)
                                     .await;
-                                peers
-                                    .record_direct_success_with_local_endpoint(
-                                        &inbound.peer_id,
-                                        Some(source),
-                                        local_endpoint,
-                                    )
-                                    .await;
-                                // Only now that WireGuard decryption succeeded is
-                                // the receiving socket adopted as the peer's
-                                // fresh affinity evidence.  The socket is
-                                // re-validated inside `remember_peer_socket`
-                                // (peer ownership, Committed phase, current
-                                // network generation).
-                                if let (Some(udp), Some(socket_index)) =
-                                    (udp.as_ref(), socket_index)
-                                {
-                                    udp.remember_peer_socket(
-                                        &inbound.peer_id,
-                                        socket_index,
-                                        crate::udp::SocketEvidence::Fresh,
-                                    )
-                                    .await;
+                                // A decrypted UDP payload is authenticated
+                                // endpoint evidence, not a Direct proof.  Feed
+                                // it into the same owned request/ACK worker as
+                                // peer-reflexive evidence; do not adopt socket
+                                // affinity or promote from this path alone.
+                                if let Some(udp) = udp.as_ref() {
+                                    let generation = peers.current_network_generation().await;
+                                    peers
+                                        .record_direct_event_for_generation_with_socket(
+                                            &inbound.peer_id,
+                                            generation,
+                                            "direct_validation_ingress_requested",
+                                            Some(source),
+                                            socket_index,
+                                            None,
+                                            None,
+                                            "decrypted direct UDP payload requested owned encrypted validation",
+                                        )
+                                        .await;
+                                    if let Some(socket_index) = socket_index {
+                                        // Decryption is sufficient to remember
+                                        // the receiving socket as evidence for
+                                        // the next owned validation request,
+                                        // but not to promote the path.
+                                        udp.remember_peer_socket(
+                                            &inbound.peer_id,
+                                            socket_index,
+                                            crate::udp::SocketEvidence::Fresh,
+                                        )
+                                        .await;
+                                    }
+                                    udp.enqueue_direct_validation_observation(
+                                        crate::udp::PeerReflexiveObservation {
+                                            peer_id: inbound.peer_id.clone(),
+                                            observed_endpoint: source,
+                                        },
+                                    );
                                 }
                                 debug!(
                                     "Confirmed direct UDP data path from {source} for peer {}",
@@ -1777,13 +1792,9 @@ impl WireGuardTransport {
     /// WireGuard decryption.
     ///
     /// Request (responder role): the initiator's encrypted request reached us
-    /// through the direct UDP path.  The remote generation is intentionally
-    /// not compared with our local counter (the counters are per-side), but
-    /// the local promotion and receiving-socket adoption happen inside one
-    /// current local epoch transaction.  We then return an idempotent ACK to
-    /// the request's source — even when we are already Direct.  The ACK is
-    /// built from the request's own IP header (source/destination swapped),
-    /// so no virtual-IP plumbing is needed.
+    /// through the direct UDP path.  It is validation ingress evidence only:
+    /// record it, enqueue the local worker and return an idempotent ACK.  The
+    /// request itself never promotes Direct or adopts socket affinity.
     ///
     /// ACK (initiator role): the peer answers our outstanding validation
     /// request.  The ACK is only trusted when its token matches the
@@ -1832,64 +1843,39 @@ impl WireGuardTransport {
                 // The token generation is remote-local and therefore cannot
                 // be compared with `local_generation`; it is echoed only for
                 // the initiator's owned ACK expectation.
-                let adoption_guard = udp.lock_peer_adoption_for_direct_validation(peer_id).await;
-                let epoch_gate = peers.network_epoch_gate();
-                let epoch_guard = epoch_gate.lock().await;
-                let local_generation = peers.current_network_generation_sync();
-                let promoted = peers
-                    .record_direct_success_for_generation_with_local_endpoint_in_epoch(
-                        &epoch_guard,
-                        peer_id,
-                        Some(source),
-                        local_generation,
-                        local_endpoint,
-                    )
-                    .await;
-                let affinity_adopted = if promoted {
-                    match socket_index {
-                        Some(socket_index) => {
-                            udp.remember_peer_socket_for_generation_in_epoch(
-                                &epoch_guard,
-                                peer_id,
-                                socket_index,
-                                local_generation,
-                                crate::udp::SocketEvidence::Fresh,
-                            )
-                            .await
-                        }
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                drop(epoch_guard);
-                drop(adoption_guard);
-
-                if !promoted {
-                    debug!(
-                        peer_id,
-                        local_generation,
-                        "ignored direct-validation request after peer lifecycle or generation transition"
-                    );
-                    return;
-                }
+                // An authenticated request is evidence for the local
+                // validation worker, not proof of the local path. Enqueue it
+                // newest-wins and let the worker send our own request. This
+                // keeps an inbound request from cancelling the local
+                // request/ACK transaction in the R7/R8 cross-over race.
+                let local_generation = peers.current_network_generation().await;
                 peers
-                    .record_direct_event(
+                    .record_direct_validation_event_with_metadata(
                         peer_id,
+                        local_generation,
+                        crate::peer::DirectValidationEventMetadata {
+                            remote_validation_owner: Some(token.owner_token),
+                            request_id: Some(token.request_id),
+                            ..crate::peer::DirectValidationEventMetadata::default()
+                        },
                         "direct_validation_request_received",
                         Some(source),
+                        socket_index,
                         None,
-                        None,
+                        Some(0),
                         format!(
-                            "validated direct UDP request remote_generation={} local_generation={} request_id={} seq={} affinity_adopted={}",
+                            "received authenticated encrypted validation request remote_generation={} local_generation={} request_id={} seq={}",
                             token.generation,
                             local_generation,
                             token.request_id,
                             token.sequence,
-                            affinity_adopted,
                         ),
                     )
                     .await;
+                udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
+                    peer_id: peer_id.to_string(),
+                    observed_endpoint: source,
+                });
                 // Answer idempotently — also when already Direct — so the
                 // initiator always gets the confirmation it needs.  The ACK
                 // uses the request's own IP header with source/destination
@@ -1930,16 +1916,76 @@ impl WireGuardTransport {
                     .await
                 {
                     Ok(true) => {
+                        peers
+                            .record_direct_validation_event_with_metadata(
+                                peer_id,
+                                local_generation,
+                                crate::peer::DirectValidationEventMetadata {
+                                    remote_validation_owner: Some(token.owner_token),
+                                    request_id: Some(token.request_id),
+                                    ..crate::peer::DirectValidationEventMetadata::default()
+                                },
+                                "direct_validation_ack_sent",
+                                Some(source),
+                                socket_index,
+                                None,
+                                Some(1),
+                                format!(
+                                    "sent encrypted validation ACK request_id={} seq={}",
+                                    token.request_id, token.sequence
+                                ),
+                            )
+                            .await;
                         debug!(
                             "Answered direct-validation request from peer {peer_id_owned} at {source} with an ACK"
                         );
                     }
                     Ok(false) => {
+                        peers
+                            .record_direct_validation_event_with_metadata(
+                                peer_id,
+                                local_generation,
+                                crate::peer::DirectValidationEventMetadata {
+                                    remote_validation_owner: Some(token.owner_token),
+                                    request_id: Some(token.request_id),
+                                    ..crate::peer::DirectValidationEventMetadata::default()
+                                },
+                                "direct_validation_ack_send_failed",
+                                Some(source),
+                                socket_index,
+                                None,
+                                Some(0),
+                                format!(
+                                    "WireGuard session was no longer ready for request_id={} seq={}",
+                                    token.request_id, token.sequence
+                                ),
+                            )
+                            .await;
                         debug!(
                             "Could not answer direct-validation request from {peer_id_owned}: WireGuard session is no longer ready"
                         );
                     }
                     Err(err) => {
+                        peers
+                            .record_direct_validation_event_with_metadata(
+                                peer_id,
+                                local_generation,
+                                crate::peer::DirectValidationEventMetadata {
+                                    remote_validation_owner: Some(token.owner_token),
+                                    request_id: Some(token.request_id),
+                                    ..crate::peer::DirectValidationEventMetadata::default()
+                                },
+                                "direct_validation_ack_send_failed",
+                                Some(source),
+                                socket_index,
+                                None,
+                                Some(0),
+                                format!(
+                                    "failed to send ACK for request_id={} seq={}: {err}",
+                                    token.request_id, token.sequence
+                                ),
+                            )
+                            .await;
                         debug!(
                             "Failed to answer direct-validation request from {peer_id_owned} at {source}: {err}"
                         );
@@ -1970,14 +2016,12 @@ impl WireGuardTransport {
                 // expectation owner is still active and that the local
                 // network generation has not advanced.  A stale ACK can
                 // therefore neither promote Direct nor adopt socket affinity.
-                tracing::info!(
-                    event = "direct_validation_ack_received",
-                    "direct_validation_ack_received peer_id={} generation={} request_id={} owner={}",
-                    peer_id, token.generation, token.request_id, token.owner_token
-                );
                 let epoch_gate = peers.network_epoch_gate();
                 let epoch_guard = epoch_gate.lock().await;
                 let current_generation = peers.current_network_generation_sync();
+                let endpoint_authenticated = udp
+                    .is_authenticated_direct_endpoint(peer_id, source, current_generation)
+                    .await;
                 let Some(expectation) = udp
                     .consume_direct_validation_ack(
                         peer_id,
@@ -1985,6 +2029,9 @@ impl WireGuardTransport {
                         token.generation,
                         token.owner_token,
                         current_generation,
+                        source,
+                        socket_index,
+                        endpoint_authenticated,
                     )
                     .await
                 else {
@@ -1992,8 +2039,76 @@ impl WireGuardTransport {
                         "Ignored direct-validation ACK from {peer_id}: no current owned expectation (request_id={} token_generation={} token_owner={} current_generation={})",
                         token.request_id, token.generation, token.owner_token, current_generation
                     );
+                    peers
+                        .record_direct_event_for_generation_with_socket(
+                            peer_id,
+                            current_generation,
+                            "direct_validation_ack_unmatched",
+                            Some(source),
+                            socket_index,
+                            None,
+                            None,
+                            format!(
+                                "ignored encrypted validation ACK request_id={} generation={} socket_index={} because no exact owned expectation matched",
+                                token.request_id,
+                                token.generation,
+                                socket_index
+                                    .map_or_else(|| "none".to_string(), |index| index.to_string())
+                            ),
+                        )
+                        .await;
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            current_generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                request_id: Some(token.request_id),
+                                observed_ack_endpoint: Some(source),
+                                ack_endpoint_authenticated: Some(endpoint_authenticated),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_unmatched",
+                            Some(source),
+                            socket_index,
+                            None,
+                            None,
+                            "unmatched encrypted validation ACK; no local owner was consumed",
+                        )
+                        .await;
                     return;
                 };
+
+                peers
+                    .record_direct_validation_event_with_metadata(
+                        peer_id,
+                        expectation.generation,
+                        crate::peer::DirectValidationEventMetadata {
+                            local_validation_session_id: Some(expectation.owner_token),
+                            request_id: Some(token.request_id),
+                            expected_endpoint: expectation.endpoint,
+                            observed_ack_endpoint: Some(source),
+                            ack_endpoint_authenticated: Some(endpoint_authenticated),
+                            ..crate::peer::DirectValidationEventMetadata::default()
+                        },
+                        "direct_validation_ack_received",
+                        Some(source),
+                        socket_index,
+                        None,
+                        Some(1),
+                        format!(
+                            "consumed encrypted validation ACK request_id={} generation={} socket_index={} expected_endpoint={} observed_endpoint={} authenticated_endpoint_drift={}",
+                            token.request_id,
+                            expectation.generation,
+                            socket_index
+                                .map_or_else(|| "none".to_string(), |index| index.to_string()),
+                            expectation
+                                .endpoint
+                                .map_or_else(|| "none".to_string(), |endpoint| endpoint.to_string()),
+                            source,
+                            expectation.endpoint != Some(source),
+                        ),
+                    )
+                    .await;
 
                 // Do not re-read the generation here.  The consumed
                 // expectation is the proof that this exact generation and
@@ -2045,15 +2160,63 @@ impl WireGuardTransport {
                 }
 
                 peers
-                    .record_direct_event(
+                    .record_direct_validation_event_with_metadata(
                         peer_id,
-                        "direct_validation_ack_received",
+                        expectation.generation,
+                        crate::peer::DirectValidationEventMetadata {
+                            local_validation_session_id: Some(expectation.owner_token),
+                            request_id: Some(token.request_id),
+                            expected_endpoint: expectation.endpoint,
+                            observed_ack_endpoint: Some(source),
+                            selected_endpoint: Some(source),
+                            ack_endpoint_authenticated: Some(endpoint_authenticated),
+                            ..crate::peer::DirectValidationEventMetadata::default()
+                        },
+                        "direct_validation_promoted",
                         Some(source),
+                        socket_index,
                         None,
-                        None,
+                        Some(1),
                         format!(
-                            "direct UDP path confirmed by validation ACK generation={} request_id={} seq={} owner={} affinity_adopted={affinity_adopted}",
-                            expectation.generation, token.request_id, token.sequence, token.owner_token
+                            "promoted after owned request/ACK request_id={} generation={} socket_index={} expected_endpoint={} observed_endpoint={} local_endpoint={} authenticated_endpoint_drift={} affinity_adopted={affinity_adopted}",
+                            token.request_id,
+                            expectation.generation,
+                            socket_index.map_or_else(|| "none".to_string(), |index| index.to_string()),
+                            expectation
+                                .endpoint
+                                .map_or_else(|| "none".to_string(), |endpoint| endpoint.to_string()),
+                            source,
+                            local_endpoint.map_or_else(|| "none".to_string(), |endpoint| endpoint.to_string()),
+                            expectation.endpoint != Some(source),
+                        ),
+                    )
+                    .await;
+                peers
+                    .record_direct_validation_event_with_metadata(
+                        peer_id,
+                        expectation.generation,
+                        crate::peer::DirectValidationEventMetadata {
+                            local_validation_session_id: Some(expectation.owner_token),
+                            request_id: Some(token.request_id),
+                            expected_endpoint: expectation.endpoint,
+                            observed_ack_endpoint: Some(source),
+                            selected_endpoint: Some(source),
+                            ack_endpoint_authenticated: Some(endpoint_authenticated),
+                            ..crate::peer::DirectValidationEventMetadata::default()
+                        },
+                        "direct_path_promoted",
+                        Some(source),
+                        socket_index,
+                        None,
+                        Some(1),
+                        format!(
+                            "selected endpoint after owned validation ACK request_id={} expected_endpoint={} observed_ack_endpoint={} selected_endpoint={} affinity_adopted={affinity_adopted}",
+                            token.request_id,
+                            expectation
+                                .endpoint
+                                .map_or_else(|| "none".to_string(), |endpoint| endpoint.to_string()),
+                            source,
+                            source,
                         ),
                     )
                     .await;

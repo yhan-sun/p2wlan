@@ -6,12 +6,363 @@
 #[derive(Clone)]
 struct HolePunchSignalContext {
     control: ControlClient,
-    local_candidates: Arc<RwLock<Vec<String>>>,
-    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
     stun_servers: Vec<SocketAddr>,
     stun_timeout: Duration,
     /// Daemon incarnation epoch embedded in the fresh-prediction label.
     boot_epoch_ms: u64,
+}
+
+/// Immutable telemetry captured when a trigger is admitted or folded into an
+/// existing rendezvous. The endpoints themselves remain in the peer's normal
+/// candidate diagnostics; this record only carries a stable hash and source
+/// categories so logs can explain a replacement without exposing additional
+/// candidate material.
+#[derive(Clone)]
+struct PunchCandidateSnapshot {
+    candidates: Vec<SocketAddr>,
+    hash: u64,
+    /// Number of candidate endpoints for which provenance was captured.  An
+    /// unknown provenance is deliberately retained as an explicit category
+    /// rather than silently omitted, so this is always auditable against the
+    /// snapshot's candidate count.
+    source_count: usize,
+    /// Number of distinct provenance categories represented by `source_count`.
+    /// Kept separately because a count of categories is not a count of
+    /// candidate endpoints.
+    source_category_count: usize,
+    source_summary: String,
+}
+
+async fn punch_candidate_snapshot(
+    peers: &PeerManager,
+    peer_id: &str,
+    candidates: Vec<SocketAddr>,
+) -> PunchCandidateSnapshot {
+    let mut canonical = candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    canonical.sort_unstable();
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for endpoint in &canonical {
+        for byte in endpoint.as_bytes().iter().copied().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    let connection = peers.get_connection(peer_id).await;
+    let mut source_counts = HashMap::<String, usize>::new();
+    for candidate in &candidates {
+        let source = connection
+            .as_ref()
+            .and_then(|connection| connection.candidate_sources.get(&candidate.to_string()))
+            .map(|source| format!("{source:?}"))
+            .unwrap_or_else(|| "Unknown".to_string());
+        *source_counts.entry(source).or_default() += 1;
+    }
+    let source_count = source_counts.values().sum();
+    let source_category_count = source_counts.len();
+    let mut source_summary = source_counts.into_iter().collect::<Vec<_>>();
+    source_summary.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let source_summary = source_summary
+        .into_iter()
+        .map(|(source, count)| format!("{source}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    PunchCandidateSnapshot {
+        candidates,
+        hash,
+        source_count,
+        source_category_count,
+        source_summary,
+    }
+}
+
+/// Schedule one small relay-coordinated peer-reflexive retry window.
+///
+/// A peer-reflexive observation is authenticated evidence, but it is not a
+/// Direct-path proof.  The immediate fast punch keeps that just-observed NAT
+/// mapping warm; this helper is the separate, relay-coordinated retry that
+/// gives the observer and receiver a common `punch_at_ms`.  It deliberately
+/// uses an endpoint slice and one socket rather than falling through to the
+/// normal candidate × socket traversal, and it owns the shared deduplicator
+/// so it cannot overlap an ordinary punch or send after cancellation.
+async fn spawn_peer_reflexive_micro_window(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
+    peer_id: String,
+    candidates: Vec<SocketAddr>,
+    punch_at_ms: Option<u64>,
+    origin: &'static str,
+) {
+    let Some(punch_at_ms) = punch_at_ms else {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "peer_reflexive_micro_window_skipped",
+                None,
+                None,
+                None,
+                format!(
+                    "origin={origin} skipped relay-coordinated micro-window because no shared punch_at_ms was supplied"
+                ),
+            )
+            .await;
+        return;
+    };
+
+    let mut targets = Vec::with_capacity(PEER_REFLEXIVE_MICRO_WINDOW_MAX_TARGETS);
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if seen.insert(candidate) {
+            targets.push(candidate);
+        }
+        if targets.len() == PEER_REFLEXIVE_MICRO_WINDOW_MAX_TARGETS {
+            break;
+        }
+    }
+    if targets.is_empty() {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "peer_reflexive_micro_window_skipped",
+                None,
+                Some(0),
+                None,
+                format!(
+                    "origin={origin} skipped relay-coordinated micro-window because no trusted target endpoint was available"
+                ),
+            )
+            .await;
+        return;
+    }
+    if peers.is_direct(&peer_id).await {
+        return;
+    }
+
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "peer_reflexive_micro_window_suppressed",
+                targets.first().copied(),
+                Some(targets.len()),
+                None,
+                format!(
+                    "origin={origin} recovery epoch is not eligible for a peer-reflexive micro-window"
+                ),
+            )
+            .await;
+        return;
+    };
+    let generation = peers.current_network_generation().await;
+    let session = match punch_deduplicator
+        .claim_for_epoch_with_rendezvous(
+            &peer_id,
+            generation,
+            epoch,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(punch_at_ms),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Deferred(deferred) => {
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    generation,
+                    "peer_reflexive_micro_window_deferred",
+                    targets.first().copied(),
+                    None,
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} deferred behind active session_id={} active_generation={} active_epoch={} active_punch_at_ms={:?} reason={}",
+                        deferred.active_session_id,
+                        deferred.active_network_generation,
+                        deferred.active_epoch,
+                        deferred.active_punch_at_ms,
+                        deferred.reason.label(),
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+    let delay = relay_assisted_punch_delay(Some(punch_at_ms));
+    let session_id = session.session_id();
+    tokio::spawn(async move {
+        peers
+            .record_direct_event_for_generation_with_socket(
+                &peer_id,
+                generation,
+                "peer_reflexive_micro_window_scheduled",
+                targets.first().copied(),
+                None,
+                Some(targets.len()),
+                None,
+                format!(
+                    "origin={origin} session_id={session_id} recovery_epoch={epoch} punch_at_ms={punch_at_ms} delay_ms={} max_targets={} attempts={} socket_policy=primary_only",
+                    delay.as_millis(),
+                    PEER_REFLEXIVE_MICRO_WINDOW_MAX_TARGETS,
+                    PEER_REFLEXIVE_MICRO_WINDOW_ATTEMPTS,
+                ),
+            )
+            .await;
+        if !delay.is_zero() {
+            tokio::select! {
+                _ = sleep(delay) => {}
+                _ = session.cancelled() => {
+                    peers.record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        generation,
+                        "peer_reflexive_micro_window_cancelled",
+                        targets.first().copied(),
+                        None,
+                        Some(targets.len()),
+                        None,
+                        format!(
+                            "origin={origin} session_id={session_id} cancelled while waiting for shared punch_at_ms={punch_at_ms}; reason={}",
+                            session.cancellation_reason().map(PunchCancellationReason::label).unwrap_or("unknown"),
+                        ),
+                    ).await;
+                    return;
+                }
+            }
+        }
+        if session.is_cancelled() || peers.is_direct(&peer_id).await {
+            return;
+        }
+
+        let dispatch_at_ms = session.mark_first_send_started();
+        let cancellation = session.cancellation_handle();
+        let mut send_result = None;
+        let outcome = run_owned_punch_session_with_deadline(
+            &session,
+            PEER_REFLEXIVE_MICRO_WINDOW_DEADLINE,
+            async {
+                let owner_gate = || !cancellation.is_cancelled();
+                send_result = Some(
+                    udp.punch_candidates_primary_socket_until_not_direct_gated_report(
+                        &peer_id,
+                        targets.clone(),
+                        PEER_REFLEXIVE_MICRO_WINDOW_INTERVAL,
+                        PEER_REFLEXIVE_MICRO_WINDOW_ATTEMPTS,
+                        &owner_gate,
+                    )
+                    .await,
+                );
+            },
+        )
+        .await;
+
+        match outcome {
+            PunchSessionOutcome::Cancelled => {
+                peers.record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    generation,
+                    "peer_reflexive_micro_window_cancelled",
+                    targets.first().copied(),
+                    None,
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} session_id={session_id} cancelled during bounded send; reason={}",
+                        session.cancellation_reason().map(PunchCancellationReason::label).unwrap_or("unknown"),
+                    ),
+                ).await;
+            }
+            PunchSessionOutcome::DeadlineExceeded => {
+                peers.record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    generation,
+                    "peer_reflexive_micro_window_deadline",
+                    targets.first().copied(),
+                    None,
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} session_id={session_id} exceeded {}ms bounded send deadline",
+                        PEER_REFLEXIVE_MICRO_WINDOW_DEADLINE.as_millis(),
+                    ),
+                ).await;
+            }
+            PunchSessionOutcome::Completed => match send_result {
+                Some(Ok(report)) => {
+                    let first_send_deviation_ms = report
+                        .first_send_at_ms
+                        .map(|actual| i128::from(actual) - i128::from(punch_at_ms));
+                    let socket_index = report.per_socket_sent.first().map(|(index, _)| *index);
+                    let per_socket_sent = report
+                        .per_socket_sent
+                        .iter()
+                        .map(|(index, count)| format!("{index}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    peers.record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        generation,
+                        "peer_reflexive_micro_window_first_packet_sent",
+                        targets.first().copied(),
+                        socket_index,
+                        Some(targets.len()),
+                        Some(report.packets_sent),
+                        format!(
+                            "origin={origin} session_id={session_id} recovery_epoch={epoch} punch_at_ms={punch_at_ms} dispatch_at_ms={dispatch_at_ms} actual_first_send_at_ms={:?} first_send_deviation_ms={first_send_deviation_ms:?} per_socket_actual_datagrams={per_socket_sent}",
+                            report.first_send_at_ms,
+                        ),
+                    ).await;
+                    peers.record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        generation,
+                        "peer_reflexive_micro_window_completed",
+                        targets.first().copied(),
+                        socket_index,
+                        Some(targets.len()),
+                        Some(report.packets_sent),
+                        format!(
+                            "origin={origin} session_id={session_id} sent={} unique_target_endpoints={} budget_skipped={} epoch_budget_exhausted={} candidate_iteration_capped={}",
+                            report.packets_sent,
+                            report.unique_target_endpoints,
+                            report.budget_skipped,
+                            report.epoch_budget_exhausted,
+                            report.candidate_iteration_capped,
+                        ),
+                    ).await;
+                }
+                Some(Err(error)) => {
+                    peers.record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        generation,
+                        "peer_reflexive_micro_window_error",
+                        targets.first().copied(),
+                        None,
+                        Some(targets.len()),
+                        None,
+                        format!("origin={origin} session_id={session_id} bounded send failed: {error}"),
+                    ).await;
+                }
+                None => {
+                    peers.record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        generation,
+                        "peer_reflexive_micro_window_cancelled",
+                        targets.first().copied(),
+                        None,
+                        Some(targets.len()),
+                        None,
+                        format!("origin={origin} session_id={session_id} send did not start"),
+                    ).await;
+                }
+            },
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,22 +419,85 @@ async fn spawn_hole_punch_task(
     } else {
         PUNCH_PRIORITY_SYNCHRONIZED
     };
+    // Capture a trusted target snapshot before claiming. When this trigger is
+    // folded into a valid first rendezvous window the snapshot is stashed for
+    // that owner's dispatch; it is never silently discarded just because a
+    // dedup permit is already active.
+    let trigger_candidates = match &frozen_targets {
+        Some(frozen) => frozen.clone(),
+        None => peers
+            .direct_probe_target_set_for(&peer_id)
+            .await
+            .map(|target| target.candidates)
+            .unwrap_or_default(),
+    };
+    let trigger_snapshot = punch_candidate_snapshot(&peers, &peer_id, trigger_candidates).await;
+    let network_generation = peers.current_network_generation().await;
     let claimed = punch_deduplicator
-        .claim_for_epoch(&peer_id, epoch, claim_priority, fresh_prediction)
+        .claim_for_epoch_with_rendezvous(
+            &peer_id,
+            network_generation,
+            epoch,
+            claim_priority,
+            fresh_prediction,
+            punch_at_ms,
+        )
         .await;
-    let Some(session) = claimed else {
-        peers
-            .record_direct_event(
-                &peer_id,
-                "punch_suppressed",
-                None,
-                None,
-                None,
-                "suppressed overlapping UDP punch session for this peer",
-            )
-            .await;
-        debug!("Suppressing overlapping UDP punch session for {peer_id}");
-        return;
+    let session = match claimed {
+        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Deferred(deferred) => {
+            let stashed = if trigger_snapshot.candidates.is_empty() {
+                false
+            } else {
+                peers
+                    .stash_recovery_target(PendingRecoveryTarget {
+                        peer_id: peer_id.clone(),
+                        candidates: trigger_snapshot.candidates.clone(),
+                        // A valid fresh snapshot stays immutable even when it
+                        // is deferred behind the first ordinary send. An
+                        // ordinary refresh remains a normal latest snapshot.
+                        frozen_targets: fresh_prediction
+                            .is_some()
+                            .then_some(trigger_snapshot.candidates.clone()),
+                        fresh_prediction,
+                        // The active plan owns its already-coordinated
+                        // punch_at. Do not re-clock it to this later offer.
+                        punch_at_ms: None,
+                        seen_at: Instant::now(),
+                    })
+                    .await;
+                true
+            };
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "punch_window_preserved",
+                    trigger_snapshot.candidates.first().copied(),
+                    Some(trigger_snapshot.candidates.len()),
+                    None,
+                    format!(
+                        "incoming synchronized trigger folded into active session_id={} active_generation={} active_epoch={} active_punch_at_ms={:?} reason={} incoming_generation={} incoming_epoch={} incoming_punch_at_ms={punch_at_ms:?} candidate_snapshot_hash={:016x} candidate_source_count={} candidate_source_category_count={} candidate_source_counts={} target_stashed={stashed}",
+                        deferred.active_session_id,
+                        deferred.active_network_generation,
+                        deferred.active_epoch,
+                        deferred.active_punch_at_ms,
+                        deferred.reason.label(),
+                        network_generation,
+                        epoch,
+                        trigger_snapshot.hash,
+                        trigger_snapshot.source_count,
+                        trigger_snapshot.source_category_count,
+                        trigger_snapshot.source_summary,
+                    ),
+                )
+                .await;
+            debug!(
+                "Preserving active relay-assisted rendezvous for {peer_id}: session={} reason={}",
+                deferred.active_session_id,
+                deferred.reason.label()
+            );
+            return;
+        }
     };
     let punch_delay = relay_assisted_punch_delay(punch_at_ms);
     if !punch_delay.is_zero() {
@@ -102,8 +516,15 @@ async fn spawn_hole_punch_task(
                 None,
                 None,
                 format!(
-                    "scheduled relay-assisted UDP punch delay_ms={} punch_at_ms={punch_at_ms:?} recovery_epoch={epoch}",
-                    punch_delay.as_millis()
+                    "scheduled relay-assisted UDP punch session_id={} network_generation={} recovery_epoch={} delay_ms={} punch_at_ms={punch_at_ms:?} candidate_snapshot_hash={:016x} candidate_source_count={} candidate_source_category_count={} candidate_source_counts={}",
+                    session.session_id(),
+                    network_generation,
+                    epoch,
+                    punch_delay.as_millis(),
+                    trigger_snapshot.hash,
+                    trigger_snapshot.source_count,
+                    trigger_snapshot.source_category_count,
+                    trigger_snapshot.source_summary,
                 ),
             )
             .await;
@@ -265,8 +686,55 @@ async fn spawn_hole_punch_task(
             FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
         };
 
+        if session.is_cancelled() {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "punch_session_cancelled",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "cancelled scheduled UDP punch before rendezvous wait session_id={} network_generation={} recovery_epoch={} reason={}",
+                        session.session_id(),
+                        network_generation,
+                        epoch,
+                        session
+                            .cancellation_reason()
+                            .map(PunchCancellationReason::label)
+                            .unwrap_or("unknown"),
+                    ),
+                )
+                .await;
+            return;
+        }
+
         if !punch_delay.is_zero() {
-            sleep(punch_delay).await;
+            tokio::select! {
+                _ = sleep(punch_delay) => {}
+                _ = session.cancelled() => {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_session_cancelled",
+                            None,
+                            None,
+                            None,
+                            format!(
+                                "cancelled scheduled UDP punch while waiting for rendezvous session_id={} network_generation={} recovery_epoch={} reason={}",
+                                session.session_id(),
+                                network_generation,
+                                epoch,
+                                session
+                                    .cancellation_reason()
+                                    .map(PunchCancellationReason::label)
+                                    .unwrap_or("unknown"),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            }
         }
 
         // Direct may have been confirmed while the fresh-mapping generation
@@ -395,6 +863,7 @@ async fn spawn_hole_punch_task(
                 .await;
             return;
         }
+        let dispatch_snapshot = punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
         peers
             .record_direct_event(
                 &peer_id,
@@ -403,8 +872,15 @@ async fn spawn_hole_punch_task(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "starting synchronized UDP punch across {} candidates",
-                    candidates.len()
+                    "starting synchronized UDP punch session_id={} network_generation={} recovery_epoch={} across {} candidates; candidate_snapshot_hash={:016x} candidate_source_count={} candidate_source_category_count={} candidate_source_counts={} punch_at_ms={punch_at_ms:?}",
+                    session.session_id(),
+                    network_generation,
+                    epoch,
+                    candidates.len(),
+                    dispatch_snapshot.hash,
+                    dispatch_snapshot.source_count,
+                    dispatch_snapshot.source_category_count,
+                    dispatch_snapshot.source_summary,
                 ),
             )
             .await;
@@ -440,8 +916,21 @@ async fn spawn_hole_punch_task(
             .direct_probe_success_count_for_generation(&peer_id, generation)
             .await;
         let commit_seq_before = peers.direct_commit_seq_sync(&peer_id);
+        // Keep the before/after diagnostic delta on the exact signaling
+        // session that was active when this owned punch began.  A rekey can
+        // legitimately arrive while a still-valid first punch window is
+        // preserved; consulting the current session at the end would then
+        // make an old-session ACK appear to vanish (or a new-session ACK
+        // appear to belong to this task).
+        let probe_rx_session_id = peers.probe_session_id_for_peer(&peer_id).await;
 
-        let rx_before = udp.probe_rx_snapshot().await;
+        let rx_before = udp
+            .probe_rx_snapshot_for_peer_session(
+                &peer_id,
+                generation,
+                probe_rx_session_id.as_deref(),
+            )
+            .await;
         let mut last_punch_report: Option<PunchSendReport> = None;
         let deadline = punch_session_deadline(
             &candidates,
@@ -458,6 +947,34 @@ async fn spawn_hole_punch_task(
             if session.is_cancelled() {
                 return;
             }
+            // This synchronous dispatch boundary is immediately before the
+            // first outbound sweep. It is paired with the UDP layer's actual
+            // send report, and prevents a fresh offer arriving in this tiny
+            // interval from cancelling the synchronized first window.
+            let first_send_dispatch_ms = session.mark_first_send_started();
+            let first_send_dispatch_deviation_ms = punch_at_ms.map(|scheduled| {
+                i128::from(first_send_dispatch_ms) - i128::from(scheduled)
+            });
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "punch_first_send_dispatch",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    None,
+                    format!(
+                        "first owned UDP send dispatch session_id={} network_generation={} recovery_epoch={} punch_at_ms={punch_at_ms:?} first_send_dispatch_ms={} first_send_dispatch_deviation_ms={first_send_dispatch_deviation_ms:?} candidate_snapshot_hash={:016x} candidate_source_count={} candidate_source_category_count={} candidate_source_counts={}",
+                        session.session_id(),
+                        generation,
+                        epoch,
+                        first_send_dispatch_ms,
+                        dispatch_snapshot.hash,
+                        dispatch_snapshot.source_count,
+                        dispatch_snapshot.source_category_count,
+                        dispatch_snapshot.source_summary,
+                    ),
+                )
+                .await;
             let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                 && udp.has_dynamic_socket_for_peer(&peer_id).await
             {
@@ -531,8 +1048,37 @@ async fn spawn_hole_punch_task(
                         .await;
                 }
                 Ok(report) => {
-                    last_punch_report = Some(report);
                     let sent = report.packets_sent;
+                    let actual_first_send_at_ms = report.first_send_at_ms;
+                    let actual_first_send_deviation_ms =
+                        actual_first_send_at_ms.zip(punch_at_ms).map(|(actual, scheduled)| {
+                            i128::from(actual) - i128::from(scheduled)
+                        });
+                    let per_socket_sent = report
+                        .per_socket_sent
+                        .iter()
+                        .map(|(socket, count)| format!("{socket}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    // This is deliberately emitted only from the UDP send
+                    // report, after a kernel send completed. The earlier
+                    // dispatch event is useful scheduling telemetry but must
+                    // never be mistaken for the first physical packet.
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_first_packet_sent",
+                            candidates.first().copied(),
+                            Some(candidates.len()),
+                            Some(sent),
+                            format!(
+                                "session_id={} network_generation={} recovery_epoch={} punch_at_ms={punch_at_ms:?} actual_first_send_at_ms={actual_first_send_at_ms:?} first_send_deviation_ms={actual_first_send_deviation_ms:?} per_socket_actual_datagrams={per_socket_sent}",
+                                session.session_id(),
+                                generation,
+                                epoch,
+                            ),
+                        )
+                        .await;
                     let birthday_window_completion = if let Some(plan) =
                         birthday_plan.as_ref().filter(|_| stable_remote_scatter)
                     {
@@ -567,6 +1113,7 @@ async fn spawn_hole_punch_task(
                     } else {
                         None
                     };
+                    last_punch_report = Some(report);
                     info!("Sent {sent} UDP punch probes to peer {peer_id}");
                     peers
                         .record_direct_event(
@@ -574,12 +1121,19 @@ async fn spawn_hole_punch_task(
                             "punch_probes_sent",
                             candidates.first().copied(),
                             Some(candidates.len()),
-                            Some(sent),
-                            format!(
-                                "sent {sent} UDP punch probes across {} candidates",
-                                candidates.len()
-                            ),
-                        )
+                        Some(sent),
+                        format!(
+                            "sent {sent} UDP punch probes session_id={} network_generation={} recovery_epoch={} across {} candidates; candidate_snapshot_hash={:016x} candidate_source_count={} candidate_source_category_count={} candidate_source_counts={}; per-socket coverage is recorded by the paired scan-completed event",
+                            session.session_id(),
+                            generation,
+                            epoch,
+                            candidates.len(),
+                            dispatch_snapshot.hash,
+                            dispatch_snapshot.source_count,
+                            dispatch_snapshot.source_category_count,
+                            dispatch_snapshot.source_summary,
+                        ),
+                    )
                         .await;
                     // Bounded feedback window: wait for a matched ACK (or a
                     // Direct commit) instead of a bare sleep, so a promotion
@@ -608,10 +1162,18 @@ async fn spawn_hole_punch_task(
                     let success_count_after = peers
                         .direct_probe_success_count_for_generation(&peer_id, generation)
                         .await;
-                    let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
+                    let rx_delta = udp
+                        .probe_rx_snapshot_for_peer_session(
+                            &peer_id,
+                            generation,
+                            probe_rx_session_id.as_deref(),
+                        )
+                        .await
+                        .delta_since(rx_before);
                     if sent > 0 && success_count_after == success_count_before {
                         let timeout_detail = format!(
-                            "no matched UDP punch ACK after {sent} probes; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                            "no matched UDP punch ACK after {sent} probes; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                            probe_rx_session_id.as_deref().unwrap_or("legacy"),
                             rx_delta.known_peer_ip_datagrams_received,
                             rx_delta.authenticated_probe_packets_received,
                             rx_delta.authenticated_probe_acks_observed,
@@ -705,18 +1267,35 @@ async fn spawn_hole_punch_task(
                     .record_direct_event(
                         &peer_id,
                         "punch_session_cancelled",
-                        None,
-                        None,
-                        None,
-                        "cancelled stale UDP punch session before replacement",
-                    )
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "cancelled stale UDP punch session before replacement session_id={} network_generation={} recovery_epoch={} reason={}",
+                        session.session_id(),
+                        generation,
+                        epoch,
+                        session
+                            .cancellation_reason()
+                            .map(PunchCancellationReason::label)
+                            .unwrap_or("unknown"),
+                    ),
+                )
                     .await;
             }
             PunchSessionOutcome::DeadlineExceeded => {
-                let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
+                let rx_delta = udp
+                    .probe_rx_snapshot_for_peer_session(
+                        &peer_id,
+                        generation,
+                        probe_rx_session_id.as_deref(),
+                    )
+                    .await
+                    .delta_since(rx_before);
                 let timeout_detail = format!(
-                    "synchronized UDP punch session stopped after {}ms deadline; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                    "synchronized UDP punch session stopped after {}ms deadline; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
                     deadline.as_millis(),
+                    probe_rx_session_id.as_deref().unwrap_or("legacy"),
                     rx_delta.known_peer_ip_datagrams_received,
                     rx_delta.authenticated_probe_packets_received,
                     rx_delta.authenticated_probe_acks_observed,
@@ -736,7 +1315,7 @@ async fn spawn_hole_punch_task(
                     )
                     .await;
                 if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
-                    let covered_all = last_punch_report.is_some_and(|report| {
+                    let covered_all = last_punch_report.as_ref().is_some_and(|report| {
                         report.unique_target_endpoints as usize >= candidates.len()
                     });
                     if covered_all {
@@ -749,7 +1328,7 @@ async fn spawn_hole_punch_task(
                                 "birthday_probe_plan_completed",
                                 candidates.first().copied(),
                                 Some(candidates.len()),
-                                last_punch_report.map(|report| report.packets_sent),
+                                last_punch_report.as_ref().map(|report| report.packets_sent),
                                 format!(
                                     "stable-side birthday session deadline after a complete send report; cursor_advanced={cursor_advanced} start_rank={} end_rank={}",
                                     plan.start_rank,
@@ -827,11 +1406,15 @@ async fn advertise_fresh_mapping_prediction(
             .await;
         return false;
     }
+    let snapshot = signal.candidate_snapshot.read().await.clone();
+    let (local_candidates, local_candidate_sources) = snapshot
+        .map(|snapshot| (snapshot.candidates, snapshot.candidate_sources))
+        .unwrap_or_default();
     let (candidates, candidate_sources) = build_fresh_mapping_signal_payload(
         result,
         signal.boot_epoch_ms,
-        &signal.local_candidates.read().await.clone(),
-        &signal.local_candidate_sources.read().await.clone(),
+        &local_candidates,
+        &local_candidate_sources,
     );
 
     let punch_at_ms = Some(relay_assisted_punch_at_ms());

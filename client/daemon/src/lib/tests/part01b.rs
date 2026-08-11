@@ -246,7 +246,9 @@ fn fresh_window_survives_full_prepare_pipeline_alongside_96_ordinary_volatile() 
     );
     // The final set fits the wire budget.
     assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
-    assert!(candidates.len() > MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+    // A full fresh window reserves the whole budget, so no ordinary candidate
+    // is left in the payload.
+    assert_eq!(candidates.len(), MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
     // Sources stay consistent with the surviving set.
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
     assert!(fresh_endpoints

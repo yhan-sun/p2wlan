@@ -176,6 +176,38 @@ use std::collections::HashMap;
         server.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn repeated_transient_peer_not_found_is_deduplicated_in_relay_diagnostics() {
+        let peers = peer_manager();
+        peers.add_peer(&peer("node-b", "10.20.0.2")).await;
+        let relay = RelayTransport::connect_for_test("default", "tcp://relay.test:18081", peers);
+        let diagnostics = Arc::new(tokio::sync::RwLock::new(RelaySelectionDiagnostics::default()));
+        let (relay_tx, relay_rx) = mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+
+        for _ in 0..3 {
+            relay_tx
+                .send(RelayMessage::Error {
+                    code: 404,
+                    message: "peer not found: node-b".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(relay_tx);
+        relay
+            .run_inbound(relay_rx, inbound_tx, Some(diagnostics.clone()))
+            .await
+            .unwrap();
+
+        let diagnostics = diagnostics.read().await;
+        assert_eq!(
+            diagnostics.selected_error_count, 1,
+            "one transient 404 window must not inflate selected relay errors"
+        );
+        assert_eq!(diagnostics.last_error_code.as_deref(), Some("peer_not_found"));
+    }
+
     #[test]
     fn relay_candidate_parses_region_and_legacy_endpoint() {
         let preferred = vec!["cn-east".to_string()];

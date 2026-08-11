@@ -1773,11 +1773,13 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
         "203.0.113.120:55001".to_string(),
         "127.0.0.1:55002".to_string(),
     ];
-    *daemon.local_candidates.write().await = cached.clone();
-    *daemon.local_candidate_sources.write().await = HashMap::from([
+    let cached_sources = HashMap::from([
         (cached[0].clone(), "stun_observed".to_string()),
         (cached[1].clone(), "host".to_string()),
     ]);
+    daemon
+        .publish_candidate_snapshot(cached.clone(), cached_sources, Vec::new())
+        .await;
 
     // A blocked live refresh: any STUN/candidate refresh would stall here.
     // The answer must not wait for it.

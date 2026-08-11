@@ -53,6 +53,37 @@ impl PeerManager {
         true
     }
 
+    /// Whether an endpoint was independently authenticated for this peer in
+    /// the current generation. Address/port-dependent NATs can legitimately
+    /// move the peer-reflexive source between an encrypted request and its
+    /// ACK; only a source already learned from that peer's authenticated probe
+    /// evidence may replace the request target in that case.
+    pub(crate) async fn is_authenticated_direct_endpoint(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+    ) -> bool {
+        let conns = self.connections.read().await;
+        let Some(conn) = conns.get(node_id) else {
+            return false;
+        };
+        conn.candidate_pairs.iter().any(|pair| {
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == generation
+                && matches!(
+                    pair.source,
+                    CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
+                )
+                && matches!(
+                    pair.state,
+                    CandidatePairState::Probing
+                        | CandidatePairState::Succeeded
+                        | CandidatePairState::Selected
+                )
+        })
+    }
+
     /// Learn an endpoint from a legacy ACK correlated to an outstanding nonce.
     ///
     /// The caller must verify the nonce, generation, local socket, and source

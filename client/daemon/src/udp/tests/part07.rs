@@ -208,6 +208,15 @@ async fn cancel_mid_beat_old_worker_stops_before_next_send() {
     }
     let before_cancel = count_pending_receiver_datagrams(&receiver).await;
 
+    // A production heartbeat is admitted once per three-second service slot.
+    // This test uses a short worker interval only to make the ownership race
+    // deterministic, so advance the test clock before requesting its next
+    // real service beat rather than accidentally asserting that a second
+    // candidate sweep is allowed inside the same slot.
+    transport
+        .relay_backoff_heartbeat_budget
+        .set_service_slot_for_test(1);
+
     // The next beat parks the worker at the pre-send gate.
     timeout(Duration::from_secs(2), gate.reached.notified())
         .await

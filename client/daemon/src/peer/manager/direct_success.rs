@@ -125,6 +125,20 @@ impl PeerManager {
                 );
             }
             conn.transition(ConnectionState::Direct);
+            // Keep the persisted selector in lock-step with the Direct
+            // promotion.  A selector snapshot taken before this ACK may
+            // still say Relay, but it can never be written after this commit
+            // without observing the newer connection state.
+            if let Some(endpoint) = selected_endpoint {
+                let mut direct_selection =
+                    conn.select_path_for_data(generation, true, true);
+                direct_selection.path = Some(NetworkPath::Direct);
+                direct_selection.direct_endpoint = Some(endpoint);
+                direct_selection.direct_confirmed = true;
+                direct_selection.reason_code = REASON_PATH_DIRECT_CONFIRMED;
+                conn.record_path_selection_event(generation, &direct_selection, local_endpoint);
+                conn.last_path_selection = Some(direct_selection);
+            }
             if let (Some(endpoint), Some((source, _))) = (selected_endpoint, pair_success) {
                 let direct_type = classify_confirmed_direct_endpoint(endpoint, source);
                 let local_endpoint_text = format_log_endpoint(local_endpoint);

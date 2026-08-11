@@ -237,6 +237,15 @@ const PEER_REFLEXIVE_SIGNAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// mapping warm without waiting behind the peer-wide synchronized punch lease.
 const PEER_REFLEXIVE_FAST_PUNCH_INTERVAL: Duration = Duration::from_millis(10);
 const PEER_REFLEXIVE_FAST_PUNCH_ATTEMPTS: u32 = 2;
+/// After a peer-reflexive observation has been relayed, both sides get one
+/// small, shared-window retry.  This is intentionally separate from the
+/// immediate two-packet mapping warmer above: it has a relay-advertised
+/// `punch_at_ms`, one socket, at most two trusted endpoints and four logical
+/// probes, so it cannot become a candidate/sockets scan storm.
+const PEER_REFLEXIVE_MICRO_WINDOW_MAX_TARGETS: usize = 2;
+const PEER_REFLEXIVE_MICRO_WINDOW_INTERVAL: Duration = Duration::from_millis(20);
+const PEER_REFLEXIVE_MICRO_WINDOW_ATTEMPTS: u32 = 2;
+const PEER_REFLEXIVE_MICRO_WINDOW_DEADLINE: Duration = Duration::from_secs(1);
 /// During an asymmetric hard-NAT punch, the hard side keeps exactly one
 /// destination-specific binding warm while the stable side sweeps predicted
 /// public ports. This is a NAT-state maintainer, not a data-path keepalive.
@@ -251,10 +260,9 @@ const RELAY_BACKOFF_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 ///
 /// The request/ACK protocol is fully daemon-internal and authenticated by the
 /// WireGuard session: neither side needs TUN, an OS ICMP echo reply, or user
-/// traffic.  The responder validates the request (peer identity via the
-/// session, network generation via the embedded token), promotes itself to
-/// Direct on a valid request and returns an idempotent ACK; the initiator
-/// promotes to Direct when the ACK matches the outstanding request token.
+/// traffic.  The responder validates the request and returns an idempotent
+/// ACK; each side promotes to Direct only after its own request's exact ACK is
+/// consumed.
 const DIRECT_VALIDATION_REQUEST_DELAYS: [Duration; 3] = [
     Duration::ZERO,
     Duration::from_millis(80),
@@ -335,10 +343,10 @@ pub(crate) const FRESH_PREDICTION_SOURCE_LABEL_PREFIX: &str = "predicted_fresh:"
 /// prediction window.  The prediction is time-sensitive: it must not be
 /// crowded out by ordinary STUN/predicted candidates, and the sender order
 /// (top-1 first, then the successor window) must survive truncation intact.
-/// `MAX_PREDICTED_PORTS` bounds the window the model can produce, so a
-/// reservation of that size preserves every publishable window port.
+/// The reservation covers the widest window the model can produce, so every
+/// publishable window port is preserved.
 pub(crate) const MAX_SIGNAL_FRESH_WINDOW_CANDIDATES: usize =
-    p2pnet_nat::mapping::MAX_PREDICTED_PORTS;
+    p2pnet_nat::mapping::MAX_MONOTONIC_WINDOW_PORTS;
 
 /// Identity of one fresh-mapping prediction: the sender's daemon incarnation
 /// (`boot_epoch`, a persistent strictly-monotonic counter seeded from the wall

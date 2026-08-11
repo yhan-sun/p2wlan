@@ -26,6 +26,10 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         )
         .await;
     let stats = PeerManagerStats::from_diagnostics(&peers);
+    let candidate_snapshot = context.candidate_snapshot.read().await.clone();
+    let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) = candidate_snapshot
+        .map(|snapshot| (snapshot.candidates, Some(snapshot.version), Some(snapshot.hash)))
+        .unwrap_or_else(|| (Vec::new(), None, None));
 
     DiagnosticsSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -43,7 +47,9 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         udp_socket_count,
         udp_socket_pool_active,
         udp_socket_pool,
-        local_candidates: context.local_candidates.read().await.clone(),
+        local_candidates,
+        candidate_snapshot_version,
+        candidate_snapshot_hash,
         nat_profile: context.nat_profile.read().await.clone(),
         gateway_mapping: context.gateway_mapping.read().await.clone(),
         relay_servers: context.config.relay.servers.clone(),
@@ -53,5 +59,44 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         peers,
         stats,
         health: health_snap,
+    }
+}
+
+async fn build_peer_scoped_snapshot(
+    context: DiagnosticsContext,
+    peer_id: &str,
+) -> PeerScopedDiagnosticsSnapshot {
+    let relay_connected = context.relay_transport.read().await.is_some();
+    let udp_local_endpoint = context
+        .udp_transport
+        .read()
+        .await
+        .as_ref()
+        .and_then(|udp| udp.local_addr().ok());
+    let peer_snapshot = context
+        .peers
+        .diagnostic_with_path_selection(
+            peer_id,
+            context.config.relay.prefer_direct,
+            relay_connected,
+            DIRECT_RETRY_BASE_INTERVAL,
+            udp_local_endpoint,
+        )
+        .await;
+    let (network_generation, peer) = peer_snapshot
+        .map(|(generation, peer)| (generation, Some(peer)))
+        .unwrap_or_else(|| (context.peers.current_network_generation_sync(), None));
+    let network_peer_count = context.peers.active_connection_count().await;
+    let captured_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    PeerScopedDiagnosticsSnapshot {
+        node_id: context.config.node.node_id.clone(),
+        network_id: context.config.network.network_id.clone(),
+        network_generation,
+        network_peer_count,
+        captured_at_ms,
+        peer,
     }
 }

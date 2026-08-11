@@ -1204,6 +1204,8 @@ impl UdpTransport {
         let mut budget_skipped = 0u32;
         let mut last_budget_reason = None;
         let mut sent_endpoints = HashSet::new();
+        let mut first_send_at_ms = None;
+        let mut per_socket_sent = 0u32;
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         for round in schedule {
             if !round.delay_before.is_zero() {
@@ -1240,7 +1242,7 @@ impl UdpTransport {
                     }
                 }
                 match self
-                    .send_probe_on_socket(
+                    .send_probe_on_socket_result(
                         index,
                         socket.clone(),
                         Some(peer_id),
@@ -1250,8 +1252,13 @@ impl UdpTransport {
                     )
                     .await
                 {
-                    Ok(_) => {
+                    Ok(sent) => {
                         packets_sent = packets_sent.saturating_add(1);
+                        if let Some(sent_at_ms) = sent.first_send_at_ms {
+                            first_send_at_ms.get_or_insert(sent_at_ms);
+                        }
+                        per_socket_sent = per_socket_sent
+                            .saturating_add(u32::from(sent.datagrams_sent));
                         sent_endpoints.insert(candidate);
                         self.peers.record_direct_probe_sent(peer_id, candidate).await;
                         trace!(
@@ -1288,6 +1295,10 @@ impl UdpTransport {
         Ok(PunchSendReport {
             packets_sent,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
+            first_send_at_ms,
+            per_socket_sent: (per_socket_sent > 0)
+                .then_some(vec![(index, per_socket_sent)])
+                .unwrap_or_default(),
             budget_skipped,
             epoch_budget_exhausted: false,
             candidate_iteration_capped: false,

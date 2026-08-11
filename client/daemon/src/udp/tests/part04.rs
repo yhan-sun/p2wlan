@@ -493,6 +493,14 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
         dynamic_rx >= 1,
         "the Accepted socket's own reader must have processed the ACK (got {dynamic_rx})"
     );
+    assert!(
+        transport
+            .socket_pool_diagnostics()
+            .await
+            .iter()
+            .any(|metrics| metrics.socket_index == result.socket_index),
+        "diagnostics must include the adopted dynamic socket's actual UDP counters"
+    );
     let (resolved_index, socket) = transport.socket_for_peer(Some("peer-b")).await.unwrap();
     assert_eq!(
         resolved_index, result.socket_index,
@@ -2192,6 +2200,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
             local_endpoint: Some(transport.local_addr().unwrap()),
             socket_index: 0,
             generation: peers.current_network_generation().await,
+            probe_session_id: None,
             peer_id: Some("peer-b".to_string()),
             purpose: PendingProbePurpose::ConnectivityCheck,
             accepts_authenticated_ack: true,

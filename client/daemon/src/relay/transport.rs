@@ -236,7 +236,17 @@ impl RelayTransport {
                     );
                     if let Some(ref diags) = relay_selection {
                         let mut d = diags.write().await;
-                        d.selected_error_count = d.selected_error_count.saturating_add(1);
+                        // Relay registration handoffs can emit the same 404
+                        // more than once before the remote reconnects. Keep
+                        // one diagnostic sample for an identical outstanding
+                        // error instead of turning one transient window into a
+                        // misleading error-count storm. A different peer/code
+                        // (or any later different error) remains visible.
+                        let duplicate = d.last_error_code.as_deref() == Some(error_code.as_str())
+                            && d.last_error.as_deref() == Some(message.as_str());
+                        if !duplicate {
+                            d.selected_error_count = d.selected_error_count.saturating_add(1);
+                        }
                         d.last_error = Some(message.clone());
                         d.last_error_code = Some(error_code.clone());
                     }

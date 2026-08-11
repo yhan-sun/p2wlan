@@ -127,19 +127,101 @@ impl PeerManager {
     ) {
         let code = code.into();
         let reason = reason.into();
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.relay_health.record_failure(code.clone(), reason.clone());
-            if conn.state == ConnectionState::Relay {
-                conn.transition(ConnectionState::FallbackToRelay);
+        // A relay 404 may be a short registration handoff/reconnect window.
+        // Keep an online peer's current recovery/fresh mapping alive during a
+        // bounded grace period; only confirmed offline evidence or a sustained
+        // 404 after that window reaches the destructive quarantine path. A
+        // repeated 404 in the same grace window is also one failure sample:
+        // it must not inflate peer health diagnostics on every relay frame.
+        let record_failure = if code == "peer_not_found" {
+            self.handle_relay_peer_not_found(node_id, &reason).await
+        } else {
+            true
+        };
+        if record_failure {
+            if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+                conn.relay_health.record_failure(code, reason);
+                if conn.state == ConnectionState::Relay {
+                    conn.transition(ConnectionState::FallbackToRelay);
+                }
             }
         }
-        // A relay 404 is authoritative proof the destination is not
-        // registered: quarantine the peer's whole recovery (session,
-        // candidates, fresh mapping) so it cannot keep burning shared NAT
-        // and scheduler capacity.  Only new control-plane evidence re-opens
-        // recovery.
-        if code == "peer_not_found" {
-            self.quarantine_peer(node_id, &reason).await;
+    }
+
+    /// Handle a relay 404 and report whether this observation should become a
+    /// new peer-health failure sample. Repeated errors while one grace window
+    /// is open return false so diagnostics stay representative of the window,
+    /// rather than the relay's frame count.
+    async fn handle_relay_peer_not_found(&self, node_id: &str, reason: &str) -> bool {
+        let now = Instant::now();
+        let Some(connection) = self.get_connection(node_id).await else {
+            // A missing connection is already authoritative offline evidence;
+            // retain the existing anti-storm isolation behavior.
+            self.quarantine_peer(node_id, reason).await;
+            return true;
+        };
+        if !connection.online {
+            self.quarantine_peer(node_id, reason).await;
+            return true;
+        }
+
+        let mut emit_grace_event = false;
+        let mut grace_remaining = RELAY_PEER_NOT_FOUND_GRACE;
+        let should_quarantine = {
+            let mut grace = self.relay_not_found_grace.lock().await;
+            let evidence_changed = grace.get(node_id).is_some_and(|state| {
+                state.last_seen != connection.last_seen
+                    || state.public_key != connection.public_key
+                    || state.endpoint != connection.signaled_endpoint
+            });
+            if evidence_changed {
+                // A newer online incarnation/endpoint supersedes the old
+                // 404 observation.  Start a fresh handoff grace window for
+                // this evidence rather than destroying the new recovery.
+                grace.remove(node_id);
+            }
+            let state = grace
+                .entry(node_id.to_string())
+                .or_insert_with(|| RelayNotFoundGraceState {
+                    started_at: now,
+                    last_seen: connection.last_seen,
+                    public_key: connection.public_key.clone(),
+                    endpoint: connection.signaled_endpoint,
+                    event_recorded: false,
+                });
+            let elapsed = now.saturating_duration_since(state.started_at);
+            if elapsed >= RELAY_PEER_NOT_FOUND_GRACE {
+                grace.remove(node_id);
+                true
+            } else {
+                grace_remaining = RELAY_PEER_NOT_FOUND_GRACE.saturating_sub(elapsed);
+                if !state.event_recorded {
+                    state.event_recorded = true;
+                    emit_grace_event = true;
+                }
+                false
+            }
+        };
+
+        if should_quarantine {
+            self.quarantine_peer(node_id, reason).await;
+            true
+        } else if emit_grace_event {
+            self.record_direct_event(
+                node_id,
+                "relay_peer_not_found_grace",
+                connection.signaled_endpoint,
+                None,
+                None,
+                format!(
+                    "relay peer_not_found treated as transient while control plane reports online; preserving recovery for {}ms reason={reason}",
+                    grace_remaining.as_millis()
+                ),
+            )
+            .await;
+            true
+        } else {
+            false
         }
     }
 

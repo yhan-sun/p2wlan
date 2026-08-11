@@ -3,7 +3,7 @@ async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     local_candidates: Arc<RwLock<Vec<String>>>,
-    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
     punch_deduplicator: PunchAttemptDeduplicator,
     control: ControlClient,
     stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
@@ -84,8 +84,7 @@ async fn run_direct_probe_loop(
                 let stun_timeout = *stun_timeout.read().await;
                 HolePunchSignalContext {
                     control: control.clone(),
-                    local_candidates: local_candidates.clone(),
-                    local_candidate_sources: local_candidate_sources.clone(),
+                    candidate_snapshot: candidate_snapshot.clone(),
                     stun_servers,
                     stun_timeout,
                     boot_epoch_ms,
@@ -101,7 +100,18 @@ async fn run_direct_probe_loop(
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
-                let rx_before = udp.probe_rx_snapshot().await;
+                // The retry's receive delta is meaningful only for the
+                // Probe-v2 binding in force when this task was admitted.
+                // Keep that value fixed across an in-flight rekey rather
+                // than reading a different current session at timeout time.
+                let probe_rx_session_id = peers.probe_session_id_for_peer(&peer_id).await;
+                let rx_before = udp
+                    .probe_rx_snapshot_for_peer_session(
+                        &peer_id,
+                        generation,
+                        probe_rx_session_id.as_deref(),
+                    )
+                    .await;
                 let mut last_punch_report: Option<PunchSendReport> = None;
                 let deadline = punch_session_deadline(
                     &candidates,
@@ -405,8 +415,29 @@ async fn run_direct_probe_loop(
                                 .await;
                         }
                         Ok(report) => {
-                            last_punch_report = Some(report);
                             let sent = report.packets_sent;
+                            let actual_first_send_at_ms = report.first_send_at_ms;
+                            let per_socket_sent = report
+                                .per_socket_sent
+                                .iter()
+                                .map(|(socket, count)| format!("{socket}:{count}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "retry_first_packet_sent",
+                                    candidates.first().copied(),
+                                    Some(candidates.len()),
+                                    Some(sent),
+                                    format!(
+                                        "session_id={} network_generation={} recovery_epoch={} actual_first_send_at_ms={actual_first_send_at_ms:?} per_socket_actual_datagrams={per_socket_sent}",
+                                        session.session_id(),
+                                        generation,
+                                        epoch,
+                                    ),
+                                )
+                                .await;
                             let birthday_window_completion = if let Some(plan) =
                                 birthday_plan.as_ref().filter(|_| stable_remote_scatter)
                             {
@@ -441,6 +472,7 @@ async fn run_direct_probe_loop(
                             } else {
                                 None
                             };
+                            last_punch_report = Some(report);
                             peers
                                 .record_direct_event(
                                     &peer_id,
@@ -478,10 +510,18 @@ async fn run_direct_probe_loop(
                             let success_count_after = peers
                                 .direct_probe_success_count_for_generation(&peer_id, generation)
                                 .await;
-                            let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
+                            let rx_delta = udp
+                                .probe_rx_snapshot_for_peer_session(
+                                    &peer_id,
+                                    generation,
+                                    probe_rx_session_id.as_deref(),
+                                )
+                                .await
+                                .delta_since(rx_before);
                             if success_count_after == success_count_before {
                                 let timeout_detail = format!(
-                                    "no matched direct probe ACK after {sent} {retry_label} probes; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                                    "no matched direct probe ACK after {sent} {retry_label} probes; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                                    probe_rx_session_id.as_deref().unwrap_or("legacy"),
                                     rx_delta.known_peer_ip_datagrams_received,
                                     rx_delta.authenticated_probe_packets_received,
                                     rx_delta.authenticated_probe_acks_observed,
@@ -600,10 +640,18 @@ async fn run_direct_probe_loop(
                             .await;
                     }
                     PunchSessionOutcome::DeadlineExceeded => {
-                        let rx_delta = udp.probe_rx_snapshot().await.delta_since(rx_before);
+                        let rx_delta = udp
+                            .probe_rx_snapshot_for_peer_session(
+                                &peer_id,
+                                generation,
+                                probe_rx_session_id.as_deref(),
+                            )
+                            .await
+                            .delta_since(rx_before);
                         let timeout_detail = format!(
-                            "background UDP retry stopped after {}ms deadline; known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
+                            "background UDP retry stopped after {}ms deadline; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
                             deadline.as_millis(),
+                            probe_rx_session_id.as_deref().unwrap_or("legacy"),
                             rx_delta.known_peer_ip_datagrams_received,
                             rx_delta.authenticated_probe_packets_received,
                             rx_delta.authenticated_probe_acks_observed,
@@ -629,6 +677,7 @@ async fn run_direct_probe_loop(
                             // grace): advance the cursor so the next cycle
                             // does not rescan the same 3,000 ports.
                             let covered_all = last_punch_report
+                                .as_ref()
                                 .is_some_and(|report| {
                                     report.unique_target_endpoints as usize >= candidates.len()
                                 });
@@ -646,7 +695,9 @@ async fn run_direct_probe_loop(
                                         "birthday_probe_plan_completed",
                                         candidates.first().copied(),
                                         Some(candidates.len()),
-                                        last_punch_report.map(|report| report.packets_sent),
+                                        last_punch_report
+                                            .as_ref()
+                                            .map(|report| report.packets_sent),
                                         format!(
                                             "stable-side birthday session deadline after a complete send report; cursor_advanced={cursor_advanced} start_rank={} end_rank={}",
                                             plan.start_rank,

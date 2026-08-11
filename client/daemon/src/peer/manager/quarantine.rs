@@ -2,11 +2,11 @@
 // Stale-peer quarantine: authoritative isolation of relay 404 peers
 // ============================================================
 //
-// A relay `peer_not_found` (404) is authoritative evidence that the
-// destination is not registered on the relay — it is gone, restarted, or
-// left the network.  Continuing to scan such a peer on every retry tick
-// wastes shared NAT, CPU, log and scheduler capacity and starves the other
-// peers' recovery.
+// A relay `peer_not_found` (404) is evidence that the destination is not
+// currently registered on this relay.  Registration handoff/reconnects can
+// leave a short 404 window while the control plane still reports the same
+// incarnation online, so relay errors are first held in a bounded grace state
+// (see `RelayNotFoundGraceState`) before the destructive quarantine below.
 //
 // A quarantined peer:
 //   - cannot start fresh-mapping generations, candidate plans, sessions or
@@ -18,9 +18,31 @@
 //     `add_peer` with online/endpoint/incarnation/offer changes
 //     (`unquarantine_peer`), never by retry churn.
 //
-// Repeated 404s apply an exponential quarantine backoff (base 60s, cap
-// 30min) with event deduplication, so the peer cannot keep logging a
+// Repeated confirmed 404s apply an exponential quarantine backoff (base 60s,
+// cap 30min) with event deduplication, so the peer cannot keep logging a
 // warning or a scan every second.
+
+/// Confirmation window for a relay registration handoff/reconnect.
+///
+/// This is deliberately much shorter than the quarantine itself, but longer
+/// than the synchronized first-punch window: an online peer gets a relay
+/// reconnect/renewal attempt without losing that current Direct recovery
+/// session, while a genuinely offline peer is isolated as soon as the control
+/// plane says it is offline (or once this window expires).
+pub(crate) const RELAY_PEER_NOT_FOUND_GRACE: Duration = Duration::from_secs(15);
+
+/// Identity/evidence snapshot captured at the first transient relay 404.
+#[derive(Debug, Clone)]
+pub(crate) struct RelayNotFoundGraceState {
+    pub started_at: Instant,
+    pub last_seen: u64,
+    pub public_key: String,
+    pub endpoint: Option<SocketAddr>,
+    /// Keep the grace event itself one-per-window.  Relay diagnostics perform
+    /// an additional error-level deduplication, but peer timeline events must
+    /// also stay bounded when the relay sends repeated 404 frames.
+    pub event_recorded: bool,
+}
 
 
 
@@ -54,6 +76,19 @@ impl PeerQuarantineState {
 }
 
 impl PeerManager {
+    /// Drop a pending relay registration grace window after fresh control-plane
+    /// evidence or peer removal.  This never touches quarantine state.
+    pub(crate) async fn clear_relay_not_found_grace(&self, peer_id: &str) {
+        self.relay_not_found_grace.lock().await.remove(peer_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_force_relay_not_found_grace_elapsed(&self, peer_id: &str) {
+        if let Some(state) = self.relay_not_found_grace.lock().await.get_mut(peer_id) {
+            state.started_at = Instant::now() - RELAY_PEER_NOT_FOUND_GRACE;
+        }
+    }
+
     /// Quarantine a peer after authoritative relay `peer_not_found` evidence.
     ///
     /// Idempotent within one quarantine episode: repeated 404s for the same
@@ -63,6 +98,10 @@ impl PeerManager {
     /// generation is never touched; the active punch session (if any) is
     /// cancelled through the registered hook.
     pub(crate) async fn quarantine_peer(&self, peer_id: &str, reason: &str) {
+        // A confirmed quarantine supersedes any transient registration grace;
+        // keeping the old grace would let a later stale relay error mutate the
+        // new incarnation's state.
+        self.clear_relay_not_found_grace(peer_id).await;
         let now = Instant::now();
         let mut fresh = false;
         let backoff;

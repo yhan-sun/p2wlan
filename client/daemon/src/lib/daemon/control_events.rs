@@ -350,6 +350,40 @@ impl Daemon {
         if already_direct || *cancellation.borrow() {
             return;
         }
+        // The peer-reflexive signal carries the observer's relay-normalized
+        // rendezvous deadline.  Join it with a tiny trusted remote-target
+        // slice before the optional candidate re-offer: this is the receiver
+        // half of the shared micro-window, not a replacement for the normal
+        // full recovery punch below. Old signals without a deadline retain
+        // the legacy full-punch behavior but never invent a one-sided
+        // "synchronized" micro-window.
+        if let Some(shared_punch_at_ms) = work.punch_at_ms {
+            let udp = self.udp_transport.read().await.clone();
+            let targets = self.peers.direct_probe_target_set_for(peer_id).await;
+            if let (Some(udp), Some(targets)) = (udp, targets) {
+                spawn_peer_reflexive_micro_window(
+                    udp,
+                    self.peers.clone(),
+                    self.punch_attempts.clone(),
+                    peer_id.to_string(),
+                    targets.candidates,
+                    Some(shared_punch_at_ms),
+                    "peer_reflexive_receiver",
+                )
+                .await;
+            } else {
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "peer_reflexive_micro_window_skipped",
+                        None,
+                        None,
+                        None,
+                        "receiver could not join shared peer-reflexive micro-window because UDP transport or trusted remote targets were unavailable",
+                    )
+                    .await;
+            }
+        }
         if local_candidate_changed && !candidates.is_empty() {
             let send_result = tokio::select! {
                 changed = cancellation.changed() => {
@@ -598,7 +632,7 @@ impl Daemon {
             return None;
         }
         let targets = snapshot
-            .candidates
+            .fresh_candidates
             .iter()
             .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
             .collect::<Vec<_>>();

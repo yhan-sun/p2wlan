@@ -114,6 +114,36 @@ impl DirectValidationIngress {
     }
 }
 
+/// Write an encrypted-validation lifecycle event with the exact generation
+/// and owner captured by the session lease.  A peer timeline already scopes
+/// the event to `peer_id`; the explicit owner makes a queued worker, its ACK
+/// expectation, and its terminal result traceable without treating probe ACK
+/// counters from another peer as evidence for this worker.
+#[allow(clippy::too_many_arguments)]
+async fn record_validation_event(
+    peers: &PeerManager,
+    peer_id: &str,
+    generation: u64,
+    owner_token: u64,
+    stage: impl Into<String>,
+    endpoint: Option<SocketAddr>,
+    sent_probes: Option<u32>,
+    detail: impl Into<String>,
+) {
+    peers
+        .record_direct_validation_event(
+            peer_id,
+            generation,
+            owner_token,
+            stage,
+            endpoint,
+            None,
+            sent_probes,
+            detail,
+        )
+        .await;
+}
+
 /// The one authoritative task spawner for daemon-internal validation.
 ///
 /// Both authenticated-punch ACKs and peer-reflexive observations feed the
@@ -183,7 +213,22 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                     .await
                 {
                     crate::udp::DirectValidationSessionStart::Spawn(lease) => {
+                        let queued_target = *lease.target_rx.borrow();
                         if pending_leases.len() >= MAX_PENDING_DIRECT_VALIDATION_PEERS {
+                            record_validation_event(
+                                &peers,
+                                &lease.peer_id,
+                                queued_target.generation,
+                                lease.owner_token,
+                                "direct_validation_dropped",
+                                Some(queued_target.endpoint),
+                                Some(0),
+                                format!(
+                                    "dropped validation session before worker start: pending peer cap {} reached",
+                                    MAX_PENDING_DIRECT_VALIDATION_PEERS
+                                ),
+                            )
+                            .await;
                             let removed = udp
                                 .finish_direct_validation_session(
                                     &lease.peer_id,
@@ -198,6 +243,22 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                                 "direct-validation pending lease cap reached; dropping newest distinct peer"
                             );
                         } else {
+                            record_validation_event(
+                                &peers,
+                                &lease.peer_id,
+                                queued_target.generation,
+                                lease.owner_token,
+                                "direct_validation_queued",
+                                Some(queued_target.endpoint),
+                                Some(0),
+                                format!(
+                                    "queued encrypted validation session owner={} generation={} pending_leases={}",
+                                    lease.owner_token,
+                                    queued_target.generation,
+                                    pending_leases.len().saturating_add(1)
+                                ),
+                            )
+                            .await;
                             // Retain the owner/session while capacity is
                             // saturated.  Later observations for this peer
                             // merge into the same watch target, and the owner
@@ -207,6 +268,18 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                         }
                     }
                     crate::udp::DirectValidationSessionStart::Merged => {
+                        peers
+                            .record_direct_event(
+                                &observation.peer_id,
+                                "direct_validation_observation_merged",
+                                Some(observation.observed_endpoint),
+                                None,
+                                Some(0),
+                                format!(
+                                    "merged newest endpoint into the peer's existing validation worker generation={generation}"
+                                ),
+                            )
+                            .await;
                         debug!(
                             peer_id = %observation.peer_id,
                             remote_endpoint = %observation.observed_endpoint,
@@ -372,16 +445,46 @@ async fn run_direct_encrypted_validation_session(
     let peer_id = lease.peer_id.clone();
     let owner_token = lease.owner_token;
     let mut target_rx = lease.target_rx;
+    // The lease is the source of truth for this worker's generation.  Every
+    // terminal event below uses this captured value, even when cancellation
+    // races a later network-generation advance.
+    let lease_target = *target_rx.borrow();
+    let generation = lease_target.generation;
+    let lease_endpoint = lease_target.endpoint;
 
     let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
         debug!(
             "Skipping encrypted Direct validation for {}; local virtual IP '{}' is not IPv4",
             peer_id, local_virtual_ip
         );
+        record_validation_event(
+            &peers,
+            &peer_id,
+            generation,
+            owner_token,
+            "direct_validation_cancelled",
+            Some(lease_endpoint),
+            Some(0),
+            format!(
+                "cancelled before start: local virtual IP '{local_virtual_ip}' is not IPv4"
+            ),
+        )
+        .await;
         udp.finish_direct_validation_session(&peer_id, owner_token).await;
         return;
     };
     let Some(connection) = peers.get_connection(&peer_id).await else {
+        record_validation_event(
+            &peers,
+            &peer_id,
+            generation,
+            owner_token,
+            "direct_validation_cancelled",
+            Some(lease_endpoint),
+            Some(0),
+            "cancelled before start: peer connection disappeared",
+        )
+        .await;
         udp.finish_direct_validation_session(&peer_id, owner_token).await;
         return;
     };
@@ -390,16 +493,57 @@ async fn run_direct_encrypted_validation_session(
             "Skipping encrypted Direct validation for {}; peer virtual IP '{}' is not IPv4",
             peer_id, connection.virtual_ip
         );
+        record_validation_event(
+            &peers,
+            &peer_id,
+            generation,
+            owner_token,
+            "direct_validation_cancelled",
+            Some(lease_endpoint),
+            Some(0),
+            format!(
+                "cancelled before start: peer virtual IP '{}' is not IPv4",
+                connection.virtual_ip
+            ),
+        )
+        .await;
         udp.finish_direct_validation_session(&peer_id, owner_token).await;
         return;
     };
 
     let Some(initial_target) = current_validation_target(&peers, &target_rx, owner_token).await
     else {
+        let observed_target = *target_rx.borrow();
+        let direct = peers.is_direct_for_generation(&peer_id, generation).await;
+        record_validation_event(
+            &peers,
+            &peer_id,
+            generation,
+            owner_token,
+            if direct {
+                "direct_validation_completed"
+            } else {
+                "direct_validation_cancelled"
+            },
+            Some(observed_target.endpoint),
+            Some(0),
+            if direct {
+                "completed before request: encrypted Direct validation was confirmed by another owned path"
+                    .to_string()
+            } else if observed_target.cancelled {
+                "cancelled before request: validation owner was revoked".to_string()
+            } else if observed_target.owner_token != owner_token {
+                "cancelled before request: validation owner was replaced".to_string()
+            } else if peers.current_network_generation().await != generation {
+                "cancelled before request: network generation advanced".to_string()
+            } else {
+                "cancelled before request: validation target was unavailable".to_string()
+            },
+        )
+        .await;
         udp.finish_direct_validation_session(&peer_id, owner_token).await;
         return;
     };
-    let generation = initial_target.generation;
     tracing::info!(
         event = "encrypted_trial_started",
         peer_id = %peer_id,
@@ -408,6 +552,19 @@ async fn run_direct_encrypted_validation_session(
         owner_token,
         "encrypted direct-validation session started"
     );
+    record_validation_event(
+        &peers,
+        &peer_id,
+        generation,
+        owner_token,
+        "direct_validation_started",
+        Some(initial_target.endpoint),
+        Some(0),
+        format!(
+            "started encrypted direct-validation request/ACK exchange owner={owner_token} generation={generation}"
+        ),
+    )
+    .await;
     peers
         .record_direct_event(
             &peer_id,
@@ -421,21 +578,6 @@ async fn run_direct_encrypted_validation_session(
         )
         .await;
 
-    if peers.is_direct_for_generation(&peer_id, generation).await {
-        peers
-            .record_direct_event(
-                &peer_id,
-                "encrypted_trial_skipped",
-                Some(initial_target.endpoint),
-                None,
-                Some(0),
-                "skipped bounded WireGuard validation because Direct is already confirmed for this network generation",
-            )
-            .await;
-        udp.finish_direct_validation_session(&peer_id, owner_token).await;
-        return;
-    }
-
     // An observation can arrive before offer/answer installs the WireGuard
     // session.  Keep one owned worker alive, but always read the latest target
     // before it sends a packet and leave immediately if the owner is revoked.
@@ -444,31 +586,59 @@ async fn run_direct_encrypted_validation_session(
     loop {
         let Some(target) = current_validation_target(&peers, &target_rx, owner_token).await
         else {
+            let observed_target = *target_rx.borrow();
+            let direct = peers.is_direct_for_generation(&peer_id, generation).await;
+            record_validation_event(
+                &peers,
+                &peer_id,
+                generation,
+                owner_token,
+                if direct {
+                    "direct_validation_completed"
+                } else {
+                    "direct_validation_cancelled"
+                },
+                Some(observed_target.endpoint),
+                Some(0),
+                if direct {
+                    "completed while waiting for WireGuard session: encrypted ACK promoted Direct"
+                        .to_string()
+                } else if observed_target.cancelled {
+                    "cancelled while waiting for WireGuard session: validation owner was revoked"
+                        .to_string()
+                } else if observed_target.owner_token != owner_token {
+                    "cancelled while waiting for WireGuard session: validation owner was replaced"
+                        .to_string()
+                } else {
+                    "cancelled while waiting for WireGuard session: network generation advanced"
+                        .to_string()
+                },
+            )
+            .await;
             udp.finish_direct_validation_session(&peer_id, owner_token).await;
             return;
         };
         if target.generation != generation {
+            record_validation_event(
+                &peers,
+                &peer_id,
+                generation,
+                owner_token,
+                "direct_validation_cancelled",
+                Some(target.endpoint),
+                Some(0),
+                format!(
+                    "cancelled while waiting for WireGuard session: target generation {} replaced lease generation {}",
+                    target.generation, generation
+                ),
+            )
+            .await;
             udp.finish_direct_validation_session(&peer_id, owner_token).await;
             return;
         }
-        if peers.is_direct_for_generation(&peer_id, generation).await {
-            peers
-                .record_direct_event(
-                    &peer_id,
-                    "encrypted_trial_skipped",
-                    Some(target.endpoint),
-                    None,
-                    Some(0),
-                    "skipped bounded WireGuard validation because Direct became confirmed while waiting for the WireGuard session",
-                )
-                .await;
-            udp.finish_direct_validation_session(&peer_id, owner_token).await;
-            return;
-        }
-
         let status = transport.session_status(&peer_id).await;
         if status.has_active && !status.expired {
-            if waiting_for_session {
+        if waiting_for_session {
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -506,6 +676,20 @@ async fn run_direct_encrypted_validation_session(
                 peer_id,
                 DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
             );
+            record_validation_event(
+                &peers,
+                &peer_id,
+                generation,
+                owner_token,
+                "direct_validation_timed_out",
+                Some(target.endpoint),
+                Some(0),
+                format!(
+                    "timed out waiting for a ready WireGuard session after {}ms",
+                    DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
+                ),
+            )
+            .await;
             peers
                 .record_direct_event(
                     &peer_id,
@@ -536,21 +720,52 @@ async fn run_direct_encrypted_validation_session(
     // unbounded retry loop.
     let validation_id = unix_time_millis() as u16;
     let mut sent = 0u32;
+    let mut terminal_stage = "direct_validation_timed_out";
+    let mut terminal_reason = String::from(
+        "no encrypted validation ACK received within the bounded request/ACK exchange",
+    );
+    let mut stop_worker = false;
     for (sequence, delay) in DIRECT_VALIDATION_REQUEST_DELAYS.into_iter().enumerate() {
         let _ = wait_for_validation_update(&mut target_rx, delay).await;
         let Some(target) = current_validation_target(&peers, &target_rx, owner_token).await
         else {
+            let observed_target = *target_rx.borrow();
+            if peers.is_direct_for_generation(&peer_id, generation).await {
+                terminal_stage = "direct_validation_completed";
+                terminal_reason =
+                    "completed after encrypted validation ACK promoted Direct".to_string();
+            } else {
+                terminal_stage = "direct_validation_cancelled";
+                terminal_reason = if observed_target.cancelled {
+                    "cancelled during request exchange: validation owner was revoked".to_string()
+                } else if observed_target.owner_token != owner_token {
+                    "cancelled during request exchange: validation owner was replaced".to_string()
+                } else {
+                    "cancelled during request exchange: network generation advanced".to_string()
+                };
+            }
             break;
         };
-        if target.generation != generation
-            || peers.is_direct_for_generation(&peer_id, generation).await
-        {
+        if target.generation != generation {
+            terminal_stage = "direct_validation_cancelled";
+            terminal_reason = format!(
+                "cancelled before next request: target generation {} no longer matches lease generation {}",
+                target.generation, generation
+            );
             break;
         }
 
         let request_id = validation_id.wrapping_add(sequence as u16);
-        if !udp
-            .expect_direct_validation_ack_owned(
+        // Resolve the ACTUAL sending socket, take its send lease and register
+        // the ACK expectation for that exact socket in one logic path.  The
+        // send below uses the resolved socket directly, so a dynamic socket
+        // detach or an affinity switch can never make the ACK expectation
+        // disagree with the socket that really carried the request.  The
+        // lease lives inside the expectation until the ACK, a cancellation, a
+        // timeout or a generation invalidation releases it, keeping the
+        // socket's reader alive for the whole ACK window.
+        let prepared = match udp
+            .prepare_direct_validation_send(
                 &peer_id,
                 request_id,
                 generation,
@@ -559,8 +774,34 @@ async fn run_direct_encrypted_validation_session(
             )
             .await
         {
-            break;
-        }
+            Ok(prepared) => prepared,
+            Err(crate::udp::DirectValidationSendError::OwnerRevoked) => {
+                terminal_stage = "direct_validation_cancelled";
+                terminal_reason = format!(
+                    "cancelled before request {request_id}: validation owner no longer owns endpoint {}",
+                    target.endpoint
+                );
+                break;
+            }
+            Err(crate::udp::DirectValidationSendError::NoSocket) => {
+                terminal_stage = "direct_validation_failed";
+                terminal_reason =
+                    "failed to prepare validation send: no UDP socket resolved for the peer"
+                        .to_string();
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "encrypted_trial_failed",
+                        Some(target.endpoint),
+                        None,
+                        Some(sent),
+                        "no UDP socket resolved for the owned validation request",
+                    )
+                    .await;
+                break;
+            }
+        };
+        let socket_index = Some(prepared.socket_index);
         let payload = build_direct_validation_payload(
             DirectValidationKind::Request,
             generation,
@@ -576,6 +817,8 @@ async fn run_direct_encrypted_validation_session(
             &payload,
         );
         let send_udp = udp.clone();
+        let send_socket = prepared.socket.clone();
+        let send_socket_index = prepared.socket_index;
         let endpoint = target.endpoint;
         match transport
             .encrypt_and_emit_outbound(
@@ -585,7 +828,15 @@ async fn run_direct_encrypted_validation_session(
                     packet,
                 },
                 move |encrypted| async move {
-                    send_udp.send_packet_to(&encrypted, endpoint).await.map(|_| ())
+                    send_udp
+                        .send_encrypted_packet_on_socket(
+                            &send_socket,
+                            send_socket_index,
+                            &encrypted,
+                            endpoint,
+                        )
+                        .await
+                        .map(|_| ())
                 },
             )
             .await
@@ -604,10 +855,18 @@ async fn run_direct_encrypted_validation_session(
                     "direct-validation request sent"
                 );
                 peers
-                    .record_direct_event(
+                    .record_direct_validation_event_with_metadata(
                         &peer_id,
+                        generation,
+                        crate::peer::DirectValidationEventMetadata {
+                            local_validation_session_id: Some(owner_token),
+                            request_id: Some(request_id),
+                            expected_endpoint: Some(endpoint),
+                            ..crate::peer::DirectValidationEventMetadata::default()
+                        },
                         "direct_validation_request_sent",
                         Some(endpoint),
+                        socket_index,
                         None,
                         Some(sent),
                         format!(
@@ -621,11 +880,35 @@ async fn run_direct_encrypted_validation_session(
                     let Some(current) = current_validation_target(&peers, &target_rx, owner_token)
                         .await
                     else {
+                        if peers.is_direct_for_generation(&peer_id, generation).await {
+                            terminal_stage = "direct_validation_completed";
+                            terminal_reason =
+                                "completed while awaiting ACK: encrypted validation ACK promoted Direct"
+                                    .to_string();
+                        } else {
+                            terminal_stage = "direct_validation_cancelled";
+                            terminal_reason =
+                                "cancelled while awaiting ACK: validation owner was revoked or generation advanced"
+                                    .to_string();
+                        }
+                        stop_worker = true;
                         break;
                     };
                     if current.generation != generation
                         || peers.is_direct_for_generation(&peer_id, generation).await
                     {
+                        if peers.is_direct_for_generation(&peer_id, generation).await {
+                            terminal_stage = "direct_validation_completed";
+                            terminal_reason =
+                                "completed while awaiting ACK: encrypted validation ACK promoted Direct"
+                                    .to_string();
+                        } else {
+                            terminal_stage = "direct_validation_cancelled";
+                            terminal_reason =
+                                "cancelled while awaiting ACK: network generation advanced"
+                                    .to_string();
+                        }
+                        stop_worker = true;
                         break;
                     }
                     // A newer endpoint cleared this request's expectation in
@@ -642,12 +925,24 @@ async fn run_direct_encrypted_validation_session(
                     )
                     .await;
                 }
+                if stop_worker {
+                    break;
+                }
             }
             Ok(false) => {
                 debug!(
                     "Stopping encrypted Direct validation for {}; WireGuard session is no longer ready",
                     peer_id
                 );
+                terminal_stage = "direct_validation_cancelled";
+                terminal_reason =
+                    "cancelled: WireGuard session became unavailable while emitting request"
+                        .to_string();
+                // Withdraw the expectation: the request never left this
+                // daemon, so a late ACK must not match it.  This releases the
+                // socket send lease held by the expectation.
+                udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
+                    .await;
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -665,6 +960,12 @@ async fn run_direct_encrypted_validation_session(
                     "Failed to send encrypted Direct validation to {} at {}: {err}",
                     peer_id, endpoint
                 );
+                terminal_stage = "direct_validation_failed";
+                terminal_reason = format!("failed to emit encrypted validation packet: {err}");
+                // Withdraw the expectation and its socket lease: the request
+                // was never sent, so no ACK may confirm it.
+                udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
+                    .await;
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -680,6 +981,14 @@ async fn run_direct_encrypted_validation_session(
         }
     }
 
+    // The ACK handler revokes the worker as part of the same epoch transaction
+    // that promotes Direct.  Observe the state once more before publishing a
+    // timeout so a promotion racing the final ACK wait is reported as success.
+    if peers.is_direct_for_generation(&peer_id, generation).await {
+        terminal_stage = "direct_validation_completed";
+        terminal_reason = "completed: encrypted validation ACK confirmed Direct".to_string();
+    }
+
     let final_endpoint = active_direct_validation_target(&target_rx, owner_token)
         .map(|target| target.endpoint)
         .or(Some(initial_target.endpoint));
@@ -693,5 +1002,16 @@ async fn run_direct_encrypted_validation_session(
             format!("sent {sent} bounded WireGuard validation requests owner={owner_token}"),
         )
         .await;
+    record_validation_event(
+        &peers,
+        &peer_id,
+        generation,
+        owner_token,
+        terminal_stage,
+        final_endpoint,
+        Some(sent),
+        terminal_reason,
+    )
+    .await;
     udp.finish_direct_validation_session(&peer_id, owner_token).await;
 }

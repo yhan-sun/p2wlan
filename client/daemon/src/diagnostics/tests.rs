@@ -126,7 +126,7 @@ mod tests {
             config,
             peers,
             Arc::new(RwLock::new(None)),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(GatewayMappingDiagnostics::default())),
             Arc::new(RwLock::new(None)),
@@ -195,6 +195,25 @@ mod tests {
             .as_ref()
             .expect("current path selection should be included in /status");
         assert_eq!(current_path.reason_code, REASON_PATH_RELAY_UNAVAILABLE);
+
+        let mut scoped_stream = TcpStream::connect(addr).await.unwrap();
+        scoped_stream
+            .write_all(
+                b"GET /status/peer/node-b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut scoped_response = String::new();
+        scoped_stream
+            .read_to_string(&mut scoped_response)
+            .await
+            .unwrap();
+        assert!(scoped_response.starts_with("HTTP/1.1 200 OK"));
+        let scoped_body = scoped_response.split("\r\n\r\n").nth(1).unwrap();
+        let scoped: PeerScopedDiagnosticsSnapshot = serde_json::from_str(scoped_body).unwrap();
+        assert_eq!(scoped.network_peer_count, 0);
+        assert!(scoped.captured_at_ms > 0);
+        assert_eq!(scoped.peer.unwrap().node_id, "node-b");
 
         let mut shutdown_stream = TcpStream::connect(addr).await.unwrap();
         shutdown_stream

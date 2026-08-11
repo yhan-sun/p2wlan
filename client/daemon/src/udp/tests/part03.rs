@@ -334,7 +334,11 @@ async fn udp_inbound_decrypts_and_writes_packet_to_tun() {
 
     let conn = peers.get_connection("peer-a").await.unwrap();
     assert_eq!(conn.bytes_received, written.len() as u64);
-    assert_eq!(conn.state.to_string(), "direct");
+    assert_ne!(
+        conn.state.to_string(),
+        "direct",
+        "a decrypted ordinary payload is evidence for validation, not Direct proof"
+    );
     assert_eq!(conn.endpoint, Some(sender.local_addr().unwrap()));
     assert_eq!(
         conn.candidate_sources
@@ -693,6 +697,7 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
             local_endpoint: Some(local_addr),
             socket_index: 0,
             generation,
+            probe_session_id: None,
             peer_id: Some("peer-b".to_string()),
             purpose: PendingProbePurpose::ConnectivityCheck,
             accepts_authenticated_ack: false,
@@ -757,6 +762,7 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
             local_endpoint: Some(local_addr),
             socket_index: 0,
             generation,
+            probe_session_id: None,
             peer_id: Some("peer-b".to_string()),
             purpose: PendingProbePurpose::ConnectivityCheck,
             accepts_authenticated_ack: true,

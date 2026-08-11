@@ -194,12 +194,30 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
         ))
         .await;
 
+    assert!(matches!(
+        manager.recovery_epoch_admit("peer-stale").await,
+        RecoveryAdmission::Accepted { .. }
+    ));
+    manager
+        .record_relay_failure("peer-stale", "peer_not_found", "peer not found: peer-stale")
+        .await;
+    assert!(
+        !manager.peer_quarantined("peer-stale").await,
+        "the first 404 for an online peer must enter bounded registration grace"
+    );
+    assert!(
+        manager.recovery_epoch_active("peer-stale").await,
+        "registration grace must preserve the active recovery epoch"
+    );
+    manager
+        .test_force_relay_not_found_grace_elapsed("peer-stale")
+        .await;
     manager
         .record_relay_failure("peer-stale", "peer_not_found", "peer not found: peer-stale")
         .await;
     assert!(
         manager.peer_quarantined("peer-stale").await,
-        "a relay 404 must quarantine the peer"
+        "a sustained relay 404 after the confirmation window must quarantine the peer"
     );
     assert!(
         !manager.recovery_epoch_active("peer-stale").await,
@@ -233,6 +251,105 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
     assert!(
         !manager.peer_quarantined("peer-stale").await,
         "a new authoritative endpoint must unquarantine the peer"
+    );
+}
+
+#[tokio::test]
+async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients() {
+    let manager = PeerManager::new(test_config());
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation_counter = cancellations.clone();
+    manager.set_punch_cancel_hook(Arc::new(move |_| {
+        cancellation_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    let mut peer = flood_peer_113("peer-online", "10.20.0.6", "7.8.9.10:5001".parse().unwrap());
+    peer.last_seen = 10;
+    manager.add_peer(&peer).await;
+    assert!(matches!(
+        manager.recovery_epoch_admit("peer-online").await,
+        RecoveryAdmission::Accepted { .. }
+    ));
+
+    for _ in 0..3 {
+        manager
+            .record_relay_failure("peer-online", "peer_not_found", "peer not found: peer-online")
+            .await;
+    }
+    assert!(
+        !manager.peer_quarantined("peer-online").await,
+        "repeated 404s inside grace must not quarantine an online peer"
+    );
+    assert!(
+        manager.recovery_epoch_active("peer-online").await,
+        "transient relay 404s must not cancel the current recovery"
+    );
+    assert_eq!(
+        cancellations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "transient relay 404s must not invoke the active-punch cancellation hook"
+    );
+    let diagnostics = manager.diagnostics().await;
+    let peer_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-online")
+        .unwrap();
+    assert_eq!(
+        peer_diagnostics
+            .direct_events
+            .iter()
+            .filter(|event| event.stage == "relay_peer_not_found_grace")
+            .count(),
+        1,
+        "a transient 404 burst must contribute one bounded grace event"
+    );
+    assert_eq!(
+        peer_diagnostics.relay.failure_count,
+        1,
+        "a transient 404 burst must remain one peer-health failure sample"
+    );
+
+    // A newer control sample represents fresh online evidence and starts a
+    // new grace window rather than converting an old relay error into a
+    // quarantine for the still-online peer.
+    peer.last_seen = 11;
+    manager.add_peer(&peer).await;
+    manager
+        .record_relay_failure("peer-online", "peer_not_found", "peer not found: peer-online")
+        .await;
+    assert!(!manager.peer_quarantined("peer-online").await);
+    assert!(manager.recovery_epoch_active("peer-online").await);
+    let diagnostics = manager.diagnostics().await;
+    let peer_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-online")
+        .unwrap();
+    assert_eq!(
+        peer_diagnostics.relay.failure_count,
+        2,
+        "fresh control evidence begins a new transient 404 window rather than hiding it forever"
+    );
+}
+
+#[tokio::test]
+async fn offline_peer_not_found_bypasses_registration_grace() {
+    let manager = PeerManager::new(test_config());
+    let mut peer = flood_peer_113("peer-offline", "10.20.0.7", "8.9.10.11:5001".parse().unwrap());
+    manager.add_peer(&peer).await;
+    peer.online = false;
+    peer.last_seen = 20;
+    manager.add_peer(&peer).await;
+
+    manager
+        .record_relay_failure(
+            "peer-offline",
+            "peer_not_found",
+            "peer not found: peer-offline",
+        )
+        .await;
+    assert!(
+        manager.peer_quarantined("peer-offline").await,
+        "offline control evidence must retain immediate stale-peer isolation"
     );
 }
 

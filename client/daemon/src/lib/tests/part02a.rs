@@ -757,11 +757,13 @@ fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
 
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
     assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
-    // LAN hosts preserved (budget allows all three).
+    // LAN hosts yield when the fresh window reserves the whole budget: the
+    // prediction window is time-sensitive and the peer already learned LAN
+    // hosts from earlier signals.
     for endpoint in ["192.168.1.10:51820", "192.168.1.11:51820", "10.0.0.5:51820"] {
         assert!(
-            candidates.contains(&endpoint.to_string()),
-            "LAN host {endpoint} must survive"
+            !candidates.contains(&endpoint.to_string()),
+            "LAN host {endpoint} must yield to the full fresh window"
         );
     }
     // Whole fresh window preserved, ordered top-1 first, and leading.
@@ -791,7 +793,10 @@ fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
         })
         .count();
     assert_eq!(fresh_kept, MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
-    // Both public IPs still represented after truncation.
-    assert!(candidates.iter().any(|c| c.starts_with("198.51.100.10:")));
-    assert!(candidates.iter().any(|c| c.starts_with("198.51.100.20:")));
+    // A full fresh window reserves the whole wire budget: ordinary STUN
+    // candidates and LAN hosts yield (the peer already learned them from the
+    // offer), and the payload is exactly the prediction window.
+    assert!(candidates
+        .iter()
+        .all(|c| !c.starts_with("198.51.100.10:") && !c.starts_with("198.51.100.20:")));
 }

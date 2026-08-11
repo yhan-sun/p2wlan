@@ -211,7 +211,8 @@ impl UdpTransport {
             })
             .await;
 
-            if self.peers.has_known_public_candidate_ip(source.ip()).await {
+            let known_peer_ip = self.peers.has_known_public_candidate_ip(source.ip()).await;
+            if known_peer_ip {
                 self.update_socket_diagnostics(socket_index, |metrics| {
                     metrics.known_peer_ip_datagrams_received = metrics
                         .known_peer_ip_datagrams_received
@@ -302,10 +303,32 @@ impl UdpTransport {
                     ProbeKeyRole::Pending { token } => Some(token.clone()),
                     _ => None,
                 };
+                let matched_probe_session_id = key_candidate.session_id.clone();
                 let key = key_candidate.key;
-
+                // Probe v2 carries the *sender's* local generation.  Timeout
+                // diagnostics are scoped to this daemon's punch generation,
+                // so never use the remote counter as the local map key.
+                // Matched ACKs below are attributed even more precisely to
+                // the stamped pending-probe generation.
+                let received_local_generation = self.peers.current_network_generation().await;
                 match packet.kind {
                     PunchPacketKind::Punch => {
+                        self.update_peer_probe_rx_diagnostics(
+                            &identity.source_node_id,
+                            received_local_generation,
+                            matched_probe_session_id.as_deref(),
+                            |snapshot| {
+                                if known_peer_ip {
+                                    snapshot.known_peer_ip_datagrams_received = snapshot
+                                        .known_peer_ip_datagrams_received
+                                        .saturating_add(1);
+                                }
+                                snapshot.authenticated_probe_packets_received = snapshot
+                                    .authenticated_probe_packets_received
+                                    .saturating_add(1);
+                            },
+                        )
+                        .await;
                         let punch_generation =
                             packet.generation.unwrap_or(identity.generation);
                         match self
@@ -606,12 +629,35 @@ impl UdpTransport {
                             }
                             let latency = pending.sent_at.elapsed();
                             let generation = pending.generation;
+                            let probe_session_id = pending.probe_session_id.as_deref();
                             let local_endpoint = pending.local_endpoint;
                             let purpose = pending.purpose;
                             let socket_epoch = pending.socket_epoch;
                             self.update_socket_diagnostics(socket_index, |metrics| {
                                 metrics.probe_acks_received += 1
                             })
+                            .await;
+                            self.update_peer_probe_rx_diagnostics(
+                                &identity.source_node_id,
+                                generation,
+                                probe_session_id,
+                                |snapshot| {
+                                    if known_peer_ip {
+                                        snapshot.known_peer_ip_datagrams_received = snapshot
+                                            .known_peer_ip_datagrams_received
+                                            .saturating_add(1);
+                                    }
+                                    snapshot.authenticated_probe_packets_received = snapshot
+                                        .authenticated_probe_packets_received
+                                        .saturating_add(1);
+                                    snapshot.authenticated_probe_acks_observed = snapshot
+                                        .authenticated_probe_acks_observed
+                                        .saturating_add(1);
+                                    snapshot.probe_acks_received = snapshot
+                                        .probe_acks_received
+                                        .saturating_add(1);
+                                },
+                            )
                             .await;
                             self.remember_peer_socket(
                                 &identity.source_node_id,
@@ -639,6 +685,32 @@ impl UdpTransport {
                                 // daemon-internal encrypted validation toward
                                 // the ACK's source so both sides converge to
                                 // Direct without user traffic.
+                                //
+                                // This is evidence ingress only. It is
+                                // deliberately recorded before handing off to
+                                // the bounded validation scheduler and never
+                                // promotes Direct on its own. The explicit
+                                // pending-probe generation/session prevents a
+                                // later rekey or another peer's ACK from being
+                                // presented as this validation request.
+                                self.peers
+                                    .record_direct_event_for_generation_with_socket(
+                                        &identity.source_node_id,
+                                        generation,
+                                        "direct_validation_ingress_requested",
+                                        Some(source),
+                                        Some(socket_index),
+                                        None,
+                                        None,
+                                        format!(
+                                            "matched authenticated probe ACK; probe_session_id={} socket_index={} local_endpoint={} rtt_ms={}; requesting bounded encrypted validation ingress",
+                                            probe_session_id.unwrap_or("legacy"),
+                                            socket_index,
+                                            format_optional_endpoint(local_endpoint),
+                                            latency.as_millis(),
+                                        ),
+                                    )
+                                    .await;
                                 self.trigger_encrypted_validation(
                                     &identity.source_node_id,
                                     source,
@@ -677,6 +749,28 @@ impl UdpTransport {
                                     .authenticated_probe_acks_unmatched
                                     .saturating_add(1)
                             })
+                            .await;
+                            self.update_peer_probe_rx_diagnostics(
+                                &identity.source_node_id,
+                                received_local_generation,
+                                matched_probe_session_id.as_deref(),
+                                |snapshot| {
+                                    if known_peer_ip {
+                                        snapshot.known_peer_ip_datagrams_received = snapshot
+                                            .known_peer_ip_datagrams_received
+                                            .saturating_add(1);
+                                    }
+                                    snapshot.authenticated_probe_packets_received = snapshot
+                                        .authenticated_probe_packets_received
+                                        .saturating_add(1);
+                                    snapshot.authenticated_probe_acks_observed = snapshot
+                                        .authenticated_probe_acks_observed
+                                        .saturating_add(1);
+                                    snapshot.authenticated_probe_acks_unmatched = snapshot
+                                        .authenticated_probe_acks_unmatched
+                                        .saturating_add(1);
+                                },
+                            )
                             .await;
                             trace!(
                                 "Ignored unmatched authenticated UDP punch ACK from peer {} at {}",
@@ -772,6 +866,7 @@ impl UdpTransport {
                                         pending.sent_at.elapsed(),
                                         pending.generation,
                                         pending.peer_id.clone(),
+                                        pending.probe_session_id.clone(),
                                         pending.local_endpoint,
                                         pending.purpose,
                                         pending.socket_epoch,
@@ -787,7 +882,7 @@ impl UdpTransport {
                         let ack_matched = ack_match.is_some();
                         let pending_peer_id = ack_match
                             .as_ref()
-                            .and_then(|(_, _, peer_id, _, _, _, _, _)| peer_id.clone());
+                            .and_then(|(_, _, peer_id, _, _, _, _, _, _)| peer_id.clone());
                         // The peer identity comes from the matched pending
                         // probe (never from the source address alone, which
                         // would let a spoofed ACK drive endpoint learning).
@@ -806,7 +901,9 @@ impl UdpTransport {
                             let adoption = self.adoption_lock_for(&peer_id).await;
                             let _adoption_guard = adoption.lock().await;
                             let pending_cleanup_epoch =
-                                ack_match.as_ref().map(|(_, _, _, _, _, _, epoch, _)| *epoch);
+                                ack_match
+                                    .as_ref()
+                                    .map(|(_, _, _, _, _, _, _, epoch, _)| *epoch);
                             let still_clean = match pending_cleanup_epoch {
                                 Some(stamped) => {
                                     self.peer_probe_cleanup_epoch(&peer_id).await == stamped
@@ -823,6 +920,7 @@ impl UdpTransport {
                                 latency,
                                 generation,
                                 _,
+                                probe_session_id,
                                 local_endpoint,
                                 purpose,
                                 socket_epoch,
@@ -833,6 +931,20 @@ impl UdpTransport {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
                                     metrics.probe_acks_received += 1
                                 })
+                                .await;
+                                self.update_peer_probe_rx_diagnostics(
+                                    &peer_id,
+                                    generation,
+                                    probe_session_id.as_deref(),
+                                    |snapshot| {
+                                        snapshot.legacy_probe_acks_observed = snapshot
+                                            .legacy_probe_acks_observed
+                                            .saturating_add(1);
+                                        snapshot.probe_acks_received = snapshot
+                                            .probe_acks_received
+                                            .saturating_add(1);
+                                    },
+                                )
                                 .await;
                                 self.peers
                                     .learn_correlated_probe_endpoint(&peer_id, source)
@@ -853,8 +965,30 @@ impl UdpTransport {
                                         generation,
                                         local_endpoint,
                                     )
-                                    .await;
+                                .await;
                                 if accepted {
+                                    // Legacy peers still need the same
+                                    // per-pending-probe attribution. The ACK
+                                    // remains only an ingress signal for the
+                                    // encrypted validation worker.
+                                    self.peers
+                                        .record_direct_event_for_generation_with_socket(
+                                            &peer_id,
+                                            generation,
+                                            "direct_validation_ingress_requested",
+                                            Some(source),
+                                            Some(socket_index),
+                                            None,
+                                            None,
+                                            format!(
+                                                "matched legacy probe ACK; probe_session_id={} socket_index={} local_endpoint={} rtt_ms={}; requesting bounded encrypted validation ingress",
+                                                probe_session_id.as_deref().unwrap_or("legacy"),
+                                                socket_index,
+                                                format_optional_endpoint(local_endpoint),
+                                                latency.as_millis(),
+                                            ),
+                                        )
+                                        .await;
                                     self.trigger_encrypted_validation(&peer_id, source)
                                         .await;
                                     if purpose == PendingProbePurpose::ConsentCheck {

@@ -108,6 +108,24 @@ impl PeerConnection {
         local_generation: u64,
         current_selection: Option<&PathSelection>,
     ) -> Option<&CandidatePair> {
+        // A confirmed public selected pair is the durable Direct proof for
+        // this generation.  A late host/private candidate may be a valid
+        // future probe target, but it must never displace that proof in
+        // diagnostics merely because a concurrent selector snapshot saw it.
+        if self.state == ConnectionState::Direct {
+            if let Some(pair) = self
+                .candidate_pairs
+                .iter()
+                .filter(|pair| {
+                    pair.local_generation == local_generation
+                        && pair.state == CandidatePairState::Selected
+                        && is_public_probe_endpoint(pair.remote_endpoint)
+                })
+                .max_by_key(|pair| pair.selected_at)
+            {
+                return Some(pair);
+            }
+        }
         if let Some(endpoint) = current_selection.and_then(|selection| selection.direct_endpoint) {
             if let Some(pair) = self.candidate_pairs.iter().find(|pair| {
                 pair.local_generation == local_generation && pair.remote_endpoint == endpoint

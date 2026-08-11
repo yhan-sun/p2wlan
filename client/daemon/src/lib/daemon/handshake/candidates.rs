@@ -5,8 +5,7 @@ impl Daemon {
     async fn hole_punch_signal_context(&self) -> Option<HolePunchSignalContext> {
         Some(HolePunchSignalContext {
             control: self.control.clone(),
-            local_candidates: self.local_candidates.clone(),
-            local_candidate_sources: self.local_candidate_sources.clone(),
+            candidate_snapshot: self.candidate_snapshot.clone(),
             stun_servers: self.runtime_stun_servers.read().await.clone(),
             stun_timeout: *self.runtime_stun_timeout.read().await,
             boot_epoch_ms: self.boot_epoch_ms,
@@ -14,24 +13,20 @@ impl Daemon {
     }
 
     async fn current_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
-        let _refresh_guard = self.candidate_refresh_lock.lock().await;
-        (
-            self.local_candidates.read().await.clone(),
-            self.local_candidate_sources.read().await.clone(),
-        )
+        self.leased_candidate_set().await.unwrap_or_else(|| {
+            (Vec::new(), HashMap::new())
+        })
     }
 
     /// Snapshot the cached candidate set WITHOUT taking the refresh lock.
     ///
-    /// Used only by the responder answer path: a live STUN refresh must never
-    /// delay the answer, so the snapshot may be momentarily inconsistent with
-    /// the source map.  That is harmless for a best-effort signal payload (a
-    /// missing source label is ignored by the server).
+    /// Used by the responder answer path: a live STUN refresh must never delay
+    /// the answer. The lease is the one committed candidate/source tuple.
     async fn cached_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
-        (
-            self.local_candidates.read().await.clone(),
-            self.local_candidate_sources.read().await.clone(),
-        )
+        if let Some(leased) = self.leased_candidate_set().await {
+            return leased;
+        }
+        (Vec::new(), HashMap::new())
     }
 
     async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
@@ -64,11 +59,12 @@ impl Daemon {
         // are never re-gathered inside the TTL, so concurrent initiators,
         // rekeys and offers share ONE gather instead of each running a live
         // STUN refresh (which would churn the local source/port mapping).
-        if let Some(leased) = self.leased_candidate_set().await {
-            if !leased.0.is_empty() {
-                return leased;
+        if let Some(fresh) = self.fresh_candidate_set().await {
+            if !fresh.0.is_empty() {
+                return fresh;
             }
         }
+        let stale = self.leased_candidate_set().await;
         if let Some(udp) = self.udp_transport.read().await.clone() {
             if let Some(refreshed) = self
                 .refresh_local_candidates_for_imminent_signal(&udp, reason)
@@ -77,19 +73,46 @@ impl Daemon {
                 return refreshed;
             }
         }
+        if let Some(stale) = stale {
+            if !stale.0.is_empty() {
+                return stale;
+            }
+        }
         self.wait_for_local_candidate_set().await
     }
 
     async fn add_local_peer_reflexive_candidate(&self, observed_endpoint: &str) -> bool {
         let _refresh_guard = self.candidate_refresh_lock.lock().await;
-        let mut candidates = self.local_candidates.write().await;
-        let mut candidate_sources = self.local_candidate_sources.write().await;
+        let current = self.cached_candidate_snapshot().await;
+        let mut candidates = current
+            .as_ref()
+            .map(|snapshot| snapshot.candidates.clone())
+            .unwrap_or_default();
+        let mut candidate_sources = current
+            .as_ref()
+            .map(|snapshot| snapshot.candidate_sources.clone())
+            .unwrap_or_default();
         match add_peer_reflexive_candidate_to_set(
             observed_endpoint,
             &mut candidates,
             &mut candidate_sources,
         ) {
             Ok(true) => {
+                let network_identity = current
+                    .as_ref()
+                    .map(|snapshot| snapshot.network_identity.clone())
+                    .unwrap_or_default();
+                publish_candidate_snapshot_to_store(
+                    &self.candidate_snapshot,
+                    candidates.clone(),
+                    candidate_sources.clone(),
+                    network_identity,
+                )
+                .await;
+                // Compatibility mirrors are written only after the coherent
+                // snapshot commit and are never used to assemble signal data.
+                *self.local_candidates.write().await = candidates;
+                *self.local_candidate_sources.write().await = candidate_sources;
                 info!(
                     "Updated relay-assisted peer-reflexive local UDP candidate {}",
                     observed_endpoint
@@ -117,7 +140,7 @@ impl Daemon {
         // Publication reuses the snapshot lease: a fresh lease means the
         // current committed set is already live — no re-gather, no endpoint
         // re-publish (the gather path already published it).
-        let (candidates, candidate_sources) = if let Some(leased) = self.leased_candidate_set().await
+        let (candidates, candidate_sources) = if let Some(leased) = self.fresh_candidate_set().await
         {
             leased
         } else if let Some(refreshed) = self
@@ -125,6 +148,8 @@ impl Daemon {
             .await
         {
             refreshed
+        } else if let Some(stale) = self.leased_candidate_set().await {
+            stale
         } else {
             self.current_local_candidate_set().await
         };
@@ -271,6 +296,19 @@ impl Daemon {
         reason: &str,
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
         let _refresh_guard = self.candidate_refresh_lock.lock().await;
+        // Another initiator may have completed the gather while this caller
+        // waited for the single-flight lock. Re-check the lease after lock
+        // acquisition or concurrent offers will serialize duplicate STUN
+        // gathers and churn the public mapping again.
+        if let Some(leased) = self.fresh_candidate_set().await {
+            if !leased.0.is_empty() {
+                debug!(
+                    "Pre-signal UDP candidates reused after refresh lock handoff for {reason} ({} candidates)",
+                    leased.0.len()
+                );
+                return Some(leased);
+            }
+        }
         let stun_servers = self.runtime_stun_servers.read().await.clone();
         if stun_servers.is_empty() {
             return None;
@@ -320,15 +358,25 @@ impl Daemon {
             });
         }
 
-        let previous_candidates = self.local_candidates.read().await.clone();
-        let previous_candidate_sources = self.local_candidate_sources.read().await.clone();
+        let previous_snapshot = self.cached_candidate_snapshot().await;
+        let previous_candidates = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.candidates.clone())
+            .unwrap_or_default();
+        let previous_candidate_sources = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.candidate_sources.clone())
+            .unwrap_or_default();
         let next_network_identity = prepare_signal_candidates_and_network_identity(
             &previous_candidates,
             &previous_candidate_sources,
             &mut candidates,
             &mut candidate_sources,
         );
-        let previous_network_identity = self.local_network_identity.read().await.clone();
+        let previous_network_identity = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.network_identity.clone())
+            .unwrap_or_default();
         let should_advance_generation =
             !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
         let change_reason = candidate_set_change_reason(
@@ -344,17 +392,17 @@ impl Daemon {
         let real_change = change_reason != "no_change" && change_reason != "order_only";
 
         if candidate_refresh_requires_commit(real_change, should_advance_generation) {
-            *self.local_candidates.write().await = candidates.clone();
-            *self.local_candidate_sources.write().await = candidate_sources.clone();
-            *self.local_network_identity.write().await = next_network_identity.clone();
             // The committed set becomes the shared snapshot lease: every
             // signaling path for the next TTL reuses it without a live gather.
             self.publish_candidate_snapshot(
                 candidates.clone(),
                 candidate_sources.clone(),
-                next_network_identity,
+                next_network_identity.clone(),
             )
             .await;
+            *self.local_candidates.write().await = candidates.clone();
+            *self.local_candidate_sources.write().await = candidate_sources.clone();
+            *self.local_network_identity.write().await = next_network_identity.clone();
             if should_advance_generation {
                 self.peers
                     .advance_candidate_refresh_generation("pre-signal UDP candidate refresh")
@@ -409,10 +457,12 @@ impl Daemon {
             return;
         };
 
-        let Some(conn) = self.peers.get_connection(node_id).await else {
+        let Some(_conn) = self.peers.get_connection(node_id).await else {
             debug!("No peer connection for {node_id}; skipping hole punch");
             return;
         };
+        let observed_generation = self.peers.current_network_generation().await;
+        let observed_commit_seq = self.peers.direct_commit_seq_sync(node_id);
 
         if self.peers.should_defer_relay_assisted_punch(node_id).await {
             debug!(
@@ -421,7 +471,11 @@ impl Daemon {
             return;
         }
 
-        if self.local_candidates.read().await.is_empty() {
+        if self
+            .leased_candidate_set()
+            .await
+            .is_none_or(|(candidates, _)| candidates.is_empty())
+        {
             self.peers
                 .record_direct_event(
                     node_id,
@@ -436,10 +490,24 @@ impl Daemon {
             return;
         }
 
-        if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
+        if !self
+            .peers
+            .begin_hole_punch_if_current(node_id, observed_generation, observed_commit_seq)
+            .await
+        {
             self.peers
-                .update_state(node_id, ConnectionState::HolePunching)
+                .record_direct_event(
+                    node_id,
+                    "hole_punch_start_skipped_stale_state",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "state/generation/commit changed before punch start; observed_generation={observed_generation} observed_direct_commit_seq={observed_commit_seq:?}"
+                    ),
+                )
                 .await;
+            return;
         }
 
         let peer_id = node_id.to_string();
