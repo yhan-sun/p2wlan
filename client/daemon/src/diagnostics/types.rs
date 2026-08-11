@@ -107,6 +107,13 @@ pub struct DiagnosticsSnapshot {
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,
     pub relay_selection: RelaySelectionDiagnostics,
+    /// Control-plane HTTP proxy policy label (`direct` | `environment`).
+    pub control_proxy_mode: String,
+    /// Whether the configured proxy mode consults environment proxy variables.
+    /// Never includes the proxy URL, tokens, or authentication material.
+    pub control_proxy_consults_env: bool,
+    /// Bounded connection timeline (correlation id + event ring).
+    pub connection_timeline: ConnectionTimelineDiagnostics,
     pub traversal_history: TraversalHistoryDiagnostics,
     pub peers: Vec<PeerDiagnostics>,
     pub stats: PeerManagerStats,
@@ -140,6 +147,8 @@ pub struct DiagnosticsContext {
     health: Arc<HealthState>,
     task_manager: Arc<TaskManager>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Per-process connection timeline (correlation id + bounded events).
+    timeline: Arc<ConnectionTimeline>,
 }
 
 impl DiagnosticsContext {
@@ -156,6 +165,7 @@ impl DiagnosticsContext {
         health: Arc<HealthState>,
         task_manager: Arc<TaskManager>,
         shutdown_tx: tokio::sync::watch::Sender<bool>,
+        timeline: Arc<ConnectionTimeline>,
     ) -> Self {
         Self {
             config,
@@ -169,6 +179,7 @@ impl DiagnosticsContext {
             health,
             task_manager,
             shutdown_tx,
+            timeline,
         }
     }
 }

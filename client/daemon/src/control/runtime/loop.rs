@@ -1,5 +1,8 @@
+#[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
     mut config: Config,
+    http: reqwest::Client,
+    timeline: Arc<ConnectionTimeline>,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     state: Arc<RwLock<ClientState>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
@@ -7,7 +10,6 @@ async fn run_control_loop(
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
     critical_auth_tx: watch::Sender<Option<CriticalControlAuth>>,
 ) {
-    let http = reqwest::Client::new();
     let base_url = normalize_http_base_url(&config.control.server_url);
 
     // Prefer an existing device credential; fall back to user JWT for first registration.
@@ -40,6 +42,12 @@ async fn run_control_loop(
             loop {
                 match register_device(&http, &base_url, &token, &config).await {
                     Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
+                        timeline.emit(
+                            "control_registered",
+                            None,
+                            None,
+                            Some(format!("node_id={node_id} virtual_ip={virtual_ip}")),
+                        );
                         {
                             let mut s = state.write().await;
                             s.registered = true;

@@ -6,7 +6,7 @@ use tokio::time::{sleep, timeout};
 #[test]
 fn test_control_client_creation() {
     let config = test_config();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     // Client created successfully, no events yet
     drop(client);
 }
@@ -16,7 +16,7 @@ fn test_control_client_creation_disabled() {
     let mut config = test_config();
     config.control.auth_token = "test-token".to_string();
     // When disabled, no background control loop is spawned
-    let (client, _rx) = ControlClient::new(&config, false, None, None);
+    let (client, _rx) = ControlClient::new(&config, false, None, None, ConnectionTimeline::new("test-node", 0));
     drop(client);
 }
 
@@ -39,7 +39,7 @@ async fn test_control_client_disabled_emits_no_events() {
     config.control.auth_token = "test-token".to_string();
     config.control.server_url = "http://127.0.0.1:1".to_string(); // unreachable
 
-    let (client, mut rx) = ControlClient::new(&config, false, None, None);
+    let (client, mut rx) = ControlClient::new(&config, false, None, None, ConnectionTimeline::new("test-node", 0));
 
     // Give any accidental background task a moment to fire events.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -53,7 +53,7 @@ async fn test_control_client_disabled_emits_no_events() {
 #[tokio::test]
 async fn test_control_client_handle_registered() {
     let config = test_config();
-    let (client, mut rx) = ControlClient::new(&config, true, None, None);
+    let (client, mut rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
 
     client
         .handle_message(ControlMessage::Registered {
@@ -84,7 +84,7 @@ async fn test_control_client_handle_registered() {
 #[tokio::test]
 async fn test_control_client_handle_peer_join_leave() {
     let config = test_config();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
 
     client
         .handle_message(ControlMessage::PeerJoin {
@@ -182,7 +182,7 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
     config.control.server_url = format!("http://{address}");
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, mut rx) = ControlClient::new(&config, true, None, None);
+    let (client, mut rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
 
     timeout(Duration::from_secs(5), async {
         loop {
@@ -707,7 +707,7 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     server.wait_registered().await;
 
     let stalled = tokio::spawn({
@@ -773,7 +773,7 @@ async fn critical_answer_not_blocked_by_slow_critical_offers() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     server.wait_registered().await;
 
     let mut offers = Vec::new();
@@ -840,7 +840,7 @@ async fn critical_answer_retries_exact_payload_then_succeeds() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     server.wait_registered().await;
 
     timeout(Duration::from_secs(3), client.send_peer_answer_with_sources_schedule_and_session(
@@ -900,7 +900,7 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     server.wait_registered().await;
 
     // Owner A's answer is in flight against a stalled server connection.
@@ -976,7 +976,7 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None);
+    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
     server.wait_registered().await;
 
     let stalled = tokio::spawn({

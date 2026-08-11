@@ -81,13 +81,15 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.transports.append(transport)
         return transport, protocol, transport.get_extra_info("sockname")
 
-    async def new_nat(self, name, fabric=None):
+    async def new_nat(self, name, fabric=None, strict_filtering=False, block_direct=False):
         nat = NAT_SIM.Nat(
             name,
             "127.0.0.1",
             1,
             seed=7 if name == "A" else 8,
             base_port=unused_udp_port(),
+            strict_filtering=strict_filtering,
+            block_direct=block_direct,
         )
         await nat.start(fabric)
         self.nats.append(nat)
@@ -168,6 +170,70 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         attacker.sendto(b"must-drop", (nat.public_ip, mapping.port))
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(received.received.get(), timeout=0.15)
+
+    async def test_strict_filtering_rejects_peer_public_socket_not_destination(self):
+        fabric = NAT_SIM.NatFabric()
+        nat = await self.new_nat("A", fabric, strict_filtering=True)
+        nat_b = await self.new_nat("B", fabric, strict_filtering=True)
+        client, received, client_addr = await self.capture_endpoint()
+        nat.record_client(client_addr)
+
+        # B's public socket is a REAL peer public endpoint.
+        peer_client, _, peer_client_addr = await self.capture_endpoint()
+        nat_b.record_client(peer_client_addr)
+        peer_mapping = nat_b.mapping_for(peer_client_addr, ("127.0.0.1", 9))
+        await nat_b.ensure_bound(peer_mapping)
+
+        # A's client mapping was created toward a DIFFERENT destination.  With
+        # strict (endpoint-dependent) filtering the peer's unrelated public
+        # socket is rejected even though the fallback mode would admit it.
+        mapping = nat.mapping_for(client_addr, ("127.0.0.1", 12345))
+        await nat.ensure_bound(mapping)
+        peer_mapping.transport.sendto(b"strict-drop", (nat.public_ip, mapping.port))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(received.received.get(), timeout=0.15)
+
+    async def test_block_direct_blackholes_data_plane_but_keeps_stun(self):
+        fabric = NAT_SIM.NatFabric()
+        nat_a = await self.new_nat("A", fabric, block_direct=True)
+        nat_b = await self.new_nat("B", fabric, block_direct=True)
+        client_a, received_a, client_a_addr = await self.capture_endpoint()
+        client_b, received_b, client_b_addr = await self.capture_endpoint()
+        nat_a.record_client(client_a_addr)
+        nat_b.record_client(client_b_addr)
+
+        # STUN observers keep working under the blackhole (Direct candidates
+        # are still discovered; only the data plane is blocked).
+        observer = await nat_a.add_observer()
+        transaction = bytes(range(12))
+        request = struct.pack("!HHI", NAT_SIM.BINDING_REQUEST, 0, NAT_SIM.MAGIC_COOKIE) + transaction
+        client_a.sendto(request, observer)
+        response, _ = await asyncio.wait_for(received_a.received.get(), timeout=1)
+        self.assertEqual(response[8:20], transaction)
+
+        # A direct data-plane datagram from A to B's public mapping never
+        # arrives at B: the deterministic bidirectional UDP blackhole.
+        mapping_b = nat_b.mapping_for(client_b_addr, ("127.0.0.1", 9))
+        await nat_b.ensure_bound(mapping_b)
+        client_a.sendto(b"blackhole", (nat_b.public_ip, mapping_b.port))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(received_b.received.get(), timeout=0.15)
+
+    def test_strict_filtering_inbound_allowed_requires_exact_destination(self):
+        strict = NAT_SIM.Nat("A", "127.0.0.1", 1, 7, unused_udp_port(), strict_filtering=True)
+        mapping = NAT_SIM.Mapping(
+            client=("127.0.0.1", 1000), destination=("127.0.0.1", 2000), port=3000
+        )
+        # Exact mapping destination is always admitted.
+        self.assertTrue(strict.inbound_allowed(mapping, ("127.0.0.1", 2000)))
+        # Any other source is rejected under endpoint-dependent filtering, even
+        # a port that is clearly not the destination.
+        self.assertFalse(strict.inbound_allowed(mapping, ("127.0.0.1", 2999)))
+        self.assertFalse(strict.inbound_allowed(mapping, ("127.0.0.2", 2000)))
+        # Without a fabric, the non-strict fallback also rejects an arbitrary
+        # source (the peer-endpoint fallback requires a real peer socket).
+        non_strict = NAT_SIM.Nat("B", "127.0.0.1", 1, 8, unused_udp_port())
+        self.assertFalse(non_strict.inbound_allowed(mapping, ("127.0.0.1", 2999)))
 
 
 if __name__ == "__main__":

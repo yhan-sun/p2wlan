@@ -28,6 +28,10 @@ AIR_DAEMON_BIN=${AIR_DAEMON_BIN:-}
 MINI_TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | head -1 || echo "100.84.190.40")
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-30}
 DIRECT_SUCCESS_TARGET_MS=${DIRECT_SUCCESS_TARGET_MS:-10000}
+# Availability acceptance target: from the moment BOTH daemons have a relay
+# transport connected to the later of the two first-usable events (both sides
+# completed a bidirectional encrypted overlay loopback).
+AVAILABILITY_FIRST_USABLE_TARGET_MS=${AVAILABILITY_FIRST_USABLE_TARGET_MS:-3000}
 VALIDATE_OVERLAY=${VALIDATE_OVERLAY:-0}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-12}
 STUN_SERVERS=${STUN_SERVERS:-"stun.cloudflare.com:3478,stun.l.google.com:19302,stun.miwifi.com:3478"}
@@ -82,17 +86,42 @@ case "$ACCEPTANCE_MODE" in
         ;;
     esac
     ;;
+  availability)
+    # First-usable availability: --validate-overlay is always enabled and the
+    # pass condition is a bidirectional encrypted overlay loopback (both sides
+    # must emit overlay_payload_verified).  Direct results are reported as
+    # informational only and are never a usability gate: relay-first means
+    # user traffic is usable before Direct converges (or without it at all).
+    if [[ -n "$DAEMON_BIN_OVERRIDE" ]]; then
+      echo "[mini-air] ACCEPTANCE_MODE=availability only permits the current-tree build; unset DAEMON_BIN_OVERRIDE" >&2
+      exit 2
+    fi
+    case "$STRICT_PHASE" in
+      preflight)
+        ACCEPTANCE_STAGE=availability-preflight
+        ROUNDS=${ROUNDS:-3}
+        ;;
+      acceptance)
+        ACCEPTANCE_STAGE=availability-acceptance
+        ROUNDS=${ROUNDS:-10}
+        ;;
+      *)
+        echo "[mini-air] STRICT_PHASE must be preflight or acceptance" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   *)
-    echo "[mini-air] ACCEPTANCE_MODE must be compat or strict" >&2
+    echo "[mini-air] ACCEPTANCE_MODE must be compat, strict or availability" >&2
     exit 2
     ;;
 esac
 case "$ACCEPTANCE_STAGE" in
-  compat-baseline|strict-preflight)
+  compat-baseline|strict-preflight|availability-preflight)
     [[ "$ROUNDS" == "3" ]] || { echo "[mini-air] $ACCEPTANCE_STAGE requires ROUNDS=3" >&2; exit 2; }
     ;;
-  strict-acceptance)
-    [[ "$ROUNDS" == "10" ]] || { echo "[mini-air] strict acceptance requires ROUNDS=10" >&2; exit 2; }
+  strict-acceptance|availability-acceptance)
+    [[ "$ROUNDS" == "10" ]] || { echo "[mini-air] $ACCEPTANCE_STAGE requires ROUNDS=10" >&2; exit 2; }
     ;;
 esac
 if [[ -z "$ARTIFACT_ROOT" || -z "$AB_SEQUENCE_DIR" ]]; then
@@ -409,6 +438,51 @@ log_reports_overlay_round_trip() {
   local log_file=$1
   local peer_id=$2
   count_log_events_for_peer "$log_file" "$peer_id" 'overlay_payload_verified'
+}
+
+# Epoch milliseconds of the FIRST log line matching a regexp, or empty when the
+# log has no match.  Used to compute the availability "first usable after relay
+# selected" metric from the daemons' own wall-clock timestamps.
+log_first_event_epoch_ms() {
+  local log_file=$1
+  local pattern=$2
+  python3 - "$log_file" "$pattern" <<'PY'
+import datetime
+import re
+import sys
+
+log_file, pattern = sys.argv[1], sys.argv[2]
+try:
+    with open(log_file, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if re.search(pattern, line):
+                match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)", line)
+                if match:
+                    ts = datetime.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+                    print(int(ts.timestamp() * 1000))
+                    raise SystemExit(0)
+except OSError:
+    pass
+PY
+}
+
+# The `path` field value of the FIRST log line matching a regexp, or empty.
+log_first_event_path() {
+  local log_file=$1
+  local pattern=$2
+  grep -E -m1 -- "$pattern" "$log_file" 2>/dev/null | sed -n 's/.*path=Some("\([^"]*\)").*/\1/p'
+}
+
+# The value of a `Some(N)` numeric structured field on the FIRST log line
+# matching a regexp, or empty.  Used to read the daemon's OWN monotonic
+# relay-ready -> usable delta (`relay_ready_to_usable_ms=Some(N)` on the
+# `first_usable_confirmed` event), so availability timing is never computed by
+# subtracting wall clocks across the two machines.
+log_first_event_field() {
+  local log_file=$1
+  local pattern=$2
+  local field=$3
+  grep -E -m1 -- "$pattern" "$log_file" 2>/dev/null | sed -n "s/.*${field}=Some(\([0-9]*\)).*/\1/p"
 }
 
 count_stage() {
@@ -857,14 +931,19 @@ echo "[mini-air] isolated network id: $NETWORK_ID"
 overall=0
 if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
   printf 'round\tacceptance_mode\tfunctional_direct_ms\telapsed_ms\ta_endpoint\tb_endpoint\ta_crash_panic\tb_crash_panic\n' >"$BASE_DIR/round-metrics.tsv"
+elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+  printf 'round\tacceptance_mode\tfirst_usable_after_relay_ms\telapsed_ms\tfirst_usable_path_a\tfirst_usable_path_b\ta_direct\tb_direct\ta_relay_selections\tb_relay_selections\ta_overlay_round_trips\tb_overlay_round_trips\ta_relay_peer_confirmed\tb_relay_peer_confirmed\ta_crash_panic\tb_crash_panic\n' >"$BASE_DIR/round-metrics.tsv"
 else
   printf 'round\tacceptance_mode\tfunctional_direct_ms\tstrict_convergence_ms\telapsed_ms\ta_direct\tb_direct\ta_endpoint\tb_endpoint\ta_validation_sessions\tb_validation_sessions\ta_validation_requests\tb_validation_requests\ta_validation_acks\tb_validation_acks\ta_validation_promoted\tb_validation_promoted\ta_strict_validation\tb_strict_validation\ta_matched_acks\tb_matched_acks\ta_overlay_round_trips\tb_overlay_round_trips\ta_http_429\tb_http_429\ta_relay_hedges\tb_relay_hedges\ta_relay_fallbacks\tb_relay_fallbacks\ta_relay_selections\tb_relay_selections\ta_crash_panic\tb_crash_panic\ta_post_direct_traversal\tb_post_direct_traversal\ta_non_target_traversal\tb_non_target_traversal\n' >"$BASE_DIR/round-metrics.tsv"
 fi
 LOCAL_VALIDATE_OVERLAY_FLAG=""
 REMOTE_VALIDATE_OVERLAY_ARG=""
-if [[ "$VALIDATE_OVERLAY" == "1" ]]; then
-  LOCAL_VALIDATE_OVERLAY_FLAG="--validate-overlay"
-  REMOTE_VALIDATE_OVERLAY_ARG="--validate-overlay"
+if [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
+  # Availability mode ALWAYS drives the real encrypted overlay loopback and
+  # targets every online peer (relay-usable until Direct is confirmed), so the
+  # first-usable standard does not depend on a UDP punch succeeding.
+  LOCAL_VALIDATE_OVERLAY_FLAG="--validate-overlay --overlay-any-path"
+  REMOTE_VALIDATE_OVERLAY_ARG="--validate-overlay --overlay-any-path"
 fi
 for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
@@ -1026,6 +1105,12 @@ for round in $(seq 1 "$ROUNDS"); do
   CAPTURE_WINDOW_S=$DIRECT_TIMEOUT_S
   if [[ "$ACCEPTANCE_MODE" == "strict" && "$CAPTURE_WINDOW_S" -lt 45 ]]; then
     CAPTURE_WINDOW_S=45
+  fi
+  if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+    # Availability does not wait for Direct to converge: the overlay loopback
+    # (over relay until Direct is confirmed) is the usability gate, and the
+    # status snapshots below only feed the artifacts.
+    CAPTURE_WINDOW_S=$OVERLAY_TIMEOUT_S
   fi
   for _ in $(seq 1 $((CAPTURE_WINDOW_S * 2))); do
     accepted_pair=0
@@ -1274,7 +1359,7 @@ PY
   A_OVERLAY_ROUND_TRIPS=0
   B_OVERLAY_ROUND_TRIPS=0
   overlay_ok=1
-  if [[ "$VALIDATE_OVERLAY" == "1" ]]; then
+  if [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
     overlay_ok=0
     for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 2))); do
       A_OVERLAY_ROUND_TRIPS=$(log_reports_overlay_round_trip "$ROUND_DIR/node-a.log" "$AIR_NODE_ID")
@@ -1288,6 +1373,44 @@ PY
       fi
       sleep 0.5
     done
+  fi
+  # Availability first-usable metric: from the moment BOTH daemons have a relay
+  # transport connected to the later of the two first-usable events (both sides
+  # completed a bidirectional encrypted overlay loopback).
+  A_FIRST_USABLE_TS=""
+  B_FIRST_USABLE_TS=""
+  A_RELAY_READY_TS=""
+  B_RELAY_READY_TS=""
+  A_FIRST_USABLE_PATH=""
+  B_FIRST_USABLE_PATH=""
+  FIRST_USABLE_AFTER_RELAY_MS=""
+  if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+    # Per-daemon monotonic relay-ready -> usable delta: each daemon computes it
+    # on ITS OWN clock and reports `relay_ready_to_usable_ms=Some(N)` on the
+    # first_usable_confirmed event (which also requires a locally-sent matching
+    # nonce echo).  The harness NEVER subtracts wall clocks across the two
+    # machines; FIRST_USABLE_AFTER_RELAY_MS is the LATER (max) of the two
+    # per-daemon deltas.
+    A_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-a.log" 'first_usable_bidirectional_overlay_ms')
+    B_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-b.log" 'first_usable_bidirectional_overlay_ms')
+    A_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-a.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
+    B_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-b.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
+    if [[ -n "$A_RELAY_READY_TO_USABLE_MS" && -n "$B_RELAY_READY_TO_USABLE_MS" ]]; then
+      FIRST_USABLE_AFTER_RELAY_MS=$((A_RELAY_READY_TO_USABLE_MS > B_RELAY_READY_TO_USABLE_MS ? A_RELAY_READY_TO_USABLE_MS : B_RELAY_READY_TO_USABLE_MS))
+    else
+      FIRST_USABLE_AFTER_RELAY_MS=""
+    fi
+    # The first-usable evidence must be for the TARGET peer (the other node),
+    # not a stale/third-party peer.  first_usable_confirmed already required a
+    # locally-sent matching nonce echo; this additionally pins the peer.
+    A_TARGET_PEER_OK=0
+    B_TARGET_PEER_OK=0
+    if [[ -n "$AIR_NODE_ID" ]]; then
+      A_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null | grep -c "$AIR_NODE_ID" || true)
+    fi
+    if [[ -n "$MINI_NODE_ID" ]]; then
+      B_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null | grep -c "$MINI_NODE_ID" || true)
+    fi
   fi
   A_HTTP_429=$(count_log_events "$ROUND_DIR/node-a.log" 'HTTP 429|status.?429|429 Too Many')
   B_HTTP_429=$(count_log_events "$ROUND_DIR/node-b.log" 'HTTP 429|status.?429|429 Too Many')
@@ -1313,6 +1436,31 @@ PY
       echo "round_audit=$ROUND_DIR/round-audit.json"
       echo "snapshot_id=$SNAPSHOT_ID snapshot_poll_index=$SNAPSHOT_POLL_INDEX"
       echo "snapshot_a_sha256=$SNAPSHOT_A_SHA256 snapshot_b_sha256=$SNAPSHOT_B_SHA256 snapshot_result_sha256=$SNAPSHOT_RESULT_SHA256"
+    } >"$ROUND_DIR/metrics.env"
+  elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+    A_RELAY_PEER_CONFIRMED=$(count_log_events "$ROUND_DIR/node-a.log" 'relay_peer_confirmed')
+    B_RELAY_PEER_CONFIRMED=$(count_log_events "$ROUND_DIR/node-b.log" 'relay_peer_confirmed')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$round" "$ACCEPTANCE_MODE" "$FIRST_USABLE_AFTER_RELAY_MS" "$ELAPSED_MS" \
+      "$A_FIRST_USABLE_PATH" "$B_FIRST_USABLE_PATH" "$A_DIRECT" "$B_DIRECT" \
+      "$A_RELAY_SELECTIONS" "$B_RELAY_SELECTIONS" \
+      "$A_OVERLAY_ROUND_TRIPS" "$B_OVERLAY_ROUND_TRIPS" \
+      "$A_RELAY_PEER_CONFIRMED" "$B_RELAY_PEER_CONFIRMED" \
+      "$A_CRASH_PANIC" "$B_CRASH_PANIC" >>"$BASE_DIR/round-metrics.tsv"
+    {
+      echo "round=$round acceptance_mode=availability first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS elapsed_ms=$ELAPSED_MS"
+      echo "first_usable_path_a=$A_FIRST_USABLE_PATH first_usable_path_b=$B_FIRST_USABLE_PATH"
+      echo "network_id=$NETWORK_ID"
+      echo "mini_node_id=$MINI_NODE_ID air_node_id=$AIR_NODE_ID"
+      echo "a_direct=$A_DIRECT b_direct=$B_DIRECT (informational; direct is not a usability gate)"
+      echo "a_relay_selections=$A_RELAY_SELECTIONS b_relay_selections=$B_RELAY_SELECTIONS"
+      echo "a_relay_peer_confirmed=$A_RELAY_PEER_CONFIRMED b_relay_peer_confirmed=$B_RELAY_PEER_CONFIRMED"
+      echo "a_overlay_round_trips=$A_OVERLAY_ROUND_TRIPS b_overlay_round_trips=$B_OVERLAY_ROUND_TRIPS"
+      echo "a_crash_panic=$A_CRASH_PANIC b_crash_panic=$B_CRASH_PANIC"
+      echo "timeline_a=$ROUND_DIR/node-a.log timeline_b=$ROUND_DIR/node-b.log"
+      echo "status_a=$ROUND_DIR/node-a.status.json status_b=$ROUND_DIR/node-b.status.json"
+      echo "isolation_prove=$ROUND_DIR/isolation-prove.json isolation_delete=$ROUND_DIR/isolation-delete.json isolation_cleaned=$ROUND_DIR/isolation-cleaned.json"
+      echo "round_audit=$ROUND_DIR/round-audit.json"
     } >"$ROUND_DIR/metrics.env"
   else
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1381,7 +1529,7 @@ PY
     grep -F -- "$AIR_NODE_ID" "$ROUND_DIR/node-a.log" | grep -E 'direct_path_promoted|candidate_pair_selected' | head -2
     echo "== B promotion =="
     grep -F -- "$MINI_NODE_ID" "$ROUND_DIR/node-b.log" | grep -E 'direct_path_promoted|candidate_pair_selected' | head -2
-    if [[ "$VALIDATE_OVERLAY" == "1" ]]; then
+    if [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
       echo "== A encrypted overlay payload =="
       grep -F -- "$AIR_NODE_ID" "$ROUND_DIR/node-a.log" | grep 'overlay_payload_verified' | head -2
       echo "== B encrypted overlay payload =="
@@ -1393,6 +1541,19 @@ PY
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-a.log" | head -4
     echo "== B relay hedge/fallback/selection =="
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-b.log" | head -4
+    if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+      echo "== A first-usable timeline (all timepoints with corr_id + t_ms + path) =="
+      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-a.log" | head -14
+      echo "== B first-usable timeline =="
+      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-b.log" | head -14
+      echo "== direct results (informational only, not a usability gate) =="
+      echo "a_direct=$A_DIRECT b_direct=$B_DIRECT a_first_usable_path=$A_FIRST_USABLE_PATH b_first_usable_path=$B_FIRST_USABLE_PATH"
+      grep -h 'direct_path_promoted\|first_direct_probe_sent' "$ROUND_DIR/node-a.log" | head -2
+      grep -h 'direct_path_promoted\|first_direct_probe_sent' "$ROUND_DIR/node-b.log" | head -2
+      echo "== relay selection result =="
+      grep -h 'relay_selection_started\|relay_transport_connected\|relay_peer_confirmed\|selected relay region' "$ROUND_DIR/node-a.log" | head -4
+      grep -h 'relay_selection_started\|relay_transport_connected\|relay_peer_confirmed\|selected relay region' "$ROUND_DIR/node-b.log" | head -4
+    fi
     if [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
       echo "== network isolation proof =="
       cat "$ROUND_DIR/isolation-prove.json" 2>/dev/null || echo "isolation-prove.json missing"
@@ -1436,24 +1597,40 @@ PY
      is_public_ipv4_endpoint "$B_EP" && [[ "$STRICT_CONVERGENCE_MS" -le "$DIRECT_SUCCESS_TARGET_MS" ]] && \
      [[ "$MINI_ALIVE" -eq 1 ]] && [[ "$AIR_ALIVE" -eq 1 ]]; then
     round_ok=1
+  elif [[ "$ACCEPTANCE_MODE" == "availability" ]] && \
+     [[ "$INFRASTRUCTURE_INVALID" -eq 0 ]] && \
+     [[ "$overlay_ok" -eq 1 ]] && [[ "$STATUS_CAPTURE_OK" -eq 1 ]] && \
+     [[ "$A_CRASH_PANIC" -eq 0 ]] && [[ "$B_CRASH_PANIC" -eq 0 ]] && \
+     [[ "$A_RELAY_PEER_CONFIRMED" -ge 1 ]] && [[ "$B_RELAY_PEER_CONFIRMED" -ge 1 ]] && \
+     [[ "$A_FIRST_USABLE_PATH" == relay:* ]] && [[ "$B_FIRST_USABLE_PATH" == relay:* ]] && \
+     [[ "$A_TARGET_PEER_OK" -ge 1 ]] && [[ "$B_TARGET_PEER_OK" -ge 1 ]] && \
+     [[ -n "$FIRST_USABLE_AFTER_RELAY_MS" ]] && \
+     [[ "$FIRST_USABLE_AFTER_RELAY_MS" -ge 0 ]] && \
+     [[ "$FIRST_USABLE_AFTER_RELAY_MS" -le "$AVAILABILITY_FIRST_USABLE_TARGET_MS" ]] && \
+     [[ "$MINI_ALIVE" -eq 1 ]] && [[ "$AIR_ALIVE" -eq 1 ]]; then
+    round_ok=1
   fi
   record_sequence_round "$round" "$round_ok" "$FUNCTIONAL_DIRECT_MS" "$STRICT_CONVERGENCE_MS"
   if [[ "$round_ok" -eq 1 ]]; then
     if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
       echo "[mini-air] ROUND $round: FUNCTIONAL-DIRECT baseline functional_direct_ms=$FUNCTIONAL_DIRECT_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
+    elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+      echo "[mini-air] ROUND $round: PASS availability first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_path=$A_FIRST_USABLE_PATH b_path=$B_FIRST_USABLE_PATH a_direct=$A_DIRECT b_direct=$B_DIRECT evidence=$ROUND_DIR/evidence.log"
     else
       echo "[mini-air] ROUND $round: PASS strict_convergence_ms=$STRICT_CONVERGENCE_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     fi
   else
     if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
       echo "[mini-air] ROUND $round: FUNCTIONAL-DIRECT baseline incomplete a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
+    elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+      echo "[mini-air] ROUND $round: NO-FIRST-USABLE overlay_ok=$overlay_ok first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/evidence.log"
     else
       echo "[mini-air] ROUND $round: NO-DIRECT-or-nonpublic-path a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     fi
     overall=1
     # Strict acceptance gets a full evidence window for later regression
     # gates. Compatibility has no lifecycle gate, so its timeout is enough.
-    if [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
+    if [[ "$ACCEPTANCE_MODE" == "strict" || "$ACCEPTANCE_MODE" == "availability" ]]; then
       FAILURE_CAPTURE_DEADLINE_MS=$((START_MS + 45000))
       while :; do
         NOW_MS=$(python3 -c 'import time; print(int(time.time()*1000))')

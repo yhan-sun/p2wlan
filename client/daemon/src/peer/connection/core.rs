@@ -92,6 +92,38 @@ pub struct PeerConnection {
     /// or endpoint change); outbound punch loops gate every actual UDP send
     /// on this sequence.
     pub direct_commit_seq: u64,
+    /// Local network generation in which a relay transport first became ready
+    /// to carry this peer's traffic (the shared relay slot published an
+    /// endpoint while the peer had an encrypting WireGuard session).  This is
+    /// the per-peer `RelayTransportConnected` milestone: it is strictly weaker
+    /// than [`relay_confirmed_generation`] (a TCP/TLS connect or a queued
+    /// registration must never count as delivery).
+    pub relay_ready_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the per-peer relay-ready milestone.
+    pub relay_ready_at: Option<Instant>,
+    /// Relay endpoint that carried the per-peer relay-ready milestone.
+    pub relay_ready_endpoint: Option<String>,
+    /// Local network generation in which the relay path to this peer was
+    /// confirmed by a matching forced-relay encrypted probe/ACK (the ACK's real
+    /// ingress was relay).  Never set by a local TCP/TLS connect or by a
+    /// command-queue accept.
+    pub relay_confirmed_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the relay peer confirmation.
+    pub relay_confirmed_at: Option<Instant>,
+    /// Relay endpoint whose ingress carried the confirming ACK.
+    pub relay_confirmed_endpoint: Option<String>,
+    /// Monotonic relay-confirm sequence.  Bumped (and mirrored in the peer
+    /// manager, notified to outbound waiters) every time the peer's relay
+    /// confirmation changes, mirroring [`direct_commit_seq`].
+    pub relay_confirm_seq: u64,
+    /// Local network generation of the first confirmed usable path
+    /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
+    /// milestone.
+    pub first_usable_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the first usable path milestone.
+    pub first_usable_at: Option<Instant>,
+    /// Which path became first usable.
+    pub first_usable_path: Option<NetworkPath>,
     /// Short window after a local generation change where previous Direct peers
     /// are reprobed aggressively before returning to normal retry backoff.
     direct_reclaim_until: Option<Instant>,
@@ -148,6 +180,16 @@ impl PeerConnection {
             relay_health: PathHealth::default(),
             direct_generation: 0,
             direct_commit_seq: 0,
+            relay_ready_generation: None,
+            relay_ready_at: None,
+            relay_ready_endpoint: None,
+            relay_confirmed_generation: None,
+            relay_confirmed_at: None,
+            relay_confirmed_endpoint: None,
+            relay_confirm_seq: 0,
+            first_usable_generation: None,
+            first_usable_at: None,
+            first_usable_path: None,
             direct_reclaim_until: None,
             candidate_pairs: Vec::new(),
             birthday_probe_cursor: 0,
@@ -177,6 +219,16 @@ impl PeerConnection {
         self.relay_health = PathHealth::default();
         self.direct_generation = 0;
         self.direct_reclaim_until = None;
+        self.relay_ready_generation = None;
+        self.relay_ready_at = None;
+        self.relay_ready_endpoint = None;
+        self.relay_confirmed_generation = None;
+        self.relay_confirmed_at = None;
+        self.relay_confirmed_endpoint = None;
+        self.relay_confirm_seq = 0;
+        self.first_usable_generation = None;
+        self.first_usable_at = None;
+        self.first_usable_path = None;
         self.candidate_pairs.clear();
         self.birthday_probe_cursor = 0;
         self.last_path_selection = None;
@@ -250,5 +302,21 @@ impl PeerConnection {
     /// Record bytes received.
     pub fn record_received(&mut self, n: u64) {
         self.bytes_received += n;
+    }
+
+    /// Record the first confirmed usable path for this peer + generation.
+    ///
+    /// `path` is `Direct` or `Relay` and only a CONFIRMED path may reach here
+    /// (a matching direct-validation ACK, or a matching forced-relay probe ACK
+    /// whose real ingress was relay).  Emits exactly once per peer; later calls
+    /// no-op.  Returns whether this call recorded the milestone.
+    pub fn record_first_usable(&mut self, path: NetworkPath, generation: u64) -> bool {
+        if self.first_usable_at.is_some() {
+            return false;
+        }
+        self.first_usable_generation = Some(generation);
+        self.first_usable_at = Some(Instant::now());
+        self.first_usable_path = Some(path);
+        true
     }
 }

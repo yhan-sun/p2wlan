@@ -28,8 +28,10 @@ import asyncio
 import collections
 import dataclasses
 import errno
+import json
 import random
 import struct
+import time
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 
@@ -38,6 +40,32 @@ BINDING_REQUEST = 0x0001
 BINDING_RESPONSE = 0x0101
 XOR_MAPPED_ADDRESS = 0x0020
 Address = Tuple[str, int]
+
+
+def format_address(addr: Address) -> str:
+    return f"{addr[0]}:{addr[1]}"
+
+
+class NatTrace:
+    """Optional sanitized event trace for deterministic traversal analysis."""
+
+    def __init__(self, path: str) -> None:
+        self._stream = open(path, "w", encoding="utf-8")
+        self._sequence = 0
+
+    def record(self, event: str, **fields: object) -> None:
+        self._sequence += 1
+        row = {
+            "sequence": self._sequence,
+            "monotonic_ns": time.monotonic_ns(),
+            "event": event,
+            **fields,
+        }
+        self._stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        self._stream.flush()
+
+    def close(self) -> None:
+        self._stream.close()
 
 
 def ip_bytes(ip: str) -> bytes:
@@ -122,8 +150,13 @@ class PublicForwarderProtocol(asyncio.DatagramProtocol):
 class NatFabric:
     """Coordinates source translation between the two loopback NATs."""
 
-    def __init__(self) -> None:
+    def __init__(self, trace: Optional[NatTrace] = None) -> None:
         self.nats: List["Nat"] = []
+        self.trace = trace
+
+    def record(self, event: str, **fields: object) -> None:
+        if self.trace is not None:
+            self.trace.record(event, **fields)
 
     def add_nat(self, nat: "Nat") -> None:
         if nat not in self.nats:
@@ -164,6 +197,8 @@ class Nat:
         consume_before_punch: int = 0,
         loss_rate: float = 0.0,
         reorder: bool = False,
+        strict_filtering: bool = False,
+        block_direct: bool = False,
     ) -> None:
         if step == 0:
             raise ValueError("--step must not be zero for address/port-dependent mappings")
@@ -175,6 +210,15 @@ class Nat:
         self.consume_before_punch = consume_before_punch
         self.loss_rate = loss_rate
         self.reorder = reorder
+        # Endpoint-dependent filtering: only the exact destination a client's
+        # mapping was created toward may send in; a peer's other public socket
+        # is not automatically admitted.
+        self.strict_filtering = strict_filtering
+        # Deterministic bidirectional UDP data-plane blackhole: every inter-NAT
+        # datagram is dropped while STUN observers keep working, so Direct can
+        # never establish but the relay data plane still carries traffic.  This
+        # models the field CGNAT bidirectional UDP blackhole.
+        self.block_direct = block_direct
         self.mappings: Dict[Tuple[Address, Address], Mapping] = {}
         self.mapping_by_port: Dict[int, Mapping] = {}
         self.forwarders: Dict[int, asyncio.DatagramTransport] = {}
@@ -242,6 +286,13 @@ class Nat:
         mapping = Mapping(client=client, destination=destination, port=self._allocate_unused_port())
         self.mappings[key] = mapping
         self.mapping_by_port[mapping.port] = mapping
+        if self.fabric is not None:
+            self.fabric.record(
+                "mapping_created",
+                nat=self.name,
+                public_endpoint=f"{self.public_ip}:{mapping.port}",
+                destination=format_address(destination),
+            )
         return mapping
 
     def owns_public_endpoint(self, addr: Address) -> bool:
@@ -345,6 +396,11 @@ class Nat:
         # Exact destination matching is the normal endpoint-dependent path.
         if addr == mapping.destination:
             return True
+        if self.strict_filtering:
+            # Endpoint-dependent filtering: the client's mapping was created
+            # only toward `mapping.destination`; any other source (including a
+            # peer's unrelated public socket) is rejected.
+            return False
         # A fresh peer-facing mapping can legitimately move between the peer's
         # STUN measurement and its first authenticated punch.  In the loopback
         # model accept only a real public socket owned by the other simulated
@@ -358,6 +414,19 @@ class Nat:
         source_nat = self.fabric.owner_for_private_client(addr) if self.fabric is not None else None
         if source_nat is not None:
             if source_nat is not self:
+                if self.block_direct or source_nat.block_direct:
+                    # Deterministic bidirectional UDP blackhole: this is a
+                    # daemon's direct data-plane datagram and the blackhole is
+                    # on.  Drop it so Direct can never establish while STUN
+                    # gathering and the TCP relay keep working.
+                    if self.fabric is not None:
+                        self.fabric.record(
+                            "direct_blocked",
+                            receiver_nat=self.name,
+                            sender_nat=source_nat.name,
+                            receiver_endpoint=f"{self.public_ip}:{port}",
+                        )
+                    return
                 # This is a daemon's direct loopback send.  Re-inject it from
                 # the sender NAT's mapping socket so the receiver sees the
                 # sender's public endpoint, exactly once.
@@ -365,6 +434,14 @@ class Nat:
             # Hairpinning is intentionally unsupported by this harness.
             return
         if not self.inbound_allowed(mapping, addr):
+            if self.fabric is not None:
+                self.fabric.record(
+                    "inbound_filter_drop",
+                    nat=self.name,
+                    receiver_endpoint=f"{self.public_ip}:{mapping.port}",
+                    expected_source=format_address(mapping.destination),
+                    actual_source=format_address(addr),
+                )
             return
         if self.loss_rate > 0 and self.rng.random() < self.loss_rate:
             return
@@ -372,6 +449,14 @@ class Nat:
             if self.loop is not None:
                 self.loop.create_task(self._delayed_delivery(mapping, data, addr, 0.02))
             return
+        if self.fabric is not None:
+            self.fabric.record(
+                "inbound_admitted",
+                nat=self.name,
+                receiver_endpoint=f"{self.public_ip}:{mapping.port}",
+                expected_source=format_address(mapping.destination),
+                actual_source=format_address(addr),
+            )
         self._deliver(mapping, data, addr)
 
     def _deliver(self, mapping: Mapping, data: bytes, source: Address) -> None:
@@ -412,14 +497,18 @@ def main() -> None:
     parser.add_argument("--consume-b", type=int, default=0)
     parser.add_argument("--loss", type=float, default=0.0)
     parser.add_argument("--reorder", action="store_true")
+    parser.add_argument("--strict-filtering", action="store_true")
+    parser.add_argument("--block-direct", action="store_true")
     parser.add_argument("--seed", type=int, default=20260806)
     parser.add_argument("--observers", type=int, default=4)
     parser.add_argument("--base-a", type=int, default=36000)
     parser.add_argument("--base-b", type=int, default=46000)
+    parser.add_argument("--trace-file", type=str)
     args = parser.parse_args()
 
     async def run() -> None:
-        fabric = NatFabric()
+        trace = NatTrace(args.trace_file) if args.trace_file else None
+        fabric = NatFabric(trace)
         nat_a = Nat(
             "A",
             "127.0.0.1",
@@ -429,6 +518,8 @@ def main() -> None:
             args.consume_a,
             args.loss,
             args.reorder,
+            args.strict_filtering,
+            args.block_direct,
         )
         nat_b = Nat(
             "B",
@@ -439,16 +530,24 @@ def main() -> None:
             args.consume_b,
             args.loss,
             args.reorder,
+            args.strict_filtering,
+            args.block_direct,
         )
-        await nat_a.start(fabric)
-        await nat_b.start(fabric)
-        observer_a = [await nat_a.add_observer() for _ in range(args.observers)]
-        observer_b = [await nat_b.add_observer() for _ in range(args.observers)]
-        print("STUN_A=" + ",".join(f"{host}:{port}" for host, port in observer_a), flush=True)
-        print("STUN_B=" + ",".join(f"{host}:{port}" for host, port in observer_b), flush=True)
-        print("BASE_A=%d" % args.base_a, flush=True)
-        print("BASE_B=%d" % args.base_b, flush=True)
-        await asyncio.Event().wait()
+        try:
+            await nat_a.start(fabric)
+            await nat_b.start(fabric)
+            observer_a = [await nat_a.add_observer() for _ in range(args.observers)]
+            observer_b = [await nat_b.add_observer() for _ in range(args.observers)]
+            print("STUN_A=" + ",".join(f"{host}:{port}" for host, port in observer_a), flush=True)
+            print("STUN_B=" + ",".join(f"{host}:{port}" for host, port in observer_b), flush=True)
+            print("BASE_A=%d" % args.base_a, flush=True)
+            print("BASE_B=%d" % args.base_b, flush=True)
+            await asyncio.Event().wait()
+        finally:
+            await nat_a.close()
+            await nat_b.close()
+            if trace is not None:
+                trace.close()
 
     asyncio.run(run())
 

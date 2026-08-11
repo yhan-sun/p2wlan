@@ -103,9 +103,15 @@ struct Cli {
     #[arg(long, name = "relay-selection-timeout-ms")]
     relay_selection_timeout_ms: Option<u64>,
 
-    /// Override relay fallback timeout (ms)
-    #[arg(long, name = "relay-fallback-timeout-ms")]
-    relay_fallback_timeout_ms: Option<u64>,
+    /// Override relay startup timeout (ms): how long the first business packet
+    /// waits for a relay transport before dropping with a stable reason code.
+    /// The old `--relay-fallback-timeout-ms` name is accepted as an alias.
+    #[arg(
+        long,
+        name = "relay-startup-timeout-ms",
+        alias = "relay-fallback-timeout-ms"
+    )]
+    relay_startup_timeout_ms: Option<u64>,
 
     /// Override diagnostics bind address
     #[arg(long, name = "diagnostics-bind")]
@@ -133,11 +139,34 @@ struct Cli {
     #[arg(long, name = "no-host-candidates")]
     no_host_candidates: bool,
 
+    /// Disable the fresh-socket measure-then-punch strategy. This is intended
+    /// for controlled traversal ablations; production defaults to enabled.
+    #[arg(long, name = "disable-fresh-mapping-punch")]
+    disable_fresh_mapping_punch: bool,
+
+    /// Disable bounded birthday probing. This is intended for controlled
+    /// traversal ablations; production defaults to enabled.
+    #[arg(long, name = "disable-birthday-probing")]
+    disable_birthday_probing: bool,
+
     /// Drive a real encrypted overlay payload through the production
     /// dataplane via an in-memory mock TUN (independent validation
     /// harnesses only; off by default in production).
     #[arg(long, name = "validate-overlay")]
     validate_overlay: bool,
+
+    /// With --validate-overlay, target every online peer with a WireGuard
+    /// session (independent validation harnesses only).  Off by default: the
+    /// overlay loop then only sends over confirmed Direct paths.
+    #[arg(long, name = "overlay-any-path")]
+    overlay_any_path: bool,
+
+    /// Control-plane HTTP proxy policy: `direct` (default, never reads
+    /// environment proxies) or `environment` (explicitly honors
+    /// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY).  WebSocket signaling is always
+    /// direct-only regardless of this value.
+    #[arg(long, name = "proxy-mode", value_parser = ["direct", "environment"])]
+    proxy_mode: Option<String>,
 
     /// Override device name
     #[arg(long, name = "device-name")]

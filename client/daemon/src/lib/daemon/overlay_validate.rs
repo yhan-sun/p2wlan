@@ -11,7 +11,7 @@
 //   2. encrypted by the production WireGuardTransport session,
 //   3. emitted through the production outbound path selector, which sends
 //      the encrypted datagram over the DIRECT UDP socket when the peer is
-//      Direct,
+//      Direct, or over the relay once RelayPeerConfirmed,
 //   4. decrypted on the far side by the production WireGuard inbound path,
 //   5. delivered to the production DataPlane inbound path (record_received),
 //      which writes it to the mock TUN,
@@ -21,11 +21,29 @@
 // proves bidirectional real encrypted overlay traffic.  This is NOT a
 // test-only plaintext bypass: there is no path from this loop to the UDP
 // socket other than DataPlane -> WireGuard -> outbound selector.
+//
+// AVAILABILITY EVIDENCE (relay-first):
+// - Every inbound overlay payload is forwarded from the WireGuard inbound
+//   path WITH its REAL relay/direct ingress metadata (the `OverlayIngressEvent`
+//   side channel).  The loop never back-infers the path from `active_path`.
+// - An echo is only accepted as `first_usable` evidence when its nonce matches
+//   a nonce THIS daemon actually sent to the SAME peer, within the validity
+//   window — a bounded outbound nonce registry, never a bare "transport-ready"
+//   signal.
+// - `first_usable_path` is emitted per peer + generation (scoped timeline
+//   first-event), and the relay-ready -> usable delta is computed on the
+//   daemon's own monotonic clock and reported in the event detail.  The
+//   harness only SUMS the two ends' deltas; it never subtracts wall clocks
+//   across machines.
+
+use std::collections::VecDeque;
 
 use p2pnet_tun::mock::MockTunController;
+use crate::transport::{OverlayIngress, OverlayIngressEvent};
 
-/// Overlay payload magic ("P2WLOV").
-const OVERLAY_MAGIC: &[u8; 6] = b"P2WLOV";
+/// Overlay payload magic ("P2WLOV"), shared with the transport-layer
+/// pre-filter so the ingress feed forwards exactly these payloads.
+const OVERLAY_MAGIC: &[u8] = crate::OVERLAY_PAYLOAD_MAGIC;
 /// Overlay payload marker for the acceptance report.
 const OVERLAY_EVIDENCE_PREFIX: &str = "overlay_payload";
 /// How often the loop probes every Direct peer.
@@ -44,6 +62,12 @@ const OVERLAY_CHECKSUM_SPAN: usize = 6 + 1 + 8 + 4;
 /// fresh requests are echoed, so an echo of an echo can never loop.
 const OVERLAY_DIRECTION_REQUEST: u8 = 0;
 const OVERLAY_DIRECTION_ECHO: u8 = 1;
+/// An echo must match a nonce this daemon actually sent (to the same peer)
+/// within this validity window; a stale or never-sent nonce can never confirm
+/// first usability.
+const OVERLAY_NONCE_TTL: Duration = Duration::from_secs(15);
+/// Bound on the outbound nonce registry (oldest evicted first).
+const OVERLAY_NONCE_CAP: usize = 256;
 
 struct OverlayStats {
     sent: u64,
@@ -53,15 +77,26 @@ struct OverlayStats {
     last_seq: u64,
 }
 
+/// One nonce this daemon sent in a fresh overlay request.
+struct SentOverlayNonce {
+    peer_id: String,
+    generation: u64,
+    sent_at: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_overlay_validate_loop(
-    mut controller: MockTunController,
+    controller: MockTunController,
     peers: Arc<PeerManager>,
     local_vip: String,
     local_node_id: String,
+    overlay_any_path: bool,
+    timeline: Arc<ConnectionTimeline>,
+    mut overlay_ingress_rx: mpsc::Receiver<OverlayIngressEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!(
-        "overlay_validate loop started local_vip={local_vip}: sending real encrypted overlay payloads through the production dataplane"
+        "overlay_validate loop started local_vip={local_vip} any_path={overlay_any_path}: sending real encrypted overlay payloads through the production dataplane"
     );
     let mut stats = OverlayStats {
         sent: 0,
@@ -70,75 +105,62 @@ pub async fn run_overlay_validate_loop(
         verified_round_trips: 0,
         last_seq: 0,
     };
-    let mut seen = std::collections::VecDeque::<(u64, u32)>::new();
+    let mut seen = VecDeque::<(u64, u32)>::new();
     let mut next_nonce: u64 = rand::random();
     let mut next_seq = 0u32;
+    // Bounded outbound nonce registry: nonce -> (peer sent to, generation,
+    // sent at).  Echo verification requires an exact match here.
+    let mut sent_nonces: HashMap<u64, SentOverlayNonce> = HashMap::new();
+    let mut nonce_order: VecDeque<u64> = VecDeque::new();
+    // First-usable strictness: a bidirectional encrypted overlay business
+    // loopback is proven by the FIRST verified echo.  An echo is only ever
+    // generated when the peer verified a fresh request of ours (our outbound ->
+    // peer inbound -> peer echo -> our inbound decryption), so a single UDP
+    // send or TCP connect can never satisfy it.  The loop does NOT require a
+    // prior verified inbound request first: the two daemons send on their own
+    // intervals, so the first echo can legitimately arrive before the peer's
+    // first request.
     let mut send_tick = tokio::time::interval(OVERLAY_SEND_INTERVAL);
     send_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick so the peer can converge to Direct
-    // before the first payload is injected.
+    // Skip the immediate first tick so the peer can converge before the first
+    // payload is injected.
     send_tick.tick().await;
 
     loop {
         tokio::select! {
             _ = send_tick.tick() => {
-                stats.sent = stats
-                    .sent
-                    .saturating_add(send_overlay_payloads(
+                stats.sent = stats.sent.saturating_add(
+                    send_overlay_payloads(
                         &controller,
                         &peers,
                         &local_vip,
+                        overlay_any_path,
                         &mut next_nonce,
                         &mut next_seq,
                         &mut stats,
+                        &mut sent_nonces,
+                        &mut nonce_order,
                     )
-                    .await);
+                    .await,
+                );
             }
-            written = controller.recv_written() => {
-                let Ok(packet) = written else {
-                    warn!("overlay_validate: mock TUN closed; stopping");
+            event = overlay_ingress_rx.recv() => {
+                let Some(event) = event else {
+                    warn!("overlay_validate: overlay ingress feed closed; stopping");
                     break;
                 };
-                match verify_overlay_packet(
-                    &packet,
+                handle_overlay_ingress(
+                    event,
+                    &controller,
                     &local_vip,
                     &local_node_id,
                     &mut seen,
                     &mut stats,
                     &peers,
+                    &timeline,
+                    &sent_nonces,
                 )
-                .await
-                {
-                    OverlayVerdict::Valid { peer_id, virtual_ip, nonce, seq, direction } => {
-                        // Echo the payload back through the real pipeline so
-                        // one round proves bidirectional encrypted traffic.
-                        // ONLY a fresh request (direction 0) is echoed; an
-                        // echo is never echoed again, so (nonce, seq) ping-
-                        // pong is impossible.
-                        if direction != OVERLAY_DIRECTION_REQUEST {
-                            continue;
-                        }
-                        let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
-                        if let Some(echo) = build_udp_overlay_packet(
-                            &local_vip,
-                            &virtual_ip,
-                            39287,
-                            39286,
-                            &payload,
-                        ) {
-                            if controller.inject(echo).await.is_ok() {
-                                info!(
-                                    "{OVERLAY_EVIDENCE_PREFIX}_echo peer={peer_id} dst_ip={virtual_ip} seq={seq} nonce={nonce:#x} len={}",
-                                    payload.len() + 28
-                                );
-                            }
-                        }
-                    }
-                    OverlayVerdict::Invalid { reason } => {
-                        warn!("{OVERLAY_EVIDENCE_PREFIX}_invalid {reason}");
-                    }
-                    OverlayVerdict::Ignored => {}
-                }
+                .await;
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow_and_update() {
@@ -171,19 +193,39 @@ fn build_overlay_payload(direction: u8, nonce: u64, seq: u32) -> Vec<u8> {
     payload
 }
 
-/// Inject one payload per Direct peer into the production dataplane.
+/// Inject one payload per target peer into the production dataplane.
+///
+/// In the default strict-direct mode only peers in `ConnectionState::Direct`
+/// are targeted, so the evidence always rides a confirmed Direct path.  In
+/// `any_path` mode every online peer is targeted and the outbound path selector
+/// rides Relay until Direct is confirmed — the availability mode's "first
+/// usable business packet" does not depend on a UDP punch succeeding.
+///
+/// Every sent nonce is recorded in the bounded registry so a later echo can be
+/// matched to THIS daemon's own request (peer + generation + validity).
+#[allow(clippy::too_many_arguments)]
 async fn send_overlay_payloads(
     controller: &MockTunController,
     peers: &Arc<PeerManager>,
     local_vip: &str,
+    overlay_any_path: bool,
     next_nonce: &mut u64,
     next_seq: &mut u32,
     stats: &mut OverlayStats,
+    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
+    nonce_order: &mut VecDeque<u64>,
 ) -> u64 {
     let mut sent = 0u64;
     let direct_peers = peers.diagnostics().await;
     for peer in direct_peers {
-        if peer.state != ConnectionState::Direct {
+        if overlay_any_path {
+            // Target online peers regardless of path; the transport skips
+            // peers without a ready WireGuard session (encrypt_and_emit_outbound
+            // returns `sent=false`), so the path selector makes the choice.
+            if !peer.online {
+                continue;
+            }
+        } else if peer.state != crate::peer::ConnectionState::Direct {
             continue;
         }
         let virtual_ip = peer.virtual_ip.clone();
@@ -196,19 +238,31 @@ async fn send_overlay_payloads(
         else {
             continue;
         };
-        let active_path = peer
-            .active_path
-            .map(|path| format!("{path:?}"))
-            .unwrap_or_else(|| "none".to_string());
+        // Register the outbound nonce BEFORE the send so a fast echo cannot
+        // race ahead of the registry insert.
+        let generation = peers.current_network_generation().await;
+        sent_nonces.insert(
+            *next_nonce,
+            SentOverlayNonce {
+                peer_id: peer_id.clone(),
+                generation,
+                sent_at: Instant::now(),
+            },
+        );
+        nonce_order.push_back(*next_nonce);
+        while nonce_order.len() > OVERLAY_NONCE_CAP {
+            if let Some(oldest) = nonce_order.pop_front() {
+                sent_nonces.remove(&oldest);
+            }
+        }
         if controller.inject(packet).await.is_ok() {
             sent += 1;
             stats.last_seq = u64::from(*next_seq);
             info!(
-                "{OVERLAY_EVIDENCE_PREFIX}_sent peer={peer_id} dst_ip={virtual_ip} seq={} nonce={} len={} active_path={active_path} state={}",
+                "{OVERLAY_EVIDENCE_PREFIX}_sent peer={peer_id} dst_ip={virtual_ip} seq={} nonce={} len={} generation={generation}",
                 *next_seq,
                 *next_nonce,
                 payload.len() + 28,
-                peer.state
             );
         }
     }
@@ -222,11 +276,151 @@ enum OverlayVerdict {
         nonce: u64,
         seq: u32,
         direction: u8,
+        /// Path that actually carried the verified inbound packet (relay or
+        /// direct), from the transport-layer ingress metadata — never
+        /// back-inferred from `active_path`.
+        path: String,
     },
     Invalid {
         reason: String,
     },
     Ignored,
+}
+
+/// Handle one decrypted inbound overlay event forwarded by the WireGuard
+/// inbound path with its real ingress metadata.
+#[allow(clippy::too_many_arguments)]
+async fn handle_overlay_ingress(
+    event: OverlayIngressEvent,
+    controller: &MockTunController,
+    local_vip: &str,
+    local_node_id: &str,
+    seen: &mut VecDeque<(u64, u32)>,
+    stats: &mut OverlayStats,
+    peers: &Arc<PeerManager>,
+    timeline: &Arc<ConnectionTimeline>,
+    sent_nonces: &HashMap<u64, SentOverlayNonce>,
+) {
+    let ingress_label = match &event.ingress {
+        OverlayIngress::Direct => "direct".to_string(),
+        OverlayIngress::Relay(endpoint) => format!("relay:{endpoint}"),
+    };
+    match verify_overlay_packet(
+        &event.packet,
+        local_vip,
+        local_node_id,
+        seen,
+        stats,
+        peers,
+        &ingress_label,
+    )
+    .await
+    {
+        OverlayVerdict::Valid {
+            peer_id,
+            virtual_ip,
+            nonce,
+            seq,
+            direction,
+            path,
+        } => {
+            if direction == OVERLAY_DIRECTION_REQUEST {
+                // Echo the payload back through the real pipeline so
+                // one round proves bidirectional encrypted traffic.
+                // ONLY a fresh request (direction 0) is echoed; an
+                // echo is never echoed again, so (nonce, seq) ping-
+                // pong is impossible.
+                let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
+                if let Some(echo) = build_udp_overlay_packet(
+                    local_vip,
+                    &virtual_ip,
+                    39287,
+                    39286,
+                    &payload,
+                ) {
+                    if controller.inject(echo).await.is_ok() {
+                        info!(
+                            "{OVERLAY_EVIDENCE_PREFIX}_echo peer={peer_id} dst_ip={virtual_ip} seq={seq} nonce={nonce:#x} len={}",
+                            payload.len() + 28
+                        );
+                    }
+                }
+            } else if direction == OVERLAY_DIRECTION_ECHO {
+                // First confirmed bidirectional encrypted overlay
+                // business loopback: an echo only exists after the
+                // peer verified and echoed OUR request.  The echo is
+                // accepted as first-usable evidence ONLY when its
+                // nonce matches a nonce this daemon actually sent to
+                // the SAME peer within the validity window (bounded
+                // outbound nonce registry).
+                match sent_nonces.get(&nonce) {
+                    Some(sent)
+                        if sent.peer_id == peer_id
+                            && sent.sent_at.elapsed() <= OVERLAY_NONCE_TTL =>
+                    {
+                        let generation = sent.generation;
+                        let scope = format!("peer:{peer_id}:{generation}");
+                        // Per-daemon monotonic relay-ready -> usable delta
+                        // (only meaningful when the usable path is relay).
+                        let relay_delta_ms = if let OverlayIngress::Relay(_) = &event.ingress {
+                            peers
+                                .relay_ready_at(&peer_id)
+                                .await
+                                .map(|ready_at| {
+                                    Instant::now()
+                                        .saturating_duration_since(ready_at)
+                                        .as_millis()
+                                        .min(u64::MAX as u128) as u64
+                                })
+                        } else {
+                            None
+                        };
+                        timeline.emit_first_scoped(
+                            &scope,
+                            "first_usable_path",
+                            Some(&path),
+                            None,
+                            Some(format!(
+                                "peer={peer_id} dst_ip={virtual_ip} seq={seq} ingress={ingress_label}"
+                            )),
+                        );
+                        timeline.emit_first_scoped(
+                            &scope,
+                            "first_usable_bidirectional_overlay_ms",
+                            Some(&path),
+                            None,
+                            Some(format!(
+                                "peer={peer_id} dst_ip={virtual_ip} seq={seq} ingress={ingress_label} generation={generation} relay_ready_to_usable_ms={}",
+                                relay_delta_ms
+                                    .map(|ms| ms.to_string())
+                                    .unwrap_or_else(|| "n/a".to_string())
+                            )),
+                        );
+                        info!(
+                            event = "first_usable_confirmed",
+                            peer_id = %peer_id,
+                            path = %path,
+                            ingress = %ingress_label,
+                            generation = generation,
+                            relay_ready_to_usable_ms = ?relay_delta_ms,
+                            seq = seq,
+                            "first_usable_confirmed peer_id={peer_id} path={path} ingress={ingress_label} generation={generation} relay_ready_to_usable_ms={relay_delta_ms:?}",
+                        );
+                    }
+                    _ => {
+                        stats.received_invalid += 1;
+                        warn!(
+                            "{OVERLAY_EVIDENCE_PREFIX}_unmatched_echo peer={peer_id} seq={seq} nonce={nonce:#x} ingress={ingress_label} — echo nonce does not match a locally-sent request to this peer (or expired); not first-usable evidence"
+                        );
+                    }
+                }
+            }
+        }
+        OverlayVerdict::Invalid { reason } => {
+            warn!("{OVERLAY_EVIDENCE_PREFIX}_invalid {reason}");
+        }
+        OverlayVerdict::Ignored => {}
+    }
 }
 
 /// Verify a decrypted inbound overlay payload that the production dataplane
@@ -236,9 +430,10 @@ async fn verify_overlay_packet(
     packet: &[u8],
     local_vip: &str,
     _local_node_id: &str,
-    seen: &mut std::collections::VecDeque<(u64, u32)>,
+    seen: &mut VecDeque<(u64, u32)>,
     stats: &mut OverlayStats,
     peers: &Arc<PeerManager>,
+    ingress_label: &str,
 ) -> OverlayVerdict {
     let parsed = match p2pnet_tun::Ipv4Packet::new(packet) {
         Ok(parsed) => parsed,
@@ -313,20 +508,10 @@ async fn verify_overlay_packet(
             reason: format!("unexpected destination {dst_ip} (local {local_vip})"),
         };
     }
-    let conn = peers.get_connection(&peer_id).await;
-    let active_path = conn
-        .as_ref()
-        .and_then(|conn| conn.active_path())
-        .map(|path| format!("{path:?}"))
-        .unwrap_or_else(|| "none".to_string());
-    let state = conn
-        .as_ref()
-        .map(|conn| conn.state.to_string())
-        .unwrap_or_default();
     stats.received_valid += 1;
     stats.verified_round_trips += 1;
     info!(
-        "{OVERLAY_EVIDENCE_PREFIX}_verified peer={peer_id} src_ip={src_ip} seq={seq} nonce={nonce:#x} len={} active_path={active_path} state={state} verified_round_trips={}",
+        "{OVERLAY_EVIDENCE_PREFIX}_verified peer={peer_id} src_ip={src_ip} seq={seq} nonce={nonce:#x} len={} ingress={ingress_label} verified_round_trips={}",
         payload.len(),
         stats.verified_round_trips
     );
@@ -336,6 +521,7 @@ async fn verify_overlay_packet(
         nonce,
         seq,
         direction,
+        path: ingress_label.to_string(),
     }
 }
 

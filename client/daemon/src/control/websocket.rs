@@ -3,6 +3,13 @@
 //! Subscribes to push notifications (`ready` / `signals_available`) so the
 //! REST long-poll can wake immediately when a new signal lands, instead of
 //! waiting a full tick. Split out of `control.rs`.
+//!
+//! PROXY POLICY: WebSocket signaling is ALWAYS direct-only.  The pinned
+//! tokio-tungstenite client has no proxy support, so `connect_async` never
+//! reads `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` regardless of
+//! `ControlProxyMode`.  The daemon logs this explicitly at startup; the
+//! REST control loop's proxy policy (see `control::proxy`) is deliberately
+//! NOT mirrored here, so the two lanes can never silently disagree.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,6 +34,14 @@ const SIGNAL_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNAL_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const SIGNAL_WS_PROTOCOL: &str = "p2wlan.signaling.v1";
 const SIGNAL_WS_PROTOCOL_VERSION: u8 = 1;
+
+/// Stable diagnostic label of the WebSocket proxy policy.  Always
+/// `direct_only` today: the pinned tokio-tungstenite client cannot use a
+/// proxy, so signaling never rides an ambient proxy and the REST lane's proxy
+/// mode is never silently mirrored here.
+pub fn websocket_proxy_policy_label() -> &'static str {
+    "direct_only"
+}
 
 #[derive(Debug, Deserialize)]
 struct SignalWebSocketMessage {
@@ -122,6 +137,12 @@ pub(super) async fn run_signal_websocket(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(SIGNAL_WS_PROTOCOL),
         );
+
+        // Proxy policy: WebSocket signaling is ALWAYS direct-only.  The pinned
+        // tokio-tungstenite client has no proxy support, so `connect_async`
+        // never reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY regardless of
+        // `ControlProxyMode`.  The daemon logs this explicitly at startup;
+        // do not try to route WS through an ambient proxy here.
 
         match time::timeout(
             SIGNAL_WS_CONNECT_TIMEOUT,

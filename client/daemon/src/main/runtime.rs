@@ -40,7 +40,14 @@ async fn main() -> p2pnet_daemon::Result<()> {
             })
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        // When stdout is redirected (harness logs, service managers), emit
+        // plain text: ANSI escape codes corrupt line-oriented parsers that
+        // grep `re.match`-style at the start of a log line.
+        use std::io::IsTerminal;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(std::io::stdout().is_terminal())
+            .init();
     }
 
     info!("P2WLAN daemon starting...");

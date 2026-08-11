@@ -1017,6 +1017,8 @@ impl Daemon {
             peers: self.peers.clone(),
             relay_transport: self.relay_transport.clone(),
             relay_selection: self.relay_selection.clone(),
+            relay_available_tx: self.relay_available_tx.clone(),
+            timeline: self.timeline.clone(),
             inbound_tx: network_inbound_tx.clone(),
             control: self.control.clone(),
             allow_insecure_plaintext,

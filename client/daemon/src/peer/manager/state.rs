@@ -98,6 +98,19 @@ pub struct PeerManager {
     /// Wake-up for any direct-commit bump.  Waiters re-check the peer's
     /// sequence after waking.
     direct_commit_notify: Arc<Notify>,
+    /// Lock-free per-peer relay-confirm sequence mirror.  Bumped (and notified)
+    /// whenever a peer's forced-relay encrypted probe/ACK confirms the relay
+    /// path, so the outbound actor can flush a waiting first packet the moment
+    /// RelayPeerConfirmed lands.
+    relay_confirm_seq_mirror: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Wake-up for any relay-confirm bump.  Waiters re-check the peer's
+    /// sequence after waking.
+    relay_confirm_notify: Arc<Notify>,
+    /// Bounded per-peer relay probe expectations: the token the local daemon
+    /// sent in a forced-relay probe request, against which a relay-ingress ACK
+    /// is verified before RelayPeerConfirmed is set.
+    relay_probe_expectations:
+        Arc<std::sync::Mutex<HashMap<String, crate::relay_probe::RelayProbeExpectation>>>,
     /// Authoritative stale-peer quarantine state (relay 404 isolation).
     quarantined_peers: Arc<tokio::sync::Mutex<HashMap<String, PeerQuarantineState>>>,
     /// Short-lived relay registration grace state. A relay `peer_not_found`
@@ -112,6 +125,11 @@ pub struct PeerManager {
     /// Hook cancelling the transport-owned relay-backoff heartbeat when a
     /// peer becomes Direct, leaves, or loses its relay safety net.
     relay_backoff_heartbeat_cancel_hook: PunchCancelHookSlot,
+    /// Optional per-process connection timeline.  The daemon installs it after
+    /// construction; path-confirmation events (`first_direct_probe_sent`,
+    /// `relay_peer_confirmed`, `direct_promoted`) emit through it, no-oping
+    /// when it is not installed (unit tests).
+    timeline: std::sync::Mutex<Option<Arc<ConnectionTimeline>>>,
     /// Configuration.
     config: Config,
 }

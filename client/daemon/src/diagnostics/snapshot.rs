@@ -55,6 +55,11 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection,
+        control_proxy_mode: context.config.control.proxy_mode.as_label().to_string(),
+        control_proxy_consults_env: crate::control::proxy_consults_environment(
+            context.config.control.proxy_mode,
+        ),
+        connection_timeline: context.timeline.snapshot(),
         traversal_history: context.peers.traversal_history_diagnostics().await,
         peers,
         stats,

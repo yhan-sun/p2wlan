@@ -138,8 +138,55 @@ mod tests {
         assert_eq!(decoded.network.socket_pool_size, 1);
         assert!(decoded.relay.preferred_regions.is_empty());
         assert_eq!(decoded.relay.selection_timeout_ms, 3000);
+        // The deprecated fallback_timeout_ms alias must map onto the new
+        // relay_startup_timeout_ms field so old configs keep their semantics.
+        assert_eq!(decoded.relay.relay_startup_timeout_ms, 5000);
+        // New defaults must remain safe when a legacy config omits them.
+        assert_eq!(decoded.control.proxy_mode, ControlProxyMode::Direct);
+        assert!(!decoded.network.validate_overlay);
+        assert!(!decoded.network.overlay_any_path);
         assert!(!decoded.diagnostics.enabled);
         assert_eq!(decoded.diagnostics.bind, "127.0.0.1:39277");
+    }
+
+    #[test]
+    fn test_control_proxy_mode_serde_default_and_environment() {
+        // Absent proxy_mode must default to Direct (never read env proxies).
+        let json = r#"{
+            "node": {"node_id": "n1", "public_key": "p", "private_key": "k", "device_name": "d", "platform": "macos"},
+            "network": {"network_id": "net1", "virtual_ip": "10.20.0.1", "cidr": "10.20.0.0/16"},
+            "control": {"server_url": "https://ctrl.test", "auth_token": ""},
+            "relay": {"servers": []}
+        }"#;
+        let decoded: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.control.proxy_mode, ControlProxyMode::Direct);
+
+        // Explicit environment mode round-trips.
+        let json = r#"{
+            "node": {"node_id": "n1", "public_key": "p", "private_key": "k", "device_name": "d", "platform": "macos"},
+            "network": {"network_id": "net1", "virtual_ip": "10.20.0.1", "cidr": "10.20.0.0/16"},
+            "control": {"server_url": "https://ctrl.test", "auth_token": "", "proxy_mode": "environment"},
+            "relay": {"servers": []}
+        }"#;
+        let decoded: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.control.proxy_mode, ControlProxyMode::Environment);
+        let serialized = serde_json::to_string(&decoded).unwrap();
+        assert!(serialized.contains("\"proxy_mode\":\"environment\""));
+        // The label used by diagnostics stays stable.
+        assert_eq!(ControlProxyMode::Direct.as_label(), "direct");
+        assert_eq!(ControlProxyMode::Environment.as_label(), "environment");
+    }
+
+    #[test]
+    fn test_network_config_serializes_new_overlay_and_startup_timeout_fields() {
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        // New fields serialize under their canonical names.
+        assert!(json.contains("\"relay_startup_timeout_ms\":"));
+        assert!(!json.contains("fallback_timeout_ms"));
+        assert!(json.contains("\"proxy_mode\":\"direct\""));
+        assert!(json.contains("\"overlay_any_path\":false"));
+        assert_eq!(config.relay.relay_startup_timeout_ms, 5000);
     }
 
     #[test]

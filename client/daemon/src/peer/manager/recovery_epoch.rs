@@ -1057,6 +1057,40 @@ impl PeerManager {
         }
     }
 
+    /// Synchronous per-peer relay-confirm sequence mirror, updated together
+    /// with the peer's relay confirmation state so an outbound waiter reading
+    /// it per notification can never miss a confirmation that already committed.
+    pub(crate) fn relay_confirm_seq_sync(&self, peer_id: &str) -> Option<u64> {
+        self.relay_confirm_seq_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .copied()
+    }
+
+    /// Bump the relay-confirm sequence for a peer and wake every waiter.  Must
+    /// be called in the same critical section as the relay confirmation state
+    /// transition so no waiter observes the sequence without the state.
+    pub(crate) fn bump_relay_confirm_seq(&self, peer_id: &str) -> u64 {
+        let seq = {
+            let mut mirror = self
+                .relay_confirm_seq_mirror
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = mirror.entry(peer_id.to_string()).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        self.relay_confirm_notify.notify_waiters();
+        seq
+    }
+
+    /// Notification for any relay-confirm bump; waiters must re-check the
+    /// peer's sequence and confirmation state after waking.
+    pub(crate) fn relay_confirm_notify(&self) -> Arc<Notify> {
+        self.relay_confirm_notify.clone()
+    }
+
     /// Whether the recovery epoch budget diagnostics should be surfaced.
     pub(crate) async fn recovery_epoch_active(&self, peer_id: &str) -> bool {
         self.recovery_epochs.read().await.contains_key(peer_id)

@@ -463,7 +463,7 @@ fn validates_and_sets_safe_config_values() {
         "stun.l.google.com:19302,stun.example.com:19302",
     )
     .unwrap();
-    set_config_value(&mut config, "direct-timeout", "7000ms").unwrap();
+    set_config_value(&mut config, "relay-startup-timeout", "7000ms").unwrap();
     set_config_value(&mut config, "upnp", "off").unwrap();
     set_config_value(&mut config, "birthday-probing", "no").unwrap();
     set_config_value(&mut config, "socket-pool", "3").unwrap();
@@ -477,7 +477,7 @@ fn validates_and_sets_safe_config_values() {
     );
     assert_eq!(config.network.stun_servers.len(), 2);
     assert_eq!(config.network.stun_servers[0], "stun.l.google.com:19302");
-    assert_eq!(config.relay.fallback_timeout_ms, 7000);
+    assert_eq!(config.relay.relay_startup_timeout_ms, 7000);
     assert!(!config.network.upnp_enabled);
     assert!(!config.network.birthday_probing_enabled);
     assert!(config.network.socket_pool_enabled);

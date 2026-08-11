@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 pub(crate) const CANDIDATE_EXPIRY_CLOCK_SKEW_GRACE_MS: u64 = 120_000;
 
 use crate::config::Config;
+use crate::connection_timeline::ConnectionTimeline;
 use crate::control::PeerInfo;
 use crate::traversal_history::{
     traversal_history_path, TraversalHistory, TraversalHistoryDiagnostics,
@@ -53,14 +54,17 @@ const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PEER_REFLEXIVE_SAME_IP_RETAINED_PORTS: usize = 3;
-const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 96;
+/// Probe budgets per cycle.  Kept `pub(crate)` so a stability test can pin
+/// them against accidental regression while this work changes the relay-first
+/// data path.
+pub(crate) const PREDICTED_PROBE_BUDGET_PER_CYCLE: usize = 96;
 const PREDICTED_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 96;
 const PREDICTED_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 96;
 const PREDICTED_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 48;
-const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 192;
-const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 256;
+pub(crate) const BIRTHDAY_PROBE_BUDGET_PER_CYCLE: usize = 192;
+pub(crate) const BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE: usize = 256;
 const BIRTHDAY_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 192;
-const BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 192;
+pub(crate) const BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 192;
 const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
 const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
 const BIRTHDAY_PROBE_PORT_SPACE: usize = u16::MAX as usize;

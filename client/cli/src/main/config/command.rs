@@ -78,7 +78,10 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                     "relay"
                 }
             );
-            println!("direct-timeout = {}ms", config.relay.fallback_timeout_ms);
+            println!(
+                "relay-startup-timeout = {}ms",
+                config.relay.relay_startup_timeout_ms
+            );
             println!("diagnostics = {}", config.diagnostics.bind);
             Ok(())
         }

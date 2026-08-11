@@ -107,3 +107,21 @@ async fn signal_websocket_authenticates_negotiates_and_wakes() {
     client.abort();
     server.await.unwrap();
 }
+
+#[test]
+fn websocket_proxy_policy_is_direct_only_and_stable() {
+    // WebSocket signaling uses the pinned tokio-tungstenite client which has
+    // no proxy support: the policy is ALWAYS direct-only, independent of the
+    // REST lane's ControlProxyMode.  This label is surfaced in the startup
+    // diagnostics so an operator can see the limitation explicitly.
+    assert_eq!(crate::control::websocket_proxy_policy_label(), "direct_only");
+    // The REST HTTP lane can opt into environment proxies; the WS lane never
+    // can — the two policies are deliberately distinct and must not silently
+    // diverge into an inconsistent state.
+    assert!(crate::control::proxy_consults_environment(
+        crate::config::ControlProxyMode::Environment
+    ));
+    assert!(!crate::control::proxy_consults_environment(
+        crate::config::ControlProxyMode::Direct
+    ));
+}

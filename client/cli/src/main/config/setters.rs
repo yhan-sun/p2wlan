@@ -121,12 +121,12 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             "relay" => config.relay.prefer_direct = false,
             _ => return Err("relay-policy 只支持 auto、direct 或 relay".to_string()),
         },
-        "direct-timeout" => {
-            let timeout = parse_millis(value, "direct-timeout")?;
+        "relay-startup-timeout" | "direct-timeout" => {
+            let timeout = parse_millis(value, "relay-startup-timeout")?;
             if !(100..=60000).contains(&timeout) {
-                return Err("direct-timeout 必须在 100ms 到 60000ms 之间".to_string());
+                return Err("relay-startup-timeout 必须在 100ms 到 60000ms 之间".to_string());
             }
-            config.relay.fallback_timeout_ms = timeout;
+            config.relay.relay_startup_timeout_ms = timeout;
         }
         _ => {
             return Err(format!(

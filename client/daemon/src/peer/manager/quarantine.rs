@@ -141,6 +141,30 @@ impl PeerManager {
         }
         self.cancel_relay_backoff_heartbeat(peer_id);
 
+        // A sustained relay peer_not_found (the 404 quarantine path) revokes
+        // the peer's RelayPeerConfirmed: the peer is not registered on the
+        // relay, so a future relay path needs a fresh forced-probe
+        // confirmation.  Direct stays authoritative.
+        let relay_confirm_revoked = {
+            let mut conns = self.connections.write().await;
+            match conns.get_mut(peer_id) {
+                Some(conn) if conn.relay_confirmed_at.is_some() => {
+                    conn.relay_confirmed_at = None;
+                    conn.relay_confirmed_generation = None;
+                    conn.relay_confirmed_endpoint = None;
+                    conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+                    if conn.state == ConnectionState::Relay {
+                        conn.transition(ConnectionState::FallbackToRelay);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        if relay_confirm_revoked {
+            self.bump_relay_confirm_seq(peer_id);
+        }
+
         if fresh {
             let consecutive = self.quarantine_consecutive(peer_id).await;
             info!(

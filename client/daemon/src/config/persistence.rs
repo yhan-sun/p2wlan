@@ -109,6 +109,7 @@ impl Config {
                 fresh_mapping_harness_loopback: false,
                 gather_host_candidates: true,
                 validate_overlay: false,
+                overlay_any_path: false,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),
@@ -117,13 +118,14 @@ impl Config {
                 credential_issued: false,
                 reconnect_interval_secs: default_reconnect_interval(),
                 heartbeat_interval_secs: default_heartbeat_interval(),
+                proxy_mode: ControlProxyMode::default(),
             },
             relay: RelayConfig {
                 servers: Vec::new(),
                 preferred_regions: Vec::new(),
                 selection_timeout_ms: default_relay_selection_timeout(),
                 prefer_direct: true,
-                fallback_timeout_ms: default_relay_timeout(),
+                relay_startup_timeout_ms: default_relay_timeout(),
                 allow_insecure_plaintext: false,
                 ca_cert_path: None,
             },

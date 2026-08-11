@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, ControlProxyMode};
 use crate::error::{DaemonError, Result};
 
 use super::{
@@ -38,6 +38,7 @@ include!("http/auth.rs");
 include!("http/device.rs");
 include!("http/signal.rs");
 include!("http/peers.rs");
+include!("proxy.rs");
 
 #[cfg(test)]
 mod signal_send_timeout_tests {

@@ -380,3 +380,76 @@ use std::collections::HashMap;
         drop(outcome);
         fallback.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn relay_selector_publishes_first_success_without_waiting_for_black_hole_candidate() {
+        // One healthy relay plus one "TCP connects but registration never
+        // completes" black hole.  First-success must publish the healthy one in
+        // about the preference window (25ms), NOT wait for the black hole's
+        // connect/register timeout.  The still-running black-hole task is
+        // cancelled and recorded distinctly from failed/timeout.
+        let healthy = RelayServer::start_random().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    // Accept and hold the socket open, never sending a
+                    // Registered frame: the DERP registration never completes.
+                    let _ = tokio::io::copy(&mut sock, &mut tokio::io::sink()).await;
+                });
+            }
+        });
+
+        let specs = vec![
+            RelayCandidateConfig::legacy(format!("healthy@{}", healthy.addr)),
+            RelayCandidateConfig::legacy(format!("blackhole@{blackhole_addr}")),
+        ];
+        let started = Instant::now();
+        let outcome = select_relay(
+            &specs,
+            &[],
+            Duration::from_secs(10),
+            "node-a",
+            peer_manager(),
+            None,
+            None,
+            true,
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let transport = outcome.transport.as_ref().unwrap();
+        assert_eq!(transport.endpoint(), healthy.addr.to_string());
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "first-success must NOT wait the black hole's 10s timeout; took {elapsed:?}"
+        );
+        // The healthy candidate is a success; the black hole is CANCELLED (not
+        // failed/timeout) because it was still in flight when the selection
+        // published and aborted it.
+        let healthy_diag = outcome
+            .diagnostics
+            .candidates
+            .iter()
+            .find(|c| c.endpoint == healthy.addr.to_string())
+            .unwrap();
+        assert_eq!(healthy_diag.outcome.as_deref(), Some("success"));
+        let bh_diag = outcome
+            .diagnostics
+            .candidates
+            .iter()
+            .find(|c| c.endpoint == blackhole_addr.to_string())
+            .unwrap();
+        assert_eq!(
+            bh_diag.outcome.as_deref(),
+            Some("cancelled"),
+            "the in-flight black-hole candidate must be recorded as cancelled, got {:?}",
+            bh_diag.outcome
+        );
+
+        drop(outcome);
+        server.abort();
+        healthy.shutdown().await;
+    }

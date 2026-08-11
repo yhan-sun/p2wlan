@@ -2,6 +2,13 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+/// How long after the FIRST relay connect success the selection keeps waiting
+/// for a better-ranked (preferred-region) candidate before publishing.  This
+/// is the explicit preference window: it must be very short so a black-hole
+/// candidate never stretches the total selection time, while still letting a
+/// preferred candidate that is already mid-connect win.
+const RELAY_SELECTION_PREFERENCE_WINDOW: Duration = Duration::from_millis(25);
+
 /// Connect to all valid relay candidates concurrently and select the best one.
 /// Preferred regions win first; connection latency and config order break ties.
 ///
@@ -69,6 +76,7 @@ pub(crate) async fn select_relay_with_cooldowns(
                             "relay candidate cooling down for {remaining_ms} ms"
                         )),
                         error_code: Some("cooling_down".to_string()),
+                        outcome: None,
                     });
                     continue;
                 }
@@ -81,6 +89,7 @@ pub(crate) async fn select_relay_with_cooldowns(
                         cooldown_remaining_ms: None,
                         error: None,
                         error_code: None,
+                        outcome: None,
                     });
                     candidates.push(candidate);
                 } else {
@@ -91,6 +100,7 @@ pub(crate) async fn select_relay_with_cooldowns(
                         cooldown_remaining_ms: None,
                         error: Some("duplicate relay endpoint".to_string()),
                         error_code: Some("duplicate_endpoint".to_string()),
+                        outcome: None,
                     });
                 }
             }
@@ -101,12 +111,14 @@ pub(crate) async fn select_relay_with_cooldowns(
                 cooldown_remaining_ms: None,
                 error: Some(error),
                 error_code: Some("invalid_spec".to_string()),
+                outcome: None,
             }),
         }
     }
 
     let mut tasks = JoinSet::new();
-    for candidate in candidates {
+    for candidate in &candidates {
+        let candidate = candidate.clone();
         let node_id = node_id.to_string();
         let peers = peers.clone();
         let ticket_cache = ticket_cache.clone();
@@ -146,41 +158,124 @@ pub(crate) async fn select_relay_with_cooldowns(
         });
     }
 
+    // First-success publish with a very short explicit preference window.
+    //
+    // Every candidate connect runs concurrently and is internally bounded by
+    // `selection_timeout`.  The moment ANY candidate succeeds:
+    //   - if the success is the best-ranked (preferred-region) candidate, the
+    //     selection publishes immediately;
+    //   - otherwise it waits at most RELAY_SELECTION_PREFERENCE_WINDOW for a
+    //     better-ranked candidate that is already mid-connect, then publishes
+    //     the best success so far and ABORTS every still-running task.
+    // A black-hole candidate can therefore never stretch the total selection
+    // past (first success + the 25ms preference window).
     let mut connected = Vec::new();
-    while let Some(task_result) = tasks.join_next().await {
-        let Ok((candidate, latency_ms, result)) = task_result else {
-            continue;
-        };
-        let candidate_diagnostics = &mut diagnostics.candidates[candidate.index];
-        candidate_diagnostics.connect_latency_ms = Some(latency_ms);
+    let mut first_success_at: Option<Instant> = None;
+    let mut preference_deadline: Option<Instant> = None;
 
-        match result {
-            Ok(Ok((transport, relay_rx))) => connected.push(ConnectedCandidate {
-                candidate,
-                transport,
-                relay_rx,
-            }),
-            Ok(Err(error)) => {
-                candidate_diagnostics.error = Some(error.to_string());
-                candidate_diagnostics.error_code = Some(error.error_code());
+    loop {
+        // Best-ranked preference rank among ALL connectable candidates.
+        let best_rank = candidates
+            .iter()
+            .map(|candidate| candidate.preference_rank)
+            .min();
+        // Once we have a success, stop early if the best-ranked candidate has
+        // succeeded (publish immediately) or the preference window elapsed.
+        if first_success_at.is_some() {
+            if connected
+                .iter()
+                .any(|c: &ConnectedCandidate| Some(c.candidate.preference_rank) == best_rank)
+            {
+                break;
             }
-            Err(_) => {
-                candidate_diagnostics.error = Some(format!(
-                    "relay selection timed out after {} ms",
-                    duration_millis(selection_timeout)
-                ));
-                candidate_diagnostics.error_code = Some("timeout".to_string());
+            if preference_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
             }
+        }
+        let wait_budget = match (first_success_at, preference_deadline) {
+            (Some(_), Some(deadline)) => deadline.saturating_duration_since(Instant::now()),
+            _ => {
+                // No success yet: keep joining until some task resolves.  Every
+                // in-flight task is internally bounded by selection_timeout, so
+                // this cannot wait forever; a black hole resolves with a
+                // timeout result.
+                Duration::from_secs(3600)
+            }
+        };
+        if wait_budget.is_zero() {
+            break;
+        }
+
+        let joined = tokio::time::timeout(wait_budget, tasks.join_next()).await;
+        match joined {
+            Ok(Some(Ok((candidate, latency_ms, result)))) => {
+                let candidate_diagnostics = &mut diagnostics.candidates[candidate.index];
+                candidate_diagnostics.connect_latency_ms = Some(latency_ms);
+
+                match result {
+                    Ok(Ok((transport, relay_rx))) => {
+                        candidate_diagnostics.outcome = Some("success".to_string());
+                        connected.push(ConnectedCandidate {
+                            candidate,
+                            transport,
+                            relay_rx,
+                        });
+                        connected.sort_by_key(|connected| {
+                            (
+                                connected.candidate.preference_rank,
+                                connected.transport.connect_latency_ms,
+                                connected.candidate.index,
+                            )
+                        });
+                        if first_success_at.is_none() {
+                            first_success_at = Some(Instant::now());
+                            preference_deadline =
+                                Some(Instant::now() + RELAY_SELECTION_PREFERENCE_WINDOW);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        candidate_diagnostics.error = Some(error.to_string());
+                        candidate_diagnostics.error_code = Some(error.error_code());
+                        candidate_diagnostics.outcome = Some("failed".to_string());
+                    }
+                    Err(_) => {
+                        candidate_diagnostics.error = Some(format!(
+                            "relay selection timed out after {} ms",
+                            duration_millis(selection_timeout)
+                        ));
+                        candidate_diagnostics.error_code = Some("timeout".to_string());
+                        candidate_diagnostics.outcome = Some("timeout".to_string());
+                    }
+                }
+            }
+            Ok(Some(Err(_))) => {
+                // Task panicked: cannot attribute a candidate; treat as failed.
+            }
+            Ok(None) => break, // every task resolved
+            Err(_) => break,   // preference window elapsed after a first success
         }
     }
 
-    connected.sort_by_key(|connected| {
-        (
-            connected.candidate.preference_rank,
-            connected.transport.connect_latency_ms,
-            connected.candidate.index,
-        )
-    });
+    // The publish decision is final: abort every still-running candidate so a
+    // black hole (or any slower candidate) can never keep the supervisor busy
+    // or leak a connection.  Candidates that never resolved are recorded as
+    // cancelled so diagnostics distinguish success / failed / cancelled /
+    // timeout for failover analysis.
+    tasks.abort_all();
+    for candidate in &candidates {
+        let candidate_diagnostics = &mut diagnostics.candidates[candidate.index];
+        if candidate_diagnostics.outcome.is_none() {
+            candidate_diagnostics.outcome = Some("cancelled".to_string());
+            if candidate_diagnostics.error.is_none() {
+                candidate_diagnostics.error = Some(
+                    "relay connect superseded by an earlier success; task cancelled".to_string(),
+                );
+                candidate_diagnostics.error_code = Some("cancelled".to_string());
+            }
+        }
+    }
 
     if let Some(selected) = connected.into_iter().next() {
         diagnostics.selected_region = Some(selected.candidate.region.clone());

@@ -14,12 +14,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_tun::{Ipv4Packet, Protocol};
 use p2pnet_wireguard::{MessageTransport, TransportSession};
-use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
+use crate::relay::RelayTransport;
 
 const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
 const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
@@ -475,6 +476,56 @@ pub struct ReceivedEncryptedPacket {
     pub udp_transport_owner: Option<u64>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
+}
+
+/// Real ingress path of one decrypted inbound overlay payload, derived from
+/// the `ReceivedEncryptedPacket` metadata at the transport layer — never
+/// back-inferred from the current `active_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayIngress {
+    /// The packet decrypted from a datagram owned by the published direct UDP
+    /// transport.
+    Direct,
+    /// The packet arrived through a relay; carries the relay endpoint.
+    Relay(String),
+}
+
+/// A decrypted inbound overlay candidate forwarded to the independent overlay
+/// validation harness with its REAL ingress metadata.
+#[derive(Debug, Clone)]
+pub struct OverlayIngressEvent {
+    pub peer_id: String,
+    pub packet: Vec<u8>,
+    pub ingress: OverlayIngress,
+}
+
+/// Optional evidence feed the daemon hands to the WireGuard inbound path:
+/// the shared relay transport (to answer forced-relay probe requests over the
+/// relay) and, when the independent overlay harness is active, the overlay
+/// ingress channel (real relay/direct ingress metadata for decrypted overlay
+/// payloads).  Production daemons always carry the relay transport; the
+/// overlay channel is `None` unless `--validate-overlay` is set.
+#[derive(Clone)]
+pub(crate) struct InboundEvidenceFeed {
+    pub(crate) relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressEvent>>,
+}
+
+/// Whether a decrypted IP packet looks like an overlay business payload (UDP
+/// with the overlay magic right after the UDP header).  The overlay validation
+/// loop re-verifies fully (magic, checksum, nonce/seq, sender); this is only a
+/// cheap transport-layer pre-filter so ordinary keepalive/user traffic is not
+/// forwarded to the harness.
+pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
+    let Ok(ip) = Ipv4Packet::new(packet) else {
+        return false;
+    };
+    if ip.protocol() != Protocol::Udp {
+        return false;
+    }
+    let payload = ip.payload();
+    payload.len() > 8 + crate::OVERLAY_PAYLOAD_MAGIC.len()
+        && payload[8..8 + crate::OVERLAY_PAYLOAD_MAGIC.len()] == crate::OVERLAY_PAYLOAD_MAGIC[..]
 }
 
 /// Source of the UDP transport used by WireGuard inbound after decryption.
@@ -1578,6 +1629,32 @@ impl WireGuardTransport {
             inbound_tx,
             peers,
             InboundUdpTransport::Static(Box::new(udp)),
+            None,
+        )
+        .await
+    }
+
+    /// Consume encrypted packets while resolving the UDP transport from the
+    /// latest daemon publication for every packet.  `evidence` optionally
+    /// carries the shared relay transport (for forced-relay probe ACKs) and the
+    /// overlay ingress channel (real ingress metadata for decrypted overlay
+    /// payloads).  This is intentionally separate from the static API above so
+    /// unit tests and non-daemon users retain their simple
+    /// `Option<UdpTransport>` setup.
+    pub(crate) async fn run_inbound_with_peers_live_udp_and_relay(
+        &self,
+        encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
+        inbound_tx: mpsc::Sender<InboundPacket>,
+        peers: Option<Arc<PeerManager>>,
+        udp_updates: watch::Receiver<Option<crate::udp::UdpTransport>>,
+        evidence: Option<InboundEvidenceFeed>,
+    ) -> Result<()> {
+        self.run_inbound_with_udp_source(
+            encrypted_rx,
+            inbound_tx,
+            peers,
+            InboundUdpTransport::Watch(udp_updates),
+            evidence,
         )
         .await
     }
@@ -1586,6 +1663,7 @@ impl WireGuardTransport {
     /// latest daemon publication for every packet.  This is intentionally
     /// separate from the static API above so unit tests and non-daemon users
     /// retain their simple `Option<UdpTransport>` setup.
+    #[cfg(test)]
     pub(crate) async fn run_inbound_with_peers_live_udp(
         &self,
         encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
@@ -1593,11 +1671,12 @@ impl WireGuardTransport {
         peers: Option<Arc<PeerManager>>,
         udp_updates: watch::Receiver<Option<crate::udp::UdpTransport>>,
     ) -> Result<()> {
-        self.run_inbound_with_udp_source(
+        self.run_inbound_with_peers_live_udp_and_relay(
             encrypted_rx,
             inbound_tx,
             peers,
-            InboundUdpTransport::Watch(udp_updates),
+            udp_updates,
+            None,
         )
         .await
     }
@@ -1608,6 +1687,7 @@ impl WireGuardTransport {
         inbound_tx: mpsc::Sender<InboundPacket>,
         peers: Option<Arc<PeerManager>>,
         udp_source: InboundUdpTransport,
+        evidence: Option<InboundEvidenceFeed>,
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
             let source = packet.source;
@@ -1635,9 +1715,45 @@ impl WireGuardTransport {
                         );
                         continue;
                     }
+                    // A decrypted relay datagram keeps the relay health
+                    // bookkeeping fresh below, but it does NOT set
+                    // RelayPeerConfirmed: per the relay-first contract that
+                    // milestone is only reached by a matching forced-relay
+                    // probe ACK whose real ingress was relay.  A local
+                    // TCP/TLS connect or a command-queue accept is never
+                    // delivery.
                     let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
                     let direct_validation = parse_direct_validation_token(&inbound.packet);
+                    let relay_probe = crate::relay_probe::parse_relay_probe_token(&inbound.packet);
                     if let Some(peers) = peers.as_ref() {
+                        // Forced-relay path-probe / path-ack: consumed here and
+                        // never forwarded to TUN.  Only a probe that ACTUALLY
+                        // arrived over the relay may confirm the relay path (or
+                        // be answered over it); a probe that somehow decrypted
+                        // on a non-relay ingress is ignored.
+                        if let Some(token) = relay_probe {
+                            if relay_endpoint.is_some() {
+                                self.handle_relay_probe_packet(
+                                    peers,
+                                    evidence.as_ref().map(|feed| &feed.relay_transport),
+                                    &inbound.peer_id,
+                                    &inbound.packet,
+                                    relay_endpoint.as_deref().unwrap_or("unknown"),
+                                    token,
+                                )
+                                .await;
+                            } else {
+                                debug!(
+                                    peer_id = %inbound.peer_id,
+                                    "ignored relay probe {} that arrived without relay ingress",
+                                    if token.kind == crate::relay_probe::RelayProbeKind::Ack {
+                                        "ack"
+                                    } else {
+                                        "request"
+                                    }
+                                );
+                            }
+                        }
                         let promoted_tokens = self
                             .pending_promoted_responder_tokens(&inbound.peer_id)
                             .await;
@@ -1738,19 +1854,19 @@ impl WireGuardTransport {
                                     inbound.peer_id
                                 );
                             }
-                        } else if let Some(relay_endpoint) = relay_endpoint {
+                        } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
                             if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
                                 peers
                                     .record_relay_success_with_latency(
                                         &inbound.peer_id,
-                                        &relay_endpoint,
+                                        relay_endpoint,
                                         true,
                                         rtt,
                                     )
                                     .await;
                             } else {
                                 peers
-                                    .record_relay_success(&inbound.peer_id, &relay_endpoint, true)
+                                    .record_relay_success(&inbound.peer_id, relay_endpoint, true)
                                     .await;
                             }
                             debug!(
@@ -1759,8 +1875,38 @@ impl WireGuardTransport {
                             );
                         }
                     }
-                    if internal_rekey_confirmation || direct_validation.is_some() {
+                    if internal_rekey_confirmation
+                        || direct_validation.is_some()
+                        || relay_probe.is_some()
+                    {
                         continue;
+                    }
+                    // Forward a decrypted overlay candidate to the independent
+                    // overlay validation harness WITH its real ingress (derived
+                    // from this envelope, never from the active path).
+                    if let Some(feed) = evidence.as_ref() {
+                        if is_overlay_payload_candidate(&inbound.packet) {
+                            let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref() {
+                                Some(OverlayIngress::Relay(relay_endpoint.clone()))
+                            } else if owns_direct_packet && source.is_some() {
+                                Some(OverlayIngress::Direct)
+                            } else {
+                                // No attributable ingress (relay nor owned
+                                // direct): do not guess.
+                                None
+                            };
+                            if let Some(ingress) = ingress {
+                                if let Some(tx) = &feed.overlay_ingress_tx {
+                                    let _ = tx
+                                        .send(OverlayIngressEvent {
+                                            peer_id: inbound.peer_id.clone(),
+                                            packet: inbound.packet.clone(),
+                                            ingress,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                     }
                     inbound_tx.send(inbound).await.map_err(|_| {
                         DaemonError::Network("inbound packet channel closed".to_string())
@@ -2226,6 +2372,15 @@ impl WireGuardTransport {
                     "promoted after owned request/ACK request_id={}",
                     token.request_id
                 );
+                peers.emit_timeline(
+                    "direct_promoted",
+                    Some("direct"),
+                    None,
+                    Some(format!(
+                        "peer={peer_id} endpoint={source} generation={} request_id={:?}",
+                        expectation.generation, token.request_id
+                    )),
+                );
                 peers
                     .record_direct_validation_event_with_metadata(
                         peer_id,
@@ -2258,6 +2413,125 @@ impl WireGuardTransport {
                 debug!(
                     "Direct UDP path confirmed for peer {peer_id} at {source} by validation ACK"
                 );
+            }
+        }
+    }
+
+    /// Handle one forced-relay path-probe / path-ack packet after successful
+    /// WireGuard decryption and a confirmed relay ingress (`relay_endpoint` is
+    /// `Some` at the call site).
+    ///
+    /// Request (responder role): the initiator's encrypted probe reached us
+    /// through the relay.  Answer idempotently over the SAME relay transport
+    /// (never the path selector) with the mirrored token, so the initiator can
+    /// confirm the relay path.  The request itself never changes local path
+    /// state.
+    ///
+    /// ACK (initiator role): the peer answers our outstanding forced-relay
+    /// probe.  The ACK is trusted only when its token mirrors the expectation
+    /// the probe loop registered (request id AND network generation AND owner
+    /// token) AND the ACK arrived over the relay.  On a match the peer manager
+    /// sets RelayPeerConfirmed and consumes the expectation, so duplicate or
+    /// late ACKs are no-ops.
+    async fn handle_relay_probe_packet(
+        &self,
+        peers: &Arc<PeerManager>,
+        relay_transport: Option<&Arc<RwLock<Option<RelayTransport>>>>,
+        peer_id: &str,
+        packet: &[u8],
+        relay_endpoint: &str,
+        token: crate::relay_probe::RelayProbeToken,
+    ) {
+        match token.kind {
+            crate::relay_probe::RelayProbeKind::Request => {
+                // Without a live relay transport there is nothing to answer
+                // over; drop silently (the initiator retries its probe).
+                let Some(relay_transport) = relay_transport else {
+                    debug!(
+                        peer_id = %peer_id,
+                        "ignored relay probe request from {peer_id}: no relay transport to answer on"
+                    );
+                    return;
+                };
+                let Some(relay) = relay_transport.read().await.clone() else {
+                    debug!(
+                        peer_id = %peer_id,
+                        "ignored relay probe request from {peer_id}: relay slot is empty"
+                    );
+                    return;
+                };
+                let Ok(ip) = Ipv4Packet::new(packet) else {
+                    return;
+                };
+                // Answer with the request's own IP header, source/destination
+                // swapped; the token mirrors the request exactly.  Sending the
+                // ACK over the relay (forced, not the path selector) is what
+                // lets the initiator confirm the real relay ingress.
+                let ack_payload = crate::relay_probe::build_relay_probe_payload(
+                    crate::relay_probe::RelayProbeKind::Ack,
+                    token.generation,
+                    token.request_id,
+                    token.owner_token,
+                );
+                let ack_packet = Ipv4Packet::build_icmp_echo_request(
+                    ip.dst_addr(),
+                    ip.src_addr(),
+                    token.request_id,
+                    1,
+                    &ack_payload,
+                );
+                let relay_send = relay.clone();
+                match self
+                    .encrypt_and_emit_outbound(
+                        OutboundPacket {
+                            peer_id: peer_id.to_string(),
+                            dst_ip: ip.src_addr().to_string(),
+                            packet: ack_packet,
+                        },
+                        move |encrypted| async move {
+                            relay_send.send_packet(&encrypted).await.map(|_| ())
+                        },
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            event = "relay_probe_ack_sent",
+                            peer_id = %peer_id,
+                            relay_endpoint = %relay_endpoint,
+                            request_id = token.request_id,
+                            "relay_probe_ack_sent peer_id={peer_id} relay_endpoint={relay_endpoint} request_id={}",
+                            token.request_id,
+                        );
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "Could not answer relay probe from {peer_id}: WireGuard session is no longer ready"
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to answer relay probe from {peer_id} over {relay_endpoint}: {err}"
+                        );
+                    }
+                }
+            }
+            crate::relay_probe::RelayProbeKind::Ack => {
+                // The caller guaranteed the ACK's real ingress was relay.  The
+                // peer manager verifies the token against the outstanding
+                // expectation (request id + generation + owner, within TTL)
+                // AND that the ACK arrived over the SAME relay the probe was
+                // sent on (real ingress binding); only then does it set
+                // RelayPeerConfirmed.
+                let confirmed = peers
+                    .consume_relay_probe_ack(peer_id, token, relay_endpoint)
+                    .await;
+                if !confirmed {
+                    debug!(
+                        peer_id = %peer_id,
+                        "relay probe ACK from {peer_id} did not match a fresh outstanding expectation, or arrived over a different relay (or was already consumed)"
+                    );
+                }
             }
         }
     }

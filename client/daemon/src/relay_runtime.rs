@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use p2pnet_relay::RelayMessage;
 use p2pnet_tun::Ipv4Packet;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
@@ -215,6 +215,11 @@ pub(super) struct RelaySupervisor {
     pub(super) relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     pub(super) relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     pub(super) inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    /// Watch flipped whenever the shared relay transport slot is set/cleared,
+    /// so the outbound path can wait event-driven for relay availability.
+    pub(super) relay_available_tx: watch::Sender<bool>,
+    /// Per-process connection timeline.
+    pub(super) timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
     // A2 fields
     pub(super) ticket_cache: Option<Arc<RelayTicketCache>>,
     pub(super) relay_ticket: Option<String>,
@@ -419,6 +424,17 @@ impl RelaySupervisor {
                                 std::sync::atomic::Ordering::SeqCst,
                             );
                             *self.relay_transport.write().await = Some(new_transport.clone());
+                            let _ = self.relay_available_tx.send(true);
+                            self.timeline.emit(
+                                "relay_transport_connected",
+                                Some("relay"),
+                                None,
+                                Some(format!(
+                                    "region={} endpoint={} renewal_handoff=true",
+                                    new_transport.region(),
+                                    new_transport.endpoint()
+                                )),
+                            );
                             inbound_ended = self.spawn_inbound_task(
                                 generation,
                                 new_transport.clone(),
@@ -697,6 +713,13 @@ impl RelaySupervisor {
             let now = Instant::now();
             cooldowns.retain(|_, until| *until > now);
 
+            self.timeline.emit(
+                "relay_selection_started",
+                None,
+                None,
+                Some(format!("candidates={}", self.relay_candidates.len())),
+            );
+
             let RelaySelectionOutcome {
                 transport,
                 relay_rx,
@@ -729,6 +752,20 @@ impl RelaySupervisor {
                     relay.connect_latency_ms()
                 );
                 *self.relay_transport.write().await = Some(relay.clone());
+                // Flip the availability watch BEFORE the first packet waiter
+                // polls, so the outbound path wakes event-driven.
+                let _ = self.relay_available_tx.send(true);
+                self.timeline.emit(
+                    "relay_transport_connected",
+                    Some("relay"),
+                    None,
+                    Some(format!(
+                        "region={} endpoint={} connect_latency_ms={}",
+                        relay.region(),
+                        relay.endpoint(),
+                        relay.connect_latency_ms()
+                    )),
+                );
                 retry_delay = Duration::from_secs(1);
 
                 let endpoint = relay.endpoint().to_string();
@@ -777,6 +814,7 @@ impl RelaySupervisor {
                     )
                     .await;
                 *self.relay_transport.write().await = None;
+                let _ = self.relay_available_tx.send(false);
                 let (peer_failure_code, peer_failure_reason) = match &ended {
                     Ok(()) => (
                         "relay_transport_closed",
@@ -847,6 +885,7 @@ impl RelaySupervisor {
                 warn!("{reason}");
             } else {
                 *self.relay_transport.write().await = None;
+                let _ = self.relay_available_tx.send(false);
                 if permanent_auth {
                     retry_delay = max_retry_delay;
                 }
@@ -992,6 +1031,167 @@ pub(super) struct RelayValidationPacket<'a> {
     pub(super) sequence: u16,
 }
 
+/// Cadence of the forced-relay probe loop while any peer still needs a relay
+/// confirmation.  Fast enough that the first business packet's wait (bounded
+/// by `relay_startup_timeout_ms`) is not materially extended by probe latency,
+/// and it is kicked event-driven by the outbound actor when a packet actually
+/// waits.
+const RELAY_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence of re-sending a forced-relay probe to an unconfirmed peer.  The
+/// probe token is STABLE per peer (never overwritten), so a late ACK — relay
+/// latency up to the expectation TTL — always echoes the token the expectation
+/// currently holds.  This cadence only bounds how often the wire sees a fresh
+/// probe; the expectation is refreshed every tick regardless.
+const RELAY_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drive forced-relay path-probes to every peer that has an encrypting
+/// WireGuard session, relay connected, Direct unconfirmed and RelayPeerConfirmed
+/// not yet set.  Each probe registers a newest-wins expectation on the peer
+/// manager; only the matching ACK whose real ingress is relay sets
+/// `RelayPeerConfirmed` (never a local connect or a queued registration).
+///
+/// The loop ticks at [`RELAY_PROBE_POLL_INTERVAL`] and is also kicked
+/// immediately (`kick_rx`) by the outbound actor when a first business packet
+/// starts waiting, so a peer that becomes relay-ready does not wait for the
+/// next tick.
+pub(super) async fn run_relay_peer_probe_loop(
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    local_virtual_ip: String,
+    mut kick_rx: watch::Receiver<u64>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let Ok(local_ip) = local_virtual_ip.parse::<Ipv4Addr>() else {
+        debug!("Skipping relay peer probe; local virtual IP '{local_virtual_ip}' is not IPv4");
+        return;
+    };
+    let mut ticker = interval(RELAY_PROBE_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Per-peer STABLE probe token: (owner token, request id).  It is chosen
+    // once per peer (while the peer still needs a probe) and re-sent verbatim,
+    // so a late ACK — relay latency up to the expectation TTL — always echoes
+    // the token the expectation currently holds.  A fresh expectation is never
+    // overwritten with a mismatched token.
+    let mut probe_tokens: HashMap<String, (u64, u16)> = HashMap::new();
+    // Per-peer last-send time, to pace re-sends (bounded cadence) without
+    // changing the token.
+    let mut last_sent: HashMap<String, Instant> = HashMap::new();
+    let mut next_request_id: u16 = 0;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = kick_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                kick_rx.borrow_and_update();
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow_and_update() {
+                    return;
+                }
+            }
+        }
+        let Some(relay) = relay_transport.read().await.clone() else {
+            continue;
+        };
+        let relay_endpoint = relay.endpoint().to_string();
+        let targets = peers.relay_probe_targets().await;
+        if targets.is_empty() {
+            probe_tokens.clear();
+            last_sent.clear();
+            continue;
+        }
+        let now = Instant::now();
+        for (peer_id, peer_virtual_ip, target_generation) in &targets {
+            let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
+                debug!("Skipping relay probe for {peer_id}; peer virtual IP '{peer_virtual_ip}' is not IPv4");
+                continue;
+            };
+            if !transport.session_status(peer_id).await.has_active {
+                continue;
+            }
+            // The relay is genuinely usable for this peer: record the
+            // per-peer RelayTransportConnected milestone.
+            peers
+                .mark_relay_transport_ready(peer_id, &relay_endpoint, *target_generation)
+                .await;
+            // Stable per-peer token: chosen once, reused for every re-send.
+            let (owner_token, request_id) = match probe_tokens.get(peer_id) {
+                Some(&token) => token,
+                None => {
+                    next_request_id = next_request_id.wrapping_add(1);
+                    let token = (unix_time_millis(), next_request_id);
+                    probe_tokens.insert(peer_id.clone(), token);
+                    token
+                }
+            };
+            // (Re)register the expectation with the SAME token.  This refreshes
+            // the expectation's validity window, so an ACK that lags the probe
+            // by up to the expectation TTL still matches.
+            peers.register_relay_probe_expectation(
+                peer_id,
+                *target_generation,
+                request_id,
+                owner_token,
+                &relay_endpoint,
+            );
+            // Pace the re-send cadence (the expectation above is refreshed on
+            // every tick regardless, so a late ACK always has a live window).
+            if last_sent
+                .get(peer_id)
+                .is_some_and(|at| now.saturating_duration_since(*at) < RELAY_PROBE_RETRY_INTERVAL)
+            {
+                continue;
+            }
+            let payload = crate::relay_probe::build_relay_probe_payload(
+                crate::relay_probe::RelayProbeKind::Request,
+                *target_generation,
+                request_id,
+                owner_token,
+            );
+            let packet =
+                Ipv4Packet::build_icmp_echo_request(local_ip, peer_ip, request_id, 1, &payload);
+            let relay_send = relay.clone();
+            match transport
+                .encrypt_and_emit_outbound(
+                    OutboundPacket {
+                        peer_id: peer_id.clone(),
+                        dst_ip: peer_virtual_ip.clone(),
+                        packet,
+                    },
+                    |encrypted| async move { relay_send.send_packet(&encrypted).await },
+                )
+                .await
+            {
+                Ok(true) => {
+                    last_sent.insert(peer_id.clone(), now);
+                    debug!(
+                        event = "relay_probe_sent",
+                        peer_id = %peer_id,
+                        relay_endpoint = %relay_endpoint,
+                        generation = target_generation,
+                        request_id = request_id,
+                        "relay probe sent peer_id={peer_id} request_id={request_id}",
+                    );
+                }
+                Ok(false) => {
+                    debug!("Relay probe skipped for {peer_id}: WireGuard session is not ready");
+                }
+                Err(err) => {
+                    debug!("Relay probe send failed for {peer_id} via {relay_endpoint}: {err}");
+                }
+            }
+        }
+        // Drop token/last-sent state for peers that no longer need a probe
+        // (now confirmed, Direct, offline), so the maps stay bounded.
+        probe_tokens
+            .retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
+        last_sent.retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
+    }
+}
+
 pub(super) async fn send_relay_validation_packet(
     validation: RelayValidationPacket<'_>,
     transport: &WireGuardTransport,
@@ -1125,6 +1325,7 @@ mod tests {
         let config = crate::Config::generate_default("https://ctrl.test", "net1").unwrap();
         let peers = Arc::new(PeerManager::new(config));
         let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
         RelaySupervisor {
             relay_candidates: Vec::new(),
             preferred_regions: Vec::new(),
@@ -1133,6 +1334,8 @@ mod tests {
             peers,
             relay_transport: Arc::new(RwLock::new(None)),
             relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
+            relay_available_tx,
+            timeline: crate::connection_timeline::ConnectionTimeline::new("node-a", 0),
             inbound_tx,
             ticket_cache,
             relay_ticket: None,

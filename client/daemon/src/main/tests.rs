@@ -27,14 +27,20 @@ use super::*;
             relay: None,
             relay_regions: None,
             relay_selection_timeout_ms: None,
-            relay_fallback_timeout_ms: None,
+            relay_startup_timeout_ms: None,
             diagnostics_bind: None,
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
+            disable_fresh_mapping_punch: false,
+            disable_birthday_probing: false,
             validate_overlay: false,
+
+            overlay_any_path: false,
+
+            proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
             log_file: None,
@@ -61,6 +67,19 @@ use super::*;
 
         assert_eq!(config.control.server_url, "https://old.example");
         assert_eq!(config.network.network_id, "old-net");
+    }
+
+    #[test]
+    fn traversal_ablation_flags_disable_only_the_requested_strategies() {
+        let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        let mut cli = test_cli(None, None);
+        cli.disable_fresh_mapping_punch = true;
+        cli.disable_birthday_probing = true;
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert!(!config.network.fresh_mapping_punch_enabled);
+        assert!(!config.network.birthday_probing_enabled);
     }
 
     #[test]
@@ -92,14 +111,20 @@ use super::*;
             relay: Some("cn-east@127.0.0.1:8080,us-west@127.0.0.1:8081".to_string()),
             relay_regions: Some("cn-east,us-west".to_string()),
             relay_selection_timeout_ms: Some(750),
-            relay_fallback_timeout_ms: None,
+            relay_startup_timeout_ms: None,
             diagnostics_bind: None,
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
+            disable_fresh_mapping_punch: false,
+            disable_birthday_probing: false,
             validate_overlay: false,
+
+            overlay_any_path: false,
+
+            proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
             log_file: None,
@@ -150,14 +175,20 @@ use super::*;
             relay: None,
             relay_regions: None,
             relay_selection_timeout_ms: None,
-            relay_fallback_timeout_ms: None,
+            relay_startup_timeout_ms: None,
             diagnostics_bind: None,
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
+            disable_fresh_mapping_punch: false,
+            disable_birthday_probing: false,
             validate_overlay: false,
+
+            overlay_any_path: false,
+
+            proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
             log_file: None,
@@ -275,14 +306,20 @@ use super::*;
             relay: None,
             relay_regions: None,
             relay_selection_timeout_ms: None,
-            relay_fallback_timeout_ms: None,
+            relay_startup_timeout_ms: None,
             diagnostics_bind: None,
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
+            disable_fresh_mapping_punch: false,
+            disable_birthday_probing: false,
             validate_overlay: false,
+
+            overlay_any_path: false,
+
+            proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
             log_file: None,

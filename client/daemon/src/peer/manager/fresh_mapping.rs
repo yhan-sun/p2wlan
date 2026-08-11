@@ -167,13 +167,14 @@ impl PeerManager {
     /// Endpoint-independent / open NATs have a stable public port; only
     /// address/port-dependent (symmetric-class) mappings benefit from the
     /// measure-then-punch generation.  The NAT-sim harness forces the fresh
-    /// path on so the deterministic dual-NAT simulation exercises it.
+    /// path on so the deterministic dual-NAT simulation exercises it, unless
+    /// an explicit experiment has disabled the strategy.
     pub(crate) async fn local_nat_requires_fresh_mapping_punch(&self) -> bool {
-        if self.fresh_mapping_harness_loopback_enabled().await {
-            return true;
-        }
         if !self.config.network.fresh_mapping_punch_enabled {
             return false;
+        }
+        if self.fresh_mapping_harness_loopback_enabled().await {
+            return true;
         }
         self.local_nat_profile
             .read()
@@ -717,7 +718,10 @@ impl PeerManager {
             return Vec::new();
         };
         let mut endpoints = conn
-            .asymmetric_stable_public_endpoints(conn.probe_candidate_endpoints())
+            .asymmetric_stable_endpoints_for_fresh_mapping(
+                conn.probe_candidate_endpoints(),
+                allow_loopback,
+            )
             .into_iter()
             .filter(|endpoint| eligible(*endpoint))
             .collect::<Vec<_>>();

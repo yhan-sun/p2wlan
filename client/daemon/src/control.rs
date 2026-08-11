@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::connection_timeline::ConnectionTimeline;
 use crate::error::{DaemonError, Result};
 use crate::relay::RelaySelectionDiagnostics;
 use rand::Rng;
@@ -31,7 +32,18 @@ use tracing::{debug, error, info, warn};
 mod http;
 mod websocket;
 
+/// Single control-plane HTTP client builder shared by the ordinary loop and the
+/// critical lane (see [`control::proxy`](crate::control::proxy)).
+pub use http::control_http_client;
 pub(crate) use http::incarnation_fits_candidate_generation_encoding;
+#[cfg(test)]
+pub(crate) use http::prepare_signal_payload as prepare_signal_payload_for_test;
+/// Whether the configured proxy mode consults the process environment's proxy
+/// variables for control-plane HTTP traffic (diagnostics only).
+pub use http::proxy_consults_environment;
+/// Short, non-sensitive HTTP proxy behavior label (diagnostics/structured
+/// events).  See [`control::proxy`](crate::control::proxy) for the policy.
+pub use http::proxy_http_behavior_label;
 #[cfg(test)]
 use http::register_device_payload;
 use http::{
@@ -40,6 +52,9 @@ use http::{
     send_signal, update_endpoint, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
 };
 use websocket::spawn_signal_websocket;
+/// Stable WebSocket proxy policy label (`direct_only`).  Signaling never rides
+/// an ambient proxy.
+pub use websocket::websocket_proxy_policy_label;
 
 #[cfg(test)]
 use futures_util::SinkExt;

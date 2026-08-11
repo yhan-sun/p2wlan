@@ -560,10 +560,34 @@ impl PeerConnection {
     }
 
     fn asymmetric_stable_public_endpoints(&self, endpoints: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        self.asymmetric_stable_endpoints(endpoints, false)
+    }
+
+    /// Stable remote targets for a fresh-mapping generation.
+    ///
+    /// Production only accepts public endpoints. The deterministic NAT
+    /// harness opts into loopback explicitly so it can exercise the same
+    /// source-selection policy without weakening the production boundary.
+    pub(crate) fn asymmetric_stable_endpoints_for_fresh_mapping(
+        &self,
+        endpoints: Vec<SocketAddr>,
+        allow_loopback: bool,
+    ) -> Vec<SocketAddr> {
+        self.asymmetric_stable_endpoints(endpoints, allow_loopback)
+    }
+
+    fn asymmetric_stable_endpoints(
+        &self,
+        endpoints: Vec<SocketAddr>,
+        allow_loopback: bool,
+    ) -> Vec<SocketAddr> {
+        let eligible = |endpoint: SocketAddr| {
+            is_public_probe_endpoint(endpoint) || (allow_loopback && endpoint.ip().is_loopback())
+        };
         let mut authoritative = endpoints
             .iter()
             .copied()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| eligible(*endpoint))
             .filter(|endpoint| {
                 is_authoritative_stable_public_source(self.candidate_source_for_endpoint(*endpoint))
             })
@@ -575,7 +599,7 @@ impl PeerConnection {
 
         let mut reclaim = endpoints
             .into_iter()
-            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| eligible(*endpoint))
             .filter(|endpoint| {
                 matches!(
                     self.candidate_source_for_endpoint(*endpoint),

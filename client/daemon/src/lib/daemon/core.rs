@@ -80,6 +80,13 @@ pub struct Daemon {
     /// regardless of wall-clock rollback or a restart within the same
     /// millisecond, and old incarnations' late signals can never win again.
     boot_epoch_ms: u64,
+    /// Per-process connection timeline (correlation id + bounded event ring).
+    timeline: Arc<ConnectionTimeline>,
+    /// Watch for relay transport availability.  The relay supervisor flips this
+    /// whenever the shared `relay_transport` slot is set or cleared, so the
+    /// outbound path can wait event-driven for a relay to come up instead of
+    /// polling at a fixed interval.
+    relay_available_tx: watch::Sender<bool>,
 }
 
 impl Daemon {
@@ -88,19 +95,6 @@ impl Daemon {
         let control_enabled = !config.network.manual;
         let config_path = config.config_path.clone();
         let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
-        let (control, control_rx) = ControlClient::new(
-            &config,
-            control_enabled,
-            config_path,
-            Some(relay_selection.clone()),
-        );
-        let (transport, encrypted_rx) = WireGuardTransport::new();
-        let acl_engine = AclEngine::from_config(&config.acl);
-        let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
-
-        let health = tasks::HealthState::new();
-        let task_manager = tasks::TaskManager::new(health.clone());
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // The fresh-mapping prediction incarnation epoch: a persistent
         // strictly-monotonic counter (seeded from the wall clock only on the
         // very first boot).  A restarted daemon's label supersedes every label
@@ -129,8 +123,24 @@ impl Daemon {
                 "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation or the incarnation outgrew its encoding field); ordinary punching continues"
             );
         }
+        let timeline = ConnectionTimeline::new(&config.node.node_id, boot_epoch_ms);
+        let (control, control_rx) = ControlClient::new(
+            &config,
+            control_enabled,
+            config_path,
+            Some(relay_selection.clone()),
+            timeline.clone(),
+        );
+        let (transport, encrypted_rx) = WireGuardTransport::new();
+        let acl_engine = AclEngine::from_config(&config.acl);
+        let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
+
+        let health = tasks::HealthState::new();
+        let task_manager = tasks::TaskManager::new(health.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let udp_transport = Arc::new(RwLock::new(None));
+        let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
 
         // Register the punch-session canceller on the peer manager so a
         // stale/404 quarantined peer's in-flight recovery session is
@@ -138,6 +148,7 @@ impl Daemon {
         // the same deduplicator the daemon hands to the punch tasks).
         let punch_attempts = PunchAttemptDeduplicator::default();
         let peers = Arc::new(PeerManager::new(config.clone()));
+        peers.set_timeline(timeline.clone());
         {
             let punch_attempts = punch_attempts.clone();
             peers.set_punch_cancel_hook(Arc::new(move |peer_id| {
@@ -185,6 +196,8 @@ impl Daemon {
             shutdown_tx,
             shutdown_rx,
             boot_epoch_ms,
+            timeline,
+            relay_available_tx,
         }
     }
 

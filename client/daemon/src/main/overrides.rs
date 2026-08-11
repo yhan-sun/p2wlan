@@ -88,8 +88,8 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if let Some(timeout_ms) = cli.relay_selection_timeout_ms {
         config.relay.selection_timeout_ms = timeout_ms;
     }
-    if let Some(timeout_ms) = cli.relay_fallback_timeout_ms {
-        config.relay.fallback_timeout_ms = timeout_ms;
+    if let Some(timeout_ms) = cli.relay_startup_timeout_ms {
+        config.relay.relay_startup_timeout_ms = timeout_ms;
     }
     if let Some(ref bind) = cli.diagnostics_bind {
         config.diagnostics.enabled = true;
@@ -110,8 +110,23 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.no_host_candidates {
         config.network.gather_host_candidates = false;
     }
+    if cli.disable_fresh_mapping_punch {
+        config.network.fresh_mapping_punch_enabled = false;
+    }
+    if cli.disable_birthday_probing {
+        config.network.birthday_probing_enabled = false;
+    }
     if cli.validate_overlay {
         config.network.validate_overlay = true;
+    }
+    if cli.overlay_any_path {
+        config.network.overlay_any_path = true;
+    }
+    if let Some(ref mode) = cli.proxy_mode {
+        config.control.proxy_mode = match mode.as_str() {
+            "environment" => ControlProxyMode::Environment,
+            _ => ControlProxyMode::Direct,
+        };
     }
     if let Some(ref name) = cli.device_name {
         config.node.device_name = name.clone();

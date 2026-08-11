@@ -8,6 +8,12 @@ pub struct RelayCandidateDiagnostics {
     pub cooldown_remaining_ms: Option<u64>,
     pub error: Option<String>,
     pub error_code: Option<String>,
+    /// How this candidate's connect attempt ended in the most recent
+    /// selection pass: `success`, `failed`, `timeout`, or `cancelled` (a
+    /// better relay was already published and the in-flight connect was
+    /// aborted).  Kept for failover diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// Result of the most recent relay selection pass.

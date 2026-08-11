@@ -33,6 +33,10 @@ def list_nodes(control_url, token, network_id, timeout_s=8):
 
 def active_node_ids(nodes):
     """Device IDs the server currently reports within the online lease."""
+    # A fully clean network can surface `nodes: null` (not just `[]`) from the
+    # control plane; treat it as empty so cleanup proofs and roster checks
+    # never crash on an empty network.
+    nodes = nodes or []
     return {
         node.get("id")
         for node in nodes
@@ -180,6 +184,10 @@ def prove_cleaned(control_url, token, network_id, deleted_ids, deadline_s=10, po
             time.sleep(poll_s)
             continue
         active = active_node_ids(nodes)
+        # A fully clean network can surface `nodes: null` from the control
+        # plane; normalize before `len` (and `active_node_ids` already
+        # normalizes its own iteration).
+        nodes = nodes or []
         remaining = active & expected_gone
         probes.append({
             "device_rows": len(nodes),

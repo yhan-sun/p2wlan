@@ -134,6 +134,7 @@ mod tests {
             health,
             task_manager,
             shutdown_tx,
+            ConnectionTimeline::new("node-a", 0),
         );
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 

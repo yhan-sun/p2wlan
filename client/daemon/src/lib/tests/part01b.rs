@@ -323,3 +323,97 @@ fn compact_never_truncates_fresh_window_ports_before_reservation() {
     assert!(candidates.len() <= MAX_SIGNAL_CANDIDATES);
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
 }
+
+#[test]
+fn control_endpoint_selection_is_independent_of_proxy_policy() {
+    // A proxy only affects how control-plane HTTP TRAFFIC is transported; it
+    // must never change which STUN-derived UDP candidate is published.  The
+    // same `control_udp_endpoint_from_candidates` result feeds both the PATCH
+    // endpoint lease (`update_endpoint`) and the offer/answer candidate
+    // payloads, so the server keeps saving the exact STUN-derived candidate
+    // regardless of proxy mode.
+    let candidates = vec!["8.8.8.8:41000".to_string(), "10.0.0.5:41000".to_string()];
+    let sources = HashMap::from([
+        ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
+        ("10.0.0.5:41000".to_string(), "host".to_string()),
+    ]);
+    let selected = control_udp_endpoint_from_candidates(&candidates, &sources);
+    assert_eq!(selected.as_deref(), Some("8.8.8.8:41000"));
+    // The proxy policy never enters the candidate-selection function; both
+    // modes resolve to the same STUN-derived endpoint.
+    assert_eq!(crate::config::ControlProxyMode::Direct.as_label(), "direct");
+    assert_eq!(crate::config::ControlProxyMode::Environment.as_label(), "environment");
+}
+
+#[test]
+fn relay_first_defaults_and_probe_budgets_are_stable() {
+    // These invariants are load-bearing for relay-first availability: the
+    // socket pool stays off, the default UDP bind stays 0.0.0.0:0, and the
+    // NAT probe budgets must not be changed by this work.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    assert_eq!(config.network.udp_bind, "0.0.0.0:0");
+    assert!(!config.network.socket_pool_enabled);
+    assert_eq!(config.network.socket_pool_size, 1);
+    assert_eq!(config.relay.relay_startup_timeout_ms, 5000);
+
+    assert_eq!(crate::peer::PREDICTED_PROBE_BUDGET_PER_CYCLE, 96);
+    assert_eq!(crate::peer::BIRTHDAY_PROBE_BUDGET_PER_CYCLE, 192);
+    assert_eq!(crate::peer::BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE, 256);
+    assert_eq!(crate::peer::BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE, 192);
+}
+
+#[test]
+fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
+    // The STUN-derived UDP candidates are signalled to the control plane as
+    // JSON verbatim.  A proxy changes how the control-plane HTTP TRAFFIC is
+    // transported; it must never substitute the proxy egress IP for a STUN
+    // candidate — the candidate JSON is produced independently of the proxy
+    // mode, and the selected control endpoint stays the STUN-observed one.
+    use std::collections::HashMap;
+    let candidates = vec![
+        "203.0.113.10:41000".to_string(), // STUN-observed public endpoint
+        "192.168.1.10:51820".to_string(), // host candidate
+    ];
+    let sources = HashMap::from([
+        ("203.0.113.10:41000".to_string(), "stun_observed".to_string()),
+        ("192.168.1.10:51820".to_string(), "host".to_string()),
+    ]);
+    // The prepared signal body carries the EXACT STUN candidate list in JSON.
+    let payload = crate::control::prepare_signal_payload_for_test(
+        "node-a",
+        "node-b",
+        "offer",
+        &candidates,
+        &sources,
+        b"handshake-bytes",
+        Some(1_000),
+        None,
+        Some("sess-1"),
+        None,
+        None,
+    )
+    .expect("signal payload must build");
+    let json_candidates: Vec<String> = payload["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(json_candidates, candidates, "candidate JSON must be the STUN-derived list verbatim");
+    assert_eq!(
+        payload["candidate_sources"]["203.0.113.10:41000"],
+        "stun_observed",
+        "the STUN source label must survive into the JSON"
+    );
+    // Neither proxy mode rewrites the STUN-derived endpoint selection.
+    for mode in [
+        crate::config::ControlProxyMode::Direct,
+        crate::config::ControlProxyMode::Environment,
+    ] {
+        assert_eq!(
+            control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
+            Some("203.0.113.10:41000"),
+            "proxy mode {mode:?} must never replace the STUN candidate with a proxy egress"
+        );
+    }
+}

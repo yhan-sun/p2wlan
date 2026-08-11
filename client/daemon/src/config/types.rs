@@ -177,9 +177,9 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub fresh_mapping_harness_loopback: bool,
     /// Drive a real encrypted overlay payload through the production
-    /// dataplane (DataPlane -> WireGuard encrypt -> direct UDP -> WireGuard
-    /// decrypt -> DataPlane) using an in-memory mock TUN instead of a system
-    /// interface (independent validation harnesses only).
+    /// dataplane (DataPlane -> WireGuard encrypt -> outbound path selector ->
+    /// WireGuard decrypt -> DataPlane) using an in-memory mock TUN instead of
+    /// a system interface (independent validation harnesses only).
     ///
     /// This is NOT a test-only plaintext bypass: every payload byte goes
     /// through the exact production outbound/inbound pipeline, and the flag
@@ -189,6 +189,15 @@ pub struct NetworkConfig {
     /// macOS TUN creation is unavailable to the validation harness.
     #[serde(default)]
     pub validate_overlay: bool,
+    /// When `validate_overlay` is enabled, target every online peer with an
+    /// established WireGuard session instead of only Direct peers.  The
+    /// outbound path selector then rides Relay until Direct is confirmed, so
+    /// an availability harness can prove "first usable business packet" over
+    /// Relay without any Direct path.  This is independent-harness only and
+    /// defaults to off: with the flag off, the overlay loop preserves the
+    /// strict-direct semantics of sending only over confirmed Direct paths.
+    #[serde(default)]
+    pub overlay_any_path: bool,
 }
 
 fn default_cidr() -> String {
@@ -230,6 +239,37 @@ fn default_socket_pool_size() -> usize {
     1
 }
 
+/// Control-plane proxy policy.
+///
+/// The daemon's own control-plane HTTP traffic must be explicit about whether
+/// the process environment's `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+/// variables are honored.  UDP endpoints are always derived from STUN
+/// candidates and signalled as JSON; a proxy's egress IP is never used as a
+/// UDP endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlProxyMode {
+    /// Do NOT read environment proxies for control-plane HTTP.  This is the
+    /// default: control traffic connects directly and is never routed through
+    /// an ambient proxy.
+    #[default]
+    Direct,
+    /// Explicitly allow reading `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` for
+    /// control-plane HTTP.  WebSocket signaling remains direct-only (the
+    /// pinned tokio-tungstenite client has no proxy support).
+    Environment,
+}
+
+impl ControlProxyMode {
+    /// Short stable label used by diagnostics and structured events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Environment => "environment",
+        }
+    }
+}
+
 /// Control plane server configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
@@ -250,6 +290,10 @@ pub struct ControlConfig {
     /// Heartbeat interval in seconds.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
+    /// Explicit control-plane HTTP proxy policy.  `direct` by default; the
+    /// daemon never consults environment proxies unless this is `environment`.
+    #[serde(default)]
+    pub proxy_mode: ControlProxyMode,
 }
 
 impl std::fmt::Debug for ControlConfig {
@@ -264,6 +308,7 @@ impl std::fmt::Debug for ControlConfig {
             .field("credential_issued", &self.credential_issued)
             .field("reconnect_interval_secs", &self.reconnect_interval_secs)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("proxy_mode", &self.proxy_mode)
             .finish()
     }
 }
@@ -289,9 +334,17 @@ pub struct RelayConfig {
     /// Whether to prefer direct P2P over relay.
     #[serde(default = "default_true")]
     pub prefer_direct: bool,
-    /// Timeout for direct connection attempt before falling back to relay (ms).
-    #[serde(default = "default_relay_timeout")]
-    pub fallback_timeout_ms: u64,
+    /// Bounded time the first business packet waits for a relay transport to
+    /// become available before it is dropped with a stable diagnostic reason.
+    ///
+    /// This replaces the old, never-enforced `fallback_timeout_ms` ("timeout
+    /// for direct connection attempt before falling back to relay").  Relay is
+    /// never deliberately delayed by this value: once a relay transport is
+    /// connected, outbound packets use it immediately.  Old configs that still
+    /// carry `fallback_timeout_ms` are read as this field (backward-compatible
+    /// parse), and the field is serialized under the new name.
+    #[serde(default = "default_relay_timeout", alias = "fallback_timeout_ms")]
+    pub relay_startup_timeout_ms: u64,
     /// Whether to allow insecure plaintext TCP to relay (default: false, development only).
     #[serde(default)]
     pub allow_insecure_plaintext: bool,

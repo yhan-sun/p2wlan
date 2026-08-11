@@ -14,6 +14,7 @@ impl ControlClient {
         enabled: bool,
         config_path: Option<PathBuf>,
         relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+        timeline: Arc<ConnectionTimeline>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -41,13 +42,31 @@ impl ControlClient {
         };
 
         if enabled && has_control_credential(config) {
+            // ONE control-plane HTTP client backs both the ordinary loop and
+            // the independent critical lane, so the two lanes can never
+            // disagree on proxy policy.
+            let http = control_http_client(config.control.proxy_mode).unwrap_or_else(|err| {
+                // A `.no_proxy()` client cannot fail under normal settings.
+                // Fall back to a direct no_proxy client so control traffic
+                // never silently rides an ambient proxy.
+                warn!(
+                    "Control-plane HTTP client build failed for proxy mode {} ({err}); falling back to a direct no_proxy client",
+                    config.control.proxy_mode.as_label()
+                );
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("no_proxy control HTTP client must build")
+            });
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
+            let critical_http = Arc::new(http.clone());
             tokio::spawn(async move {
                 run_critical_control_loop(
+                    critical_http,
                     critical_answer_rx,
                     critical_offer_rx,
                     critical_ctrl_rx,
@@ -60,6 +79,8 @@ impl ControlClient {
             tokio::spawn(async move {
                 run_control_loop(
                     config,
+                    http,
+                    timeline,
                     &event_tx,
                     state,
                     &mut cmd_rx,

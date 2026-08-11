@@ -52,6 +52,7 @@ coverage/
 # Local-only project notes and research drafts
 P2PNet-Design.md
 PRODUCT.md
+research/nat-traversal-paper/
 docs/*
 !docs/production-hardening.zh.md
 !docs/production-hardening.en.md

@@ -22,7 +22,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-policy、direct-timeout";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-policy、relay-startup-timeout";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -99,7 +99,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, relay, relay-policy, or direct-timeout
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, relay, relay-policy, or relay-startup-timeout
         key: String,
         value: String,
     },

@@ -32,6 +32,7 @@
 pub mod acl;
 mod candidate_refresh;
 pub mod config;
+pub mod connection_timeline;
 pub mod control;
 pub mod dataplane;
 pub mod diagnostics;
@@ -43,6 +44,7 @@ mod network_outbound;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
+pub(crate) mod relay_probe;
 pub(crate) mod relay_runtime;
 pub mod route;
 pub mod tasks;
@@ -92,6 +94,7 @@ use candidate_refresh::{
     should_update_stable_control_endpoint, stable_network_candidate_signature,
     truncate_signal_candidates,
 };
+use connection_timeline::ConnectionTimeline;
 #[cfg(test)]
 use control::RelayCatalogEntry;
 use control::{ControlClient, ControlEvent, PeerOfferSendFailure};
@@ -101,7 +104,7 @@ use diagnostics::{
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
-use network_outbound::run_network_outbound;
+use network_outbound::{run_network_outbound, RelayStartupWait};
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
 use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportKeyPair,
@@ -118,8 +121,8 @@ use relay::RelayCandidateConfig;
 use relay::{RelaySelectionDiagnostics, RelayTicketCache, RelayTransport};
 use relay_runtime::{
     effective_relay_allow_insecure_plaintext, infer_default_relay_servers,
-    relay_candidates_from_sources, run_relay_peer_validation_loop, udp_observers_from_sources,
-    RelaySupervisor,
+    relay_candidates_from_sources, run_relay_peer_probe_loop, run_relay_peer_validation_loop,
+    udp_observers_from_sources, RelaySupervisor,
 };
 #[cfg(test)]
 use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, RelayValidationPacket};
@@ -128,8 +131,9 @@ use transport::parse_direct_validation_token;
 #[cfg(test)]
 use transport::EncryptedPeerPacket;
 use transport::{
-    build_direct_validation_payload, DirectValidationKind, OrderedEncryptedPeerPacket,
-    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, WireGuardTransport,
+    build_direct_validation_payload, DirectValidationKind, InboundEvidenceFeed,
+    OrderedEncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionCommit,
+    ResponderSessionStage, WireGuardTransport,
 };
 use udp::{
     FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveIngress,
@@ -338,6 +342,12 @@ const PUNCH_SESSION_HARD_DEADLINE: Duration = Duration::from_secs(24);
 /// punch sessions; the embedded incarnation+generation lets the receiver
 /// reject a stale prediction that a superseded task managed to send late.
 pub(crate) const FRESH_PREDICTION_SOURCE_LABEL_PREFIX: &str = "predicted_fresh:";
+
+/// Magic bytes of the independent overlay-validation business payload
+/// (`P2WLOV`), used by the WireGuard inbound path as a cheap pre-filter before
+/// forwarding a decrypted inbound packet to the overlay harness with its real
+/// ingress metadata.
+pub(crate) const OVERLAY_PAYLOAD_MAGIC: &[u8] = b"P2WLOV";
 
 /// Reserved part of the 96-candidate signaling budget for the fresh-mapping
 /// prediction window.  The prediction is time-sensitive: it must not be

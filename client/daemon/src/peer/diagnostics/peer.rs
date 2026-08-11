@@ -34,6 +34,20 @@ pub struct PeerDiagnostics {
     pub direct: PathHealthDiagnostics,
     pub relay: PathHealthDiagnostics,
     pub direct_generation: u64,
+    /// Relay endpoint whose ingress carried the confirming forced-relay probe
+    /// ACK, when RelayPeerConfirmed (never from a local connect / queued
+    /// registration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_confirmed_endpoint: Option<String>,
+    /// Network generation in which the relay path was confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_confirmed_generation: Option<u64>,
+    /// Path that became first usable for this peer (`Relay` or `Direct`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_usable_path: Option<NetworkPath>,
+    /// Network generation of the first usable path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_usable_generation: Option<u64>,
     pub candidate_pair_stats: Vec<CandidatePairSourceStats>,
     pub candidate_pairs: Vec<CandidatePairDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +263,10 @@ impl PeerDiagnostics {
             direct: PathHealthDiagnostics::from(&conn.direct_health),
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
+            relay_confirmed_endpoint: conn.relay_confirmed_endpoint.clone(),
+            relay_confirmed_generation: conn.relay_confirmed_generation,
+            first_usable_path: conn.first_usable_path,
+            first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(
                 &conn.candidate_pairs,
                 local_generation,

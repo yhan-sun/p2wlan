@@ -3,6 +3,7 @@
 //! The main client daemon that runs the P2P virtual network.
 
 use clap::Parser;
+use p2pnet_daemon::config::ControlProxyMode;
 use p2pnet_daemon::{Config, Daemon, DaemonError};
 use std::fs::OpenOptions;
 use std::path::PathBuf;

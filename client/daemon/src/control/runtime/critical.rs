@@ -18,6 +18,7 @@
 /// - retries reuse the exact prepared payload and are cut off by one overall
 ///   deadline, so a successful round can never become a 3 x 5 s sequence.
 async fn run_critical_control_loop(
+    http: Arc<reqwest::Client>,
     mut answer_rx: mpsc::Receiver<CriticalAnswerCommand>,
     mut offer_rx: mpsc::Receiver<CriticalOfferCommand>,
     mut ctrl_rx: mpsc::Receiver<CriticalControlCommand>,
@@ -25,7 +26,6 @@ async fn run_critical_control_loop(
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
 ) {
-    let http = Arc::new(reqwest::Client::new());
     let answer_permits = Arc::new(Semaphore::new(CRITICAL_ANSWER_MAX_INFLIGHT));
     let offer_permits = Arc::new(Semaphore::new(CRITICAL_OFFER_MAX_INFLIGHT));
     let ctrl_permits = Arc::new(Semaphore::new(CRITICAL_CTRL_MAX_INFLIGHT));

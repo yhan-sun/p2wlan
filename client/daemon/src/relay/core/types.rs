@@ -1,3 +1,4 @@
+#[derive(Debug, Clone)]
 struct RelayCandidate {
     index: usize,
     region: String,

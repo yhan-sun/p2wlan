@@ -80,6 +80,7 @@ impl PeerManager {
         // deadlock.
         let mut unquarantine_after_lock: Option<&'static str> = None;
         let mut cancel_heartbeat_after_lock = false;
+        let mut revoke_relay_after_lock = false;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -150,6 +151,13 @@ impl PeerManager {
             .await;
         }
         conn.nat_type = info.nat_type.clone();
+        // An explicit offline transition revokes RelayPeerConfirmed: the peer
+        // is not reachable, so the confirmed relay path must be re-established
+        // by a fresh probe when it comes back online.  (Identity changes
+        // already reset via `reset_for_identity_change`.)
+        if conn.online && !info.online {
+            revoke_relay_after_lock = true;
+        }
         conn.online = info.online;
         conn.last_seen = info.last_seen;
         conn.remote_relay_rtt_ms = info.relay_rtt_ms;
@@ -229,6 +237,9 @@ impl PeerManager {
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
         drop(conns);
         drop(ip_map);
+        if revoke_relay_after_lock {
+            self.revoke_relay_peer_confirmation(&info.node_id).await;
+        }
         if cancel_heartbeat_after_lock {
             self.cancel_relay_backoff_heartbeat(&info.node_id);
         }

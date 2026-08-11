@@ -8,6 +8,20 @@ impl Daemon {
             self.config.network.network_id, self.config.network.cidr
         );
         info!("Control server: {}", self.config.control.server_url);
+        info!(
+            "Control plane proxy mode: {} (HTTP {}; WebSocket signaling is always direct-only)",
+            self.config.control.proxy_mode.as_label(),
+            crate::control::proxy_http_behavior_label(self.config.control.proxy_mode)
+        );
+        self.timeline.emit(
+            "daemon_started",
+            None,
+            None,
+            Some(format!(
+                "node_id={} boot_epoch_ms={}",
+                self.config.node.node_id, self.boot_epoch_ms
+            )),
+        );
 
         let mut virtual_ip = self.config.network.virtual_ip.clone();
         let mut netmask = self.config.network.netmask.clone();
@@ -175,6 +189,26 @@ impl Daemon {
         let punch_attempts = self.config.network.punch_attempts;
 
         let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
+        let relay_candidates_present =
+            !relay_candidates_from_sources(&relay_catalog, &relay_servers).is_empty();
+        let relay_startup_wait = if relay_candidates_present {
+            RelayStartupWait {
+                timeout: Some(Duration::from_millis(
+                    self.config.relay.relay_startup_timeout_ms.max(1),
+                )),
+            }
+        } else {
+            // No relay candidates are configured or expected: the first packet
+            // degrades to direct-only immediately with a stable reason code
+            // instead of waiting for a relay that will never start.
+            RelayStartupWait { timeout: None }
+        };
+        let relay_available_rx = self.relay_available_tx.subscribe();
+        // Kick signal for the forced-relay probe loop: bumped by the outbound
+        // actor when a first business packet starts waiting (or a relay comes
+        // up), so the probe fires immediately instead of waiting for the next
+        // poll tick.
+        let (relay_probe_kick_tx, relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
         self.task_manager
             .spawn(
                 "network-outbound",
@@ -185,6 +219,10 @@ impl Daemon {
                     prefer_direct,
                     self.udp_transport.clone(),
                     self.relay_transport.clone(),
+                    relay_available_rx,
+                    relay_startup_wait,
+                    relay_probe_kick_tx,
+                    self.timeline.clone(),
                 ),
             )
             .await;
@@ -220,6 +258,28 @@ impl Daemon {
                 ),
             )
             .await;
+        // Forced-relay path-probe loop: confirms RelayPeerConfirmed with a
+        // matching probe/ACK (real ingress relay) before any business packet
+        // rides the relay.  Kicked event-driven by the outbound actor.
+        let probe_peers = self.peers.clone();
+        let probe_transport = self.transport.clone();
+        let probe_relay_transport = self.relay_transport.clone();
+        let probe_local_vip = virtual_ip.clone();
+        let probe_shutdown_rx = self.shutdown_rx.clone();
+        self.task_manager
+            .spawn(
+                "relay-peer-probe",
+                false,
+                run_relay_peer_probe_loop(
+                    probe_peers,
+                    probe_transport,
+                    probe_relay_transport,
+                    probe_local_vip,
+                    relay_probe_kick_rx,
+                    probe_shutdown_rx,
+                ),
+            )
+            .await;
         if self.config.diagnostics.enabled {
             let diagnostics_bind = self.config.diagnostics.bind.clone();
             let diagnostics_context = DiagnosticsContext::new(
@@ -234,6 +294,7 @@ impl Daemon {
                 self.health.clone(),
                 self.task_manager.clone(),
                 self.shutdown_tx.clone(),
+                self.timeline.clone(),
             );
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager
@@ -341,6 +402,8 @@ spawn_relay_inbound(RelayInboundSpawnContext {
     peers: self.peers.clone(),
     relay_transport: self.relay_transport.clone(),
     relay_selection: self.relay_selection.clone(),
+    relay_available_tx: self.relay_available_tx.clone(),
+    timeline: self.timeline.clone(),
     inbound_tx: network_inbound_tx.clone(),
     control: self.control.clone(),
     allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,

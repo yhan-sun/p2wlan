@@ -14,6 +14,7 @@ use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::connection_timeline::{ConnectionTimeline, ConnectionTimelineDiagnostics};
 use crate::error::{DaemonError, Result};
 use crate::gateway_mapping::GatewayMappingDiagnostics;
 use crate::peer::{

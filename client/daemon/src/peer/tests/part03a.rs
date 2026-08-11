@@ -396,6 +396,31 @@ async fn stable_public_candidate_precedes_predicted_budget_in_synchronized_punch
 }
 
 #[tokio::test]
+async fn fresh_mapping_harness_uses_loopback_stun_target_not_predicted_target() {
+    let mut config = test_config();
+    config.network.fresh_mapping_harness_loopback = true;
+    let manager = PeerManager::new(config);
+    let stable_endpoint: SocketAddr = "127.0.0.1:46000".parse().unwrap();
+    let predicted_endpoint: SocketAddr = "127.0.0.1:46001".parse().unwrap();
+    let candidates = vec![predicted_endpoint.to_string(), stable_endpoint.to_string()];
+    let sources = HashMap::from([
+        (predicted_endpoint.to_string(), "predicted".to_string()),
+        (stable_endpoint.to_string(), "stun_observed".to_string()),
+    ]);
+
+    manager.add_peer(&test_peer("peer1", stable_endpoint)).await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    assert_eq!(
+        manager.stable_remote_punch_targets_for("peer1").await,
+        vec![stable_endpoint],
+        "the harness must retain the authoritative loopback STUN endpoint while excluding speculative predictions"
+    );
+}
+
+#[tokio::test]
 async fn synchronized_punch_uses_only_predicted_window_during_history_cooldown() {
     let mut history = TraversalHistory::default();
     history.record_failure(CandidatePairSource::Predicted);

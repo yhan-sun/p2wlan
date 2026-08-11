@@ -32,11 +32,67 @@ impl PeerManager {
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
+            relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_confirm_notify: Arc::new(Notify::new()),
+            relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             quarantined_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             relay_not_found_grace: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
+            timeline: std::sync::Mutex::new(None),
             config,
+        }
+    }
+
+    /// Install the per-process connection timeline.  Called once by the daemon
+    /// right after construction so path-confirmation events can emit.
+    pub(crate) fn set_timeline(&self, timeline: Arc<ConnectionTimeline>) {
+        *self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeline);
+    }
+
+    /// Emit a connection-timeline event; no-op when no timeline is installed.
+    pub(crate) fn emit_timeline(
+        &self,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.emit(event, path, reason_code, detail);
+        }
+    }
+
+    /// Emit a connection-timeline first-milestone event scoped to a
+    /// peer + network generation; no-op when no timeline is installed or when
+    /// the same (peer, generation, event) already emitted.  Returns whether it
+    /// emitted.
+    pub(crate) fn emit_timeline_first(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) -> bool {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let scope = format!("peer:{peer_id}:{generation}");
+        match timeline {
+            Some(timeline) => timeline.emit_first_scoped(&scope, event, path, reason_code, detail),
+            None => false,
         }
     }
 

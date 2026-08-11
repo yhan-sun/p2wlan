@@ -763,6 +763,14 @@ impl PeerManager {
     /// mark pairs as probing only once the UDP layer confirms a packet left.
     pub async fn record_direct_probe_sent(&self, node_id: &str, endpoint: SocketAddr) -> bool {
         let generation = self.current_network_generation().await;
+        self.emit_timeline_first(
+            node_id,
+            generation,
+            "first_direct_probe_sent",
+            Some("direct"),
+            None,
+            Some(format!("peer={node_id} endpoint={endpoint} generation={generation}")),
+        );
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;

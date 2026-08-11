@@ -37,7 +37,7 @@ pub(super) async fn send_signal(
 /// candidate generation, expiry, Probe signature, session id, and WireGuard
 /// bytes must not change between delivery-ambiguous attempts.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_signal_payload(
+pub(crate) fn prepare_signal_payload(
     from_node_id: &str,
     to_node_id: &str,
     signal_type: &str,
@@ -541,7 +541,7 @@ fn unix_time_millis() -> u64 {
 }
 
 #[derive(Clone)]
-pub(super) struct SignalSigningIdentity {
+pub(crate) struct SignalSigningIdentity {
     keypair: Ed25519KeyPair,
 }
 
