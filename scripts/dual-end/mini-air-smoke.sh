@@ -903,6 +903,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --token "$TOKEN" \
     --device-name "$LOCAL_NODE_A_DEVICE" \
     --udp-bind 0.0.0.0:0 \
+    --socket-pool 3 \
     --stun "$STUN_SERVERS" \
     --stun-timeout-ms 1000 \
     --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
@@ -934,6 +935,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --token '$TOKEN' \\
     --device-name '$REMOTE_NODE_B_DEVICE' \\
     --udp-bind 0.0.0.0:0 \
+    --socket-pool 3 \
     --stun '$STUN_SERVERS' \
     --stun-timeout-ms 1000 \
     --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
@@ -1042,7 +1044,7 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     result = json.load(stream)
 values = [
-    side.get("key", {}).get("direct_promotion_at_ms")
+    (side or {}).get("key", {}).get("direct_promotion_at_ms")
     for side in (result.get("left", {}), result.get("right", {}))
 ]
 if any(value is None for value in values):
@@ -1214,13 +1216,27 @@ PY
 import json
 import sys
 
+def endpoint_of(status_path, peer_id):
+    with open(status_path, encoding="utf-8") as stream:
+        status = json.load(stream)
+    for peer in status.get("peers", []) or []:
+        if not isinstance(peer, dict):
+            continue
+        if peer.get("node_id") != peer_id:
+            continue
+        pair = peer.get("selected_pair") or peer.get("current_direct_pair") or {}
+        if isinstance(pair, dict):
+            return pair.get("remote_endpoint") or ""
+        return ""
+    return ""
+
 print(json.dumps({
     "acceptance_mode": "compat",
     "classification": "functional_direct_baseline",
     "mini_peer_id": sys.argv[2],
     "air_peer_id": sys.argv[4],
-    "mini_endpoint": next((p.get("selected_pair", p.get("current_direct_pair", {})).get("remote_endpoint") for p in json.load(open(sys.argv[1])).get("peers", []) if p.get("node_id") == sys.argv[2]), ""),
-    "air_endpoint": next((p.get("selected_pair", p.get("current_direct_pair", {})).get("remote_endpoint") for p in json.load(open(sys.argv[3])).get("peers", []) if p.get("node_id") == sys.argv[4]), ""),
+    "mini_endpoint": endpoint_of(sys.argv[1], sys.argv[2]),
+    "air_endpoint": endpoint_of(sys.argv[3], sys.argv[4]),
 }, indent=2, sort_keys=True))
 PY
   fi

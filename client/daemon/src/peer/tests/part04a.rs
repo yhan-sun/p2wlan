@@ -65,11 +65,16 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
         })
         .count();
     // The wide window is generated in bounded per-plan slices: the expected
-    // set mirrors the sliced budget exactly.
+    // set mirrors the sliced budget exactly.  v0.1.116 also bounds every
+    // ActivePool stage (ScatterExtended included) by the 192-datagram session
+    // ceiling so one session can fully cover a planned window without the
+    // mid-window truncation that stalled the birthday cursor (a 384-candidate
+    // plan was cut at 171 endpoints by the old 512-datagram session cap).
+    let stage_window = RECOVERY_STAGE_SCATTER_EXTENDED_MAX_PROBES as usize;
     let sliced_budget = birthday_budget.min(
-        BIRTHDAY_PLAN_SLICE.saturating_sub(
-            [stable_endpoint, second_observed].len(),
-        ),
+        stage_window
+            .saturating_sub([stable_endpoint, second_observed].len())
+            .min(BIRTHDAY_PLAN_SLICE.saturating_sub([stable_endpoint, second_observed].len())),
     );
     let expected_birthday_count = birthday_probe_endpoints_for_bases(
         &[stable_endpoint, second_observed],

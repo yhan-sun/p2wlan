@@ -291,12 +291,58 @@ impl PeerConnection {
         );
     }
 
+    /// Push one direct-traversal event into the bounded ring.
+    ///
+    /// The strict acceptance lifecycle (owned validation request -> ACK ->
+    /// promoted -> path) is the authoritative proof of a real Direct
+    /// promotion, so those evidence stages are protected from eviction: a
+    /// post-promotion burst of ordinary traversal events (scan completions,
+    /// inbound probes, maintainer stops) must never push the validation
+    /// chain out of the ring before the harness snapshot captures it
+    /// (field evidence: the v0.1.116 acceptance rounds that converged in
+    /// ~1 s produced enough post-promotion events to evict
+    /// `direct_validation_request_sent`, so the strict parser could not
+    /// reconstruct the owned chain).
     fn push_direct_event(&mut self, event: DirectTraversalEvent) {
         self.direct_events.push(event);
-
+        if self.direct_events.len() <= DIRECT_TRAVERSAL_EVENT_LIMIT {
+            return;
+        }
+        // Evict ordinary events first so the owned request -> ACK -> promoted
+        // -> path chain survives the ring no matter which side pushed the
+        // overflow.  If the ring is entirely validation evidence (impossible
+        // in practice), the final drain below still enforces the hard cap.
+        let mut evicted = 0usize;
+        let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;
+        self.direct_events.retain(|candidate| {
+            if evicted >= excess {
+                return true;
+            }
+            if is_validation_evidence_stage(&candidate.stage) {
+                true
+            } else {
+                evicted += 1;
+                false
+            }
+        });
         if self.direct_events.len() > DIRECT_TRAVERSAL_EVENT_LIMIT {
             let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;
             self.direct_events.drain(0..excess);
         }
     }
+}
+
+/// Direct-validation lifecycle stages that the strict acceptance parser
+/// requires as one owned chain.  These events are never evicted from the
+/// bounded event ring by ordinary traversal noise.
+fn is_validation_evidence_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "direct_validation_request_sent"
+            | "direct_validation_request_received"
+            | "direct_validation_ack_sent"
+            | "direct_validation_ack_received"
+            | "direct_validation_promoted"
+            | "direct_path_promoted"
+    )
 }

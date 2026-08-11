@@ -103,9 +103,19 @@ pub(crate) const RECOVERY_EVIDENCE_REGRANT_SESSIONS: u32 = 1;
 
 /// Per-stage probe ceilings (the stage target construction enforces these in
 /// addition to the epoch credit).
+///
+/// v0.1.116: all ActivePool stage ceilings are bounded by the punch session's
+/// physical-datagram cap (192) so a planned window always fits ONE session —
+/// the stage target planner divides the ceiling by the active socket count,
+/// and a window larger than the session cap would be truncated mid-window
+/// (field evidence: a 384-candidate ScatterSmall plan was cut at 171 unique
+/// endpoints by the 512-datagram session cap, leaving the window's tail never
+/// scanned).  A single controlled coverage of a 64-candidate window from a
+/// 3-socket pool is 192 datagrams, well below the previous 512.
 pub(crate) const RECOVERY_STAGE_INITIAL_MAX_PROBES: u32 = 96;
-pub(crate) const RECOVERY_STAGE_PREDICTED_MAX_PROBES: u32 = 384;
-pub(crate) const RECOVERY_STAGE_SCATTER_SMALL_MAX_PROBES: u32 = 512;
+pub(crate) const RECOVERY_STAGE_PREDICTED_MAX_PROBES: u32 = 192;
+pub(crate) const RECOVERY_STAGE_SCATTER_SMALL_MAX_PROBES: u32 = 192;
+pub(crate) const RECOVERY_STAGE_SCATTER_EXTENDED_MAX_PROBES: u32 = 192;
 /// RelayBackoff (and relay-backed ScatterExtended) stages probe at most this
 /// many trusted endpoints: the relay is the data plane, so traversal work is
 /// a low-frequency, bounded heartbeat instead of a full wide scan.
@@ -165,7 +175,7 @@ impl RecoveryStage {
             RecoveryStage::Initial => RECOVERY_STAGE_INITIAL_MAX_PROBES,
             RecoveryStage::Predicted => RECOVERY_STAGE_PREDICTED_MAX_PROBES,
             RecoveryStage::ScatterSmall => RECOVERY_STAGE_SCATTER_SMALL_MAX_PROBES,
-            RecoveryStage::ScatterExtended => u32::MAX,
+            RecoveryStage::ScatterExtended => RECOVERY_STAGE_SCATTER_EXTENDED_MAX_PROBES,
             RecoveryStage::RelayBackoff => RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES,
         }
     }

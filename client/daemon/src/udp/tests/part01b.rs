@@ -176,7 +176,7 @@ async fn qualified_socket_pool_probes_from_each_bound_socket() {
 }
 
 #[tokio::test]
-async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted() {
+async fn active_pool_sweep_is_bounded_by_session_cap_across_alternate_sockets() {
     let peers = peer_manager();
     peers.add_peer(&peer("peer-b", "10.20.0.9", None)).await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -196,7 +196,10 @@ async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted
         .await
         .unwrap();
 
-    assert_eq!(sent as usize, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP);
+    // v0.1.116: the per-session physical cap (192) binds BEFORE the remote-IP
+    // pacing budget (224/s): one session is one controlled coverage, bounded
+    // by the session ceiling, not by the sustained-rate budget.
+    assert_eq!(sent as usize, MAX_PUNCH_PROBES_PER_SESSION as usize);
     let pending = transport.pending_probes.lock().await;
     let mut endpoints = pending
         .values()
@@ -207,7 +210,7 @@ async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted
 
     assert_eq!(
         endpoints.len(),
-        OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP / transport.socket_count()
+        MAX_PUNCH_PROBES_PER_SESSION as usize / transport.socket_count()
     );
     assert!(endpoints
         .iter()
@@ -216,7 +219,8 @@ async fn active_pool_uses_alternate_sockets_before_remote_ip_budget_is_exhausted
     for probe in pending.values() {
         per_socket[probe.socket_index] += 1;
     }
-    let expected_per_socket = OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP / transport.socket_count();
+    let expected_per_socket =
+        MAX_PUNCH_PROBES_PER_SESSION as usize / transport.socket_count();
     assert_eq!(
         per_socket,
         vec![expected_per_socket; transport.socket_count()]

@@ -95,8 +95,6 @@ impl PeerManager {
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
         let old_signaled_endpoint = conn.signaled_endpoint;
-        let old_online = conn.online;
-        let old_last_seen = conn.last_seen;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
 
@@ -199,30 +197,32 @@ impl PeerManager {
             conn.transition(ConnectionState::Idle);
         }
 
-        // A control-plane online transition, a newer last-seen sample, or a
-        // new endpoint/identity is fresh evidence that an in-flight relay 404
-        // may belong to a reconnect/handoff.  It starts a new bounded grace
-        // window without touching any active recovery state.
+        // A relay 404 is authoritative evidence that the peer's registration
+        // is absent on the relay.  Only evidence that the peer is a NEW
+        // instance re-opens the registration-grace window: a brand-new node
+        // ID (fresh registration) or a changed public key (identity rotation
+        // / reinstall).  Endpoint heartbeats, `last_seen` growth, ordinary
+        // NAT endpoint churn and online transitions are all consistent with
+        // the SAME stale incarnation still missing its relay registration, so
+        // they must NOT clear the grace window (field evidence: old v0.1.108 /
+        // v0.1.110 nodes kept restarting 404 grace and quarantine churn on
+        // every control-plane heartbeat while their relay registration was
+        // permanently absent).
         let clear_relay_not_found_grace_after_lock = info.online
-            && (is_new
-                || !old_online
-                || info.last_seen > old_last_seen
-                || endpoint_changed
-                || public_key_changed);
+            && (is_new || public_key_changed);
 
-        // Authoritative control-plane evidence (online transition, endpoint
-        // or identity/incarnation change) re-opens recovery for a quarantined
-        // peer.  A plain refresh with unchanged evidence does not unquarantine
-        // a peer whose relay 404 is still authoritative.  The re-open is
+        // Authoritative recovery re-open for a quarantined peer is limited to
+        // identity/incarnation change (public-key rotation) and new
+        // registrations.  Endpoint churn on a stale incarnation is NOT
+        // authoritative: the NAT endpoint moves every heartbeat while the
+        // relay registration stays absent, and unquarantining on it would
+        // restart the whole punch / relay-404 / re-quarantine storm on every
+        // poll.  Authenticated inbound evidence (a live encrypted punch from
+        // the peer) is handled by `learn_authenticated_endpoint`, and a
+        // PeerLeft removes the quarantine in `remove_peer`.  The re-open is
         // deferred until the connection map guard is released to avoid
         // re-locking it inside `unquarantine_peer`.
-        if !is_new
-            && endpoint_changed
-            && info.online
-            && self.peer_quarantined_sync(&info.node_id)
-        {
-            unquarantine_after_lock = Some("authoritative endpoint/online update");
-        } else if identity_changed && info.online && self.peer_quarantined_sync(&info.node_id) {
+        if identity_changed && info.online && self.peer_quarantined_sync(&info.node_id) {
             unquarantine_after_lock = Some("identity/incarnation change");
         }
 
@@ -262,6 +262,11 @@ impl PeerManager {
         drop(conns);
         self.cancel_relay_backoff_heartbeat(node_id);
         self.clear_relay_not_found_grace(node_id).await;
+        // A PeerLeft is authoritative evidence that the peer's incarnation is
+        // gone: drop any relay-404 quarantine so a later rejoin (a NEW node
+        // ID / registration) starts clean instead of inheriting the dead
+        // incarnation's isolation.
+        self.quarantined_peers.lock().await.remove(node_id);
         self.direct_peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

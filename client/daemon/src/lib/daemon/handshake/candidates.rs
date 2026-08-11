@@ -338,9 +338,14 @@ impl Daemon {
                 include_host_candidate,
             )
         }) {
-            if !candidates.contains(&endpoint) {
-                candidates.insert(0, endpoint.clone());
+            // The advertised endpoint is the peer's PRIMARY punch target and
+            // must be FIRST in the signaled order; the public mapping is
+            // already present from gathering, so move it to the front (see
+            // the same fix in `udp_direct` / `candidate_refresh`).
+            if let Some(index) = candidates.iter().position(|c| c == &endpoint) {
+                candidates.remove(index);
             }
+            candidates.insert(0, endpoint.clone());
             candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
                 if self
                     .config

@@ -435,15 +435,27 @@ const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::from_millis(6);
 const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::ZERO;
 /// Hard bound on primary connectivity-check datagrams emitted by one punch
 /// session. Retransmissions are reserved for nomination and consent checks.
-const MAX_PUNCH_PROBES_PER_SESSION: u32 = 512;
+///
+/// v0.1.116 lowered this from 512 to 192: field evidence (Mini real log) shows
+/// a 96-candidate wide window was emitted as 512 physical datagrams with 416
+/// repeated target ports across attempt rounds, and the repeat rounds never
+/// hit a destination-dependent CGNAT mapping that had moved to a completely
+/// different port range.  One CONTROLLED coverage of a 64-candidate window
+/// from a 3-socket pool is 192 datagrams (zero repeats) and matches the
+/// successful cold-start profile (a 32-candidate scan converged in ~0.5 s with
+/// 64 datagrams).  The wide scatter stages are bounded by the same 192 ceiling
+/// (`RECOVERY_STAGE_*_MAX_PROBES`) so a planned window always fits one session.
+const MAX_PUNCH_PROBES_PER_SESSION: u32 = 192;
 /// Hard bound for the easy-side remote-port scatter sweep.
 ///
 /// When the peer has an address/port-dependent mapping, the stable side must
 /// cover a much wider peer-port window while the hard-NAT side keeps one
 /// destination-specific binding warm.  The one-second outbound budgets still
 /// pace this over time; this cap only prevents the session from stopping after
-/// the first few hundred ports.
-const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 3_072;
+/// the first few hundred ports.  Lowered 4x in v0.1.116 (3072 -> 768): the
+/// easy-side scatter is one controlled per-session sweep, not an open-ended
+/// burst, and the ACK-feedback stage machine widens the window across sessions.
+const MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION: u32 = 768;
 /// A punch session stops after this many consecutive budget rejections
 /// without a single send: the whole candidate window is being refused by the
 /// admission layer, so continuing to enumerate it only burns CPU and log

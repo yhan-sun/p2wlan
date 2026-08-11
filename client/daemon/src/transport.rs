@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use p2pnet_tun::{Ipv4Packet, Protocol};
 use p2pnet_wireguard::{MessageTransport, TransportSession};
 use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
@@ -1872,6 +1872,14 @@ impl WireGuardTransport {
                         ),
                     )
                     .await;
+                info!(
+                    event = "direct_validation_request_received",
+                    peer_id = %peer_id,
+                    remote_endpoint = %source,
+                    request_id = token.request_id,
+                    "received authenticated encrypted validation request request_id={}",
+                    token.request_id
+                );
                 udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
                     peer_id: peer_id.to_string(),
                     observed_endpoint: source,
@@ -1936,6 +1944,15 @@ impl WireGuardTransport {
                                 ),
                             )
                             .await;
+                        info!(
+                            event = "direct_validation_ack_sent",
+                            peer_id = %peer_id,
+                            remote_endpoint = %source,
+                            request_id = token.request_id,
+                            "sent encrypted validation ACK request_id={} seq={}",
+                            token.request_id,
+                            token.sequence
+                        );
                         debug!(
                             "Answered direct-validation request from peer {peer_id_owned} at {source} with an ACK"
                         );
@@ -2109,6 +2126,15 @@ impl WireGuardTransport {
                         ),
                     )
                     .await;
+                info!(
+                    event = "direct_validation_ack_received",
+                    peer_id = %peer_id,
+                    remote_endpoint = %source,
+                    request_id = token.request_id,
+                    generation = expectation.generation,
+                    "consumed encrypted validation ACK request_id={}",
+                    token.request_id
+                );
 
                 // Do not re-read the generation here.  The consumed
                 // expectation is the proof that this exact generation and
@@ -2191,6 +2217,15 @@ impl WireGuardTransport {
                         ),
                     )
                     .await;
+                info!(
+                    event = "direct_validation_promoted",
+                    peer_id = %peer_id,
+                    remote_endpoint = %source,
+                    request_id = token.request_id,
+                    generation = expectation.generation,
+                    "promoted after owned request/ACK request_id={}",
+                    token.request_id
+                );
                 peers
                     .record_direct_validation_event_with_metadata(
                         peer_id,

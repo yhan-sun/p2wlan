@@ -341,6 +341,18 @@ async fn run_direct_probe_loop(
                         RELAY_BACKOFF_HEARTBEAT_INTERVAL,
                     )
                     .await;
+                    // A wide remote-scatter sweep is one CONTROLLED window
+                    // coverage (see the synchronized punch for the field
+                    // evidence): a prediction / scatter window must never be
+                    // repeated through `attempts` rounds — one complete
+                    // coverage per stage, then the feedback machine widens or
+                    // rotates the window.  Repeated rounds only multiply
+                    // physical datagrams on ports that already missed.
+                    let effective_attempts = if remote_scatter_pool || stable_remote_scatter {
+                        1
+                    } else {
+                        attempts
+                    };
                     let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                         && udp.has_dynamic_socket_for_peer(&peer_id).await
                     {
@@ -348,7 +360,7 @@ async fn run_direct_probe_loop(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
-                            attempts,
+                            effective_attempts,
                         )
                         .await
                     } else if stable_remote_scatter {
@@ -356,7 +368,7 @@ async fn run_direct_probe_loop(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
-                            attempts,
+                            effective_attempts,
                         )
                         .await
                     } else if remote_scatter_pool {
@@ -364,7 +376,7 @@ async fn run_direct_probe_loop(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
-                            attempts,
+                            effective_attempts,
                         )
                         .await
                     } else {
@@ -372,7 +384,7 @@ async fn run_direct_probe_loop(
                             &peer_id,
                             candidates.clone(),
                             probe_interval,
-                            attempts,
+                            effective_attempts,
                         )
                         .await
                     };

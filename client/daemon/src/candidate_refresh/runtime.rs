@@ -203,9 +203,17 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             )
         });
         if let Some(endpoint) = advertised_endpoint.as_ref() {
-            if !candidates.contains(endpoint) {
-                candidates.insert(0, endpoint.clone());
+            // The advertised endpoint is the peer's PRIMARY punch target and
+            // must be FIRST in the signaled order (the receiver preserves
+            // signal order as its probe priority).  A private host candidate
+            // first made the peer punch an unreachable private address
+            // (field evidence: v0.1.116 acceptance rounds timed out at
+            // ~102 s); moving the public mapping to the front unconditionally
+            // (it is already present from gathering) fixes the priority.
+            if let Some(index) = candidates.iter().position(|candidate| candidate == endpoint) {
+                candidates.remove(index);
             }
+            candidates.insert(0, endpoint.clone());
             candidate_sources
                 .entry(endpoint.clone())
                 .or_insert_with(|| {

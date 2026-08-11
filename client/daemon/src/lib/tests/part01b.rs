@@ -40,6 +40,31 @@ fn advertised_udp_endpoint_omits_specific_bind_when_host_candidates_are_disabled
 }
 
 #[test]
+fn advertised_udp_endpoint_prefers_public_candidate_over_private_host() {
+    // Field evidence (v0.1.116 acceptance): advertising the private host
+    // endpoint first made the peer punch the unreachable private address and
+    // cold-start rounds timed out at ~102 s.  A public reflexive mapping must
+    // win over the private host address even when host candidates are
+    // enabled.
+    let local: SocketAddr = "192.168.0.239:60482".parse().unwrap();
+    let candidates = vec![
+        "192.168.0.239:60482".to_string(),
+        "220.165.178.32:7361".to_string(),
+    ];
+    assert_eq!(
+        advertised_udp_endpoint(local, None, &candidates, true),
+        Some("220.165.178.32:7361".to_string()),
+        "the public reflexive mapping must be the advertised endpoint"
+    );
+    // Without any public candidate, the private host address remains the
+    // fallback (LAN-only deployments).
+    assert_eq!(
+        advertised_udp_endpoint(local, None, &["192.168.0.239:60482".to_string()], true),
+        Some("192.168.0.239:60482".to_string())
+    );
+}
+
+#[test]
 fn control_endpoint_prefers_explicit_mapping_over_stun_candidate() {
     let candidates = vec!["8.8.8.8:41000".to_string(), "1.1.1.1:60207".to_string()];
     let sources = HashMap::from([

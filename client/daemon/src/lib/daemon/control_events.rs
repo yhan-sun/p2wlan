@@ -1150,16 +1150,23 @@ impl Daemon {
                         }
                     } else if update.endpoint_changed {
                         // The peer moved to a different public endpoint:
-                        // fresh generations aimed at the old endpoint must be
-                        // invalidated so no old task keeps committing toward
-                        // it.  The old dynamic socket itself keeps working as
-                        // the peer's current mapping until a new generation
-                        // commits or peer-level cleanup runs (the state
-                        // machine preserves it on failure).
+                        // in-flight punch work aimed at the old endpoint must
+                        // be cancelled so no stale task keeps sending toward
+                        // it.  The LOCAL fresh-mapping model is deliberately
+                        // KEPT: it predicts THIS side's own NAT port sequence
+                        // (measured against the STUN observers), which is
+                        // independent of the peer's endpoint.  Field evidence
+                        // (v0.1.116 acceptance): the Air side's fresh
+                        // generation was invalidated by the Mini's signaled
+                        // endpoint churn (`fresh_mapping_invalidated
+                        // reason=endpoint_changed`), aborting its 96-port
+                        // prediction punch after 8 probes and leaving only a
+                        // slow single-candidate retry — a cold-start round
+                        // that then timed out at 102 s.  The old dynamic
+                        // socket itself keeps working as the peer's current
+                        // mapping until a new generation commits or
+                        // peer-level cleanup runs.
                         self.punch_attempts.cancel(&peer_info.node_id);
-                        self.peers
-                            .clear_fresh_mapping(&peer_info.node_id, "endpoint_changed")
-                            .await;
                         if let Some(udp) = self.udp_transport.read().await.clone() {
                             udp.clear_pending_probes_for_peer(&peer_info.node_id)
                                 .await;

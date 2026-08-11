@@ -762,11 +762,52 @@ async fn spawn_hole_punch_task(
         // ordinary refresh may update the shared set, but it must never change
         // the target of a running fresh session.
         //
+        // The frozen prediction window NEVER replaces the ordinary candidate
+        // set: it is UNIONED with it.  Field evidence (v0.1.115 Mini log): a
+        // destination-dependent CGNAT peer (Air) advertised a 96-port
+        // prediction window that its actual peer-facing mapping (port 6609)
+        // was NOT inside, while the ordinary candidate set carried the peer's
+        // STUN-observed endpoint (6467).  Because the frozen window replaced
+        // the ordinary set, all four 512-probe sessions (2048 datagrams)
+        // scanned the wrong window and the only working signal was the
+        // peer-reflexive observation.  Merging keeps the trusted ordinary
+        // candidates FIRST (they carry real authenticated evidence) and
+        // appends the prediction window after them.
+        //
         // The newest-wins pending target (stashed by a trigger that was
         // suppressed while another session ran) wins over a freshly computed
         // target: new candidates update the plan's target without ever
         // resetting its budgets or starting a parallel session.
         let pending_target = peers.take_recovery_target(&peer_id).await;
+        let merge_frozen = |ordinary: Option<DirectProbeTargetSet>,
+                            frozen: Option<Vec<SocketAddr>>,
+                            recovery_epoch: u64|
+         -> Option<DirectProbeTargetSet> {
+            let mut frozen = frozen.unwrap_or_default();
+            match ordinary {
+                Some(mut ordinary) => {
+                    for endpoint in frozen.drain(..) {
+                        if !ordinary.candidates.contains(&endpoint) {
+                            ordinary.candidates.push(endpoint);
+                        }
+                    }
+                    Some(ordinary)
+                }
+                None if !frozen.is_empty() => Some(DirectProbeTargetSet {
+                    peer_id: peer_id.clone(),
+                    candidates: frozen,
+                    remote_scatter_pool: false,
+                    stable_remote_scatter: false,
+                    birthday_plan: None,
+                    recovery_epoch,
+                }),
+                None => None,
+            }
+        };
+        // Snapshot before the match consumes the option: the owned punch
+        // block below still needs to know whether this session is a frozen
+        // prediction window (it decides the attempt policy).
+        let is_frozen_prediction_window = frozen_targets.is_some();
         let target = match pending_target {
             Some(pending) => {
                 if let Some(punch_at) = pending.punch_at_ms {
@@ -776,25 +817,24 @@ async fn spawn_hole_punch_task(
                         pending.candidates.len()
                     );
                 }
-                let candidates = pending.frozen_targets.or(Some(pending.candidates));
-                Some(DirectProbeTargetSet {
-                    peer_id: peer_id.clone(),
-                    candidates: candidates.unwrap_or_default(),
-                    remote_scatter_pool: false,
-                    stable_remote_scatter: false,
-                    birthday_plan: None,
-                    recovery_epoch: epoch,
-                })
+                let has_frozen = pending.frozen_targets.is_some();
+                let frozen = if has_frozen {
+                    pending.frozen_targets
+                } else {
+                    Some(pending.candidates)
+                };
+                let ordinary = if has_frozen {
+                    peers.direct_probe_target_set_for(&peer_id).await
+                } else {
+                    None
+                };
+                merge_frozen(ordinary, frozen, epoch)
             }
             None => match frozen_targets {
-                Some(frozen) => Some(DirectProbeTargetSet {
-                    peer_id: peer_id.clone(),
-                    candidates: frozen,
-                    remote_scatter_pool: false,
-                    stable_remote_scatter: false,
-                    birthday_plan: None,
-                    recovery_epoch: epoch,
-                }),
+                Some(frozen) => {
+                    let ordinary = peers.direct_probe_target_set_for(&peer_id).await;
+                    merge_frozen(ordinary, Some(frozen), epoch)
+                }
                 None => peers.direct_probe_target_set_for(&peer_id).await,
             },
         };
@@ -975,6 +1015,26 @@ async fn spawn_hole_punch_task(
                     ),
                 )
                 .await;
+            // A prediction window / wide scatter sweep is one CONTROLLED
+            // window coverage: every candidate is sent once from every active
+            // socket, then the window either matched (ACK / Direct) or the
+            // feedback-driven stage machine advances to a DIFFERENT window.
+            // Repeating the same window through `attempts` rounds only
+            // multiplies physical datagrams on ports that already missed
+            // (field evidence: a 96-port fresh prediction window was sent as
+            // 512 datagrams with 416 repeated target ports, and the repeat
+            // rounds never hit a destination-dependent CGNAT mapping that
+            // moved to a completely different port range).  The ACK feedback
+            // window after the sweep provides the retry semantics.
+            let effective_attempts = if fresh_prediction.is_some()
+                || is_frozen_prediction_window
+                || remote_scatter_pool
+                || stable_remote_scatter
+            {
+                1
+            } else {
+                attempts
+            };
             let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
                 && udp.has_dynamic_socket_for_peer(&peer_id).await
             {
@@ -982,7 +1042,7 @@ async fn spawn_hole_punch_task(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
-                    attempts,
+                    effective_attempts,
                 )
                 .await
             } else if stable_remote_scatter {
@@ -990,7 +1050,7 @@ async fn spawn_hole_punch_task(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
-                    attempts,
+                    effective_attempts,
                 )
                 .await
             } else if remote_scatter_pool {
@@ -998,7 +1058,7 @@ async fn spawn_hole_punch_task(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
-                    attempts,
+                    effective_attempts,
                 )
                 .await
             } else {
@@ -1006,7 +1066,7 @@ async fn spawn_hole_punch_task(
                     &peer_id,
                     candidates.clone(),
                     probe_interval,
-                    attempts,
+                    effective_attempts,
                 )
                 .await
             };

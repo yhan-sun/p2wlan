@@ -111,7 +111,11 @@ impl PeerManager {
             &history,
             local_nat_profile.as_ref(),
             ProbeTargetMode::Synchronized,
-            recovery_target_cap(recovery_stage, relay_safety_net),
+            recovery_target_cap(
+                recovery_stage,
+                relay_safety_net,
+                self.config.network.socket_pool_size,
+            ),
         );
         if !endpoints.is_empty() {
             conn.record_direct_event(
@@ -145,6 +149,7 @@ impl PeerManager {
                     &mut remote_scatter_pool,
                     stage,
                     relay_safety_net,
+                    self.config.network.socket_pool_size,
                 );
             }
             Some(DirectProbeTargetSet {
@@ -579,7 +584,11 @@ impl PeerManager {
                 } else {
                     ProbeTargetMode::Background
                 },
-                recovery_target_cap(Some(stage), relay_safety_net),
+                recovery_target_cap(
+                    Some(stage),
+                    relay_safety_net,
+                    self.config.network.socket_pool_size,
+                ),
             );
             if endpoints.is_empty() {
                 continue;
@@ -613,6 +622,7 @@ impl PeerManager {
                 &mut remote_scatter_pool,
                 stage,
                 relay_safety_net,
+                self.config.network.socket_pool_size,
             );
             sets.push(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
@@ -769,9 +779,20 @@ impl PeerManager {
 /// window so the plan never persists candidates beyond the stage's real scan:
 /// `cap_targets_by_recovery_stage` below remains as the post-selection safety
 /// net with identical numbers.
+///
+/// The stage ceiling counts PHYSICAL kernel datagrams, while a punch session
+/// sends every planned candidate from every active local socket (the wide
+/// window's whole purpose is multi-socket coverage of a moving remote-port
+/// window).  The plan is therefore sized to the number of candidates that one
+/// session can cover COMPLETELY: `ceiling / socket_count`.  Field evidence
+/// (v0.1.115 Mini log): a 384-candidate ScatterSmall plan was truncated at
+/// 171 unique endpoints by the 512-datagram session cap (512/3 sockets), so
+/// the remaining window was never scanned, the birthday cursor could not
+/// advance, and the next session re-scanned the same 171 ports.
 fn recovery_target_cap(
     stage: Option<RecoveryStage>,
     relay_safety_net: bool,
+    socket_count: usize,
 ) -> Option<usize> {
     let stage = stage?;
     let max_probes = if relay_safety_net && stage >= RecoveryStage::ScatterExtended {
@@ -779,7 +800,8 @@ fn recovery_target_cap(
     } else {
         stage.max_probes()
     };
-    Some(max_probes as usize)
+    let sockets = socket_count.max(1) as u32;
+    Some((max_probes / sockets).max(1) as usize)
 }
 
 /// Bound a target set by the recovery stage machine.
@@ -803,6 +825,7 @@ fn cap_targets_by_recovery_stage(
     remote_scatter_pool: &mut bool,
     stage: RecoveryStage,
     relay_safety_net: bool,
+    socket_count: usize,
 ) {
     if stage < RecoveryStage::ScatterExtended {
         *birthday_plan = None;
@@ -828,8 +851,13 @@ fn cap_targets_by_recovery_stage(
         RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES
     } else {
         stage.max_probes()
-    } as usize;
-    if endpoints.len() > max_probes {
-        endpoints.truncate(max_probes);
+    };
+    // Same physical-datagram semantics as `recovery_target_cap`: the ceiling
+    // is per-datagram, every candidate is sent from every socket, so the
+    // truncation boundary is `ceiling / socket_count` candidates — anything
+    // wider would be cut mid-window by the session cap.
+    let max_candidates = (max_probes / socket_count.max(1) as u32).max(1) as usize;
+    if endpoints.len() > max_candidates {
+        endpoints.truncate(max_candidates);
     }
 }

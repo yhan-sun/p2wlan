@@ -608,22 +608,25 @@ pub(super) const RELAY_BACKOFF_HEARTBEAT_PER_PEER_PER_WINDOW: usize = 24;
 pub(super) const RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW: usize = 120;
 
 pub(super) const OUTBOUND_PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 1024;
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 512;
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_NETWORK: usize = 512;
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 256;
 // Symmetric NAT traversal often needs to sweep a short predicted port window
-// against one public IP from multiple local sockets. Keep this bounded, but
-// wide enough that a 96-port predicted/birthday window can be tried from a
-// four-socket pool during one synchronized punch.
-pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 384;
+// against one public IP from multiple local sockets.  v0.1.116 bounded this to
+// below the peer budget (256) so the remote-IP limit is the more granular
+// binding constraint, while leaving the easy-side stable unique scatter (200
+// distinct ports in its coverage test) and one 192-datagram ActivePool session
+// room — all well under the 512 ceiling the task requires the per-session
+// volume to stay below.
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 224;
 
 /// Persistent budgets span retries: they are only pruned every
 /// `OUTBOUND_PROBE_PERSISTENT_WINDOW`, so repeated punch sessions share one
 /// long-term allowance instead of each refilling its own 1-second window.
 pub(super) const OUTBOUND_PROBE_PERSISTENT_WINDOW: Duration = Duration::from_secs(60);
-pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_NETWORK: usize = 12_000;
-pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER: usize = 6_000;
-pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_REMOTE_IP: usize = 4_500;
-pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET: usize = 3_000;
+pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_NETWORK: usize = 6_000;
+pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER: usize = 3_000;
+pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_REMOTE_IP: usize = 2_250;
+pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET: usize = 1_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutboundProbeAdmission {

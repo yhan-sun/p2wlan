@@ -50,6 +50,13 @@ impl PeerManager {
         // waiting out the 30-minute epoch.  The re-open is capped per epoch.
         self.recovery_reopen_on_evidence(node_id, "authenticated_punch")
             .await;
+        // The same evidence proves the relay-404 quarantine was wrong (or the
+        // peer re-registered): a live authenticated datagram from the peer is
+        // the strongest possible recovery signal, strictly stronger than any
+        // control-plane heartbeat.  Unquarantine so the learned endpoint can
+        // actually be probed instead of being frozen out of the target set.
+        self.unquarantine_peer(node_id, "authenticated inbound punch observed")
+            .await;
         true
     }
 

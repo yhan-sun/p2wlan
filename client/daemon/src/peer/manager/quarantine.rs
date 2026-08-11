@@ -32,12 +32,14 @@
 pub(crate) const RELAY_PEER_NOT_FOUND_GRACE: Duration = Duration::from_secs(15);
 
 /// Identity/evidence snapshot captured at the first transient relay 404.
+///
+/// Only the public key is kept as evidence: `last_seen` growth and NAT
+/// endpoint churn belong to the SAME stale incarnation and must not restart
+/// the registration-grace window (v0.1.116 authority boundary).
 #[derive(Debug, Clone)]
 pub(crate) struct RelayNotFoundGraceState {
     pub started_at: Instant,
-    pub last_seen: u64,
     pub public_key: String,
-    pub endpoint: Option<SocketAddr>,
     /// Keep the grace event itself one-per-window.  Relay diagnostics perform
     /// an additional error-level deduplication, but peer timeline events must
     /// also stay bounded when the relay sends repeated 404 frames.

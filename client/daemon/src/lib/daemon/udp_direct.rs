@@ -280,9 +280,21 @@ async fn run_udp_direct_instance(
                         &candidate_endpoints,
                         peers.gather_host_candidates().await,
                     ) {
-                        if !candidate_endpoints.contains(&endpoint) {
-                            candidate_endpoints.insert(0, endpoint.clone());
+                        // The advertised endpoint is the peer's PRIMARY punch
+                        // target and must be FIRST in the signaled order (the
+                        // receiver preserves signal order as its probe
+                        // priority).  The public mapping is already present
+                        // from gathering, so move it to the front instead of
+                        // only inserting when absent (field evidence:
+                        // v0.1.116 acceptance rounds where the private host
+                        // endpoint stayed first timed out at ~102 s because
+                        // the peer punched the unreachable private address).
+                        if let Some(index) =
+                            candidate_endpoints.iter().position(|c| c == &endpoint)
+                        {
+                            candidate_endpoints.remove(index);
                         }
+                        candidate_endpoints.insert(0, endpoint.clone());
                         candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
                             if udp_advertise.as_deref().is_some_and(|configured| {
                                 !configured.trim().is_empty() && configured.trim() == endpoint

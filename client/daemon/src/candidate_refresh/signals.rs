@@ -11,21 +11,29 @@ pub(super) fn advertised_udp_endpoint(
         return Some(endpoint.to_string());
     }
 
-    if include_host_candidate && !local_addr.ip().is_unspecified() {
-        return Some(local_addr.to_string());
-    }
-
+    // A public reflexive / port-mapped candidate is the peer's best primary
+    // target: it is reachable through both NATs, while a private host
+    // candidate is not.  Field evidence (v0.1.116 acceptance): advertising
+    // the private host endpoint FIRST made the Air side punch the
+    // unreachable private address (192.168.0.239:...) and two of ten cold
+    // start rounds timed out at ~102 s; the rounds where the public mapping
+    // won the ordering converged in ~3-6 s.
     candidates
         .iter()
         .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
         .find(|candidate| is_public_udp_candidate(*candidate))
+        .map(|candidate| candidate.to_string())
         .or_else(|| {
             candidates
                 .iter()
                 .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
                 .find(|candidate| !candidate.ip().is_unspecified() && !candidate.ip().is_loopback())
+                .map(|candidate| candidate.to_string())
         })
-        .map(|candidate| candidate.to_string())
+        .or_else(|| {
+            (include_host_candidate && !local_addr.ip().is_unspecified())
+                .then(|| local_addr.to_string())
+        })
 }
 
 pub(super) fn control_udp_endpoint_from_candidates(

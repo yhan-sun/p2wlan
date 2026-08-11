@@ -154,6 +154,16 @@ impl PeerManager {
     /// rather than the relay's frame count.
     async fn handle_relay_peer_not_found(&self, node_id: &str, reason: &str) -> bool {
         let now = Instant::now();
+        // A peer already under an ACTIVE relay-404 quarantine is already
+        // isolated and its episode is deduplicated.  Every later 404 for the
+        // same episode is absorbed here: no peer-health failure sample, no
+        // state transition, no repeated WARN log (the relay can keep sending
+        // 404 frames every few seconds while the stale peer's registration
+        // stays absent).  Only after the quarantine expires does the next 404
+        // re-enter the grace/quarantine machinery.
+        if self.peer_quarantined_sync(node_id) {
+            return false;
+        }
         let Some(connection) = self.get_connection(node_id).await else {
             // A missing connection is already authoritative offline evidence;
             // retain the existing anti-storm isolation behavior.
@@ -169,24 +179,28 @@ impl PeerManager {
         let mut grace_remaining = RELAY_PEER_NOT_FOUND_GRACE;
         let should_quarantine = {
             let mut grace = self.relay_not_found_grace.lock().await;
-            let evidence_changed = grace.get(node_id).is_some_and(|state| {
-                state.last_seen != connection.last_seen
-                    || state.public_key != connection.public_key
-                    || state.endpoint != connection.signaled_endpoint
-            });
-            if evidence_changed {
-                // A newer online incarnation/endpoint supersedes the old
-                // 404 observation.  Start a fresh handoff grace window for
-                // this evidence rather than destroying the new recovery.
+            // Only an IDENTITY change (public-key rotation / reinstall) is a
+            // newer incarnation that supersedes the pending 404 observation.
+            // `last_seen` growth and ordinary NAT endpoint churn belong to
+            // the SAME stale incarnation (field evidence: every control poll
+            // advanced last_seen and moved the endpoint while the relay
+            // registration stayed absent) — restarting the grace window on
+            // them would keep the peer in perpetual "transient 404" limbo
+            // and re-quarantine storms alive forever.
+            let identity_changed = grace
+                .get(node_id)
+                .is_some_and(|state| state.public_key != connection.public_key);
+            if identity_changed {
+                // A newer incarnation supersedes the old 404 observation.
+                // Start a fresh handoff grace window for this evidence
+                // rather than destroying the new recovery.
                 grace.remove(node_id);
             }
             let state = grace
                 .entry(node_id.to_string())
                 .or_insert_with(|| RelayNotFoundGraceState {
                     started_at: now,
-                    last_seen: connection.last_seen,
                     public_key: connection.public_key.clone(),
-                    endpoint: connection.signaled_endpoint,
                     event_recorded: false,
                 });
             let elapsed = now.saturating_duration_since(state.started_at);

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import '../api/diagnostics_api.dart';
@@ -144,8 +145,23 @@ class DaemonController {
     }
 
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
-    final ready = await _waitForHealth(settings.diagnosticsUrl, timeout);
+    final ready = await _waitForHealth(
+      settings.diagnosticsUrl,
+      timeout,
+      logPath,
+    );
     if (!ready) {
+      // A daemon that exited right after an elevated launch usually failed
+      // for a definitive, actionable reason.  Detect a permanent control
+      // auth failure (expired token / revoked credential) from the log tail
+      // and surface it immediately instead of a generic "TUN failed" wait.
+      if (await _logShowsPermanentAuthFailure(logPath)) {
+        return DaemonCommandResult(
+          ok: false,
+          message: '登录已过期，请重新登录。后台 p2wlan-daemon 因认证失败退出，启动过程未创建虚拟网卡。',
+          manualCommand: manualCommand,
+        );
+      }
       return DaemonCommandResult(
         ok: false,
         message:

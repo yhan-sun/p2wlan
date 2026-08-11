@@ -243,14 +243,35 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
     let fresh = manager.fresh_mapping_for_peer("peer-stale").await;
     assert!(fresh.is_none(), "quarantine must invalidate fresh mappings");
 
-    // Authoritative control-plane evidence (new endpoint + online) re-opens
-    // recovery; plain refresh without evidence does not.
+    // Ordinary control-plane churn (new endpoint on the SAME incarnation,
+    // advancing last_seen) is NOT authoritative recovery evidence: the
+    // v0.1.115 field logs showed endpoint churn on every poll un-quarantining
+    // the stale peer and restarting the punch / 404 / re-quarantine storm.
+    // Only identity change, a new registration, PeerLeft or authenticated
+    // inbound evidence re-opens recovery.
     let mut refresh = flood_peer_113("peer-stale", "10.20.0.4", "6.7.8.9:5001".parse().unwrap());
     refresh.endpoint = "6.7.8.9:5002".to_string();
+    refresh.last_seen = refresh.last_seen.saturating_add(1);
     manager.add_peer(&refresh).await;
     assert!(
+        manager.peer_quarantined("peer-stale").await,
+        "endpoint churn must NOT unquarantine a relay-404 peer"
+    );
+    // And the churn must not start a new punch session either: the stale
+    // target set stays frozen.
+    assert!(
+        manager.direct_probe_targets_for("peer-stale").await.is_empty(),
+        "endpoint churn must not re-open synchronized punching for a quarantined peer"
+    );
+
+    // Identity change (public-key rotation) is authoritative: recovery is
+    // re-opened.
+    let mut rotated = flood_peer_113("peer-stale", "10.20.0.4", "6.7.8.9:5002".parse().unwrap());
+    rotated.public_key = "rotated-new-key".to_string();
+    manager.add_peer(&rotated).await;
+    assert!(
         !manager.peer_quarantined("peer-stale").await,
-        "a new authoritative endpoint must unquarantine the peer"
+        "an identity/incarnation change must unquarantine the peer"
     );
 }
 
@@ -309,9 +330,10 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
         "a transient 404 burst must remain one peer-health failure sample"
     );
 
-    // A newer control sample represents fresh online evidence and starts a
-    // new grace window rather than converting an old relay error into a
-    // quarantine for the still-online peer.
+    // last_seen growth on the SAME incarnation is NOT fresh registration
+    // evidence (v0.1.116 authority boundary): the still-open grace window
+    // covers the new heartbeat and the 404 stays deduplicated instead of
+    // starting a fresh window per control poll.
     peer.last_seen = 11;
     manager.add_peer(&peer).await;
     manager
@@ -326,8 +348,8 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
         .unwrap();
     assert_eq!(
         peer_diagnostics.relay.failure_count,
-        2,
-        "fresh control evidence begins a new transient 404 window rather than hiding it forever"
+        1,
+        "last_seen growth must not open a new 404 window for the same incarnation"
     );
 }
 
