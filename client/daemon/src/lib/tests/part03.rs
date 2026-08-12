@@ -2338,6 +2338,111 @@ async fn test_network_outbound_direct_commit_flushes_waiting_first_packet_immedi
 }
 
 #[tokio::test]
+async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() {
+    // The first business packet parks with a SHORT startup deadline.  The relay
+    // path is confirmed just before that deadline expires: the confirmation
+    // must win — the queued packet is flushed over the relay, never dropped by
+    // a deadline-expiry that raced the confirmation.
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let (encrypted_tx, encrypted_rx) = mpsc::channel(8);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        encrypted_rx,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(150)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    let payload = vec![7, 8, 9];
+    encrypted_tx
+        .send(
+            OrderedEncryptedPeerPacket::for_test(EncryptedPeerPacket {
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                wire_bytes: payload.clone(),
+            })
+            .await,
+        )
+        .await
+        .unwrap();
+
+    // Let the packet park (its 150ms deadline is still running), then confirm
+    // the relay path just before the deadline.  The confirmation must flush the
+    // waiting packet over the relay instead of the expiry dropping it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(peers
+        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
+        .await);
+
+    let mut saw_data = false;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), rx_b.recv()).await {
+            Ok(Some(RelayMessage::Data { .. })) => {
+                saw_data = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(saw_data, "the waiting first packet must ride the relay after confirmation");
+
+    // The confirmation must not be defeated by a racing startup-wait expiry.
+    let snapshot = timeline.snapshot();
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| event.event == "relay_unavailable_or_first_packet_expired"
+                && event.reason_code.as_deref() == Some("relay_startup_wait_expired")),
+        "a confirmed relay path must never be dropped by relay_startup_wait_expired"
+    );
+
+    worker.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     // RelayPeerConfirmed must NEVER be set by a local connect / queue accept:
     // only a MATCHING forced-relay probe ACK (matching request id + generation

@@ -201,6 +201,13 @@ func (s *RelayServer) Close() error {
 		}
 		s.mu.Unlock()
 
+		s.mu.Lock()
+		if s.metricsHTTP != nil {
+			_ = s.metricsHTTP.Close()
+			s.metricsHTTP = nil
+		}
+		s.mu.Unlock()
+
 		s.wg.Wait()
 	})
 	return err

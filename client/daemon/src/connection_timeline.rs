@@ -77,6 +77,14 @@ impl ConnectionTimeline {
         &self.correlation_id
     }
 
+    /// Monotonic milliseconds since this daemon process started (the same
+    /// clock used for every event's `at_ms`).  Exposed at `/status` top level
+    /// so a single snapshot can be placed on the daemon's own timeline without
+    /// wall-clock reconciliation.
+    pub fn uptime_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
     /// Record and log one timeline event with the shared correlation id and the
     /// relative startup time (`t_ms`).
     #[allow(clippy::too_many_arguments)]

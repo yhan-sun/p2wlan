@@ -30,6 +30,14 @@ const RELAY_VALIDATION_MAX_RTT: Duration = Duration::from_secs(600);
 /// and per-peer so a not-ready peer cannot build unbounded memory pressure.
 const PENDING_OUTBOUND_TTL: Duration = Duration::from_secs(8);
 const MAX_PENDING_OUTBOUND_PER_PEER: usize = 256;
+/// Bound how long a synthetic control/probe packet (`encrypt_and_emit_outbound`)
+/// may wait for the peer's outbound emit lock.  A burst of user traffic holding
+/// the lock (encrypted_tx backpressure) must never block the relay probe /
+/// direct-validation control lane indefinitely: on timeout the attempt is
+/// skipped and the probe loop retries on its next tick.  The ordering lock is
+/// still respected — the control packet only skips a locked-out attempt, it
+/// never bypasses the counter ordering.
+const CONTROL_EMIT_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 /// Continue accepting packets encrypted with the prior receive key briefly
 /// after a successful rekey. The control-plane answer and UDP data plane are
 /// delivered independently, so either side can observe a few packets from the
@@ -424,17 +432,32 @@ pub struct EncryptedPeerPacket {
 /// WireGuard replay protection is counter based. Keeping this guard inside
 /// the egress queue prevents a later synthetic confirmation packet from being
 /// encrypted and sent ahead of an earlier user packet that is still queued.
+///
+/// The guard is held ONLY while the packet is being handed to the network
+/// worker (and sent immediately when the peer is usable).  When the worker
+/// parks the packet in the peer's pending queue (peer not yet usable — waiting
+/// for RelayPeerConfirmed / DirectConfirmed), the guard is released: a queued
+/// business packet must never hold the peer's emit lock and thereby block the
+/// relay probes / direct-validation control packets that are the ONLY thing
+/// that can make the peer usable.
 pub struct OrderedEncryptedPeerPacket {
     packet: EncryptedPeerPacket,
-    _send_order_guard: Arc<OwnedMutexGuard<()>>,
+    _send_order_guard: Option<Arc<OwnedMutexGuard<()>>>,
 }
 
 impl OrderedEncryptedPeerPacket {
     fn new(packet: EncryptedPeerPacket, send_order_guard: Arc<OwnedMutexGuard<()>>) -> Self {
         Self {
             packet,
-            _send_order_guard: send_order_guard,
+            _send_order_guard: Some(send_order_guard),
         }
+    }
+
+    /// Release the ordering guard (the peer is not usable yet and the packet
+    /// is parking in the bounded pending queue).  Must be called before the
+    /// packet is queued for a peer that is not yet confirmed usable.
+    pub(crate) fn release_send_order_guard(&mut self) {
+        self._send_order_guard = None;
     }
 
     #[cfg(test)]
@@ -975,6 +998,11 @@ impl WireGuardTransport {
     /// Encrypt and emit one packet while holding the peer's counter-ordering
     /// lock through the actual send. Synthetic confirmation packets use this
     /// path so a delayed low counter cannot fall behind a 64-packet burst.
+    ///
+    /// The lock wait is BOUNDED: if a burst of user traffic is holding the
+    /// per-peer emit lock (encrypted_tx backpressure) the attempt is skipped
+    /// and the caller's loop retries, so relay probes / direct-validation
+    /// control packets are never blocked behind user traffic indefinitely.
     pub async fn encrypt_and_emit_outbound<F, Fut>(
         &self,
         packet: OutboundPacket,
@@ -986,7 +1014,18 @@ impl WireGuardTransport {
     {
         let peer_id = packet.peer_id.clone();
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
-        let _emit_guard = emit_lock.lock().await;
+        let _emit_guard = match tokio::time::timeout(CONTROL_EMIT_LOCK_TIMEOUT, emit_lock.lock())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                debug!(
+                    peer_id = %peer_id,
+                    "control/probe packet for {peer_id} skipped: the outbound emit lock is held by busy user traffic; retrying on the next probe tick"
+                );
+                return Ok(false);
+            }
+        };
         let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
             return Ok(false);
         };

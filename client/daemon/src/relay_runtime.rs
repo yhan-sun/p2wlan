@@ -825,6 +825,20 @@ impl RelaySupervisor {
                         format!("relay {endpoint} transport failed: {error}"),
                     ),
                 };
+                self.timeline.emit(
+                    if ended.is_ok() {
+                        "relay_transport_closed"
+                    } else {
+                        "relay_transport_failed"
+                    },
+                    Some("relay"),
+                    if ended.is_ok() {
+                        Some("relay_transport_closed")
+                    } else {
+                        Some("relay_transport_failed")
+                    },
+                    Some(peer_failure_reason.clone()),
+                );
                 self.peers
                     .invalidate_relay_transport(&endpoint, peer_failure_code, peer_failure_reason)
                     .await;
@@ -1059,6 +1073,7 @@ pub(super) async fn run_relay_peer_probe_loop(
     transport: WireGuardTransport,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     local_virtual_ip: String,
+    timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
     mut kick_rx: watch::Receiver<u64>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -1174,6 +1189,14 @@ pub(super) async fn run_relay_peer_probe_loop(
                         generation = target_generation,
                         request_id = request_id,
                         "relay probe sent peer_id={peer_id} request_id={request_id}",
+                    );
+                    timeline.emit(
+                        "relay_probe_sent",
+                        Some("relay"),
+                        None,
+                        Some(format!(
+                            "peer={peer_id} relay_endpoint={relay_endpoint} generation={target_generation} request_id={request_id}"
+                        )),
                     );
                 }
                 Ok(false) => {

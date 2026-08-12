@@ -385,6 +385,15 @@ impl PeerManager {
                             endpoint,
                             duration_millis(latency)
                         );
+                        self.emit_timeline(
+                            "candidate_pair_probe_succeeded",
+                            Some("direct"),
+                            None,
+                            Some(format!(
+                                "peer={node_id} remote_endpoint={endpoint} rtt_ms={}",
+                                duration_millis(latency)
+                            )),
+                        );
                     }
                 }
                 None => conn.direct_health.record_success(),

@@ -205,7 +205,18 @@ use std::collections::HashMap;
             diagnostics.selected_error_count, 1,
             "one transient 404 window must not inflate selected relay errors"
         );
-        assert_eq!(diagnostics.last_error_code.as_deref(), Some("peer_not_found"));
+        // A per-peer 404 is deduplicated in its own slot and never overwrites
+        // the connection-level health label.
+        assert_eq!(
+            diagnostics.last_error_code.as_deref(),
+            None,
+            "a per-peer peer_not_found must not set the connection-level last_error_code"
+        );
+        assert_eq!(
+            diagnostics.last_peer_not_found.as_deref(),
+            Some("peer not found: node-b"),
+            "the per-peer 404 is recorded in its own dedup slot"
+        );
     }
 
     #[test]

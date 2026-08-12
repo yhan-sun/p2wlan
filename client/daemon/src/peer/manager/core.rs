@@ -40,6 +40,7 @@ impl PeerManager {
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             timeline: std::sync::Mutex::new(None),
+            outbound_drops: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -94,6 +95,25 @@ impl PeerManager {
             Some(timeline) => timeline.emit_first_scoped(&scope, event, path, reason_code, detail),
             None => false,
         }
+    }
+
+    /// Record dropped outbound business packets for a stable reason code so
+    /// `/status` can report queue/startup-wait loss structurally.
+    pub(crate) async fn record_outbound_drop(
+        &self,
+        reason_code: &str,
+        packets: usize,
+        bytes: usize,
+    ) {
+        let mut drops = self.outbound_drops.lock().await;
+        let entry = drops.entry(reason_code.to_string()).or_default();
+        entry.packets = entry.packets.saturating_add(packets as u64);
+        entry.bytes = entry.bytes.saturating_add(bytes as u64);
+    }
+
+    /// Snapshot of the process-wide outbound-drop counters by reason code.
+    pub async fn outbound_drop_stats(&self) -> HashMap<String, OutboundDropCounters> {
+        self.outbound_drops.lock().await.clone()
     }
 
     /// Update the latest local NAT profile used by adaptive probe scheduling.

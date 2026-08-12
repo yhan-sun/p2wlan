@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"github.com/golang-jwt/jwt/v5"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -26,6 +27,9 @@ type RelayConfig struct {
 	TLSCertChainPath           string
 	TLSPrivateKeyPath          string
 	AllowInsecurePlaintext     bool
+	// Read-only metrics HTTP endpoint (empty = disabled). Exposes only the
+	// aggregate counters from RelayStatsSnapshot, never tickets or tokens.
+	MetricsBind string
 	// A2: ticket verification
 	TicketKeyringJSON        string
 	RelayAudience            string
@@ -52,6 +56,9 @@ type RelayServer struct {
 	mu          sync.Mutex
 	closing     bool
 	connections map[net.Conn]struct{}
+
+	// Read-only metrics HTTP server (nil unless MetricsBind is configured).
+	metricsHTTP *http.Server
 
 	// A2: ticket verification
 	ticketKeyring map[string]ed25519.PublicKey

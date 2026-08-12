@@ -231,6 +231,7 @@ impl PeerManager {
             relay_connections: relay,
             total_bytes_sent,
             total_bytes_received,
+            outbound_drops: HashMap::new(),
         }
     }
 }

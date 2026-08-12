@@ -30,8 +30,16 @@ pub struct RelaySelectionDiagnostics {
     pub selected_pong_count: u64,
     pub selected_error_count: u64,
     pub candidates: Vec<RelayCandidateDiagnostics>,
+    /// Connection-level relay error (a per-peer `peer_not_found` is never
+    /// written here, so a healthy connection's health label cannot be
+    /// permanently replaced by one peer's 404).
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+    /// Most recent per-peer `peer_not_found` message, used to deduplicate
+    /// repeated 404 frames of one registration window without touching the
+    /// connection-level `last_error`/`last_error_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_peer_not_found: Option<String>,
 }
 
 impl RelaySelectionDiagnostics {

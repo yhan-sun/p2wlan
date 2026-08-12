@@ -23,6 +23,11 @@ func main() {
 	} else {
 		log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", server.Addr(), config.MaxConnections, config.MaxFramePayload)
 	}
+	if config.MetricsBind != "" {
+		if _, err := server.ServeMetrics(); err != nil {
+			log.Fatalf("metrics listener error: %v", err)
+		}
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

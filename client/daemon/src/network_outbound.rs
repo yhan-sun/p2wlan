@@ -307,12 +307,21 @@ async fn handle_ingress(
         entry.wait_generation.is_some() && entry.wait_generation != Some(generation)
     }) {
         drop_pending_queue(
+            peers,
             pending.remove(&peer_id),
             REASON_OUTBOUND_GENERATION_CHANGED,
             timeline,
-        );
+        )
+        .await;
     }
 
+    // Park the packet.  The peer is NOT usable yet (relay not confirmed,
+    // direct not confirmed): release the ordering guard BEFORE queuing so this
+    // packet can never hold the peer's emit lock while it waits for a path.
+    // The relay probe / direct-validation control packets that will make the
+    // peer usable must not be blocked by queued business traffic.
+    let mut packet = packet;
+    packet.release_send_order_guard();
     let entry = pending
         .entry(peer_id.clone())
         .or_insert_with(PeerPendingQueue::new);
@@ -325,10 +334,12 @@ async fn handle_ingress(
                 // not configured/expected.  Drop every parked packet with a
                 // stable reason code.
                 drop_pending_queue(
+                    peers,
                     pending.remove(&peer_id),
                     REASON_DIRECT_ONLY_NO_RELAY,
                     timeline,
-                );
+                )
+                .await;
                 debug!(
                     "Encrypted packet for peer {} dropped: direct-only config has no relay and direct is not confirmed",
                     peer_id
@@ -472,18 +483,33 @@ async fn maintenance(
     let generation = peers.current_network_generation().await;
 
     // 1. Startup-deadline expiry: every queued packet of a peer whose shared
-    //    deadline passed is dropped with the stable reason code.
-    let expired: Vec<String> = pending
-        .iter()
-        .filter(|(_, entry)| entry.wait_deadline.is_some_and(|deadline| now >= deadline))
-        .map(|(peer_id, _)| peer_id.clone())
-        .collect();
+    //    deadline passed is dropped with the stable reason code.  A peer that
+    //    JUST became usable (RelayPeerConfirmed or DirectConfirmed) in the same
+    //    tick is NOT dropped here: the confirmation races the deadline, and
+    //    flush_ready_peers below must deliver its queued packets instead of the
+    //    expiry dropping them as if the path never came up.
+    let expired: Vec<String> = {
+        let mut expired = Vec::new();
+        for (peer_id, entry) in pending.iter() {
+            if !entry.wait_deadline.is_some_and(|deadline| now >= deadline) {
+                continue;
+            }
+            let usable =
+                peers.is_relay_peer_confirmed(peer_id).await || peers.is_direct(peer_id).await;
+            if !usable {
+                expired.push(peer_id.clone());
+            }
+        }
+        expired
+    };
     for peer_id in expired {
         drop_pending_queue(
+            peers,
             pending.remove(&peer_id),
             REASON_RELAY_STARTUP_WAIT_EXPIRED,
             timeline,
-        );
+        )
+        .await;
     }
 
     // 2. Cancellation: peer offline or generation change invalidates the wait.
@@ -498,7 +524,7 @@ async fn maintenance(
         })
         .collect();
     for (peer_id, reason) in cancellations {
-        drop_pending_queue(pending.remove(&peer_id), reason, timeline);
+        drop_pending_queue(peers, pending.remove(&peer_id), reason, timeline).await;
     }
     let offline: Vec<String> = {
         let mut offline = Vec::new();
@@ -514,10 +540,12 @@ async fn maintenance(
     };
     for peer_id in offline {
         drop_pending_queue(
+            peers,
             pending.remove(&peer_id),
             REASON_OUTBOUND_PEER_OFFLINE,
             timeline,
-        );
+        )
+        .await;
     }
 
     // 3. Flush what became usable (paced by each peer's retry_after).
@@ -532,8 +560,10 @@ async fn maintenance(
     .await;
 }
 
-/// Drop a pending queue, emitting a stable reason event with the peer detail.
-fn drop_pending_queue(
+/// Drop a pending queue, emitting a stable reason event with the peer detail
+/// and recording the loss in the peer manager's structural drop counters.
+async fn drop_pending_queue(
+    peers: &PeerManager,
     queue: Option<PeerPendingQueue>,
     reason_code: &'static str,
     timeline: &ConnectionTimeline,
@@ -561,6 +591,9 @@ fn drop_pending_queue(
                 .unwrap_or(0)
         )),
     );
+    peers
+        .record_outbound_drop(reason_code, dropped, queue.bytes)
+        .await;
     debug!(
         "Dropped {dropped} queued packets for peer {peer_id}: {reason_code} (bytes={})",
         queue.bytes

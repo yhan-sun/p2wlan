@@ -78,6 +78,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
 	udpObserverBind := fs.String("udp-observer-bind", getenv("RELAY_UDP_OBSERVER_BIND", ""), "Optional UDP observer/STUN bind address")
+	metricsBind := fs.String("metrics-bind", getenv("RELAY_METRICS_BIND", ""), "Optional read-only metrics HTTP listen address (empty disables)")
 	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
 	registerTimeout := fs.Duration("register-timeout", envRegisterTimeout, "Register timeout")
 	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
@@ -107,6 +108,7 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	config := &RelayConfig{
 		Bind:                       *bind,
 		UDPObserverBind:            strings.TrimSpace(*udpObserverBind),
+		MetricsBind:                strings.TrimSpace(*metricsBind),
 		SendQueueCapacity:          *sendQueue,
 		RegisterTimeout:            *registerTimeout,
 		IdleTimeout:                *idleTimeout,

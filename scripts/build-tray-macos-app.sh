@@ -24,7 +24,17 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 install -m 0755 "$ROOT_DIR/target/$PROFILE/p2wlan-tray" "$EXECUTABLE"
 install -m 0755 "$ROOT_DIR/target/$PROFILE/p2wlan-daemon" "$RESOURCES_DIR/p2wlan-daemon"
 
-cat >"$CONTENTS_DIR/Info.plist" <<'PLIST'
+# Derive the bundle version from the workspace so the App, the built-in daemon
+# and `/status.version` can never drift apart again.
+VERSION="$(grep -m1 -E '^version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' "$ROOT_DIR/Cargo.toml" | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')"
+if [[ -z "$VERSION" ]]; then
+  echo "[build-tray] could not derive workspace version from Cargo.toml" >&2
+  exit 1
+fi
+# CFBundleVersion must be numeric (dot-separated ok): strip the dots.
+BUILD_NUMBER="${VERSION//./}"
+
+cat >"$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +52,9 @@ cat >"$CONTENTS_DIR/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.116</string>
+  <string>$VERSION</string>
   <key>CFBundleVersion</key>
-  <string>116</string>
+  <string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key>
   <string>11.0</string>
   <key>LSUIElement</key>

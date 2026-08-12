@@ -87,6 +87,9 @@ pub struct DiagnosticsSnapshot {
     pub virtual_ip: String,
     pub network_id: String,
     pub network_generation: u64,
+    /// Monotonic milliseconds since this daemon process started (matches the
+    /// timeline events' `at_ms` clock).
+    pub uptime_ms: u64,
     pub protocol: ProtocolDiagnostics,
     pub mtu: MtuDiagnostics,
     pub udp_local_addr: Option<String>,

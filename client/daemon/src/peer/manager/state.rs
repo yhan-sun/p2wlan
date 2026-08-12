@@ -130,8 +130,19 @@ pub struct PeerManager {
     /// `relay_peer_confirmed`, `direct_promoted`) emit through it, no-oping
     /// when it is not installed (unit tests).
     timeline: std::sync::Mutex<Option<Arc<ConnectionTimeline>>>,
+    /// Process-wide outbound-drop counters (packets/bytes) by stable reason
+    /// code.  `/status` reports these structurally so business-packet loss is
+    /// observable without log greps.
+    outbound_drops: Arc<tokio::sync::Mutex<HashMap<String, OutboundDropCounters>>>,
     /// Configuration.
     config: Config,
+}
+
+/// Aggregate counter of dropped outbound business packets for one reason code.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct OutboundDropCounters {
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 /// Metadata changes observed while applying one control-plane peer snapshot.

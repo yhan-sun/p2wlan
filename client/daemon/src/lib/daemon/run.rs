@@ -265,6 +265,7 @@ impl Daemon {
         let probe_transport = self.transport.clone();
         let probe_relay_transport = self.relay_transport.clone();
         let probe_local_vip = virtual_ip.clone();
+        let probe_timeline = self.timeline.clone();
         let probe_shutdown_rx = self.shutdown_rx.clone();
         self.task_manager
             .spawn(
@@ -275,6 +276,7 @@ impl Daemon {
                     probe_transport,
                     probe_relay_transport,
                     probe_local_vip,
+                    probe_timeline,
                     relay_probe_kick_rx,
                     probe_shutdown_rx,
                 ),

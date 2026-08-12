@@ -129,6 +129,14 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         ("GET", "/health") => {
             write_response(&mut stream, 200, "text/plain", "ok\n", cors_origin).await?
         }
+        ("GET", "/status.version") => {
+            let body = serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "name": "p2wlan-daemon",
+            })
+            .to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
         ("GET", "/status") => {
             let snapshot = build_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;

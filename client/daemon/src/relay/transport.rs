@@ -242,13 +242,33 @@ impl RelayTransport {
                         // error instead of turning one transient window into a
                         // misleading error-count storm. A different peer/code
                         // (or any later different error) remains visible.
-                        let duplicate = d.last_error_code.as_deref() == Some(error_code.as_str())
-                            && d.last_error.as_deref() == Some(message.as_str());
-                        if !duplicate {
-                            d.selected_error_count = d.selected_error_count.saturating_add(1);
+                        //
+                        // A per-peer `peer_not_found` describes ONE peer's
+                        // registration, not the relay connection's health.  It
+                        // is deduplicated against its own most-recent message
+                        // and never written into the connection-level
+                        // `last_error`/`last_error_code` (which the supervisor
+                        // uses to report genuine connection ends).  The
+                        // peer-level revocation/quarantine below is the
+                        // authoritative handling.
+                        if error_code == "peer_not_found" {
+                            let duplicate =
+                                d.last_peer_not_found.as_deref() == Some(message.as_str());
+                            if !duplicate {
+                                d.selected_error_count = d.selected_error_count.saturating_add(1);
+                                d.last_peer_not_found = Some(message.clone());
+                            }
+                        } else {
+                            let duplicate = d.last_error_code.as_deref()
+                                == Some(error_code.as_str())
+                                && d.last_error.as_deref() == Some(message.as_str());
+                            if !duplicate {
+                                d.selected_error_count = d.selected_error_count.saturating_add(1);
+                            }
+                            d.last_error = Some(message.clone());
+                            d.last_error_code = Some(error_code.clone());
+                            d.last_peer_not_found = None;
                         }
-                        d.last_error = Some(message.clone());
-                        d.last_error_code = Some(error_code.clone());
                     }
                     if let Some(peer_id) = relay_error_peer_id(&message).map(str::to_string) {
                         self.peers

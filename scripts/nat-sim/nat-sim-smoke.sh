@@ -26,6 +26,7 @@ ROUNDS=${ROUNDS:-5}
 NAT_SEED_BASE=${NAT_SEED_BASE:-20260806}
 PORT=${PORT:-38080}
 RELAY_PORT=${RELAY_PORT:-38081}
+RELAY_METRICS_PORT=${RELAY_METRICS_PORT:-39081}
 DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 301))}
 DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 302))}
 STEP_A=${STEP_A:-1}
@@ -177,6 +178,7 @@ for round in $(seq 1 "$ROUNDS"); do
   KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
   RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" -bind "127.0.0.1:$RELAY_PORT" \
     -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
+    -metrics-bind "127.0.0.1:$RELAY_METRICS_PORT" \
     >"$ROUND_DIR/relay.log" 2>&1 &
   RELAY_PID=$!
   PIDS+=($RELAY_PID)
@@ -305,6 +307,7 @@ for round in $(seq 1 "$ROUNDS"); do
   ELAPSED_MS=$((END_MS - START_MS))
   curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status" >"$ROUND_DIR/node-a.status.json" || printf '{}\n' >"$ROUND_DIR/node-a.status.json"
   curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_B_PORT/status" >"$ROUND_DIR/node-b.status.json" || printf '{}\n' >"$ROUND_DIR/node-b.status.json"
+  curl -fsS --max-time 5 "http://127.0.0.1:$RELAY_METRICS_PORT/metrics" >"$ROUND_DIR/relay.metrics.json" || printf '{}\n' >"$ROUND_DIR/relay.metrics.json"
 
   # Record the evidence stream for this round.
   {

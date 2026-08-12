@@ -25,7 +25,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
             udp_local_endpoint,
         )
         .await;
-    let stats = PeerManagerStats::from_diagnostics(&peers);
+    let mut stats = PeerManagerStats::from_diagnostics(&peers);
+    stats.outbound_drops = context.peers.outbound_drop_stats().await;
     let candidate_snapshot = context.candidate_snapshot.read().await.clone();
     let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) = candidate_snapshot
         .map(|snapshot| (snapshot.candidates, Some(snapshot.version), Some(snapshot.hash)))
@@ -38,6 +39,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation().await,
+        uptime_ms: context.timeline.uptime_ms(),
         protocol: ProtocolDiagnostics::current(),
         mtu: MtuDiagnostics::from_runtime(
             context.config.network.mtu,

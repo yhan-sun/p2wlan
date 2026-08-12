@@ -472,10 +472,12 @@ impl PeerManager {
     /// by a fresh forced-probe ACK (matching ingress + generation) before the
     /// peer is usable over the relay again.
     pub(crate) async fn revoke_relay_peer_confirmation(&self, node_id: &str) -> bool {
-        let revoked = {
+        let (revoked, previous_endpoint, previous_generation) = {
             let mut conns = self.connections.write().await;
             match conns.get_mut(node_id) {
                 Some(conn) if conn.relay_confirmed_at.is_some() => {
+                    let endpoint = conn.relay_confirmed_endpoint.clone();
+                    let generation = conn.relay_confirmed_generation;
                     conn.relay_confirmed_at = None;
                     conn.relay_confirmed_generation = None;
                     conn.relay_confirmed_endpoint = None;
@@ -483,12 +485,22 @@ impl PeerManager {
                     if conn.state == ConnectionState::Relay {
                         conn.transition(ConnectionState::FallbackToRelay);
                     }
-                    true
+                    (true, endpoint, generation)
                 }
-                _ => false,
+                _ => (false, None, None),
             }
         };
         if revoked {
+            self.emit_timeline(
+                "relay_peer_confirmed_revoked",
+                Some("relay"),
+                None,
+                Some(format!(
+                    "peer={node_id} relay_endpoint={} generation={:?}",
+                    previous_endpoint.as_deref().unwrap_or("unknown"),
+                    previous_generation
+                )),
+            );
             self.bump_relay_confirm_seq(node_id);
         }
         revoked

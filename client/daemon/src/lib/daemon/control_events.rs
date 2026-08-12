@@ -1033,6 +1033,15 @@ impl Daemon {
                         "Peer joined: {} ({})",
                         peer_info.node_id, peer_info.virtual_ip
                     );
+                    self.timeline.emit_first(
+                        "peer_roster_ready",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={} virtual_ip={} online={}",
+                            peer_info.node_id, peer_info.virtual_ip, peer_info.online
+                        )),
+                    );
                     self.peers.add_peer(&peer_info).await;
 
                     if peer_info.online {

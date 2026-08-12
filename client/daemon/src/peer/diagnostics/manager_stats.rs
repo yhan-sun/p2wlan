@@ -6,6 +6,10 @@ pub struct PeerManagerStats {
     pub relay_connections: usize,
     pub total_bytes_sent: u64,
     pub total_bytes_received: u64,
+    /// Dropped outbound business packets (packets/bytes) by stable reason
+    /// code, accumulated since daemon start.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub outbound_drops: HashMap<String, OutboundDropCounters>,
 }
 
 impl PeerManagerStats {
@@ -23,6 +27,7 @@ impl PeerManagerStats {
                 .count(),
             total_bytes_sent: peers.iter().map(|peer| peer.bytes_sent).sum(),
             total_bytes_received: peers.iter().map(|peer| peer.bytes_received).sum(),
+            outbound_drops: HashMap::new(),
         }
     }
 }
