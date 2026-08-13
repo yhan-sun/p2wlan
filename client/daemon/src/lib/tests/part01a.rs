@@ -517,6 +517,38 @@ fn direct_fast_probe_skips_rendezvous_dependent_target_sets() {
     assert!(!direct_fast_probe_is_safe(true, true));
 }
 
+#[test]
+fn fresh_prediction_allows_bounded_fast_probe_for_scatter_target_sets() {
+    assert!(direct_fast_probe_is_allowed(true, false, true));
+    assert!(direct_fast_probe_is_allowed(false, true, true));
+    assert!(!direct_fast_probe_is_allowed(true, false, false));
+    assert!(!direct_fast_probe_is_allowed(false, true, false));
+}
+
+#[test]
+fn direct_fast_probe_prefers_fresh_prediction_window_without_expanding_budget() {
+    let candidates = vec![
+        "198.51.100.10:40000".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40001".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40002".parse::<SocketAddr>().unwrap(),
+    ];
+    let preferred = vec![
+        "198.51.100.10:40002".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40003".parse::<SocketAddr>().unwrap(),
+    ];
+
+    let selected = direct_fast_probe_candidates_with_preferred(&candidates, &preferred);
+
+    assert_eq!(selected[0], preferred[0]);
+    assert_eq!(selected[1], preferred[1]);
+    assert_eq!(selected[2], candidates[0]);
+    assert_eq!(selected.len(), 4);
+    assert_eq!(
+        selected.iter().collect::<HashSet<_>>().len(),
+        selected.len()
+    );
+}
+
 #[tokio::test]
 async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_session() {
     let local_identity = NodeIdentity::generate();

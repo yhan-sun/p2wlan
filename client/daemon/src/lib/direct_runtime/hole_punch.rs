@@ -789,8 +789,11 @@ async fn spawn_hole_punch_task(
         };
         // Snapshot before the match consumes the option: the owned punch
         // block below still needs to know whether this session is a frozen
-        // prediction window (it decides the attempt policy).
-        let is_frozen_prediction_window = frozen_targets.is_some();
+        // prediction window (it decides the attempt policy and the bounded
+        // fast prefix). A pending fresh prediction can replace the original
+        // trigger target, so retain that snapshot too.
+        let mut is_frozen_prediction_window = frozen_targets.is_some();
+        let mut fast_prediction_candidates = frozen_targets.clone().unwrap_or_default();
         let target = match pending_target {
             Some(pending) => {
                 if let Some(punch_at) = pending.punch_at_ms {
@@ -801,6 +804,10 @@ async fn spawn_hole_punch_task(
                     );
                 }
                 let has_frozen = pending.frozen_targets.is_some();
+                if has_frozen {
+                    fast_prediction_candidates = pending.frozen_targets.clone().unwrap_or_default();
+                    is_frozen_prediction_window = true;
+                }
                 let frozen = if has_frozen {
                     pending.frozen_targets
                 } else {
@@ -922,13 +929,25 @@ async fn spawn_hole_punch_task(
         // synchronized full window below as the dependent-NAT fallback. This
         // stage is control traffic only; business packets remain relay-first
         // until the encrypted Direct validation ACK commits the path.
-        let fast_probe_is_safe = direct_fast_probe_is_safe(remote_scatter_pool, stable_remote_scatter);
+        let has_fresh_prediction_window = !fast_prediction_candidates.is_empty();
+        let fast_probe_is_allowed = direct_fast_probe_is_allowed(
+            remote_scatter_pool,
+            stable_remote_scatter,
+            has_fresh_prediction_window,
+        );
         if punch_at_ms.is_some()
             && !session.is_cancelled()
             && !peers.is_direct(&peer_id).await
-            && fast_probe_is_safe
+            && fast_probe_is_allowed
         {
-            let fast_candidates = direct_fast_probe_candidates(&candidates);
+            let fast_candidates = if fast_prediction_candidates.is_empty() {
+                direct_fast_probe_candidates(&candidates)
+            } else {
+                direct_fast_probe_candidates_with_preferred(
+                    &candidates,
+                    &fast_prediction_candidates,
+                )
+            };
             if !fast_candidates.is_empty() {
                 peers
                     .record_direct_event(
@@ -1040,7 +1059,7 @@ async fn spawn_hole_punch_task(
         } else if punch_at_ms.is_some()
             && !session.is_cancelled()
             && !peers.is_direct(&peer_id).await
-            && !fast_probe_is_safe
+            && !fast_probe_is_allowed
         {
             peers
                 .record_direct_event(
@@ -1050,11 +1069,12 @@ async fn spawn_hole_punch_task(
                     Some(candidates.len()),
                     None,
                     format!(
-                        "skipped immediate candidate prefix because synchronized rendezvous is required session_id={} generation={} remote_scatter_pool={} stable_remote_scatter={}",
+                        "skipped immediate candidate prefix because synchronized rendezvous is required session_id={} generation={} remote_scatter_pool={} stable_remote_scatter={} fresh_prediction_window={}",
                         session.session_id(),
                         network_generation,
                         remote_scatter_pool,
                         stable_remote_scatter,
+                        has_fresh_prediction_window,
                     ),
                 )
                 .await;

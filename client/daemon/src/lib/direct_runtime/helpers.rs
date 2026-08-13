@@ -11,8 +11,25 @@ fn direct_probe_ack_grace(probe_interval: Duration) -> Duration {
 /// window intentionally does not reorder or expand that set. A later
 /// synchronized/scatter stage still owns the complete candidate coverage.
 fn direct_fast_probe_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    direct_fast_probe_candidates_with_preferred(candidates, &[])
+}
+
+/// Build the bounded fast window, preferring an immutable fresh-prediction
+/// snapshot when one is available.
+///
+/// The ordinary candidate selector deliberately keeps trusted, non-predicted
+/// candidates first for the broad sweep. That ordering is correct for the
+/// fallback plan, but it can hide the exact port window just advertised by a
+/// fresh mapping signal from the first latency-sensitive probes. Prefer only
+/// the already-accepted prediction snapshot here; all remaining candidates
+/// retain their normal order and the synchronized sweep still covers the full
+/// set.
+fn direct_fast_probe_candidates_with_preferred(
+    candidates: &[SocketAddr],
+    preferred: &[SocketAddr],
+) -> Vec<SocketAddr> {
     let mut selected = Vec::with_capacity(DIRECT_FAST_PROBE_MAX_CANDIDATES);
-    for candidate in candidates {
+    for candidate in preferred.iter().chain(candidates) {
         if selected.contains(candidate) {
             continue;
         }
@@ -26,6 +43,19 @@ fn direct_fast_probe_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
 
 fn direct_fast_probe_is_safe(remote_scatter_pool: bool, stable_remote_scatter: bool) -> bool {
     !remote_scatter_pool && !stable_remote_scatter
+}
+
+/// A fresh prediction is an explicitly signaled, generation-bound rendezvous
+/// window. It is safe to probe a small prefix immediately even when the broad
+/// target set is classified as remote scatter; an unqualified scatter target
+/// still requires the synchronized window below.
+fn direct_fast_probe_is_allowed(
+    remote_scatter_pool: bool,
+    stable_remote_scatter: bool,
+    has_fresh_prediction_window: bool,
+) -> bool {
+    direct_fast_probe_is_safe(remote_scatter_pool, stable_remote_scatter)
+        || has_fresh_prediction_window
 }
 
 /// Hard deadline for one owned punch session.
