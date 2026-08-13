@@ -31,6 +31,27 @@ fn git_output(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Print the concrete git ref that backs `HEAD` as a Cargo input.
+///
+/// Watching `.git/HEAD` alone is insufficient on a normal branch: a commit
+/// updates `.git/refs/heads/<branch>` while `.git/HEAD` continues to contain
+/// the same symbolic-ref text. Watching only the refs directory is also not
+/// recursive, so Cargo can reuse a build script result and embed the previous
+/// commit identity after a commit or checkout. The concrete ref closes that
+/// identity gap while the HEAD/packed-refs watches retain detached-head and
+/// packed-ref coverage.
+fn print_git_identity_watchers() {
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    if let Some(symbolic_ref) = git_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        let symbolic_ref = symbolic_ref.trim();
+        if !symbolic_ref.is_empty() {
+            println!("cargo:rerun-if-changed=../../.git/refs/heads/{symbolic_ref}");
+        }
+    }
+}
+
 /// Build deterministic dirty material. Git status names an untracked file,
 /// but does not include its contents; including the bytes here prevents two
 /// different dirty source trees from sharing one build identity.
@@ -153,9 +174,7 @@ fn main() {
     println!("cargo:rustc-env=P2WLAN_BUILD_ID={build_id}");
     println!("cargo:rustc-env=P2WLAN_BUILD_TIME_MS={build_ms}");
     // Re-run when the checked-out commit moves so stale builds never claim a
-    // newer commit than they were compiled from.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
-    println!("cargo:rerun-if-changed=../../.git/refs");
-    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    // newer commit than they were compiled from. The concrete branch ref is
+    // essential because `.git/HEAD` usually remains unchanged across commits.
+    print_git_identity_watchers();
 }
