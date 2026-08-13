@@ -181,6 +181,69 @@ async fn live_stun_refresh_does_not_steal_encrypted_datagrams() {
 }
 
 #[tokio::test]
+async fn parallel_live_stun_gather_does_not_sum_observer_delays() {
+    let peers = peer_manager();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let mut servers = Vec::new();
+    let mut workers = Vec::new();
+    for (delay, mapped) in [
+        (
+            Duration::from_millis(20),
+            "203.0.113.7:45678".parse::<SocketAddr>().unwrap(),
+        ),
+        (
+            Duration::from_millis(180),
+            "203.0.113.8:45679".parse::<SocketAddr>().unwrap(),
+        ),
+    ] {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        servers.push(server_addr);
+        workers.push(tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+            let request = StunMessage::decode(&buf[..n]).unwrap();
+            tokio::time::sleep(delay).await;
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(mapped));
+            server
+                .send_to(&response.encode(), client_addr)
+                .await
+                .unwrap();
+        }));
+    }
+
+    let started = Instant::now();
+    let report = transport
+        .gather_candidate_report_live_parallel(servers, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(report.nat_profile.observations.len(), 2);
+    assert!(report
+        .nat_profile
+        .observations
+        .iter()
+        .all(|observation| observation.error.is_none()));
+    assert!(
+        elapsed < Duration::from_millis(320),
+        "parallel gather took {elapsed:?}; observer delays were likely serialized"
+    );
+
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    inbound_worker.abort();
+}
+
+#[tokio::test]
 async fn run_inbound_acks_punch_and_does_not_forward_to_wireguard() {
     let peers = peer_manager();
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -218,6 +218,16 @@ async fn run_udp_direct_instance(
         lease.shutdown_receiver(),
     ));
 
+    // Start the reader before the initial STUN gather. The live gather uses
+    // the reader-owned STUN waiter registry; starting it only after a serial
+    // gather made public candidates wait behind observer timeouts and left
+    // the first Direct offer with only a private host candidate.
+    let mut inbound_worker = tokio::spawn({
+        let udp = udp.clone();
+        let inbound_tx = udp_inbound_tx.clone();
+        async move { udp.run_inbound(inbound_tx).await }
+    });
+
     // Publish host candidates as soon as the socket has a port.  The full
     // report below may spend seconds probing an unreachable STUN observer;
     // that delay is useful for NAT classification but must not delay the
@@ -278,7 +288,9 @@ async fn run_udp_direct_instance(
     let outcome = if let Some(initial_refresh_guard) = initial_refresh_guard {
 
             let (mut candidate_endpoints, mut candidate_sources) =
-                match udp.gather_candidate_report(stun_servers.clone(), stun_timeout).await
+                match udp
+                    .gather_candidate_report_live_parallel(stun_servers.clone(), stun_timeout)
+                    .await
                 {
                     Ok(report) => {
                         let (endpoints, sources) = candidate_endpoints_from_report(&report);
@@ -509,7 +521,12 @@ async fn run_udp_direct_instance(
             let outcome = if keepalive_interval.is_zero() {
                 let refresh_udp = udp.clone();
                 tokio::select! {
-                    result = udp.clone().run_inbound(udp_inbound_tx) => result,
+                    result = &mut inbound_worker => match result {
+                        Ok(result) => result,
+                        Err(error) => Err(DaemonError::Network(format!(
+                            "UDP inbound worker failed: {error}"
+                        ))),
+                    },
                     _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
                         udp: refresh_udp,
                         stun_servers,
@@ -538,7 +555,12 @@ async fn run_udp_direct_instance(
                 let keepalive_udp = udp.clone();
                 let refresh_udp = udp.clone();
                 tokio::select! {
-                    result = udp.clone().run_inbound(udp_inbound_tx) => result,
+                    result = &mut inbound_worker => match result {
+                        Ok(result) => result,
+                        Err(error) => Err(DaemonError::Network(format!(
+                            "UDP inbound worker failed: {error}"
+                        ))),
+                    },
                     _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
                     _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
                         udp: refresh_udp,
@@ -572,6 +594,9 @@ async fn run_udp_direct_instance(
     } else {
         Ok(())
     };
+
+    inbound_worker.abort();
+    let _ = inbound_worker.await;
 
     // This sends the ownership-scoped stop signal before withdrawing the
     // watch value and cancels every validation owner tied to this socket.  A

@@ -49,6 +49,7 @@ include!("udp/state.rs");
 include!("udp/core.rs");
 include!("udp/admission.rs");
 include!("udp/gather.rs");
+include!("udp/fast_gather.rs");
 include!("udp/dynamic_punch.rs");
 include!("udp/outbound.rs");
 include!("udp/inbound.rs");
