@@ -355,6 +355,10 @@ pub(crate) struct DirectValidationExpectation {
     /// or removed by owner cancellation.
     #[allow(dead_code)]
     pub(crate) lease: Option<DynamicSocketSendLease>,
+    /// Monotonic instant immediately before the encrypted validation datagram
+    /// is handed to the kernel. Promotion must score the exact Request -> ACK
+    /// exchange instead of reusing an older candidate-probe RTT.
+    pub(crate) sent_at: Option<Instant>,
     pub(crate) expires_at: Instant,
 }
 

@@ -277,6 +277,9 @@ pub struct DirectValidationEventMetadata {
     /// Whether the observed ACK endpoint passed authenticated endpoint
     /// admission. Required when it differs from `expected_endpoint`.
     pub(crate) ack_endpoint_authenticated: Option<bool>,
+    /// RTT measured from the actual encrypted validation Request send to its
+    /// matched ACK. This is stronger than a queued candidate-probe RTT.
+    pub(crate) validation_rtt_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +305,7 @@ pub struct DirectTraversalEvent {
     pub observed_ack_endpoint: Option<SocketAddr>,
     pub selected_endpoint: Option<SocketAddr>,
     pub ack_endpoint_authenticated: Option<bool>,
+    pub validation_rtt_ms: Option<u64>,
     pub stage: String,
     pub endpoint: Option<SocketAddr>,
     pub candidate_count: Option<usize>,
@@ -333,6 +337,7 @@ impl DirectTraversalEvent {
             observed_ack_endpoint: None,
             selected_endpoint: None,
             ack_endpoint_authenticated: None,
+            validation_rtt_ms: None,
             stage: stage.into(),
             endpoint,
             candidate_count,

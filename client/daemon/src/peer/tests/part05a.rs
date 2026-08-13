@@ -40,6 +40,61 @@ async fn path_selector_prefers_relay_until_direct_is_confirmed() {
 }
 
 #[tokio::test]
+async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.31:51831".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(700)),
+        )
+        .await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(20),
+        )
+        .await;
+
+    let generation = manager.current_network_generation().await;
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    assert!(manager
+        .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+            &epoch_guard,
+            "peer1",
+            Some(endpoint),
+            generation,
+            None,
+            Some(Duration::from_millis(8)),
+        )
+        .await);
+    drop(epoch_guard);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    let pair = connection
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == endpoint && pair.local_generation == generation)
+        .unwrap();
+    assert_eq!(pair.state, CandidatePairState::Selected);
+    assert_eq!(pair.rtt_ewma_ms.or(pair.rtt_ms), Some(8));
+    assert_eq!(connection.direct_health.rtt_ewma_ms, Some(8));
+    assert_eq!(connection.direct_health.latency_ms, Some(8));
+
+    let selection = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(selection.direct_confirmed);
+}
+
+#[tokio::test]
 async fn path_selector_uses_scores_and_hysteresis_for_degraded_direct() {
     let config = test_config();
     let manager = PeerManager::new(config);

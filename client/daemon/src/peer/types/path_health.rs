@@ -39,6 +39,18 @@ impl PathHealth {
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
     }
 
+    /// Record an authoritative data-plane RTT.  Candidate probes are useful
+    /// for ranking, but their timestamp can include NAT-sweep queueing.  An
+    /// encrypted Request -> ACK exchange is stronger evidence and must replace
+    /// that stale sample rather than being blended into it.
+    pub(super) fn record_success_with_authoritative_latency(&mut self, latency: Duration) {
+        self.record_success();
+        let latency_ms = duration_millis(latency);
+        self.latency_ms = Some(latency_ms);
+        self.rtt_ewma_ms = Some(latency_ms);
+        self.jitter_ms = Some(0);
+    }
+
     pub(super) fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
         self.last_failure_at = Some(Instant::now());
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);

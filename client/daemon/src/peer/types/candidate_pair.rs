@@ -222,6 +222,23 @@ impl CandidatePair {
         }
     }
 
+    /// Record an encrypted validation success whose RTT is authoritative for
+    /// this generation.  Do not EWMA-blend it with a delayed candidate probe:
+    /// that would keep a usable Direct path looking like a 500ms+ path and
+    /// immediately trigger the relay quality floor.
+    pub(super) fn record_authoritative_success(
+        &mut self,
+        latency: Duration,
+        selected: bool,
+        local_endpoint: Option<SocketAddr>,
+    ) {
+        self.record_success(Some(latency), selected, local_endpoint);
+        let latency_ms = duration_millis(latency);
+        self.rtt_ms = Some(latency_ms);
+        self.rtt_ewma_ms = Some(latency_ms);
+        self.jitter_ms = Some(0);
+    }
+
     pub(super) fn clear_selection(&mut self) {
         if self.state == CandidatePairState::Selected {
             self.state = CandidatePairState::Succeeded;

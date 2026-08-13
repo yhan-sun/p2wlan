@@ -60,6 +60,8 @@ pub struct DirectTraversalEventDiagnostics {
     pub selected_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_endpoint_authenticated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_rtt_ms: Option<u64>,
     pub stage: String,
     pub endpoint: Option<String>,
     pub candidate_count: Option<usize>,
@@ -86,6 +88,7 @@ impl From<&DirectTraversalEvent> for DirectTraversalEventDiagnostics {
                 .map(|endpoint| endpoint.to_string()),
             selected_endpoint: event.selected_endpoint.map(|endpoint| endpoint.to_string()),
             ack_endpoint_authenticated: event.ack_endpoint_authenticated,
+            validation_rtt_ms: event.validation_rtt_ms,
             stage: event.stage.clone(),
             endpoint: event.endpoint.map(|endpoint| endpoint.to_string()),
             candidate_count: event.candidate_count,

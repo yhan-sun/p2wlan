@@ -2314,6 +2314,7 @@ impl WireGuardTransport {
                 // keeps an inbound request from cancelling the local
                 // request/ACK transaction in the R7/R8 cross-over race.
                 let local_generation = peers.current_network_generation().await;
+
                 peers
                     .record_direct_validation_event_with_metadata(
                         peer_id,
@@ -2560,6 +2561,10 @@ impl WireGuardTransport {
                     return;
                 };
 
+                let validation_latency = expectation.sent_at.map(|sent_at| sent_at.elapsed());
+                let validation_rtt_ms =
+                    validation_latency.map(|latency| latency.as_millis() as u64);
+
                 peers
                     .record_direct_validation_event_with_metadata(
                         peer_id,
@@ -2570,6 +2575,7 @@ impl WireGuardTransport {
                             expected_endpoint: expectation.endpoint,
                             observed_ack_endpoint: Some(source),
                             ack_endpoint_authenticated: Some(endpoint_authenticated),
+                            validation_rtt_ms,
                             ..crate::peer::DirectValidationEventMetadata::default()
                         },
                         "direct_validation_ack_received",
@@ -2597,6 +2603,9 @@ impl WireGuardTransport {
                     remote_endpoint = %source,
                     request_id = token.request_id,
                     generation = expectation.generation,
+                    validation_rtt_ms = ?expectation
+                        .sent_at
+                        .map(|sent_at| sent_at.elapsed().as_millis() as u64),
                     "consumed encrypted validation ACK request_id={}",
                     token.request_id
                 );
@@ -2606,12 +2615,13 @@ impl WireGuardTransport {
                 // owner initiated the request, and the promotion remains
                 // inside the epoch guard that made the check atomic.
                 let promoted = peers
-                    .record_direct_success_for_generation_with_local_endpoint_in_epoch(
+                    .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
                         &epoch_guard,
                         peer_id,
                         Some(source),
                         expectation.generation,
                         local_endpoint,
+                        validation_latency,
                     )
                     .await;
                 let affinity_adopted = if promoted {
@@ -2661,6 +2671,7 @@ impl WireGuardTransport {
                             observed_ack_endpoint: Some(source),
                             selected_endpoint: Some(source),
                             ack_endpoint_authenticated: Some(endpoint_authenticated),
+                            validation_rtt_ms,
                             ..crate::peer::DirectValidationEventMetadata::default()
                         },
                         "direct_validation_promoted",

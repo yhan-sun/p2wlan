@@ -1122,6 +1122,7 @@ impl UdpTransport {
                 endpoint: None,
                 socket_index: None,
                 lease: None,
+                sent_at: None,
                 expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
             },
         );
@@ -1169,6 +1170,7 @@ impl UdpTransport {
                 endpoint: Some(endpoint),
                 socket_index,
                 lease: None,
+                sent_at: None,
                 expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
             },
         )
@@ -1241,6 +1243,7 @@ impl UdpTransport {
                     endpoint: Some(endpoint),
                     socket_index: Some(socket_index),
                     lease: Some(lease),
+                    sent_at: None,
                     expires_at: Instant::now() + crate::DIRECT_VALIDATION_EXPECTATION_TTL,
                 },
             )
@@ -1252,6 +1255,31 @@ impl UdpTransport {
             socket_index,
             socket,
         })
+    }
+
+    /// Stamp the monotonic boundary immediately before an owned encrypted
+    /// validation request is handed to the UDP socket.  The ACK handler uses
+    /// this value to measure the real encrypted Request -> ACK RTT.
+    pub(crate) async fn mark_direct_validation_send_started(
+        &self,
+        peer_id: &str,
+        request_id: u16,
+        generation: u64,
+        owner_token: u64,
+    ) -> bool {
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        let Some(expectation) = expectations.get_mut(peer_id) else {
+            return false;
+        };
+        if expectation.request_id != request_id
+            || expectation.generation != generation
+            || expectation.owner_token != owner_token
+            || expectation.expires_at <= Instant::now()
+        {
+            return false;
+        }
+        expectation.sent_at = Some(Instant::now());
+        true
     }
 
     /// Resolve the socket for a direct-validation send under ONE

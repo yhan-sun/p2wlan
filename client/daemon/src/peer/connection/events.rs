@@ -254,6 +254,7 @@ impl PeerConnection {
         event.observed_ack_endpoint = metadata.observed_ack_endpoint;
         event.selected_endpoint = metadata.selected_endpoint;
         event.ack_endpoint_authenticated = metadata.ack_endpoint_authenticated;
+        event.validation_rtt_ms = metadata.validation_rtt_ms;
         event.socket_index = socket_index;
         self.push_direct_event(event);
     }

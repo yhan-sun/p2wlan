@@ -80,6 +80,30 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
+        self.record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+            _epoch_guard,
+            node_id,
+            endpoint,
+            generation,
+            local_endpoint,
+            None,
+        )
+        .await
+    }
+
+    /// Record Direct success from an encrypted validation ACK and, when
+    /// present, replace probe-derived RTT with that exact Request -> ACK
+    /// measurement.  The generation gate and promotion transaction are shared
+    /// with the ordinary confirmation path.
+    pub(crate) async fn record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+        validation_latency: Option<Duration>,
+    ) -> bool {
         // The lock-free mirror is written while this very gate is held by a
         // generation advance.  Reading it here therefore cannot race an
         // advance between validation and mutation.
@@ -97,13 +121,34 @@ impl PeerManager {
             let selected_endpoint = endpoint.or(conn.endpoint);
             let pair_success = selected_endpoint.map(|endpoint| {
                 conn.endpoint = Some(endpoint);
-                conn.mark_candidate_pair_success(endpoint, generation, None, true, local_endpoint)
+                if let Some(latency) = validation_latency {
+                    conn.mark_candidate_pair_authoritative_success(
+                        endpoint,
+                        generation,
+                        latency,
+                        true,
+                        local_endpoint,
+                    )
+                } else {
+                    conn.mark_candidate_pair_success(
+                        endpoint,
+                        generation,
+                        None,
+                        true,
+                        local_endpoint,
+                    )
+                }
             });
             let direct_confirmation_changed = !was_direct
                 || previous_endpoint != selected_endpoint
                 || previous_generation != generation;
             conn.direct_generation = generation;
-            conn.direct_health.record_success();
+            if let Some(latency) = validation_latency {
+                conn.direct_health
+                    .record_success_with_authoritative_latency(latency);
+            } else {
+                conn.direct_health.record_success();
+            }
             conn.clear_direct_reclaim_window();
             if direct_confirmation_changed {
                 // The direct-commit sequence is bumped inside the SAME

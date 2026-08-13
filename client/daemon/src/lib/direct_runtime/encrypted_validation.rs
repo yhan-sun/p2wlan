@@ -817,6 +817,7 @@ async fn run_direct_encrypted_validation_session(
             &payload,
         );
         let send_udp = udp.clone();
+        let validation_peer_id = peer_id.clone();
         let send_socket = prepared.socket.clone();
         let send_socket_index = prepared.socket_index;
         let endpoint = target.endpoint;
@@ -828,6 +829,19 @@ async fn run_direct_encrypted_validation_session(
                     packet,
                 },
                 move |encrypted| async move {
+                    if !send_udp
+                        .mark_direct_validation_send_started(
+                            &validation_peer_id,
+                            request_id,
+                            generation,
+                            owner_token,
+                        )
+                        .await
+                    {
+                        return Err(crate::error::DaemonError::Network(
+                            "direct-validation owner was revoked before UDP send".to_string(),
+                        ));
+                    }
                     send_udp
                         .send_encrypted_packet_on_socket(
                             &send_socket,
