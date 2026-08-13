@@ -3,6 +3,17 @@ use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+
+/// A test HTTP client that never consults ambient HTTP_PROXY/HTTPS_PROXY:
+/// these tests mock the control endpoint on 127.0.0.1 and must be immune to
+/// the process environment (e.g. the fake-proxy tests that set HTTP_PROXY).
+fn test_no_proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client must build")
+}
+
 #[test]
 fn test_control_client_creation() {
     let config = test_config();
@@ -324,7 +335,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let result = poll_signals(
-        &reqwest::Client::new(),
+        &test_no_proxy_client(),
         &format!("http://{address}"),
         "test-token",
         "node-a",
@@ -437,7 +448,7 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
 
     // First poll: the signal is decoded, enqueued, and ACKed.
     let result = poll_signals(
-        &reqwest::Client::new(),
+        &test_no_proxy_client(),
         &format!("http://{address}"),
         "test-token",
         "node-a",
@@ -466,7 +477,7 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
     // lease expired).  The signal id dedup skips the duplicate event but the
     // ACK is still sent, so the server stops redelivering.
     let result = poll_signals(
-        &reqwest::Client::new(),
+        &test_no_proxy_client(),
         &format!("http://{address}"),
         "test-token",
         "node-a",

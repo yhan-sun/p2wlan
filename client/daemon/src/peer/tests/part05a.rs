@@ -12,16 +12,16 @@ async fn path_selector_prefers_relay_until_direct_is_confirmed() {
     assert_eq!(waiting.direct_endpoint, None);
 
     let no_relay = manager.select_path_for_data("peer1", true, false).await;
-    assert_eq!(no_relay.path, Some(NetworkPath::Direct));
-    assert_eq!(no_relay.reason_code, REASON_PATH_RELAY_UNAVAILABLE);
-    assert_eq!(no_relay.direct_endpoint, Some(endpoint));
+    assert_eq!(no_relay.path, None);
+    assert_eq!(no_relay.reason_code, REASON_PATH_UNAVAILABLE);
+    assert_eq!(no_relay.direct_endpoint, None);
     assert!(!no_relay.direct_confirmed);
 
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(6)))
         .await;
     let provisional = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(provisional.path, Some(NetworkPath::Direct));
+    assert_eq!(provisional.path, Some(NetworkPath::Relay));
     assert!(!provisional.direct_confirmed);
     assert_eq!(
         manager.get_connection("peer1").await.unwrap().active_path(),
@@ -407,20 +407,18 @@ async fn degraded_direct_is_retained_until_relay_peer_path_is_confirmed() {
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert!(selected.direct_confirmed);
-    assert!(selected.relay_hedged);
+    assert!(!selected.relay_hedged);
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
 
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
     assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
-    assert!(
-        diagnostics[0]
-            .current_path_selection
-            .as_ref()
-            .unwrap()
-            .relay_hedged
-    );
+    assert!(!diagnostics[0]
+        .current_path_selection
+        .as_ref()
+        .unwrap()
+        .relay_hedged);
 }
 
 #[tokio::test]

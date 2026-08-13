@@ -199,11 +199,18 @@ async fn run_direct_probe_loop(
                             .await;
                     }
 
-                    // Fresh-mapping generation: measure a fresh socket and
-                    // create a predictable peer-facing mapping before the
-                    // ordinary candidate sweep.  The recovery epoch allows at
-                    // most one fresh generation per epoch.
-                    let fresh_generation = {
+                    // Fresh mapping is an optimization for later Direct
+                    // windows. It must not delay this retry's first ordinary
+                    // sweep; the old ordering spent the fresh-mapping
+                    // measurement in front of every retry.
+                    let fresh_mapping_task = {
+                        let udp = udp.clone();
+                        let peers = peers.clone();
+                        let peer_id = peer_id.clone();
+                        let signal = signal.clone();
+                        let cancellation = session.cancellation_handle();
+                        tokio::spawn(async move {
+                        let fresh_generation = {
                         let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
                         let mut generation = if !peers.try_begin_fresh_generation(&peer_id).await {
                             peers
@@ -227,13 +234,13 @@ async fn run_direct_probe_loop(
                                 &targets,
                                 probe_interval,
                                 attempts.min(2),
-                                Some(&session.cancellation_handle()),
+                                Some(&cancellation),
                             )
                             .await
                         };
                         match &mut generation {
                             FreshMappingOutcome::Accepted(result, handoff) => {
-                                if session.is_cancelled() {
+                                if cancellation.is_cancelled() {
                                     peers
                                         .record_direct_event(
                                             &peer_id,
@@ -273,7 +280,7 @@ async fn run_direct_probe_loop(
                                             &peers,
                                             &peer_id,
                                             &*result,
-                                            &session.cancellation_handle(),
+                                            &cancellation,
                                         )
                                         .await
                                     };
@@ -322,6 +329,9 @@ async fn run_direct_probe_loop(
                         }
                         generation
                     };
+                        drop(fresh_generation);
+                        })
+                    };
 
                     for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
                         udp.spawn_nat_binding_maintainer(
@@ -353,17 +363,7 @@ async fn run_direct_probe_loop(
                     } else {
                         attempts
                     };
-                    let punch_result = if matches!(fresh_generation, FreshMappingOutcome::Accepted(..))
-                        && udp.has_dynamic_socket_for_peer(&peer_id).await
-                    {
-                        udp.punch_candidates_from_dynamic_socket(
-                            &peer_id,
-                            candidates.clone(),
-                            probe_interval,
-                            effective_attempts,
-                        )
-                        .await
-                    } else if stable_remote_scatter {
+                    let punch_result = if stable_remote_scatter {
                         udp.punch_candidates_stable_unique_scatter_until_not_direct(
                             &peer_id,
                             candidates.clone(),
@@ -633,6 +633,18 @@ async fn run_direct_probe_loop(
                                 .await;
                             warn!("Failed to retry direct UDP probes for peer {peer_id}: {err}");
                         }
+                    }
+                    if let Err(error) = fresh_mapping_task.await {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "fresh_mapping_worker_failed",
+                                None,
+                                None,
+                                None,
+                                format!("fresh-mapping worker failed after the retry sweep: {error}"),
+                            )
+                            .await;
                     }
                 })
                 .await;

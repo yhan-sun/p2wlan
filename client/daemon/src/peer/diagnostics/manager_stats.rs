@@ -7,9 +7,19 @@ pub struct PeerManagerStats {
     pub total_bytes_sent: u64,
     pub total_bytes_received: u64,
     /// Dropped outbound business packets (packets/bytes) by stable reason
-    /// code, accumulated since daemon start.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// code, accumulated since daemon start.  Terminal loss only.
+    #[serde(default)]
     pub outbound_drops: HashMap<String, OutboundDropCounters>,
+    /// Transient outbound send-failure attempts (packets by reason code),
+    /// accumulated since daemon start.  A failed attempt is re-parked and
+    /// retried; a packet that is finally lost lands in `outbound_drops`
+    /// instead — the two maps never double-count the same loss.
+    #[serde(default)]
+    pub outbound_send_failures: HashMap<String, OutboundDropCounters>,
+    /// Bounded peer/generation/correlation ledger for outbound loss and
+    /// retry events.
+    #[serde(default)]
+    pub outbound_loss_events: Vec<OutboundLossEvent>,
 }
 
 impl PeerManagerStats {
@@ -28,6 +38,8 @@ impl PeerManagerStats {
             total_bytes_sent: peers.iter().map(|peer| peer.bytes_sent).sum(),
             total_bytes_received: peers.iter().map(|peer| peer.bytes_received).sum(),
             outbound_drops: HashMap::new(),
+            outbound_send_failures: HashMap::new(),
+            outbound_loss_events: Vec::new(),
         }
     }
 }

@@ -223,6 +223,22 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
         !manager.recovery_epoch_active("peer-stale").await,
         "quarantine must cancel the stale peer's recovery epoch"
     );
+    assert!(
+        !manager
+            .relay_probe_targets()
+            .await
+            .iter()
+            .any(|(peer_id, _, _)| peer_id == "peer-stale"),
+        "a quarantined peer must not remain in the forced-relay probe set"
+    );
+    assert!(
+        !manager
+            .relay_validation_targets(Duration::from_secs(15))
+            .await
+            .iter()
+            .any(|(peer_id, _)| peer_id == "peer-stale"),
+        "a quarantined peer must not remain in proactive relay validation"
+    );
 
     // The stale peer must produce NO recovery work on repeated ticks.
     for _ in 0..10 {
@@ -272,6 +288,14 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
     assert!(
         !manager.peer_quarantined("peer-stale").await,
         "an identity/incarnation change must unquarantine the peer"
+    );
+    assert!(
+        manager
+            .relay_probe_targets()
+            .await
+            .iter()
+            .any(|(peer_id, _, _)| peer_id == "peer-stale"),
+        "authoritative rejoin must reopen relay-first probing"
     );
 }
 
@@ -501,4 +525,129 @@ async fn direct_restart_recovery_is_bounded_and_prioritized() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn slow_probe_transport_confirmation_does_not_block_other_peer_state() {
+    let manager = Arc::new(PeerManager::new(test_config()));
+    manager
+        .add_peer(&flood_peer_113(
+            "peer-slow-confirm",
+            "10.20.0.20",
+            "5.6.7.20:5001".parse().unwrap(),
+        ))
+        .await;
+    assert_eq!(
+        manager
+            .stage_probe_session_binding(
+                "peer-slow-confirm",
+                "slow-token".to_string(),
+                Some("slow-session".to_string()),
+                None,
+                true,
+            )
+            .await,
+        ProbeBindingStage::Staged
+    );
+
+    let transport_started = Arc::new(Notify::new());
+    let release_transport = Arc::new(Notify::new());
+    let confirm_manager = Arc::clone(&manager);
+    let started_for_confirm = Arc::clone(&transport_started);
+    let release_for_confirm = Arc::clone(&release_transport);
+    let confirm_task = tokio::spawn(async move {
+        confirm_manager
+            .confirm_probe_and_transport_transaction("peer-slow-confirm", "slow-token", || async move {
+                started_for_confirm.notify_one();
+                release_for_confirm.notified().await;
+                true
+            })
+            .await
+    });
+
+    transport_started.notified().await;
+
+    // This is the operation that previously waited behind the process-wide
+    // connection write lock held across the slow transport await.  It must
+    // complete while the confirmation is still parked, proving that a slow
+    // peer cannot starve another peer's control/event state.
+    let other_peer = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.add_peer(&flood_peer_113(
+            "peer-independent",
+            "10.20.0.21",
+            "5.6.7.21:5001".parse().unwrap(),
+        )),
+    )
+    .await
+    .expect("slow transport confirmation must not block another peer")
+    .is_new;
+    assert!(other_peer);
+
+    release_transport.notify_one();
+    assert!(confirm_task.await.unwrap());
+    assert_eq!(
+        manager
+            .get_connection("peer-slow-confirm")
+            .await
+            .unwrap()
+            .probe_binding_token,
+        Some("slow-token".to_string()),
+        "the transport confirmation must still publish its matching binding"
+    );
+}
+
+#[tokio::test]
+async fn direct_ack_feedback_does_not_hold_connection_lock_across_recovery_wait() {
+    let manager = Arc::new(PeerManager::new(test_config()));
+    let endpoint = "5.6.7.30:5001".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_113("peer-ack-lock", "10.20.0.30", endpoint))
+        .await;
+    assert!(matches!(
+        manager.recovery_epoch_admit("peer-ack-lock").await,
+        RecoveryAdmission::Accepted { .. }
+    ));
+
+    // Hold the independent recovery ledger so the ACK path is forced to park
+    // after it has acquired the connection map.  The connection write guard
+    // must already be released before it waits for this ledger; otherwise an
+    // unrelated PeerJoined cannot install its state.
+    let recovery_guard = manager.recovery_epochs.write().await;
+    let ack_manager = Arc::clone(&manager);
+    let ack_task = tokio::spawn(async move {
+        ack_manager
+            .record_direct_probe_success_with_latency(
+                "peer-ack-lock",
+                endpoint,
+                Some(Duration::from_millis(1)),
+            )
+            .await
+    });
+
+    // The ACK has to reach the recovery wait before we test an unrelated
+    // connection mutation.  A task that returned immediately would leave the
+    // test unable to distinguish the old lock-held bug from a healthy fast
+    // path.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !ack_task.is_finished(),
+        "ACK path should be parked on the held recovery ledger"
+    );
+
+    let independent = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.add_peer(&flood_peer_113(
+            "peer-ack-independent",
+            "10.20.0.31",
+            "5.6.7.31:5001".parse().unwrap(),
+        )),
+    )
+    .await
+    .expect("recovery feedback must not hold the global connection lock")
+    .is_new;
+    assert!(independent);
+
+    drop(recovery_guard);
+    ack_task.await.unwrap();
 }

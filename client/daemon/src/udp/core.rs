@@ -807,6 +807,7 @@ impl UdpTransport {
     /// ACK handler can match, adopt or re-insert while the cleanup runs, and
     /// an ACK that already matched under the lock is followed by the cleanup
     /// removing every adoption it created.
+    #[allow(dead_code)]
     pub(crate) async fn clear_pending_probes_for_peer(&self, peer_id: &str) {
         let adoption = self.adoption_lock_for(peer_id).await;
         let _adoption_guard = adoption.lock().await;

@@ -115,8 +115,7 @@ impl PeerConnection {
             }
         }
 
-        if selection.path == Some(NetworkPath::Direct) && previous_path != Some(NetworkPath::Direct)
-        {
+        if should_record_direct_promotion(previous_path, selection) {
             info!(
                 event = "direct_path_promoted",
                 peer_id = %self.node_id,
@@ -345,4 +344,48 @@ fn is_validation_evidence_stage(stage: &str) -> bool {
             | "direct_validation_promoted"
             | "direct_path_promoted"
     )
+}
+
+/// A Direct path is promoted only after the encrypted data-plane confirmation
+/// transaction has committed.  Candidate nomination and trial-window sends
+/// may still be recorded in `PathSelectionEvent`, but they are not a user
+/// visible path transition and must never emit `direct_path_promoted`.
+fn should_record_direct_promotion(
+    previous_path: Option<NetworkPath>,
+    selection: &PathSelection,
+) -> bool {
+    selection.path == Some(NetworkPath::Direct)
+        && selection.direct_confirmed
+        && previous_path != Some(NetworkPath::Direct)
+}
+
+#[cfg(test)]
+mod path_promotion_tests {
+    use super::*;
+
+    #[test]
+    fn trial_direct_selection_cannot_emit_promotion() {
+        let selection = PathSelection::direct(
+            "192.0.2.10:40000".parse().unwrap(),
+            "direct_trial",
+            "candidate probe only",
+            false,
+        );
+        assert!(!should_record_direct_promotion(None, &selection));
+    }
+
+    #[test]
+    fn encrypted_direct_selection_emits_promotion_once() {
+        let selection = PathSelection::direct(
+            "192.0.2.10:40000".parse().unwrap(),
+            "direct_confirmed",
+            "encrypted data path confirmed",
+            true,
+        );
+        assert!(should_record_direct_promotion(None, &selection));
+        assert!(!should_record_direct_promotion(
+            Some(NetworkPath::Direct),
+            &selection
+        ));
+    }
 }

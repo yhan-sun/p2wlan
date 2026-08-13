@@ -4,6 +4,7 @@
 //! allows test code to inject packets and observe written packets.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::InterfaceConfig;
@@ -23,7 +24,7 @@ use crate::interface::VirtualInterface;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let (mut dev, mut ctrl) = MockTunDevice::new_pair("p2pnet0", 1420, "10.20.0.1");
+///     let (mut dev, ctrl) = MockTunDevice::new_pair("p2pnet0", 1420, "10.20.0.1");
 ///
 ///     // Inject a packet into the device
 ///     ctrl.inject(vec![0x45, 0x00]).await;
@@ -46,12 +47,14 @@ pub struct MockTunDevice {
 }
 
 /// The test harness side of a mock TUN device pair.
+#[derive(Clone)]
 pub struct MockTunController {
     name: String,
     /// Inject packets into the device (device reads these).
     read_tx: mpsc::Sender<Vec<u8>>,
-    /// Receive packets written by the device.
-    write_rx: mpsc::Receiver<Vec<u8>>,
+    /// Receive packets written by the device.  Shared (Arc) so clones of the
+    /// controller can concurrently inject AND drain the bounded write channel.
+    write_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
 impl MockTunDevice {
@@ -77,7 +80,7 @@ impl MockTunDevice {
         let controller = MockTunController {
             name: name.to_string(),
             read_tx,
-            write_rx,
+            write_rx: Arc::new(tokio::sync::Mutex::new(write_rx)),
         };
 
         (device, controller)
@@ -152,8 +155,9 @@ impl MockTunController {
     }
 
     /// Try to receive a packet that was written by the device.
-    pub async fn recv_written(&mut self) -> Result<Vec<u8>> {
-        self.write_rx.recv().await.ok_or(Error::DeviceClosed)
+    pub async fn recv_written(&self) -> Result<Vec<u8>> {
+        let mut write_rx = self.write_rx.lock().await;
+        write_rx.recv().await.ok_or(Error::DeviceClosed)
     }
 
     /// Get the device name.
@@ -170,7 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_read_write() {
-        let (mut dev, mut ctrl) = MockTunDevice::new_default("test0");
+        let (mut dev, ctrl) = MockTunDevice::new_default("test0");
 
         // Build a test packet
         let packet = Ipv4Packet::build_icmp_echo_request(

@@ -20,6 +20,13 @@ pub enum RelayError {
     #[error("timeout: {0}")]
     Timeout(String),
 
+    /// A frame was accepted by the local writer command queue, but the
+    /// connection was interrupted before `write_all` completed.  The frame's
+    /// delivery is therefore unknown and must never be retried with an older
+    /// WireGuard counter.
+    #[error("relay write delivery uncertain: {0}")]
+    WriteUncertain(String),
+
     /// Failed to connect to relay server.
     #[error("connect failed: {0}")]
     ConnectFailed(String),
@@ -51,6 +58,19 @@ pub enum RelayError {
     /// Channel communication error.
     #[error("channel error: {0}")]
     Channel(String),
+
+    /// The local command queue rejected the frame before the writer owned it.
+    #[error("relay command queue full")]
+    CommandQueueFull,
+
+    /// The writer task was already stopped before this frame was accepted.
+    #[error("relay writer stopped before command acceptance")]
+    WriterStoppedBeforeAccept,
+
+    /// The writer task ended before reporting a write completion. Delivery is
+    /// not knowable at this boundary and the ciphertext is terminal.
+    #[error("relay writer stopped before write completion")]
+    WriterStoppedBeforeWrite,
 
     /// Unsupported protocol version.
     #[error("unsupported protocol version: {0}")]
@@ -181,11 +201,15 @@ impl RelayError {
             }
             RelayError::Protocol(_) => "protocol_error",
             RelayError::Timeout(_) => "timeout",
+            RelayError::WriteUncertain(_) => "write_delivery_uncertain",
             RelayError::ConnectFailed(_) => "connect_failed",
             RelayError::NotConnected => "not_connected",
             RelayError::PeerNotFound(_) => "peer_not_found",
             RelayError::FrameTooLarge(_, _) => "frame_too_large",
             RelayError::Channel(_) => "channel_error",
+            RelayError::CommandQueueFull => "relay_command_queue_full",
+            RelayError::WriterStoppedBeforeAccept => "relay_writer_stopped_before_accept",
+            RelayError::WriterStoppedBeforeWrite => "relay_writer_stopped_before_write",
             RelayError::Closed(_) => "connection_closed",
             RelayError::Io(_) => "io_error",
             RelayError::UnexpectedMessageType(_) => "unexpected_message_type",

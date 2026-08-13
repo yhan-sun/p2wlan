@@ -29,10 +29,32 @@ if [[ ! -x "$DAEMON_PATH" ]]; then
   echo "Flutter app does not contain an executable p2wlan-daemon" >&2
   exit 1
 fi
-if [[ "$($DAEMON_PATH --version)" != "p2wlan-daemon $APP_VERSION" ]]; then
-  echo "Bundled daemon version does not match Flutter app version $APP_VERSION" >&2
+DAEMON_VERSION="$($DAEMON_PATH --version)"
+if [[ "$DAEMON_VERSION" != "p2wlan-daemon $APP_VERSION" && "$DAEMON_VERSION" != "p2wlan-daemon $APP_VERSION "* ]]; then
+  echo "Bundled daemon version does not match Flutter app version $APP_VERSION: $DAEMON_VERSION" >&2
   exit 1
 fi
+
+MANIFEST_PATH="$APP_DIR/Contents/Resources/build-manifest.json"
+DAEMON_SHA="$(shasum -a 256 "$DAEMON_PATH" | awk '{print $1}')"
+python3 - "$APP_VERSION" "$DAEMON_PATH" "$DAEMON_SHA" "$MANIFEST_PATH" <<'PY'
+import json, subprocess, sys
+version, daemon, daemon_sha, manifest = sys.argv[1:]
+info = json.loads(subprocess.check_output([daemon, "--build-info"], text=True))
+with open(manifest, "w", encoding="utf-8") as handle:
+    json.dump({
+        "app_version": version,
+        "git_commit": info.get("git_commit", ""),
+        "build_id": info.get("build_id", ""),
+        "daemon_sha256": daemon_sha,
+        "daemon_build_info": info,
+    }, handle, indent=2)
+PY
+python3 "$ROOT_DIR/scripts/release/verify_release_identity.py" \
+  --release \
+  --daemon "$DAEMON_PATH" \
+  --manifest "$MANIFEST_PATH" \
+  --app-info "$APP_DIR/Contents/Info.plist"
 
 echo "[package-flutter-macos] signing app after bundling the release daemon..."
 codesign \

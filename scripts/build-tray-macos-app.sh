@@ -67,4 +67,44 @@ cat >"$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Build identity is checked by the shared fail-closed verifier below.
+GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ -z "$GIT_COMMIT" ]]; then
+  echo "[build-tray] FATAL: git commit unavailable" >&2
+  exit 1
+fi
+TRAY_SHA="$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')"
+DAEMON_SHA="$(shasum -a 256 "$RESOURCES_DIR/p2wlan-daemon" | awk '{print $1}')"
+python3 - "$VERSION" "$GIT_COMMIT" "$TRAY_SHA" "$DAEMON_SHA" "$RESOURCES_DIR/p2wlan-daemon" "$CONTENTS_DIR/Resources/build-manifest.json" <<'PY'
+import json, subprocess, sys
+version, commit, tray_sha, daemon_sha, daemon, manifest = sys.argv[1:]
+info = json.loads(subprocess.check_output([daemon, "--build-info"], text=True))
+if not info:
+    raise SystemExit("embedded daemon returned empty build-info")
+with open(manifest, "w", encoding="utf-8") as handle:
+    json.dump({
+        "app_version": version,
+        "git_commit": commit,
+        "build_id": info.get("build_id", ""),
+        "tray_sha256": tray_sha,
+        "daemon_sha256": daemon_sha,
+        "daemon_build_info": info,
+    }, handle, indent=2)
+PY
+if [[ "$PROFILE" == "release" ]]; then
+  python3 "$ROOT_DIR/scripts/release/verify_release_identity.py" \
+    --daemon "$RESOURCES_DIR/p2wlan-daemon" \
+    --manifest "$CONTENTS_DIR/Resources/build-manifest.json" \
+    --app-info "$CONTENTS_DIR/Info.plist" \
+    --expected-commit "$GIT_COMMIT" \
+    --release
+else
+  python3 "$ROOT_DIR/scripts/release/verify_release_identity.py" \
+    --daemon "$RESOURCES_DIR/p2wlan-daemon" \
+    --manifest "$CONTENTS_DIR/Resources/build-manifest.json" \
+    --app-info "$CONTENTS_DIR/Info.plist" \
+    --expected-commit "$GIT_COMMIT"
+fi
+echo "[build-tray] app_version=$VERSION git_commit=$GIT_COMMIT daemon_sha256=$DAEMON_SHA tray_sha256=$TRAY_SHA"
+
 echo "$APP_DIR"

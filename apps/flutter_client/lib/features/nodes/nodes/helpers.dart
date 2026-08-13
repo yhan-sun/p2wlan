@@ -104,11 +104,19 @@ bool _canRunSpeedTest(PeerSnapshot peer) =>
 
 String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return strings.offline;
-  if (peer.path == 'relay') return strings.relay;
+  if (peer.path == 'relay') {
+    // Only a matching encrypted relay probe ACK is "中继已验证" (the daemon's
+    // relay_confirmed_endpoint is set solely by that ACK).
+    return peer.isRelayVerified ? strings.relay : strings.probing;
+  }
   if (peer.path == 'direct_trial' || peer.path == 'probing') {
-    return strings.probing;
+    // A candidate probe RTT is NOT a connection: show it only inside the
+    // probing label, never as the peer's latency.
+    return strings.probingWithProbeRtt(peer.probeLatencyMs);
   }
   if (peer.path == 'direct') {
+    // "直连已验证" requires the daemon's encrypted direct validation ACK.
+    if (!peer.isDirectVerified) return strings.probing;
     return switch (peer.connectionType) {
       'public_udp' => strings.isZh ? '公网直连' : 'Public direct',
       'lan' => strings.isZh ? '局域网直连' : 'LAN direct',

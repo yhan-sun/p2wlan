@@ -139,6 +139,8 @@
       "bytes_sent": 4200,
       "bytes_received": 5300,
       "relay_server": "203.0.113.10:18081",
+      "relay_confirmed_endpoint": "203.0.113.10:18081",
+      "relay_confirmed_generation": 0,
       "candidates": [],
       "direct": {
         "last_success_age_ms": null,

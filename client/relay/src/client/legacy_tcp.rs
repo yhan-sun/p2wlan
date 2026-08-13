@@ -1,5 +1,27 @@
 use super::*;
 
+/// See the endpoint-based client implementation for the lifecycle invariant:
+/// an accepted command interrupted during `write_all` is delivery-uncertain,
+/// never a safe plaintext retry.
+async fn write_all_or_shutdown<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    close_rx: &mut watch::Receiver<bool>,
+) -> std::result::Result<(), RelayError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = writer.write_all(bytes) => result.map_err(RelayError::from),
+        changed = close_rx.changed() => {
+            let _ = changed;
+            Err(RelayError::WriteUncertain(
+                "writer interrupted after command acceptance".into(),
+            ))
+        }
+    }
+}
+
 impl RelayClient {
     #[allow(dead_code)]
     pub(super) async fn connect_to_addr(
@@ -39,7 +61,10 @@ impl RelayClient {
 
         // Send Register frame immediately
         let reg_frame = Frame::register(node_id);
-        writer.write_all(&reg_frame.encode()).await?;
+        let encoded = reg_frame.encode();
+        tokio::time::timeout(config.register_timeout, writer.write_all(&encoded))
+            .await
+            .map_err(|_| RelayError::Timeout("registration write timed out".into()))??;
 
         info!(
             "Connected to relay server at {} (node_id={})",
@@ -79,47 +104,74 @@ impl RelayClient {
                                     warn!("Frame payload exceeds max limit");
                                     continue;
                                 }
-                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                if let Err(err) = write_all_or_shutdown(
+                                    &mut writer,
+                                    &frame.encode(),
+                                    &mut write_close_rx,
+                                )
+                                .await
+                                {
                                     warn!("Relay write error: {}", err);
                                     note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                                     break;
                                 }
                             }
-                            ClientCommand::SendData { dst, data } => match Frame::forward(&dst, &data) {
-                                Ok(frame) => {
-                                    if frame.payload.len() > max_payload {
-                                        warn!("Frame payload exceeds max limit");
-                                        continue;
+                            ClientCommand::SendData { dst, data, completion } => {
+                                let data_len = data.len();
+                                let result = match Frame::forward(&dst, &data) {
+                                    Ok(frame) if frame.payload.len() > max_payload => {
+                                        Err(RelayError::FrameTooLarge(frame.payload.len(), max_payload))
                                     }
-                                    if let Err(err) = writer.write_all(&frame.encode()).await {
-                                        warn!("Relay write error: {}", err);
-                                        note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
-                                        break;
+                                    Ok(frame) => {
+                                        write_all_or_shutdown(
+                                            &mut writer,
+                                            &frame.encode(),
+                                            &mut write_close_rx,
+                                        )
+                                        .await
                                     }
+                                    Err(err) => Err(err),
+                                };
+                                let failed = result.is_err();
+                                if !failed {
+                                    debug!(
+                                        event = "relay_write_completed",
+                                        peer_id = %dst,
+                                        bytes = data_len,
+                                        "relay writer completed write_all; this is not a peer-delivery acknowledgement"
+                                    );
                                 }
-                                Err(e) => {
-                                    warn!("Failed to build forward frame: {}", e);
+                                let _ = completion.send(result);
+                                if failed {
+                                    note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
+                                    break;
                                 }
-                            },
+                            }
                             ClientCommand::Ping => {
                                 let frame = Frame::ping();
-                                if let Err(err) = writer.write_all(&frame.encode()).await {
+                                if let Err(err) = write_all_or_shutdown(
+                                    &mut writer,
+                                    &frame.encode(),
+                                    &mut write_close_rx,
+                                )
+                                .await
+                                {
                                     warn!("Relay ping write error: {}", err);
                                     note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                                     break;
                                 }
                             }
-                            ClientCommand::Close => {
-                                let frame = Frame::close(CLOSE_NORMAL);
-                                let _ = writer.write_all(&frame.encode()).await;
-                                note_close_reason(&write_reason, RelayCloseReason::LocalShutdown);
-                                break;
-                            }
                         }
                     }
                     _ = keepalive.tick() => {
                         let frame = Frame::ping();
-                        if let Err(err) = writer.write_all(&frame.encode()).await {
+                        if let Err(err) = write_all_or_shutdown(
+                            &mut writer,
+                            &frame.encode(),
+                            &mut write_close_rx,
+                        )
+                        .await
+                        {
                             warn!("Relay keepalive write error: {}", err);
                             note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                             break;
@@ -272,11 +324,18 @@ impl RelayClient {
                         let frame = Frame::new(MSG_RECEIVED, payload.to_vec());
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
+                                // Preserve every encrypted data frame while
+                                // applying bounded backpressure.  A
+                                // try_send/full close here silently discards
+                                // relay ingress during a burst; the reader
+                                // must wait for the dataplane consumer just
+                                // like the TLS client does.
                                 if msg_tx_clone
-                                    .try_send(RelayMessage::Data {
+                                    .send(RelayMessage::Data {
                                         from_node: src.to_string(),
                                         data: data.to_vec(),
                                     })
+                                    .await
                                     .is_err()
                                 {
                                     warn!("msg_tx full or closed, closing connection");
@@ -363,6 +422,6 @@ impl RelayClient {
             }
         }
 
-        Ok((Self { cmd_tx }, msg_rx))
+        Ok((Self { cmd_tx, close_tx }, msg_rx))
     }
 }

@@ -68,6 +68,40 @@ enum OfferIngressVerdict {
 }
 
 impl Daemon {
+    /// A same-node remote restart is identified by the encoded candidate
+    /// generation carried in its offer. Keep this narrow: endpoint metadata is
+    /// also changed by ordinary NAT churn and is not safe as a lifecycle
+    /// signal. The arbiter covers the short state boundary; UDP cleanup then
+    /// invalidates late probes and dynamic socket adoption.
+    async fn reset_peer_for_remote_incarnation_if_needed(
+        &self,
+        peer_id: &str,
+        candidate_generation: u64,
+    ) -> bool {
+        let handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
+        let changed = self
+            .peers
+            .reset_peer_session_if_remote_incarnation_changed(
+                peer_id,
+                candidate_generation,
+                "remote_incarnation_changed",
+            )
+            .await;
+        if !changed {
+            drop(handshake_guard);
+            return false;
+        }
+        self.transport.remove_session(peer_id).await;
+        self.pending_handshakes.lock().await.clear_peer(peer_id);
+        drop(handshake_guard);
+        self.punch_attempts.cancel(peer_id);
+        if let Some(udp) = self.udp_transport.read().await.clone() {
+            udp.cleanup_peer_lifecycle(peer_id, "remote_incarnation_changed", false)
+                .await;
+        }
+        true
+    }
+
     /// Decide whether an offer may touch candidate-plane state.
     ///
     /// Runs before `fresh_prediction_transaction` and before the responder
@@ -516,6 +550,11 @@ impl Daemon {
                 offer = newest;
                 continue;
             }
+            self.reset_peer_for_remote_incarnation_if_needed(
+                &offer.from_node_id,
+                offer.candidate_generation,
+            )
+            .await;
             // The offer-ingress verdict runs before any candidate-plane
             // state: duplicates and rate-limited retransmissions never apply
             // candidates, never run a fresh transaction and never trigger a
@@ -1029,6 +1068,7 @@ impl Daemon {
                 }
 
                 ControlEvent::PeerJoined(peer_info) => {
+                    let peer_join_started = std::time::Instant::now();
                     info!(
                         "Peer joined: {} ({})",
                         peer_info.node_id, peer_info.virtual_ip
@@ -1043,6 +1083,20 @@ impl Daemon {
                         )),
                     );
                     self.peers.add_peer(&peer_info).await;
+                    let peer_state_elapsed = peer_join_started.elapsed();
+                    if peer_state_elapsed >= Duration::from_millis(250) {
+                        warn!(
+                            "PeerJoined state install was slow: peer={} elapsed_ms={}",
+                            peer_info.node_id,
+                            peer_state_elapsed.as_millis()
+                        );
+                    } else {
+                        debug!(
+                            "PeerJoined state installed: peer={} elapsed_ms={}",
+                            peer_info.node_id,
+                            peer_state_elapsed.as_millis()
+                        );
+                    }
 
                     if peer_info.online {
                         if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
@@ -1055,6 +1109,11 @@ impl Daemon {
                             .reserve_event_initiator_handshake(&peer_info.node_id)
                             .await
                         {
+                            debug!(
+                                "PeerJoined handshake reserved: peer={} elapsed_ms={}",
+                                peer_info.node_id,
+                                peer_join_started.elapsed().as_millis()
+                            );
                             let peer_info = peer_info.clone();
                             slow_work.push(Box::pin(async move {
                                 daemon
@@ -1072,6 +1131,11 @@ impl Daemon {
                                 )
                                 .await;
                         }
+                        debug!(
+                            "PeerJoined event complete: peer={} elapsed_ms={}",
+                            peer_info.node_id,
+                            peer_join_started.elapsed().as_millis()
+                        );
                     } else {
                         debug!(
                             "Peer {} is currently offline; keeping it in diagnostics without starting traversal",
@@ -1098,6 +1162,9 @@ impl Daemon {
                                 .clear_peer(&peer_info.node_id);
                         }
                         self.punch_attempts.cancel(&peer_info.node_id);
+                        self.peers
+                            .clear_fresh_mapping(&peer_info.node_id, "peer_offline")
+                            .await;
                         if let Some(udp) = self.udp_transport.read().await.clone() {
                             // One atomic lifecycle cleanup under the peer's
                             // adoption lock: the pending probes drop and the
@@ -1160,27 +1227,14 @@ impl Daemon {
                             .await;
                         }
                     } else if update.endpoint_changed {
-                        // The peer moved to a different public endpoint:
-                        // in-flight punch work aimed at the old endpoint must
-                        // be cancelled so no stale task keeps sending toward
-                        // it.  The LOCAL fresh-mapping model is deliberately
-                        // KEPT: it predicts THIS side's own NAT port sequence
-                        // (measured against the STUN observers), which is
-                        // independent of the peer's endpoint.  Field evidence
-                        // (v0.1.116 acceptance): the Air side's fresh
-                        // generation was invalidated by the Mini's signaled
-                        // endpoint churn (`fresh_mapping_invalidated
-                        // reason=endpoint_changed`), aborting its 96-port
-                        // prediction punch after 8 probes and leaving only a
-                        // slow single-candidate retry — a cold-start round
-                        // that then timed out at 102 s.  The old dynamic
-                        // socket itself keeps working as the peer's current
-                        // mapping until a new generation commits or
-                        // peer-level cleanup runs.
+                        // Endpoint metadata changes are normal NAT/candidate
+                        // churn.  They must not tear down a confirmed relay or
+                        // WireGuard session. A same-node restart is reset only
+                        // when a later peer offer carries a different encoded
+                        // candidate-generation incarnation.
                         self.punch_attempts.cancel(&peer_info.node_id);
                         if let Some(udp) = self.udp_transport.read().await.clone() {
-                            udp.clear_pending_probes_for_peer(&peer_info.node_id)
-                                .await;
+                            udp.clear_pending_probes_for_peer(&peer_info.node_id).await;
                         }
                     }
                     let was_offline = previous.as_ref().is_some_and(|peer| !peer.online);
@@ -1335,6 +1389,11 @@ impl Daemon {
                         }
                         continue;
                     }
+                    self.reset_peer_for_remote_incarnation_if_needed(
+                        &from_node_id,
+                        candidate_generation,
+                    )
+                    .await;
                     // Fresh-prediction verification happens BEFORE any
                     // candidate state is touched: a superseded prediction
                     // must not pollute the candidate set, while the handshake

@@ -45,10 +45,10 @@ async fn test_send_data_between_clients() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut alice, mut rx_a) = RelayClient::connect(&addr.to_string(), "alice")
+    let (alice, mut rx_a) = RelayClient::connect(&addr.to_string(), "alice")
         .await
         .unwrap();
-    let (mut bob, mut rx_b) = RelayClient::connect(&addr.to_string(), "bob")
+    let (bob, mut rx_b) = RelayClient::connect(&addr.to_string(), "bob")
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn test_send_to_nonexistent_peer() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "sender")
+    let (client, mut rx) = RelayClient::connect(&addr.to_string(), "sender")
         .await
         .unwrap();
 
@@ -117,7 +117,7 @@ async fn test_ping_pong() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "pinger")
+    let (client, mut rx) = RelayClient::connect(&addr.to_string(), "pinger")
         .await
         .unwrap();
 
@@ -138,7 +138,7 @@ async fn test_large_data() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut sender, _rx_s) = RelayClient::connect(&addr.to_string(), "sender")
+    let (sender, _rx_s) = RelayClient::connect(&addr.to_string(), "sender")
         .await
         .unwrap();
     let (_receiver, mut rx_r) = RelayClient::connect(&addr.to_string(), "receiver")
@@ -178,7 +178,7 @@ async fn test_close_connection() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client, _rx) = RelayClient::connect(&addr.to_string(), "closer")
+    let (client, _rx) = RelayClient::connect(&addr.to_string(), "closer")
         .await
         .unwrap();
 
@@ -189,15 +189,65 @@ async fn test_close_connection() {
     server.shutdown().await;
 }
 
+/// Once a data command has been accepted by the local queue, aborting the
+/// connection must wake a blocked `write_all` and classify the packet as
+/// delivery-uncertain. The old writer must not resume later and emit the
+/// stale ciphertext after a replacement connection has started.
+#[tokio::test]
+async fn abort_interrupts_blocked_write_without_late_completion() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_stream, mut server_stream) = tokio::io::duplex(1024);
+    let server = tokio::spawn(async move {
+        let mut header = [0u8; FRAME_HEADER_SIZE];
+        server_stream.read_exact(&mut header).await.unwrap();
+        let payload_len = u16::from_be_bytes([header[6], header[7]]) as usize;
+        let mut payload = vec![0u8; payload_len];
+        server_stream.read_exact(&mut payload).await.unwrap();
+        server_stream
+            .write_all(&Frame::registered("blocked-writer").encode())
+            .await
+            .unwrap();
+        // Do not drain the following large forward frame. Its write must
+        // remain pending until the client-side abort signal wins the select.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let config = RelayClientConfig {
+        register_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let (client, _rx) =
+        RelayClient::finish_connect_with_stream(client_stream, "blocked-writer", config)
+            .await
+            .unwrap();
+    let abort_handle = client.clone();
+    let send_task =
+        tokio::spawn(async move { client.send_data("peer", &vec![0xA5; 60_000]).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    abort_handle.abort();
+    let result = tokio::time::timeout(Duration::from_secs(1), send_task)
+        .await
+        .expect("aborting a blocked write must wake send_data")
+        .expect("send task must not panic")
+        .expect_err("a blocked write interrupted by abort cannot be successful");
+    assert!(
+        matches!(result, RelayError::WriteUncertain(_)),
+        "{result:?}"
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_bidirectional_stream() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut a, mut rxa) = RelayClient::connect(&addr.to_string(), "streamA")
+    let (a, mut rxa) = RelayClient::connect(&addr.to_string(), "streamA")
         .await
         .unwrap();
-    let (mut b, mut rxb) = RelayClient::connect(&addr.to_string(), "streamB")
+    let (b, mut rxb) = RelayClient::connect(&addr.to_string(), "streamB")
         .await
         .unwrap();
 
@@ -471,7 +521,7 @@ async fn relay_disconnect_reason_is_classified() {
         .await
         .unwrap();
     let addr = server.addr;
-    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "local-node")
+    let (client, mut rx) = RelayClient::connect(&addr.to_string(), "local-node")
         .await
         .unwrap();
     client.close().await.unwrap();

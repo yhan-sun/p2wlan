@@ -4,7 +4,7 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
-    use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_RELAY_UNAVAILABLE};
+    use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_UNAVAILABLE};
 
     #[test]
     fn cors_origin_is_restricted_to_local_dev_server() {
@@ -43,6 +43,14 @@ mod tests {
             409
         );
         assert_eq!(speedtest_error_status("download speedtest failed"), 503);
+    }
+
+    #[test]
+    fn diagnostics_snapshot_timeout_is_structured_and_fail_closed() {
+        let body: serde_json::Value =
+            serde_json::from_str(&diagnostics_snapshot_timeout_body()).unwrap();
+        assert_eq!(body["reason_code"], "status_snapshot_timeout");
+        assert_eq!(body["error"], "diagnostics snapshot timed out");
     }
 
     #[tokio::test]
@@ -195,7 +203,7 @@ mod tests {
             .current_path_selection
             .as_ref()
             .expect("current path selection should be included in /status");
-        assert_eq!(current_path.reason_code, REASON_PATH_RELAY_UNAVAILABLE);
+        assert_eq!(current_path.reason_code, REASON_PATH_UNAVAILABLE);
 
         let mut scoped_stream = TcpStream::connect(addr).await.unwrap();
         scoped_stream
@@ -215,6 +223,25 @@ mod tests {
         assert_eq!(scoped.network_peer_count, 0);
         assert!(scoped.captured_at_ms > 0);
         assert_eq!(scoped.peer.unwrap().node_id, "node-b");
+
+        let mut runtime_stream = TcpStream::connect(addr).await.unwrap();
+        runtime_stream
+            .write_all(b"GET /status.runtime HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut runtime_response = String::new();
+        runtime_stream
+            .read_to_string(&mut runtime_response)
+            .await
+            .unwrap();
+        assert!(runtime_response.starts_with("HTTP/1.1 200 OK"));
+        let runtime_body = runtime_response.split("\r\n\r\n").nth(1).unwrap();
+        let runtime: RuntimeDiagnosticsSnapshot = serde_json::from_str(runtime_body).unwrap();
+        assert_eq!(runtime.process_id, std::process::id());
+        assert_eq!(runtime.node_id, "node-a");
+        assert_eq!(runtime.virtual_ip, "10.20.0.1");
+        assert_eq!(runtime.network_id, "net1");
+        assert!(runtime.uptime_ms > 0);
 
         let mut shutdown_stream = TcpStream::connect(addr).await.unwrap();
         shutdown_stream

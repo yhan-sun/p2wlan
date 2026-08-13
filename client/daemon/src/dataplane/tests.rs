@@ -59,6 +59,79 @@ use std::net::Ipv4Addr;
     }
 
     #[tokio::test]
+    async fn does_not_lose_tun_packets_when_inbound_work_is_ready() {
+        const BURST: usize = 256;
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default").unwrap(),
+        ));
+        peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
+
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (mut dataplane, mut outbound_rx, inbound_tx) =
+            DataPlane::new_bidirectional(tun, peers);
+        let task = tokio::spawn(async move { dataplane.run().await });
+
+        // Keep the inbound branch continuously ready while the TUN side is
+        // under load.  Before the read/route split, cancellation after a TUN
+        // recv but before peer resolution could silently consume one packet.
+        let drain_ctrl = ctrl.clone();
+        let drain_task = tokio::spawn(async move {
+            for _ in 0..BURST {
+                timeout(Duration::from_secs(1), drain_ctrl.recv_written())
+                    .await
+                    .expect("inbound packet was not written to TUN")
+                    .expect("mock TUN write side closed");
+            }
+        });
+        let inbound_task = tokio::spawn(async move {
+            for id in 0..BURST {
+                let packet = Ipv4Packet::build_icmp_echo_request(
+                    Ipv4Addr::new(10, 20, 0, 2),
+                    Ipv4Addr::new(10, 20, 0, 1),
+                    0x5000 + id as u16,
+                    id as u16,
+                    b"inbound",
+                );
+                inbound_tx
+                    .send(InboundPacket {
+                        peer_id: "peer-b".to_string(),
+                        packet,
+                    })
+                    .await
+                    .expect("inbound channel closed");
+            }
+        });
+
+        let expected: Vec<Vec<u8>> = (0..BURST)
+            .map(|id| {
+                Ipv4Packet::build_icmp_echo_request(
+                    Ipv4Addr::new(10, 20, 0, 1),
+                    Ipv4Addr::new(10, 20, 0, 2),
+                    0x4000 + id as u16,
+                    id as u16,
+                    b"outbound",
+                )
+            })
+            .collect();
+        for packet in &expected {
+            ctrl.inject(packet.clone()).await.unwrap();
+        }
+
+        for expected_packet in expected {
+            let routed = timeout(Duration::from_secs(2), outbound_rx.recv())
+                .await
+                .expect("TUN packet was silently lost")
+                .expect("outbound channel closed");
+            assert_eq!(routed.peer_id, "peer-b");
+            assert_eq!(routed.packet, expected_packet);
+        }
+
+        inbound_task.await.unwrap();
+        drain_task.await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn drops_packet_for_unknown_virtual_ip() {
         let peers = Arc::new(PeerManager::new(
             Config::generate_default("http://ctrl.test", "default").unwrap(),
@@ -90,7 +163,7 @@ use std::net::Ipv4Addr;
         ));
         peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
 
-        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
         let (mut dataplane, _outbound_rx, inbound_tx) =
             DataPlane::new_bidirectional(tun, peers.clone());
         let task = tokio::spawn(async move { dataplane.run().await });
@@ -130,7 +203,7 @@ use std::net::Ipv4Addr;
         ));
         peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
 
-        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
         let (mut dataplane, _outbound_rx, inbound_tx) =
             DataPlane::new_bidirectional(tun, peers.clone());
         let task = tokio::spawn(async move { dataplane.run().await });
@@ -167,7 +240,7 @@ use std::net::Ipv4Addr;
         ));
         peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
 
-        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
         let (dataplane, _outbound_rx, inbound_tx) =
             DataPlane::new_bidirectional(tun, peers.clone());
         let mut dataplane = dataplane.with_overlay_cidr("10.20.0.0/16");
@@ -211,7 +284,7 @@ use std::net::Ipv4Addr;
         ));
         peers.add_peer(&peer("peer-b", "10.20.0.2")).await;
 
-        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
         let (dataplane, _outbound_rx, inbound_tx) =
             DataPlane::new_bidirectional(tun, peers.clone());
         let mut dataplane = dataplane.with_overlay_cidr("10.20.0.0/16");
@@ -325,7 +398,7 @@ use std::net::Ipv4Addr;
             }],
         })));
 
-        let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
+        let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.1");
         let (dataplane, _outbound_rx, inbound_tx) =
             DataPlane::new_bidirectional(tun, peers.clone());
         let mut dataplane = dataplane.with_acl(acl, "local-node");

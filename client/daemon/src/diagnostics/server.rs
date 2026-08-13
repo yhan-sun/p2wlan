@@ -117,10 +117,19 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
                     .await?;
                 return Ok(());
             }
-            let snapshot = build_peer_scoped_snapshot(context, peer_id).await;
-            let status = if snapshot.peer.is_some() { 200 } else { 404 };
-            let body = serde_json::to_string_pretty(&snapshot)?;
-            write_response(&mut stream, status, "application/json", &body, cors_origin).await?;
+            match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_peer_scoped_snapshot(context, peer_id)).await {
+                Ok(snapshot) => {
+                    let status = if snapshot.peer.is_some() { 200 } else { 404 };
+                    let body = serde_json::to_string_pretty(&snapshot)?;
+                    write_response(&mut stream, status, "application/json", &body, cors_origin)
+                        .await?;
+                }
+                Err(_) => {
+                    let body = diagnostics_snapshot_timeout_body();
+                    write_response(&mut stream, 503, "application/json", &body, cors_origin)
+                        .await?;
+                }
+            }
             return Ok(());
         }
     }
@@ -133,14 +142,29 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let body = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "name": "p2wlan-daemon",
+                "build": crate::build_info::current(),
             })
             .to_string();
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
-        ("GET", "/status") => {
-            let snapshot = build_snapshot(context).await;
+        ("GET", "/status.runtime") => {
+            let snapshot = build_runtime_snapshot(context).await;
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("GET", "/status") => {
+            match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_snapshot(context)).await {
+                Ok(snapshot) => {
+                    let body = serde_json::to_string_pretty(&snapshot)?;
+                    write_response(&mut stream, 200, "application/json", &body, cors_origin)
+                        .await?;
+                }
+                Err(_) => {
+                    let body = diagnostics_snapshot_timeout_body();
+                    write_response(&mut stream, 503, "application/json", &body, cors_origin)
+                        .await?;
+                }
+            }
         }
         ("POST", "/speedtest") => {
             match run_speedtest_from_query(context, query).await {
@@ -175,6 +199,14 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
     }
 
     Ok(())
+}
+
+fn diagnostics_snapshot_timeout_body() -> String {
+    serde_json::json!({
+        "error": "diagnostics snapshot timed out",
+        "reason_code": "status_snapshot_timeout"
+    })
+    .to_string()
 }
 
 fn split_request_target(target: &str) -> (&str, Option<&str>) {

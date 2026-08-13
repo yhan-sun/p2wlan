@@ -26,7 +26,10 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         )
         .await;
     let mut stats = PeerManagerStats::from_diagnostics(&peers);
-    stats.outbound_drops = context.peers.outbound_drop_stats().await;
+    let outbound_loss = context.peers.outbound_loss_stats().await;
+    stats.outbound_drops = outbound_loss.drops;
+    stats.outbound_send_failures = outbound_loss.send_failures;
+    stats.outbound_loss_events = outbound_loss.events;
     let candidate_snapshot = context.candidate_snapshot.read().await.clone();
     let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) = candidate_snapshot
         .map(|snapshot| (snapshot.candidates, Some(snapshot.version), Some(snapshot.hash)))
@@ -38,7 +41,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
-        network_generation: context.peers.current_network_generation().await,
+        network_generation: context.peers.current_network_generation_sync(),
         uptime_ms: context.timeline.uptime_ms(),
         protocol: ProtocolDiagnostics::current(),
         mtu: MtuDiagnostics::from_runtime(
@@ -105,5 +108,18 @@ async fn build_peer_scoped_snapshot(
         network_peer_count,
         captured_at_ms,
         peer,
+    }
+}
+
+async fn build_runtime_snapshot(context: DiagnosticsContext) -> RuntimeDiagnosticsSnapshot {
+    RuntimeDiagnosticsSnapshot {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        process_id: std::process::id(),
+        node_id: context.config.node.node_id.clone(),
+        virtual_ip: context.config.network.virtual_ip.clone(),
+        network_id: context.config.network.network_id.clone(),
+        network_generation: context.peers.current_network_generation_sync(),
+        uptime_ms: context.timeline.uptime_ms(),
+        relay_connected: context.relay_transport.read().await.is_some(),
     }
 }

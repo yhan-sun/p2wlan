@@ -186,7 +186,7 @@ mod tests {
         assert!(!json.contains("fallback_timeout_ms"));
         assert!(json.contains("\"proxy_mode\":\"direct\""));
         assert!(json.contains("\"overlay_any_path\":false"));
-        assert_eq!(config.relay.relay_startup_timeout_ms, 5000);
+        assert_eq!(config.relay.relay_startup_timeout_ms, 3000);
     }
 
     #[test]

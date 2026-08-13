@@ -16,6 +16,13 @@ assert SPEC.loader is not None
 NAT_SIM = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NAT_SIM)
 
+OBSERVABILITY_PATH = Path(__file__).with_name("validate_observability.py")
+OBS_SPEC = importlib.util.spec_from_file_location("p2wlan_observability", OBSERVABILITY_PATH)
+assert OBS_SPEC is not None
+assert OBS_SPEC.loader is not None
+OBSERVABILITY = importlib.util.module_from_spec(OBS_SPEC)
+OBS_SPEC.loader.exec_module(OBSERVABILITY)
+
 
 class CaptureProtocol(asyncio.DatagramProtocol):
     def __init__(self):
@@ -60,6 +67,46 @@ class StunEncodingTests(unittest.TestCase):
         self.assertIsNone(NAT_SIM.parse_binding_request(wrong_cookie))
         wrong_type = struct.pack("!HHI", NAT_SIM.BINDING_RESPONSE, 0, NAT_SIM.MAGIC_COOKIE) + transaction_id
         self.assertIsNone(NAT_SIM.parse_binding_request(wrong_type))
+
+
+class ObservabilityFailClosedTests(unittest.TestCase):
+    def test_missing_status_schema_is_rejected(self):
+        with self.assertRaises(ValueError):
+            OBSERVABILITY.validate_status({})
+        with self.assertRaises(ValueError):
+            OBSERVABILITY.validate_status(
+                {"stats": {"outbound_drops": {}}, "connection_timeline": {}}
+            )
+
+    def test_missing_metrics_schema_is_rejected(self):
+        with self.assertRaises(ValueError):
+            OBSERVABILITY.validate_metrics({"forwarded_frames_total": 0})
+        with self.assertRaises(ValueError):
+            OBSERVABILITY.validate_metrics(
+                {
+                    "active_connections": 0,
+                    "registered_peers": 0,
+                    "forwarded_frames_total": 0,
+                    "forward_errors_total": 0,
+                    "source_key": "must-not-be-exposed",
+                }
+            )
+
+    def test_drop_counters_are_packets_and_bytes_not_reason_cardinality(self):
+        value = {
+            "stats": {
+                "outbound_drops": {
+                    "queue_full": {"packets": 3, "bytes": 300},
+                    "deadline": {"packets": 2, "bytes": 200},
+                },
+                "outbound_loss_events": [],
+            },
+            "connection_timeline": {"correlation_id": "node-1", "events": []},
+        }
+        validated = OBSERVABILITY.validate_status(value)
+        drops = validated["stats"]["outbound_drops"]
+        self.assertEqual(sum(item["packets"] for item in drops.values()), 5)
+        self.assertEqual(sum(item["bytes"] for item in drops.values()), 500)
 
 
 class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):

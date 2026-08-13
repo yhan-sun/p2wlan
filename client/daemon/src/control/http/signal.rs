@@ -133,6 +133,30 @@ pub(super) async fn send_prepared_signal(
         }
     }
 
+    // This is a server-side queue receipt, not a peer-delivery proof.  Keep it
+    // in the log so a later receiver-side `signal_delivery_enqueued` event can
+    // be correlated without logging handshake bytes, credentials, or tickets.
+    if let Some(receipt) = body.signal.as_ref() {
+        let expected_to = payload
+            .get("to_node_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        let received_to = receipt.to_node_id.as_deref().unwrap_or("<missing>");
+        if receipt.to_node_id.as_deref().is_some_and(|to| to != expected_to) {
+            return Err(DaemonError::ControlPlane(format!(
+                "control signal receipt target mismatch: expected {expected_to}, got {received_to}"
+            )));
+        }
+        debug!(
+            "Control signal queued receipt id={:?} from={:?} to={:?} type={:?} signal_seq={:?}",
+            receipt.id,
+            receipt.from_node_id,
+            receipt.to_node_id,
+            receipt.signal_type,
+            receipt.signal_seq,
+        );
+    }
+
     Ok(())
 }
 
@@ -188,28 +212,57 @@ pub(super) async fn poll_signals(
         );
     }
 
-    // Every signal that was delivered to us in ACK mode must be acknowledged
-    // once it was fully decoded and enqueued; duplicates (a redelivered batch
-    // whose ACK was lost) are acknowledged too, so a row is never redelivered
-    // forever.
+    // Every signal that was delivered to us in ACK mode is acknowledged only
+    // after it was validated and either enqueued or classified as a terminal
+    // malformed/unsupported row.  A target mismatch or a failed local enqueue
+    // is deliberately left leased so the control plane redelivers it instead
+    // of turning a routing/channel failure into silent loss.
     let mut acks: Vec<SignalAckRequest> = Vec::new();
     let mut seen_any_delivery = false;
     let mut dedup = recent_signal_ids.lock().await;
     for signal in body.signals {
-        if let (Some(signal_id), Some(delivery_token)) =
-            (signal.id.as_deref(), signal.delivery_token.as_deref())
+        let delivery_ack = match (signal.id.as_deref(), signal.delivery_token.as_deref()) {
+            (Some(signal_id), Some(delivery_token)) => {
+                seen_any_delivery = true;
+                Some(SignalAckRequest {
+                    id: signal_id.to_string(),
+                    delivery_token: delivery_token.to_string(),
+                })
+            }
+            _ => None,
+        };
+
+        debug!(
+            "Control signal delivery received id={:?} from={} to={:?} type={} signal_seq={:?}",
+            signal.id,
+            signal.from_node_id,
+            signal.to_node_id,
+            signal.signal_type,
+            signal.signal_seq,
+        );
+
+        if signal
+            .to_node_id
+            .as_deref()
+            .is_some_and(|to_node_id| to_node_id != self_node_id)
         {
-            seen_any_delivery = true;
-            acks.push(SignalAckRequest {
-                id: signal_id.to_string(),
-                delivery_token: delivery_token.to_string(),
-            });
+            warn!(
+                "Rejecting control signal delivery id={:?}: target mismatch expected={} got={:?} reason_code=signal_wrong_target",
+                signal.id, self_node_id, signal.to_node_id
+            );
+            // Do not ACK a row that the server claims belongs to another
+            // device.  Its lease will expire and preserve evidence of the
+            // routing defect for the control-plane operator.
+            continue;
         }
         if signal.protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
             warn!(
                 "Skipping unsupported signal protocol_version={} from {} type={}",
                 signal.protocol_version, signal.from_node_id, signal.signal_type
             );
+            if let Some(ack) = delivery_ack {
+                acks.push(ack);
+            }
             continue;
         }
         if let Some(signal_id) = signal.id.as_deref() {
@@ -222,11 +275,10 @@ pub(super) async fn poll_signals(
                     "Skipping duplicate signal {signal_id} from {} (redelivered batch); already processed",
                     signal.from_node_id
                 );
+                if let Some(ack) = delivery_ack {
+                    acks.push(ack);
+                }
                 continue;
-            }
-            dedup.push_back(signal_id.to_string());
-            while dedup.len() > MAX_RECENT_SIGNAL_IDS {
-                dedup.pop_front();
             }
         }
         let punch_at_ms =
@@ -248,6 +300,9 @@ pub(super) async fn poll_signals(
                 "Skipping signal from {} type={}: handshake hex has an odd length",
                 signal.from_node_id, signal.signal_type
             );
+            if let Some(ack) = delivery_ack {
+                acks.push(ack);
+            }
             continue;
         } else {
             match hex::decode(signal.handshake.trim()) {
@@ -257,19 +312,24 @@ pub(super) async fn poll_signals(
                         "Skipping signal from {} type={}: handshake hex decode failed: {error}",
                         signal.from_node_id, signal.signal_type
                     );
+                    if let Some(ack) = delivery_ack {
+                        acks.push(ack);
+                    }
                     continue;
                 }
             }
         };
 
-        match signal.signal_type.as_str() {
+        let signal_id = signal.id.clone();
+        let from_node_id = signal.from_node_id.clone();
+        let enqueued = match signal.signal_type.as_str() {
             // `peer_offer_fresh` is the independent queue key for fresh-mapping
             // prediction advertisements: it is delivered in send order and an
             // ordinary `peer_offer` can never overwrite it server-side.  The
             // event handler re-verifies the fresh label and the per-peer
             // high-water before applying anything.
             "peer_offer" | "peer_offer_fresh" => {
-                let _ = event_tx.send(ControlEvent::PeerOffer {
+                event_tx.send(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -281,10 +341,10 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                });
+                }).is_ok()
             }
             "peer_answer" => {
-                let _ = event_tx.send(ControlEvent::PeerAnswer {
+                event_tx.send(ControlEvent::PeerAnswer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -296,25 +356,51 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                });
+                }).is_ok()
             }
             "peer_reflexive" => {
                 if let Some(observed_endpoint) = peer_reflexive_endpoint_from_signal(&signal) {
-                    let _ = event_tx.send(ControlEvent::PeerReflexive {
+                    event_tx.send(ControlEvent::PeerReflexive {
                         from_node_id: signal.from_node_id,
                         observed_endpoint,
                         punch_at_ms,
-                    });
+                    }).is_ok()
                 } else {
                     warn!(
                         "Ignoring peer_reflexive signal from {}; missing observed endpoint",
                         signal.from_node_id
                     );
+                    true
                 }
             }
             other => {
                 warn!("Ignoring unsupported signal type from control plane: {other}");
+                true
             }
+        };
+        if enqueued {
+            if let Some(signal_id) = signal_id.as_deref() {
+                dedup.push_back(signal_id.to_string());
+                while dedup.len() > MAX_RECENT_SIGNAL_IDS {
+                    dedup.pop_front();
+                }
+            }
+            debug!(
+                "Control signal delivery enqueued id={:?} from={} to={} type={} signal_seq={:?}",
+                signal_id,
+                from_node_id,
+                self_node_id,
+                signal.signal_type,
+                signal.signal_seq,
+            );
+            if let Some(ack) = delivery_ack {
+                acks.push(ack);
+            }
+        } else {
+            warn!(
+                "Control signal delivery could not enqueue id={:?} from={} reason_code=local_event_channel_closed",
+                signal_id, from_node_id
+            );
         }
     }
     drop(dedup);
@@ -428,6 +514,18 @@ pub(super) const CANDIDATE_GENERATION_INCARNATION_BITS: u64 = 41;
 /// reached and further generations are refused.
 pub(super) const CANDIDATE_GENERATION_COUNTER_BITS: u64 = 63 - 1 - CANDIDATE_GENERATION_INCARNATION_BITS;
 pub(super) const CANDIDATE_GENERATION_COUNTER_MASK: u64 = (1u64 << CANDIDATE_GENERATION_COUNTER_BITS) - 1;
+
+/// Return the daemon-incarnation component of an encoded candidate
+/// generation. Legacy generations have no restart identity and must not be
+/// used to infer a restart from ordinary endpoint churn.
+pub(crate) fn candidate_generation_incarnation(generation: u64) -> Option<u64> {
+    if generation & CANDIDATE_GENERATION_INCARNATION_FLAG == 0 {
+        return None;
+    }
+    let incarnation =
+        (generation & (CANDIDATE_GENERATION_INCARNATION_FLAG - 1)) >> CANDIDATE_GENERATION_COUNTER_BITS;
+    (incarnation != 0).then_some(incarnation)
+}
 
 /// Why no candidate generation could be produced for this signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

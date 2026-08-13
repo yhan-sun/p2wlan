@@ -651,6 +651,7 @@ pub(super) enum OutboundProbeAdmission {
     HeartbeatBudgetLimited,
 }
 
+#[allow(dead_code)]
 pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission) -> &'static str {
     match admission {
         OutboundProbeAdmission::Accepted => "accepted",

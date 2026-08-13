@@ -354,12 +354,37 @@ fn relay_first_defaults_and_probe_budgets_are_stable() {
     assert_eq!(config.network.udp_bind, "0.0.0.0:0");
     assert!(!config.network.socket_pool_enabled);
     assert_eq!(config.network.socket_pool_size, 1);
-    assert_eq!(config.relay.relay_startup_timeout_ms, 5000);
+    assert_eq!(config.relay.relay_startup_timeout_ms, 3000);
 
     assert_eq!(crate::peer::PREDICTED_PROBE_BUDGET_PER_CYCLE, 96);
     assert_eq!(crate::peer::BIRTHDAY_PROBE_BUDGET_PER_CYCLE, 192);
     assert_eq!(crate::peer::BIRTHDAY_PROBE_SUCCESS_BUDGET_PER_CYCLE, 256);
     assert_eq!(crate::peer::BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE, 192);
+}
+
+#[test]
+fn relay_first_candidate_shortcut_never_waits_for_stun_when_relay_is_ready() {
+    let cached = vec!["203.0.113.10:41000".to_string()];
+    let sources = HashMap::from([(
+        "203.0.113.10:41000".to_string(),
+        "stun_observed".to_string(),
+    )]);
+
+    assert_eq!(
+        relay_first_candidate_shortcut(cached.clone(), sources.clone(), true),
+        Some((cached, sources)),
+        "a committed snapshot must be used without a second refresh"
+    );
+    assert_eq!(
+        relay_first_candidate_shortcut(Vec::new(), HashMap::new(), true),
+        Some((Vec::new(), HashMap::new())),
+        "relay availability permits an immediate empty-candidate encrypted handshake"
+    );
+    assert_eq!(
+        relay_first_candidate_shortcut(Vec::new(), HashMap::new(), false),
+        None,
+        "without relay or candidates the caller must keep the bounded race alive"
+    );
 }
 
 #[test]

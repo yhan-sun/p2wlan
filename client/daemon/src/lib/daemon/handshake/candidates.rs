@@ -51,6 +51,7 @@ impl Daemon {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn local_candidate_set_for_signal(
         &self,
         reason: &str,
@@ -537,4 +538,26 @@ impl Daemon {
     }
 
 
+}
+
+/// Select the candidate payload for the relay-first handshake fast path.
+///
+/// A committed candidate snapshot is safe to signal immediately.  When no
+/// snapshot exists, an already connected relay still permits an encrypted
+/// WireGuard session to be established with an empty candidate list; later
+/// candidate refreshes are a Direct-upgrade concern.  `None` means the caller
+/// should wait briefly for the first candidate snapshot while relay selection
+/// is still racing startup.
+pub(crate) fn relay_first_candidate_shortcut(
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    relay_available: bool,
+) -> Option<(Vec<String>, HashMap<String, String>)> {
+    if !candidates.is_empty() {
+        Some((candidates, candidate_sources))
+    } else if relay_available {
+        Some((Vec::new(), HashMap::new()))
+    } else {
+        None
+    }
 }

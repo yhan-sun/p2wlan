@@ -1,11 +1,16 @@
 #[derive(Parser, Debug, Clone)]
 #[command(name = "p2wlan-daemon")]
-#[command(version)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (git ", env!("P2WLAN_GIT_COMMIT"), ")"))]
 #[command(about = "P2WLAN client daemon", long_about = None)]
 struct Cli {
     /// Run with default config or specify config file path
     #[arg(long, default_value = "p2wlan-config.json")]
     config: PathBuf,
+
+    /// Print the full build identity (git commit, build id, binary SHA-256)
+    /// as JSON and exit without touching config or state.
+    #[arg(long)]
+    build_info: bool,
 
     /// Generate a new config
     #[arg(long)]
@@ -24,8 +29,14 @@ struct Cli {
     status: bool,
 
     /// Override auth token
-    #[arg(long)]
+    #[arg(long, conflicts_with = "token-file")]
     token: Option<String>,
+
+    /// Read the auth token from a permission-protected file instead of
+    /// exposing it in the daemon command line.  Intended for service
+    /// managers and the audited dual-end harness.
+    #[arg(long, name = "token-file", conflicts_with = "token")]
+    token_file: Option<PathBuf>,
 
     /// Override interface name
     #[arg(long)]
@@ -121,13 +132,32 @@ struct Cli {
     #[arg(long, name = "diagnostics-disable")]
     diagnostics_disable: bool,
 
-    /// Prefer relay path instead of direct UDP
-    #[arg(long, name = "prefer-relay")]
+    /// Start business traffic on the confirmed relay while Direct keeps
+    /// probing in the background and may be promoted after encrypted ACK.
+    #[arg(
+        long,
+        name = "prefer-relay",
+        conflicts_with_all = ["prefer-direct", "relay-only"]
+    )]
     prefer_relay: bool,
 
-    /// Prefer direct UDP path instead of relay fallback
-    #[arg(long, name = "prefer-direct")]
+    /// Allow Direct to be selected as soon as its encrypted validation is
+    /// confirmed; Relay remains the fallback.
+    #[arg(
+        long,
+        name = "prefer-direct",
+        conflicts_with_all = ["prefer-relay", "relay-only"]
+    )]
     prefer_direct: bool,
+
+    /// Disable Direct data-path promotion entirely. Direct candidate and
+    /// validation workers are not started for this explicit diagnostic mode.
+    #[arg(
+        long,
+        name = "relay-only",
+        conflicts_with_all = ["prefer-relay", "prefer-direct"]
+    )]
+    relay_only: bool,
 
     /// Allow loopback endpoints in the fresh-mapping generation (NAT-sim
     /// harnesses only; see config.network.fresh_mapping_harness_loopback).
@@ -143,6 +173,11 @@ struct Cli {
     /// for controlled traversal ablations; production defaults to enabled.
     #[arg(long, name = "disable-fresh-mapping-punch")]
     disable_fresh_mapping_punch: bool,
+
+    /// Do not advertise extrapolated server-reflexive candidates inferred
+    /// from STUN observations. Intended for controlled static-STUN baselines.
+    #[arg(long, name = "disable-predicted-candidates")]
+    disable_predicted_candidates: bool,
 
     /// Disable bounded birthday probing. This is intended for controlled
     /// traversal ablations; production defaults to enabled.
@@ -160,6 +195,12 @@ struct Cli {
     /// overlay loop then only sends over confirmed Direct paths.
     #[arg(long, name = "overlay-any-path")]
     overlay_any_path: bool,
+
+    /// With --validate-overlay, fire one burst of N business payloads per
+    /// peer right after the first usable evidence and verify every echo
+    /// (zero loss/duplicate/reorder; independent validation harnesses only).
+    #[arg(long, name = "overlay-burst", default_value_t = 0)]
+    overlay_burst: usize,
 
     /// Control-plane HTTP proxy policy: `direct` (default, never reads
     /// environment proxies) or `environment` (explicitly honors

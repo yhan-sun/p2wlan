@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn very_slow_public_direct_is_hedged_with_unconfirmed_relay() {
+async fn very_slow_confirmed_direct_is_not_duplicated_to_relay() {
     let config = test_config();
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "8.8.8.8:51842".parse().unwrap();
@@ -26,7 +26,7 @@ async fn very_slow_public_direct_is_hedged_with_unconfirmed_relay() {
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert!(selected.direct_confirmed);
-    assert!(selected.relay_hedged);
+    assert!(!selected.relay_hedged);
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
     assert!(
         selected.direct_score.as_ref().unwrap().score
@@ -35,7 +35,7 @@ async fn very_slow_public_direct_is_hedged_with_unconfirmed_relay() {
 }
 
 #[tokio::test]
-async fn path_selector_uses_hedged_trial_direct_when_relay_scores_higher() {
+async fn path_selector_keeps_relay_until_direct_is_encrypted_confirmed() {
     let config = test_config();
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "127.0.0.1:51839".parse().unwrap();
@@ -57,9 +57,9 @@ async fn path_selector_uses_hedged_trial_direct_when_relay_scores_higher() {
     }
 
     let selected = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selected.path, Some(NetworkPath::Direct));
-    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_TRIAL);
-    assert!(selected.relay_hedged);
+    assert_eq!(selected.path, Some(NetworkPath::Relay));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+    assert!(!selected.relay_hedged);
     assert!(!selected.direct_confirmed);
     assert!(
         selected.direct_score.as_ref().unwrap().score
@@ -139,16 +139,16 @@ async fn recent_public_probe_success_stays_trial_candidate_after_single_timeout(
     );
 
     let selected = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selected.path, Some(NetworkPath::Direct));
-    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_TRIAL);
-    assert_eq!(selected.direct_endpoint, Some(stable_endpoint));
-    assert!(selected.relay_hedged);
+    assert_eq!(selected.path, Some(NetworkPath::Relay));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+    assert_eq!(selected.direct_endpoint, None);
+    assert!(!selected.relay_hedged);
     assert!(!selected.direct_confirmed);
 
     let diagnostics = manager.diagnostics().await;
     let current = diagnostics[0].current_direct_pair.as_ref().unwrap();
     assert_eq!(current.remote_endpoint, stable_endpoint.to_string());
-    assert!(current.nominated);
+    assert!(!current.nominated);
 }
 
 #[tokio::test]
@@ -204,11 +204,11 @@ async fn path_selector_does_not_treat_unselected_succeeded_pair_as_confirmed_dir
     }
 
     let selection = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert_eq!(selection.direct_endpoint, Some(trial_endpoint));
-    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_TRIAL);
+    assert_eq!(selection.path, Some(NetworkPath::Relay));
+    assert_eq!(selection.direct_endpoint, None);
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
     assert!(!selection.direct_confirmed);
-    assert!(selection.relay_hedged);
+    assert!(!selection.relay_hedged);
 
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)

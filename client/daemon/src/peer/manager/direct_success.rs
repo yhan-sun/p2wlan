@@ -329,6 +329,7 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
+        let mut record_ack_feedback = false;
         let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
@@ -359,7 +360,11 @@ impl PeerManager {
                         // Matched-ACK feedback: the recovery stage machine
                         // resets to Initial so a live path is never expanded
                         // by a later no-ACK batch.
-                        self.record_recovery_ack_feedback(node_id, endpoint).await;
+                        // Do not await it while the process-wide connection
+                        // write guard is held.  The recovery ledger is
+                        // independent state, and waiting here can block
+                        // PeerJoined/PeerAnswer handling for every peer.
+                        record_ack_feedback = true;
                         conn.record_direct_event(
                             generation,
                             "probe_ack_received",
@@ -420,6 +425,9 @@ impl PeerManager {
             }
             pair_success
         };
+        if record_ack_feedback {
+            self.record_recovery_ack_feedback(node_id, endpoint).await;
+        }
         if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }

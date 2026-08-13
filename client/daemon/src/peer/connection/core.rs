@@ -225,7 +225,6 @@ impl PeerConnection {
         self.relay_confirmed_generation = None;
         self.relay_confirmed_at = None;
         self.relay_confirmed_endpoint = None;
-        self.relay_confirm_seq = 0;
         self.first_usable_generation = None;
         self.first_usable_at = None;
         self.first_usable_path = None;
@@ -235,6 +234,19 @@ impl PeerConnection {
         self.path_events.clear();
         self.direct_events.clear();
         self.sync_direct_cache();
+    }
+
+    /// Reset all transport/path state for a new remote daemon session while
+    /// retaining the peer's long-lived identity and Probe MAC key.
+    ///
+    /// A control-plane endpoint change is stronger than a candidate refresh:
+    /// the old WireGuard session may still contain a high counter and the old
+    /// relay confirmation may still be accepted by local path selection, even
+    /// though the remote daemon that owned them has gone away.  The caller
+    /// must first stop the transport/UDP workers, then use this reset before
+    /// starting the replacement handshake.
+    pub(crate) fn reset_for_peer_session(&mut self) {
+        self.reset_for_identity_change();
     }
 
     /// Whether the connection is active (direct or relay).
@@ -308,10 +320,10 @@ impl PeerConnection {
     ///
     /// `path` is `Direct` or `Relay` and only a CONFIRMED path may reach here
     /// (a matching direct-validation ACK, or a matching forced-relay probe ACK
-    /// whose real ingress was relay).  Emits exactly once per peer; later calls
-    /// no-op.  Returns whether this call recorded the milestone.
+    /// whose real ingress was relay). Emits exactly once per peer + generation;
+    /// later calls in the same generation no-op.
     pub fn record_first_usable(&mut self, path: NetworkPath, generation: u64) -> bool {
-        if self.first_usable_at.is_some() {
+        if self.first_usable_generation == Some(generation) && self.first_usable_at.is_some() {
             return false;
         }
         self.first_usable_generation = Some(generation);

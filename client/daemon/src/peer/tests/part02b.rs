@@ -211,8 +211,8 @@ async fn low_latency_private_candidate_beats_selected_public_direct() {
     );
 
     let selection = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert_eq!(selection.direct_endpoint, Some(private_endpoint));
+    assert_eq!(selection.path, Some(NetworkPath::Relay));
+    assert!(!selection.direct_confirmed);
 
     manager
         .record_direct_success("peer1", Some(private_endpoint))

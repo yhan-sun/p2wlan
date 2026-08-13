@@ -8,7 +8,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +20,20 @@ use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::relay::RelayTransport;
+
+/// Stable, non-reversible diagnostic fingerprint for an opaque encrypted
+/// datagram. This is only used in local debug traces to correlate the same
+/// ciphertext at transport boundaries; it is not exposed in status/metrics.
+pub(crate) fn wire_fingerprint(bytes: &[u8]) -> u64 {
+    // FNV-1a is adequate for correlation, not authentication. Keeping this
+    // allocation-free also makes the diagnostic safe on the hot path.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
 const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
@@ -426,55 +439,6 @@ pub struct EncryptedPeerPacket {
     pub wire_bytes: Vec<u8>,
 }
 
-/// An encrypted packet that retains its peer's ordering lock until the
-/// network worker has completed the real UDP/relay send.
-///
-/// WireGuard replay protection is counter based. Keeping this guard inside
-/// the egress queue prevents a later synthetic confirmation packet from being
-/// encrypted and sent ahead of an earlier user packet that is still queued.
-///
-/// The guard is held ONLY while the packet is being handed to the network
-/// worker (and sent immediately when the peer is usable).  When the worker
-/// parks the packet in the peer's pending queue (peer not yet usable — waiting
-/// for RelayPeerConfirmed / DirectConfirmed), the guard is released: a queued
-/// business packet must never hold the peer's emit lock and thereby block the
-/// relay probes / direct-validation control packets that are the ONLY thing
-/// that can make the peer usable.
-pub struct OrderedEncryptedPeerPacket {
-    packet: EncryptedPeerPacket,
-    _send_order_guard: Option<Arc<OwnedMutexGuard<()>>>,
-}
-
-impl OrderedEncryptedPeerPacket {
-    fn new(packet: EncryptedPeerPacket, send_order_guard: Arc<OwnedMutexGuard<()>>) -> Self {
-        Self {
-            packet,
-            _send_order_guard: Some(send_order_guard),
-        }
-    }
-
-    /// Release the ordering guard (the peer is not usable yet and the packet
-    /// is parking in the bounded pending queue).  Must be called before the
-    /// packet is queued for a peer that is not yet confirmed usable.
-    pub(crate) fn release_send_order_guard(&mut self) {
-        self._send_order_guard = None;
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn for_test(packet: EncryptedPeerPacket) -> Self {
-        let lock = Arc::new(Mutex::new(()));
-        Self::new(packet, Arc::new(lock.lock_owned().await))
-    }
-}
-
-impl Deref for OrderedEncryptedPeerPacket {
-    type Target = EncryptedPeerPacket;
-
-    fn deref(&self) -> &Self::Target {
-        &self.packet
-    }
-}
-
 /// An encrypted WireGuard packet received from UDP or relay transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedEncryptedPacket {
@@ -520,6 +484,10 @@ pub struct OverlayIngressEvent {
     pub peer_id: String,
     pub packet: Vec<u8>,
     pub ingress: OverlayIngress,
+    /// Generation observed after decryption. The overlay validator rejects a
+    /// queued event that crossed an Air/network restart before it can echo or
+    /// confirm first_usable.
+    pub connection_generation: u64,
 }
 
 /// Optional evidence feed the daemon hands to the WireGuard inbound path:
@@ -531,6 +499,11 @@ pub struct OverlayIngressEvent {
 #[derive(Clone)]
 pub(crate) struct InboundEvidenceFeed {
     pub(crate) relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    /// Production timeline sink. This is populated for real TUN and mock-TUN
+    /// dataplanes alike; the latter additionally gets the nonce-aware harness
+    /// feed below. A decrypted non-control packet is therefore recorded as
+    /// first-usable evidence on the normal production path too.
+    pub(crate) timeline: Option<Arc<crate::connection_timeline::ConnectionTimeline>>,
     pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressEvent>>,
 }
 
@@ -549,6 +522,16 @@ pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
     let payload = ip.payload();
     payload.len() > 8 + crate::OVERLAY_PAYLOAD_MAGIC.len()
         && payload[8..8 + crate::OVERLAY_PAYLOAD_MAGIC.len()] == crate::OVERLAY_PAYLOAD_MAGIC[..]
+}
+
+/// A decrypted WireGuard keepalive has no inner IP packet.  Only a valid
+/// overlay IPv4 packet is production business ingress evidence; otherwise the
+/// initial session/rekey traffic could falsely set `first_usable` before the
+/// TUN has delivered a real packet.  This predicate intentionally accepts all
+/// IPv4 protocols (ICMP, TCP, UDP, etc.) so it is not tied to the harness-only
+/// overlay echo format.
+pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
+    Ipv4Packet::new(packet).is_ok()
 }
 
 /// Source of the UDP transport used by WireGuard inbound after decryption.
@@ -598,11 +581,38 @@ impl InboundUdpTransport {
 pub struct WireGuardTransport {
     sessions: Arc<Mutex<HashMap<String, PeerTransportSessions>>>,
     pending_outbound: Arc<Mutex<HashMap<String, VecDeque<PendingOutboundPacket>>>>,
+    /// Serializes every producer that can feed the network-outbound worker
+    /// for one peer. This is deliberately separate from the WireGuard emit
+    /// lock: raw session-backlog/live-TUN ordering must be established before
+    /// encryption, while the emit lock is held only from counter allocation
+    /// through the actual transport handoff.
+    outbound_ingress_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     outbound_emit_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     promoted_responder_tokens: Arc<Mutex<HashMap<String, VecDeque<PromotedResponderToken>>>>,
     hedge_replay_counters: Arc<std::sync::Mutex<HashMap<String, HedgeReplayCounter>>>,
-    encrypted_tx: mpsc::Sender<OrderedEncryptedPeerPacket>,
+    /// Feed of RAW (not yet encrypted) outbound packets handed to the network
+    /// outbound worker.  The worker — not the transport — decides whether the
+    /// peer's path is usable and only then encrypts (allocating a WireGuard
+    /// counter) under the per-peer emit lock, holding it through the actual
+    /// send.  Parking plaintext while a path is unavailable means a queued
+    /// business packet can never hold the emit lock, occupy a counter, or be
+    /// overtaken on the wire by a higher-counter control packet.
+    outbound_tx: mpsc::Sender<OutboundPacket>,
+    /// Shared structural outbound-loss counters (terminal drops + send
+    /// failures), wired by the daemon to the peer manager's map so `/status`
+    /// reports the transport-level session queue loss together with the
+    /// worker-level loss in one place.  `None` (unit tests) skips counting.
+    outbound_loss_sink:
+        Arc<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::peer::OutboundLossCounters>>>>>,
 }
+
+/// Stable reason code for a packet dropped from the transport-level
+/// session-not-ready queue because it outlived [`PENDING_OUTBOUND_TTL`].
+pub(crate) const REASON_SESSION_QUEUE_STALE: &str = "session_queue_ttl_expired";
+/// Stable reason code for a packet dropped from the transport-level
+/// session-not-ready queue because the per-peer bound was exceeded.
+pub(crate) const REASON_SESSION_QUEUE_FULL: &str = "session_queue_full";
+pub(crate) const REASON_SESSION_QUEUE_REMOVED: &str = "session_queue_removed";
 
 /// Whether a WireGuard decrypt failure is WireGuard's counter-based replay
 /// protection rejecting a duplicate copy of an already-decrypted ciphertext
@@ -624,20 +634,127 @@ struct HedgeReplayCounter {
 const HEDGE_REPLAY_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 impl WireGuardTransport {
-    /// Create a transport adapter and a receiver for encrypted peer packets.
-    pub fn new() -> (Self, mpsc::Receiver<OrderedEncryptedPeerPacket>) {
-        let (encrypted_tx, encrypted_rx) = mpsc::channel(1024);
+    /// Create a transport adapter and a receiver for RAW routed outbound
+    /// packets.  The network outbound worker consumes the receiver and is the
+    /// only place that encrypts business packets (under the per-peer emit
+    /// lock, holding it through the actual send).
+    pub fn new() -> (Self, mpsc::Receiver<OutboundPacket>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         (
             Self {
                 sessions: Arc::new(Mutex::new(HashMap::new())),
                 pending_outbound: Arc::new(Mutex::new(HashMap::new())),
+                outbound_ingress_locks: Arc::new(Mutex::new(HashMap::new())),
                 outbound_emit_locks: Arc::new(Mutex::new(HashMap::new())),
                 promoted_responder_tokens: Arc::new(Mutex::new(HashMap::new())),
                 hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
-                encrypted_tx,
+                outbound_tx,
+                outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
             },
-            encrypted_rx,
+            outbound_rx,
         )
+    }
+
+    /// Share the peer manager's outbound-loss counters with this transport so
+    /// session-not-ready queue loss lands in `/status.stats.outbound_drops`
+    /// under the same map as the worker's drops.  Installed once by the
+    /// daemon before any traffic flows.
+    pub fn set_outbound_loss_sink(
+        &self,
+        sink: Option<Arc<tokio::sync::Mutex<crate::peer::OutboundLossCounters>>>,
+    ) {
+        *self
+            .outbound_loss_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+    }
+
+    /// The shared loss sink, if the daemon installed one.
+    fn outbound_loss_registry(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::peer::OutboundLossCounters>>> {
+        self.outbound_loss_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record TERMINAL dropped business packets against the shared sink, if
+    /// installed.
+    pub(crate) async fn record_outbound_drop(
+        &self,
+        reason_code: &str,
+        packets: usize,
+        bytes: usize,
+    ) {
+        if packets == 0 {
+            return;
+        }
+        if let Some(sink) = self.outbound_loss_registry() {
+            let mut loss = sink.lock().await;
+            let entry = loss.drops.entry(reason_code.to_string()).or_default();
+            entry.packets = entry.packets.saturating_add(packets as u64);
+            entry.bytes = entry.bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    /// Record a transient outbound send-failure ATTEMPT against the shared
+    /// sink (never counted as a terminal drop).
+    pub(crate) async fn record_outbound_send_failure(
+        &self,
+        reason_code: &str,
+        attempts: usize,
+        bytes: usize,
+    ) {
+        if attempts == 0 {
+            return;
+        }
+        if let Some(sink) = self.outbound_loss_registry() {
+            let mut loss = sink.lock().await;
+            let entry = loss
+                .send_failures
+                .entry(reason_code.to_string())
+                .or_default();
+            entry.packets = entry.packets.saturating_add(attempts as u64);
+            entry.bytes = entry.bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    /// Record a loss event emitted by the legacy session queue.  Production
+    /// relay-first traffic is owned by `network_outbound`, but this queue is
+    /// still reachable during session teardown; it must not disappear from
+    /// the same queryable event ledger.  It has no daemon timeline handle, so
+    /// it uses an explicit transport correlation and generation zero rather
+    /// than inventing a current-generation value.
+    async fn record_outbound_queue_event(
+        &self,
+        kind: &str,
+        peer_id: &str,
+        reason_code: &str,
+        packets: usize,
+        bytes: usize,
+    ) {
+        if packets == 0 {
+            return;
+        }
+        let Some(sink) = self.outbound_loss_registry() else {
+            return;
+        };
+        let mut loss = sink.lock().await;
+        const MAX_OUTBOUND_LOSS_EVENTS: usize = 512;
+        if loss.events.len() >= MAX_OUTBOUND_LOSS_EVENTS {
+            loss.events.remove(0);
+        }
+        loss.events.push(crate::peer::OutboundLossEvent {
+            kind: kind.to_string(),
+            peer_id: peer_id.to_string(),
+            generation: 0,
+            reason_code: reason_code.to_string(),
+            packets: packets as u64,
+            bytes: bytes as u64,
+            correlation_id: "transport-session-queue".to_string(),
+            at_ms: 0,
+        });
     }
 
     /// Install or replace an established transport session for a peer.
@@ -1081,8 +1198,30 @@ impl WireGuardTransport {
 
     /// Remove a peer session.
     pub async fn remove_session(&self, peer_id: &str) {
+        // A session flush may already have removed its queue and be forwarding
+        // raw packets. Wait for that per-peer ingress turn before clearing the
+        // session/backlog, so a live packet cannot be inserted behind a
+        // removal and later resurrect an obsolete session queue.
+        let ingress_lock = self.outbound_ingress_lock(peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         self.sessions.lock().await.remove(peer_id);
-        self.pending_outbound.lock().await.remove(peer_id);
+        let removed = self.pending_outbound.lock().await.remove(peer_id);
+        if let Some(queue) = removed {
+            let bytes = queue
+                .iter()
+                .map(|item| item.packet.packet.len())
+                .sum::<usize>();
+            self.record_outbound_drop(REASON_SESSION_QUEUE_REMOVED, queue.len(), bytes)
+                .await;
+            self.record_outbound_queue_event(
+                "drop",
+                peer_id,
+                REASON_SESSION_QUEUE_REMOVED,
+                queue.len(),
+                bytes,
+            )
+            .await;
+        }
         self.promoted_responder_tokens.lock().await.remove(peer_id);
         self.remove_idle_outbound_emit_lock(peer_id).await;
     }
@@ -1139,23 +1278,6 @@ impl WireGuardTransport {
         self.encrypt_outbound_inner(packet, false).await
     }
 
-    /// Encrypt and enqueue a synthetic packet into the same ordered channel
-    /// used by normal TUN traffic. Holding the per-peer lock through enqueue
-    /// keeps its counter ahead of no packet that is already queued for send.
-    pub async fn enqueue_outbound(&self, packet: OutboundPacket) -> Result<bool> {
-        let peer_id = packet.peer_id.clone();
-        let emit_lock = self.outbound_emit_lock(&peer_id).await;
-        let emit_guard = Arc::new(emit_lock.lock_owned().await);
-        let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
-            return Ok(false);
-        };
-        self.encrypted_tx
-            .send(OrderedEncryptedPeerPacket::new(encrypted, emit_guard))
-            .await
-            .map_err(|_| DaemonError::Network("encrypted packet channel closed".to_string()))?;
-        Ok(true)
-    }
-
     /// Encrypt one outbound user packet, or queue it briefly if the session is
     /// not installed yet. This is used only by the TUN data path; synthetic
     /// validation/probe packets continue to use encrypt_outbound so they do not
@@ -1165,17 +1287,54 @@ impl WireGuardTransport {
         packet: OutboundPacket,
     ) -> Result<Option<EncryptedPeerPacket>> {
         let peer_id = packet.peer_id.clone();
+        // Reserve the raw per-peer ingress turn before checking session state.
+        // If a responder is being installed concurrently, the session-ready
+        // flush and a live packet cannot cross each other at this boundary.
+        let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
         let emit_guard = emit_lock.lock().await;
-        let encrypted = self.encrypt_outbound_inner(packet, true).await?;
+        let queued_packet = packet.clone();
+        // Do not let this legacy convenience API create a second producer
+        // ordering domain while the production network-outbound worker owns
+        // plaintext parking. If the session is absent, park the raw packet in
+        // the same transport backlog under the ingress guard below.
+        let encrypted = self.encrypt_outbound_inner(packet, false).await?;
         drop(emit_guard);
         if encrypted.is_none() {
-            let status = self.session_status(&peer_id).await;
-            if status.has_active && !status.expired {
-                self.flush_pending_outbound_for_peer(&peer_id).await;
-            }
+            self.queue_pending_outbound_locked(queued_packet, "session not ready")
+                .await;
         }
         Ok(encrypted)
+    }
+
+    /// Encrypt one business packet for the network outbound worker, holding
+    /// the per-peer emit lock through the actual send.
+    ///
+    /// The returned guard MUST be kept alive until the packet has been handed
+    /// to the selected transport (UDP datagram sent or relay frame written):
+    /// WireGuard counters are allocated under this lock, so holding it through
+    /// the send guarantees wire order == counter order per peer.  A control
+    /// packet (relay probe / direct-validation) can only be encrypted after a
+    /// lower-counter business packet has completed its send, so a queued
+    /// business packet can never be overtaken by a higher-counter control
+    /// packet into the receiver's 64-packet replay window.
+    ///
+    /// When the peer's WireGuard session is not ready, `None` is returned and
+    /// the network outbound actor retains the plaintext in its single
+    /// per-peer FIFO. There is deliberately no second production queue here:
+    /// session-ready flush, live TUN traffic and retry all share that actor.
+    pub(crate) async fn encrypt_outbound_with_guard(
+        &self,
+        packet: OutboundPacket,
+    ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedMutexGuard<()>>)>> {
+        let peer_id = packet.peer_id.clone();
+        let emit_lock = self.outbound_emit_lock(&peer_id).await;
+        let emit_guard = Arc::new(emit_lock.lock_owned().await);
+        let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
+            return Ok(None);
+        };
+        Ok(Some((encrypted, emit_guard)))
     }
 
     async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
@@ -1188,6 +1347,18 @@ impl WireGuardTransport {
         // other dead weak entries at the same time so ongoing peer churn
         // cannot grow the registry without adding O(peer_count) work to every
         // ordinary packet on an already-active peer.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn outbound_ingress_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.outbound_ingress_locks.lock().await;
+        if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+
         locks.retain(|_, lock| lock.strong_count() > 0);
         let lock = Arc::new(Mutex::new(()));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
@@ -1269,151 +1440,199 @@ impl WireGuardTransport {
     }
 
     async fn queue_pending_outbound(&self, packet: OutboundPacket, reason: &'static str) {
+        let peer_id = packet.peer_id.clone();
+        let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
+        self.queue_pending_outbound_locked(packet, reason).await;
+    }
+
+    /// Queue a raw packet while the caller owns the peer's ingress turn.
+    /// Keeping the mutation and the flush/removal boundary under the same
+    /// lock prevents a live producer from racing an in-flight session flush.
+    async fn queue_pending_outbound_locked(&self, packet: OutboundPacket, reason: &'static str) {
         let now = Instant::now();
         let peer_id = packet.peer_id.clone();
         let packet_len = packet.packet.len();
-        let mut pending = self.pending_outbound.lock().await;
-        let queue = pending.entry(peer_id.clone()).or_default();
-        let stale_before = queue.len();
-        queue.retain(|queued| {
-            now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL
-        });
-        let stale_dropped = stale_before.saturating_sub(queue.len());
-        let mut overflow_dropped = 0usize;
-        while queue.len() >= MAX_PENDING_OUTBOUND_PER_PEER {
-            queue.pop_front();
-            overflow_dropped = overflow_dropped.saturating_add(1);
+        let (stale_dropped, stale_bytes, overflow_dropped, overflow_bytes, depth) = {
+            let mut pending = self.pending_outbound.lock().await;
+            let queue = pending.entry(peer_id.clone()).or_default();
+            let stale_before = queue.len();
+            let mut stale_bytes = 0usize;
+            queue.retain(|queued| {
+                let fresh = now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL;
+                if !fresh {
+                    stale_bytes = stale_bytes.saturating_add(queued.packet.packet.len());
+                }
+                fresh
+            });
+            let stale_dropped = stale_before.saturating_sub(queue.len());
+            let mut overflow_dropped = 0usize;
+            let mut overflow_bytes = 0usize;
+            while queue.len() >= MAX_PENDING_OUTBOUND_PER_PEER {
+                if let Some(old) = queue.pop_front() {
+                    overflow_dropped = overflow_dropped.saturating_add(1);
+                    overflow_bytes = overflow_bytes.saturating_add(old.packet.packet.len());
+                }
+            }
+            queue.push_back(PendingOutboundPacket {
+                queued_at: now,
+                packet,
+            });
+            (
+                stale_dropped,
+                stale_bytes,
+                overflow_dropped,
+                overflow_bytes,
+                queue.len(),
+            )
+        };
+        if stale_dropped > 0 {
+            self.record_outbound_drop(REASON_SESSION_QUEUE_STALE, stale_dropped, stale_bytes)
+                .await;
+            self.record_outbound_queue_event(
+                "drop",
+                &peer_id,
+                REASON_SESSION_QUEUE_STALE,
+                stale_dropped,
+                stale_bytes,
+            )
+            .await;
         }
-        queue.push_back(PendingOutboundPacket {
-            queued_at: now,
-            packet,
-        });
+        if overflow_dropped > 0 {
+            self.record_outbound_drop(REASON_SESSION_QUEUE_FULL, overflow_dropped, overflow_bytes)
+                .await;
+            self.record_outbound_queue_event(
+                "drop",
+                &peer_id,
+                REASON_SESSION_QUEUE_FULL,
+                overflow_dropped,
+                overflow_bytes,
+            )
+            .await;
+        }
         debug!(
             "Queued outbound packet for peer {} until WireGuard session is ready ({} bytes, reason={}, depth={}, stale_dropped={}, overflow_dropped={})",
             peer_id,
             packet_len,
             reason,
-            queue.len(),
+            depth,
             stale_dropped,
             overflow_dropped
         );
     }
 
-    pub(crate) async fn flush_pending_outbound_for_peer(&self, peer_id: &str) {
-        let emit_lock = self.outbound_emit_lock(peer_id).await;
-        let emit_guard = Arc::new(emit_lock.lock_owned().await);
-        self.flush_pending_outbound_for_peer_inner(peer_id, emit_guard)
-            .await;
+    /// Forward a live raw TUN packet through the same per-peer ingress turn as
+    /// session-ready backlog flushing. If a backlog exists, append behind it;
+    /// otherwise hand the packet to the network-outbound worker immediately.
+    async fn forward_raw_outbound(&self, packet: OutboundPacket) -> Result<()> {
+        let peer_id = packet.peer_id.clone();
+        let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
+        let has_pending = self.pending_outbound.lock().await.contains_key(&peer_id);
+        if has_pending {
+            self.queue_pending_outbound_locked(packet, "session backlog flush in progress")
+                .await;
+            return Ok(());
+        }
+        self.outbound_tx
+            .send(packet)
+            .await
+            .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))
     }
 
-    async fn flush_pending_outbound_for_peer_inner(
-        &self,
-        peer_id: &str,
-        emit_guard: Arc<OwnedMutexGuard<()>>,
-    ) {
+    pub(crate) async fn flush_pending_outbound_for_peer(&self, peer_id: &str) {
+        // Hold the ingress turn for the entire raw FIFO handoff. Live TUN
+        // packets arriving during this operation either wait and follow the
+        // flushed backlog, or are appended before this turn begins.
+        let ingress_lock = self.outbound_ingress_lock(peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         let now = Instant::now();
-        let (packets, expired_count) = {
+        let (packets, expired_count, expired_bytes) = {
             let mut pending = self.pending_outbound.lock().await;
             let Some(queue) = pending.get_mut(peer_id) else {
                 return;
             };
             let mut packets = Vec::with_capacity(queue.len());
             let mut expired_count = 0usize;
+            let mut expired_bytes = 0usize;
             while let Some(queued) = queue.pop_front() {
                 if now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL {
                     packets.push(queued.packet);
                 } else {
                     expired_count = expired_count.saturating_add(1);
+                    expired_bytes = expired_bytes.saturating_add(queued.packet.packet.len());
                 }
             }
             pending.remove(peer_id);
-            (packets, expired_count)
+            (packets, expired_count, expired_bytes)
         };
 
+        if expired_count > 0 {
+            self.record_outbound_drop(REASON_SESSION_QUEUE_STALE, expired_count, expired_bytes)
+                .await;
+            self.record_outbound_queue_event(
+                "drop",
+                peer_id,
+                REASON_SESSION_QUEUE_STALE,
+                expired_count,
+                expired_bytes,
+            )
+            .await;
+            debug!(
+                "Discarded {} expired pending outbound packets for peer {}",
+                expired_count, peer_id
+            );
+        }
         if packets.is_empty() {
-            if expired_count > 0 {
-                debug!(
-                    "Discarded {} expired pending outbound packets for peer {}",
-                    expired_count, peer_id
-                );
-            }
             return;
         }
 
-        let mut encrypted_packets = Vec::with_capacity(packets.len());
-        let mut encrypt_failed = 0usize;
-        {
-            let mut sessions = self.sessions.lock().await;
-            let Some(peer_sessions) = sessions.get_mut(peer_id) else {
-                debug!(
-                    "WireGuard session for peer {} disappeared before pending packet flush; re-queueing {} packets",
-                    peer_id,
-                    packets.len()
-                );
-                drop(sessions);
-                for packet in packets {
-                    self.queue_pending_outbound(packet, "session disappeared before flush")
-                        .await;
-                }
-                return;
-            };
-            peer_sessions.prepare_active(now);
-            let Some(active) = peer_sessions.active.as_mut() else {
-                drop(sessions);
-                for packet in packets {
-                    self.queue_pending_outbound(packet, "session not ready before flush")
-                        .await;
-                }
-                return;
-            };
-            if active.session.is_expired() {
-                drop(sessions);
-                for packet in packets {
-                    self.queue_pending_outbound(packet, "session expired before flush")
-                        .await;
-                }
-                return;
-            }
-
-            for packet in packets {
-                match active.session.encrypt_to_bytes(&packet.packet) {
-                    Ok(wire_bytes) => encrypted_packets.push(EncryptedPeerPacket {
-                        peer_id: packet.peer_id,
-                        dst_ip: packet.dst_ip,
-                        wire_bytes,
-                    }),
-                    Err(err) => {
-                        encrypt_failed = encrypt_failed.saturating_add(1);
-                        warn!(
-                            "Dropping pending outbound packet for peer {} after WireGuard encrypt failed: {err}",
-                            peer_id
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut sent_count = 0usize;
-        for encrypted in encrypted_packets {
-            if let Err(err) = self
-                .encrypted_tx
-                .send(OrderedEncryptedPeerPacket::new(
-                    encrypted,
-                    emit_guard.clone(),
-                ))
-                .await
-            {
+        // Forward the RAW packets to the network outbound worker in FIFO
+        // order.  The worker owns encryption: it holds the peer's emit lock
+        // from encryption through the actual send, so counters are allocated
+        // and transmitted strictly in queue order (never a relay probe /
+        // direct-validation control packet jumping ahead of a queued business
+        // packet's counter).
+        let total_packets = packets.len();
+        let total_bytes = packets
+            .iter()
+            .map(|packet| packet.packet.len())
+            .sum::<usize>();
+        let mut forwarded = 0usize;
+        let mut forwarded_bytes = 0usize;
+        for packet in packets {
+            let packet_bytes = packet.packet.len();
+            if let Err(err) = self.outbound_tx.send(packet).await {
                 warn!(
                     "Pending outbound packet channel closed while flushing peer {}: {err}",
                     peer_id
                 );
+                let remaining = total_packets.saturating_sub(forwarded + 1);
+                // The failed send owns the packet; count it and every item
+                // still held locally instead of silently losing the session
+                // queue during actor shutdown.
+                self.record_outbound_drop(
+                    REASON_SESSION_QUEUE_REMOVED,
+                    remaining + 1,
+                    total_bytes.saturating_sub(forwarded_bytes),
+                )
+                .await;
+                self.record_outbound_queue_event(
+                    "drop",
+                    peer_id,
+                    REASON_SESSION_QUEUE_REMOVED,
+                    remaining + 1,
+                    total_bytes.saturating_sub(forwarded_bytes),
+                )
+                .await;
                 break;
             }
-            sent_count = sent_count.saturating_add(1);
+            forwarded = forwarded.saturating_add(1);
+            forwarded_bytes = forwarded_bytes.saturating_add(packet_bytes);
         }
         debug!(
-            "Flushed pending outbound packets for peer {} (sent={}, expired={}, encrypt_failed={})",
-            peer_id, sent_count, expired_count, encrypt_failed
+            "Forwarded pending outbound packets for peer {} (forwarded={}, expired={})",
+            peer_id, forwarded, expired_count
         );
     }
 
@@ -1611,31 +1830,23 @@ impl WireGuardTransport {
         }
     }
 
-    /// Consume routed packets and emit encrypted WireGuard packets.
+    /// Forward routed packets from the dataplane to the network outbound
+    /// worker WITHOUT encrypting them.
+    ///
+    /// The worker is the only place that encrypts business packets: it checks
+    /// path usability first, parks PLAINTEXT packets for a not-yet-usable
+    /// peer, and only then — once the path is confirmed — acquires the
+    /// per-peer emit lock and encrypts + sends each packet in FIFO order
+    /// holding the lock through the actual send.  A parked packet therefore
+    /// never holds the emit lock, never occupies a WireGuard counter, and can
+    /// never be overtaken on the wire by a higher-counter control packet.
     pub async fn run_outbound(
         &self,
         mut outbound_rx: mpsc::Receiver<OutboundPacket>,
     ) -> Result<()> {
         while let Some(packet) = outbound_rx.recv().await {
-            let peer_id = packet.peer_id.clone();
-            let emit_lock = self.outbound_emit_lock(&peer_id).await;
-            let emit_guard = Arc::new(emit_lock.lock_owned().await);
-            if let Some(encrypted) = self.encrypt_outbound_inner(packet, true).await? {
-                self.encrypted_tx
-                    .send(OrderedEncryptedPeerPacket::new(encrypted, emit_guard))
-                    .await
-                    .map_err(|_| {
-                        DaemonError::Network("encrypted packet channel closed".to_string())
-                    })?;
-            } else {
-                drop(emit_guard);
-                let status = self.session_status(&peer_id).await;
-                if status.has_active && !status.expired {
-                    self.flush_pending_outbound_for_peer(&peer_id).await;
-                }
-            }
+            self.forward_raw_outbound(packet).await?;
         }
-
         Ok(())
     }
 
@@ -1735,6 +1946,14 @@ impl WireGuardTransport {
             let relay_peer_id = packet.relay_peer_id;
             let socket_index = packet.socket_index;
             let udp_transport_owner = packet.udp_transport_owner;
+            debug!(
+                event = "wireguard_inbound_envelope_received",
+                bytes = packet.wire_bytes.len(),
+                wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
+                relay_endpoint = ?relay_endpoint,
+                relay_peer_id = ?relay_peer_id,
+                "encrypted datagram reached the daemon transport decrypt boundary"
+            );
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
                     // Do not retain a UDP watch snapshot across decrypt. A
@@ -1920,6 +2139,62 @@ impl WireGuardTransport {
                     {
                         continue;
                     }
+                    // A normal decrypted packet is the production ingress
+                    // proof. The mock overlay validator adds a stronger
+                    // nonce/echo check, but production must not depend on
+                    // that harness to ever emit first_usable. The ingress is
+                    // taken from this packet's envelope and never inferred
+                    // from the current selected path.
+                    if is_real_overlay_business_packet(&inbound.packet) {
+                        if let Some(feed) = evidence.as_ref() {
+                            let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref() {
+                                Some((
+                                    crate::peer::NetworkPath::Relay,
+                                    format!("relay:{relay_endpoint}"),
+                                    Some(relay_endpoint.as_str()),
+                                ))
+                            } else if owns_direct_packet && source.is_some() {
+                                Some((crate::peer::NetworkPath::Direct, "direct".to_string(), None))
+                            } else {
+                                None
+                            };
+                            if let (Some(peer_manager), Some((path, ingress_label, relay_id))) =
+                                (peers.as_ref(), ingress)
+                            {
+                                let generation = peer_manager.current_network_generation().await;
+                                if peer_manager
+                                    .record_verified_first_usable(
+                                        &inbound.peer_id,
+                                        generation,
+                                        path,
+                                        &ingress_label,
+                                    )
+                                    .await
+                                {
+                                    if let Some(timeline) = feed.timeline.as_ref() {
+                                        let scope =
+                                            format!("peer:{}:{generation}", inbound.peer_id);
+                                        timeline.emit_first_scoped(
+                                        &scope,
+                                        "first_real_business_ingress",
+                                        Some(match path {
+                                            crate::peer::NetworkPath::Relay => "relay",
+                                            crate::peer::NetworkPath::Direct => "direct",
+                                        }),
+                                        None,
+                                        Some(format!(
+                                            "peer={} generation={generation} path_id={} relay_id={} source={:?}",
+                                            inbound.peer_id,
+                                            ingress_label,
+                                            relay_id.unwrap_or("none"),
+                                            source,
+                                        )),
+                                    );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Forward a decrypted overlay candidate to the independent
                     // overlay validation harness WITH its real ingress (derived
                     // from this envelope, never from the active path).
@@ -1936,11 +2211,16 @@ impl WireGuardTransport {
                             };
                             if let Some(ingress) = ingress {
                                 if let Some(tx) = &feed.overlay_ingress_tx {
+                                    let connection_generation = peers
+                                        .as_ref()
+                                        .map(|manager| manager.current_network_generation_sync())
+                                        .unwrap_or_default();
                                     let _ = tx
                                         .send(OverlayIngressEvent {
                                             peer_id: inbound.peer_id.clone(),
                                             packet: inbound.packet.clone(),
                                             ingress,
+                                            connection_generation,
                                         })
                                         .await;
                                 }
@@ -2573,18 +2853,6 @@ impl WireGuardTransport {
                 }
             }
         }
-    }
-}
-
-/// Drain and log encrypted packets until UDP/relay transport is attached.
-pub async fn log_encrypted_packets(mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>) {
-    while let Some(packet) = encrypted_rx.recv().await {
-        debug!(
-            "Encrypted packet ready for peer {} (dst={}, {} bytes)",
-            packet.peer_id,
-            packet.dst_ip,
-            packet.wire_bytes.len()
-        );
     }
 }
 

@@ -16,17 +16,35 @@ isolation-invalid infrastructure problems separately from product failures.
 from __future__ import print_function
 
 import json
+import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+
+def _open(request, timeout_s):
+    """Open control-plane HTTP directly unless proxy use is explicit.
+
+    A desktop shell may export an application proxy for browsers.  Letting
+    urllib inherit it can make control-plane DELETE/GET requests observe a
+    proxy-generated 502 while the daemon's UDP path uses the host network.
+    That produces a false roster/cleanup failure and, worse, mismatched
+    endpoint diagnostics.  Operators who intentionally need a proxy must opt
+    in with P2WLAN_CONTROL_PROXY=environment and test that path separately.
+    """
+    if os.environ.get("P2WLAN_CONTROL_PROXY", "direct").lower() == "environment":
+        return urllib.request.urlopen(request, timeout=timeout_s)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout_s)
 
 
 def list_nodes(control_url, token, network_id, timeout_s=8):
     """GET /api/v1/nodes?network_id=... with the round account token."""
     url = "%s/api/v1/nodes?network_id=%s" % (control_url, urllib.parse.quote(network_id))
     request = urllib.request.Request(url, headers={"Authorization": "Bearer %s" % token})
-    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+    with _open(request, timeout_s) as response:
         body = json.load(response)
     return body.get("nodes", [])
 
@@ -115,7 +133,7 @@ def delete_device(control_url, token, device_id, timeout_s=8):
         "Authorization": "Bearer %s" % token,
     }, method="DELETE")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        with _open(request, timeout_s) as response:
             return True, response.status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -165,12 +183,14 @@ def delete_devices_by_name(control_url, token, network_id, device_names, timeout
 
 
 
-def prove_cleaned(control_url, token, network_id, deleted_ids, deadline_s=10, poll_s=0.5):
-    """After deleting this round's devices, require the active roster to be empty.
+def prove_cleaned(control_url, token, network_id, deleted_ids, deadline_s=10, poll_s=0.5,
+                  reject_third_party=True):
+    """After deleting this round's devices, prove they are no longer active.
 
-    A third-party device that shows up during cleanup, or a device that
-    remains registered, fails the proof so the next round never starts on a
-    polluted network.
+    Strict mode also requires the whole network to be empty.  Availability
+    runs on a shared staging network may set ``reject_third_party=False``:
+    unrelated live devices are recorded in the report but are not deleted or
+    allowed to invalidate a target-scoped relay/overlay result.
     """
     expected_gone = set(deleted_ids)
     deadline = time.time() + deadline_s
@@ -195,7 +215,7 @@ def prove_cleaned(control_url, token, network_id, deleted_ids, deadline_s=10, po
             "deleted_but_still_active": sorted(remaining),
             "third_party_active": sorted(active - expected_gone),
         })
-        if active - expected_gone:
+        if reject_third_party and active - expected_gone:
             return {
                 "ok": False,
                 "reason": "third_party_active_during_cleanup",
@@ -206,8 +226,10 @@ def prove_cleaned(control_url, token, network_id, deleted_ids, deadline_s=10, po
         if not remaining:
             return {
                 "ok": True,
-                "reason": "network_clean_no_active_nodes",
-                "active_ids": [],
+                "reason": ("network_clean_no_active_nodes"
+                           if not active else "deleted_nodes_inactive_third_party_recorded"),
+                "active_ids": sorted(active),
+                "third_party_active": sorted(active - expected_gone),
                 "device_rows": len(nodes),
                 "inert_historical_rows": len(nodes),
                 "probes": probes,
@@ -256,7 +278,7 @@ def main(argv):
             "outcomes": report,
         }, sort_keys=True))
         return 0 if ok else 1
-    if len(argv) >= 7 and argv[1] == "--prove-cleaned":
+    if len(argv) >= 7 and argv[1] in ("--prove-cleaned", "--prove-cleaned-scoped"):
         control_url, token, network_id = argv[2:5]
         deadline = 15
         rest = argv[5:]
@@ -265,7 +287,12 @@ def main(argv):
             rest = rest[:rest.index("--deadline")]
         deleted_ids = rest
         report = prove_cleaned(
-            control_url, token, network_id, deleted_ids, deadline_s=deadline
+            control_url,
+            token,
+            network_id,
+            deleted_ids,
+            deadline_s=deadline,
+            reject_third_party=argv[1] == "--prove-cleaned",
         )
         print(json.dumps(report, sort_keys=True))
         return 0 if report["ok"] else 1
@@ -274,6 +301,7 @@ def main(argv):
         "       network-isolation.py --delete CONTROL_URL TOKEN DEVICE_ID\n"
         "       network-isolation.py --delete-by-name CONTROL_URL TOKEN NETWORK_ID NAME...\n"
         "       network-isolation.py --prove-cleaned CONTROL_URL TOKEN NETWORK_ID DEVICE_ID... [--deadline S]\n"
+        "       network-isolation.py --prove-cleaned-scoped CONTROL_URL TOKEN NETWORK_ID DEVICE_ID... [--deadline S]\n"
     )
 
 

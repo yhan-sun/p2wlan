@@ -24,9 +24,11 @@ MODE=${MODE:-direct}
 NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info}
 ROUNDS=${ROUNDS:-5}
 NAT_SEED_BASE=${NAT_SEED_BASE:-20260806}
-PORT=${PORT:-38080}
-RELAY_PORT=${RELAY_PORT:-38081}
-RELAY_METRICS_PORT=${RELAY_METRICS_PORT:-39081}
+ # Avoid collisions between locally parallel/recent smoke invocations.  The
+ # caller may still pin PORT/RELAY_PORT/RELAY_METRICS_PORT explicitly.
+PORT=${PORT:-$((38080 + ($$ % 1000) * 10))}
+RELAY_PORT=${RELAY_PORT:-$((PORT + 1))}
+RELAY_METRICS_PORT=${RELAY_METRICS_PORT:-$((PORT + 1001))}
 DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 301))}
 DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 302))}
 STEP_A=${STEP_A:-1}
@@ -37,6 +39,7 @@ LOSS=${LOSS:-0.0}
 REORDER=${REORDER:-0}
 STRICT_FILTERING=${STRICT_FILTERING:-0}
 FRESH_MAPPING_PUNCH=${FRESH_MAPPING_PUNCH:-1}
+PREDICTED_CANDIDATES=${PREDICTED_CANDIDATES:-1}
 BIRTHDAY_PROBING=${BIRTHDAY_PROBING:-1}
 SOCKET_POOL=${SOCKET_POOL:-}
 BASE_A=${BASE_A:-36000}
@@ -44,6 +47,34 @@ BASE_B=${BASE_B:-46000}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-60}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-30}
 NAT_SIM_ARTIFACT_DIR=${NAT_SIM_ARTIFACT_DIR:-}
+# Post-first-usable burst verification: fire this many business payloads per
+# peer right after first-usable evidence and require EVERY echo (zero loss /
+# duplicate / replay).  Relay-only rounds default to a 256-packet burst.
+OVERLAY_BURST=${OVERLAY_BURST:-0}
+# Relay-only rounds verify a full 256-packet burst by default (the acceptance
+# requirement: 100 continuous + 256 burst with zero loss).
+if [[ "$OVERLAY_BURST" -eq 0 && "$MODE" == "relay-only" ]]; then
+  OVERLAY_BURST=256
+fi
+# Artificial per-frame relay forwarding delay in ms (slow-relay diagnostics;
+# the relay observes the full one-way delay).  Informational: a delayed relay
+# cannot meet the 3000ms SLO, so no PASS/FAIL claim is made for it.
+RELAY_DELAY_MS=${RELAY_DELAY_MS:-0}
+# Kill and restart the relay mid-round and require the overlay to recover
+# (relay disconnect/reconnect verification).
+RELAY_KILL_RESTART=${RELAY_KILL_RESTART:-0}
+# Number of relay candidates offered in the catalog.  With RELAY_FAILOVER=1,
+# the ACTIVE relay is killed after the round's first confirmation and the
+# daemon must fail over to another candidate and re-confirm.
+RELAY_COUNT=${RELAY_COUNT:-1}
+RELAY_FAILOVER=${RELAY_FAILOVER:-0}
+# Failure-injection hooks exercise the harness' own observability gate.  They
+# deliberately make a required endpoint unavailable or malformed; the smoke
+# run must FAIL with a reason code instead of manufacturing an empty JSON
+# object or a zero delta.
+STATUS_FAILURE_INJECTION=${STATUS_FAILURE_INJECTION:-0}
+METRICS_FAILURE_INJECTION=${METRICS_FAILURE_INJECTION:-0}
+STATUS_SCHEMA_INJECTION=${STATUS_SCHEMA_INJECTION:-0}
 
 if ! [[ "$NAT_SEED_BASE" =~ ^[0-9]+$ ]]; then
   echo "[nat-sim] NAT_SEED_BASE must be a non-negative integer" >&2
@@ -108,6 +139,71 @@ node_failure_code() {
   strip_ansi < "$log" | grep "relay_unavailable_or_first_packet_expired" | grep -oE 'reason_code=Some\("[A-Za-z0-9_]+"\)' | head -1 | sed -E 's/.*reason_code=Some\("([A-Za-z0-9_]+)"\).*/\1/' || true
 }
 
+# Fetch a required JSON endpoint.  A failed request, an empty document, or an
+# incomplete schema is an acceptance failure.  In particular, this function
+# never writes `{}` as a substitute for missing status/metrics evidence.
+fetch_required_json() {
+  local url="$1" output="$2" kind="$3"
+  if [[ "$kind" == "status" && "$STATUS_FAILURE_INJECTION" == "1" ]]; then
+    echo "[nat-sim] FAIL reason_code=status_http_500_injected url=$url" >&2
+    return 1
+  fi
+  if [[ "$kind" == "metrics" && "$METRICS_FAILURE_INJECTION" == "1" ]]; then
+    echo "[nat-sim] FAIL reason_code=metrics_http_500_injected url=$url" >&2
+    return 1
+  fi
+  if ! curl -fsS --max-time 5 "$url" -o "$output"; then
+    echo "[nat-sim] FAIL reason_code=${kind}_unavailable url=$url" >&2
+    return 1
+  fi
+  if ! python3 - "$output" "$kind" "$STATUS_SCHEMA_INJECTION" <<'PY'
+import json
+import sys
+
+path, kind, schema_injection = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        value = json.load(handle)
+except Exception as exc:
+    raise SystemExit(f"{kind}_invalid_json: {exc}")
+if not isinstance(value, dict) or not value:
+    raise SystemExit(f"{kind}_empty_or_non_object")
+if kind == "status":
+    if schema_injection == "1":
+        raise SystemExit("status_schema_injected")
+    stats = value.get("stats")
+    timeline = value.get("connection_timeline")
+    if not isinstance(stats, dict) or not isinstance(timeline, dict):
+        raise SystemExit("status_schema_incomplete")
+    if not isinstance(stats.get("outbound_drops"), dict):
+        raise SystemExit("status_schema_missing_outbound_drops")
+    if not isinstance(stats.get("outbound_loss_events"), list):
+        raise SystemExit("status_schema_missing_outbound_loss_events")
+    if not isinstance(timeline.get("correlation_id"), str) or not timeline["correlation_id"]:
+        raise SystemExit("status_schema_missing_correlation_id")
+    if not isinstance(timeline.get("events"), list):
+        raise SystemExit("status_schema_missing_timeline_events")
+elif kind == "metrics":
+    required = (
+        "active_connections",
+        "registered_peers",
+        "forwarded_frames_total",
+        "forward_errors_total",
+    )
+    for field in required:
+        if not isinstance(value.get(field), (int, float)) or isinstance(value.get(field), bool):
+            raise SystemExit(f"metrics_schema_missing_{field}")
+    # Metrics are intentionally aggregate-only; source identifiers do not
+    # belong on this unauthenticated diagnostic endpoint.
+    if "auth_failure_sources" in value:
+        raise SystemExit("metrics_schema_contains_source_identifiers")
+PY
+  then
+    echo "[nat-sim] FAIL reason_code=${kind}_schema_invalid file=$output" >&2
+    return 1
+  fi
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
@@ -120,7 +216,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
-echo "[nat-sim] traversal flags: strict_filtering=$STRICT_FILTERING fresh_mapping=$FRESH_MAPPING_PUNCH birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
+echo "[nat-sim] traversal flags: strict_filtering=$STRICT_FILTERING fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
 echo "[nat-sim] building control server, relay and daemon..."
 (
   cd "$ROOT_DIR/server"
@@ -174,20 +270,40 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
 
-  # Relay (safety net; TCP, bypasses the NATs).
+  # Relay(s) (safety net; TCP, bypasses the NATs).  Multiple relays offer a
+  # catalog with several candidates; the daemon selects one and fails over to
+  # another when the active one dies (RELAY_FAILOVER).
   KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
-  RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" -bind "127.0.0.1:$RELAY_PORT" \
-    -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
-    -metrics-bind "127.0.0.1:$RELAY_METRICS_PORT" \
-    >"$ROUND_DIR/relay.log" 2>&1 &
-  RELAY_PID=$!
-  PIDS+=($RELAY_PID)
+  RELAY_PIDS=()
+  RELAY_ENDPOINTS=""
+  if [[ "$RELAY_COUNT" -lt 1 ]]; then RELAY_COUNT=1; fi
+  for relay_idx in $(seq 1 "$RELAY_COUNT"); do
+    R_PORT=$((RELAY_PORT + relay_idx - 1))
+    R_METRICS=$((RELAY_METRICS_PORT + relay_idx - 1))
+    R_AUDIENCE="relay-sim"
+    R_REGION="local"
+    if [[ "$relay_idx" -gt 1 ]]; then
+      R_AUDIENCE="relay-sim-$relay_idx"
+      R_REGION="local-b"
+    fi
+    RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" "$BASE_DIR/relay-server" \
+      -bind "127.0.0.1:$R_PORT" \
+      -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
+      -metrics-bind "127.0.0.1:$R_METRICS" \
+      -forward-delay "${RELAY_DELAY_MS}ms" \
+      >"$ROUND_DIR/relay-$relay_idx.log" 2>&1 &
+    RELAY_PIDS+=($!)
+    PIDS+=($!)
+    if [[ -n "$RELAY_ENDPOINTS" ]]; then RELAY_ENDPOINTS="$RELAY_ENDPOINTS,"; fi
+    RELAY_ENDPOINTS="${RELAY_ENDPOINTS}{\"region\":\"$R_REGION\",\"audience\":\"$R_AUDIENCE\",\"endpoint\":\"tcp://127.0.0.1:$R_PORT\"}"
+  done
+  RELAY_PID="${RELAY_PIDS[0]}"
 
   # Control server with the relay catalog (no UDP observer in the catalog:
   # every STUN flow must traverse the simulated NATs).
   export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
     RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
-    RELAY_CATALOG_JSON="[{\"region\":\"local\",\"audience\":\"relay-sim\",\"endpoint\":\"tcp://127.0.0.1:$RELAY_PORT\"}]"
+    RELAY_CATALOG_JSON="[$RELAY_ENDPOINTS]"
   "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   PIDS+=($SERVER_PID)
@@ -198,9 +314,13 @@ for round in $(seq 1 "$ROUNDS"); do
   done
   curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null
 
-  REGISTER_JSON=$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/register" \
-    -H 'Content-Type: application/json' \
-    -d '{"email":"smoke@example.com","password":"passw0rd"}')
+  REGISTER_JSON=""
+  for _ in {1..20}; do
+    REGISTER_JSON=$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/register" \
+      -H 'Content-Type: application/json' \
+      -d '{"email":"smoke@example.com","password":"passw0rd"}' 2>/dev/null) && break
+    sleep 0.5
+  done
   TOKEN=$(printf '%s' "$REGISTER_JSON" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
   if [[ -z "$TOKEN" ]]; then
     echo "[nat-sim] round $round: failed to parse auth token" >&2
@@ -218,11 +338,21 @@ for round in $(seq 1 "$ROUNDS"); do
     # the outbound selector ride Relay since Direct is blackholed.
     OVERLAY_FLAGS="$OVERLAY_FLAGS --overlay-any-path"
   fi
+  if [[ "$OVERLAY_BURST" -gt 0 ]]; then
+    OVERLAY_FLAGS="$OVERLAY_FLAGS --overlay-burst $OVERLAY_BURST"
+  fi
 
   TRAVERSAL_FLAGS=""
+  if [[ "$RELAY_COUNT" -ge 2 ]]; then
+    # Both daemons must converge on the PRIMARY relay first for the failover
+    # scenario to be deterministic (region preference wins over latency jitter).
+    TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-regions local-a"
+  fi
   if [[ "$FRESH_MAPPING_PUNCH" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-fresh-mapping-punch"; fi
+  if [[ "$PREDICTED_CANDIDATES" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-predicted-candidates"; fi
   if [[ "$BIRTHDAY_PROBING" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-birthday-probing"; fi
   if [[ -n "$SOCKET_POOL" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --socket-pool $SOCKET_POOL"; fi
+  if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
 
   P2WLAN_DISABLE_TUN=1 RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-a.json" \
@@ -269,13 +399,24 @@ for round in $(seq 1 "$ROUNDS"); do
     # Availability pass condition: BOTH sides complete a bidirectional
     # encrypted overlay loopback (overlay_payload_verified), which here rides
     # Relay.  Direct must not establish (informational, not a failure signal).
+    # When OVERLAY_BURST is set, the round additionally waits for the burst to
+    # complete on both sides.
     overlay_ok=0
-    for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 2))); do
+    for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
       A_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+      A_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+      B_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
       if [[ "$A_OVERLAY" -gt 0 && "$B_OVERLAY" -gt 0 ]]; then
-        overlay_ok=1
-        break
+        if [[ "$OVERLAY_BURST" -gt 0 ]]; then
+          if [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 ]]; then
+            overlay_ok=1
+            break
+          fi
+        else
+          overlay_ok=1
+          break
+        fi
       fi
       sleep 0.5
     done
@@ -291,7 +432,9 @@ for round in $(seq 1 "$ROUNDS"); do
       if grep -q '→ direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \
          grep -q '→ direct' "$ROUND_DIR/node-b.log" 2>/dev/null && \
          grep -q 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null && \
-         grep -q 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+         grep -q 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null && \
+         grep -q 'event="first_usable_confirmed".*ingress=direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \
+         grep -q 'event="first_usable_confirmed".*ingress=direct' "$ROUND_DIR/node-b.log" 2>/dev/null; then
         direct_ok=1
         break
       fi
@@ -305,9 +448,11 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
   END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   ELAPSED_MS=$((END_MS - START_MS))
-  curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status" >"$ROUND_DIR/node-a.status.json" || printf '{}\n' >"$ROUND_DIR/node-a.status.json"
-  curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_B_PORT/status" >"$ROUND_DIR/node-b.status.json" || printf '{}\n' >"$ROUND_DIR/node-b.status.json"
-  curl -fsS --max-time 5 "http://127.0.0.1:$RELAY_METRICS_PORT/metrics" >"$ROUND_DIR/relay.metrics.json" || printf '{}\n' >"$ROUND_DIR/relay.metrics.json"
+  STATUS_SCHEMA_OK=1
+  fetch_required_json "http://127.0.0.1:$DIAG_A_PORT/status" "$ROUND_DIR/node-a.status.json" status || STATUS_SCHEMA_OK=0
+  fetch_required_json "http://127.0.0.1:$DIAG_B_PORT/status" "$ROUND_DIR/node-b.status.json" status || STATUS_SCHEMA_OK=0
+  METRICS_SCHEMA_OK=1
+  fetch_required_json "http://127.0.0.1:$((RELAY_METRICS_PORT))/metrics" "$ROUND_DIR/relay.metrics.json" metrics || METRICS_SCHEMA_OK=0
 
   # Record the evidence stream for this round.
   {
@@ -338,10 +483,36 @@ for round in $(seq 1 "$ROUNDS"); do
   # SUMS the two ends' deltas, never subtracts wall clocks across machines.
   A_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-a.log")
   B_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-b.log")
-  [[ -z "$A_DELTA" ]] && A_DELTA=0
-  [[ -z "$B_DELTA" ]] && B_DELTA=0
-  SUM_DELTA=$((A_DELTA + B_DELTA))
-  DELTA_SUMS+=("$SUM_DELTA")
+  DELTA_OK=1
+  if [[ -z "$A_DELTA" || -z "$B_DELTA" ]]; then
+    if [[ "$MODE" == "relay-only" ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=first_usable_delta_missing a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
+      DELTA_OK=0
+      overall=1
+      A_DELTA=-1
+      B_DELTA=-1
+      SUM_DELTA=-1
+    else
+      # A Direct first-usable proof has no relay-ready delta by definition;
+      # preserve that as an explicit non-value rather than treating it as 0.
+      A_DELTA="n/a"
+      B_DELTA="n/a"
+      SUM_DELTA="n/a"
+    fi
+  else
+    SUM_DELTA=$((A_DELTA + B_DELTA))
+    DELTA_SUMS+=("$SUM_DELTA")
+  fi
+
+  if [[ "$MODE" == "relay-only" && "$RELAY_DELAY_MS" -gt 0 ]]; then
+    if [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=relay_first_slo_exceeded slow_relay_delay_ms=$RELAY_DELAY_MS a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA slo_ms=3000" >&2
+      overall=1
+    else
+      echo "[nat-sim] ROUND $round: FAIL reason_code=slow_relay_test_not_exercised delay_ms=$RELAY_DELAY_MS" >&2
+      overall=1
+    fi
+  fi
   A_INGRESS=$(node_first_usable_ingress "$ROUND_DIR/node-a.log")
   B_INGRESS=$(node_first_usable_ingress "$ROUND_DIR/node-b.log")
   A_RELAY_CONFIRMED=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null || echo 0)
@@ -360,29 +531,162 @@ for round in $(seq 1 "$ROUNDS"); do
     #     ingress);
     #   - BOTH sides' first usable path had real relay ingress (ingress=relay:),
     #     which by construction required a locally-sent, matching-nonce echo;
-    #   - each daemon's OWN monotonic relay-ready -> usable delta <= 3000ms.
+    #   - each daemon's OWN monotonic relay-ready -> usable delta <= 3000ms;
+    #   - zero structured outbound drops, zero WireGuard replay rejects and
+    #     zero overlay duplicate/invalid on BOTH sides;
+    #   - when OVERLAY_BURST is set: the full burst completed on BOTH sides.
     a_relay_first=0
     b_relay_first=0
     [[ "$A_INGRESS" == relay:* ]] && a_relay_first=1
     [[ "$B_INGRESS" == relay:* ]] && b_relay_first=1
-    if [[ "$overlay_ok" -eq 1 && "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 \
+    read -r A_DROPS A_DROP_BYTES < <(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$ROUND_DIR/node-a.status.json'))
+    s=d.get('stats',{})
+    drops=s['outbound_drops']
+    if not isinstance(drops, dict): raise ValueError('outbound_drops schema')
+    packets=sum(int(v['packets']) for v in drops.values())
+    bytes_=sum(int(v['bytes']) for v in drops.values())
+    print(packets, bytes_)
+except Exception:
+    print('-1 -1')")
+    read -r B_DROPS B_DROP_BYTES < <(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$ROUND_DIR/node-b.status.json'))
+    s=d.get('stats',{})
+    drops=s['outbound_drops']
+    if not isinstance(drops, dict): raise ValueError('outbound_drops schema')
+    packets=sum(int(v['packets']) for v in drops.values())
+    bytes_=sum(int(v['bytes']) for v in drops.values())
+    print(packets, bytes_)
+except Exception:
+    print('-1 -1')")
+    A_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_BURST_BAD=$(grep -c 'overlay_burst_incomplete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_BURST_BAD=$(grep -c 'overlay_burst_incomplete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    BURST_OK=1
+    if [[ "$OVERLAY_BURST" -gt 0 ]]; then
+      [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 && "$A_BURST_BAD" -eq 0 && "$B_BURST_BAD" -eq 0 ]] || BURST_OK=0
+    fi
+    if [[ "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 && "$DELTA_OK" -eq 1 \
+          && "$overlay_ok" -eq 1 && "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \
           && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \
-          && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 ]]; then
-      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/evidence.log"
+          && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 \
+          && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
+          && "$A_REPLAY" -eq 0 && "$B_REPLAY" -eq 0 \
+          && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 \
+          && "$BURST_OK" -eq 1 ]]; then
+      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
     else
-      echo "[nat-sim] ROUND $round: FAIL relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA elapsed_ms=$ELAPSED_MS (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms)"
+      echo "[nat-sim] ROUND $round: FAIL relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete)"
       overall=1
     fi
   else
     # A single-sided Direct, unverified Direct payload, or relay-only round is
     # a failure.  The direct validation loop cannot use Relay in this mode.
-    if [[ "$direct_ok" -eq 1 ]]; then
-      echo "[nat-sim] ROUND $round: PASS both_direct a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
+    if [[ "$direct_ok" -eq 1 && "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 ]]; then
+      echo "[nat-sim] ROUND $round: PASS both_direct a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
     else
-      echo "[nat-sim] ROUND $round: NO-DIRECT a_direct=$A_DIRECT b_direct=$B_DIRECT a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA elapsed_ms=$ELAPSED_MS (relay fallback expected)"
+      if [[ "$direct_ok" -ne 1 ]]; then
+        DIRECT_REASON="direct_overlay_unverified"
+      elif [[ "$STATUS_SCHEMA_OK" -ne 1 ]]; then
+        DIRECT_REASON="status_schema_invalid"
+      else
+        DIRECT_REASON="metrics_schema_invalid"
+      fi
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$DIRECT_REASON a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
       overall=1
+    fi
+  fi
+
+  # Relay resilience scenarios (diagnostic; only run in relay-only mode where
+  # the relay is the only data path).
+  if [[ "$MODE" == "relay-only" && "$RELAY_KILL_RESTART" == "1" ]]; then
+    # Kill the active relay and restart it on the same port: the daemon must
+    # reconnect and the encrypted overlay must recover (verified round trips
+    # continue growing) within the window.
+    A_BEFORE=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_BEFORE=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    kill "${RELAY_PIDS[0]}" 2>/dev/null || true
+    wait "${RELAY_PIDS[0]}" 2>/dev/null || true
+    sleep 1
+    KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
+    RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" \
+      -bind "127.0.0.1:$RELAY_PORT" \
+      -ticket-keyring "$KEYRING_JSON" -require-auth -allow-insecure-plaintext \
+      -metrics-bind "127.0.0.1:$RELAY_METRICS_PORT" \
+      -forward-delay "${RELAY_DELAY_MS}ms" \
+      >"$ROUND_DIR/relay-restarted.log" 2>&1 &
+    RELAY_PIDS[0]=$!
+    PIDS+=($!)
+    recovered=0
+    for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
+      A_AFTER=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+      B_AFTER=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+      if [[ "$A_AFTER" -gt "$A_BEFORE" && "$B_AFTER" -gt "$B_BEFORE" ]]; then
+        recovered=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [[ "$recovered" -eq 1 ]]; then
+      echo "[nat-sim] ROUND $round: PASS relay_kill_restart_recovery overlay_before=$A_BEFORE after_a=$A_AFTER"
+    else
+      echo "[nat-sim] ROUND $round: FAIL relay_kill_restart_recovery (overlay did not recover after relay restart)"
+      overall=1
+    fi
+  fi
+
+  if [[ "$MODE" == "relay-only" && "$RELAY_FAILOVER" == "1" && "$RELAY_COUNT" -ge 2 ]]; then
+    # Kill the ACTIVE relay (the one the daemons confirmed on); with another
+    # candidate in the catalog the daemon must fail over, re-probe and
+    # re-confirm on the replacement relay, and the overlay must keep running.
+    ACTIVE_ENDPOINT=$(strip_ansi < "$ROUND_DIR/node-a.log" | grep -m1 'relay_peer_confirmed' | grep -oE 'relay_endpoint=[^ ]+' | head -1 | cut -d= -f2 || true)
+    if [[ -z "$ACTIVE_ENDPOINT" ]]; then
+      echo "[nat-sim] ROUND $round: FAIL relay_failover (could not determine the active relay endpoint)"
+      overall=1
+    else
+      ACTIVE_PORT=$(printf '%s' "$ACTIVE_ENDPOINT" | grep -oE '[0-9]+$')
+      killed=0
+      for idx in $(seq 1 "$RELAY_COUNT"); do
+        R_PORT=$((RELAY_PORT + idx - 1))
+        if [[ "$R_PORT" == "$ACTIVE_PORT" ]]; then
+          kill "${RELAY_PIDS[$((idx - 1))]}" 2>/dev/null || true
+          wait "${RELAY_PIDS[$((idx - 1))]}" 2>/dev/null || true
+          killed=1
+          break
+        fi
+      done
+      if [[ "$killed" -eq 0 ]]; then
+        echo "[nat-sim] ROUND $round: FAIL relay_failover (active relay $ACTIVE_ENDPOINT not among the started relays)"
+        overall=1
+      else
+        re_confirmed=0
+        for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
+          B_CONF=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+          A_CONF=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+          if [[ "$A_CONF" -ge 2 && "$B_CONF" -ge 2 ]]; then
+            re_confirmed=1
+            break
+          fi
+          sleep 0.5
+        done
+        if [[ "$re_confirmed" -eq 1 ]]; then
+          echo "[nat-sim] ROUND $round: PASS relay_failover_reconfirmed active=$ACTIVE_ENDPOINT confirmations_a=$A_CONF confirmations_b=$B_CONF"
+        else
+          echo "[nat-sim] ROUND $round: FAIL relay_failover_reconfirmed (no re-confirmation on the replacement relay; active=$ACTIVE_ENDPOINT)"
+          overall=1
+        fi
+      fi
     fi
   fi
 
@@ -392,8 +696,14 @@ for round in $(seq 1 "$ROUNDS"); do
     overall=1
   fi
 
-  kill "$NODE_A_PID" "$NODE_B_PID" "$RELAY_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
-  wait "$NODE_A_PID" "$NODE_B_PID" "$RELAY_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
+  kill "$NODE_A_PID" "$NODE_B_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
+  for relay_pid in "${RELAY_PIDS[@]:-}"; do
+    kill "$relay_pid" 2>/dev/null || true
+  done
+  wait "$NODE_A_PID" "$NODE_B_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
+  for relay_pid in "${RELAY_PIDS[@]:-}"; do
+    wait "$relay_pid" 2>/dev/null || true
+  done
   PIDS=()
   sleep 0.5
 done

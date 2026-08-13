@@ -12,8 +12,10 @@ pub struct Daemon {
     peers: Arc<PeerManager>,
     /// Shared WireGuard transport session adapter.
     transport: WireGuardTransport,
-    /// Encrypted outbound packets emitted by the WireGuard adapter.
-    encrypted_rx: Option<mpsc::Receiver<OrderedEncryptedPeerPacket>>,
+    /// RAW routed outbound packets emitted by the WireGuard adapter to the
+    /// network outbound worker (which is the only place that encrypts
+    /// business packets).
+    outbound_rx: Option<mpsc::Receiver<OutboundPacket>>,
     /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
     pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
     /// Serializes offer, answer, and maintenance mutations for one peer.
@@ -131,7 +133,7 @@ impl Daemon {
             Some(relay_selection.clone()),
             timeline.clone(),
         );
-        let (transport, encrypted_rx) = WireGuardTransport::new();
+        let (transport, outbound_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 
@@ -149,6 +151,15 @@ impl Daemon {
         let punch_attempts = PunchAttemptDeduplicator::default();
         let peers = Arc::new(PeerManager::new(config.clone()));
         peers.set_timeline(timeline.clone());
+        // Share ONE outbound-loss counter map between the peer manager (worker
+        // drops) and the transport (session-not-ready queue drops) so
+        // `/status.stats.outbound_drops` / `outbound_send_failures` report
+        // every loss source in one place.
+        let outbound_loss = Arc::new(tokio::sync::Mutex::new(
+            crate::peer::OutboundLossCounters::default(),
+        ));
+        peers.set_outbound_loss_sink(outbound_loss.clone());
+        transport.set_outbound_loss_sink(Some(outbound_loss));
         {
             let punch_attempts = punch_attempts.clone();
             peers.set_punch_cancel_hook(Arc::new(move |peer_id| {
@@ -162,7 +173,7 @@ impl Daemon {
             control_rx,
             peers,
             transport,
-            encrypted_rx: Some(encrypted_rx),
+            outbound_rx: Some(outbound_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             handshake_arbiter: HandshakeArbiter::default(),
             local_candidates: Arc::new(RwLock::new(Vec::new())),

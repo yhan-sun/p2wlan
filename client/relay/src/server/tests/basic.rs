@@ -11,12 +11,12 @@ async fn test_client_register_and_forward() {
     let addr = server.addr;
 
     // Client A registers
-    let (mut client_a, mut rx_a) = RelayClient::connect(&addr.to_string(), "nodeA")
+    let (client_a, mut rx_a) = RelayClient::connect(&addr.to_string(), "nodeA")
         .await
         .unwrap();
 
     // Client B registers
-    let (mut client_b, mut rx_b) = RelayClient::connect(&addr.to_string(), "nodeB")
+    let (client_b, mut rx_b) = RelayClient::connect(&addr.to_string(), "nodeB")
         .await
         .unwrap();
 
@@ -61,7 +61,7 @@ async fn test_forward_to_nonexistent_peer() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "lonely")
+    let (client, mut rx) = RelayClient::connect(&addr.to_string(), "lonely")
         .await
         .unwrap();
 
@@ -84,7 +84,7 @@ async fn test_ping_pong() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client, mut rx) = RelayClient::connect(&addr.to_string(), "pinger")
+    let (client, mut rx) = RelayClient::connect(&addr.to_string(), "pinger")
         .await
         .unwrap();
 
@@ -109,7 +109,7 @@ async fn test_multiple_peers() {
     // Register 3 clients
     let (_c1, mut rx1) = RelayClient::connect(&addr.to_string(), "p1").await.unwrap();
     let (_c2, mut rx2) = RelayClient::connect(&addr.to_string(), "p2").await.unwrap();
-    let (mut c3, _rx3) = RelayClient::connect(&addr.to_string(), "p3").await.unwrap();
+    let (c3, _rx3) = RelayClient::connect(&addr.to_string(), "p3").await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -149,7 +149,7 @@ async fn test_large_data_transfer() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    let (mut client_a, _rxa) = RelayClient::connect(&addr.to_string(), "bigA")
+    let (client_a, _rxa) = RelayClient::connect(&addr.to_string(), "bigA")
         .await
         .unwrap();
     let (_client_b, mut rxb) = RelayClient::connect(&addr.to_string(), "bigB")

@@ -197,6 +197,7 @@ async fn relay_validation_targets_include_slow_direct_but_skip_fast_direct() {
 
     manager.add_peer(&test_peer("fast", fast_endpoint)).await;
     manager.add_peer(&test_peer("slow", slow_endpoint)).await;
+    manager.add_peer(&test_peer("offline", "127.0.0.1:51847".parse().unwrap())).await;
     {
         let mut conns = manager.connections.write().await;
         let fast = conns.get_mut("fast").unwrap();
@@ -210,6 +211,7 @@ async fn relay_validation_targets_include_slow_direct_but_skip_fast_direct() {
             .record_success_with_latency(Duration::from_millis(
                 SLOW_DIRECT_RELAY_VALIDATION_RTT_MS,
             ));
+        conns.get_mut("offline").unwrap().online = false;
     }
 
     let targets = manager
@@ -218,6 +220,7 @@ async fn relay_validation_targets_include_slow_direct_but_skip_fast_direct() {
 
     assert!(!targets.iter().any(|(node_id, _)| node_id == "fast"));
     assert!(targets.iter().any(|(node_id, _)| node_id == "slow"));
+    assert!(!targets.iter().any(|(node_id, _)| node_id == "offline"));
 }
 
 #[tokio::test]

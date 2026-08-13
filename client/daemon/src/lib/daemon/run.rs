@@ -2,6 +2,20 @@ impl Daemon {
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
         info!("P2WLAN daemon v{} starting...", env!("CARGO_PKG_VERSION"));
+        let build = crate::build_info::current();
+        info!(
+            event = "daemon_build_identity",
+            version = %build.app_version,
+            git_commit = %build.git_commit,
+            build_id = %build.build_id,
+            binary_sha256 = %build.binary_sha256,
+            binary_path = %build.binary_path,
+            "daemon_build_identity version={} git_commit={} build_id={} binary_sha256={}",
+            build.app_version,
+            build.git_commit,
+            build.build_id,
+            build.binary_sha256,
+        );
         info!("Node ID: {}", self.config.node.node_id);
         info!(
             "Network: {} ({})",
@@ -29,8 +43,6 @@ impl Daemon {
         let mut assigned_node_id = self.config.node.node_id.clone();
         let mut relay_servers = self.config.relay.servers.clone();
         let mut relay_catalog = Vec::new();
-
-        let mut control_event_registered = None;
 
         if !self.config.network.manual {
             info!("Running in managed mode. Waiting for control plane registration...");
@@ -83,13 +95,6 @@ impl Daemon {
                                 infer_default_relay_servers(&self.config.control.server_url);
                         }
 
-                        control_event_registered = Some(ControlEvent::Registered {
-                            node_id: Some(assigned_node_id.clone()),
-                            virtual_ip: virtual_ip.clone(),
-                            cidr: Some(cidr.clone()),
-                            relay_servers: relay_servers.clone(),
-                            relay_catalog: relay_catalog.clone(),
-                        });
                         break;
                     }
                     ControlEvent::ServerError { code, message } => {
@@ -141,11 +146,50 @@ impl Daemon {
         // Install overlay route
         self.route_manager.add_cidr_route(&cidr)?;
 
-        let Some(encrypted_rx) = self.encrypted_rx.take() else {
+        let Some(outbound_rx) = self.outbound_rx.take() else {
             return Err(DaemonError::Network(
-                "encrypted packet receiver already attached".to_string(),
+                "outbound packet receiver already attached".to_string(),
             ));
         };
+        let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
+
+        // Relay setup is the availability path.  Start it immediately after
+        // control registration/TUN setup, before any best-effort STUN DNS
+        // resolution.  The previous order resolved the default STUN hostnames
+        // serially here; on Mini two 1-second resolver timeouts delayed relay
+        // selection by ~4.1s even though the control plane and relay were
+        // already reachable.  Direct candidate gathering remains in its own
+        // task below and can publish/upgrade after relay is serving.
+        let relay_candidates = relay_candidates_from_sources(&relay_catalog, &relay_servers);
+        let relay_candidates_present = !relay_candidates.is_empty();
+        let mut relay_started = false;
+        if relay_candidates_present {
+            relay_started = true;
+            spawn_relay_inbound(RelayInboundSpawnContext {
+                task_manager: self.task_manager.clone(),
+                relay_candidates,
+                preferred_regions: self.config.relay.preferred_regions.clone(),
+                selection_timeout: Duration::from_millis(
+                    self.config.relay.selection_timeout_ms.max(1),
+                ),
+                node_id: assigned_node_id.clone(),
+                peers: self.peers.clone(),
+                relay_transport: self.relay_transport.clone(),
+                relay_selection: self.relay_selection.clone(),
+                relay_available_tx: self.relay_available_tx.clone(),
+                timeline: self.timeline.clone(),
+                inbound_tx: network_inbound_tx.clone(),
+                control: self.control.clone(),
+                allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
+                ca_cert_path: self.config.relay.ca_cert_path.clone(),
+            })
+            .await;
+        } else {
+            debug!(
+                "No relay servers configured; direct UDP only unless peers provide relay later"
+            );
+        }
+
         let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
             DaemonError::Config(format!(
                 "invalid network.udp_bind '{}': {e}",
@@ -188,9 +232,6 @@ impl Daemon {
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let punch_attempts = self.config.network.punch_attempts;
 
-        let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
-        let relay_candidates_present =
-            !relay_candidates_from_sources(&relay_catalog, &relay_servers).is_empty();
         let relay_startup_wait = if relay_candidates_present {
             RelayStartupWait {
                 timeout: Some(Duration::from_millis(
@@ -214,7 +255,8 @@ impl Daemon {
                 "network-outbound",
                 true,
                 run_network_outbound(
-                    encrypted_rx,
+                    outbound_rx,
+                    self.transport.clone(),
                     self.peers.clone(),
                     prefer_direct,
                     self.udp_transport.clone(),
@@ -366,54 +408,6 @@ let udp_direct_context = UdpDirectTaskContext {
 self.task_manager
     .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
     .await;
-
-        // Relay registration must use the node ID assigned by the control plane.
-        let mut relay_started = false;
-
-        // If we had a cached control_event_registered, process it first
-        if let Some(ControlEvent::Registered {
-            ref node_id,
-            ref relay_servers,
-            ref relay_catalog,
-            ..
-        }) = control_event_registered
-        {
-            let relay_node_id = node_id
-                .clone()
-                .unwrap_or_else(|| self.config.node.node_id.clone());
-            let relay_servers = if relay_servers.is_empty() {
-                self.config.relay.servers.clone()
-            } else {
-                relay_servers.clone()
-            };
-            let relay_candidates = relay_candidates_from_sources(relay_catalog, &relay_servers);
-            if relay_candidates.is_empty() {
-                debug!(
-                    "No relay servers configured; direct UDP only unless peers provide relay later"
-                );
-            } else {
-                relay_started = true;
-spawn_relay_inbound(RelayInboundSpawnContext {
-    task_manager: self.task_manager.clone(),
-    relay_candidates,
-    preferred_regions: self.config.relay.preferred_regions.clone(),
-    selection_timeout: Duration::from_millis(
-        self.config.relay.selection_timeout_ms.max(1),
-    ),
-    node_id: relay_node_id,
-    peers: self.peers.clone(),
-    relay_transport: self.relay_transport.clone(),
-    relay_selection: self.relay_selection.clone(),
-    relay_available_tx: self.relay_available_tx.clone(),
-    timeline: self.timeline.clone(),
-    inbound_tx: network_inbound_tx.clone(),
-    control: self.control.clone(),
-    allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
-    ca_cert_path: self.config.relay.ca_cert_path.clone(),
-})
-.await;
-            }
-        }
 
 // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
 self.task_manager

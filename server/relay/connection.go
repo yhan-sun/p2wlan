@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -9,6 +10,29 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// writeFull is the relay's frame boundary: a successful forwarding decision
+// must put the complete encoded frame on the destination connection.  A
+// single net.Conn.Write is allowed to report n < len(p), so ignoring n can
+// truncate a frame without incrementing forward_errors_total.  The client
+// reader then loses stream framing and one encrypted packet silently
+// disappears even though the relay counted it as forwarded.
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n < 0 || n > len(data) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
 
 func authFailureSource(addr net.Addr) string {
 	if addr == nil {
@@ -94,7 +118,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				if !ok {
 					return
 				}
-				if _, err := conn.Write(frame); err != nil {
+				if err := writeFull(conn, frame); err != nil {
 					p.writeFailed.Store(true)
 					_ = conn.Close()
 					return

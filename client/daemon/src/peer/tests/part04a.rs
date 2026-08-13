@@ -500,7 +500,7 @@ async fn synchronized_probe_targets_bypass_failure_cooldown() {
 }
 
 #[test]
-fn direct_retry_backoff_reaches_sixty_four_seconds() {
+fn direct_retry_backoff_is_capped_for_fast_recovery() {
     let mut health = PathHealth::default();
     let base = DIRECT_RETRY_BASE_INTERVAL;
 
@@ -517,14 +517,14 @@ fn direct_retry_backoff_reaches_sixty_four_seconds() {
     assert_eq!(health.retry_after(base), Duration::from_secs(8));
 
     health.record_failure(REASON_DIRECT_PROBE_FAILED, "fifth failure");
-    assert_eq!(health.retry_after(base), Duration::from_secs(16));
+    assert_eq!(health.retry_after(base), Duration::from_secs(8));
 
     health.record_failure(REASON_DIRECT_PROBE_FAILED, "sixth failure");
-    assert_eq!(health.retry_after(base), Duration::from_secs(32));
+    assert_eq!(health.retry_after(base), Duration::from_secs(8));
 
     health.record_failure(REASON_DIRECT_PROBE_FAILED, "seventh failure");
-    assert_eq!(health.retry_after(base), Duration::from_secs(64));
+    assert_eq!(health.retry_after(base), Duration::from_secs(8));
 
     health.record_failure(REASON_DIRECT_PROBE_FAILED, "eighth failure");
-    assert_eq!(health.retry_after(base), Duration::from_secs(64));
+    assert_eq!(health.retry_after(base), Duration::from_secs(8));
 }

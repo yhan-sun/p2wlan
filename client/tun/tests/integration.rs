@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 /// Test that a mock device can read and write packets.
 #[tokio::test]
 async fn test_mock_device_roundtrip() {
-    let (mut dev, mut ctrl) = MockTunDevice::new_default("p2pnet0");
+    let (mut dev, ctrl) = MockTunDevice::new_default("p2pnet0");
 
     let src = Ipv4Addr::new(10, 20, 0, 1);
     let dst = Ipv4Addr::new(10, 20, 0, 2);

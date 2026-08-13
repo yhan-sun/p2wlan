@@ -28,6 +28,15 @@ func getIntEnv(key string, fallback int) (int, error) {
 	return i, nil
 }
 
+func getEnvDurationMs(key string, fallbackMs int64) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if ms, err := strconv.ParseInt(val, 10, 64); err == nil && ms >= 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return time.Duration(fallbackMs) * time.Millisecond
+}
+
 func getDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
 	val := os.Getenv(key)
 	if val == "" {
@@ -43,7 +52,11 @@ func getDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
 func parseConfig(args []string) (*RelayConfig, error) {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
 
-	envSendQueue, err := getIntEnv("RELAY_SEND_QUEUE", 128)
+	// A bounded 256-packet bidirectional overlay burst can have a full
+	// one-way burst plus control frames queued while the peer's TCP writer is
+	// scheduled. Keep this finite, but leave enough headroom that a healthy
+	// relay does not reject a valid burst at the queue boundary.
+	envSendQueue, err := getIntEnv("RELAY_SEND_QUEUE", 1024)
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +92,9 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
 	udpObserverBind := fs.String("udp-observer-bind", getenv("RELAY_UDP_OBSERVER_BIND", ""), "Optional UDP observer/STUN bind address")
 	metricsBind := fs.String("metrics-bind", getenv("RELAY_METRICS_BIND", ""), "Optional read-only metrics HTTP listen address (empty disables)")
+	metricsAllowPublic := fs.Bool("metrics-allow-public", getenv("RELAY_METRICS_ALLOW_PUBLIC", "false") == "true", "Explicitly allow the metrics endpoint on a public/wildcard bind (default: loopback/private only)")
+	forwardDelay := fs.Duration("forward-delay", getEnvDurationMs("RELAY_FORWARD_DELAY_MS", 0), "Artificial per-frame forwarding delay in ms (diagnostics: slow-relay tests)")
+	debugFrames := fs.Bool("debug-frames", getenv("RELAY_DEBUG_FRAMES", "false") == "true", "Log opaque encrypted frame fingerprints (diagnostics only)")
 	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
 	registerTimeout := fs.Duration("register-timeout", envRegisterTimeout, "Register timeout")
 	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
@@ -109,6 +125,9 @@ func parseConfig(args []string) (*RelayConfig, error) {
 		Bind:                       *bind,
 		UDPObserverBind:            strings.TrimSpace(*udpObserverBind),
 		MetricsBind:                strings.TrimSpace(*metricsBind),
+		MetricsAllowPublic:         *metricsAllowPublic,
+		ForwardDelay:               *forwardDelay,
+		DebugFrames:                *debugFrames,
 		SendQueueCapacity:          *sendQueue,
 		RegisterTimeout:            *registerTimeout,
 		IdleTimeout:                *idleTimeout,

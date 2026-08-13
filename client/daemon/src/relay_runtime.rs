@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use p2pnet_relay::RelayMessage;
 use p2pnet_tun::Ipv4Packet;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
@@ -1006,10 +1007,10 @@ pub(super) async fn run_relay_peer_validation_loop(
             last_relay_endpoint = Some(relay_endpoint);
             continue;
         }
-        last_relay_endpoint = Some(relay_endpoint);
+        last_relay_endpoint = Some(relay_endpoint.clone());
 
         let validation_id = unix_time_millis() as u16;
-        let mut sent_count = 0usize;
+        let mut sends = Vec::new();
         for (sequence, (peer_id, peer_virtual_ip)) in targets.into_iter().enumerate() {
             let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
                 debug!(
@@ -1017,20 +1018,51 @@ pub(super) async fn run_relay_peer_validation_loop(
                 );
                 continue;
             };
-            let packet = RelayValidationPacket {
-                peer_id: &peer_id,
-                peer_virtual_ip: &peer_virtual_ip,
-                local_ip,
-                peer_ip,
-                validation_id,
-                sequence: sequence as u16,
-            };
-            match send_relay_validation_packet(packet, &transport, &relay).await {
-                Ok(()) => sent_count = sent_count.saturating_add(1),
-                Err(err) => debug!("Relay peer validation skipped for {peer_id}: {err}"),
+            let send_transport = transport.clone();
+            let send_relay = relay.clone();
+            let send_peer_id = peer_id;
+            let send_peer_virtual_ip = peer_virtual_ip;
+            let send_sequence = sequence as u16;
+            sends.push(async move {
+                let packet = RelayValidationPacket {
+                    peer_id: &send_peer_id,
+                    peer_virtual_ip: &send_peer_virtual_ip,
+                    local_ip,
+                    peer_ip,
+                    validation_id,
+                    sequence: send_sequence,
+                };
+                let result = tokio::time::timeout(
+                    RELAY_CONTROL_SEND_TIMEOUT,
+                    send_relay_validation_packet(packet, &send_transport, &send_relay),
+                )
+                .await;
+                (send_peer_id, result)
+            });
+        }
+
+        let mut sent_count = 0usize;
+        let mut transport_failed = false;
+        for (peer_id, result) in join_all(sends).await {
+            match result {
+                Ok(Ok(())) => sent_count = sent_count.saturating_add(1),
+                Ok(Err(err)) => {
+                    debug!("Relay peer validation skipped for {peer_id}: {err}");
+                }
+                Err(_) => {
+                    transport_failed = true;
+                    relay.abort_writer();
+                    warn!(
+                        event = "relay_validation_send_timeout",
+                        peer_id = %peer_id,
+                        relay_endpoint = %relay_endpoint,
+                        timeout_ms = RELAY_CONTROL_SEND_TIMEOUT.as_millis(),
+                        "relay validation writer completion timed out; relay transport invalidated"
+                    );
+                }
             }
         }
-        if sent_count > 0 {
+        if sent_count > 0 && !transport_failed {
             last_validation_at = Some(Instant::now());
         }
     }
@@ -1051,12 +1083,17 @@ pub(super) struct RelayValidationPacket<'a> {
 /// and it is kicked event-driven by the outbound actor when a packet actually
 /// waits.
 const RELAY_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Cadence of re-sending a forced-relay probe to an unconfirmed peer.  The
-/// probe token is STABLE per peer (never overwritten), so a late ACK — relay
-/// latency up to the expectation TTL — always echoes the token the expectation
-/// currently holds.  This cadence only bounds how often the wire sees a fresh
-/// probe; the expectation is refreshed every tick regardless.
-const RELAY_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Cadence of re-sending a forced-relay probe to an unconfirmed peer. The
+/// first send is event-driven/250ms polled; a lost ACK gets a second chance
+/// inside the 1s relay-first target instead of waiting 5s. The token is stable
+/// per peer (never overwritten), and the expectation is refreshed every tick,
+/// so this only bounds wire sends, not ACK validity.
+const RELAY_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+/// Relay control traffic is not a reason to hold the probe/validation loop (or
+/// another peer's control packet) behind a stalled relay writer. If this
+/// boundary is reached the encrypted counter is terminal and the relay writer
+/// is invalidated; the next attempt allocates a fresh counter from plaintext.
+const RELAY_CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Drive forced-relay path-probes to every peer that has an encrypting
 /// WireGuard session, relay connected, Direct unconfirmed and RelayPeerConfirmed
@@ -1092,6 +1129,11 @@ pub(super) async fn run_relay_peer_probe_loop(
     // Per-peer last-send time, to pace re-sends (bounded cadence) without
     // changing the token.
     let mut last_sent: HashMap<String, Instant> = HashMap::new();
+    // Per-peer + generation probe attempt counts, so the timeline can report a
+    // bounded summary instead of one `relay_probe_sent` event per re-send
+    // (which would crowd out the startup/roster/session/confirmed milestones
+    // in the 64-event ring).
+    let mut attempt_counts: HashMap<String, (u64, u64)> = HashMap::new();
     let mut next_request_id: u16 = 0;
     loop {
         tokio::select! {
@@ -1116,9 +1158,13 @@ pub(super) async fn run_relay_peer_probe_loop(
         if targets.is_empty() {
             probe_tokens.clear();
             last_sent.clear();
+            // Report attempt summaries for peers that stopped needing probes.
+            emit_probe_attempt_summaries(&timeline, &attempt_counts);
+            attempt_counts.clear();
             continue;
         }
         let now = Instant::now();
+        let mut sends = Vec::new();
         for (peer_id, peer_virtual_ip, target_generation) in &targets {
             let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
                 debug!("Skipping relay probe for {peer_id}; peer virtual IP '{peer_virtual_ip}' is not IPv4");
@@ -1168,50 +1214,152 @@ pub(super) async fn run_relay_peer_probe_loop(
             );
             let packet =
                 Ipv4Packet::build_icmp_echo_request(local_ip, peer_ip, request_id, 1, &payload);
-            let relay_send = relay.clone();
-            match transport
-                .encrypt_and_emit_outbound(
-                    OutboundPacket {
-                        peer_id: peer_id.clone(),
-                        dst_ip: peer_virtual_ip.clone(),
-                        packet,
-                    },
-                    |encrypted| async move { relay_send.send_packet(&encrypted).await },
+            let send_transport = transport.clone();
+            let send_relay = relay.clone();
+            let send_peer_id = peer_id.clone();
+            let send_peer_virtual_ip = peer_virtual_ip.clone();
+            let send_relay_endpoint = relay_endpoint.clone();
+            let send_generation = *target_generation;
+            sends.push(async move {
+                let result = tokio::time::timeout(
+                    RELAY_CONTROL_SEND_TIMEOUT,
+                    send_transport.encrypt_and_emit_outbound(
+                        OutboundPacket {
+                            peer_id: send_peer_id.clone(),
+                            dst_ip: send_peer_virtual_ip,
+                            packet,
+                        },
+                        |encrypted| async move { send_relay.send_packet(&encrypted).await },
+                    ),
                 )
-                .await
-            {
-                Ok(true) => {
+                .await;
+                (
+                    send_peer_id,
+                    send_generation,
+                    request_id,
+                    send_relay_endpoint,
+                    result,
+                )
+            });
+        }
+
+        // Do not serialize probe delivery across peers.  A blocked writer is a
+        // relay-connection failure, but it must not make peer B wait behind
+        // peer A's 500ms boundary before B can even allocate/send its probe.
+        for (peer_id, generation, request_id, endpoint, result) in join_all(sends).await {
+            match result {
+                Ok(Ok(true)) => {
                     last_sent.insert(peer_id.clone(), now);
+                    let count = attempt_counts
+                        .entry(peer_id.clone())
+                        .or_insert((0, generation));
+                    count.0 = count.0.saturating_add(1);
+                    count.1 = generation;
                     debug!(
                         event = "relay_probe_sent",
                         peer_id = %peer_id,
-                        relay_endpoint = %relay_endpoint,
-                        generation = target_generation,
+                        relay_endpoint = %endpoint,
+                        generation = generation,
                         request_id = request_id,
                         "relay probe sent peer_id={peer_id} request_id={request_id}",
                     );
-                    timeline.emit(
+                    // Only the FIRST probe per peer + generation lands in the
+                    // bounded timeline; re-sends are counted in the summary
+                    // event emitted when the peer leaves the probe set, so the
+                    // 64-event ring cannot be flooded by retries.
+                    let scope = format!("peer:{peer_id}:{generation}");
+                    timeline.emit_first_scoped(
+                        &scope,
                         "relay_probe_sent",
                         Some("relay"),
                         None,
                         Some(format!(
-                            "peer={peer_id} relay_endpoint={relay_endpoint} generation={target_generation} request_id={request_id}"
+                            "peer={peer_id} relay_endpoint={endpoint} generation={generation} request_id={request_id}"
                         )),
                     );
                 }
-                Ok(false) => {
+                Ok(Ok(false)) => {
                     debug!("Relay probe skipped for {peer_id}: WireGuard session is not ready");
                 }
-                Err(err) => {
-                    debug!("Relay probe send failed for {peer_id} via {relay_endpoint}: {err}");
+                Ok(Err(err)) => {
+                    debug!("Relay probe send failed for {peer_id} via {endpoint}: {err}");
+                }
+                Err(_) => {
+                    // The probe already consumed its counter when encryption
+                    // succeeded.  Never retry that ciphertext.  Invalidating
+                    // the writer also wakes any other completion waiters and
+                    // lets the supervisor establish a replacement transport.
+                    relay.abort_writer();
+                    timeline.emit(
+                        "relay_probe_send_timeout",
+                        Some("relay"),
+                        Some("relay_writer_timeout"),
+                        Some(format!(
+                            "peer={peer_id} generation={generation} relay_endpoint={endpoint} request_id={request_id} timeout_ms={}",
+                            RELAY_CONTROL_SEND_TIMEOUT.as_millis()
+                        )),
+                    );
+                    warn!(
+                        event = "relay_probe_send_timeout",
+                        peer_id = %peer_id,
+                        relay_endpoint = %endpoint,
+                        generation = generation,
+                        request_id = request_id,
+                        "relay probe writer completion timed out; relay transport invalidated"
+                    );
                 }
             }
         }
         // Drop token/last-sent state for peers that no longer need a probe
-        // (now confirmed, Direct, offline), so the maps stay bounded.
+        // (now confirmed, Direct, offline), so the maps stay bounded, and
+        // report each such peer's total probe-attempt count as a summary
+        // milestone (one event per peer + generation, never per re-send).
+        let departed: Vec<(String, u64, u64)> = attempt_counts
+            .iter()
+            .filter(|(peer_id, _)| {
+                !targets
+                    .iter()
+                    .any(|(target_id, _, _)| target_id == *peer_id)
+            })
+            .map(|(peer_id, (count, generation))| (peer_id.clone(), *count, *generation))
+            .collect();
+        for (peer_id, count, generation) in departed {
+            let scope = format!("peer:{peer_id}:{generation}");
+            timeline.emit_first_scoped(
+                &scope,
+                "relay_probe_attempts",
+                Some("relay"),
+                None,
+                Some(format!(
+                    "peer={peer_id} generation={generation} attempts={count}"
+                )),
+            );
+        }
         probe_tokens
             .retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
         last_sent.retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
+        attempt_counts
+            .retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
+    }
+}
+
+/// Emit bounded `relay_probe_attempts` summary milestones for every tracked
+/// peer + generation (used when the target set empties as a whole).
+fn emit_probe_attempt_summaries(
+    timeline: &crate::connection_timeline::ConnectionTimeline,
+    attempt_counts: &HashMap<String, (u64, u64)>,
+) {
+    for (peer_id, (count, generation)) in attempt_counts {
+        let scope = format!("peer:{peer_id}:{generation}");
+        timeline.emit_first_scoped(
+            &scope,
+            "relay_probe_attempts",
+            Some("relay"),
+            None,
+            Some(format!(
+                "peer={peer_id} generation={generation} attempts={count}"
+            )),
+        );
     }
 }
 

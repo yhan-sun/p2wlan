@@ -44,11 +44,13 @@ pub const DIRECT_RECLAIM_WINDOW: Duration = Duration::from_secs(10);
 /// Base cadence for relay-backed Direct reconnection.
 ///
 /// Relay already provides the data-plane safety net, so peers with a plausible
-/// punch window should retry quickly after a Direct path falls apart. The
-/// peer-level backoff below yields 1s through 64s retries; generation-change
-/// reclaim still bypasses this cooldown for a recently working Direct path.
+/// punch window must keep trying during the bounded fast-recovery window. The
+/// peer-level backoff is deliberately capped at 8s: a 64s retry gap made a
+/// healthy relay hide Direct recovery for most of the user's acceptance
+/// window. Recovery epoch budgets and per-peer probe admission remain the
+/// safety limits; this cap does not create an unbounded probe storm.
 pub const DIRECT_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(1);
-const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 6;
+const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
@@ -105,7 +107,6 @@ const MAX_CANDIDATE_PAIRS_PER_PEER: usize = 640;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
 const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
-const DIRECT_TRIAL_MIN_SCORE: i32 = 40;
 const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const DIRECT_TRAVERSAL_EVENT_LIMIT: usize = 32;

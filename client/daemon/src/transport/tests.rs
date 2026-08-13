@@ -1,14 +1,14 @@
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use p2pnet_crypto::NodeIdentity;
     use p2pnet_tun::Ipv4Packet;
     use p2pnet_wireguard::{
-        HandshakeInitiator, HandshakeResponder, MessageTransport, TransportSession, TYPE_TRANSPORT,
+        HandshakeInitiator, HandshakeResponder, MessageTransport, TransportSession,
     };
     use tokio::sync::{mpsc, oneshot, watch, Notify};
 
@@ -18,6 +18,21 @@ mod tests {
     use crate::peer::{ConnectionState, NetworkPath, ProbeBindingStage, ProbeKeyRole};
     use crate::udp::UdpTransport;
     use tokio::time::{sleep, timeout};
+
+    #[test]
+    fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {
+        assert!(!is_real_overlay_business_packet(&[]));
+        assert!(!is_real_overlay_business_packet(&[0u8; 32]));
+
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            7,
+            1,
+            b"real-tun-business",
+        );
+        assert!(is_real_overlay_business_packet(&packet));
+    }
 
     fn establish_sessions() -> (TransportSession, TransportSession) {
         let node_a = NodeIdentity::generate();
@@ -37,10 +52,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypts_outbound_packet_with_peer_session() {
-        let (node_a_session, mut node_b_session) = establish_sessions();
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
-        transport.add_session("peer-b", node_a_session).await;
+    async fn run_outbound_forwards_raw_packet_without_encrypting() {
+        // The transport no longer encrypts on the dataplane path: run_outbound
+        // forwards the RAW packet to the network outbound worker, which is the
+        // only place that encrypts business packets (and only once the peer's
+        // path is usable).
+        let (_node_a_session, _node_b_session) = establish_sessions();
+        let (transport, mut outbound_rx) = WireGuardTransport::new();
 
         let packet = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 1),
@@ -50,10 +68,10 @@ mod tests {
             b"ping",
         );
 
-        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (outbound_tx, dataplane_rx) = mpsc::channel(4);
         let worker = {
             let transport = transport.clone();
-            tokio::spawn(async move { transport.run_outbound(outbound_rx).await })
+            tokio::spawn(async move { transport.run_outbound(dataplane_rx).await })
         };
 
         outbound_tx
@@ -65,22 +83,25 @@ mod tests {
             .await
             .unwrap();
 
-        let encrypted = encrypted_rx.recv().await.unwrap();
-        assert_eq!(encrypted.peer_id, "peer-b");
-        assert_eq!(encrypted.dst_ip, "10.20.0.2");
-        assert_eq!(encrypted.wire_bytes[0], TYPE_TRANSPORT);
+        let raw = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .expect("the worker receiver must get the forwarded RAW packet")
+            .expect("channel open");
+        assert_eq!(raw.peer_id, "peer-b");
+        assert_eq!(raw.dst_ip, "10.20.0.2");
+        assert_eq!(raw.packet, packet);
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "no encrypted packet may appear on the worker channel"
+        );
 
-        let decrypted = node_b_session
-            .decrypt_from_bytes(&encrypted.wire_bytes)
-            .unwrap();
-        assert_eq!(decrypted, packet);
-
-        worker.abort();
+        drop(outbound_tx);
+        worker.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn drops_outbound_packet_without_session() {
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        let (transport, mut outbound_rx) = WireGuardTransport::new();
 
         let dropped = transport
             .encrypt_outbound(OutboundPacket {
@@ -92,13 +113,13 @@ mod tests {
             .unwrap();
 
         assert!(dropped.is_none());
-        assert!(encrypted_rx.try_recv().is_err());
+        assert!(outbound_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn session_install_cannot_miss_packet_queued_in_the_handoff_window() {
-        let (mut remote_session, local_session) = establish_sessions();
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        let (_remote_session, local_session) = establish_sessions();
+        let (transport, mut outbound_rx) = WireGuardTransport::new();
         let pending_guard = transport.pending_outbound.lock().await;
         let packet = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 2),
@@ -135,25 +156,23 @@ mod tests {
         .unwrap();
         drop(pending_guard);
 
-        let encrypted = tokio::time::timeout(Duration::from_secs(1), encrypted_rx.recv())
+        // The session commit must forward the RAW queued packet to the
+        // network outbound worker (never lose it in the handoff window, and
+        // never encrypt it before the worker decides the path is usable).
+        let raw = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            remote_session
-                .decrypt_from_bytes(&encrypted.wire_bytes)
-                .unwrap(),
-            packet
-        );
-        drop(encrypted);
+        assert_eq!(raw.peer_id, "peer-a");
+        assert_eq!(raw.packet, packet);
         assert!(queue_task.await.unwrap().unwrap().is_none());
         install_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn pending_flush_and_live_outbound_emit_monotonic_counters() {
+    async fn pending_flush_forwards_raw_packets_in_fifo_order_and_encrypts_monotonic() {
         let (_remote_session, local_session) = establish_sessions();
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        let (transport, mut outbound_rx) = WireGuardTransport::new();
         for sequence in 0..96u16 {
             assert!(transport
                 .encrypt_or_queue_outbound(OutboundPacket {
@@ -172,37 +191,65 @@ mod tests {
                 .is_none());
         }
 
-        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (outbound_tx, dataplane_rx) = mpsc::channel(1);
         let worker = tokio::spawn({
             let transport = transport.clone();
-            async move { transport.run_outbound(outbound_rx).await }
+            async move { transport.run_outbound(dataplane_rx).await }
         });
-        let install = tokio::spawn({
-            let transport = transport.clone();
-            async move { transport.add_session("peer-a", local_session).await }
-        });
-        outbound_tx
-            .send(OutboundPacket {
+        let live_packet = OutboundPacket {
+            peer_id: "peer-a".to_string(),
+            dst_ip: "10.20.0.1".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                Ipv4Addr::new(10, 20, 0, 2),
+                Ipv4Addr::new(10, 20, 0, 1),
+                0x1212,
+                96,
+                b"live",
+            ),
+        };
+        // Install first so the session flush (queued 0..95, forwarded in FIFO)
+        // deterministically precedes the live dataplane packet on the worker
+        // channel — exactly the order a single worker must preserve.
+        transport.add_session("peer-a", local_session).await;
+        outbound_tx.send(live_packet.clone()).await.unwrap();
+
+        // The session flush and the live dataplane packets arrive at the
+        // worker as RAW packets in FIFO order (session queue first, live
+        // packet last) — the worker's order is preserved end to end.
+        let mut received = Vec::new();
+        for _ in 0..97 {
+            let raw = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+                .await
+                .expect("the worker channel must deliver the forwarded packet")
+                .expect("channel open");
+            let parsed = Ipv4Packet::new(&raw.packet).unwrap();
+            let icmp = parsed.payload();
+            // ICMP echo header: type(1) code(1) checksum(2) id(2) seq(2)
+            let sequence = u16::from_be_bytes([icmp[6], icmp[7]]);
+            received.push(sequence);
+        }
+        assert_eq!(received, (0..97u16).collect::<Vec<_>>());
+
+        // Encrypting the forwarded packets in worker order allocates strictly
+        // increasing counters: WireGuard order on the wire matches the FIFO.
+        let mut counters = Vec::new();
+        for raw in received {
+            let packet = OutboundPacket {
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
                     Ipv4Addr::new(10, 20, 0, 2),
                     Ipv4Addr::new(10, 20, 0, 1),
                     0x1212,
-                    96,
-                    b"live",
+                    raw,
+                    b"queued",
                 ),
-            })
-            .await
-            .unwrap();
-        install.await.unwrap();
-
-        let mut counters = Vec::new();
-        for _ in 0..97 {
-            let encrypted = tokio::time::timeout(Duration::from_secs(1), encrypted_rx.recv())
+            };
+            let (encrypted, _guard) = transport
+                .encrypt_outbound_with_guard(packet)
                 .await
-                .unwrap()
-                .unwrap();
+                .expect("session must be ready")
+                .expect("session must be ready");
             counters.push(
                 MessageTransport::from_bytes(&encrypted.wire_bytes)
                     .unwrap()
@@ -213,6 +260,115 @@ mod tests {
 
         drop(outbound_tx);
         worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_flush_and_live_tun_share_one_per_peer_ingress_fifo() {
+        // A session-ready flush and the live TUN bridge are two independent
+        // producers of the transport's raw outbound channel.  Fill that
+        // channel first so the flush is forced to wait while a live packet is
+        // submitted concurrently; the per-peer ingress arbiter must keep the
+        // live packet behind the older session backlog.
+        let (_remote_session, local_session) = establish_sessions();
+        let (transport, mut outbound_rx) = WireGuardTransport::new();
+        for sequence in 0..96u16 {
+            assert!(transport
+                .encrypt_or_queue_outbound(OutboundPacket {
+                    peer_id: "peer-a".to_string(),
+                    dst_ip: "10.20.0.1".to_string(),
+                    packet: Ipv4Packet::build_icmp_echo_request(
+                        Ipv4Addr::new(10, 20, 0, 2),
+                        Ipv4Addr::new(10, 20, 0, 1),
+                        0x3131,
+                        sequence,
+                        b"session-backlog",
+                    ),
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        let filler = OutboundPacket {
+            peer_id: "filler".to_string(),
+            dst_ip: "10.20.0.254".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                Ipv4Addr::new(10, 20, 0, 1),
+                Ipv4Addr::new(10, 20, 0, 254),
+                0x3132,
+                0,
+                b"filler",
+            ),
+        };
+        for _ in 0..1024 {
+            transport
+                .outbound_tx
+                .try_send(filler.clone())
+                .expect("the raw outbound channel capacity must be known to this regression");
+        }
+
+        let (live_tx, live_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn({
+            let transport = transport.clone();
+            async move { transport.run_outbound(live_rx).await }
+        });
+        let install = tokio::spawn({
+            let transport = transport.clone();
+            async move { transport.add_session("peer-a", local_session).await }
+        });
+
+        // Wait until the session is installed and the flush has removed the
+        // backlog from its map.  At this point its first raw send is blocked
+        // by the full central channel, so the live producer is truly
+        // concurrent with the flush rather than merely following it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let active = transport.session_status("peer-a").await.has_active;
+            let pending = transport
+                .pending_outbound
+                .lock()
+                .await
+                .contains_key("peer-a");
+            if active && !pending {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+
+        let live_packet = OutboundPacket {
+            peer_id: "peer-a".to_string(),
+            dst_ip: "10.20.0.1".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                Ipv4Addr::new(10, 20, 0, 2),
+                Ipv4Addr::new(10, 20, 0, 1),
+                0x3131,
+                96,
+                b"live-tun",
+            ),
+        };
+        live_tx.send(live_packet).await.unwrap();
+
+        let mut peer_sequences = Vec::new();
+        // Drain the 1024 filler frames plus the 96 queued frames and one live
+        // frame.  Only the peer-a sequence is relevant; the order in which
+        // the filler is drained is intentionally part of the backpressure.
+        for _ in 0..(1024 + 96 + 1) {
+            let packet = tokio::time::timeout(Duration::from_secs(3), outbound_rx.recv())
+                .await
+                .expect("raw outbound channel must drain")
+                .expect("raw outbound channel must stay open");
+            if packet.peer_id == "peer-a" {
+                let ip = Ipv4Packet::new(&packet.packet).unwrap();
+                let icmp = ip.payload();
+                peer_sequences.push(u16::from_be_bytes([icmp[6], icmp[7]]));
+            }
+        }
+        assert_eq!(peer_sequences, (0..97u16).collect::<Vec<_>>());
+
+        install.await.unwrap();
+        drop(live_tx);
+        forwarder.abort();
     }
 
     #[tokio::test]
@@ -633,10 +789,12 @@ mod tests {
                 .unwrap()
                 .expires_at = Instant::now();
         }
-        assert!(!transport
-            .session_status("peer-a")
-            .await
-            .has_pending_responder);
+        assert!(
+            !transport
+                .session_status("peer-a")
+                .await
+                .has_pending_responder
+        );
 
         transport
             .install_active_session(
@@ -747,7 +905,7 @@ mod tests {
                         u64::MAX,
                         Duration::MAX,
                         u64::MAX,
-                        Duration::from_millis(1),
+                        Duration::from_millis(100),
                     ),
                 )
                 .await,
@@ -759,7 +917,7 @@ mod tests {
                 .await,
             ResponderSessionCommit::PendingConfirmation
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
         assert_eq!(
             transport
@@ -873,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn queued_packet_holds_counter_lock_until_network_send_finishes() {
         let (mut remote, local) = establish_sessions();
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        let (transport, _outbound_rx) = WireGuardTransport::new();
         transport.add_session("peer-a", local).await;
 
         let first = Ipv4Packet::build_icmp_echo_request(
@@ -883,14 +1041,15 @@ mod tests {
             0,
             b"queued-before-immediate",
         );
-        assert!(transport
-            .enqueue_outbound(OutboundPacket {
+        let (encrypted_first, guard) = transport
+            .encrypt_outbound_with_guard(OutboundPacket {
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: first.clone(),
             })
             .await
-            .unwrap());
+            .expect("session ready")
+            .expect("session ready");
 
         let second = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 2),
@@ -921,15 +1080,25 @@ mod tests {
             }
         });
 
-        assert!(tokio::time::timeout(Duration::from_millis(20), emitted_rx.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), emitted_rx.recv())
+                .await
+                .is_err(),
+            "a later control packet must not be encrypted while a queued business packet's guard is held"
+        );
 
-        let queued = encrypted_rx.recv().await.unwrap();
-        assert_eq!(remote.decrypt_from_bytes(&queued.wire_bytes).unwrap(), first);
-        // The real network worker releases the guard only after its send and
-        // retry loop has completed. Dropping the test wrapper models that point.
-        drop(queued);
+        // The queued packet's guard is released only after its network send
+        // completes (here: when the worker's send is done).  Only then can the
+        // control packet be encrypted — its counter is strictly higher, so the
+        // wire order always matches the counter order.
+        assert_eq!(
+            remote
+                .decrypt_from_bytes(&encrypted_first.wire_bytes)
+                .unwrap(),
+            first
+        );
+        drop(encrypted_first);
+        drop(guard);
 
         let emitted = tokio::time::timeout(Duration::from_secs(1), emitted_rx.recv())
             .await
@@ -945,10 +1114,10 @@ mod tests {
     #[tokio::test]
     async fn dead_peer_egress_lock_is_pruned_during_later_peer_churn() {
         let (_remote, local) = establish_sessions();
-        let (transport, mut encrypted_rx) = WireGuardTransport::new();
+        let (transport, _outbound_rx) = WireGuardTransport::new();
         transport.add_session("peer-a", local).await;
-        assert!(transport
-            .enqueue_outbound(OutboundPacket {
+        let (encrypted, guard) = transport
+            .encrypt_outbound_with_guard(OutboundPacket {
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -960,7 +1129,8 @@ mod tests {
                 ),
             })
             .await
-            .unwrap());
+            .expect("session ready")
+            .expect("session ready");
 
         transport.remove_session("peer-a").await;
         assert!(transport
@@ -969,8 +1139,8 @@ mod tests {
             .await
             .contains_key("peer-a"));
 
-        let queued = encrypted_rx.recv().await.unwrap();
-        drop(queued);
+        drop(encrypted);
+        drop(guard);
         let later_peer_lock = transport.outbound_emit_lock("peer-b").await;
         drop(later_peer_lock);
 
@@ -1153,7 +1323,7 @@ mod tests {
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
-socket_index: None,
+                socket_index: None,
                 udp_transport_owner: None,
                 wire_bytes,
             })
@@ -1277,7 +1447,7 @@ socket_index: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
-socket_index: None,
+                socket_index: None,
                 udp_transport_owner: None,
                 wire_bytes,
             })
@@ -1341,7 +1511,7 @@ socket_index: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("peer-a".to_string()),
-socket_index: None,
+                socket_index: None,
                 udp_transport_owner: None,
                 wire_bytes,
             })
@@ -1403,7 +1573,7 @@ socket_index: None,
                 local_endpoint: None,
                 relay_endpoint: Some("tls://relay.test:443".to_string()),
                 relay_peer_id: Some("different-peer".to_string()),
-socket_index: None,
+                socket_index: None,
                 udp_transport_owner: None,
                 wire_bytes,
             })
@@ -1450,11 +1620,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -1566,11 +1734,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -1657,11 +1823,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -1732,7 +1896,10 @@ socket_index: None,
             .await
             .unwrap()
             .unwrap();
-        assert!(replacement_udp.affinity_pin_for_test("peer-a").await.is_some());
+        assert!(replacement_udp
+            .affinity_pin_for_test("peer-a")
+            .await
+            .is_some());
         assert!(
             stale_udp.affinity_pin_for_test("peer-a").await.is_none(),
             "the retired UDP transport must not receive post-replacement affinity"
@@ -1754,11 +1921,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         let source: std::net::SocketAddr = "198.51.100.73:51820".parse().unwrap();
         peers
             .add_peer(&PeerInfo {
@@ -1788,15 +1953,17 @@ socket_index: None,
             _ => panic!("replacement transport must own the validation lease"),
         };
         let request_id = 0x7A21;
-        assert!(replacement_udp
-            .expect_direct_validation_ack_owned(
-                "peer-a",
-                request_id,
-                generation,
-                owner_token,
-                source,
-            )
-            .await);
+        assert!(
+            replacement_udp
+                .expect_direct_validation_ack_owned(
+                    "peer-a",
+                    request_id,
+                    generation,
+                    owner_token,
+                    source,
+                )
+                .await
+        );
 
         let stale_local_endpoint = stale_udp.local_addr().unwrap();
         let (udp_updates_tx, udp_updates_rx) = watch::channel(Some(stale_udp.clone()));
@@ -1871,7 +2038,10 @@ socket_index: None,
             "a queued packet from a retired reader must not consume the replacement expectation"
         );
         assert!(
-            replacement_udp.affinity_pin_for_test("peer-a").await.is_none(),
+            replacement_udp
+                .affinity_pin_for_test("peer-a")
+                .await
+                .is_none(),
             "a retired reader packet must not establish replacement affinity"
         );
         assert!(
@@ -1885,11 +2055,9 @@ socket_index: None,
         let (_remote_session, local_session) = establish_sessions();
         let (transport, _encrypted_rx) = WireGuardTransport::new();
         transport.add_session("peer-a", local_session).await;
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -1973,7 +2141,6 @@ socket_index: None,
             Some(token.request_id),
             "request_id must remain structured rather than only appearing in detail text"
         );
-
     }
 
     #[tokio::test]
@@ -1986,11 +2153,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -2019,15 +2184,16 @@ socket_index: None,
                 panic!("an active non-Direct peer must accept the initial owner lease")
             }
         };
-        assert!(udp
-            .expect_direct_validation_ack_owned(
+        assert!(
+            udp.expect_direct_validation_ack_owned(
                 "peer-a",
                 0x7A11,
                 old_generation,
                 owner_token,
                 source,
             )
-            .await);
+            .await
+        );
 
         assert_eq!(
             peers
@@ -2117,11 +2283,9 @@ socket_index: None,
         let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
         wg_transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(Config::generate_default(
-            "https://ctrl.test",
-            "net1",
-        )
-        .unwrap()));
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -2144,15 +2308,17 @@ socket_index: None,
             crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
             _ => panic!("retired transport must obtain the first lease"),
         };
-        assert!(retired_udp
-            .expect_direct_validation_ack_owned(
-                "peer-a",
-                request_id,
-                generation,
-                retired_owner,
-                source,
-            )
-            .await);
+        assert!(
+            retired_udp
+                .expect_direct_validation_ack_owned(
+                    "peer-a",
+                    request_id,
+                    generation,
+                    retired_owner,
+                    source,
+                )
+                .await
+        );
 
         // Binding a replacement changes the active registry without advancing
         // the network generation. Its globally allocated owner must differ.
@@ -2167,15 +2333,16 @@ socket_index: None,
             _ => panic!("replacement transport must obtain a fresh lease"),
         };
         assert_ne!(retired_owner, current_owner);
-        assert!(udp
-            .expect_direct_validation_ack_owned(
+        assert!(
+            udp.expect_direct_validation_ack_owned(
                 "peer-a",
                 request_id,
                 generation,
                 current_owner,
                 source,
             )
-            .await);
+            .await
+        );
 
         let old_ack_packet = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 2),
@@ -2284,10 +2451,7 @@ socket_index: None,
             "the duplicate ciphertext must be rejected by WireGuard replay protection"
         );
         assert!(
-            second
-                .unwrap_err()
-                .to_string()
-                .contains("replay detected"),
+            second.unwrap_err().to_string().contains("replay detected"),
             "the rejection must be classified as replay detected"
         );
         assert_eq!(

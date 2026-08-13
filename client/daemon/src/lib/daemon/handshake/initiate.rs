@@ -129,35 +129,63 @@ impl Daemon {
         drop(handshake_guard);
         let (candidates, candidate_sources) = {
             let snapshot = self.cached_local_candidate_set().await;
-            if snapshot.0.is_empty() {
+            let mut relay_available = self.relay_available_tx.subscribe();
+            let relay_is_available = *relay_available.borrow();
+            if let Some(snapshot) = relay_first_candidate_shortcut(
+                snapshot.0,
+                snapshot.1,
+                relay_is_available,
+            ) {
+                if snapshot.0.is_empty() {
+                    self.peers
+                        .record_direct_event(
+                            &peer_info.node_id,
+                            "relay_first_empty_candidate_offer",
+                            None,
+                            Some(0),
+                            None,
+                            "relay transport is available; encrypted handshake is not gated on STUN candidates",
+                        )
+                        .await;
+                }
+                snapshot
+            } else {
+                // Once the relay transport is up, an empty candidate list is
+                // intentional: the control-plane handshake still establishes
+                // the encrypted session, and the forced relay probe can then
+                // prove the relay path.  Waiting for STUN here recreated the
+                // old "relay TCP is ready but the first business packet waits
+                // for candidate gathering" failure.  Direct candidates are
+                // refreshed and signaled independently after this point.
+                // Relay selection and candidate gathering run in parallel.
+                // Whichever becomes usable first wins; a cancellation is
+                // fail-closed and releases the reservation immediately.
                 tokio::select! {
-                    candidates = self.local_candidate_set_for_signal("handshake offer") => candidates,
+                    biased;
+                    changed = relay_available.changed() => {
+                        if changed.is_ok() && *relay_available.borrow() {
+                            self.peers
+                                .record_direct_event(
+                                    &peer_info.node_id,
+                                    "relay_first_empty_candidate_offer",
+                                    None,
+                                    Some(0),
+                                    None,
+                                    "relay became available before STUN candidates; encrypted handshake is not gated on candidates",
+                                )
+                                .await;
+                            (Vec::new(), HashMap::new())
+                        } else {
+                            self.wait_for_local_candidate_set().await
+                        }
+                    }
+                    candidates = self.wait_for_local_candidate_set() => candidates,
                     changed = reservation.cancellation.changed() => {
                         if changed.is_err() || *reservation.cancellation.borrow() {
                             return Ok(None);
                         }
                         return Ok(None);
                     }
-                }
-            } else {
-                // A usable cached set already exists.  Refresh only within a
-                // short budget; a slow STUN/prediction gather must never
-                // delay the offer's rendezvous window.
-                match tokio::time::timeout(
-                    Duration::from_millis(HANDSHAKE_OFFER_REFRESH_BUDGET_MS),
-                    async {
-                        let udp = self.udp_transport.read().await.clone()?;
-                        self.refresh_local_candidates_for_imminent_signal(
-                            &udp,
-                            "handshake offer",
-                        )
-                        .await
-                    },
-                )
-                .await
-                {
-                    Ok(Some(refreshed)) => refreshed,
-                    _ => snapshot,
                 }
             }
         };

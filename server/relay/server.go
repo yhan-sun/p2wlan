@@ -87,6 +87,8 @@ func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
 		revokedTicketJTIs: revokedJTIs,
 		revokedDeviceIDs:  revokedDevices,
 	}
+	server.hub.forwardDelay = config.ForwardDelay
+	server.hub.debugFrames = config.DebugFrames
 	server.startRevocationPolling()
 	return server, nil
 }

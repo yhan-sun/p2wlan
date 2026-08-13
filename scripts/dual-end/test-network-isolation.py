@@ -189,6 +189,20 @@ class NetworkIsolationTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["reason"], "third_party_active_during_cleanup")
 
+    def test_scoped_cleanup_allows_unrelated_active_devices(self):
+        FakeControl.nodes = [node("intruder", True, 100), node("historical", False, 0)]
+        report = ISO.prove_cleaned(
+            self.url,
+            "tok",
+            "default",
+            ["mini", "air"],
+            deadline_s=5,
+            reject_third_party=False,
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["reason"], "deleted_nodes_inactive_third_party_recorded")
+        self.assertEqual(report["third_party_active"], ["intruder"])
+
     def test_cli_prove_exit_code_distinguishes_failure(self):
         FakeControl.nodes = [node("mini", True, 100), node("air", True, 100)]
         good = subprocess.run(

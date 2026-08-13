@@ -357,7 +357,26 @@ struct SignalCreateResponse {
     success: bool,
     #[serde(default)]
     protocol_version: Option<u8>,
+    /// The durable control-plane receipt.  A successful HTTP response is not
+    /// itself a receiver receipt, but this row identity lets both ends prove
+    /// which queued signal was created when correlating a later delivery.
+    #[serde(default)]
+    signal: Option<SignalCreateReceipt>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignalCreateReceipt {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    from_node_id: Option<String>,
+    #[serde(default)]
+    to_node_id: Option<String>,
+    #[serde(rename = "type", default)]
+    signal_type: Option<String>,
+    #[serde(default)]
+    signal_seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +409,14 @@ struct SignalResponse {
     #[serde(default)]
     id: Option<String>,
     from_node_id: String,
+    /// Older control servers did not expose the target/sequence in their
+    /// response.  When present, the receiver validates the target before it
+    /// acknowledges a lease; this prevents a server-side routing regression
+    /// from being silently turned into a successful delivery.
+    #[serde(default)]
+    to_node_id: Option<String>,
+    #[serde(default)]
+    signal_seq: Option<u64>,
     #[serde(rename = "type")]
     signal_type: String,
     #[serde(default = "default_signal_rest_protocol_version")]
@@ -613,7 +640,7 @@ enum ControlCommand {
     /// Immediately refresh the peer list.
     ///
     /// Sent when a signal arrives from a peer that is not yet registered:
-    /// the regular peer poll can be up to MIN_PEER_POLL_INTERVAL_SECS away,
+    /// the regular peer roster poll can be up to one second away,
     /// and a cold-start handshake must not wait out that cadence.
     PollPeersNow,
     /// Create a tunnel.

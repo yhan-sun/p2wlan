@@ -218,6 +218,56 @@ async fn run_udp_direct_instance(
         lease.shutdown_receiver(),
     ));
 
+    // Publish host candidates as soon as the socket has a port.  The full
+    // report below may spend seconds probing an unreachable STUN observer;
+    // that delay is useful for NAT classification but must not delay the
+    // first encrypted relay session or the first LAN/public host punch.
+    if peers.gather_host_candidates().await {
+        if let Ok(local_addr) = udp.local_addr() {
+            let mut host_candidates = p2pnet_nat::gather_local_addresses()
+                .into_iter()
+                .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
+                .map(|ip| SocketAddr::new(ip, local_addr.port()).to_string())
+                .collect::<Vec<_>>();
+            if !local_addr.ip().is_unspecified() && !local_addr.ip().is_loopback() {
+                host_candidates.push(local_addr.to_string());
+            }
+            host_candidates.sort();
+            host_candidates.dedup();
+            if !host_candidates.is_empty() {
+                let mut host_sources = host_candidates
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| (endpoint, "host".to_string()))
+                    .collect::<HashMap<_, _>>();
+                let host_network_identity = prepare_signal_candidates_and_network_identity(
+                    &[],
+                    &HashMap::new(),
+                    &mut host_candidates,
+                    &mut host_sources,
+                );
+                // This fast path must never wait behind an older refresh: a
+                // rebound UDP instance must still observe shutdown promptly.
+                if let Ok(_host_commit_guard) = candidate_refresh_lock.try_lock() {
+                    publish_candidate_snapshot_to_store(
+                        &candidate_snapshot,
+                        host_candidates.clone(),
+                        host_sources.clone(),
+                        host_network_identity.clone(),
+                    )
+                    .await;
+                    *local_candidates.write().await = host_candidates.clone();
+                    *udp_local_candidate_sources.write().await = host_sources;
+                    *local_network_identity.write().await = host_network_identity;
+                    info!(
+                        "Published {} host UDP candidates before STUN refresh",
+                        host_candidates.len()
+                    );
+                }
+            }
+        }
+    }
+
     // Do not let a slow initial STUN refresh hide a successfully rebound UDP
     // transport. If this lease is superseded while waiting, skip candidate
     // work entirely and let the common cleanup below withdraw only our owner.

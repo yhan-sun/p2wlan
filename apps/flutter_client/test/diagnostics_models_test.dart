@@ -268,4 +268,96 @@ void main() {
     expect(peer.connectionType, 'offline');
     expect(peer.latencyMs, isNull);
   });
+
+  test('candidate probe RTT is never displayed as connection latency', () {
+    // A peer whose direct candidate probe succeeded with 8ms is STILL not a
+    // direct connection: probing state must expose the probe RTT only through
+    // probeLatencyMs, and latencyMs (the number rendered as the peer's
+    // latency) must be null.
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'probing-peer',
+      'device_name': 'air-mac',
+      'virtual_ip': '10.20.0.50',
+      'online': true,
+      'state': 'hole_punching',
+      'active_path': null,
+      'direct_type': 'unknown',
+      'is_relay': false,
+      'direct': {'latency_ms': 8, 'rtt_ewma_ms': 8},
+      'relay': <String, dynamic>{},
+      'current_path_selection': {
+        'path': 'direct',
+        'reason': 'direct trial',
+        'reason_code': 'direct_trial',
+        'direct_confirmed': false,
+        'relay_hedged': false,
+      },
+    });
+
+    expect(peer.path, 'direct_trial');
+    expect(peer.connectionType, 'probing');
+    expect(peer.isDirectVerified, isFalse);
+    expect(peer.latencyMs, isNull,
+        reason: 'a candidate probe RTT must never be shown as connection latency');
+    expect(peer.probeLatencyMs, 8);
+  });
+
+  test('relay verified requires the daemon relay_confirmed_endpoint', () {
+    // active_path relay alone (e.g. a relay fallback with no matching probe
+    // ACK evidence) must NOT be presented as "中继已验证".
+    final notVerified = PeerSnapshot.fromJson({
+      'node_id': 'relay-peer',
+      'device_name': 'travel-mac',
+      'virtual_ip': '10.20.0.51',
+      'online': true,
+      'state': 'relay',
+      'active_path': 'relay',
+      'direct_type': 'relay',
+      'is_relay': true,
+      'direct': <String, dynamic>{},
+      'relay': {'latency_ms': 33},
+    });
+    expect(notVerified.path, 'relay');
+    expect(notVerified.relayConfirmedEndpoint, isNull);
+    expect(notVerified.isRelayVerified, isFalse);
+    expect(notVerified.latencyMs, isNull,
+        reason: 'relay RTT without encrypted relay confirmation is not usable latency');
+
+    // A matching encrypted relay probe ACK sets relay_confirmed_endpoint; only
+    // then is the peer "中继已验证".
+    final verified = PeerSnapshot.fromJson({
+      'node_id': 'relay-peer',
+      'device_name': 'travel-mac',
+      'virtual_ip': '10.20.0.51',
+      'online': true,
+      'state': 'relay',
+      'active_path': 'relay',
+      'direct_type': 'relay',
+      'is_relay': true,
+      'direct': <String, dynamic>{},
+      'relay': {'latency_ms': 33},
+      'relay_confirmed_endpoint': 'tcp://relay.test:18081',
+      'relay_confirmed_generation': 3,
+    });
+    expect(verified.isRelayVerified, isTrue);
+    expect(verified.latencyMs, 33);
+  });
+
+  test('direct verified requires the daemon direct state', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'direct-peer',
+      'device_name': 'studio-mac',
+      'virtual_ip': '10.20.0.52',
+      'online': true,
+      'state': 'direct',
+      'active_path': 'direct',
+      'direct_type': 'public_udp',
+      'is_relay': false,
+      'direct': {'latency_ms': 12},
+      'relay': <String, dynamic>{},
+    });
+    expect(peer.path, 'direct');
+    expect(peer.isDirectVerified, isTrue);
+    expect(peer.latencyMs, 12);
+  });
 }

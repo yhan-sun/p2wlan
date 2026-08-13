@@ -308,16 +308,24 @@ async fn run_peer_reflexive_signal_worker(
             continue;
         }
 
-        run_peer_reflexive_fast_punch(&udp, &peers, &observation).await;
+        // The fast punch is a bounded NAT warmer.  Its send completion is
+        // useful immediately, but waiting for the diagnostic ACK grace window
+        // here used to block the control-plane peer-reflexive signal for at
+        // least one second (direct_probe_ack_grace clamps small probe windows
+        // to 1s).  That made the newly observed endpoint reach the other peer
+        // only after the warmer's observation delay, even though the UDP
+        // receive path already owns the authenticated evidence and will start
+        // encrypted Direct validation independently.  Run the warmer and the
+        // control signal in parallel; neither operation promotes Direct.
         let endpoint = observation.observed_endpoint.to_string();
         let punch_at_ms = relay_assisted_punch_at_ms();
-        let result = control
-            .send_peer_reflexive(
-                &observation.peer_id,
-                &endpoint,
-                Some(punch_at_ms),
-            )
-            .await;
+        let fast_punch = run_peer_reflexive_fast_punch(&udp, &peers, &observation);
+        let peer_reflexive_signal = control.send_peer_reflexive(
+            &observation.peer_id,
+            &endpoint,
+            Some(punch_at_ms),
+        );
+        let (_, result) = tokio::join!(fast_punch, peer_reflexive_signal);
 
         let now = Instant::now();
         let (next_signal_at, next_backoff, retry_after_rate_limit) = match result {
@@ -470,22 +478,25 @@ async fn run_peer_reflexive_fast_punch(
                     format!("sent {sent} probes to newest peer-reflexive endpoint"),
                 )
                 .await;
-            sleep(direct_probe_ack_grace(PEER_REFLEXIVE_FAST_PUNCH_INTERVAL)).await;
+            // Do not hold the peer-reflexive signal worker open for the
+            // diagnostic ACK grace window.  A matched ACK is consumed by the
+            // UDP ingress and encrypted validation path; the signal worker's
+            // job is only to advertise the fresh endpoint to the peer.
             let success_count_after = peers
                 .direct_probe_success_count_for_generation(&observation.peer_id, generation)
                 .await;
-            if sent > 0 && success_count_after == success_count_before {
-                peers
-                    .record_direct_event(
-                        &observation.peer_id,
-                        "peer_reflexive_fast_punch_ack_timeout",
-                        Some(observation.observed_endpoint),
-                        Some(1),
-                        Some(sent),
-                        "newest peer-reflexive endpoint did not ACK before encrypted validation",
-                    )
-                    .await;
-            }
+            peers
+                .record_direct_event(
+                    &observation.peer_id,
+                    "peer_reflexive_fast_punch_ack_check_pending",
+                    Some(observation.observed_endpoint),
+                    Some(1),
+                    Some(sent),
+                    format!(
+                        "fast punch sent={sent}; ack_count_before={success_count_before} ack_count_observed_at_signal_worker_return={success_count_after}; encrypted validation remains authoritative"
+                    ),
+                )
+                .await;
         }
         Err(error) => {
             peers

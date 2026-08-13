@@ -46,10 +46,15 @@ async fn parse_stun_servers(
                 continue;
             }
             Err(_) => {
-                return Err(DaemonError::Config(format!(
-                    "STUN server '{spec}' resolution timed out after {} ms",
+                // STUN is Direct-only best effort.  A resolver timeout must
+                // never prevent the relay transport and encrypted session
+                // from becoming usable, especially when the control plane is
+                // reachable through a different network path.
+                warn!(
+                    "STUN server {spec} resolution timed out after {} ms; skipping this Direct candidate source",
                     resolve_timeout.as_millis()
-                )));
+                );
+                continue;
             }
             Ok(Err(err)) if using_defaults => {
                 warn!("Default STUN server {spec} could not be resolved: {err}");

@@ -290,7 +290,7 @@ async fn udp_inbound_decrypts_and_writes_packet_to_tun() {
     let peers = peer_manager();
     peers.add_peer(&peer("peer-a", "10.20.0.1", None)).await;
 
-    let (tun, mut ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.2");
+    let (tun, ctrl) = MockTunDevice::new_pair("test0", 1420, "10.20.0.2");
     let (mut dataplane, _outbound_rx, inbound_tx) =
         DataPlane::new_bidirectional(tun, peers.clone());
     let dataplane_worker = tokio::spawn(async move { dataplane.run().await });

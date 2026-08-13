@@ -848,11 +848,14 @@ fn remove_nat_maintainer_lease_if_owned(
 
 /// Estimate the hard deadline for a wide remote-scatter punch session.
 ///
-/// The fixed 24s bound kills an 831-candidate sweep mid-scan, so a
-/// remote-scatter session derives its deadline from the actual probe schedule:
-/// `min(planned_packets, session cap) × per-probe pacing + round delays +
-/// ACK grace + margin`, floored at 45s. Non-scatter sessions keep the fixed
-/// short bound because their candidate sets are small by construction.
+/// The fixed 24s bound killed an 831-candidate sweep mid-scan, so a
+/// remote-scatter session derives its deadline from the actual bounded probe
+/// schedule. The current session cap is 768 physical probes, so at the
+/// production 6ms pacing a complete window fits inside ten seconds. A
+/// ten-second floor gives the scheduler enough room for that bounded window
+/// while guaranteeing that the next recovery stage is not held behind the old
+/// ten-second floor. Non-scatter sessions keep the fixed short bound because
+/// their candidate sets are small by construction.
 pub(crate) fn estimate_remote_scatter_punch_deadline(
     candidates: &[SocketAddr],
     probe_interval: Duration,
@@ -860,8 +863,8 @@ pub(crate) fn estimate_remote_scatter_punch_deadline(
     socket_count: usize,
     ack_grace: Duration,
 ) -> Duration {
-    const MIN_REMOTE_SCATTER_SESSION_DEADLINE: Duration = Duration::from_secs(45);
-    const REMOTE_SCATTER_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+    const MIN_REMOTE_SCATTER_SESSION_DEADLINE: Duration = Duration::from_secs(10);
+    const REMOTE_SCATTER_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
 
     let schedule = build_probe_schedule(candidates, probe_interval, attempts);
     let planned_packets = schedule

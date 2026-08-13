@@ -3,7 +3,7 @@
 #
 # Topology:
 #   Mini (this machine, macOS M4)  --daemon A-->  real NAT A
-#   Air  (air.example.com via SSH, macOS arm64) --daemon B--> real NAT B
+#   Air  (<AIR_HOST> via SSH, macOS arm64) --daemon B--> real NAT B
 #
 # The verification control and relay are external. The two temporary daemons
 # connect through their real public NATs; Direct must be proven by both sides
@@ -13,39 +13,226 @@ set -euo pipefail
 HARNESS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT_DIR=${P2WLAN_ROOT_DIR:-$HARNESS_ROOT}
 REMOTE_CONTROL_URL=${REMOTE_CONTROL_URL:-}
+ALLOW_STAGING_TEST=${ALLOW_STAGING_TEST:-0}
+ALLOW_REAL_DUAL_MACHINE_TEST=${ALLOW_REAL_DUAL_MACHINE_TEST:-0}
+ALLOW_REMOTE_RESTART=${ALLOW_REMOTE_RESTART:-0}
+ALLOW_LEGACY_PLAINTEXT_RELAY=${ALLOW_LEGACY_PLAINTEXT_RELAY:-0}
 ROUNDS=${ROUNDS:-}
 ACCEPTANCE_MODE=${ACCEPTANCE_MODE:-strict}
 STRICT_PHASE=${STRICT_PHASE:-preflight}
 DIAG_A_PORT=${DIAG_A_PORT:-49377}
 DIAG_B_PORT=${DIAG_B_PORT:-49378}
-AIR_HOST=${AIR_HOST:-air.example.com}
-AIR_USER=${AIR_USER:-pyu}
-# The lab's Mini-Air SSH service listens on port 2222. Keep the environment
-# override for setups that deliberately use a different port.
-AIR_SSH_PORT=${AIR_SSH_PORT:-2300}
-AIR_SSH_KEY=${AIR_SSH_KEY:-/Users/pyu/Desktop/codex_local_ed25519}
+AIR_HOST=${AIR_HOST:-}
+AIR_USER=${AIR_USER:-}
+AIR_SSH_PORT=${AIR_SSH_PORT:-22}
+AIR_SSH_KEY=${AIR_SSH_KEY:-}
 AIR_DAEMON_BIN=${AIR_DAEMON_BIN:-}
-MINI_TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | head -1 || echo "100.84.190.40")
+MINI_TAILSCALE_IP=${MINI_TAILSCALE_IP:-}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-30}
 DIRECT_SUCCESS_TARGET_MS=${DIRECT_SUCCESS_TARGET_MS:-10000}
+# REAL_TUN-only fault injection. This installs a run-scoped macOS pf anchor
+# that blocks UDP only to/from the other endpoint's observed public IPv4.
+# Control HTTP, relay TCP, TUN and management SSH remain reachable.
+DIRECT_UDP_BLACKHOLE=${DIRECT_UDP_BLACKHOLE:-0}
 # Availability acceptance target: from the moment BOTH daemons have a relay
 # transport connected to the later of the two first-usable events (both sides
 # completed a bidirectional encrypted overlay loopback).
 AVAILABILITY_FIRST_USABLE_TARGET_MS=${AVAILABILITY_FIRST_USABLE_TARGET_MS:-3000}
 VALIDATE_OVERLAY=${VALIDATE_OVERLAY:-0}
+REAL_TUN=${REAL_TUN:-0}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-12}
 STUN_SERVERS=${STUN_SERVERS:-"stun.cloudflare.com:3478,stun.l.google.com:19302,stun.miwifi.com:3478"}
-NETWORK_ID=${NETWORK_ID:-default}
+P2WLAN_NETWORK_OR_TENANT=${P2WLAN_NETWORK_OR_TENANT:-}
+NETWORK_ID=${NETWORK_ID:-${P2WLAN_NETWORK_OR_TENANT:-}}
 ISOLATION_HELPER="$HARNESS_ROOT/scripts/dual-end/network-isolation.py"
 RUN_ID=${RUN_ID:-$(date +%s)-$$}
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-}
 AB_SEQUENCE_DIR=${AB_SEQUENCE_DIR:-${ARTIFACT_ROOT:-}}
 STRICT_PARSER="$HARNESS_ROOT/scripts/dual-end/strict-direct-parser.py"
 REMOTE_RUN_DIR="/tmp/p2wlan-direct-$RUN_ID"
+LOCAL_RUN_DIR="/tmp/p2wlan-direct-$RUN_ID"
 REMOTE_DAEMON_BIN="$REMOTE_RUN_DIR/p2wlan-daemon"
 DAEMON_BIN_OVERRIDE=$(printenv DAEMON_BIN_OVERRIDE 2>/dev/null || true)
 
-AIR_SSH="ssh -i $AIR_SSH_KEY -p $AIR_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=/tmp/p2wlan-direct-$RUN_ID-%C $AIR_USER@$AIR_HOST"
+# Control/relay diagnostics must observe the same host network as UDP.  A
+# desktop Clash/http_proxy can otherwise turn a transient proxy 502 into a
+# false control failure or report a proxy endpoint unrelated to the daemon's
+# candidate source.  The daemon itself defaults to direct proxy mode too; this
+# wrapper keeps every local harness curl consistent with that policy.
+curl() {
+  command curl --noproxy '*' "$@"
+}
+
+# This script can upload binaries, restart the Air daemon, delete test
+# devices, and run real control-plane requests. Do not infer authorization
+# from ACCEPTANCE_MODE: without both explicit opt-ins it is a no-op dry run.
+#
+# ALLOW_STAGING_TEST is the documented staging opt-in.  The older
+# ALLOW_REAL_DUAL_MACHINE_TEST name remains an explicit compatibility alias so
+# an already prepared staging command does not silently change behavior, but
+# neither name is sufficient without ALLOW_REMOTE_RESTART.
+STAGING_TEST_OPT_IN="$ALLOW_STAGING_TEST"
+if [[ "$STAGING_TEST_OPT_IN" != "1" && "$ALLOW_REAL_DUAL_MACHINE_TEST" == "1" ]]; then
+  STAGING_TEST_OPT_IN=1
+fi
+if [[ "$STAGING_TEST_OPT_IN" != "1" || "$ALLOW_REMOTE_RESTART" != "1" ]]; then
+  echo "[mini-air] DRY-RUN only: set ALLOW_STAGING_TEST=1 and ALLOW_REMOTE_RESTART=1 to authorize real staging actions" >&2
+  exit 0
+fi
+
+case "$REMOTE_CONTROL_URL" in
+  https://*)
+    LEGACY_PLAINTEXT_RELAY=0
+    ;;
+  http://*)
+    if [[ "$ALLOW_LEGACY_PLAINTEXT_RELAY" != "1" ]]; then
+      echo "[mini-air] REMOTE_CONTROL_URL is HTTP; set ALLOW_LEGACY_PLAINTEXT_RELAY=1 for an explicitly non-secure legacy staging run" >&2
+      exit 2
+    fi
+    LEGACY_PLAINTEXT_RELAY=1
+    echo "[mini-air] WARNING: legacy HTTP control/plaintext TCP relay is explicitly enabled; this run cannot prove secure relay staging or release readiness" >&2
+    ;;
+  *)
+    echo "[mini-air] REMOTE_CONTROL_URL must use https://, or http:// with ALLOW_LEGACY_PLAINTEXT_RELAY=1" >&2
+    exit 2
+    ;;
+esac
+if [[ -z "$NETWORK_ID" ]]; then
+  echo "[mini-air] NETWORK_ID (or P2WLAN_NETWORK_OR_TENANT) is required and must match on Mini and Air" >&2
+  exit 2
+fi
+if [[ -z "$AIR_HOST" || -z "$AIR_USER" || -z "$AIR_SSH_KEY" ]]; then
+  echo "[mini-air] AIR_HOST, AIR_USER and AIR_SSH_KEY are required after remote authorization" >&2
+  exit 2
+fi
+if [[ "$AIR_SSH_KEY" != /* || ! -f "$AIR_SSH_KEY" ]]; then
+  echo "[mini-air] AIR_SSH_KEY must be an existing absolute path" >&2
+  exit 2
+fi
+MINI_TAILSCALE_IP=${MINI_TAILSCALE_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}
+if [[ -z "$MINI_TAILSCALE_IP" ]]; then
+  echo "[mini-air] MINI_TAILSCALE_IP is required when tailscale is unavailable" >&2
+  exit 2
+fi
+
+# A root-launched macOS harness cannot necessarily read a user's SSH private
+# key (TCC/ACL may reject root even when the file is readable by the owner).
+# Run only the SSH client as the key owner; the daemon/test process remains
+# root for REAL_TUN.  This does not copy, print, or change the key.
+SSH_RUN_PREFIX=""
+if [[ "$(id -u)" == "0" ]]; then
+  SSH_KEY_OWNER=$(stat -f '%Su' -- "$AIR_SSH_KEY" 2>/dev/null || true)
+  if [[ -z "$SSH_KEY_OWNER" || "$SSH_KEY_OWNER" == "root" ]]; then
+    echo "[mini-air] could not determine a non-root owner for AIR_SSH_KEY while running as root" >&2
+    exit 2
+  fi
+  SSH_RUN_PREFIX="sudo -u $SSH_KEY_OWNER "
+fi
+
+# Do not include the arbitrary run id in the Unix-domain socket path: long,
+# auditable run ids exceed macOS's sockaddr_un limit before the first SSH
+# command. `%C` is the OpenSSH hash of the connection tuple and keeps runs
+# isolated without making the path unbounded.
+AIR_SSH="${SSH_RUN_PREFIX}ssh -i $AIR_SSH_KEY -p $AIR_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=/tmp/p2wlan-direct-%C $AIR_USER@$AIR_HOST"
+
+# An SSH login can belong to the same account as the logged-in Air user while
+# still being outside that user's GUI launchd bootstrap.  Authorization
+# Services then creates SecurityAgent but may present its password sheet to no
+# visible desktop.  Resolve the active console UID once and enter its bootstrap
+# explicitly for every remote authorization call.  The value is only a UID;
+# credentials and command payloads remain inside the existing base64 fragment.
+AIR_LOGIN_UID=$($AIR_SSH 'id -u')
+AIR_CONSOLE_UID=$($AIR_SSH 'stat -f "%u" /dev/console' 2>/dev/null || true)
+if [[ ! "$AIR_CONSOLE_UID" =~ ^[0-9]+$ ]]; then
+  AIR_CONSOLE_UID="$AIR_LOGIN_UID"
+fi
+
+# Run a remote shell fragment through macOS Authorization Services without
+# putting the Air password in a command argument, log, or artifact. The
+# fragment is sent as base64 over the already-authenticated SSH channel and is
+# decoded only inside the privileged `do shell script` invocation.
+remote_osascript_shell() {
+  local remote_command=$1
+  local encoded
+  encoded=$(printf '%s' "$remote_command" | /usr/bin/base64 | tr -d '\n')
+  $AIR_SSH "/bin/launchctl asuser '$AIR_CONSOLE_UID' /usr/bin/osascript -e 'do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\"'"
+}
+
+remote_osascript_shell_launch() {
+  local remote_command=$1
+  local pid_file=$2
+  local encoded
+  encoded=$(printf '%s' "$remote_command" | /usr/bin/base64 | tr -d '\n')
+  # Do not hold an SSH/osascript process for the lifetime of the daemon.  The
+  # privileged shell backgrounds only the decoded daemon command, then the
+  # normal SSH user waits for the root-owned PID file.  This leaves the
+  # authorization channel available for deterministic cleanup and prevents
+  # one round's pending osascript from blocking the next round's prompt.
+  $AIR_SSH "/bin/launchctl asuser '$AIR_CONSOLE_UID' /usr/bin/osascript -e 'do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\"'"
+  for _ in $(seq 1 50); do
+    if $AIR_SSH "test -s '$pid_file'" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# The user-facing harness is intentionally runnable from an ordinary Terminal
+# session.  On macOS the local daemon can still get a real utun through the
+# same global Authorization Services dialog used by the tray app.
+local_osascript_shell() {
+  local local_command=$1
+  local encoded
+  encoded=$(printf '%s' "$local_command" | /usr/bin/base64 | tr -d '\n')
+  # Use the plain Authorization Services form: it is the same global dialog
+  # that the user has already approved manually.  Extra Terminal automation
+  # can fail with AppleScript status 1 before the daemon command is reached.
+  # Keep this synchronous so startup/cleanup observe the privileged fragment's
+  # completion status; the password is never put in a shell argument, file, or
+  # artifact.
+  /usr/bin/osascript \
+    -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
+}
+
+local_osascript_shell_launch() {
+  local local_command=$1
+  local pid_file=$2
+  local encoded
+  encoded=$(printf '%s' "$local_command" | /usr/bin/base64 | tr -d '\n')
+  # Keep the Authorization Services call synchronous so its global dialog is
+  # visible to the user and its failure is observable by the harness.  The
+  # privileged shell detaches only the daemon pipeline, then waits for the
+  # daemon-owned PID file.  This avoids a hidden Terminal-tab launcher while
+  # still returning before the long-lived daemon exits.
+  # The background boundary is inside the privileged shell.  The decoded
+  # daemon command owns its log/PID file; the caller below performs the
+  # readiness wait as the unprivileged user.
+  local_osascript_shell "printf %s '$encoded' | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &"
+  for _ in $(seq 1 50); do
+    if [[ -s "$pid_file" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+AIR_REMOTE_NEEDS_OSASCRIPT=0
+LOCAL_DAEMON_NEEDS_OSASCRIPT=0
+
+if [[ "$REAL_TUN" == "1" ]]; then
+  if [[ "$(id -u)" != "0" ]]; then
+    LOCAL_DAEMON_NEEDS_OSASCRIPT=1
+  fi
+  if [[ "$AIR_LOGIN_UID" != "0" ]]; then
+    if ! remote_osascript_shell 'test "$(id -u)" = 0' >/dev/null 2>&1; then
+      echo "[mini-air] REAL_TUN=1 could not obtain Air root through macOS Authorization Services" >&2
+      exit 2
+    fi
+    AIR_REMOTE_NEEDS_OSASCRIPT=1
+  fi
+fi
 
 umask 077
 if [[ "$(cd "$ROOT_DIR" && pwd -P)" != "$HARNESS_ROOT" ]]; then
@@ -87,11 +274,9 @@ case "$ACCEPTANCE_MODE" in
     esac
     ;;
   availability)
-    # First-usable availability: --validate-overlay is always enabled and the
-    # pass condition is a bidirectional encrypted overlay loopback (both sides
-    # must emit overlay_payload_verified).  Direct results are reported as
-    # informational only and are never a usability gate: relay-first means
-    # user traffic is usable before Direct converges (or without it at all).
+    # First-usable availability is a production dataplane check when REAL_TUN
+    # is enabled.  The mock overlay validator is allowed only for local
+    # preflight/regression runs and can never be evidence for a real run.
     if [[ -n "$DAEMON_BIN_OVERRIDE" ]]; then
       echo "[mini-air] ACCEPTANCE_MODE=availability only permits the current-tree build; unset DAEMON_BIN_OVERRIDE" >&2
       exit 2
@@ -116,12 +301,47 @@ case "$ACCEPTANCE_MODE" in
     exit 2
     ;;
 esac
+if [[ "$STRICT_PHASE" == "acceptance" && "$REAL_TUN" != "1" ]]; then
+  echo "[mini-air] acceptance requires REAL_TUN=1; mock/--validate-overlay-only evidence is not production dataplane evidence" >&2
+  exit 2
+fi
+if [[ "$REAL_TUN" == "1" ]]; then
+  if [[ "$VALIDATE_OVERLAY" == "1" ]]; then
+    echo "[mini-air] REAL_TUN=1 cannot be combined with VALIDATE_OVERLAY=1" >&2
+    exit 2
+  fi
+  # The SSH login is normally the unprivileged Air user.  Checking sudo
+  # above is not enough: the daemon itself must run as root to create utun.
+  # Keep this explicit so REAL_TUN cannot accidentally become a user-mode run.
+  if [[ "$AIR_LOGIN_UID" == "0" ]]; then
+    TUN_REMOTE_RUN_PREFIX="env -u P2WLAN_DISABLE_TUN"
+  else
+    TUN_REMOTE_RUN_PREFIX="env -u P2WLAN_DISABLE_TUN"
+  fi
+else
+  TUN_REMOTE_RUN_PREFIX="env P2WLAN_DISABLE_TUN=1"
+fi
+case "$DIRECT_UDP_BLACKHOLE" in
+  0|1) ;;
+  *)
+    echo "[mini-air] DIRECT_UDP_BLACKHOLE must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [[ "$DIRECT_UDP_BLACKHOLE" == "1" && ( "$REAL_TUN" != "1" || "$ACCEPTANCE_MODE" != "availability" || "$STRICT_PHASE" != "acceptance" ) ]]; then
+  echo "[mini-air] DIRECT_UDP_BLACKHOLE requires REAL_TUN=1, ACCEPTANCE_MODE=availability and STRICT_PHASE=acceptance" >&2
+  exit 2
+fi
 case "$ACCEPTANCE_STAGE" in
   compat-baseline|strict-preflight|availability-preflight)
     [[ "$ROUNDS" == "3" ]] || { echo "[mini-air] $ACCEPTANCE_STAGE requires ROUNDS=3" >&2; exit 2; }
     ;;
   strict-acceptance|availability-acceptance)
-    [[ "$ROUNDS" == "10" ]] || { echo "[mini-air] $ACCEPTANCE_STAGE requires ROUNDS=10" >&2; exit 2; }
+    if [[ "$DIRECT_UDP_BLACKHOLE" == "1" ]]; then
+      [[ "$ROUNDS" == "20" ]] || { echo "[mini-air] DIRECT_UDP_BLACKHOLE acceptance requires ROUNDS=20" >&2; exit 2; }
+    else
+      [[ "$ROUNDS" == "10" ]] || { echo "[mini-air] $ACCEPTANCE_STAGE requires ROUNDS=10" >&2; exit 2; }
+    fi
     ;;
 esac
 if [[ -z "$ARTIFACT_ROOT" || -z "$AB_SEQUENCE_DIR" ]]; then
@@ -138,21 +358,29 @@ if [[ -n "$ARTIFACT_ROOT" ]]; then
     echo "[mini-air] refusing to reuse artifact directory: $BASE_DIR" >&2
     exit 2
   fi
-  mkdir -m 700 "$BASE_DIR"
+mkdir -m 700 "$BASE_DIR"
 else
   BASE_DIR=$(mktemp -d /tmp/p2wlan-direct-final.XXXXXX)
   chmod 700 "$BASE_DIR"
 fi
+mkdir -p -m 700 "$LOCAL_RUN_DIR"
 if [[ ! -d "$AB_SEQUENCE_DIR" ]]; then
   echo "[mini-air] A/B sequence directory does not exist: $AB_SEQUENCE_DIR" >&2
   exit 2
 fi
 REMOTE_NODE_B_PID_FILE=""
+NODE_B_PID=""
 LOCAL_NODE_A_PID=""
+LOCAL_NODE_A_PID_FILE=""
 LOCAL_NODE_A_CONFIG=""
+LOCAL_NODE_A_TOKEN_FILE=""
 LOCAL_NODE_A_DEVICE=""
 REMOTE_NODE_B_LOG=""
 REMOTE_NODE_B_DEVICE=""
+REMOTE_NODE_B_TOKEN_FILE=""
+DIRECT_BLACKHOLE_ANCHOR="com.apple/p2wlan-${RUN_ID//[^A-Za-z0-9_.-]/-}"
+DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
+DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
 # Do not inherit an ambient application-level RUST_LOG (often `warn`) here:
 # this harness needs Info promotion telemetry in both logs. Callers that need
 # a different filter can override the harness-specific variable explicitly.
@@ -195,6 +423,26 @@ sha256_file() {
     echo "[mini-air] neither shasum nor sha256sum is available locally" >&2
     return 1
   fi
+}
+
+capture_route_snapshot() {
+  local round_dir=$1
+  local phase=$2
+  local mini_ip=$3
+  local air_ip=$4
+  {
+    printf 'phase=%s\n' "$phase"
+    printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'hostname=%s\n' "$(hostname)"
+    printf '%s\n' '--- netstat ---'
+    netstat -rn 2>&1 || true
+    printf '%s\n' '--- route target ---'
+    if [[ -n "$air_ip" ]]; then route -n get "$air_ip" 2>&1 || true; fi
+    printf '%s\n' '--- ifconfig utun ---'
+    ifconfig 2>&1 | awk '/^utun[0-9]+:/{show=1} show{print} show && /^$/{show=0}' || true
+  } >"$round_dir/mini-routes-$phase.txt"
+  $AIR_SSH "phase='$phase'; air_ip='$mini_ip'; { printf 'phase=%s\\n' \"\$phase\"; printf 'captured_at=%s\\n' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; printf 'hostname=%s\\n' \"\$(hostname)\"; printf '%s\\n' '--- netstat ---'; netstat -rn 2>&1 || true; printf '%s\\n' '--- route target ---'; if [ -n \"\$air_ip\" ]; then route -n get \"\$air_ip\" 2>&1 || true; fi; printf '%s\\n' '--- ifconfig utun ---'; ifconfig 2>&1 | awk '/^utun[0-9]+:/{show=1} show{print} show && /^$/{show=0}' || true; }" \
+    >"$round_dir/air-routes-$phase.txt" 2>&1 || true
 }
 
 dirty_diff_sha256() {
@@ -485,6 +733,98 @@ log_first_event_field() {
   grep -E -m1 -- "$pattern" "$log_file" 2>/dev/null | sed -n "s/.*${field}=Some(\([0-9]*\)).*/\1/p"
 }
 
+# Read the production TUN dataplane milestone for one target peer.  The daemon
+# records this only after a normal decrypted business packet is received, and
+# records the actual ingress envelope (relay/direct) rather than the currently
+# selected path.  Output is `path|delta_ms|generation`; the delta uses one
+# daemon's own monotonic t_ms and is never derived from the other machine's
+# wall clock.
+production_first_business_info() {
+  local log_file=$1
+  local peer_id=$2
+  python3 - "$log_file" "$peer_id" <<'PY'
+import re
+import sys
+
+log_file, target = sys.argv[1:]
+relay_at = {}
+first = {}
+event_re = re.compile(
+    r'event="(relay_transport_ready_peer|first_real_business_ingress)"'
+)
+t_re = re.compile(r'\bt_ms=(\d+)')
+detail_re = re.compile(r'detail=(?:Some\()?"([^"]*)"')
+peer_re = re.compile(r'\bpeer=([^ ]+)')
+gen_re = re.compile(r'\bgeneration=(\d+)')
+path_re = re.compile(r'\bpath=(?:Some\()?"([^"]+)"')
+try:
+    stream = open(log_file, encoding="utf-8", errors="replace")
+except OSError:
+    raise SystemExit(0)
+with stream:
+    for line in stream:
+        event = event_re.search(line)
+        if not event:
+            continue
+        timestamp = t_re.search(line)
+        detail = detail_re.search(line)
+        if not timestamp or not detail:
+            continue
+        detail_text = detail.group(1)
+        peer = peer_re.search(detail_text)
+        generation = gen_re.search(detail_text)
+        if not peer or not generation or peer.group(1) != target:
+            continue
+        generation = int(generation.group(1))
+        at_ms = int(timestamp.group(1))
+        if event.group(1) == "relay_transport_ready_peer":
+            relay_at.setdefault(generation, at_ms)
+        elif event.group(1) == "first_real_business_ingress":
+            path = path_re.search(line)
+            if path:
+                first.setdefault(generation, (path.group(1), at_ms))
+for generation in sorted(first):
+    path, at_ms = first[generation]
+    if generation in relay_at:
+        print("%s|%d|%d" % (path, at_ms - relay_at[generation], generation))
+        break
+PY
+}
+
+run_real_tun_business_pair() {
+  local round_dir=$1
+  local mini_ip=$2
+  local air_ip=$3
+  local mini_ping_log="$round_dir/overlay-ping-mini-to-air.log"
+  local air_ping_log="$round_dir/overlay-ping-air-to-mini.log"
+  : >"$mini_ping_log"
+  : >"$air_ping_log"
+  local successful_mini=0
+  local successful_air=0
+  # Keep the window short and bounded: these are real ICMP packets through the
+  # system TUN, not the mock overlay validator.  Repeated single probes cover
+  # the small race between peer registration and relay confirmation without
+  # creating a backlog that could later masquerade as RTT.
+  for _ in $(seq 1 8); do
+    /sbin/ping -S "$mini_ip" -c 1 -W 1000 "$air_ip" >>"$mini_ping_log" 2>&1 &
+    local mini_ping_pid=$!
+    $AIR_SSH "ping -S '$air_ip' -c 1 -W 1000 '$mini_ip'" >>"$air_ping_log" 2>&1 &
+    local air_ping_pid=$!
+    wait "$mini_ping_pid" && successful_mini=$((successful_mini + 1)) || true
+    wait "$air_ping_pid" && successful_air=$((successful_air + 1)) || true
+    sleep 0.25
+  done
+  REAL_OVERLAY_MINI_REPLIES=$(grep -E -c 'bytes from|[0-9]+ bytes from' "$mini_ping_log" 2>/dev/null || true)
+  REAL_OVERLAY_AIR_REPLIES=$(grep -E -c 'bytes from|[0-9]+ bytes from' "$air_ping_log" 2>/dev/null || true)
+  REAL_OVERLAY_OK=0
+  if [[ "$REAL_OVERLAY_MINI_REPLIES" -gt 0 && "$REAL_OVERLAY_AIR_REPLIES" -gt 0 ]]; then
+    REAL_OVERLAY_OK=1
+  fi
+  printf 'mini_replies=%s air_replies=%s mini_successful_commands=%s air_successful_commands=%s\n' \
+    "$REAL_OVERLAY_MINI_REPLIES" "$REAL_OVERLAY_AIR_REPLIES" "$successful_mini" "$successful_air" \
+    >"$round_dir/real-overlay-summary.env"
+}
+
 count_stage() {
   local status_file=$1
   local log_file=$2
@@ -659,15 +999,15 @@ capture_status_pair() {
   capture_started_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
   # Fetch both endpoint-scoped snapshots concurrently.  ControlMaster keeps
   # the Air SSH transport warm between polls.
-  local mini_status_path="/status"
-  local air_status_path="/status"
-  if [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
-    mini_status_path="/status/peer/$AIR_NODE_ID"
-    air_status_path="/status/peer/$MINI_NODE_ID"
-  fi
+  # Acceptance predicates are target-scoped in every mode. The network-wide
+  # /status snapshot is useful as a diagnostic artifact, but materializing all
+  # stale peers can legitimately time out while this target's dataplane is
+  # healthy. Never make a slow unrelated peer part of the target verdict.
+  local mini_status_path="/status/peer/$AIR_NODE_ID"
+  local air_status_path="/status/peer/$MINI_NODE_ID"
   curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT$mini_status_path" >"$a_tmp" 2>"$a_err" &
   local mini_pid=$!
-  $AIR_SSH "curl -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT$air_status_path" >"$b_tmp" 2>"$b_err" &
+  $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT$air_status_path" >"$b_tmp" 2>"$b_err" &
   local air_pid=$!
   local mini_rc=0
   local air_rc=0
@@ -678,7 +1018,8 @@ capture_status_pair() {
   local air_captured_ms
   air_captured_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
   if [[ "$mini_rc" -ne 0 || "$air_rc" -ne 0 ]]; then
-    rm -f "$a_tmp" "$b_tmp"
+    : >"$a_tmp"
+    : >"$b_tmp"
     printf 'mini_rc=%s air_rc=%s\n' "$mini_rc" "$air_rc" >"$ROUND_DIR/poll-$poll_id.capture-error"
     return 1
   fi
@@ -753,7 +1094,7 @@ collect_air_log() {
 
 remote_status_reports_direct() {
   local peer_id=$1
-  $AIR_SSH "curl -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status | python3 -c 'import json,sys; status=json.load(sys.stdin); peer_id=sys.argv[1]; raise SystemExit(0 if any(peer.get(\"node_id\") == peer_id and peer.get(\"state\") == \"direct\" and peer.get(\"active_path\") == \"direct\" for peer in status.get(\"peers\", [])) else 1)' '$peer_id'"
+  $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status/peer/$peer_id | python3 -c 'import json,sys; status=json.load(sys.stdin); peer=status.get(\"peer\") or {}; raise SystemExit(0 if peer.get(\"node_id\") == sys.argv[1] and peer.get(\"state\") == \"direct\" and peer.get(\"active_path\") == \"direct\" else 1)' '$peer_id'"
 }
 
 direct_endpoint_from_log() {
@@ -779,7 +1120,52 @@ raise SystemExit(0 if address.version == 4 and address.is_global else 1)
 PY
 }
 
+delete_round_devices() {
+  local round_dir=$1
+  local cleanup_ok=1
+  local deleted_ids=""
+  local names=()
+  [[ -n "${LOCAL_NODE_A_DEVICE:-}" ]] && names+=("$LOCAL_NODE_A_DEVICE")
+  [[ -n "${REMOTE_NODE_B_DEVICE:-}" ]] && names+=("$REMOTE_NODE_B_DEVICE")
+  if ((${#names[@]} == 0)); then
+    return 0
+  fi
+
+  if python3 "$ISOLATION_HELPER" --delete-by-name "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" \
+    "${names[@]}" >"$round_dir/isolation-delete.json" 2>"$round_dir/isolation-delete.err"; then
+    deleted_ids=$(python3 - "$round_dir/isolation-delete.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(" ".join(json.load(stream).get("deleted_ids", [])))
+PY
+    )
+  else
+    echo "[mini-air] ROUND $round: device cleanup failed; refusing to continue" >&2
+    cat "$round_dir/isolation-delete.json" >&2 2>/dev/null || true
+    cleanup_ok=0
+  fi
+
+  local cleanup_proof_mode="--prove-cleaned"
+  if [[ "$ACCEPTANCE_MODE" != "strict" ]]; then
+    cleanup_proof_mode="--prove-cleaned-scoped"
+  fi
+  if [[ "$cleanup_ok" -eq 1 && -n "$deleted_ids" ]] && ! python3 "$ISOLATION_HELPER" "$cleanup_proof_mode" \
+    "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" $deleted_ids --deadline 15 \
+    >"$round_dir/isolation-cleaned.json" 2>>"$round_dir/isolation-delete.err"; then
+    echo "[mini-air] ROUND $round: network not clean after device deletion; refusing to continue" >&2
+    cat "$round_dir/isolation-cleaned.json" >&2 2>/dev/null || true
+    cleanup_ok=0
+  fi
+  if [[ "$cleanup_ok" -ne 1 ]]; then
+    overall=1
+    return 1
+  fi
+  return 0
+}
+
 cleanup() {
+  clear_direct_udp_blackhole
   local_daemon_cleanup || true
   remote_daemon_cleanup || true
   redact_local_config || true
@@ -790,41 +1176,59 @@ cleanup() {
 }
 
 redact_local_config() {
-  [[ -n "$LOCAL_NODE_A_CONFIG" && -f "$LOCAL_NODE_A_CONFIG" ]] || return 0
-  python3 - "$LOCAL_NODE_A_CONFIG" <<'PY'
-import json
-import os
-import sys
-
-path = sys.argv[1]
-with open(path, encoding="utf-8") as stream:
-    value = json.load(stream)
-
-def redact(item):
-    if isinstance(item, dict):
-        for key, child in list(item.items()):
-            lowered = key.lower()
-            if any(marker in lowered for marker in (
-                "token", "secret", "password", "private_key", "credential"
-            )):
-                item[key] = "<redacted>"
-            else:
-                redact(child)
-    elif isinstance(item, list):
-        for child in item:
-            redact(child)
-
-redact(value)
-tmp = "%s.redacted.%s" % (path, os.getpid())
-with open(tmp, "w", encoding="utf-8") as stream:
-    json.dump(value, stream, indent=2, sort_keys=True)
-    stream.write("\n")
-os.replace(tmp, path)
-PY
+  local files=()
+  [[ -n "$LOCAL_NODE_A_CONFIG" ]] && files+=("$LOCAL_NODE_A_CONFIG")
+  [[ -n "$LOCAL_NODE_A_TOKEN_FILE" ]] && files+=("$LOCAL_NODE_A_TOKEN_FILE")
+  ((${#files[@]} > 0)) || return 0
+  local cleanup_command=""
+  for file in "${files[@]}"; do
+    # Keep the no-delete contract for the workspace: generated credential and
+    # config files are truncated after the run, never recursively removed.
+    cleanup_command+="if [ -e '$file' ]; then : > '$file'; fi; "
+  done
+  if [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
+    local_osascript_shell "$cleanup_command" >/dev/null 2>&1 || true
+  else
+    /bin/sh -c "$cleanup_command" || true
+  fi
 }
 
 local_daemon_cleanup() {
   [[ -n "$LOCAL_NODE_A_PID" ]] || return 0
+  if [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" && -n "$LOCAL_NODE_A_PID_FILE" && -r "$LOCAL_NODE_A_PID_FILE" ]]; then
+    local privileged_pid privileged_command
+    privileged_pid=$(cat "$LOCAL_NODE_A_PID_FILE" 2>/dev/null || true)
+    case "$privileged_pid" in
+      ''|*[!0-9]*)
+        echo "[mini-air] Mini privileged cleanup verification failed; invalid PID file retained: $LOCAL_NODE_A_PID_FILE" >&2
+        return 1
+        ;;
+    esac
+    privileged_command=$(ps -ww -p "$privileged_pid" -o command= 2>/dev/null || true)
+    if [[ "$privileged_command" != *"$DAEMON_BIN"* ||
+          "$privileged_command" != *"$LOCAL_NODE_A_CONFIG"* ||
+          "$privileged_command" != *"$LOCAL_NODE_A_DEVICE"* ]]; then
+      echo "[mini-air] Mini privileged cleanup verification failed; PID retained: $privileged_pid" >&2
+      return 1
+    fi
+    if ! local_osascript_shell "kill -TERM '$privileged_pid' 2>/dev/null || true; sleep 1; if kill -0 '$privileged_pid' 2>/dev/null; then kill -KILL '$privileged_pid' 2>/dev/null || true; fi" >/dev/null 2>&1; then
+      echo "[mini-air] Mini privileged cleanup authorization failed; PID retained: $privileged_pid" >&2
+      return 1
+    fi
+    for _ in $(seq 1 20); do
+      if ! ps -p "$privileged_pid" -o pid= >/dev/null 2>&1; then
+        # The PID file is written by the root daemon into the user-owned
+        # artifact directory.  Do not try to truncate it here as the
+        # unprivileged harness user: that turns a successful cleanup into a
+        # spurious permission failure and destroys useful PID evidence.
+        LOCAL_NODE_A_PID=""
+        return 0
+      fi
+      sleep 0.1
+    done
+    echo "[mini-air] Mini privileged cleanup did not terminate verified PID: $privileged_pid" >&2
+    return 1
+  fi
   local command
   command=$(ps -ww -p "$LOCAL_NODE_A_PID" -o command= 2>/dev/null || true)
   if [[ "$command" != *"$DAEMON_BIN"* ||
@@ -835,7 +1239,32 @@ local_daemon_cleanup() {
     return 1
   fi
   kill "$LOCAL_NODE_A_PID" 2>/dev/null || true
-  LOCAL_NODE_A_PID=""
+  if ! ps -p "$LOCAL_NODE_A_PID" -o pid= >/dev/null 2>&1; then
+    LOCAL_NODE_A_PID=""
+    return 0
+  fi
+  echo "[mini-air] Mini cleanup did not terminate verified PID: $LOCAL_NODE_A_PID" >&2
+  return 1
+}
+
+local_daemon_is_alive() {
+  if [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" && -n "$LOCAL_NODE_A_PID_FILE" && -r "$LOCAL_NODE_A_PID_FILE" ]]; then
+    local privileged_pid privileged_command
+    privileged_pid=$(cat "$LOCAL_NODE_A_PID_FILE" 2>/dev/null || true)
+    case "$privileged_pid" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    # kill -0 is not a liveness probe for a root-owned process when this
+    # harness runs as the normal desktop user: macOS returns EPERM for a
+    # living daemon.  Use read-only process inspection and bind it to this
+    # round's binary/config/device identity to avoid accepting a reused PID.
+    privileged_command=$(ps -ww -p "$privileged_pid" -o command= 2>/dev/null || true)
+    [[ "$privileged_command" == *"$DAEMON_BIN"* &&
+       "$privileged_command" == *"$LOCAL_NODE_A_CONFIG"* &&
+       "$privileged_command" == *"$LOCAL_NODE_A_DEVICE"* ]]
+    return $?
+  fi
+  kill -0 "$NODE_A_PID" 2>/dev/null
 }
 
 remote_daemon_matches() {
@@ -845,12 +1274,65 @@ remote_daemon_matches() {
 
 remote_daemon_cleanup() {
   [[ -n "$REMOTE_NODE_B_PID_FILE" ]] || return 0
-  if $AIR_SSH "pid_file='$REMOTE_NODE_B_PID_FILE'; config='$AIR_CONFIG'; device='$REMOTE_NODE_B_DEVICE'; bin='$REMOTE_DAEMON_BIN'; run_id='$RUN_ID'; case \"\$pid_file:\$config:\$device:\$bin\" in *\"\$run_id\"*) ;; *) exit 3 ;; esac; if [ ! -r \"\$pid_file\" ]; then exit 3; fi; pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 3 ;; esac; cmd=\$(ps -ww -p \"\$pid\" -o command= 2>/dev/null) || exit 3; case \"\$cmd\" in *\"\$bin\"*\"\$config\"*\"\$device\"*) kill \"\$pid\" && rm -f \"\$pid_file\" \"\$config\" ;; *) exit 3 ;; esac" >/dev/null 2>&1; then
+  local cleanup_command="pid_file='$REMOTE_NODE_B_PID_FILE'; config='$AIR_CONFIG'; token_file='$REMOTE_NODE_B_TOKEN_FILE'; device='$REMOTE_NODE_B_DEVICE'; bin='$REMOTE_DAEMON_BIN'; run_id='$RUN_ID'; case \"\$pid_file:\$config:\$device:\$bin\" in *\"\$run_id\"*) ;; *) exit 3 ;; esac; if [ ! -r \"\$pid_file\" ]; then exit 3; fi; pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 3 ;; esac; cmd=\$(ps -ww -p \"\$pid\" -o command= 2>/dev/null) || exit 3; case \"\$cmd\" in *\"\$bin\"*\"\$config\"*\"\$device\"*) kill -TERM \"\$pid\" 2>/dev/null || true; sleep 1; if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null || true; fi; for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 \"\$pid\" 2>/dev/null || break; sleep 0.1; done; kill -0 \"\$pid\" 2>/dev/null && exit 4; : >\"\$pid_file\"; : >\"\$token_file\"; : >\"\$config\" ;; *) exit 3 ;; esac"
+  if { [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]] && remote_osascript_shell "$cleanup_command" >/dev/null 2>&1; } ||
+     { [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" != "1" ]] && $AIR_SSH "$cleanup_command" >/dev/null 2>&1; }; then
     REMOTE_NODE_B_PID_FILE=""
     return 0
   fi
   echo "[mini-air] Air cleanup verification failed; remote PID/config/log retained" >&2
   return 1
+}
+
+clear_direct_udp_blackhole() {
+  if [[ "$DIRECT_BLACKHOLE_LOCAL_ACTIVE" == "1" ]]; then
+    local_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
+  fi
+  if [[ "$DIRECT_BLACKHOLE_REMOTE_ACTIVE" == "1" ]]; then
+    remote_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
+  fi
+}
+
+apply_direct_udp_blackhole() {
+  [[ "$DIRECT_UDP_BLACKHOLE" == "1" ]] || return 0
+  if ! is_public_ipv4_endpoint "$AIR_PUBLIC_IPV4:1" || ! is_public_ipv4_endpoint "$MINI_PUBLIC_IPV4:1"; then
+    echo "[mini-air] refusing Direct blackhole: both observed public IPv4 values must be globally routable" >&2
+    return 1
+  fi
+
+  local mini_rule air_rule
+  mini_rule="/sbin/pfctl -e >/dev/null 2>&1 || true; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true; { printf '%s\\n' 'block drop quick inet proto udp from any to $AIR_PUBLIC_IPV4'; printf '%s\\n' 'block drop quick inet proto udp from $AIR_PUBLIC_IPV4 to any'; } | /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -f -; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -sr"
+  air_rule="/sbin/pfctl -e >/dev/null 2>&1 || true; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true; { printf '%s\\n' 'block drop quick inet proto udp from any to $MINI_PUBLIC_IPV4'; printf '%s\\n' 'block drop quick inet proto udp from $MINI_PUBLIC_IPV4 to any'; } | /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -f -; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -sr"
+
+  echo "[mini-air] installing Direct UDP blackhole on Mini for peer $AIR_PUBLIC_IPV4"
+  if ! local_osascript_shell "$mini_rule" >"$BASE_DIR/direct-blackhole-mini.rules"; then
+    echo "[mini-air] failed to install the Mini Direct UDP blackhole" >&2
+    return 1
+  fi
+  DIRECT_BLACKHOLE_LOCAL_ACTIVE=1
+
+  echo "[mini-air] installing Direct UDP blackhole on Air for peer $MINI_PUBLIC_IPV4"
+  if ! remote_osascript_shell "$air_rule" >"$BASE_DIR/direct-blackhole-air.rules"; then
+    echo "[mini-air] failed to install the Air Direct UDP blackhole; clearing Mini anchor" >&2
+    clear_direct_udp_blackhole
+    return 1
+  fi
+  DIRECT_BLACKHOLE_REMOTE_ACTIVE=1
+  printf '%s\n' "anchor=$DIRECT_BLACKHOLE_ANCHOR" "mini_peer_ipv4=$AIR_PUBLIC_IPV4" "air_peer_ipv4=$MINI_PUBLIC_IPV4" >"$BASE_DIR/direct-blackhole.config"
+}
+
+kill_remote_wrapper() {
+  # In the Authorization Services path the remote daemon is detached and the
+  # verified remote PID file is authoritative, so there is no local SSH
+  # wrapper to kill.  In the ordinary SSH path this terminates only this
+  # round's foreground SSH holder after remote_daemon_cleanup has signalled
+  # the exact run-scoped daemon PID.
+  if [[ -n "${NODE_B_PID:-}" ]]; then
+    kill "$NODE_B_PID" 2>/dev/null || true
+    NODE_B_PID=""
+  fi
 }
 trap cleanup EXIT
 
@@ -885,8 +1367,15 @@ printf '%s\n' "$DIRTY_DIFF_SHA256" >"$BASE_DIR/dirty-diff.sha256"
 
 echo "[mini-air] Air reachability check..."
 $AIR_SSH 'uname -m' | tail -1
-echo "[mini-air] Air public IPv4: $($AIR_SSH 'curl -s --max-time 8 ifconfig.me || true' | tail -1)"
-echo "[mini-air] Mini public IPv4: $(curl -s4 --max-time 8 ifconfig.me || true)"
+AIR_PUBLIC_IPV4=$($AIR_SSH 'curl --noproxy "*" -s --max-time 8 ifconfig.me || true' | tail -1 | tr -d '[:space:]')
+MINI_PUBLIC_IPV4=$(curl -s4 --max-time 8 ifconfig.me || true)
+MINI_PUBLIC_IPV4=$(printf '%s\n' "$MINI_PUBLIC_IPV4" | tail -1 | tr -d '[:space:]')
+echo "[mini-air] Air public IPv4: $AIR_PUBLIC_IPV4"
+echo "[mini-air] Mini public IPv4: $MINI_PUBLIC_IPV4"
+if [[ -z "$AIR_PUBLIC_IPV4" || -z "$MINI_PUBLIC_IPV4" ]]; then
+  echo "[mini-air] could not determine both public IPv4 addresses" >&2
+  exit 2
+fi
 
 if lsof -nP -iTCP:"$DIAG_A_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "[mini-air] Mini diagnostics port is already occupied: $DIAG_A_PORT" >&2
@@ -927,6 +1416,11 @@ if [[ "$REMOTE_DAEMON_SHA256" != "$LOCAL_DAEMON_SHA256" ]]; then
 fi
 echo "[mini-air] Air daemon SHA-256 verified: $LOCAL_DAEMON_SHA256"
 echo "[mini-air] isolated network id: $NETWORK_ID"
+printf '%s\n' "direct_udp_blackhole=$DIRECT_UDP_BLACKHOLE" >"$BASE_DIR/scenario.txt"
+if [[ "$DIRECT_UDP_BLACKHOLE" == "1" ]]; then
+  apply_direct_udp_blackhole
+  echo "[mini-air] Direct UDP blackhole active; relay TCP/control HTTP remain enabled"
+fi
 
 overall=0
 if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
@@ -939,11 +1433,26 @@ fi
 LOCAL_VALIDATE_OVERLAY_FLAG=""
 REMOTE_VALIDATE_OVERLAY_ARG=""
 if [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
+  if [[ "$REAL_TUN" == "1" ]]; then
+    LOCAL_VALIDATE_OVERLAY_FLAG=""
+    REMOTE_VALIDATE_OVERLAY_ARG=""
+  else
   # Availability mode ALWAYS drives the real encrypted overlay loopback and
   # targets every online peer (relay-usable until Direct is confirmed), so the
   # first-usable standard does not depend on a UDP punch succeeding.
   LOCAL_VALIDATE_OVERLAY_FLAG="--validate-overlay --overlay-any-path"
   REMOTE_VALIDATE_OVERLAY_ARG="--validate-overlay --overlay-any-path"
+  fi
+fi
+PATH_POLICY_FLAG=""
+if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
+  # Availability preflight is deliberately relay-first at the DATA decision:
+  # the daemon's normal policy keeps business traffic on Relay until a real
+  # Direct validation ACK promotes the path, while the Direct probe worker
+  # continues in the background.  `--prefer-relay` is a different, explicit
+  # relay-only policy in the CLI and would disable Direct probing/promotion;
+  # never use it as a relay-first acceptance shortcut.
+  PATH_POLICY_FLAG=""
 fi
 for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
@@ -952,6 +1461,13 @@ for round in $(seq 1 "$ROUNDS"); do
   CURRENT_A_POLL=""
   CURRENT_B_POLL=""
   CURRENT_RESULT=""
+  MINI_NODE_ID=""
+  AIR_NODE_ID=""
+  MINI_VIRTUAL_IP=""
+  AIR_VIRTUAL_IP=""
+  REAL_OVERLAY_OK=0
+  REAL_OVERLAY_MINI_REPLIES=0
+  REAL_OVERLAY_AIR_REPLIES=0
 
   CONTROL_URL="$REMOTE_CONTROL_URL"
   for _ in {1..40}; do
@@ -970,48 +1486,82 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
 
+  LOCAL_NODE_A_TOKEN_FILE="$LOCAL_RUN_DIR/node-a-$RUN_ID-round-$round.token"
+  REMOTE_NODE_B_TOKEN_FILE="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.token"
+  # Feed credentials over stdin into permission-protected temporary files.
+  # The token is never present in a daemon command line, process listing, or
+  # artifact directory.
+  (umask 077; printf '%s\n' "$TOKEN" >"$LOCAL_NODE_A_TOKEN_FILE")
+  $AIR_SSH "umask 077; cat > '$REMOTE_NODE_B_TOKEN_FILE'; chmod 600 '$REMOTE_NODE_B_TOKEN_FILE'" <<<"$TOKEN"
+
   START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 
   # Daemon A on the Mini.
-  LOCAL_NODE_A_CONFIG="$ROUND_DIR/node-a.json"
+  LOCAL_NODE_A_CONFIG="$LOCAL_RUN_DIR/node-a-$RUN_ID-round-$round.json"
   LOCAL_NODE_A_DEVICE="mini-a-$RUN_ID-round-$round"
-  P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$RUN_ID" RUST_LOG="$HARNESS_RUST_LOG" "$DAEMON_BIN" \
-    --config "$LOCAL_NODE_A_CONFIG" \
-    --control "$CONTROL_URL" \
-    --network "$NETWORK_ID" \
-    --token "$TOKEN" \
-    --device-name "$LOCAL_NODE_A_DEVICE" \
-    --udp-bind 0.0.0.0:0 \
-    --socket-pool 3 \
-    --stun "$STUN_SERVERS" \
-    --stun-timeout-ms 1000 \
-    --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
-    --heartbeat-interval 5 \
-    $LOCAL_VALIDATE_OVERLAY_FLAG \
-    >"$ROUND_DIR/node-a.log" 2>&1 &
-  NODE_A_PID=$!
-  LOCAL_NODE_A_PID=$NODE_A_PID
+  LOCAL_NODE_A_PID_FILE="$ROUND_DIR/node-a.pid"
+  if [[ "$REAL_TUN" == "1" ]]; then
+    LOCAL_DAEMON_COMMAND="echo \$\$ > '$LOCAL_NODE_A_PID_FILE'; exec env -u P2WLAN_DISABLE_TUN P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$DAEMON_BIN' --config '$LOCAL_NODE_A_CONFIG' --control '$CONTROL_URL' --network '$NETWORK_ID' --token-file '$LOCAL_NODE_A_TOKEN_FILE' --device-name '$LOCAL_NODE_A_DEVICE' --udp-bind 0.0.0.0:0 --socket-pool 3 --stun '$STUN_SERVERS' --stun-timeout-ms 1000 --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5 $PATH_POLICY_FLAG $LOCAL_VALIDATE_OVERLAY_FLAG >'$ROUND_DIR/node-a.log' 2>&1"
+  else
+    LOCAL_DAEMON_COMMAND="echo \$\$ > '$LOCAL_NODE_A_PID_FILE'; exec env P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$DAEMON_BIN' --config '$LOCAL_NODE_A_CONFIG' --control '$CONTROL_URL' --network '$NETWORK_ID' --token-file '$LOCAL_NODE_A_TOKEN_FILE' --device-name '$LOCAL_NODE_A_DEVICE' --udp-bind 0.0.0.0:0 --socket-pool 3 --stun '$STUN_SERVERS' --stun-timeout-ms 1000 --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5 $PATH_POLICY_FLAG $LOCAL_VALIDATE_OVERLAY_FLAG >'$ROUND_DIR/node-a.log' 2>&1"
+  fi
+  if [[ "$REAL_TUN" == "1" && "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
+    local_osascript_shell_launch "$LOCAL_DAEMON_COMMAND" "$LOCAL_NODE_A_PID_FILE"
+    NODE_A_WRAPPER_PID=""
+    NODE_A_PID=$(cat "$LOCAL_NODE_A_PID_FILE")
+    LOCAL_NODE_A_PID="$NODE_A_PID"
+  else
+    /bin/sh -c "$LOCAL_DAEMON_COMMAND" >/dev/null 2>&1 &
+    NODE_A_WRAPPER_PID=$!
+    NODE_A_PID="$NODE_A_WRAPPER_PID"
+    LOCAL_NODE_A_PID="$NODE_A_WRAPPER_PID"
+  fi
 
   for _ in {1..60}; do
     grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
     sleep 0.25
   done
 
+  # Registration is logged before TUN and diagnostics startup completes.  A
+  # root-launched macOS daemon can therefore have a valid PID and a
+  # successful control registration while port 49377 is still not listening.
+  # Do not let the later bootstrap curl turn that normal startup window into a
+  # set -e harness abort (or leave a detached privileged daemon behind).
+  A_READY=0
+  for _ in $(seq 1 40); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:$DIAG_A_PORT/health" >/dev/null 2>&1; then
+      A_READY=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ "$A_READY" -ne 1 ]]; then
+    echo "[mini-air] ROUND $round: FAIL (Mini daemon diagnostics never became ready)" >&2
+    overall=1
+    cp "$ROUND_DIR/node-a.log" "$ROUND_DIR/node-a-startup-failure.log" 2>/dev/null || true
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+
   # Daemon B on the Air (fresh config every round).
   AIR_CONFIG="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.json"
   REMOTE_NODE_B_PID_FILE="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.pid"
   REMOTE_NODE_B_LOG="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.log"
   REMOTE_NODE_B_DEVICE="air-b-$RUN_ID-round-$round"
-  # The daemon runs in the FOREGROUND of the remote session; the LOCAL ssh is
-  # backgrounded and held, so the daemon can never be SIGHUP'd by a session
-  # teardown race. NODE_B_PID is the local ssh pid: it stays alive exactly
-  # while the remote daemon runs; the remote daemon has its own verified PID
-  # file for precise teardown.
-  $AIR_SSH "echo \$\$ > '$REMOTE_NODE_B_PID_FILE'; exec env P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$REMOTE_DAEMON_BIN' \\
+  REMOTE_NODE_B_TOKEN_FILE="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.token"
+  # The ordinary SSH path keeps the remote daemon in the foreground and holds
+  # the local SSH wrapper.  The Authorization Services path cannot do that:
+  # it detaches the root daemon after the global Air authorization dialog and
+  # waits for this round's PID file.  In both paths the remote PID file is the
+  # authoritative identity for status ownership and teardown.
+  REMOTE_DAEMON_COMMAND="echo \$\$ > '$REMOTE_NODE_B_PID_FILE'; exec $TUN_REMOTE_RUN_PREFIX P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$REMOTE_DAEMON_BIN' \\
     --config '$AIR_CONFIG' \\
     --control '$CONTROL_URL' \\
     --network '$NETWORK_ID' \\
-    --token '$TOKEN' \\
+    --token-file '$REMOTE_NODE_B_TOKEN_FILE' \\
     --device-name '$REMOTE_NODE_B_DEVICE' \\
     --udp-bind 0.0.0.0:0 \
     --socket-pool 3 \
@@ -1019,17 +1569,33 @@ for round in $(seq 1 "$ROUNDS"); do
     --stun-timeout-ms 1000 \
     --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
     --heartbeat-interval 5 \
+    $PATH_POLICY_FLAG \
     $REMOTE_VALIDATE_OVERLAY_ARG \
-     </dev/null >'$REMOTE_NODE_B_LOG' 2>&1" >/dev/null 2>&1 &
-  NODE_B_PID=$!
-  echo "$NODE_B_PID" >"$ROUND_DIR/node-b.pid"
+     </dev/null >'$REMOTE_NODE_B_LOG' 2>&1"
+  if [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]]; then
+    if ! remote_osascript_shell_launch "$REMOTE_DAEMON_COMMAND" "$REMOTE_NODE_B_PID_FILE"; then
+      echo "[mini-air] ROUND $round: Air privileged launch did not produce this round's PID file" >&2
+      overall=1
+      remote_daemon_cleanup || true
+      local_daemon_cleanup || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+      continue
+    fi
+    NODE_B_PID=""
+    AIR_DAEMON_PID_FOR_ARTIFACT=$($AIR_SSH "cat '$REMOTE_NODE_B_PID_FILE' 2>/dev/null || true")
+    printf '%s\n' "$AIR_DAEMON_PID_FOR_ARTIFACT" >"$ROUND_DIR/node-b.pid"
+  else
+    $AIR_SSH "$REMOTE_DAEMON_COMMAND" >/dev/null 2>&1 &
+    NODE_B_PID=$!
+    printf '%s\n' "$NODE_B_PID" >"$ROUND_DIR/node-b.pid"
+  fi
   # The daemon must actually be up before the Direct wait begins (a fresh
   # config is generated on first start, which takes a beat).  Instead of a
   # fixed padding, wait for the daemon's diagnostics endpoint to answer so the
   # measured cold-start window is not inflated by a constant sleep.
   B_READY=0
   for _ in $(seq 1 40); do
-    if $AIR_SSH "curl -fsS --max-time 3 http://127.0.0.1:$DIAG_B_PORT/status >/dev/null 2>&1" 2>/dev/null; then
+    if $AIR_SSH "curl --noproxy '*' -fsS --max-time 3 http://127.0.0.1:$DIAG_B_PORT/health >/dev/null 2>&1" 2>/dev/null; then
       B_READY=1
       break
     fi
@@ -1039,10 +1605,72 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "[mini-air] ROUND $round: FAIL (Air daemon diagnostics never became ready)" >&2
     overall=1
     collect_air_log || : >"$ROUND_DIR/node-b.log"
-    capture_status_pair || true
     remote_daemon_cleanup || true
-    kill "$NODE_B_PID" 2>/dev/null || true
+    kill_remote_wrapper
     local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+
+  # A stale root daemon can leave the diagnostics port alive after a failed
+  # cleanup. Never trust that old endpoint: status.process_id must match the
+  # exact PID written by this round before its node identity or virtual IP is
+  # used for traffic and verdicts.
+  MINI_STATUS_BOOTSTRAP="$ROUND_DIR/mini-status-bootstrap.json"
+  AIR_STATUS_BOOTSTRAP="$ROUND_DIR/air-status-bootstrap.json"
+  if ! curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status.runtime" >"$MINI_STATUS_BOOTSTRAP"; then
+    echo "[mini-air] ROUND $round: FAIL (Mini diagnostics disappeared before bootstrap)" >&2
+    overall=1
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+  if ! $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status.runtime" >"$AIR_STATUS_BOOTSTRAP"; then
+    echo "[mini-air] ROUND $round: FAIL (Air diagnostics disappeared before bootstrap)" >&2
+    overall=1
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+  MINI_EXPECTED_PID=$(cat "$LOCAL_NODE_A_PID_FILE" 2>/dev/null || true)
+  AIR_EXPECTED_PID=$($AIR_SSH "cat '$REMOTE_NODE_B_PID_FILE' 2>/dev/null || true")
+  MINI_STATUS_PID=$(python3 - "$MINI_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        print(json.load(stream).get("process_id", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+  AIR_STATUS_PID=$(python3 - "$AIR_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        print(json.load(stream).get("process_id", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+  if [[ -z "$MINI_EXPECTED_PID" || -z "$AIR_EXPECTED_PID" ||
+        "$MINI_STATUS_PID" != "$MINI_EXPECTED_PID" ||
+        "$AIR_STATUS_PID" != "$AIR_EXPECTED_PID" ]]; then
+    echo "[mini-air] ROUND $round: FAIL (diagnostics endpoint is not owned by this round's daemon)" >&2
+    printf 'mini_expected_pid=%s mini_status_pid=%s air_expected_pid=%s air_status_pid=%s\n' \
+      "$MINI_EXPECTED_PID" "$MINI_STATUS_PID" "$AIR_EXPECTED_PID" "$AIR_STATUS_PID" \
+      >"$ROUND_DIR/diagnostics-owner-mismatch.txt"
+    overall=1
+    collect_air_log || true
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
     continue
   fi
 
@@ -1051,15 +1679,54 @@ for round in $(seq 1 "$ROUNDS"); do
   # diagnostics and use those exact peer IDs for every success predicate and
   # evidence counter below.  A third node's Direct path must never make this
   # Mini <-> Air round pass.
-  MINI_NODE_ID=$(curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("node_id", ""))')
-  AIR_NODE_ID=$($AIR_SSH "curl -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"node_id\", \"\"))'")
+  MINI_NODE_ID=$(python3 - "$MINI_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("node_id", ""))
+PY
+  )
+  AIR_NODE_ID=$(python3 - "$AIR_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("node_id", ""))
+PY
+  )
   if [[ -z "$MINI_NODE_ID" || -z "$AIR_NODE_ID" ]]; then
     echo "[mini-air] ROUND $round: FAIL (could not resolve this round's test node IDs)" >&2
     overall=1
     remote_daemon_cleanup || true
-    kill "$NODE_B_PID" 2>/dev/null || true
+    kill_remote_wrapper
     local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
     continue
+  fi
+  MINI_VIRTUAL_IP=$(python3 - "$MINI_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("virtual_ip", ""))
+PY
+  )
+  AIR_VIRTUAL_IP=$(python3 - "$AIR_STATUS_BOOTSTRAP" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("virtual_ip", ""))
+PY
+  )
+  if [[ "$REAL_TUN" == "1" && ( -z "$MINI_VIRTUAL_IP" || -z "$AIR_VIRTUAL_IP" ) ]]; then
+    echo "[mini-air] ROUND $round: FAIL (real TUN status did not expose both virtual IPs)" >&2
+    overall=1
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+  if [[ "$REAL_TUN" == "1" ]]; then
+    capture_route_snapshot "$ROUND_DIR" pre-traffic "$MINI_VIRTUAL_IP" "$AIR_VIRTUAL_IP"
   fi
 
   # Real-time isolation proof before the traversal window opens: the
@@ -1080,13 +1747,19 @@ for round in $(seq 1 "$ROUNDS"); do
       record_sequence_round "$round" 0 "" ""
       collect_air_log || true
       remote_daemon_cleanup || true
-      kill "$NODE_B_PID" 2>/dev/null || true
+      kill_remote_wrapper
       local_daemon_cleanup || true
       redact_local_config || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
       exit 1
     fi
   else
     ISOLATION_OK=0
+  fi
+
+  if [[ "$REAL_TUN" == "1" ]]; then
+    echo "[mini-air] ROUND $round: sending bounded real TUN ICMP probes $MINI_VIRTUAL_IP <-> $AIR_VIRTUAL_IP"
+    run_real_tun_business_pair "$ROUND_DIR" "$MINI_VIRTUAL_IP" "$AIR_VIRTUAL_IP"
   fi
 
   # Capture both snapshots in the same poll. Compatibility accepts observable
@@ -1112,12 +1785,22 @@ for round in $(seq 1 "$ROUNDS"); do
     # status snapshots below only feed the artifacts.
     CAPTURE_WINDOW_S=$OVERLAY_TIMEOUT_S
   fi
-  for _ in $(seq 1 $((CAPTURE_WINDOW_S * 2))); do
+  # Bound the capture window by wall time, not by a fixed number of polls.
+  # A full status snapshot can be large and an SSH/curl retry may consume
+  # several seconds; the old poll-count loop therefore stretched a nominal
+  # 12-second availability window to more than 90 seconds without adding
+  # evidence.  One slow capture may overrun the deadline, but subsequent
+  # polls are never allowed to extend it indefinitely.
+  CAPTURE_STARTED_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
+  CAPTURE_DEADLINE_MS=$((CAPTURE_STARTED_MS + CAPTURE_WINDOW_S * 1000))
+  while :; do
+    NOW_CAPTURE_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
+    [[ "$NOW_CAPTURE_MS" -ge "$CAPTURE_DEADLINE_MS" ]] && break
     accepted_pair=0
     if capture_status_pair; then
       if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
         compatibility_direct_pair "$CURRENT_A_POLL" "$AIR_NODE_ID" "$CURRENT_B_POLL" "$MINI_NODE_ID" && accepted_pair=1
-      else
+      elif [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
         strict_validation_pair "$CURRENT_A_POLL" "$AIR_NODE_ID" "$CURRENT_B_POLL" "$MINI_NODE_ID" >/dev/null && accepted_pair=1
         if [[ "$accepted_pair" -eq 1 ]]; then
           # Strict acceptance is based on the daemon's committed promotion
@@ -1266,8 +1949,8 @@ PY
 
   A_DIRECT=$(count_log_events_for_peer "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" '→ direct')
   B_DIRECT=$(count_log_events_for_peer "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" '→ direct')
-  A_EP=$(direct_endpoint_from_log "$ROUND_DIR/node-a.log" "$AIR_NODE_ID")
-  B_EP=$(direct_endpoint_from_log "$ROUND_DIR/node-b.log" "$MINI_NODE_ID")
+  A_EP=$(direct_endpoint_from_log "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" || true)
+  B_EP=$(direct_endpoint_from_log "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" || true)
   A_VALIDATION_SESSIONS=$(count_stage "$EVIDENCE_A_STATUS" "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" 'encrypted_trial_started')
   B_VALIDATION_SESSIONS=$(count_stage "$EVIDENCE_B_STATUS" "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" 'encrypted_trial_started')
   A_VALIDATION_REQUESTS=$(count_stage "$EVIDENCE_A_STATUS" "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" 'direct_validation_request_sent')
@@ -1359,7 +2042,11 @@ PY
   A_OVERLAY_ROUND_TRIPS=0
   B_OVERLAY_ROUND_TRIPS=0
   overlay_ok=1
-  if [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
+  if [[ "$REAL_TUN" == "1" ]]; then
+    A_OVERLAY_ROUND_TRIPS="$REAL_OVERLAY_MINI_REPLIES"
+    B_OVERLAY_ROUND_TRIPS="$REAL_OVERLAY_AIR_REPLIES"
+    overlay_ok="$REAL_OVERLAY_OK"
+  elif [[ "$VALIDATE_OVERLAY" == "1" || "$ACCEPTANCE_MODE" == "availability" ]]; then
     overlay_ok=0
     for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 2))); do
       A_OVERLAY_ROUND_TRIPS=$(log_reports_overlay_round_trip "$ROUND_DIR/node-a.log" "$AIR_NODE_ID")
@@ -1385,16 +2072,25 @@ PY
   B_FIRST_USABLE_PATH=""
   FIRST_USABLE_AFTER_RELAY_MS=""
   if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
-    # Per-daemon monotonic relay-ready -> usable delta: each daemon computes it
-    # on ITS OWN clock and reports `relay_ready_to_usable_ms=Some(N)` on the
-    # first_usable_confirmed event (which also requires a locally-sent matching
-    # nonce echo).  The harness NEVER subtracts wall clocks across the two
-    # machines; FIRST_USABLE_AFTER_RELAY_MS is the LATER (max) of the two
-    # per-daemon deltas.
-    A_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-a.log" 'first_usable_bidirectional_overlay_ms')
-    B_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-b.log" 'first_usable_bidirectional_overlay_ms')
-    A_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-a.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
-    B_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-b.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
+    # REAL_TUN uses the production `first_real_business_ingress` milestone:
+    # it is emitted only after a normal decrypted packet arrives from the
+    # target peer.  The mock validator's nonce/echo milestone is retained for
+    # non-production local runs only.  Each side computes its own monotonic
+    # relay-confirmed -> business-ingress delta; the harness takes max(side A,
+    # side B) and never subtracts cross-machine wall clocks.
+    if [[ "$REAL_TUN" == "1" ]]; then
+      A_PRODUCTION_INFO=$(production_first_business_info "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" || true)
+      B_PRODUCTION_INFO=$(production_first_business_info "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" || true)
+      A_FIRST_USABLE_PATH=$(printf '%s' "$A_PRODUCTION_INFO" | cut -d'|' -f1)
+      B_FIRST_USABLE_PATH=$(printf '%s' "$B_PRODUCTION_INFO" | cut -d'|' -f1)
+      A_RELAY_READY_TO_USABLE_MS=$(printf '%s' "$A_PRODUCTION_INFO" | cut -d'|' -f2)
+      B_RELAY_READY_TO_USABLE_MS=$(printf '%s' "$B_PRODUCTION_INFO" | cut -d'|' -f2)
+    else
+      A_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-a.log" 'first_usable_bidirectional_overlay_ms')
+      B_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-b.log" 'first_usable_bidirectional_overlay_ms')
+      A_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-a.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
+      B_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-b.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
+    fi
     if [[ -n "$A_RELAY_READY_TO_USABLE_MS" && -n "$B_RELAY_READY_TO_USABLE_MS" ]]; then
       FIRST_USABLE_AFTER_RELAY_MS=$((A_RELAY_READY_TO_USABLE_MS > B_RELAY_READY_TO_USABLE_MS ? A_RELAY_READY_TO_USABLE_MS : B_RELAY_READY_TO_USABLE_MS))
     else
@@ -1406,10 +2102,18 @@ PY
     A_TARGET_PEER_OK=0
     B_TARGET_PEER_OK=0
     if [[ -n "$AIR_NODE_ID" ]]; then
-      A_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null | grep -c "$AIR_NODE_ID" || true)
+      if [[ "$REAL_TUN" == "1" ]]; then
+      A_TARGET_PEER_OK=$(grep 'event="first_real_business_ingress"' "$ROUND_DIR/node-a.log" 2>/dev/null | grep -F -m1 -- "$AIR_NODE_ID" | wc -l | tr -d ' ' || true)
+      else
+        A_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null | grep -c "$AIR_NODE_ID" || true)
+      fi
     fi
     if [[ -n "$MINI_NODE_ID" ]]; then
-      B_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null | grep -c "$MINI_NODE_ID" || true)
+      if [[ "$REAL_TUN" == "1" ]]; then
+      B_TARGET_PEER_OK=$(grep 'event="first_real_business_ingress"' "$ROUND_DIR/node-b.log" 2>/dev/null | grep -F -m1 -- "$MINI_NODE_ID" | wc -l | tr -d ' ' || true)
+      else
+        B_TARGET_PEER_OK=$(grep -m1 'event="first_usable_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null | grep -c "$MINI_NODE_ID" || true)
+      fi
     fi
   fi
   A_HTTP_429=$(count_log_events "$ROUND_DIR/node-a.log" 'HTTP 429|status.?429|429 Too Many')
@@ -1511,7 +2215,7 @@ PY
     curl -s4 --max-time 8 ifconfig.me || true
     echo
     echo "== Air public IPv4 =="
-    $AIR_SSH 'curl -s --max-time 8 ifconfig.me || true'
+    $AIR_SSH 'curl --noproxy "*" -s --max-time 8 ifconfig.me || true'
     echo
     echo "== A: STUN order / profile =="
     grep -h 'Local NAT profile\|fresh_mapping_observer' "$ROUND_DIR/node-a.log" | head -8
@@ -1535,6 +2239,14 @@ PY
       echo "== B encrypted overlay payload =="
       grep -F -- "$MINI_NODE_ID" "$ROUND_DIR/node-b.log" | grep 'overlay_payload_verified' | head -2
     fi
+    if [[ "$REAL_TUN" == "1" ]]; then
+      echo "== real TUN overlay ping Mini -> Air =="
+      cat "$ROUND_DIR/overlay-ping-mini-to-air.log" 2>/dev/null || true
+      echo "== real TUN overlay ping Air -> Mini =="
+      cat "$ROUND_DIR/overlay-ping-air-to-mini.log" 2>/dev/null || true
+      echo "== real TUN overlay summary =="
+      cat "$ROUND_DIR/real-overlay-summary.env" 2>/dev/null || true
+    fi
     echo "== per-round metrics =="
     cat "$ROUND_DIR/metrics.env"
     echo "== A relay hedge/fallback/selection =="
@@ -1543,9 +2255,9 @@ PY
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-b.log" | head -4
     if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
       echo "== A first-usable timeline (all timepoints with corr_id + t_ms + path) =="
-      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-a.log" | head -14
+      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|first_real_business_ingress|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-a.log" | head -14
       echo "== B first-usable timeline =="
-      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-b.log" | head -14
+      grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|first_real_business_ingress|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-b.log" | head -14
       echo "== direct results (informational only, not a usability gate) =="
       echo "a_direct=$A_DIRECT b_direct=$B_DIRECT a_first_usable_path=$A_FIRST_USABLE_PATH b_first_usable_path=$B_FIRST_USABLE_PATH"
       grep -h 'direct_path_promoted\|first_direct_probe_sent' "$ROUND_DIR/node-a.log" | head -2
@@ -1565,7 +2277,7 @@ PY
 
   MINI_ALIVE=1
   AIR_ALIVE=1
-  if ! kill -0 "$NODE_A_PID" 2>/dev/null; then
+  if ! local_daemon_is_alive; then
     MINI_ALIVE=0
     echo "[mini-air] ROUND $round: FAIL (Mini daemon exited unexpectedly)"
   fi
@@ -1602,7 +2314,7 @@ PY
      [[ "$overlay_ok" -eq 1 ]] && [[ "$STATUS_CAPTURE_OK" -eq 1 ]] && \
      [[ "$A_CRASH_PANIC" -eq 0 ]] && [[ "$B_CRASH_PANIC" -eq 0 ]] && \
      [[ "$A_RELAY_PEER_CONFIRMED" -ge 1 ]] && [[ "$B_RELAY_PEER_CONFIRMED" -ge 1 ]] && \
-     [[ "$A_FIRST_USABLE_PATH" == relay:* ]] && [[ "$B_FIRST_USABLE_PATH" == relay:* ]] && \
+     [[ "$A_FIRST_USABLE_PATH" == "relay" ]] && [[ "$B_FIRST_USABLE_PATH" == "relay" ]] && \
      [[ "$A_TARGET_PEER_OK" -ge 1 ]] && [[ "$B_TARGET_PEER_OK" -ge 1 ]] && \
      [[ -n "$FIRST_USABLE_AFTER_RELAY_MS" ]] && \
      [[ "$FIRST_USABLE_AFTER_RELAY_MS" -ge 0 ]] && \
@@ -1650,47 +2362,22 @@ PY
     collect_air_log || true
   fi
 
+  if [[ "$REAL_TUN" == "1" ]]; then
+    capture_route_snapshot "$ROUND_DIR" post-traffic "$MINI_VIRTUAL_IP" "$AIR_VIRTUAL_IP"
+  fi
+
   # Teardown. NODE_B_PID is the local ssh pid; the remote daemon is signalled
   # only through this round's verified PID file.
   remote_daemon_cleanup || true
-  kill "$NODE_B_PID" 2>/dev/null || true
+  kill_remote_wrapper
   local_daemon_cleanup || true
   redact_local_config || true
 
-  # Delete this round's two devices so the next round starts on a clean
-  # roster, then prove the network is clean again (no active nodes).  Deletion
-  # is matched by the run-scoped device names, so it also covers early-failure
-  # paths where the diagnostics node IDs were never resolved.  A cleanup leak
-  # or third-party activity during cleanup aborts the run: the following
-  # rounds would start on a polluted network and their verdicts would be
-  # meaningless.
-  CLEANUP_OK=1
-  DELETED_IDS=()
-  if python3 "$ISOLATION_HELPER" --delete-by-name "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" \
-    "$LOCAL_NODE_A_DEVICE" "$REMOTE_NODE_B_DEVICE" \
-    >"$ROUND_DIR/isolation-delete.json" 2>"$ROUND_DIR/isolation-delete.err"; then
-    DELETED_IDS=$(python3 - "$ROUND_DIR/isolation-delete.json" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    print(" ".join(json.load(stream).get("deleted_ids", [])))
-PY
-)
-  else
-    echo "[mini-air] ROUND $round: FAIL (device cleanup failed); aborting run" >&2
-    cat "$ROUND_DIR/isolation-delete.json" >&2
-    CLEANUP_OK=0
-    overall=1
-  fi
-  if [[ -n "$DELETED_IDS" ]] && ! python3 "$ISOLATION_HELPER" --prove-cleaned \
-    "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" $DELETED_IDS --deadline 15 \
-    >"$ROUND_DIR/isolation-cleaned.json" 2>>"$ROUND_DIR/isolation-delete.err"; then
-    echo "[mini-air] ROUND $round: FAIL (network not clean after device deletion); aborting run" >&2
-    cat "$ROUND_DIR/isolation-cleaned.json" >&2
-    CLEANUP_OK=0
-    overall=1
-  fi
-  if [[ "$CLEANUP_OK" -ne 1 ]]; then
+  # Delete this round's devices and prove cleanup before the next round. The
+  # same helper is also used by every early-failure path above, so a daemon
+  # startup/diagnostics failure cannot leak a registered device into a later
+  # result.
+  if ! delete_round_devices "$ROUND_DIR"; then
     exit 1
   fi
   sleep 0.5

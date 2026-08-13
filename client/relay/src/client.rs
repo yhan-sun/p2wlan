@@ -118,11 +118,16 @@ enum ClientCommand {
     #[allow(dead_code)]
     SendFrame(Frame),
     /// Send data to a peer.
-    SendData { dst: String, data: Vec<u8> },
+    SendData {
+        dst: String,
+        data: Vec<u8>,
+        /// Completion is sent only after the writer has completed
+        /// `write_all`. A successful `try_send` alone is only local queue
+        /// acceptance and must not be reported as transport success.
+        completion: oneshot::Sender<Result<()>>,
+    },
     /// Send a ping.
     Ping,
-    /// Close the connection.
-    Close,
 }
 
 /// A relay client connection.
@@ -130,10 +135,14 @@ enum ClientCommand {
 /// The client maintains a background task that handles reading from and
 /// writing to the relay server. Data received from peers is delivered via
 /// the `mpsc::Receiver<RelayMessage>` returned by [`connect`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RelayClient {
     /// Command channel to the background task.
     cmd_tx: mpsc::Sender<ClientCommand>,
+    /// Immediate shutdown signal for transport replacement or an outbound
+    /// write timeout.  It must not wait behind a potentially blocked
+    /// `SendData` command in `cmd_tx`.
+    close_tx: watch::Sender<bool>,
 }
 
 impl RelayClient {
@@ -144,7 +153,18 @@ impl RelayClient {
     #[allow(dead_code)]
     pub fn new_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        Self { cmd_tx: tx }
+        let (close_tx, _close_rx) = watch::channel(false);
+        Self {
+            cmd_tx: tx,
+            close_tx,
+        }
+    }
+
+    /// Abort the writer immediately.  This is intentionally synchronous: a
+    /// caller handling an uncertain send must be able to invalidate the old
+    /// connection without acquiring a mutex or enqueueing another command.
+    pub fn abort(&self) {
+        let _ = self.close_tx.send(true);
     }
 }
 

@@ -89,6 +89,8 @@ fn rest_signal_response_defaults_to_v1_for_legacy_servers() {
 fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
     let signal = SignalResponse {
         from_node_id: "alice".to_string(),
+        to_node_id: None,
+        signal_seq: None,
         signal_type: "peer_reflexive".to_string(),
         protocol_version: SIGNAL_REST_PROTOCOL_VERSION,
         candidates: vec![
@@ -126,6 +128,8 @@ fn test_peer_reflexive_endpoint_prefers_tagged_candidate() {
 fn test_peer_reflexive_endpoint_falls_back_to_first_candidate() {
     let signal = SignalResponse {
         from_node_id: "alice".to_string(),
+        to_node_id: None,
+        signal_seq: None,
         signal_type: "peer_reflexive".to_string(),
         protocol_version: SIGNAL_REST_PROTOCOL_VERSION,
         candidates: vec!["198.51.100.1:40000".to_string()],
@@ -209,6 +213,11 @@ fn candidate_generations_embed_the_incarnation_in_the_high_bits() {
     let new_process_first =
         next_candidate_generation_for_incarnation(1_742_987_654_322, 0).unwrap();
     assert!(new_process_first > old_process_late);
+    assert_eq!(
+        candidate_generation_incarnation(first),
+        Some(incarnation)
+    );
+    assert_eq!(candidate_generation_incarnation(7), None);
 }
 
 #[test]

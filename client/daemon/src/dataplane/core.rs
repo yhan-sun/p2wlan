@@ -107,8 +107,14 @@ where
         if let Some(mut inbound_rx) = self.inbound_rx.take() {
             loop {
                 tokio::select! {
-                    result = self.read_and_route_once(&mut buf) => {
-                        result?;
+                    result = self.read_packet(&mut buf) => {
+                        let packet = result?;
+                        if !packet.is_empty() {
+                            // The TUN read has completed.  Route outside the
+                            // select future so a competing inbound packet
+                            // cannot cancel after bytes were consumed.
+                            self.route_outbound_packet(&packet).await?;
+                        }
                     }
                     inbound = inbound_rx.recv() => {
                         let Some(packet) = inbound else {
@@ -127,17 +133,30 @@ where
     }
 
     async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
+        let packet = self.read_packet(buf).await?;
+        if packet.is_empty() {
+            return Ok(());
+        }
+        self.route_outbound_packet(&packet).await
+    }
+
+    /// Read exactly one TUN packet without doing any further asynchronous
+    /// work.  `run` deliberately completes this future before entering the
+    /// peer-resolution/routing phase: cancelling a future after it has
+    /// consumed a packet from a TUN implementation is a silent packet loss.
+    async fn read_packet(&mut self, buf: &mut [u8]) -> Result<Vec<u8>> {
         let n = self
             .tun
             .read(buf)
             .await
             .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
+        Ok(buf[..n].to_vec())
+    }
 
-        if n == 0 {
-            return Ok(());
-        }
-
-        let packet = &buf[..n];
+    /// Route a packet that has already been removed from the TUN read queue.
+    /// This method may await peer state and ACL locks, but it is never placed
+    /// directly in the `select!` that owns the TUN read operation.
+    async fn route_outbound_packet(&mut self, packet: &[u8]) -> Result<()> {
         let parsed = match IpPacket::new(packet) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -146,7 +165,7 @@ where
             }
         };
 
-        let total_len = parsed.total_len().min(n);
+        let total_len = parsed.total_len().min(packet.len());
         let protocol = parsed.protocol();
         let dst_ip = parsed.dst_addr_string();
         let src_ip = parsed.src_addr_string();

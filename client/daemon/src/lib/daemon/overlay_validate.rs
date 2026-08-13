@@ -84,6 +84,136 @@ struct SentOverlayNonce {
     sent_at: Instant,
 }
 
+/// Post-first-usable burst verification state for one peer.
+struct OverlayBurst {
+    /// Armed once first-usable evidence exists for this peer.
+    armed: bool,
+    /// Nonces of the burst packets actually injected.
+    nonces: Vec<u64>,
+    /// Packets injected.
+    sent: u64,
+    /// Verified echoes received for this burst.
+    received: u64,
+    /// When the burst was injected (None until fired).
+    fired_at: Option<Instant>,
+}
+
+/// How long a burst may wait for its echoes before being reported incomplete.
+const OVERLAY_BURST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Fire the armed burst of one peer: inject `burst_size` fresh business
+/// payloads and register every nonce (bounded registry + burst state).
+#[allow(clippy::too_many_arguments)]
+async fn fire_pending_bursts(
+    controller: &MockTunController,
+    peers: &Arc<PeerManager>,
+    local_vip: &str,
+    burst_size: usize,
+    next_nonce: &mut u64,
+    next_seq: &mut u32,
+    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
+    nonce_order: &mut VecDeque<u64>,
+    bursts: &mut HashMap<String, OverlayBurst>,
+) {
+    let virtual_ips: HashMap<String, String> = peers
+        .diagnostics()
+        .await
+        .into_iter()
+        .map(|peer| (peer.node_id, peer.virtual_ip))
+        .collect();
+    let generation = peers.current_network_generation().await;
+    let targets: Vec<(String, String)> = bursts
+        .iter()
+        .filter(|(_, burst)| burst.armed && burst.fired_at.is_none())
+        .filter_map(|(peer_id, _)| {
+            virtual_ips
+                .get(peer_id)
+                .cloned()
+                .map(|vip| (peer_id.clone(), vip))
+        })
+        .collect();
+    for (peer_id, virtual_ip) in targets {
+        let mut nonces = Vec::with_capacity(burst_size);
+        for _ in 0..burst_size {
+            *next_nonce = next_nonce.wrapping_add(1);
+            *next_seq = next_seq.wrapping_add(1);
+            let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);
+            let Some(packet) =
+                build_udp_overlay_packet(local_vip, &virtual_ip, 39286, 39287, &payload)
+            else {
+                continue;
+            };
+            let nonce = *next_nonce;
+            // Register the outbound nonce BEFORE the send so a fast echo
+            // cannot race ahead of the registry insert.
+            sent_nonces.insert(
+                nonce,
+                SentOverlayNonce {
+                    peer_id: peer_id.clone(),
+                    generation,
+                    sent_at: Instant::now(),
+                },
+            );
+            nonce_order.push_back(nonce);
+            while nonce_order.len() > OVERLAY_NONCE_CAP {
+                if let Some(oldest) = nonce_order.pop_front() {
+                    sent_nonces.remove(&oldest);
+                }
+            }
+            if controller.inject(packet).await.is_ok() {
+                nonces.push(nonce);
+            }
+        }
+        if let Some(burst) = bursts.get_mut(&peer_id) {
+            burst.nonces = nonces.clone();
+            burst.sent = nonces.len() as u64;
+            burst.fired_at = Some(Instant::now());
+        }
+        info!(
+            event = "overlay_burst_sent",
+            peer = %peer_id,
+            sent = burst_size,
+            injected = nonces.len(),
+            "overlay_burst_sent peer={peer_id} sent={burst_size} injected={}",
+            nonces.len()
+        );
+    }
+}
+
+/// Report bursts whose echoes did not all return within the timeout (a
+/// structured failure the harness can gate on) and drop them.
+fn settle_overdue_bursts(
+    bursts: &mut HashMap<String, OverlayBurst>,
+    timeline: &Arc<ConnectionTimeline>,
+) {
+    let now = Instant::now();
+    let overdue: Vec<(String, u64, u64)> = bursts
+        .iter()
+        .filter(|(_, burst)| {
+            burst
+                .fired_at
+                .is_some_and(|fired| now.saturating_duration_since(fired) > OVERLAY_BURST_TIMEOUT)
+        })
+        .map(|(peer_id, burst)| (peer_id.clone(), burst.sent, burst.received))
+        .collect();
+    for (peer_id, sent, received) in overdue {
+        warn!(
+            event = "overlay_burst_incomplete",
+            peer = %peer_id,
+            sent = sent,
+            received = received,
+            "overlay_burst_incomplete peer={peer_id} sent={sent} received={received}"
+        );
+        timeline.emit(
+            "overlay_burst_incomplete",
+            None,
+            Some("overlay_burst_loss"),
+            Some(format!("peer={peer_id} sent={sent} received={received}")),
+        );
+        bursts.remove(&peer_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_overlay_validate_loop(
     controller: MockTunController,
@@ -91,12 +221,13 @@ pub async fn run_overlay_validate_loop(
     local_vip: String,
     local_node_id: String,
     overlay_any_path: bool,
+    overlay_burst: usize,
     timeline: Arc<ConnectionTimeline>,
     mut overlay_ingress_rx: mpsc::Receiver<OverlayIngressEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!(
-        "overlay_validate loop started local_vip={local_vip} any_path={overlay_any_path}: sending real encrypted overlay payloads through the production dataplane"
+        "overlay_validate loop started local_vip={local_vip} any_path={overlay_any_path} burst={overlay_burst}: sending real encrypted overlay payloads through the production dataplane"
     );
     let mut stats = OverlayStats {
         sent: 0,
@@ -112,6 +243,10 @@ pub async fn run_overlay_validate_loop(
     // sent at).  Echo verification requires an exact match here.
     let mut sent_nonces: HashMap<u64, SentOverlayNonce> = HashMap::new();
     let mut nonce_order: VecDeque<u64> = VecDeque::new();
+    // Post-first-usable burst verification: one burst of `overlay_burst`
+    // payloads per peer, every echo counted (zero loss / duplicate /
+    // reorder through the REAL dataplane + WireGuard pipeline).
+    let mut bursts: HashMap<String, OverlayBurst> = HashMap::new();
     // First-usable strictness: a bidirectional encrypted overlay business
     // loopback is proven by the FIRST verified echo.  An echo is only ever
     // generated when the peer verified a fresh request of ours (our outbound ->
@@ -125,6 +260,22 @@ pub async fn run_overlay_validate_loop(
     // Skip the immediate first tick so the peer can converge before the first
     // payload is injected.
     send_tick.tick().await;
+
+    // Drain the mock TUN's WRITE side continuously: the dataplane writes every
+    // decrypted inbound overlay payload into it, and if nothing consumes the
+    // (bounded, 256-entry) channel the dataplane's write_inbound blocks
+    // forever once a burst fills it — stalling the whole inbound pipeline.
+    // Verification happens through the transport's ingress feed, so the
+    // written bytes only need to be consumed, not inspected.
+    let drain_controller = controller.clone();
+    let _drain_task = tokio::spawn(async move {
+        let mut written: u64 = 0;
+        let drain = drain_controller;
+        while let Ok(_packet) = drain.recv_written().await {
+            written = written.saturating_add(1);
+        }
+        written
+    });
 
     loop {
         tokio::select! {
@@ -143,6 +294,21 @@ pub async fn run_overlay_validate_loop(
                     )
                     .await,
                 );
+                if overlay_burst > 0 {
+                    fire_pending_bursts(
+                        &controller,
+                        &peers,
+                        &local_vip,
+                        overlay_burst,
+                        &mut next_nonce,
+                        &mut next_seq,
+                        &mut sent_nonces,
+                        &mut nonce_order,
+                        &mut bursts,
+                    )
+                    .await;
+                    settle_overdue_bursts(&mut bursts, &timeline);
+                }
             }
             event = overlay_ingress_rx.recv() => {
                 let Some(event) = event else {
@@ -159,6 +325,7 @@ pub async fn run_overlay_validate_loop(
                     &peers,
                     &timeline,
                     &sent_nonces,
+                    &mut bursts,
                 )
                 .await;
             }
@@ -300,7 +467,26 @@ async fn handle_overlay_ingress(
     peers: &Arc<PeerManager>,
     timeline: &Arc<ConnectionTimeline>,
     sent_nonces: &HashMap<u64, SentOverlayNonce>,
+    bursts: &mut HashMap<String, OverlayBurst>,
 ) {
+    let current_generation = peers.current_network_generation().await;
+    if event.connection_generation != current_generation {
+        stats.received_invalid = stats.received_invalid.saturating_add(1);
+        warn!(
+            "{OVERLAY_EVIDENCE_PREFIX}_stale_generation peer={} event_generation={} current_generation={} reason_code=stale_overlay_generation",
+            event.peer_id, event.connection_generation, current_generation
+        );
+        timeline.emit(
+            "overlay_stale_generation",
+            None,
+            Some("stale_overlay_generation"),
+            Some(format!(
+                "peer={} event_generation={} current_generation={}",
+                event.peer_id, event.connection_generation, current_generation
+            )),
+        );
+        return;
+    }
     let ingress_label = match &event.ingress {
         OverlayIngress::Direct => "direct".to_string(),
         OverlayIngress::Relay(endpoint) => format!("relay:{endpoint}"),
@@ -356,35 +542,51 @@ async fn handle_overlay_ingress(
                 match sent_nonces.get(&nonce) {
                     Some(sent)
                         if sent.peer_id == peer_id
+                            && sent.generation == event.connection_generation
                             && sent.sent_at.elapsed() <= OVERLAY_NONCE_TTL =>
                     {
                         let generation = sent.generation;
                         let scope = format!("peer:{peer_id}:{generation}");
+                        // The harness-level bidirectional milestone is
+                        // recorded here — with real ingress — never by a
+                        // relay confirmation, TCP/TLS connect, or queued
+                        // registration. Production TUN has its own earlier
+                        // decrypted-business ingress milestone.
+                        let usable_path = match &event.ingress {
+                            OverlayIngress::Direct => crate::peer::NetworkPath::Direct,
+                            OverlayIngress::Relay(_) => crate::peer::NetworkPath::Relay,
+                        };
+                        // Production TUN ingress may already have recorded
+                        // first_usable from this decrypted packet. The
+                        // harness still requires the stronger nonce-matched
+                        // bidirectional echo before emitting its
+                        // first_usable_confirmed/SLO evidence; these are two
+                        // intentionally separate milestones.
+                        let _production_recorded = peers
+                            .record_verified_first_usable(
+                                &peer_id,
+                                generation,
+                                usable_path,
+                                &ingress_label,
+                            )
+                            .await;
                         // Per-daemon monotonic relay-ready -> usable delta
                         // (only meaningful when the usable path is relay).
                         let relay_delta_ms = if let OverlayIngress::Relay(_) = &event.ingress {
                             peers
-                                .relay_ready_at(&peer_id)
+                                .relay_ready_at_for_generation(&peer_id, generation)
                                 .await
                                 .map(|ready_at| {
                                     Instant::now()
                                         .saturating_duration_since(ready_at)
                                         .as_millis()
-                                        .min(u64::MAX as u128) as u64
+                                        .min(u64::MAX as u128)
+                                        as u64
                                 })
                         } else {
                             None
                         };
-                        timeline.emit_first_scoped(
-                            &scope,
-                            "first_usable_path",
-                            Some(&path),
-                            None,
-                            Some(format!(
-                                "peer={peer_id} dst_ip={virtual_ip} seq={seq} ingress={ingress_label}"
-                            )),
-                        );
-                        timeline.emit_first_scoped(
+                        let newly_confirmed = timeline.emit_first_scoped(
                             &scope,
                             "first_usable_bidirectional_overlay_ms",
                             Some(&path),
@@ -396,22 +598,70 @@ async fn handle_overlay_ingress(
                                     .unwrap_or_else(|| "n/a".to_string())
                             )),
                         );
-                        info!(
-                            event = "first_usable_confirmed",
-                            peer_id = %peer_id,
-                            path = %path,
-                            ingress = %ingress_label,
-                            generation = generation,
-                            relay_ready_to_usable_ms = ?relay_delta_ms,
-                            seq = seq,
-                            "first_usable_confirmed peer_id={peer_id} path={path} ingress={ingress_label} generation={generation} relay_ready_to_usable_ms={relay_delta_ms:?}",
-                        );
+                        if newly_confirmed {
+                            info!(
+                                event = "first_usable_confirmed",
+                                peer_id = %peer_id,
+                                path = %path,
+                                ingress = %ingress_label,
+                                generation = generation,
+                                relay_ready_to_usable_ms = ?relay_delta_ms,
+                                seq = seq,
+                                "first_usable_confirmed peer_id={peer_id} path={path} ingress={ingress_label} generation={generation} relay_ready_to_usable_ms={relay_delta_ms:?}",
+                            );
+                            // Arm the post-first-usable burst for this peer (the
+                            // fire happens on the next send tick).
+                            bursts
+                                .entry(peer_id.clone())
+                                .or_insert_with(|| OverlayBurst {
+                                    armed: true,
+                                    nonces: Vec::new(),
+                                    sent: 0,
+                                    received: 0,
+                                    fired_at: None,
+                                })
+                                .armed = true;
+                        }
                     }
                     _ => {
-                        stats.received_invalid += 1;
+                        // A valid echo of a request originated by the peer is
+                        // still encrypted business ingress, but this daemon
+                        // must not use it as proof of its own request/echo
+                        // round. It is not a malformed or stale packet, so do
+                        // not turn simultaneous bidirectional probes into a
+                        // false invalid/drop result.
                         warn!(
-                            "{OVERLAY_EVIDENCE_PREFIX}_unmatched_echo peer={peer_id} seq={seq} nonce={nonce:#x} ingress={ingress_label} — echo nonce does not match a locally-sent request to this peer (or expired); not first-usable evidence"
+                            "{OVERLAY_EVIDENCE_PREFIX}_unmatched_echo peer={peer_id} seq={seq} nonce={nonce:#x} ingress={ingress_label} reason_code=remote_echo_not_local_request — not first-usable evidence"
                         );
+                    }
+                }
+            }
+            // A verified echo of a burst packet counts toward the burst.
+            if direction == OVERLAY_DIRECTION_ECHO {
+                if let Some(burst) = bursts.get_mut(&peer_id) {
+                    if burst.fired_at.is_some() && burst.nonces.contains(&nonce) {
+                        burst.received = burst.received.saturating_add(1);
+                        if burst.received >= burst.sent {
+                            info!(
+                                event = "overlay_burst_complete",
+                                peer = %peer_id,
+                                sent = burst.sent,
+                                received = burst.received,
+                                "overlay_burst_complete peer={peer_id} sent={} received={}",
+                                burst.sent,
+                                burst.received
+                            );
+                            timeline.emit(
+                                "overlay_burst_complete",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={peer_id} sent={} received={}",
+                                    burst.sent, burst.received
+                                )),
+                            );
+                            bursts.remove(&peer_id);
+                        }
                     }
                 }
             }

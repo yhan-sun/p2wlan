@@ -131,7 +131,7 @@ async fn test_duplicate_registration_race_and_ownership() {
     drop(client1);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (mut client3, _rx3) = RelayClient::connect_verified(&addr.to_string(), "sender3")
+    let (client3, _rx3) = RelayClient::connect_verified(&addr.to_string(), "sender3")
         .await
         .unwrap();
     client3.send_data("dup", b"still here").await.unwrap();

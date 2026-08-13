@@ -240,23 +240,25 @@ async fn run_control_loop(
         });
         drop(signal_wake_tx);
 
-        let peer_interval_secs = config
-            .control
-            .heartbeat_interval_secs
-            .max(MIN_PEER_POLL_INTERVAL_SECS);
-        let mut peer_tick = time::interval(Duration::from_secs(peer_interval_secs));
-        peer_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        // Lease refresh/endpoint publication follows the configured
+        // heartbeat. Peer roster discovery is intentionally independent: it
+        // gates relay-first handshake admission and must not inherit a
+        // multi-second lease interval.
+        let heartbeat_interval_secs = config.control.heartbeat_interval_secs.max(1);
+        let mut heartbeat_tick = time::interval(Duration::from_secs(heartbeat_interval_secs));
+        heartbeat_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut peer_roster_tick =
+            time::interval(Duration::from_secs(PEER_ROSTER_POLL_INTERVAL_SECS));
+        peer_roster_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut signal_tick = time::interval(SIGNAL_FALLBACK_TICK);
         signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut last_signal_reconcile = Instant::now();
-
         let mut poll_failures: u32 = 0;
         let mut signal_failures: u32 = 0;
         let mut advertised_endpoint = String::new();
         let mut advertised_nat_type = "unknown".to_string();
         loop {
             tokio::select! {
-                _ = peer_tick.tick() => {
+                _ = heartbeat_tick.tick() => {
                     let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
                     if let Err(err) = update_endpoint(
                         &http,
@@ -271,6 +273,8 @@ async fn run_control_loop(
                     {
                         warn!("Device lease refresh failed: {err}");
                     }
+                }
+                _ = peer_roster_tick.tick() => {
                     let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
                     match &poll_result {
                         Err(e) => {
@@ -326,7 +330,6 @@ async fn run_control_loop(
                     match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await {
                         Ok(()) => {
                             signal_failures = 0;
-                            last_signal_reconcile = Instant::now();
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {
@@ -346,16 +349,15 @@ async fn run_control_loop(
                 }
                 _ = signal_tick.tick() => {
                     let ws_connected = signal_ws_connected.load(Ordering::Acquire);
-                    if ws_connected && last_signal_reconcile.elapsed() < SIGNAL_WS_RECONCILE_INTERVAL {
-                        continue;
-                    }
-                    let wait_ms = if ws_connected { 0 } else { SIGNAL_LONG_POLL_WAIT_MS };
+                    // A WebSocket notification is only a latency hint.  Keep
+                    // polling the durable REST queue even when it is
+                    // connected; a legacy/partially deployed server can
+                    // accept WS connections but fail to emit a wake-up for a
+                    // successfully queued signal.
+                    let wait_ms = signal_poll_wait_ms(ws_connected);
                     match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, wait_ms, &recent_signal_ids).await {
                         Ok(()) => {
                             signal_failures = 0;
-                            if ws_connected {
-                                last_signal_reconcile = Instant::now();
-                            }
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {

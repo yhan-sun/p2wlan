@@ -9,6 +9,41 @@ async fn main() -> p2pnet_daemon::Result<()> {
         std::process::exit(1);
     }
 
+    // Resolve this before any generated config is saved.  A token-file keeps
+    // credentials out of `ps`, shell history, and the audited daemon command
+    // while preserving the existing --token behavior for interactive use.
+    let token_file_value = cli
+        .token_file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .map_err(|e| DaemonError::Config(format!("failed to read token file {}: {e}", path.display())))
+                .and_then(|value| {
+                    let token = value.trim();
+                    if token.is_empty() {
+                        Err(DaemonError::Config(format!(
+                            "token file {} is empty",
+                            path.display()
+                        )))
+                    } else {
+                        Ok(token.to_string())
+                    }
+                })
+        })
+        .transpose()?;
+
+    // --build-info must print PURE JSON on stdout before any logging is
+    // initialized, so build scripts and CI can parse it verbatim.
+    if cli.build_info {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(p2pnet_daemon::build_info::current()).map_err(|e| {
+                DaemonError::Config(format!("failed to serialize build info: {e}"))
+            })?
+        );
+        return Ok(());
+    }
+
     // Initialize logging
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -57,6 +92,9 @@ async fn main() -> p2pnet_daemon::Result<()> {
     if cli.init {
         let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
         apply_cli_overrides(&mut config, &cli);
+        if let Some(ref token) = token_file_value {
+            config.control.auth_token = token.clone();
+        }
         let config_path = &cli.config;
         config.config_path = Some(config_path.clone());
         config.save_to_file(config_path)?;
@@ -87,6 +125,9 @@ async fn main() -> p2pnet_daemon::Result<()> {
         info!("No config file found. Generating default config...");
         let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
         apply_cli_overrides(&mut config, &cli);
+        if let Some(ref token) = token_file_value {
+            config.control.auth_token = token.clone();
+        }
         config.config_path = Some(config_path.clone());
         config.save_to_file(config_path)?;
         info!("Saved default config to {}", config_path.display());
@@ -95,6 +136,9 @@ async fn main() -> p2pnet_daemon::Result<()> {
 
     let mut config = config;
     apply_cli_overrides(&mut config, &cli);
+    if let Some(ref token) = token_file_value {
+        config.control.auth_token = token.clone();
+    }
 
     if cli.status {
         print_status(&config, &cli).await?;

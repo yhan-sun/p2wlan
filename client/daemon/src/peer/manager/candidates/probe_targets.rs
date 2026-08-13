@@ -91,6 +91,15 @@ impl PeerManager {
             Some(_) => self.has_relay_safety_net(node_id).await,
             None => false,
         };
+        // Snapshot this independent ledger before taking the process-wide
+        // connection write guard.  Awaiting it while that guard is held lets
+        // a background Direct planner starve control PeerJoined/PeerAnswer
+        // processing when another recovery operation owns the epoch lock.
+        let recovery_epoch = if recovery_stage.is_some() {
+            self.recovery_epoch_for(node_id).await
+        } else {
+            0
+        };
         let mut conns = self.connections.write().await;
         let conn = conns.get_mut(node_id)?;
         if !conn.online {
@@ -161,11 +170,7 @@ impl PeerManager {
                 remote_scatter_pool,
                 candidates: endpoints,
                 birthday_plan,
-                recovery_epoch: if recovery_stage.is_some() {
-                    self.recovery_epoch_for(node_id).await
-                } else {
-                    0
-                },
+                recovery_epoch,
             })
         }
     }
@@ -749,9 +754,11 @@ impl PeerManager {
             return false;
         }
         let advanced = conn.commit_birthday_probe_cursor(plan.start_rank, plan.end_rank);
+        drop(conns);
         if advanced {
             // A fully covered scatter-extended window counts toward the
-            // epoch's window report.
+            // epoch's window report.  The ledger update must happen after the
+            // connection map guard is released.
             self.record_recovery_scatter_window(node_id).await;
         }
         advanced

@@ -1,38 +1,64 @@
 //! Network outbound path selection: choose direct UDP vs relay fallback for
 //! each encrypted peer packet and forward it over the selected path.
 //!
-//! The outbound worker is a bounded, event-driven PER-PEER actor: a packet for
-//! a peer that is not yet usable (no confirmed Direct, no confirmed relay
-//! path) is parked in that peer's bounded queue, NOT in a blocking loop on the
-//! shared worker.  Every peer with a queued first packet shares ONE startup
-//! deadline for its current generation — N packets never pay N * timeout.  The
-//! queue is flushed the moment RelayPeerConfirmed or DirectConfirmed lands
-//! (event-driven via the peer manager's notify/sequence API), and cancellable
-//! on peer offline, generation change, relay 404, queue overflow or TTL
-//! expiry without breaking per-peer ordering or leaking tasks.
+//! The outbound worker is a bounded, event-driven PER-PEER actor.  It receives
+//! RAW (unencrypted) routed packets from the TUN dataplane, NOT
+//! already-encrypted packets.  The worker is the ONLY place that encrypts
+//! business packets, and it does so ONLY when the peer's path is usable —
+//! this enforces the four ordering invariants:
+//!
+//!   1. A business packet for a peer whose path is not yet usable is parked as
+//!      PLAINTEXT (`PendingPacket::Plain`): it is never encrypted, never
+//!      occupies a WireGuard counter, and never holds the peer's emit lock.
+//!   2. Relay probes, relay ACKs and direct-validation control packets use the
+//!      `encrypt_and_emit_outbound` control lane and are therefore never
+//!      blocked by parked business traffic: a parked packet holds no lock.
+//!   3. Once a business packet IS encrypted, the per-peer emit lock is held
+//!      from encryption through the ACTUAL send (UDP datagram or relay frame),
+//!      so wire order == WireGuard counter order per peer.  A control packet
+//!      encrypted later can only have a HIGHER counter and is sent only after
+//!      the earlier packet's send completed — a low counter can never fall
+//!      behind a higher counter into the receiver's 64-packet replay window.
+//!      A retry releases the guard and re-encrypts from plaintext.
+//!   4. Per-peer business traffic stays FIFO: drops evict the OLDEST entry,
+//!      retries re-park at the front, and the flush drains strictly in queue
+//!      order.
+//!
+//! Every peer with queued packets shares ONE startup deadline per peer +
+//! generation, the queue is flushed event-driven on RelayPeerConfirmed /
+//! DirectConfirmed, and all loss is structured-counted into the peer manager's
+//! `/status.stats.outbound_drops` (queue overflow, deadline expiry, peer
+//! offline, generation change, session-queue loss) plus the observable
+//! `outbound_send_failures` attempts map.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use p2pnet_tun::{Ipv4Packet, Protocol};
 use tokio::sync::{mpsc, watch, RwLock};
+use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::connection_timeline::ConnectionTimeline;
-use crate::peer::{
-    NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED, REASON_PATH_DIRECT_TRIAL,
-};
+use crate::dataplane::OutboundPacket;
+use crate::peer::{NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED};
 use crate::relay::RelayTransport;
-use crate::transport::{EncryptedPeerPacket, OrderedEncryptedPeerPacket};
+use crate::transport::{EncryptedPeerPacket, WireGuardTransport};
 use crate::udp::UdpTransport;
 
 const OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Bound a single path send so a stalled relay TCP write can never block the
 /// shared outbound worker (per-peer waits are already event-driven; this
-/// bounds the per-packet SEND).
+/// bounds the per-packet SEND).  The per-peer emit lock is held for at most
+/// this long, which also bounds how long a control probe can be locked out.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// A packet that has reached a usable-path actor may not remain in retry
+/// limbo. This is a loss boundary, not an attempt to hide a slow relay by
+/// increasing its timeout.
+const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
 /// Cadence of the outbound maintenance ticker (deadline expiry, peer
 /// offline / generation-change cancellation, paced retries).
 const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
@@ -40,12 +66,15 @@ const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 /// unbounded memory pressure while it waits for a path.
 const MAX_PENDING_PACKETS_PER_PEER: usize = 256;
 const MAX_PENDING_BYTES_PER_PEER: usize = 512 * 1024;
-/// Maximum packets sent from ONE peer's queue in a single flush pass.  The
-/// outbound worker is a single loop over all peers; a slow send (e.g. a
-/// stalled relay write) must not let one peer's large queue starve every other
-/// peer, so each peer's drain is bounded per tick and the rest waits for the
-/// next maintenance tick.
-const MAX_FLUSH_PER_PEER_PER_TICK: usize = 8;
+/// Maximum packets sent from ONE peer's queue in a single flush pass. Flushes
+/// for different peers run concurrently; this bound still prevents one
+/// peer's large queue from monopolising the shared transport locks.
+// Keep a bounded batch so a large peer cannot monopolise the actor, while
+// allowing a normal 65/96/256 packet burst to make progress without spending
+// most of its delivery deadline on scheduler turns.  Different peers are
+// still flushed as independent futures below, so this does not trade away
+// cross-peer fairness.
+const MAX_FLUSH_PER_PEER_PER_TICK: usize = 64;
 
 /// Stable reason code emitted when the first business packet has no usable
 /// path because the daemon is configured direct-only (no relay candidates are
@@ -63,20 +92,81 @@ pub(crate) const REASON_OUTBOUND_PEER_OFFLINE: &str = "outbound_peer_offline";
 /// Stable reason code for a waiting peer whose local network generation
 /// advanced mid-wait (old NAT mappings are invalid; the wait restarts fresh).
 pub(crate) const REASON_OUTBOUND_GENERATION_CHANGED: &str = "outbound_generation_changed";
+/// Stable reason code for a relay send attempt that failed transiently
+/// (counted as an ATTEMPT in `/status.stats.outbound_send_failures`; the
+/// packet is re-parked and retried, never silently discarded).
+pub(crate) const REASON_RELAY_SEND_NOT_HANDED: &str = "relay_send_not_handed";
+pub(crate) const REASON_RELAY_DELIVERY_UNCERTAIN: &str = "relay_delivery_uncertain";
+pub(crate) const REASON_DIRECT_DELIVERY_UNCERTAIN: &str = "direct_delivery_uncertain";
+pub(crate) const REASON_OUTBOUND_ENCRYPT_FAILED: &str = "outbound_encrypt_failed";
+pub(crate) const REASON_OUTBOUND_SESSION_NOT_READY: &str = "outbound_session_not_ready";
+pub(crate) const REASON_OUTBOUND_DELIVERY_DEADLINE: &str = "outbound_delivery_deadline_expired";
+/// Stable terminal reason for plaintext packets still owned by the worker
+/// when its ingress/watch channels close.  A worker shutdown is a lifecycle
+/// boundary, not permission to let its per-peer queues disappear silently.
+pub(crate) const REASON_OUTBOUND_WORKER_STOPPED: &str = "outbound_worker_stopped";
 
-enum OutboundSendResult {
+/// Outcome of handing one business packet to the network.
+enum SendOutcome {
+    /// The packet was handed to the selected transport.
     Sent,
-    Retryable(RetryableOutboundFailure),
+    /// The send failed before transport handoff; retry from plaintext with a
+    /// newly allocated counter.
+    Retryable(RetryableSendFailure),
+    /// Delivery status is uncertain; terminally account the packet and drop
+    /// the ciphertext after releasing the emit lock.
+    Terminal(TerminalSendFailure),
 }
 
-enum RetryableOutboundFailure {
+enum RetryableSendFailure {
     NoSelectedPath {
         reason: String,
         reason_code: &'static str,
     },
-    RelaySendFailed {
+    RelaySendNotHanded {
         err: String,
     },
+}
+
+enum TerminalSendFailure {
+    DeliveryUncertain { reason: &'static str, err: String },
+}
+
+impl RetryableSendFailure {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            RetryableSendFailure::NoSelectedPath { reason_code, .. } => reason_code,
+            RetryableSendFailure::RelaySendNotHanded { .. } => REASON_RELAY_SEND_NOT_HANDED,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::NoSelectedPath { reason, .. } => reason.clone(),
+            Self::RelaySendNotHanded { err } => err.clone(),
+        }
+    }
+}
+
+/// One queued per-peer packet. The queue intentionally contains plaintext
+/// only. An encrypted packet and its emit guard exist only in one lexical send
+/// operation; a retry releases the guard and allocates a fresh counter.
+enum PendingPacket {
+    Plain(OutboundPacket),
+}
+
+impl PendingPacket {
+    fn stored_bytes(&self) -> usize {
+        match self {
+            Self::Plain(packet) => packet.packet.len(),
+        }
+    }
+
+    fn peer_id(&self) -> &str {
+        match self {
+            Self::Plain(packet) => &packet.peer_id,
+        }
+    }
 }
 
 /// Bounded, event-driven first-packet wait policy.
@@ -95,7 +185,7 @@ pub(crate) struct RelayStartupWait {
 /// One per-peer pending queue.  Packets are sent strictly in arrival order
 /// (FIFO), so a drop or retry never reorders a peer's stream.
 struct PeerPendingQueue {
-    queue: VecDeque<OrderedEncryptedPeerPacket>,
+    queue: VecDeque<PendingPacket>,
     bytes: usize,
     /// When the peer's FIRST packet started waiting (None = not waiting).
     wait_started: Option<Instant>,
@@ -107,6 +197,8 @@ struct PeerPendingQueue {
     /// send failure), so the maintenance ticker does not hot-loop a failed
     /// relay.
     retry_after: Option<Instant>,
+    /// Terminal deadline after a path became usable or a send retry began.
+    delivery_deadline: Option<Instant>,
 }
 
 impl PeerPendingQueue {
@@ -118,55 +210,42 @@ impl PeerPendingQueue {
             wait_deadline: None,
             wait_generation: None,
             retry_after: None,
+            delivery_deadline: None,
         }
     }
 
-    /// Park a packet in the bounded queue, dropping oldest packets first when
-    /// the packet/byte bound is exceeded.  Returns the number of packets
-    /// dropped for the overflow.
-    fn enqueue(
-        &mut self,
-        packet: OrderedEncryptedPeerPacket,
-        _now: Instant,
-        peer_id: &str,
-        timeline: &ConnectionTimeline,
-    ) -> usize {
-        let packet_len = packet.wire_bytes.len();
-        let mut dropped = 0usize;
+    /// Park a packet in the bounded queue, dropping the OLDEST entries first
+    /// when the packet/byte bound is exceeded.  Returns (dropped packets,
+    /// dropped bytes) for the overflow so the caller can count them into
+    /// `/status.stats.outbound_drops` — the loss is never silently ignored.
+    fn enqueue(&mut self, packet: PendingPacket) -> (usize, usize) {
+        let packet_len = packet.stored_bytes();
+        let mut dropped_packets = 0usize;
+        let mut dropped_bytes = 0usize;
         while !self.queue.is_empty()
             && (self.queue.len() >= MAX_PENDING_PACKETS_PER_PEER
                 || self.bytes.saturating_add(packet_len) > MAX_PENDING_BYTES_PER_PEER)
         {
             if let Some(old) = self.queue.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.wire_bytes.len());
-                dropped = dropped.saturating_add(1);
+                let old_len = old.stored_bytes();
+                self.bytes = self.bytes.saturating_sub(old_len);
+                dropped_packets = dropped_packets.saturating_add(1);
+                dropped_bytes = dropped_bytes.saturating_add(old_len);
             }
-        }
-        if dropped > 0 {
-            timeline.emit(
-                "outbound_packet_dropped",
-                None,
-                Some(REASON_OUTBOUND_QUEUE_FULL),
-                Some(format!(
-                    "peer={peer_id} dropped={dropped} reason={REASON_OUTBOUND_QUEUE_FULL} queued={} bytes={}",
-                    self.queue.len(),
-                    self.bytes
-                )),
-            );
         }
         self.bytes = self.bytes.saturating_add(packet_len);
         self.queue.push_back(packet);
-        dropped
+        (dropped_packets, dropped_bytes)
     }
 
-    fn pop_front(&mut self) -> Option<OrderedEncryptedPeerPacket> {
+    fn pop_front(&mut self) -> Option<PendingPacket> {
         let packet = self.queue.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(packet.wire_bytes.len());
+        self.bytes = self.bytes.saturating_sub(packet.stored_bytes());
         Some(packet)
     }
 
-    fn push_front(&mut self, packet: OrderedEncryptedPeerPacket) {
-        self.bytes = self.bytes.saturating_add(packet.wire_bytes.len());
+    fn push_front(&mut self, packet: PendingPacket) {
+        self.bytes = self.bytes.saturating_add(packet.stored_bytes());
         self.queue.push_front(packet);
     }
 }
@@ -178,9 +257,27 @@ fn bump_probe_kick(kick: &mut u64, relay_probe_kick_tx: &watch::Sender<u64>) {
     let _ = relay_probe_kick_tx.send(*kick);
 }
 
+/// Extract the identity of an overlay harness packet for diagnostics only.
+/// This never drives routing or delivery; it lets a failed burst correlate
+/// the raw TUN ingress with the encrypted transport outcome without logging
+/// payload bytes.
+fn overlay_packet_identity(packet: &[u8]) -> Option<(u64, u32, u8)> {
+    let ip = Ipv4Packet::new(packet).ok()?;
+    if ip.protocol() != Protocol::Udp {
+        return None;
+    }
+    let udp_payload = ip.payload().get(8..)?;
+    let payload = udp_payload.strip_prefix(crate::OVERLAY_PAYLOAD_MAGIC)?;
+    let direction = *payload.first()?;
+    let nonce = u64::from_be_bytes(payload.get(1..9)?.try_into().ok()?);
+    let sequence = u32::from_be_bytes(payload.get(9..13)?.try_into().ok()?);
+    Some((nonce, sequence, direction))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_network_outbound(
-    mut encrypted_rx: mpsc::Receiver<OrderedEncryptedPeerPacket>,
+    mut outbound_rx: mpsc::Receiver<OutboundPacket>,
+    transport: WireGuardTransport,
     peers: Arc<PeerManager>,
     prefer_direct: bool,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
@@ -197,14 +294,21 @@ pub(super) async fn run_network_outbound(
     let mut ticker = interval(OUTBOUND_MAINTENANCE_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut probe_kick = 0u64;
+    // Each peer owns one independent flush task.  The actor remains free to
+    // receive and route other peers while a relay writer is slow or being
+    // replaced; `flushing_peers` prevents a newer live packet from starting a
+    // second FIFO for the same peer.
+    let mut flush_tasks = JoinSet::new();
+    let mut flushing_peers = HashSet::new();
     let _ = relay_probe_kick_tx.send(probe_kick);
 
     loop {
         tokio::select! {
-            packet = encrypted_rx.recv() => {
+            packet = outbound_rx.recv() => {
                 let Some(packet) = packet else { break; };
                 handle_ingress(
                     packet,
+                    &transport,
                     &peers,
                     &mut pending,
                     prefer_direct,
@@ -214,26 +318,34 @@ pub(super) async fn run_network_outbound(
                     &mut probe_kick,
                     &relay_probe_kick_tx,
                     &timeline,
+                    &mut flush_tasks,
+                    &mut flushing_peers,
                 ).await;
             }
             _ = direct_notify.notified() => {
-                flush_ready_peers(
+                start_ready_peer_flushes(
+                    &transport,
                     &peers,
                     &mut pending,
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
                     &timeline,
+                    &mut flush_tasks,
+                    &mut flushing_peers,
                 ).await;
             }
             _ = relay_notify.notified() => {
-                flush_ready_peers(
+                start_ready_peer_flushes(
+                    &transport,
                     &peers,
                     &mut pending,
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
                     &timeline,
+                    &mut flush_tasks,
+                    &mut flushing_peers,
                 ).await;
             }
             changed = relay_available_rx.changed() => {
@@ -242,65 +354,124 @@ pub(super) async fn run_network_outbound(
                 // waiting peer's confirmation is not delayed by the probe
                 // cadence, then flush whatever became usable.
                 bump_probe_kick(&mut probe_kick, &relay_probe_kick_tx);
-                flush_ready_peers(
+                start_ready_peer_flushes(
+                    &transport,
                     &peers,
                     &mut pending,
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
                     &timeline,
+                    &mut flush_tasks,
+                    &mut flushing_peers,
                 ).await;
             }
             _ = ticker.tick() => {
                 maintenance(
+                    &transport,
                     &peers,
                     &mut pending,
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
                     &timeline,
+                    &mut flush_tasks,
+                    &mut flushing_peers,
                 ).await;
+            }
+            flush_result = flush_tasks.join_next(), if !flush_tasks.is_empty() => {
+                match flush_result {
+                    Some(Ok((peer_id, queue))) => {
+                        flushing_peers.remove(&peer_id);
+                        merge_completed_flush(&mut pending, peer_id, queue);
+                        start_ready_peer_flushes(
+                            &transport,
+                            &peers,
+                            &mut pending,
+                            prefer_direct,
+                            &udp_transport,
+                            &relay_transport,
+                            &timeline,
+                            &mut flush_tasks,
+                            &mut flushing_peers,
+                        ).await;
+                    }
+                    Some(Err(err)) => {
+                        // A flush task contains only bounded transport work;
+                        // a panic is still a lifecycle loss and must be
+                        // visible instead of silently deleting its queue.
+                        warn!("outbound per-peer flush task failed: {err}");
+                    }
+                    None => {}
+                }
             }
         }
     }
-}
 
-/// Route one encrypted packet: send it immediately when its peer already has a
-/// usable path, otherwise park it in the peer's bounded queue and start the
-/// peer's SHARED startup deadline (first packet of a peer + generation only).
-#[allow(clippy::too_many_arguments)]
-async fn handle_ingress(
-    packet: OrderedEncryptedPeerPacket,
-    peers: &PeerManager,
-    pending: &mut HashMap<String, PeerPendingQueue>,
-    prefer_direct: bool,
-    udp_transport: &RwLock<Option<UdpTransport>>,
-    relay_transport: &RwLock<Option<RelayTransport>>,
-    relay_startup_wait: RelayStartupWait,
-    probe_kick: &mut u64,
-    relay_probe_kick_tx: &watch::Sender<u64>,
-    timeline: &ConnectionTimeline,
-) {
-    let peer_id = packet.peer_id.clone();
-    let generation = peers.current_network_generation().await;
-    let usable = peers.is_direct(&peer_id).await || peers.is_relay_peer_confirmed(&peer_id).await;
-    if usable {
-        match send_encrypted_packet_bounded(
-            &packet,
-            peers,
-            prefer_direct,
-            udp_transport,
-            relay_transport,
-        )
-        .await
-        {
-            OutboundSendResult::Sent => return,
-            // Transient send failure with a usable path: park in the queue and
-            // let the paced retry flush it.
-            OutboundSendResult::Retryable(_) => {}
+    // Finish already-started per-peer tasks before accounting their returned
+    // queues.  This is a bounded shutdown path: each transport handoff has a
+    // hard timeout and no task owns an encrypted retry packet.
+    while let Some(result) = flush_tasks.join_next().await {
+        match result {
+            Ok((peer_id, queue)) => merge_completed_flush(&mut pending, peer_id, queue),
+            Err(err) => warn!("outbound per-peer flush task failed during shutdown: {err}"),
         }
     }
 
+    // The worker owns the only mutable copy of these per-peer queues.  When
+    // either ingress or relay watch closes, account every still-parked packet
+    // before returning; otherwise a graceful task shutdown would be a silent
+    // loss path that never reaches /status.stats or the timeline.
+    let queued_peers = pending.len();
+    let queued_packets: usize = pending.values().map(|entry| entry.queue.len()).sum();
+    drop_all_pending_queues(
+        &peers,
+        &mut pending,
+        REASON_OUTBOUND_WORKER_STOPPED,
+        &timeline,
+    )
+    .await;
+    timeline.emit(
+        "outbound_worker_stopped",
+        None,
+        Some(REASON_OUTBOUND_WORKER_STOPPED),
+        Some(format!("peers={queued_peers} packets={queued_packets}")),
+    );
+}
+
+/// Route one RAW packet: encrypt + send immediately when its peer already has
+/// a usable path AND a WireGuard session; otherwise park it (PLAINTEXT — no
+/// counter, no emit lock) in the peer's bounded queue and start the peer's
+/// SHARED startup deadline (first packet of a peer + generation only).
+#[allow(clippy::too_many_arguments)]
+async fn handle_ingress(
+    packet: OutboundPacket,
+    transport: &WireGuardTransport,
+    peers: &Arc<PeerManager>,
+    pending: &mut HashMap<String, PeerPendingQueue>,
+    prefer_direct: bool,
+    udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+    relay_startup_wait: RelayStartupWait,
+    probe_kick: &mut u64,
+    relay_probe_kick_tx: &watch::Sender<u64>,
+    timeline: &Arc<ConnectionTimeline>,
+    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
+    flushing_peers: &mut HashSet<String>,
+) {
+    let peer_id = packet.peer_id.clone();
+    let generation = peers.current_network_generation().await;
+    if let Some((nonce, sequence, direction)) = overlay_packet_identity(&packet.packet) {
+        debug!(
+            event = "outbound_overlay_queued",
+            peer_id = %peer_id,
+            nonce = format_args!("{nonce:#x}"),
+            sequence,
+            direction,
+            generation,
+            "raw overlay packet entered the per-peer FIFO"
+        );
+    }
     // A waiting queue whose generation advanced mid-wait is dropped first
     // (old NAT mappings are invalid); the packet below starts a fresh wait.
     if pending.get(&peer_id).is_some_and(|entry| {
@@ -315,19 +486,32 @@ async fn handle_ingress(
         .await;
     }
 
-    // Park the packet.  The peer is NOT usable yet (relay not confirmed,
-    // direct not confirmed): release the ordering guard BEFORE queuing so this
-    // packet can never hold the peer's emit lock while it waits for a path.
-    // The relay probe / direct-validation control packets that will make the
-    // peer usable must not be blocked by queued business traffic.
-    let mut packet = packet;
-    packet.release_send_order_guard();
+    let usable = peers.is_direct(&peer_id).await
+        || peers
+            .is_relay_peer_confirmed_for_generation(&peer_id, generation)
+            .await;
+    // Every business packet, including a packet arriving after confirmation,
+    // enters the same per-peer FIFO. This is the critical distinction from the
+    // old relay-first implementation, which could send a new live packet
+    // around an older retry/session flush.
     let entry = pending
         .entry(peer_id.clone())
         .or_insert_with(PeerPendingQueue::new);
-    let _ = entry.enqueue(packet, Instant::now(), &peer_id, timeline);
+    let (dropped_packets, dropped_bytes) = entry.enqueue(PendingPacket::Plain(packet));
+    if dropped_packets > 0 {
+        record_overflow_drop(
+            peers,
+            &peer_id,
+            dropped_packets,
+            dropped_bytes,
+            entry,
+            timeline,
+        )
+        .await;
+    }
 
-    if entry.wait_started.is_none() {
+    let should_start_wait = entry.wait_started.is_none() && !usable;
+    if should_start_wait {
         match relay_startup_wait.timeout {
             None => {
                 // Direct-only configuration: never wait for a relay that is
@@ -341,7 +525,7 @@ async fn handle_ingress(
                 )
                 .await;
                 debug!(
-                    "Encrypted packet for peer {} dropped: direct-only config has no relay and direct is not confirmed",
+                    "Outbound packet for peer {} dropped: direct-only config has no relay and direct is not confirmed",
                     peer_id
                 );
             }
@@ -365,119 +549,543 @@ async fn handle_ingress(
             }
         }
     }
+
+    if usable {
+        if let Some(entry) = pending.get_mut(&peer_id) {
+            // Even a queue created after a confirmed path belongs to this
+            // generation.  Recording it here lets generation advance cancel
+            // a retry that was parked after a path/transport change instead
+            // of leaving it behind an apparently healthy peer.
+            entry.wait_generation = Some(generation);
+            entry
+                .delivery_deadline
+                .get_or_insert_with(|| Instant::now() + OUTBOUND_DELIVERY_DEADLINE);
+        }
+        start_ready_peer_flushes(
+            transport,
+            peers,
+            pending,
+            prefer_direct,
+            udp_transport,
+            relay_transport,
+            timeline,
+            flush_tasks,
+            flushing_peers,
+        )
+        .await;
+    }
 }
 
-/// Send every queued packet of peers that became usable (DirectConfirmed or
-/// RelayPeerConfirmed), strictly in FIFO order, re-parking a packet whose send
-/// transiently failed so order is never broken.
-async fn flush_ready_peers(
+/// Count a queue-overflow loss structurally and emit the timeline event.
+async fn record_overflow_drop(
     peers: &PeerManager,
-    pending: &mut HashMap<String, PeerPendingQueue>,
+    peer_id: &str,
+    dropped_packets: usize,
+    dropped_bytes: usize,
+    entry: &PeerPendingQueue,
+    timeline: &ConnectionTimeline,
+) {
+    peers
+        .record_outbound_drop(REASON_OUTBOUND_QUEUE_FULL, dropped_packets, dropped_bytes)
+        .await;
+    record_loss_event(
+        peers,
+        "drop",
+        peer_id,
+        entry
+            .wait_generation
+            .unwrap_or_else(|| peers.current_network_generation_sync()),
+        REASON_OUTBOUND_QUEUE_FULL,
+        dropped_packets,
+        dropped_bytes,
+        timeline,
+    )
+    .await;
+    timeline.emit(
+        "outbound_packet_dropped",
+        None,
+        Some(REASON_OUTBOUND_QUEUE_FULL),
+        Some(format!(
+            "peer={peer_id} dropped={dropped_packets} bytes={dropped_bytes} reason={REASON_OUTBOUND_QUEUE_FULL} queued={} queued_bytes={}",
+            entry.queue.len(),
+            entry.bytes
+        )),
+    );
+}
+
+/// Outcome of encrypting and sending one RAW packet.
+enum EncryptSendOutcome {
+    Sent,
+    Retryable {
+        packet: OutboundPacket,
+        reason_code: &'static str,
+        reason: String,
+    },
+    Terminal {
+        packet: OutboundPacket,
+        reason_code: &'static str,
+        reason: String,
+    },
+}
+
+/// Encrypt a RAW packet (holding the peer's emit lock) and send it while the
+/// guard is still held.
+async fn encrypt_then_send(
+    packet: OutboundPacket,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
     relay_transport: &RwLock<Option<RelayTransport>>,
-    timeline: &ConnectionTimeline,
+) -> EncryptSendOutcome {
+    let retry_packet = packet.clone();
+    let encrypted_and_guard = match transport.encrypt_outbound_with_guard(packet).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return EncryptSendOutcome::Retryable {
+                packet: retry_packet,
+                reason_code: REASON_OUTBOUND_SESSION_NOT_READY,
+                reason: "WireGuard session is not ready".to_string(),
+            };
+        }
+        Err(err) => {
+            return EncryptSendOutcome::Terminal {
+                packet: retry_packet,
+                reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
+                reason: err.to_string(),
+            };
+        }
+    };
+    let (encrypted, guard) = encrypted_and_guard;
+    let outcome = send_encrypted_packet_bounded(
+        &encrypted,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+    )
+    .await;
+    if let Some((nonce, sequence, direction)) = overlay_packet_identity(&retry_packet.packet) {
+        let outcome_label = match &outcome {
+            SendOutcome::Sent => "sent",
+            SendOutcome::Retryable(_) => "retryable",
+            SendOutcome::Terminal(_) => "terminal",
+        };
+        debug!(
+            event = "outbound_overlay_transport_result",
+            peer_id = %retry_packet.peer_id,
+            nonce = format_args!("{nonce:#x}"),
+            sequence,
+            direction,
+            wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&encrypted.wire_bytes)),
+            outcome = outcome_label,
+            "encrypted overlay packet reached a classified transport outcome"
+        );
+    }
+    // The guard is deliberately released before any asynchronous retry is
+    // queued. A retry is always the original plaintext and receives a fresh
+    // WireGuard counter.
+    drop(guard);
+    match outcome {
+        SendOutcome::Sent => EncryptSendOutcome::Sent,
+        SendOutcome::Retryable(failure) => EncryptSendOutcome::Retryable {
+            packet: retry_packet,
+            reason_code: failure.reason_code(),
+            reason: failure.reason(),
+        },
+        SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain { reason, err }) => {
+            EncryptSendOutcome::Terminal {
+                packet: retry_packet,
+                reason_code: reason,
+                reason: err,
+            }
+        }
+    }
+}
+
+/// Start one independent flush task for every peer that became usable
+/// (DirectConfirmed or RelayPeerConfirmed). Only plaintext is retained
+/// between attempts; encrypted packets never live in the retry queue.
+///
+/// The previous implementation awaited all peer flushes in this actor. That
+/// made the actor stop receiving new TUN packets while one relay writer was
+/// stalled. The task set below preserves one FIFO owner per peer while the
+/// actor remains fair to other peers.
+#[allow(clippy::too_many_arguments)]
+async fn start_ready_peer_flushes(
+    transport: &WireGuardTransport,
+    peers: &Arc<PeerManager>,
+    pending: &mut HashMap<String, PeerPendingQueue>,
+    prefer_direct: bool,
+    udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+    timeline: &Arc<ConnectionTimeline>,
+    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
+    flushing_peers: &mut HashSet<String>,
 ) {
+    let now = Instant::now();
+    let delivery_expired: Vec<String> = pending
+        .iter()
+        .filter(|(_, entry)| {
+            !entry.queue.is_empty()
+                && entry
+                    .delivery_deadline
+                    .is_some_and(|deadline| now >= deadline)
+        })
+        .map(|(peer_id, _)| peer_id.clone())
+        .collect();
+    for peer_id in delivery_expired {
+        drop_pending_queue(
+            peers,
+            pending.remove(&peer_id),
+            REASON_OUTBOUND_DELIVERY_DEADLINE,
+            timeline,
+        )
+        .await;
+    }
+
     let ready_ids: Vec<String> = {
         let mut ready = Vec::new();
         for (peer_id, entry) in pending.iter() {
             if entry.queue.is_empty() {
                 continue;
             }
+            if flushing_peers.contains(peer_id) {
+                continue;
+            }
             if entry.retry_after.is_some_and(|at| at > Instant::now()) {
                 continue;
             }
-            if peers.is_direct(peer_id).await || peers.is_relay_peer_confirmed(peer_id).await {
+            let generation = peers.current_network_generation().await;
+            if peers.is_direct(peer_id).await
+                || peers
+                    .is_relay_peer_confirmed_for_generation(peer_id, generation)
+                    .await
+            {
                 ready.push(peer_id.clone());
             }
         }
         ready
     };
-    for peer_id in ready_ids {
-        let mut flushed = 0usize;
-        let mut failed = false;
-        // Bound this peer's drain so a large queue + a slow send cannot starve
-        // the OTHER peers in the same worker loop; the remainder waits for the
-        // next maintenance tick (and the notify-driven flush).
-        while !failed && flushed < MAX_FLUSH_PER_PEER_PER_TICK {
-            let Some(front) = pending
-                .get_mut(&peer_id)
-                .and_then(|entry| entry.pop_front())
-            else {
-                break;
-            };
-            match send_encrypted_packet_bounded(
-                &front,
-                peers,
+    // Remove each ready queue before starting its task. Each queue remains
+    // single-owner, preserving FIFO and retry-at-front invariants, while a
+    // stalled relay writer for one peer cannot hold up another peer's ingress.
+    let ready_queues: Vec<(String, PeerPendingQueue)> = ready_ids
+        .into_iter()
+        .filter_map(|peer_id| pending.remove(&peer_id).map(|queue| (peer_id, queue)))
+        .collect();
+    for (peer_id, queue) in ready_queues {
+        flushing_peers.insert(peer_id.clone());
+        let task_transport = transport.clone();
+        let task_peers = peers.clone();
+        let task_udp_transport = udp_transport.clone();
+        let task_relay_transport = relay_transport.clone();
+        let task_timeline = timeline.clone();
+        flush_tasks.spawn(async move {
+            flush_one_peer(
+                peer_id,
+                queue,
+                task_transport,
+                task_peers,
                 prefer_direct,
-                udp_transport,
-                relay_transport,
+                task_udp_transport,
+                task_relay_transport,
+                task_timeline,
             )
             .await
-            {
-                OutboundSendResult::Sent => {
-                    flushed = flushed.saturating_add(1);
+        });
+    }
+}
+
+/// Flush one peer's queue. This is the sole owner of that peer's queue while
+/// it is in flight. A terminal/uncertain handoff stops the batch immediately:
+/// that counter is consumed, and later plaintext packets wait for a transport
+/// replacement instead of repeatedly timing out behind a dead writer.
+#[allow(clippy::too_many_arguments)]
+async fn flush_one_peer(
+    peer_id: String,
+    mut queue: PeerPendingQueue,
+    transport: WireGuardTransport,
+    peers: Arc<PeerManager>,
+    prefer_direct: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    timeline: Arc<ConnectionTimeline>,
+) -> (String, PeerPendingQueue) {
+    let mut flushed = 0usize;
+    while flushed < MAX_FLUSH_PER_PEER_PER_TICK {
+        let Some(front) = queue.pop_front() else {
+            break;
+        };
+
+        let generation = peers.current_network_generation().await;
+        if queue
+            .wait_generation
+            .is_some_and(|queued_generation| queued_generation != generation)
+        {
+            queue.push_front(front);
+            drop_pending_queue(
+                &peers,
+                Some(queue),
+                REASON_OUTBOUND_GENERATION_CHANGED,
+                &timeline,
+            )
+            .await;
+            return (peer_id, PeerPendingQueue::new());
+        }
+
+        let usable = peers.is_direct(&peer_id).await
+            || peers
+                .is_relay_peer_confirmed_for_generation(&peer_id, generation)
+                .await;
+        if !usable {
+            queue.push_front(front);
+            break;
+        }
+
+        let PendingPacket::Plain(packet) = front;
+        match encrypt_then_send(
+            packet,
+            &transport,
+            &peers,
+            prefer_direct,
+            &udp_transport,
+            &relay_transport,
+        )
+        .await
+        {
+            EncryptSendOutcome::Sent => flushed = flushed.saturating_add(1),
+            EncryptSendOutcome::Retryable {
+                packet,
+                reason_code,
+                reason,
+            } => {
+                record_retry_and_repark(
+                    &transport,
+                    &peers,
+                    &peer_id,
+                    &mut queue,
+                    packet,
+                    reason_code,
+                    reason,
+                    &timeline,
+                )
+                .await;
+                break;
+            }
+            EncryptSendOutcome::Terminal {
+                packet,
+                reason_code,
+                reason,
+            } => {
+                record_terminal_drop(
+                    &transport,
+                    &peers,
+                    &peer_id,
+                    packet,
+                    reason_code,
+                    reason,
+                    &timeline,
+                )
+                .await;
+                // Do not push this packet back: its counter may have reached
+                // the transport. The remaining plaintext packets cannot be
+                // sent behind an uncertain handoff without a new, proven
+                // path; account them as the same terminal loss now instead
+                // of leaving a queue that can spin forever while the stale
+                // confirmation remains visible.
+                while let Some(PendingPacket::Plain(remaining)) = queue.pop_front() {
+                    record_terminal_drop(
+                        &transport,
+                        &peers,
+                        &peer_id,
+                        remaining,
+                        reason_code,
+                        "remaining FIFO entries abandoned after uncertain handoff".to_string(),
+                        &timeline,
+                    )
+                    .await;
                 }
-                OutboundSendResult::Retryable(failure) => {
-                    // Re-park at the front; the next maintenance tick retries
-                    // after the pacing delay.  Order preserved.
-                    let entry = pending.get_mut(&peer_id).expect("queue exists");
-                    entry.push_front(front);
-                    entry.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
-                    match failure {
-                        RetryableOutboundFailure::NoSelectedPath {
-                            reason,
-                            reason_code,
-                        } => {
-                            debug!(
-                                "Path for queued peer {} still unavailable: {} ({})",
-                                peer_id, reason, reason_code
-                            );
-                        }
-                        RetryableOutboundFailure::RelaySendFailed { err } => {
-                            debug!(
-                                "Relay send for queued peer {} transiently failed: {err}",
-                                peer_id
-                            );
-                        }
-                    }
-                    failed = true;
-                }
+                break;
             }
         }
-        if flushed > 0 {
-            let entry = pending.get(&peer_id);
-            let remaining = entry.map(|entry| entry.queue.len()).unwrap_or(0);
-            let relay_confirm_seq = peers.relay_confirm_seq_sync(&peer_id);
-            let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
-            timeline.emit(
-                "outbound_first_packet_flushed",
-                None,
-                None,
-                Some(format!(
-                    "peer={peer_id} flushed={flushed} remaining={remaining} relay_confirm_seq={relay_confirm_seq:?} direct_commit_seq={direct_commit_seq:?}"
-                )),
-            );
-            debug!("Flushed {flushed} queued packets for peer {peer_id}");
+    }
+
+    if flushed > 0 {
+        let remaining = queue.queue.len();
+        let relay_confirm_seq = peers.relay_confirm_seq_sync(&peer_id);
+        let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
+        timeline.emit(
+            "outbound_first_packet_flushed",
+            None,
+            None,
+            Some(format!(
+                "peer={peer_id} flushed={flushed} remaining={remaining} relay_confirm_seq={relay_confirm_seq:?} direct_commit_seq={direct_commit_seq:?}"
+            )),
+        );
+        debug!("Flushed {flushed} queued packets for peer {peer_id}");
+    }
+    (peer_id, queue)
+}
+
+/// Merge a completed peer task ahead of packets that arrived while it was
+/// running. The completed queue is always older, so appending the newer queue
+/// preserves strict per-peer FIFO.
+fn merge_completed_flush(
+    pending: &mut HashMap<String, PeerPendingQueue>,
+    peer_id: String,
+    mut completed: PeerPendingQueue,
+) {
+    let Some(mut newer) = pending.remove(&peer_id) else {
+        if !completed.queue.is_empty() {
+            pending.insert(peer_id, completed);
         }
-        if pending
-            .get(&peer_id)
-            .is_some_and(|entry| entry.queue.is_empty())
-        {
-            pending.remove(&peer_id);
-        }
+        return;
+    };
+
+    if completed.queue.is_empty() {
+        pending.insert(peer_id, newer);
+        return;
+    }
+
+    completed.queue.append(&mut newer.queue);
+    completed.bytes = completed.bytes.saturating_add(newer.bytes);
+    if completed.wait_started.is_none() {
+        completed.wait_started = newer.wait_started;
+    }
+    if completed.wait_deadline.is_none() {
+        completed.wait_deadline = newer.wait_deadline;
+    }
+    if completed.wait_generation.is_none() {
+        completed.wait_generation = newer.wait_generation;
+    }
+    if completed.retry_after.is_none() {
+        completed.retry_after = newer.retry_after;
+    }
+    if completed.delivery_deadline.is_none() {
+        completed.delivery_deadline = newer.delivery_deadline;
+    }
+    pending.insert(peer_id, completed);
+}
+
+/// Record a pre-handoff failure and re-park plaintext at the FRONT of the
+/// queue. The old encrypted counter has already been abandoned and is never
+/// retried.
+#[allow(clippy::too_many_arguments)]
+async fn record_retry_and_repark(
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    peer_id: &str,
+    entry: &mut PeerPendingQueue,
+    packet: OutboundPacket,
+    reason_code: &'static str,
+    reason: String,
+    timeline: &ConnectionTimeline,
+) {
+    transport
+        .record_outbound_send_failure(reason_code, 1, packet.packet.len())
+        .await;
+    let generation = entry
+        .wait_generation
+        .unwrap_or_else(|| peers.current_network_generation_sync());
+    record_loss_event(
+        peers,
+        "send_failure",
+        peer_id,
+        generation,
+        reason_code,
+        1,
+        packet.packet.len(),
+        timeline,
+    )
+    .await;
+    debug!(
+        "Outbound packet for queued peer {} will retry from plaintext: {} ({})",
+        peer_id, reason, reason_code
+    );
+    entry.push_front(PendingPacket::Plain(packet));
+    entry.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
+    entry
+        .delivery_deadline
+        .get_or_insert_with(|| Instant::now() + OUTBOUND_DELIVERY_DEADLINE);
+    timeline.emit(
+        "outbound_send_failure",
+        None,
+        Some(reason_code),
+        Some(format!(
+            "peer={peer_id} generation={} detail={reason}",
+            entry.wait_generation.unwrap_or(0)
+        )),
+    );
+}
+
+async fn record_terminal_drop(
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    peer_id: &str,
+    packet: OutboundPacket,
+    reason_code: &'static str,
+    reason: String,
+    timeline: &ConnectionTimeline,
+) {
+    let bytes = packet.packet.len();
+    transport.record_outbound_drop(reason_code, 1, bytes).await;
+    let generation = peers.current_network_generation().await;
+    record_loss_event(
+        peers,
+        "drop",
+        peer_id,
+        generation,
+        reason_code,
+        1,
+        bytes,
+        timeline,
+    )
+    .await;
+    timeline.emit(
+        "outbound_packet_dropped",
+        None,
+        Some(reason_code),
+        Some(format!(
+            "peer={peer_id} generation={generation} dropped=1 bytes={bytes} detail={reason}"
+        )),
+    );
+    warn!(
+        "Terminal outbound drop peer={} reason_code={} bytes={} detail={}",
+        peer_id, reason_code, bytes, reason
+    );
+}
+
+fn relay_send_failure(err: &crate::error::DaemonError) -> SendOutcome {
+    let text = err.to_string();
+    // These typed relay outcomes prove the frame was rejected before the
+    // writer owned it, so plaintext may be re-encrypted. A writer completion
+    // loss or an interrupted write is deliberately not in this set.
+    if text.contains("reason_code=relay_command_queue_full")
+        || text.contains("reason_code=relay_writer_stopped_before_accept")
+    {
+        SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded { err: text })
+    } else {
+        SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+            reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+            err: text,
+        })
     }
 }
 
 /// Periodic maintenance: expire startup deadlines, cancel waits on peer
 /// offline / generation change, and flush what became usable.
+#[allow(clippy::too_many_arguments)]
 async fn maintenance(
-    peers: &PeerManager,
+    transport: &WireGuardTransport,
+    peers: &Arc<PeerManager>,
     pending: &mut HashMap<String, PeerPendingQueue>,
     prefer_direct: bool,
-    udp_transport: &RwLock<Option<UdpTransport>>,
-    relay_transport: &RwLock<Option<RelayTransport>>,
-    timeline: &ConnectionTimeline,
+    udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+    timeline: &Arc<ConnectionTimeline>,
+    flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
+    flushing_peers: &mut HashSet<String>,
 ) {
     let now = Instant::now();
     let generation = peers.current_network_generation().await;
@@ -494,8 +1102,10 @@ async fn maintenance(
             if !entry.wait_deadline.is_some_and(|deadline| now >= deadline) {
                 continue;
             }
-            let usable =
-                peers.is_relay_peer_confirmed(peer_id).await || peers.is_direct(peer_id).await;
+            let usable = peers
+                .is_relay_peer_confirmed_for_generation(peer_id, generation)
+                .await
+                || peers.is_direct(peer_id).await;
             if !usable {
                 expired.push(peer_id.clone());
             }
@@ -549,13 +1159,16 @@ async fn maintenance(
     }
 
     // 3. Flush what became usable (paced by each peer's retry_after).
-    flush_ready_peers(
+    start_ready_peer_flushes(
+        transport,
         peers,
         pending,
         prefer_direct,
         udp_transport,
         relay_transport,
         timeline,
+        flush_tasks,
+        flushing_peers,
     )
     .await;
 }
@@ -576,14 +1189,15 @@ async fn drop_pending_queue(
     let peer_id = queue
         .queue
         .front()
-        .map(|packet| packet.peer_id.clone())
+        .map(|packet| packet.peer_id().to_string())
         .unwrap_or_default();
+    let generation = queue.wait_generation.unwrap_or(0);
     timeline.emit(
         "relay_unavailable_or_first_packet_expired",
         None,
         Some(reason_code),
         Some(format!(
-            "peer={peer_id} dropped={dropped} bytes={} waited_ms={}",
+            "peer={peer_id} generation={generation} dropped={dropped} bytes={} waited_ms={}",
             queue.bytes,
             queue
                 .wait_started
@@ -594,30 +1208,97 @@ async fn drop_pending_queue(
     peers
         .record_outbound_drop(reason_code, dropped, queue.bytes)
         .await;
+    record_loss_event(
+        peers,
+        "drop",
+        &peer_id,
+        generation,
+        reason_code,
+        dropped,
+        queue.bytes,
+        timeline,
+    )
+    .await;
     debug!(
         "Dropped {dropped} queued packets for peer {peer_id}: {reason_code} (bytes={})",
         queue.bytes
     );
 }
 
-/// Send one packet with a hard time bound so a stalled relay cannot block the
-/// shared outbound worker.
+async fn drop_all_pending_queues(
+    peers: &PeerManager,
+    pending: &mut HashMap<String, PeerPendingQueue>,
+    reason_code: &'static str,
+    timeline: &ConnectionTimeline,
+) {
+    let peer_ids: Vec<String> = pending.keys().cloned().collect();
+    for peer_id in peer_ids {
+        drop_pending_queue(peers, pending.remove(&peer_id), reason_code, timeline).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_loss_event(
+    peers: &PeerManager,
+    kind: &str,
+    peer_id: &str,
+    generation: u64,
+    reason_code: &str,
+    packets: usize,
+    bytes: usize,
+    timeline: &ConnectionTimeline,
+) {
+    peers
+        .record_outbound_loss_event(crate::peer::OutboundLossEvent {
+            kind: kind.to_string(),
+            peer_id: peer_id.to_string(),
+            generation,
+            reason_code: reason_code.to_string(),
+            packets: packets as u64,
+            bytes: bytes as u64,
+            correlation_id: timeline.correlation_id().to_string(),
+            at_ms: timeline.uptime_ms(),
+        })
+        .await;
+}
+
+/// Send one encrypted packet with a hard time bound so a stalled relay cannot
+/// block the shared outbound worker. The caller owns the per-peer emit guard
+/// and releases it immediately after this classification returns.
 async fn send_encrypted_packet_bounded(
     packet: &EncryptedPeerPacket,
     peers: &PeerManager,
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
     relay_transport: &RwLock<Option<RelayTransport>>,
-) -> OutboundSendResult {
-    timeout(
+) -> SendOutcome {
+    // Capture the exact shared connection before entering the bounded send.
+    // If the supervisor replaces it while this send is stalled, abort only
+    // the old writer; never tear down the replacement transport.
+    let relay_at_start = relay_transport.read().await.clone();
+    match timeout(
         OUTBOUND_SEND_TIMEOUT,
         send_encrypted_packet_once(packet, peers, prefer_direct, udp_transport, relay_transport),
     )
     .await
-    .unwrap_or_else(|_| {
-        OutboundSendResult::Retryable(RetryableOutboundFailure::RelaySendFailed {
-            err: "outbound send timed out".to_string(),
-        })
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            if let Some(relay) = relay_at_start {
+                relay.abort_writer();
+            }
+            outbound_send_timeout_failure()
+        }
+    }
+}
+
+fn outbound_send_timeout_failure() -> SendOutcome {
+    // A timeout does not tell us whether the relay accepted the ciphertext.
+    // The caller therefore terminally consumes this counter and records the
+    // original plaintext as a loss; it must never re-encrypt/retry this packet.
+    SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+        reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+        err: "outbound send timed out".to_string(),
     })
 }
 
@@ -627,7 +1308,7 @@ async fn send_encrypted_packet_once(
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
     relay_transport: &RwLock<Option<RelayTransport>>,
-) -> OutboundSendResult {
+) -> SendOutcome {
     let relay = relay_transport.read().await.clone();
     let relay_available = relay.is_some();
     let udp = udp_transport.read().await.clone();
@@ -646,31 +1327,27 @@ async fn send_encrypted_packet_once(
             send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await;
 
         if sent_direct && !selection.relay_hedged {
-            return OutboundSendResult::Sent;
+            return SendOutcome::Sent;
         }
 
         if let Some(relay) = relay {
             return match relay.send_packet(packet).await {
-                Ok(_) => OutboundSendResult::Sent,
+                Ok(_) => SendOutcome::Sent,
                 Err(err) if sent_direct => {
                     debug!(
                         "Relay hedge send failed for peer {} after confirmed direct send: {err}",
                         packet.peer_id
                     );
-                    OutboundSendResult::Sent
+                    SendOutcome::Sent
                 }
-                Err(err) => {
-                    OutboundSendResult::Retryable(RetryableOutboundFailure::RelaySendFailed {
-                        err: err.to_string(),
-                    })
-                }
+                Err(err) => relay_send_failure(&err),
             };
         }
 
         return if sent_direct {
-            OutboundSendResult::Sent
+            SendOutcome::Sent
         } else {
-            OutboundSendResult::Retryable(RetryableOutboundFailure::NoSelectedPath {
+            SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
                 reason: selection.reason,
                 reason_code: selection.reason_code,
             })
@@ -685,23 +1362,54 @@ async fn send_encrypted_packet_once(
             Ok(_) => {
                 let _ = send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint)
                     .await;
-                OutboundSendResult::Sent
+                SendOutcome::Sent
             }
             Err(err) => {
-                let _ = send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint)
-                    .await;
-                OutboundSendResult::Retryable(RetryableOutboundFailure::RelaySendFailed {
-                    err: err.to_string(),
-                })
+                // A confirmed direct send is sufficient evidence that this
+                // packet was delivered even if the optional relay hedge
+                // failed. An unconfirmed direct send may still rescue a
+                // relay failure; only retry/drop when both paths fail.
+                // This is the ONLY Direct handoff in the relay-failure path.
+                // Never call send_direct_if_selected twice for one ciphertext:
+                // UDP send completion is an uncertain handoff, and a second
+                // copy with the same WireGuard counter would be a deliberate
+                // replay at the receiver.
+                let direct_handed =
+                    send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint)
+                        .await;
+                if direct_handed {
+                    // This is only a UDP handoff while Direct is still a
+                    // trial. It is not end-to-end evidence, so the packet's
+                    // counter is consumed and the payload is terminally
+                    // accounted for rather than re-encrypted and duplicated.
+                    direct_delivery_uncertain()
+                } else {
+                    relay_send_failure(&err)
+                }
             }
         }
     } else {
-        let _ = send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await;
-        OutboundSendResult::Retryable(RetryableOutboundFailure::NoSelectedPath {
-            reason: selection.reason,
-            reason_code: selection.reason_code,
-        })
+        let direct_handed =
+            send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await;
+        if direct_handed {
+            // UDP send_to completed, but the Direct path is unconfirmed. The
+            // receiver may have accepted this counter, therefore retrying the
+            // plaintext with a fresh counter would create a duplicate.
+            direct_delivery_uncertain()
+        } else {
+            SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+                reason: selection.reason,
+                reason_code: selection.reason_code,
+            })
+        }
     }
+}
+
+fn direct_delivery_uncertain() -> SendOutcome {
+    SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+        reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
+        err: "Direct UDP handoff completed before end-to-end confirmation".to_string(),
+    })
 }
 
 async fn select_outbound_path(
@@ -737,39 +1445,35 @@ async fn send_direct_if_selected(
     selection: &PathSelection,
     udp_local_endpoint: Option<SocketAddr>,
 ) -> bool {
-    if selection.path != Some(NetworkPath::Direct) {
+    // A candidate probe or nomination is not an encrypted data-plane proof.
+    // Business packets must never use a Direct trial: sending the same
+    // ciphertext as a relay hedge can create duplicate/reordered delivery,
+    // while sending it only over UDP makes the WireGuard counter's delivery
+    // status unknowable.  The direct-validation worker owns trial probes;
+    // this function accepts only the committed Direct state.
+    if selection.path != Some(NetworkPath::Direct) || !selection.direct_confirmed {
         return false;
     }
 
     match (udp, selection.direct_endpoint) {
-        (Some(udp), Some(endpoint)) => {
-            if !selection.direct_confirmed && selection.reason_code == REASON_PATH_DIRECT_TRIAL {
-                if let Err(err) = udp.send_nomination_probe(&packet.peer_id, endpoint).await {
-                    debug!(
-                        "Failed to send nominated UDP connectivity check for peer {} at {}: {err}",
-                        packet.peer_id, endpoint
-                    );
-                }
+        (Some(udp), Some(endpoint)) => match udp.send_packet_to(packet, endpoint).await {
+            Ok(_) => true,
+            Err(err) => {
+                warn!(
+                    "Direct UDP send failed for peer {}; trying relay fallback: {err}",
+                    packet.peer_id
+                );
+                peers
+                    .record_direct_failure_with_code_and_local_endpoint(
+                        &packet.peer_id,
+                        REASON_DIRECT_SEND_FAILED,
+                        err.to_string(),
+                        udp_local_endpoint,
+                    )
+                    .await;
+                false
             }
-            match udp.send_packet_to(packet, endpoint).await {
-                Ok(_) => true,
-                Err(err) => {
-                    warn!(
-                        "Direct UDP send failed for peer {}; trying relay fallback: {err}",
-                        packet.peer_id
-                    );
-                    peers
-                        .record_direct_failure_with_code_and_local_endpoint(
-                            &packet.peer_id,
-                            REASON_DIRECT_SEND_FAILED,
-                            err.to_string(),
-                            udp_local_endpoint,
-                        )
-                        .await;
-                    false
-                }
-            }
-        }
+        },
         (None, _) => {
             peers
                 .record_direct_failure_with_code_and_local_endpoint(
@@ -792,5 +1496,93 @@ async fn send_direct_if_selected(
                 .await;
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_queue_full_and_writer_closed_are_safe_plaintext_retries() {
+        for message in [
+            "reason_code=relay_command_queue_full",
+            "reason_code=relay_writer_stopped_before_accept",
+        ] {
+            let outcome = relay_send_failure(&crate::error::DaemonError::Relay(message.into()));
+            assert!(matches!(
+                outcome,
+                SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_relay_failure_is_terminal_delivery_uncertain() {
+        let outcome = relay_send_failure(&crate::error::DaemonError::Relay(
+            "relay protocol rejected frame after write".into(),
+        ));
+        assert!(matches!(
+            outcome,
+            SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+                reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn send_timeout_is_terminal_delivery_uncertain() {
+        assert!(matches!(
+            outbound_send_timeout_failure(),
+            SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+                reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_direct_handoff_is_terminal_not_a_plaintext_retry() {
+        assert!(matches!(
+            direct_delivery_uncertain(),
+            SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+                reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn completed_peer_flush_stays_ahead_of_live_fifo_arrivals() {
+        fn packet(sequence: u8) -> OutboundPacket {
+            OutboundPacket {
+                peer_id: "peer-a".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: vec![sequence],
+            }
+        }
+
+        let mut completed = PeerPendingQueue::new();
+        completed.enqueue(PendingPacket::Plain(packet(0)));
+        completed.enqueue(PendingPacket::Plain(packet(1)));
+
+        let mut pending = HashMap::new();
+        let mut live = PeerPendingQueue::new();
+        live.enqueue(PendingPacket::Plain(packet(2)));
+        live.enqueue(PendingPacket::Plain(packet(3)));
+        pending.insert("peer-a".to_string(), live);
+
+        merge_completed_flush(&mut pending, "peer-a".to_string(), completed);
+
+        let merged = pending.remove("peer-a").expect("merged queue");
+        let sequences: Vec<u8> = merged
+            .queue
+            .into_iter()
+            .map(|entry| match entry {
+                PendingPacket::Plain(packet) => packet.packet[0],
+            })
+            .collect();
+        assert_eq!(sequences, vec![0, 1, 2, 3]);
     }
 }

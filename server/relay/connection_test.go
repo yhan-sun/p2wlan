@@ -9,6 +9,38 @@ import (
 	"time"
 )
 
+type shortWriter struct {
+	max int
+	buf []byte
+}
+
+func (w *shortWriter) Write(data []byte) (int, error) {
+	n := w.max
+	if n > len(data) {
+		n = len(data)
+	}
+	w.buf = append(w.buf, data[:n]...)
+	return n, nil
+}
+
+func TestWriteFullHandlesShortWrites(t *testing.T) {
+	w := &shortWriter{max: 3}
+	want := []byte("complete relay frame")
+	if err := writeFull(w, want); err != nil {
+		t.Fatalf("writeFull: %v", err)
+	}
+	if string(w.buf) != string(want) {
+		t.Fatalf("writeFull wrote %q, want %q", w.buf, want)
+	}
+}
+
+func TestWriteFullRejectsZeroProgress(t *testing.T) {
+	w := &shortWriter{max: 0}
+	if err := writeFull(w, []byte("frame")); err != io.ErrShortWrite {
+		t.Fatalf("writeFull error = %v, want io.ErrShortWrite", err)
+	}
+}
+
 func TestSendQueueFullBackpressure(t *testing.T) {
 	config := testConfig()
 	config.SendQueueCapacity = 1

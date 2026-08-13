@@ -21,9 +21,9 @@ async fn write_response(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cors_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream
-        .write_all(response.as_bytes())
+    timeout(Duration::from_secs(5), stream.write_all(response.as_bytes()))
         .await
+        .map_err(|_| DaemonError::Network("diagnostics write timed out".to_string()))?
         .map_err(|e| DaemonError::Network(format!("diagnostics write failed: {e}")))?;
     Ok(())
 }

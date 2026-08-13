@@ -332,7 +332,7 @@ async fn test_peer_manager_path_health_drives_data_path() {
             .await
     );
     assert!(
-        manager
+        !manager
             .should_use_direct_for_data("peer1", true, false)
             .await
     );
@@ -381,15 +381,13 @@ async fn test_peer_manager_path_health_drives_data_path() {
         )
         .await;
     let trial = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(trial.path, Some(NetworkPath::Direct));
-    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_TRIAL);
-    assert!(trial.relay_hedged);
+    assert_eq!(trial.path, Some(NetworkPath::Relay));
+    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
+    assert!(!trial.relay_hedged);
     assert!(!trial.direct_confirmed);
-    assert!(
-        manager
-            .should_use_direct_for_data("peer1", true, true)
-            .await
-    );
+    assert!(!manager
+        .should_use_direct_for_data("peer1", true, true)
+        .await);
 
     manager.record_direct_success("peer1", Some(endpoint)).await;
     let conn = manager.get_connection("peer1").await.unwrap();

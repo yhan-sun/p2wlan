@@ -356,6 +356,13 @@ class AppStrings {
     };
   }
 
+  /// Label for the "探测中" state: a candidate probe succeeded (RTT shown)
+  /// but the DATA path is NOT verified — never displayed as a connection.
+  String probingWithProbeRtt(int? probeRttMs) {
+    if (probeRttMs == null) return probing;
+    return isZh ? '探测中 · 候选 RTT ${probeRttMs}ms（未直连）' : 'probing · candidate RTT ${probeRttMs}ms (no direct)';
+  }
+
   String routeLabel(String path, bool isRelay) {
     if (path == 'direct') return direct;
     if (path == 'relay' || isRelay) return relay;

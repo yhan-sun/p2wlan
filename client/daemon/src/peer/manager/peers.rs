@@ -70,6 +70,55 @@ fn push_probe_binding_compatibility_keys(
 }
 
 impl PeerManager {
+    /// Reset a same-node peer only when its encoded candidate generation proves
+    /// that the remote daemon incarnation changed. This keeps normal endpoint
+    /// refreshes on the existing path while making an Air restart fail closed
+    /// against old WireGuard state and acknowledgements.
+    pub(crate) async fn reset_peer_session_if_remote_incarnation_changed(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+        reason: &str,
+    ) -> bool {
+        let Some(new_incarnation) =
+            crate::control::candidate_generation_incarnation(candidate_generation)
+        else {
+            return false;
+        };
+        let (had_relay_confirmation, should_reset) = {
+            let mut connections = self.connections.write().await;
+            let Some(conn) = connections.get_mut(node_id) else {
+                return false;
+            };
+            let Some(old_incarnation) =
+                crate::control::candidate_generation_incarnation(conn.last_candidate_generation)
+            else {
+                return false;
+            };
+            if old_incarnation == new_incarnation {
+                return false;
+            }
+            let had_relay_confirmation = conn.relay_confirmed_at.is_some();
+            conn.reset_for_peer_session();
+            if had_relay_confirmation {
+                conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+            }
+            (had_relay_confirmation, true)
+        };
+        if had_relay_confirmation {
+            self.bump_relay_confirm_seq(node_id);
+        }
+        self.emit_timeline(
+            "peer_restart_detected",
+            None,
+            Some(reason),
+            Some(format!(
+                "peer={node_id} reason={reason} remote_incarnation_changed"
+            )),
+        );
+        should_reset
+    }
+
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
         let generation = self.current_network_generation().await;
@@ -81,6 +130,7 @@ impl PeerManager {
         let mut unquarantine_after_lock: Option<&'static str> = None;
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
+        let mut reset_remote_fresh_after_lock: Option<&'static str> = None;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -140,15 +190,14 @@ impl PeerManager {
             changed
         };
         if identity_changed {
-            self.reset_remote_fresh_generation(
-                &info.node_id,
-                if public_key_changed {
-                    "public_key_changed"
-                } else {
-                    "identity_key_changed_on_rejoin"
-                },
-            )
-            .await;
+            // Fresh-generation cleanup takes its own mutexes and emits a
+            // diagnostic event. Defer it until the peer/ip write guards are
+            // released so a slow cleanup can never stop control-event intake.
+            reset_remote_fresh_after_lock = Some(if public_key_changed {
+                "public_key_changed"
+            } else {
+                "identity_key_changed_on_rejoin"
+            });
         }
         conn.nat_type = info.nat_type.clone();
         // An explicit offline transition revokes RelayPeerConfirmed: the peer
@@ -237,6 +286,9 @@ impl PeerManager {
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
         drop(conns);
         drop(ip_map);
+        if let Some(reason) = reset_remote_fresh_after_lock {
+            self.reset_remote_fresh_generation(&info.node_id, reason).await;
+        }
         if revoke_relay_after_lock {
             self.revoke_relay_peer_confirmation(&info.node_id).await;
         }
@@ -265,12 +317,14 @@ impl PeerManager {
     /// supersedes the old one anyway.  Only a public-key / identity change
     /// resets the fresh space.
     pub async fn remove_peer(&self, node_id: &str) {
-        let mut conns = self.connections.write().await;
-        if let Some(conn) = conns.remove(node_id) {
+        let removed_virtual_ip = {
+            let mut conns = self.connections.write().await;
+            conns.remove(node_id).map(|conn| conn.virtual_ip)
+        };
+        if let Some(virtual_ip) = removed_virtual_ip {
             let mut ip_map = self.ip_to_node.write().await;
-            ip_map.remove(&conn.virtual_ip);
+            ip_map.remove(&virtual_ip);
         }
-        drop(conns);
         self.cancel_relay_backoff_heartbeat(node_id);
         self.clear_relay_not_found_grace(node_id).await;
         // A PeerLeft is authoritative evidence that the peer's incarnation is
@@ -703,11 +757,18 @@ impl PeerManager {
         true
     }
 
-    /// Atomically bridge a Probe-v2 adoption check with its matching
-    /// WireGuard responder confirmation. The peer binding write lock remains
-    /// held across `confirm_transport`, so peer removal, identity rotation,
-    /// and competing handshake commits cannot clear the Probe transaction
-    /// after WireGuard has already been promoted.
+    /// Bridge a Probe-v2 adoption check with its matching WireGuard responder
+    /// confirmation without holding the process-wide connection lock across
+    /// an await.
+    ///
+    /// The UDP caller serializes this operation with the peer's adoption
+    /// lifecycle lock.  The connection map is still re-checked after the
+    /// transport await, so a peer removal, identity rotation, generation
+    /// advance, or competing handshake commit cannot publish a stale Probe
+    /// binding.  Keeping the map lock out of `confirm_transport` is important:
+    /// WireGuard/session confirmation can wait on a slow transport, and a
+    /// process-wide write lock there would block unrelated peer joins,
+    /// control-signal consumption, and diagnostics snapshots.
     pub(crate) async fn confirm_probe_and_transport_transaction<F, Fut>(
         &self,
         node_id: &str,
@@ -718,28 +779,50 @@ impl PeerManager {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
+        let expected = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            prune_probe_session_bindings(conn, Instant::now());
+            let should_promote = conn
+                .pending_probe_bindings
+                .get(token)
+                .is_some_and(|pending| pending.promote_on_match);
+            let already_active = conn.probe_binding_token.as_deref() == Some(token);
+            if !should_promote && !already_active {
+                return false;
+            }
+            (should_promote, already_active)
+        };
+
+        if !confirm_transport().await {
+            return false;
+        }
+
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
-        let should_promote = conn
-            .pending_probe_bindings
-            .get(token)
-            .is_some_and(|pending| pending.promote_on_match);
-        let already_active = conn.probe_binding_token.as_deref() == Some(token);
-        if !should_promote && !already_active {
+        prune_probe_session_bindings(conn, Instant::now());
+
+        // A transport confirmation may complete after the peer was removed or
+        // its binding was replaced.  In that case the transport result is
+        // terminal for this transaction; never install the old counter/key
+        // into the new connection generation.
+        if conn.probe_binding_token.as_deref() == Some(token) {
+            return true;
+        }
+        if !expected.0 || expected.1 {
             return false;
         }
-        if !confirm_transport().await {
+        let Some(pending) = conn.pending_probe_bindings.remove(token) else {
+            return false;
+        };
+        if !pending.promote_on_match {
             return false;
         }
-        if should_promote {
-            let pending = conn
-                .pending_probe_bindings
-                .remove(token)
-                .expect("promotable Probe binding checked above");
-            install_active_probe_binding(conn, pending.binding, true);
-        }
+        install_active_probe_binding(conn, pending.binding, true);
         true
     }
 

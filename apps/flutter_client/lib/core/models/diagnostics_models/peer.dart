@@ -22,6 +22,8 @@ class PeerSnapshot {
     required this.direct,
     required this.relay,
     required this.currentPathSelection,
+    required this.relayConfirmedEndpoint,
+    required this.relayConfirmedGeneration,
   });
 
   final String nodeId;
@@ -44,6 +46,14 @@ class PeerSnapshot {
   final PathHealthSnapshot direct;
   final PathHealthSnapshot relay;
   final PathSelectionSnapshot? currentPathSelection;
+
+  /// Relay endpoint whose ingress carried the confirming forced-relay probe
+  /// ACK (daemon `relay_confirmed_endpoint`).  Present ONLY after a matching
+  /// encrypted relay probe ACK — never from a TCP/TLS connect, a queued
+  /// registration, or a candidate RTT.
+  final String? relayConfirmedEndpoint;
+  /// Network generation of the relay probe ACK confirmation.
+  final int? relayConfirmedGeneration;
 
   factory PeerSnapshot.fromJson(JsonMap json) {
     final selectionJson = _mapOrNull(json['current_path_selection']);
@@ -70,6 +80,8 @@ class PeerSnapshot {
       currentPathSelection: selectionJson == null
           ? null
           : PathSelectionSnapshot.fromJson(selectionJson),
+      relayConfirmedEndpoint: _nullableString(json['relay_confirmed_endpoint']),
+      relayConfirmedGeneration: _intOrNull(json['relay_confirmed_generation']),
     );
   }
 
@@ -110,14 +122,37 @@ class PeerSnapshot {
   }
 
   int? get latencyMs {
+    // A latency is only meaningful for a VERIFIED usable path.  A candidate
+    // probe's RTT (e.g. the 8ms UDP punch) proves nothing about the data
+    // path: it must never be displayed or counted as the connection latency.
     if (!online) return null;
-    if (path == 'direct') return direct.displayLatencyMs;
-    if (path == 'relay') return relay.displayLatencyMs;
-    if (path == 'direct_trial') {
+    if (path == 'direct') return isDirectVerified ? direct.displayLatencyMs : null;
+    if (path == 'relay') return isRelayVerified ? relay.displayLatencyMs : null;
+    return null;
+  }
+
+  /// Candidate-probe RTT (UDP punch / STUN-style measurement).  This is NOT a
+  /// connection latency: the peer's data path is not verified until
+  /// [path] is `direct` or `relay`.  Used ONLY for the "探测中" label.
+  int? get probeLatencyMs {
+    if (!online) return null;
+    if (path == 'direct_trial' || path == 'probing') {
       return direct.displayLatencyMs ?? relay.displayLatencyMs;
     }
-    return direct.displayLatencyMs ?? relay.displayLatencyMs;
+    return null;
   }
+
+  /// Whether the relay path to this peer is VERIFIED by a matching encrypted
+  /// relay probe ACK (`relay_confirmed_endpoint` — daemon authority).  A
+  /// transport connect, a queued registration, or a candidate RTT never sets
+  /// this.
+  bool get isRelayVerified =>
+      path == 'relay' && relayConfirmedEndpoint != null && relayConfirmedEndpoint!.isNotEmpty;
+
+  /// Whether the direct path to this peer is VERIFIED by a matching encrypted
+  /// direct validation exchange (daemon `active_path == direct` requires the
+  /// validation ACK).  Candidate probing never sets this.
+  bool get isDirectVerified => path == 'direct' && state == 'direct';
 
   DateTime? get lastSeenAt {
     if (lastSeen <= 0) return null;

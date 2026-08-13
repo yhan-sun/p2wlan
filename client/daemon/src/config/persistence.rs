@@ -106,10 +106,12 @@ impl Config {
                 socket_pool_enabled: false,
                 socket_pool_size: default_socket_pool_size(),
                 fresh_mapping_punch_enabled: true,
+                predicted_candidates_enabled: true,
                 fresh_mapping_harness_loopback: false,
                 gather_host_candidates: true,
                 validate_overlay: false,
                 overlay_any_path: false,
+                overlay_burst: 0,
             },
             control: ControlConfig {
                 server_url: control_url.to_string(),

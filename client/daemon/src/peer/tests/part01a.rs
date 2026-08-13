@@ -292,6 +292,9 @@ async fn diagnostics_classifies_public_udp_direct_selected_pair() {
         )
         .await;
     manager
+        .record_direct_nomination_check_with_local_endpoint("peer1", remote, Some(local))
+        .await;
+    manager
         .record_direct_success_with_local_endpoint("peer1", Some(remote), Some(local))
         .await;
 
@@ -425,7 +428,7 @@ async fn diagnostics_keeps_probe_success_as_probing_until_direct_confirmed() {
 }
 
 #[tokio::test]
-async fn probe_ack_is_not_nominated_until_selector_trials_direct() {
+async fn probe_ack_does_not_nominate_or_select_business_direct() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "8.8.8.8:12293".parse().unwrap();
     let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
@@ -454,8 +457,8 @@ async fn probe_ack_is_not_nominated_until_selector_trials_direct() {
     assert!(!before_pair.selected);
 
     let selection = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_TRIAL);
+    assert_eq!(selection.path, Some(NetworkPath::Relay));
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
     assert!(!selection.direct_confirmed);
 
     let conn = manager.get_connection("peer1").await.unwrap();
@@ -465,8 +468,8 @@ async fn probe_ack_is_not_nominated_until_selector_trials_direct() {
         .find(|pair| pair.remote_endpoint == remote)
         .unwrap();
     assert_eq!(pair.state, CandidatePairState::Succeeded);
-    assert!(pair.nominated);
-    assert!(pair.nominated_at.is_some());
+    assert!(!pair.nominated);
+    assert!(pair.nominated_at.is_none());
     assert!(pair.selected_at.is_none());
 }
 
@@ -494,8 +497,8 @@ async fn stale_nominated_trial_expires_and_falls_back_to_relay() {
         .await;
 
     let trial = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(trial.path, Some(NetworkPath::Direct));
-    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_TRIAL);
+    assert_eq!(trial.path, Some(NetworkPath::Relay));
+    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
     assert!(!trial.direct_confirmed);
 
     {
@@ -506,6 +509,7 @@ async fn stale_nominated_trial_expires_and_falls_back_to_relay() {
             .iter_mut()
             .find(|pair| pair.remote_endpoint == remote)
             .unwrap();
+        pair.nominated = true;
         pair.nominated_at = Some(Instant::now() - DIRECT_TRIAL_WINDOW - Duration::from_secs(1));
     }
 

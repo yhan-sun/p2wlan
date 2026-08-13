@@ -131,6 +131,14 @@ impl PeerManager {
         // generation is deliberately untouched.
         self.recovery_epoch_end(peer_id, "stale_peer_quarantined").await;
         self.clear_fresh_mapping(peer_id, "stale_peer_quarantined").await;
+        // Drop the forced-relay expectation together with the quarantined
+        // recovery state.  This makes quarantine a terminal boundary for the
+        // old relay registration: a late ACK has no token to consume, and a
+        // future incarnation must register a fresh expectation.
+        self.relay_probe_expectations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id);
         if let Some(hook) = self
             .punch_cancel_hook
             .lock()
@@ -232,7 +240,13 @@ impl PeerManager {
     }
 
     /// Whether the peer is currently quarantined (async).
-    #[cfg(test)]
+    ///
+    /// This is a production dataplane predicate, not just a test helper:
+    /// relay probe/validation scheduling and ACK admission must use the same
+    /// authoritative quarantine state as the recovery scheduler.  In
+    /// particular, a peer that has been isolated after a sustained relay 404
+    /// must not keep receiving probe attempts or be re-confirmed by a late
+    /// ACK from the old registration.
     pub(crate) async fn peer_quarantined(&self, peer_id: &str) -> bool {
         let now = Instant::now();
         self.quarantined_peers

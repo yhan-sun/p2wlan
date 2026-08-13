@@ -43,6 +43,7 @@ rand_core = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
+sha2 = "0.10"
 hex = "0.4"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 subtle = "2"

@@ -89,6 +89,23 @@ pub(super) async fn poll_peers(
         seen.len()
     );
 
+    // The control plane also returns historical/offline device rows.  A
+    // cold-start roster can therefore contain dozens of records before the
+    // one live peer that can carry the first business packet.  Control-event
+    // handling performs bounded per-peer work, so preserve the dataplane
+    // invariant that a live peer is admitted before an offline historical
+    // record.  Within the same liveness class, prefer the most recently seen
+    // device and use node_id only as a deterministic tie-breaker.
+    let prioritize_live = |left: &PeerInfo, right: &PeerInfo| {
+        right
+            .online
+            .cmp(&left.online)
+            .then_with(|| right.last_seen.cmp(&left.last_seen))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    };
+    joined.sort_by(prioritize_live);
+    updated.sort_by(prioritize_live);
+
     for peer in joined {
         let _ = event_tx.send(ControlEvent::PeerJoined(peer));
     }

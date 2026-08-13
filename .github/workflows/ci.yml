@@ -37,6 +37,30 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-gnu
           cargo check --target x86_64-unknown-linux-gnu
+      - name: Build Identity Gate
+        # The built daemon must report the exact commit CI checked out, and
+        # --version must carry that commit too.  A drift here means /status.version
+        # could no longer prove which build is running.
+        run: |
+          cargo build -p p2wlan-daemon
+          HEAD_SHA="$(git rev-parse HEAD)"
+          IDENTITY_JSON="$(target/debug/p2wlan-daemon --build-info)"
+          IDENTITY_SHA="$(printf '%s' "$IDENTITY_JSON" | sed -n 's/.*"git_commit": "\([^"]*\)".*/\1/p' | head -1)"
+          if [[ "$IDENTITY_SHA" != "$HEAD_SHA" ]]; then
+            echo "build identity mismatch: daemon=$IDENTITY_SHA checkout=$HEAD_SHA" >&2
+            exit 1
+          fi
+          target/debug/p2wlan-daemon --version | grep -q "$HEAD_SHA" || {
+            echo "--version must embed the git commit" >&2
+            exit 1
+          }
+          BIN_SHA="$(shasum -a 256 target/debug/p2wlan-daemon | awk '{print $1}')"
+          REPORTED_SHA="$(printf '%s' "$IDENTITY_JSON" | sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' | head -1)"
+          if [[ "$BIN_SHA" != "$REPORTED_SHA" ]]; then
+            echo "binary_sha256 mismatch: reported=$REPORTED_SHA actual=$BIN_SHA" >&2
+            exit 1
+          fi
+          echo "build identity gate PASS (commit=$HEAD_SHA sha=$BIN_SHA)"
 
   rust-windows:
     name: Rust Check (Windows)

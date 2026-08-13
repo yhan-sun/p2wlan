@@ -150,6 +150,14 @@ class StrictDirectParserTest(unittest.TestCase):
         self.assertIn('wait "$air_pid"', source)
         self.assertIn('ControlMaster=auto', source)
 
+    def test_availability_does_not_disable_background_direct_upgrade(self):
+        source = HARNESS_PATH.read_text(encoding="utf-8")
+        availability_block = source.split('if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then', 1)[1]
+        availability_block = availability_block.split("fi\nfor round in", 1)[0]
+        self.assertIn('PATH_POLICY_FLAG=""', availability_block)
+        self.assertNotIn('PATH_POLICY_FLAG="--prefer-relay"', availability_block)
+        self.assertIn('`--prefer-relay` is a different, explicit', availability_block)
+
     def test_cli_false_parser_returns_nonzero(self):
         fixture = status(events=[])
         with tempfile.TemporaryDirectory() as directory:

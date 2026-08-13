@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn remote_use_candidate_check_allows_hedged_trial_without_selecting_direct() {
+async fn remote_use_candidate_check_stays_background_until_encrypted_confirmation() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "8.8.8.8:12293".parse().unwrap();
     let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
@@ -23,10 +23,10 @@ async fn remote_use_candidate_check_allows_hedged_trial_without_selecting_direct
     );
 
     let trial = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(trial.path, Some(NetworkPath::Direct));
-    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_TRIAL);
+    assert_eq!(trial.path, Some(NetworkPath::Relay));
+    assert_eq!(trial.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
     assert!(!trial.direct_confirmed);
-    assert!(trial.relay_hedged);
+    assert!(!trial.relay_hedged);
 
     let diagnostics = manager.diagnostics().await;
     let pair = diagnostics[0]

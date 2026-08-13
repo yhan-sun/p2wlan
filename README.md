@@ -212,6 +212,11 @@ P2WLAN 的 NAT 穿透不是“只做 STUN”。当前守护进程会收集 host 
 
 P2WLAN 的控制面和中继都可以部署在自己的公网 Linux 服务器上。个人测试或小规模自用场景，一台小型服务器通常就足够。
 
+可审计的 staging 配置模板、Mini/Air 拓扑、TLS/防火墙要求和只读预检见
+[Mini/Air staging 验收说明](docs/staging-mini-air.md)。真实 staging/production 的
+catalog 必须使用 `tls://host:port`；旧的 `RELAY_SERVERS`/明文 relay 仅保留给本地
+兼容测试，不能作为真实发布拓扑。
+
 ```bash
 cd server
 mkdir -p data
@@ -222,27 +227,33 @@ go build -o p2wlan-relay ./relay
 控制面示例：
 
 ```bash
-JWT_SECRET="replace-with-a-long-random-secret" \
-DB_PATH="./data/p2wlan.db" \
-PORT=18080 \
-RELAY_SERVERS="default@relay.example.com:18081" \
-RELAY_REVOCATION_FEED_TOKEN="replace-with-a-second-random-secret" \
+set -a
+. ../deploy/staging/control.env.example  # 真实部署时由 secret manager 注入值
+set +a
 ./p2wlan-control
 ```
 
 中继示例：
 
 ```bash
-RELAY_BIND=":18081" \
+RELAY_BIND=":443" \
+RELAY_TLS_CERT="/run/secrets/p2wlan/relay/fullchain.pem" \
+RELAY_TLS_KEY="/run/secrets/p2wlan/relay/privkey.pem" \
+RELAY_REQUIRE_AUTH=true \
+RELAY_ALLOW_INSECURE_PLAINTEXT=false \
+RELAY_TICKET_KEYRING_JSON='{"<kid>":"<public-key-hex>"}' \
+RELAY_AUDIENCE="relay-cn-test-1" \
+RELAY_REGION="cn-test" \
 RELAY_REVOCATION_FEED_URL="https://control.example.com/api/v1/relay/revocations" \
 RELAY_REVOCATION_FEED_TOKEN="same-token-as-control-plane" \
+RELAY_METRICS_BIND="127.0.0.1:9090" \
 RELAY_REVOCATION_POLL_INTERVAL="30s" \
 RELAY_AUTH_FAILURE_LIMIT="20" \
 RELAY_AUTH_FAILURE_WINDOW="1m" \
 ./p2wlan-relay
 ```
 
-公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。relay 的运行时统计会累计认证失败与限速次数，并仅以短哈希来源键暴露失败来源窗口，避免泄漏 ticket/JWT 或客户端 payload 明文。
+公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。relay 的运行时统计会累计认证失败与限速次数，并仅以短哈希来源键暴露失败来源窗口，避免泄漏 ticket/JWT 或客户端 payload 明文。metrics 必须绑定 loopback，通过 SSH tunnel 读取；它只用于诊断，不能证明对端收到数据。
 
 ## 安全边界
 

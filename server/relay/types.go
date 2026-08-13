@@ -30,6 +30,17 @@ type RelayConfig struct {
 	// Read-only metrics HTTP endpoint (empty = disabled). Exposes only the
 	// aggregate counters from RelayStatsSnapshot, never tickets or tokens.
 	MetricsBind string
+	// Explicit escape hatch: allow the metrics endpoint to bind to a public /
+	// wildcard address without authentication.  Off by default — only
+	// loopback/private binds are permitted without it.
+	MetricsAllowPublic bool
+	// Artificial per-frame forwarding delay (slow-relay diagnostics; zero
+	// disables).  Applied on the forwarding path so the sender observes the
+	// full one-way delay.
+	ForwardDelay time.Duration
+	// DebugFrames enables local-only opaque frame fingerprints in relay logs.
+	// It never logs frame contents and is disabled by default.
+	DebugFrames bool
 	// A2: ticket verification
 	TicketKeyringJSON        string
 	RelayAudience            string
@@ -92,22 +103,25 @@ type relayStats struct {
 }
 
 type RelayStatsSnapshot struct {
-	ActiveConnections               int64                       `json:"active_connections"`
-	RegisteredPeers                 int                         `json:"registered_peers"`
-	AcceptedConnectionsTotal        uint64                      `json:"accepted_connections_total"`
-	RejectedConnectionsTotal        uint64                      `json:"rejected_connections_total"`
-	FrameErrorsTotal                uint64                      `json:"frame_errors_total"`
-	UDPObserverRequestsTotal        uint64                      `json:"udp_observer_requests_total"`
-	UDPObserverErrorsTotal          uint64                      `json:"udp_observer_errors_total"`
-	AuthFailuresTotal               uint64                      `json:"auth_failures_total"`
-	AuthRateLimitedTotal            uint64                      `json:"auth_rate_limited_total"`
-	LegacyRegistrationsTotal        uint64                      `json:"legacy_registrations_total"`
-	AuthenticatedRegistrationsTotal uint64                      `json:"authenticated_registrations_total"`
-	ForwardedFramesTotal            uint64                      `json:"forwarded_frames_total"`
-	ForwardErrorsTotal              uint64                      `json:"forward_errors_total"`
-	RevocationRefreshesTotal        uint64                      `json:"revocation_refreshes_total"`
-	RevocationRefreshFailuresTotal  uint64                      `json:"revocation_refresh_failures_total"`
-	AuthFailureSources              []AuthFailureSourceSnapshot `json:"auth_failure_sources,omitempty"`
+	ActiveConnections               int64  `json:"active_connections"`
+	RegisteredPeers                 int    `json:"registered_peers"`
+	AcceptedConnectionsTotal        uint64 `json:"accepted_connections_total"`
+	RejectedConnectionsTotal        uint64 `json:"rejected_connections_total"`
+	FrameErrorsTotal                uint64 `json:"frame_errors_total"`
+	UDPObserverRequestsTotal        uint64 `json:"udp_observer_requests_total"`
+	UDPObserverErrorsTotal          uint64 `json:"udp_observer_errors_total"`
+	AuthFailuresTotal               uint64 `json:"auth_failures_total"`
+	AuthRateLimitedTotal            uint64 `json:"auth_rate_limited_total"`
+	LegacyRegistrationsTotal        uint64 `json:"legacy_registrations_total"`
+	AuthenticatedRegistrationsTotal uint64 `json:"authenticated_registrations_total"`
+	// ForwardedFramesTotal counts frames accepted into a destination
+	// connection's bounded send queue. It is not an end-to-end delivery or
+	// peer-decryption acknowledgement; only the overlay echo/ACK proves that.
+	ForwardedFramesTotal           uint64                      `json:"forwarded_frames_total"`
+	ForwardErrorsTotal             uint64                      `json:"forward_errors_total"`
+	RevocationRefreshesTotal       uint64                      `json:"revocation_refreshes_total"`
+	RevocationRefreshFailuresTotal uint64                      `json:"revocation_refresh_failures_total"`
+	AuthFailureSources             []AuthFailureSourceSnapshot `json:"auth_failure_sources,omitempty"`
 }
 
 type AuthFailureSourceSnapshot struct {

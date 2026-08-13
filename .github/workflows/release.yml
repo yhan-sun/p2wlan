@@ -10,7 +10,29 @@ permissions:
   contents: write
 
 jobs:
+  identity-gate:
+    name: Release identity gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release daemon for identity verification
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Verify clean version/commit/build identity
+        run: >
+          python3 scripts/release/verify_release_identity.py
+          --release
+          --daemon target/release/p2wlan-daemon
+          --expected-commit "$GITHUB_SHA"
+
   flutter-android:
+    needs: identity-gate
     name: Flutter Android arm64 APK
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +82,7 @@ jobs:
           files: dist-release/p2wlan-flutter-android-arm64-release.apk
 
   flutter-ios:
+    needs: identity-gate
     name: Flutter iOS arm64 IPA
     runs-on: macos-14
     steps:
@@ -106,6 +129,7 @@ jobs:
           files: dist-release/p2wlan-flutter-ios-arm64-unsigned.ipa
 
   flutter-macos:
+    needs: identity-gate
     name: Flutter macOS ${{ matrix.arch }} DMG
     runs-on: macos-14
     strategy:
@@ -171,6 +195,11 @@ jobs:
             lipo "$binary" -thin "${{ matrix.lipo_arch }}" -output "$binary.thin"
             mv "$binary.thin" "$binary"
           done
+          python3 scripts/release/verify_release_identity.py \
+            --release \
+            --daemon "$app/Contents/Resources/p2wlan-daemon" \
+            --app-info "$app/Contents/Info.plist" \
+            --expected-commit "$GITHUB_SHA"
           codesign --force --deep --sign - "$app"
           hdiutil create \
             -volname "P2WLAN" \
@@ -192,6 +221,7 @@ jobs:
           files: dist-release/p2wlan-flutter-macos-${{ matrix.arch }}.dmg
 
   flutter-linux:
+    needs: identity-gate
     name: Flutter Linux ${{ matrix.arch }} Bundle
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -260,6 +290,10 @@ jobs:
             exit 1
           fi
           install -m 0755 target/release/p2wlan-daemon "$bundle_dir/p2wlan-daemon"
+          python3 scripts/release/verify_release_identity.py \
+            --release \
+            --daemon "$bundle_dir/p2wlan-daemon" \
+            --expected-commit "$GITHUB_SHA"
           tar -C "$bundle_dir" -czf "dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz" .
 
       - name: Upload artifact
@@ -275,6 +309,7 @@ jobs:
           files: dist-release/p2wlan-flutter-linux-${{ matrix.arch }}.tar.gz
 
   flutter-windows:
+    needs: identity-gate
     name: Flutter Windows ${{ matrix.arch }} Installer
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -350,6 +385,7 @@ jobs:
           }
           $sourceDir = $releaseDir.FullName
           Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
+          python3 scripts/release/verify_release_identity.py --release --daemon (Join-Path $sourceDir "p2wlan-daemon.exe") --expected-commit $env:GITHUB_SHA
           $outputDir = (Resolve-Path "dist-release").Path
           $iss = Join-Path $env:RUNNER_TEMP "p2wlan-flutter-windows.iss"
           @"
@@ -402,6 +438,7 @@ jobs:
           files: dist-release/p2wlan-flutter-windows-${{ matrix.arch }}-setup.exe
 
   linux-cli:
+    needs: identity-gate
     name: Linux ${{ matrix.arch }} CLI Package
     runs-on: ubuntu-22.04
     strategy:

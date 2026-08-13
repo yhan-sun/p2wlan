@@ -216,6 +216,80 @@ async fn public_key_change_resets_confirmed_paths() {
 }
 
 #[tokio::test]
+async fn endpoint_churn_does_not_reset_existing_path() {
+    let manager = PeerManager::new(test_config());
+    let old_endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+    let peer = test_peer("peer-restart", old_endpoint);
+    manager.add_peer(&peer).await;
+    manager.record_direct_success("peer-restart", Some(old_endpoint)).await;
+    manager.set_relay("peer-restart", "relay.test:443").await;
+
+    let mut updated = peer.clone();
+    updated.endpoint = "1.2.3.4:6000".to_string();
+    let update = manager.add_peer(&updated).await;
+    assert!(update.endpoint_changed);
+
+    let connection = manager.get_connection("peer-restart").await.unwrap();
+    assert_eq!(connection.public_key, peer.public_key);
+    assert_eq!(connection.signaled_endpoint, Some("1.2.3.4:6000".parse().unwrap()));
+    assert_eq!(connection.endpoint, Some(old_endpoint));
+    assert_eq!(connection.state, ConnectionState::Direct);
+    assert!(connection.direct_health.last_success_at.is_some());
+}
+
+#[tokio::test]
+async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_not() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+    let peer = test_peer("peer-incarnation", endpoint);
+    manager.add_peer(&peer).await;
+
+    // Keep this test independent of the candidate-generation implementation's
+    // wall clock. The flag/high-field layout is the wire compatibility
+    // contract: incarnation is above the 21-bit per-boot counter.
+    let old_generation = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 1;
+    let same_boot_refresh = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 2;
+    let new_boot_generation = 0x4000_0000_0000_0000u64 | (1001u64 << 21) | 1;
+    manager
+        .add_candidates_with_metadata(
+            "peer-incarnation",
+            &[endpoint.to_string()],
+            &HashMap::new(),
+            old_generation,
+            None,
+        )
+        .await;
+    manager.record_direct_success("peer-incarnation", Some(endpoint)).await;
+    assert!(!manager
+        .reset_peer_session_if_remote_incarnation_changed(
+            "peer-incarnation",
+            same_boot_refresh,
+            "same_boot_candidate_refresh",
+        )
+        .await);
+    assert_eq!(
+        manager
+            .get_connection("peer-incarnation")
+            .await
+            .unwrap()
+            .state,
+        ConnectionState::Direct
+    );
+
+    assert!(manager
+        .reset_peer_session_if_remote_incarnation_changed(
+            "peer-incarnation",
+            new_boot_generation,
+            "remote_incarnation_changed",
+        )
+        .await);
+    let connection = manager.get_connection("peer-incarnation").await.unwrap();
+    assert_eq!(connection.state, ConnectionState::Idle);
+    assert!(connection.direct_health.last_success_at.is_none());
+    assert!(connection.relay_confirmed_at.is_none());
+}
+
+#[tokio::test]
 async fn test_peer_manager_candidates() {
     let config = test_config();
     let manager = PeerManager::new(config);

@@ -233,9 +233,9 @@ async fn offer_storm_cannot_reset_backoff_or_spawn_fresh_sockets() {
         .find(|diagnostics| diagnostics.node_id == "peer-fail")
         .and_then(|diagnostics| diagnostics.direct_retry_after_ms)
         .expect("the backoff must be visible in diagnostics");
-    assert!(
-        retry_after >= 32_000,
-        "six failures must grow the retry backoff, got {retry_after}ms"
+    assert_eq!(
+        retry_after, 8_000,
+        "six failures must reach, but not exceed, the bounded fast-recovery cap"
     );
 
     // An offer storm must not reset the backoff: offers only stash
@@ -365,4 +365,3 @@ async fn unmatched_authenticated_acks_do_not_weaken_validation_or_expand_unbound
         "the epoch probe credit must be exactly exhausted, not negative"
     );
 }
-

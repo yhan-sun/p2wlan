@@ -159,6 +159,14 @@ pub struct NetworkConfig {
     /// same socket so the peer-facing mapping is the model's prediction.
     #[serde(default = "default_true")]
     pub fresh_mapping_punch_enabled: bool,
+    /// Whether to include extrapolated server-reflexive candidates inferred
+    /// from the observed STUN mapping sequence.
+    ///
+    /// This remains enabled in production. The explicit off switch exists for
+    /// reproducible experiments that compare the traversal stack with a
+    /// static STUN-observed candidate baseline.
+    #[serde(default = "default_true")]
+    pub predicted_candidates_enabled: bool,
     /// Whether the local socket address is gathered as a Host candidate.
     ///
     /// NAT-simulation harnesses disable host candidates so every punch must
@@ -198,6 +206,13 @@ pub struct NetworkConfig {
     /// strict-direct semantics of sending only over confirmed Direct paths.
     #[serde(default)]
     pub overlay_any_path: bool,
+    /// When `validate_overlay` is enabled, fire one BURST of this many
+    /// business payloads per peer right after the first usable evidence, and
+    /// verify that every echo comes back (zero loss/duplicate/reorder in the
+    /// real dataplane + WireGuard pipeline).  `0` disables the burst
+    /// (independent validation harnesses only).
+    #[serde(default)]
+    pub overlay_burst: usize,
 }
 
 fn default_cidr() -> String {
@@ -357,7 +372,7 @@ fn default_true() -> bool {
     true
 }
 fn default_relay_timeout() -> u64 {
-    5000
+    3000
 }
 fn default_relay_selection_timeout() -> u64 {
     3000

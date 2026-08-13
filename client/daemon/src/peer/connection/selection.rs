@@ -255,20 +255,10 @@ impl PeerConnection {
                     "relay policy disables direct UDP",
                 )
                 .with_scores(None, relay_score)
-            } else if let Some(endpoint) = direct_endpoint {
-                let direct_score =
-                    self.direct_path_score(local_generation, Some(endpoint), false, false);
-                PathSelection::direct(
-                    endpoint,
-                    REASON_PATH_RELAY_UNAVAILABLE,
-                    "relay unavailable; attempting best-effort direct UDP",
-                    false,
-                )
-                .with_scores(direct_score, None)
             } else {
                 PathSelection::unavailable(
                     REASON_PATH_UNAVAILABLE,
-                    "relay unavailable and no direct UDP endpoint exists",
+                    "relay unavailable and Direct is not encrypted-confirmed",
                 )
                 .with_scores(None, None)
             };
@@ -330,13 +320,12 @@ impl PeerConnection {
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,
                             format!(
-                                "confirmed direct score {} is poor, but relay is not peer-confirmed; retaining Direct with a Relay hedge",
+                                "confirmed direct score {} is poor, but relay is not peer-confirmed; retaining Direct",
                                 direct_score.score
                             ),
                             true,
                         )
-                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()))
-                        .with_relay_hedge();
+                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                     }
                     return PathSelection::relay(
                         REASON_PATH_DIRECT_DEGRADED,
@@ -358,13 +347,12 @@ impl PeerConnection {
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,
                             format!(
-                                "direct score {} is below relay score {}, but relay is not peer-confirmed; retaining Direct with a Relay hedge",
+                                "direct score {} is below relay score {}, but relay is not peer-confirmed; retaining Direct",
                                 direct_score.score, relay_score.score
                             ),
                             true,
                         )
-                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()))
-                        .with_relay_hedge();
+                        .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                     }
                     return PathSelection::relay(
                         REASON_PATH_DIRECT_DEGRADED,
@@ -388,66 +376,28 @@ impl PeerConnection {
             .with_scores(direct_score, relay_score);
         }
 
-        if !relay_available {
-            return PathSelection::direct(
-                endpoint,
-                REASON_PATH_RELAY_UNAVAILABLE,
-                "relay unavailable; attempting best-effort direct UDP",
-                false,
-            )
-            .with_scores(direct_score, None);
-        }
-
-        if trial_direct {
-            let trial_is_viable = if recent_success_trial {
-                true
-            } else {
+        if relay_available {
+            return PathSelection::relay(
+                REASON_PATH_DIRECT_NOT_CONFIRMED,
                 match (&direct_score, &relay_score) {
-                    (Some(direct_score), Some(_)) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
-                    (Some(direct_score), None) => direct_score.score >= DIRECT_TRIAL_MIN_SCORE,
-                    (None, _) => true,
-                }
-            };
-
-            if trial_is_viable {
-                let should_hedge_relay =
-                    matches!((&direct_score, &relay_score), (Some(_), Some(_)));
-                let selection = PathSelection::direct(
-                    endpoint,
-                    REASON_PATH_DIRECT_TRIAL,
-                    direct_score
-                        .as_ref()
-                        .map(|score| {
-                            format!(
-                                "recent UDP reachability is in trial window; score={}; sending Direct with Relay hedge until encrypted data confirms",
-                                score.score
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            "recent UDP reachability is in trial window; sending Direct with Relay hedge until encrypted data confirms".to_string()
-                        }),
-                    false,
-                )
-                .with_scores(direct_score, relay_score);
-
-                return if should_hedge_relay {
-                    selection.with_relay_hedge()
-                } else {
-                    selection
-                };
-            }
+                    (Some(direct_score), Some(relay_score)) => format!(
+                        "direct UDP pair is not encrypted-confirmed; direct_score={} relay_score={}",
+                        direct_score.score, relay_score.score
+                    ),
+                    _ => "direct UDP pair is not encrypted-confirmed; using relay".to_string(),
+                },
+            )
+            .with_scores(direct_score, relay_score);
         }
 
-        PathSelection::relay(
-            REASON_PATH_DIRECT_NOT_CONFIRMED,
-            match (&direct_score, &relay_score) {
-                (Some(direct_score), Some(relay_score)) => format!(
-                    "direct UDP pair is not confirmed enough; direct_score={} relay_score={}",
-                    direct_score.score, relay_score.score
-                ),
-                _ => "direct UDP pair is not confirmed; using relay".to_string(),
-            },
+        // Candidate/probe success is deliberately not a data-plane delivery
+        // proof.  Without a confirmed relay there is no safe path for this
+        // counter: waiting keeps FIFO/counter order intact, and the outbound
+        // actor will apply its bounded deadline/drop policy.
+        PathSelection::unavailable(
+            REASON_PATH_UNAVAILABLE,
+            "no confirmed relay and Direct is not encrypted-confirmed",
         )
-        .with_scores(direct_score, relay_score)
+        .with_scores(direct_score, None)
     }
 }

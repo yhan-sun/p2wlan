@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 mod http;
 mod websocket;
 
+pub(crate) use http::candidate_generation_incarnation;
 /// Single control-plane HTTP client builder shared by the ordinary loop and the
 /// critical lane (see [`control::proxy`](crate::control::proxy)).
 pub use http::control_http_client;

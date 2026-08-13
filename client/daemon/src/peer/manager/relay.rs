@@ -156,8 +156,13 @@ impl PeerManager {
 
     /// Confirm the relay path to a peer after a matching forced-relay probe ACK
     /// whose real ingress was relay.  Sets `RelayPeerConfirmed`, bumps the
-    /// relay-confirm sequence (notifying outbound waiters), records the
-    /// first-usable milestone and transitions the peer to Relay state.
+    /// relay-confirm sequence (notifying outbound waiters) and transitions the
+    /// peer to Relay state.
+    ///
+    /// This is the relay-path confirmation milestone ONLY — it never records
+    /// `first_usable`.  First usability must be proven by real bidirectional
+    /// decrypted overlay business traffic (`record_verified_first_usable`),
+    /// never by a confirmation, a TCP/TLS connect, or a queued registration.
     ///
     /// Returns `true` only when this call NEWLY confirmed the peer (later
     /// identical confirmations no-op).
@@ -167,27 +172,52 @@ impl PeerManager {
         relay_endpoint: &str,
         generation: u64,
     ) -> bool {
+        // Quarantine is authoritative isolation after a sustained relay
+        // `peer_not_found`.  Check it immediately before taking the
+        // connection lock so a late ACK cannot re-admit the stale peer.
+        if self.peer_quarantined(node_id).await {
+            self.emit_timeline(
+                "relay_peer_confirmation_rejected",
+                Some("relay"),
+                Some("peer_quarantined"),
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_endpoint}"
+                )),
+            );
+            return false;
+        }
         let now = Instant::now();
-        let (newly_confirmed, _first_usable) = {
+        let newly_confirmed = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
-            if conn.relay_confirmed_at.is_some() {
-                // Already confirmed for this relay; refresh the endpoint label
-                // if the relay changed underneath us.
-                if conn.relay_confirmed_endpoint.as_deref() != Some(relay_endpoint) {
-                    conn.relay_confirmed_endpoint = Some(relay_endpoint.to_string());
-                    conn.relay_confirmed_generation = Some(generation);
-                    conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                }
-                (false, false)
-            } else {
+            if conn.relay_confirmed_at.is_some()
+                && conn.relay_confirmed_generation == Some(generation)
+                && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
+            {
+                // The exact endpoint and generation was already confirmed.
+                // Duplicate encrypted ACKs are deliberately idempotent.
+                false
+            } else if conn.relay_confirmed_at.is_some()
+                && conn.relay_confirmed_generation == Some(generation)
+            {
+                // A new relay transport in the same network generation needs
+                // a fresh encrypted ACK, but it is still a real confirmation.
                 conn.relay_confirmed_generation = Some(generation);
                 conn.relay_confirmed_at = Some(now);
                 conn.relay_confirmed_endpoint = Some(relay_endpoint.to_string());
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                let first_usable = conn.record_first_usable(NetworkPath::Relay, generation);
+                false
+            } else {
+                // A confirmation from an older generation is never reused.
+                if conn.relay_confirmed_endpoint.as_deref() != Some(relay_endpoint) {
+                    conn.relay_confirmed_endpoint = None;
+                }
+                conn.relay_confirmed_generation = Some(generation);
+                conn.relay_confirmed_at = Some(now);
+                conn.relay_confirmed_endpoint = Some(relay_endpoint.to_string());
+                conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
                 }
@@ -197,18 +227,17 @@ impl PeerManager {
                     relay_endpoint = %relay_endpoint,
                     generation = generation,
                     relay_confirm_seq = conn.relay_confirm_seq,
-                    first_usable = first_usable,
-                    "relay_peer_confirmed peer_id={node_id} relay_endpoint={relay_endpoint} generation={generation} first_usable={first_usable}",
+                    "relay_peer_confirmed peer_id={node_id} relay_endpoint={relay_endpoint} generation={generation}",
                 );
                 self.emit_timeline(
                     "relay_peer_confirmed",
                     Some("relay"),
                     None,
                     Some(format!(
-                        "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} first_usable={first_usable}"
+                        "peer={node_id} generation={generation} relay_endpoint={relay_endpoint}"
                     )),
                 );
-                (true, first_usable)
+                true
             }
         };
         if newly_confirmed {
@@ -217,15 +246,88 @@ impl PeerManager {
         newly_confirmed
     }
 
+    /// Record the FIRST confirmed usable path for a peer, proven ONLY by real
+    /// decrypted business traffic. Production TUN ingress calls this after a
+    /// normal encrypted packet decrypts; the independent overlay validation
+    /// harness additionally requires a locally-sent matching-nonce echo. In
+    /// both cases the real ingress (`relay:<endpoint>` or `direct`) is known —
+    /// never a confirmation, a single UDP send, or a TCP connect.
+    ///
+    /// Emits the `first_usable_path` timeline milestone per peer + generation
+    /// and records the path on the connection.  Returns whether this call
+    /// recorded the milestone (the first verified evidence wins).
+    pub async fn record_verified_first_usable(
+        &self,
+        node_id: &str,
+        generation: u64,
+        path: NetworkPath,
+        ingress_label: &str,
+    ) -> bool {
+        // A delayed overlay echo from an older Air/network generation is not
+        // evidence for the current mapping. The caller's token carries the
+        // generation, so reject it before touching per-peer state.
+        if generation != self.current_network_generation_sync() {
+            self.emit_timeline(
+                "first_usable_stale",
+                None,
+                Some("generation_changed"),
+                Some(format!(
+                    "peer={node_id} evidence_generation={generation} current_generation={}",
+                    self.current_network_generation_sync()
+                )),
+            );
+            return false;
+        }
+        let recorded = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            conn.record_first_usable(path, generation)
+        };
+        if recorded {
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "first_usable_path",
+                Some(match path {
+                    NetworkPath::Direct => "direct",
+                    NetworkPath::Relay => "relay",
+                }),
+                None,
+                Some(format!(
+                    "peer={node_id} generation={generation} ingress={ingress_label}"
+                )),
+            );
+        }
+        recorded
+    }
+
     /// Whether the peer currently has a confirmed relay path
     /// (`RelayPeerConfirmed`).  Never true from a local connect or a queued
     /// registration.
     pub async fn is_relay_peer_confirmed(&self, node_id: &str) -> bool {
+        let generation = self.current_network_generation().await;
+        self.is_relay_peer_confirmed_for_generation(node_id, generation)
+            .await
+    }
+
+    /// Whether a relay path was confirmed by encrypted evidence in exactly the
+    /// requested network generation. This is the only predicate the outbound
+    /// data plane may use for relay-first admission.
+    pub async fn is_relay_peer_confirmed_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+    ) -> bool {
         self.connections
             .read()
             .await
             .get(node_id)
-            .is_some_and(|conn| conn.relay_confirmed_at.is_some())
+            .is_some_and(|conn| {
+                conn.relay_confirmed_at.is_some()
+                    && conn.relay_confirmed_generation == Some(generation)
+            })
     }
 
     /// Register the token of a forced-relay probe the local daemon just sent,
@@ -274,6 +376,29 @@ impl PeerManager {
         token: crate::relay_probe::RelayProbeToken,
         ack_ingress: &str,
     ) -> bool {
+        // Remove any outstanding expectation before returning.  A late ACK
+        // must not revive a peer that was quarantined after the relay stopped
+        // registering it, even if its token is otherwise syntactically valid.
+        if self.peer_quarantined(node_id).await {
+            let removed = self
+                .relay_probe_expectations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id)
+                .is_some();
+            if removed {
+                self.emit_timeline(
+                    "relay_probe_ack_stale",
+                    Some("relay"),
+                    Some("peer_quarantined"),
+                    Some(format!(
+                        "peer={node_id} request_id={} generation={} owner={} ingress={ack_ingress}",
+                        token.request_id, token.generation, token.owner_token
+                    )),
+                );
+            }
+            return false;
+        }
         let now = Instant::now();
         let expectation = {
             let mut expectations = self
@@ -361,7 +486,8 @@ impl PeerManager {
     /// confirmed or the peer becomes Direct.
     pub async fn relay_probe_targets(&self) -> Vec<(String, String, u64)> {
         let generation = self.current_network_generation().await;
-        self.connections
+        let candidates: Vec<_> = self
+            .connections
             .read()
             .await
             .values()
@@ -372,7 +498,14 @@ impl PeerManager {
                     && conn.relay_confirmed_at.is_none()
             })
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone(), generation))
-            .collect()
+            .collect();
+        let mut targets = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !self.peer_quarantined(&candidate.0).await {
+                targets.push(candidate);
+            }
+        }
+        targets
     }
 
     /// The per-peer relay-ready instant, if any (daemon-local monotonic).
@@ -381,6 +514,19 @@ impl PeerManager {
             .read()
             .await
             .get(node_id)
+            .and_then(|conn| conn.relay_ready_at)
+    }
+
+    pub async fn relay_ready_at_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+    ) -> Option<Instant> {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .filter(|conn| conn.relay_ready_generation == Some(generation))
             .and_then(|conn| conn.relay_ready_at)
     }
 
@@ -442,6 +588,14 @@ impl PeerManager {
         // open.  Revoking it immediately (and notifying outbound waiters)
         // stops the data plane from sending on a path the relay will 404.
         let record_failure = if code == "peer_not_found" {
+            // A 404 invalidates any in-flight forced-relay probe expectation
+            // for this registration.  Without this clear, an old encrypted
+            // ACK could re-confirm the peer during the bounded handoff grace
+            // window after the existing RelayPeerConfirmed was revoked.
+            self.relay_probe_expectations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             let revoked = self.revoke_relay_peer_confirmation(node_id).await;
             if revoked {
                 info!(

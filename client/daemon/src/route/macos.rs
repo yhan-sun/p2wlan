@@ -27,23 +27,29 @@ impl RouteManager {
             .status()
             .map_err(|e| crate::DaemonError::Network(format!("failed to run route add: {e}")))?;
 
-        if !status.success() {
-            let route_line = macos_route_get(&network.to_string()).unwrap_or_default();
-            if route_line.contains(&format!("interface: {interface}")) {
-                info!(
-                    "Route for {cidr} already exists on {interface} — treating as idempotent, not owned"
-                );
-                return Ok(());
-            }
+        // `route add` on macOS can print `File exists` while still returning a
+        // successful process status.  That is dangerous for a second daemon:
+        // the new utun is up, but the kernel keeps the overlay CIDR on an old
+        // utun and every real business packet is then routed into the wrong
+        // process.  Always verify the selected interface after the command,
+        // regardless of the exit status.
+        let route_line = macos_route_get(&network.to_string()).unwrap_or_default();
+        if !route_line.contains(&format!("interface: {interface}")) {
             return Err(crate::DaemonError::Network(format!(
-                "route add failed for {cidr} via {interface}; existing route: {route_line}"
+                "overlay route conflict for {cidr}: expected interface {interface}; existing route: {route_line}"
             )));
         }
 
-        if let Ok(mut added) = self.routes_added.lock() {
-            added.push((network, mask));
+        if status.success() {
+            if let Ok(mut added) = self.routes_added.lock() {
+                added.push((network, mask));
+            }
+            return Ok(());
         }
 
+        info!(
+            "Route for {cidr} already exists on {interface} — treating as idempotent, not owned"
+        );
         Ok(())
     }
 

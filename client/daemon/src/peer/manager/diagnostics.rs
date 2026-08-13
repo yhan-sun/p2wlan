@@ -34,21 +34,37 @@ impl PeerManager {
         &self,
         max_success_age: Duration,
     ) -> Vec<(String, String)> {
-        self.connections
+        let candidates: Vec<_> = self
+            .connections
             .read()
             .await
             .values()
             .filter(|conn| {
-                conn.state != ConnectionState::Direct
+                // The validation loop is a proactive data-plane check, not a
+                // cleanup mechanism for the historical peer roster. Offline
+                // and closed peers are not registered at the relay; sending
+                // to them every five seconds creates a 404 storm, consumes
+                // the relay writer lane, and can delay the current peer's
+                // probe. They are handled by lifecycle cleanup instead.
+                conn.online
+                    && conn.state != ConnectionState::Closed
+                    && (conn.state != ConnectionState::Direct
                     || conn
                         .direct_health
                         .rtt_ewma_ms
                         .or(conn.direct_health.latency_ms)
-                        .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS)
+                        .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS))
             })
             .filter(|conn| !conn.relay_health.is_confirmed_recent(max_success_age))
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone()))
-            .collect()
+            .collect();
+        let mut targets = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !self.peer_quarantined(&candidate.0).await {
+                targets.push(candidate);
+            }
+        }
+        targets
     }
 
     /// Get serializable diagnostics for every peer.
@@ -132,9 +148,12 @@ impl PeerManager {
     /// Return one peer's diagnostics from a single connection-lock snapshot.
     ///
     /// The diagnostics HTTP fast path uses this instead of materializing every
-    /// peer in a large control network.  The selector decision is deliberately
-    /// computed from the same immutable connection snapshot as state, pair,
-    /// validation events, and the persisted selection.
+    /// peer in a large control network.  The selector decision is computed
+    /// from one immutable connection snapshot.  Diagnostics must not acquire
+    /// the network epoch gate: that gate is reserved for dataplane state
+    /// transitions, and making a read-only status request wait behind a
+    /// generation cancellation can make the health endpoint report a false
+    /// outage while relay traffic is still progressing.
     pub async fn diagnostic_with_path_selection(
         &self,
         node_id: &str,
@@ -150,11 +169,6 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let recovery = self.recovery_epoch_diagnostics().await.remove(node_id);
-        // Freeze generation advancement while selecting and serializing this
-        // peer. This shares the same epoch boundary as Direct promotion, so a
-        // response cannot combine a new generation header with an old pair.
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
         let generation = self.current_network_generation_sync();
         let conns = self.connections.read().await;
         let conn = conns.get(node_id)?;
@@ -232,6 +246,8 @@ impl PeerManager {
             total_bytes_sent,
             total_bytes_received,
             outbound_drops: HashMap::new(),
+            outbound_send_failures: HashMap::new(),
+            outbound_loss_events: Vec::new(),
         }
     }
 }

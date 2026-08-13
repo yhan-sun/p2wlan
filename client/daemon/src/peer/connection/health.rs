@@ -267,6 +267,23 @@ impl PeerConnection {
     ) {
         let reason = reason.into();
         let peer_id = self.node_id.clone();
+        // `first_usable` is intentionally scoped to peer + generation. A
+        // restart or interface handover must not reuse proof from an old NAT
+        // mapping, even when the old connection object is retained.
+        if self.first_usable_generation != Some(local_generation) {
+            self.first_usable_generation = None;
+            self.first_usable_at = None;
+            self.first_usable_path = None;
+        }
+        if self.relay_confirmed_generation != Some(local_generation) {
+            self.relay_confirmed_generation = None;
+            self.relay_confirmed_at = None;
+            self.relay_confirmed_endpoint = None;
+            self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
+            if self.state == ConnectionState::Relay {
+                self.transition(ConnectionState::FallbackToRelay);
+            }
+        }
         self.candidate_pairs
             .retain(|pair| pair.local_generation.saturating_add(1) >= local_generation);
         for pair in &mut self.candidate_pairs {
@@ -285,6 +302,22 @@ impl PeerConnection {
         reason: impl Into<String>,
     ) -> bool {
         let reason = reason.into();
+        // Candidate refresh creates a new generation even when a private Direct
+        // pair is retained. Its first-usable evidence must be earned again.
+        if self.first_usable_generation != Some(local_generation) {
+            self.first_usable_generation = None;
+            self.first_usable_at = None;
+            self.first_usable_path = None;
+        }
+        if self.relay_confirmed_generation != Some(local_generation) {
+            self.relay_confirmed_generation = None;
+            self.relay_confirmed_at = None;
+            self.relay_confirmed_endpoint = None;
+            self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
+            if self.state == ConnectionState::Relay {
+                self.transition(ConnectionState::FallbackToRelay);
+            }
+        }
         let retained_confirmed_direct = (self.state == ConnectionState::Direct)
             .then(|| {
                 self.candidate_pairs

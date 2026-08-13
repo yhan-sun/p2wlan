@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type networkNodeKey struct {
@@ -27,6 +30,9 @@ type peer struct {
 type hub struct {
 	mu    sync.RWMutex
 	peers map[networkNodeKey]*peer
+	// Artificial per-frame forwarding delay (slow-relay diagnostics).
+	forwardDelay time.Duration
+	debugFrames  bool
 }
 
 func newHub() *hub {
@@ -89,8 +95,22 @@ func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayl
 	if err != nil {
 		return 4000, "malformed received frame"
 	}
+	// Slow-relay diagnostics: apply the artificial per-frame delay BEFORE
+	// handing the frame to the destination queue, so the sender observes the
+	// full one-way latency (and the relay keeps servicing other peers during
+	// the delay).
+	if h.forwardDelay > 0 {
+		select {
+		case <-time.After(h.forwardDelay):
+		case <-dst.done:
+			return 404, "peer disconnected: " + dstID
+		}
+	}
 	select {
 	case dst.send <- frame:
+		if h.debugFrames {
+			log.Printf("event=relay_forward_enqueued src=%s dst=%s bytes=%d wire_fp=%s", srcID, dstID, len(data), opaqueFrameFingerprint(data))
+		}
 		return 0, ""
 	case <-dst.done:
 		return 404, "peer disconnected: " + dstID
@@ -99,4 +119,16 @@ func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayl
 		_ = dst.conn.Close()
 		return 4008, "peer backpressure: " + dstID
 	}
+}
+
+// opaqueFrameFingerprint correlates an encrypted frame across local relay
+// traces without recording any of its contents. It is diagnostic metadata,
+// not an authentication primitive.
+func opaqueFrameFingerprint(data []byte) string {
+	var hash uint64 = 0xcbf29ce484222325
+	for _, b := range data {
+		hash ^= uint64(b)
+		hash *= 0x100000001b3
+	}
+	return fmt.Sprintf("%016x", hash)
 }

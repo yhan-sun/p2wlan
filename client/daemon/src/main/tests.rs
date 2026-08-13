@@ -2,12 +2,15 @@ use super::*;
 
     fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         Cli {
+            build_info: false,
+            overlay_burst: 0,
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
             control: control.map(ToString::to_string),
             network: network.map(ToString::to_string),
             status: false,
             token: None,
+            token_file: None,
             interface: None,
             address: None,
             manual: false,
@@ -32,9 +35,11 @@ use super::*;
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
+            relay_only: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
             disable_fresh_mapping_punch: false,
+            disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
 
@@ -74,24 +79,49 @@ use super::*;
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let mut cli = test_cli(None, None);
         cli.disable_fresh_mapping_punch = true;
+        cli.disable_predicted_candidates = true;
         cli.disable_birthday_probing = true;
 
         apply_cli_overrides(&mut config, &cli);
 
         assert!(!config.network.fresh_mapping_punch_enabled);
+        assert!(!config.network.predicted_candidates_enabled);
         assert!(!config.network.birthday_probing_enabled);
+    }
+
+    #[test]
+    fn prefer_relay_keeps_background_direct_upgrade_enabled() {
+        let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        config.relay.prefer_direct = false;
+        let mut cli = test_cli(None, None);
+        cli.prefer_relay = true;
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert!(config.relay.prefer_direct);
+
+        let mut relay_only_config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        let mut relay_only_cli = test_cli(None, None);
+        relay_only_cli.relay_only = true;
+
+        apply_cli_overrides(&mut relay_only_config, &relay_only_cli);
+
+        assert!(!relay_only_config.relay.prefer_direct);
     }
 
     #[test]
     fn network_arguments_override_generated_config() {
         let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let cli = Cli {
+            build_info: false,
+            overlay_burst: 0,
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
             token: None,
+            token_file: None,
             interface: None,
             address: None,
             manual: false,
@@ -116,9 +146,11 @@ use super::*;
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
+            relay_only: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
             disable_fresh_mapping_punch: false,
+            disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
 
@@ -150,12 +182,15 @@ use super::*;
     fn test_validate_cli_invalid_cases() {
         // Create base Cli
         let base_cli = Cli {
+            build_info: false,
+            overlay_burst: 0,
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
             control: Some("https://control.p2wlan.io".to_string()),
             network: Some("default".to_string()),
             status: false,
             token: None,
+            token_file: None,
             interface: None,
             address: None,
             manual: false,
@@ -180,9 +215,11 @@ use super::*;
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
+            relay_only: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
             disable_fresh_mapping_punch: false,
+            disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
 
@@ -281,12 +318,15 @@ use super::*;
         config.network.manual = true;
 
         let cli = Cli {
+            build_info: false,
+            overlay_burst: 0,
             config: PathBuf::from("p2wlan-config.json"),
             init: false,
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
             token: Some("test-token".to_string()),
+            token_file: None,
             interface: None,
             address: None,
             manual: false,
@@ -311,9 +351,11 @@ use super::*;
             diagnostics_disable: false,
             prefer_relay: false,
             prefer_direct: false,
+            relay_only: false,
             fresh_mapping_harness_loopback: false,
             no_host_candidates: false,
             disable_fresh_mapping_punch: false,
+            disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
 
@@ -360,6 +402,17 @@ use super::*;
             parsed_help.unwrap_err().kind(),
             clap::error::ErrorKind::DisplayHelp
         );
+
+        let relay_first = Cli::try_parse_from(["p2wlan-daemon", "--prefer-relay"]);
+        assert!(relay_first.is_ok());
+        let relay_only = Cli::try_parse_from(["p2wlan-daemon", "--relay-only"]);
+        assert!(relay_only.is_ok());
+        let conflicting_paths = Cli::try_parse_from([
+            "p2wlan-daemon",
+            "--prefer-relay",
+            "--relay-only",
+        ]);
+        assert!(conflicting_paths.is_err());
 
         let parsed_version = Cli::try_parse_from(["p2wlan-daemon", "--version"]);
         assert!(parsed_version.is_err());

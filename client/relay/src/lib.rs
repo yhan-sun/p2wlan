@@ -216,7 +216,12 @@ impl Default for RelayClientConfig {
     fn default() -> Self {
         Self {
             cmd_queue_capacity: 128,
-            inbound_queue_capacity: 128,
+            // A relay-only 256-packet overlay burst must remain bounded but
+            // must not overflow the client-side reader before the daemon's
+            // inbound dataplane can drain it. The reader also awaits this
+            // channel, so a larger bound is a throughput buffer rather than
+            // a lossy queue.
+            inbound_queue_capacity: 1024,
             register_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(10),

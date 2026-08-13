@@ -5,7 +5,7 @@ match cmd {
                             // immediately instead of waiting out the regular
                             // poll cadence, then re-arm the regular tick so
                             // this does not create a poll burst.
-                            peer_tick.reset();
+                            peer_roster_tick.reset();
                             let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
                             match &poll_result {
                                 Ok(_) => {

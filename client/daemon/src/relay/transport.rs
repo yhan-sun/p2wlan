@@ -4,7 +4,7 @@ pub struct RelayTransport {
     relay_region: String,
     relay_endpoint: String,
     connect_latency_ms: u64,
-    client: Arc<Mutex<RelayClient>>,
+    client: Arc<RelayClient>,
     peers: Arc<PeerManager>,
     /// Ticket audience of the connection's auth ticket, when authenticated.
     ticket_audience: Option<String>,
@@ -105,7 +105,7 @@ impl RelayTransport {
                 relay_region: relay_region.to_string(),
                 relay_endpoint: relay_endpoint.to_string(),
                 connect_latency_ms: duration_millis(started.elapsed()),
-                client: Arc::new(Mutex::new(client)),
+                client: Arc::new(client),
                 peers,
                 ticket_audience: None,
                 ticket_region: None,
@@ -155,7 +155,7 @@ impl RelayTransport {
             relay_region: relay_region.to_string(),
             relay_endpoint: relay_endpoint.to_string(),
             connect_latency_ms: 0,
-            client: Arc::new(Mutex::new(p2pnet_relay::client::RelayClient::new_for_test())),
+            client: Arc::new(p2pnet_relay::client::RelayClient::new_for_test()),
             peers,
             ticket_audience: None,
             ticket_region: None,
@@ -178,23 +178,39 @@ impl RelayTransport {
         self.connect_latency_ms
     }
 
+    /// Immediately invalidate this relay connection.  This is used only when
+    /// a completed command cannot be classified before the outbound deadline;
+    /// a new generation must not inherit a writer that can emit the old
+    /// ciphertext later.
+    pub fn abort_writer(&self) {
+        self.client.abort();
+    }
+
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
         self.client
-            .lock()
-            .await
             .send_data(&packet.peer_id, &packet.wire_bytes)
             .await
             .map_err(|e| {
                 DaemonError::Relay(format!(
-                    "relay send to peer {} via {} failed: {e}",
-                    packet.peer_id, self.relay_endpoint
+                    "relay send to peer {} via {} failed reason_code={}: {e}",
+                    packet.peer_id,
+                    self.relay_endpoint,
+                    e.to_snake_case()
                 ))
             })?;
 
         self.peers
             .record_relay_attempt(&packet.peer_id, &self.relay_endpoint)
             .await;
+        debug!(
+            event = "relay_outbound_write_completed",
+            peer_id = %packet.peer_id,
+            bytes = packet.wire_bytes.len(),
+            wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
+            relay_endpoint = %self.relay_endpoint,
+            "opaque encrypted frame completed the relay client write boundary"
+        );
         debug!(
             "Sent {} encrypted bytes to peer {} through relay {}",
             packet.wire_bytes.len(),
@@ -290,6 +306,14 @@ impl RelayTransport {
                     );
                 }
                 RelayMessage::Data { from_node, data } => {
+                    debug!(
+                        event = "relay_inbound_frame_accepted",
+                        peer_id = %from_node,
+                        bytes = data.len(),
+                        wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&data)),
+                        relay_endpoint = %self.relay_endpoint,
+                        "opaque encrypted frame accepted by the relay client reader"
+                    );
                     inbound_tx
                         .send(ReceivedEncryptedPacket {
                             source: None,

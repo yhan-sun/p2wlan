@@ -30,6 +30,7 @@
 //! - Phase 5: Control plane client, peer management, ACL, DNS, port mapping
 
 pub mod acl;
+pub mod build_info;
 mod candidate_refresh;
 pub mod config;
 pub mod connection_timeline;
@@ -128,12 +129,9 @@ use relay_runtime::{
 use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, RelayValidationPacket};
 #[cfg(test)]
 use transport::parse_direct_validation_token;
-#[cfg(test)]
-use transport::EncryptedPeerPacket;
 use transport::{
     build_direct_validation_payload, DirectValidationKind, InboundEvidenceFeed,
-    OrderedEncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionCommit,
-    ResponderSessionStage, WireGuardTransport,
+    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, WireGuardTransport,
 };
 use udp::{
     FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveIngress,
@@ -146,13 +144,12 @@ const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 /// Initial signaling should retry quickly; the independent background punch
 /// session can continue while a lost offer/answer is retried.
 ///
-/// The timeout must cover the full control-plane offer/answer round trip,
-/// not just the send: each leg rides a peer poll (default 5s), the responder
-/// refreshes its candidates before answering (a STUN gather takes 10-15s on
-/// the field, and the whole round trip has been measured up to ~48s), and a
-/// late answer must still match its pending session_id instead of being
-/// discarded as stale — otherwise the WireGuard session never forms and the
-/// direct-validation path can never promote the peer.
+/// The timeout is a hard cleanup bound for the control-plane offer/answer
+/// transaction and its session token.  Relay-first signaling no longer waits
+/// for a STUN refresh: a cached candidate set, or an empty set while relay is
+/// available, establishes the encrypted session; later candidates belong to
+/// the background Direct upgrade.  A late answer still has to match its
+/// pending session_id instead of being accepted as stale state.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 60;
 /// Rekeys must retry several times before the old 180-second key lifetime ends.
 const REKEY_HANDSHAKE_TIMEOUT_SECS: u64 = 45;
@@ -174,11 +171,6 @@ const POST_ANSWER_REFRESH_DEADLINE_SECS: u64 = 4;
 /// transport startup or the signal that follows a candidate refresh.
 const STARTUP_ENDPOINT_PUBLISH_BUDGET_MS: u64 = 1500;
 const PRE_SIGNAL_ENDPOINT_PUBLISH_BUDGET_MS: u64 = 1200;
-/// Budget for the initiator's pre-offer candidate refresh when a usable
-/// cached set already exists.  The fresh measurement is kept when it fits
-/// inside the budget; a slow STUN/prediction gather must never delay the
-/// offer's rendezvous window, so the cached snapshot is used instead.
-const HANDSHAKE_OFFER_REFRESH_BUDGET_MS: u64 = 1200;
 /// Public STUN fallbacks used when older configs do not specify STUN servers.
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
@@ -226,6 +218,14 @@ const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(500);
 /// HTTP wake-up jitter, and scheduler latency while still keeping the packet
 /// budget bounded by the existing probe schedule.
 const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
+/// Send a small immediate candidate window before the synchronized rendezvous
+/// window. The synchronized window is still required for dependent NATs, but
+/// waiting for it makes ordinary/public paths pay an avoidable 500ms tax.
+/// Keeping this window small preserves the per-peer probe budget and leaves the
+/// full candidate/scatter sweep as the lossless fallback.
+const DIRECT_FAST_PROBE_MAX_CANDIDATES: usize = 8;
+const DIRECT_FAST_PROBE_ATTEMPTS: u32 = 1;
+const DIRECT_FAST_PROBE_ACK_WINDOW: Duration = Duration::from_millis(250);
 /// Ignore very stale relay-assisted windows and punch immediately instead.
 const RELAY_ASSISTED_PUNCH_STALE_AFTER: Duration = Duration::from_secs(3);
 /// A peer-reflexive endpoint is relayed at most once per peer in this normal
@@ -278,12 +278,11 @@ const DIRECT_VALIDATION_ACK_WAIT: Duration = Duration::from_millis(750);
 /// WireGuard session. Keep the observed NAT mapping alive while waiting for the
 /// handshake instead of permanently discarding the only useful endpoint.
 ///
-/// The wait must cover the full control-plane handshake round trip (offer ->
-/// peer poll -> responder candidate refresh -> answer -> peer poll), which is
-/// deliberately longer than the bounded re-initiation cadence: a validation
-/// that gives up mid-handshake only re-fires on the next matched ACK, adding
-/// tens of seconds to convergence.
-const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(45);
+/// The wait covers a normal control-plane handshake round trip, but is bounded
+/// so an endpoint-specific validation lease cannot occupy the only validation
+/// worker for tens of seconds. Relay remains the data-plane fallback while a
+/// later authenticated observation can reopen validation.
+const DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT: Duration = Duration::from_secs(10);
 const DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL: Duration = Duration::from_millis(50);
 /// ICMP echo-request payload prefix marking a daemon-internal direct
 /// validation REQUEST. The token contains network generation (8 bytes BE),

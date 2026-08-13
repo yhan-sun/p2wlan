@@ -98,10 +98,13 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.diagnostics_disable {
         config.diagnostics.enabled = false;
     }
-    if cli.prefer_relay {
+    if cli.relay_only {
         config.relay.prefer_direct = false;
-    }
-    if cli.prefer_direct {
+    } else if cli.prefer_relay || cli.prefer_direct {
+        // Relay-first is the normal data-plane state: keep business FIFO on
+        // Relay until an encrypted Direct validation ACK promotes the path.
+        // The old implementation interpreted --prefer-relay as relay-only,
+        // which made successful Direct validation unable to switch traffic.
         config.relay.prefer_direct = true;
     }
     if cli.fresh_mapping_harness_loopback {
@@ -113,6 +116,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.disable_fresh_mapping_punch {
         config.network.fresh_mapping_punch_enabled = false;
     }
+    if cli.disable_predicted_candidates {
+        config.network.predicted_candidates_enabled = false;
+    }
     if cli.disable_birthday_probing {
         config.network.birthday_probing_enabled = false;
     }
@@ -121,6 +127,9 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     }
     if cli.overlay_any_path {
         config.network.overlay_any_path = true;
+    }
+    if cli.overlay_burst > 0 {
+        config.network.overlay_burst = cli.overlay_burst;
     }
     if let Some(ref mode) = cli.proxy_mode {
         config.control.proxy_mode = match mode.as_str() {

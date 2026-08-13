@@ -159,10 +159,6 @@ impl PathSelection {
         self
     }
 
-    pub(super) fn with_relay_hedge(mut self) -> Self {
-        self.relay_hedged = true;
-        self
-    }
 }
 
 /// Explainable score used by the path selector.

@@ -492,6 +492,31 @@ fn relay_assisted_punch_starts_slightly_before_advertised_time() {
     );
 }
 
+#[test]
+fn direct_fast_probe_window_preserves_candidate_order_and_is_bounded() {
+    let candidates = (0..32)
+        .map(|port| format!("198.51.100.10:{port}").parse::<SocketAddr>().unwrap())
+        .chain(std::iter::once("198.51.100.10:7".parse().unwrap()))
+        .collect::<Vec<_>>();
+
+    let selected = direct_fast_probe_candidates(&candidates);
+
+    assert_eq!(selected.len(), DIRECT_FAST_PROBE_MAX_CANDIDATES);
+    assert_eq!(selected, candidates[..DIRECT_FAST_PROBE_MAX_CANDIDATES]);
+    assert_eq!(
+        selected.iter().collect::<HashSet<_>>().len(),
+        DIRECT_FAST_PROBE_MAX_CANDIDATES
+    );
+}
+
+#[test]
+fn direct_fast_probe_skips_rendezvous_dependent_target_sets() {
+    assert!(direct_fast_probe_is_safe(false, false));
+    assert!(!direct_fast_probe_is_safe(true, false));
+    assert!(!direct_fast_probe_is_safe(false, true));
+    assert!(!direct_fast_probe_is_safe(true, true));
+}
+
 #[tokio::test]
 async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_session() {
     let local_identity = NodeIdentity::generate();

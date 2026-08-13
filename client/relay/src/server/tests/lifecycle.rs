@@ -6,7 +6,7 @@ async fn test_real_shutdown_lifecycle() {
         .unwrap();
     let addr = server.addr;
 
-    let (mut client, mut rx) = RelayClient::connect_verified(&addr.to_string(), "lifecycle-node")
+    let (client, mut rx) = RelayClient::connect_verified(&addr.to_string(), "lifecycle-node")
         .await
         .unwrap();
 

@@ -334,26 +334,54 @@ impl Daemon {
 
         // All state required to replay/validate the response is now staged.
         // The answer must never wait for a live STUN refresh or the ordinary
-        // candidate/endpoint lane: use the cached candidate snapshot, with a
-        // short bounded wait only when no candidates have been gathered yet.
+        // candidate/endpoint lane: use the cached candidate snapshot. If the
+        // relay transport is already available, an empty snapshot is valid and
+        // lets the encrypted session/relay probe complete before Direct
+        // candidates arrive. Candidate refresh remains a background upgrade.
         drop(handshake_guard);
         let (candidates, candidate_sources) = {
             let snapshot = self.cached_local_candidate_set().await;
-            if snapshot.0.is_empty() {
+            let mut relay_available = self.relay_available_tx.subscribe();
+            let relay_is_available = *relay_available.borrow();
+            if let Some(snapshot) = relay_first_candidate_shortcut(
+                snapshot.0,
+                snapshot.1,
+                relay_is_available,
+            ) {
+                snapshot
+            } else {
                 match cancellation.as_deref_mut() {
                     Some(cancellation) => {
                         tokio::select! {
-                            _ = self.wait_for_local_candidate_set() => {}
-                            _ = cancellation.changed() => return Ok(()),
+                            biased;
+                            changed = relay_available.changed() => {
+                                if changed.is_ok() && *relay_available.borrow() {
+                                    (Vec::new(), HashMap::new())
+                                } else {
+                                    self.wait_for_local_candidate_set().await
+                                }
+                            }
+                            candidates = self.wait_for_local_candidate_set() => candidates,
+                            changed = cancellation.changed() => {
+                                let _ = changed;
+                                return Ok(());
+                            }
                         }
                     }
                     None => {
-                        self.wait_for_local_candidate_set().await;
+                        tokio::select! {
+                            biased;
+                            changed = relay_available.changed() => {
+                                if changed.is_ok() && *relay_available.borrow() {
+                                    (Vec::new(), HashMap::new())
+                                } else {
+                                    self.wait_for_local_candidate_set().await
+                                }
+                            }
+                            candidates = self.wait_for_local_candidate_set() => candidates,
+                        }
                     }
                 }
-                self.cached_local_candidate_set().await
-            } else {
-                snapshot
             }
         };
         if cancellation

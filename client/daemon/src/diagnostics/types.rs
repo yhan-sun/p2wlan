@@ -3,6 +3,10 @@ const RELAY_SAFE_MTU: u32 = 1380;
 const WIREGUARD_STYLE_MTU: u32 = 1420;
 const COMMON_ETHERNET_MTU: u32 = 1500;
 const DIAGNOSTICS_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// A status request must fail closed when a contended runtime lock prevents a
+// complete snapshot. It must not leave the UI and acceptance harness hanging
+// indefinitely while the dataplane continues running.
+const DIAGNOSTICS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Static protocol boundary advertised by diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +138,25 @@ pub struct PeerScopedDiagnosticsSnapshot {
     pub network_peer_count: usize,
     pub captured_at_ms: u64,
     pub peer: Option<PeerDiagnostics>,
+}
+
+/// Process-scoped diagnostics used by supervisors and acceptance harnesses.
+///
+/// This endpoint deliberately avoids the network-wide peer snapshot. A busy
+/// or stale peer must not make a daemon appear dead merely because the full
+/// `/status` materialization timed out. It contains identity and readiness
+/// fields only; it must never grow to include tickets, tokens, keys, or
+/// endpoint credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeDiagnosticsSnapshot {
+    pub version: String,
+    pub process_id: u32,
+    pub node_id: String,
+    pub virtual_ip: String,
+    pub network_id: String,
+    pub network_generation: u64,
+    pub uptime_ms: u64,
+    pub relay_connected: bool,
 }
 
 /// Shared state needed to build diagnostics responses.

@@ -225,7 +225,7 @@ async fn peer_probe_rx_snapshot_does_not_cross_peer_or_generation() {
 }
 
 #[test]
-fn remote_scatter_punch_deadline_keeps_wide_sweep_alive() {
+fn remote_scatter_punch_deadline_keeps_wide_sweep_bounded() {
     let candidates: Vec<SocketAddr> = (0..831)
         .map(|i| {
             format!("203.0.113.10:{}", 40_000 + (i % 1000) as u16)
@@ -241,12 +241,12 @@ fn remote_scatter_punch_deadline_keeps_wide_sweep_alive() {
         Duration::from_secs(2),
     );
     assert!(
-        deadline >= Duration::from_secs(45),
-        "an 831-candidate remote scatter sweep must keep at least the 45s floor, got {deadline:?}"
+        deadline >= Duration::from_secs(10),
+        "an 831-candidate remote scatter sweep must retain a complete bounded window, got {deadline:?}"
     );
     assert!(
-        deadline > Duration::from_secs(24),
-        "remote scatter deadline must exceed the fixed 24s bound, got {deadline:?}"
+        deadline <= Duration::from_secs(10),
+        "a Direct recovery session must not retain the old long floor, got {deadline:?}"
     );
 }
 

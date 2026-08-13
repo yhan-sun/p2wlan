@@ -40,7 +40,8 @@ impl PeerManager {
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             timeline: std::sync::Mutex::new(None),
-            outbound_drops: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            outbound_loss_slot: Arc::new(std::sync::Mutex::new(None)),
+            outbound_loss_default: Arc::new(tokio::sync::Mutex::new(OutboundLossCounters::default())),
             config,
         }
     }
@@ -98,22 +99,76 @@ impl PeerManager {
     }
 
     /// Record dropped outbound business packets for a stable reason code so
-    /// `/status` can report queue/startup-wait loss structurally.
+    /// `/status` can report queue/startup-wait loss structurally.  Terminal
+    /// loss only: a packet that was handed to a transport (even if the remote
+    /// never got it) is not a drop here.
     pub(crate) async fn record_outbound_drop(
         &self,
         reason_code: &str,
         packets: usize,
         bytes: usize,
     ) {
-        let mut drops = self.outbound_drops.lock().await;
-        let entry = drops.entry(reason_code.to_string()).or_default();
+        let sink = self.outbound_loss_sink();
+        let mut loss = sink.lock().await;
+        let entry = loss.drops.entry(reason_code.to_string()).or_default();
         entry.packets = entry.packets.saturating_add(packets as u64);
         entry.bytes = entry.bytes.saturating_add(bytes as u64);
     }
 
-    /// Snapshot of the process-wide outbound-drop counters by reason code.
-    pub async fn outbound_drop_stats(&self) -> HashMap<String, OutboundDropCounters> {
-        self.outbound_drops.lock().await.clone()
+    /// Record a transient outbound send-failure ATTEMPT (the packet is
+    /// re-parked and retried, so it is NOT a drop).  Kept separate from
+    /// `outbound_drops` so a retried failure is observable without being
+    /// double-counted as terminal loss.  Send failures are recorded by the
+    /// WireGuard transport (which owns the shared sink), so this peer-manager
+    /// entry point currently has no production caller and stays private.
+    #[allow(dead_code)]
+    pub(crate) async fn record_outbound_send_failure(&self, reason_code: &str, attempts: usize) {
+        let sink = self.outbound_loss_sink();
+        let mut loss = sink.lock().await;
+        let entry = loss
+            .send_failures
+            .entry(reason_code.to_string())
+            .or_default();
+        entry.packets = entry.packets.saturating_add(attempts as u64);
+    }
+
+    /// The shared loss sink: the daemon's shared map when installed, the
+    /// per-manager default otherwise.
+    fn outbound_loss_sink(&self) -> Arc<tokio::sync::Mutex<OutboundLossCounters>> {
+        self.outbound_loss_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.outbound_loss_default.clone())
+    }
+
+    /// Share this peer manager's outbound-loss counters with the WireGuard
+    /// transport so session-not-ready queue loss lands in the SAME map that
+    /// `/status.stats` reads.  Installed once by the daemon before any
+    /// traffic flows.
+    pub fn set_outbound_loss_sink(&self, sink: Arc<tokio::sync::Mutex<OutboundLossCounters>>) {
+        *self
+            .outbound_loss_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    /// Snapshot of the process-wide outbound loss counters.
+    pub async fn outbound_loss_stats(&self) -> OutboundLossCounters {
+        self.outbound_loss_sink().lock().await.clone()
+    }
+
+    /// Append one structured outbound loss/send-failure event to the bounded
+    /// process ledger.  Aggregates and this ledger intentionally share the
+    /// same mutex so a status snapshot cannot observe one without the other.
+    pub(crate) async fn record_outbound_loss_event(&self, event: OutboundLossEvent) {
+        const MAX_OUTBOUND_LOSS_EVENTS: usize = 512;
+        let sink = self.outbound_loss_sink();
+        let mut loss = sink.lock().await;
+        if loss.events.len() >= MAX_OUTBOUND_LOSS_EVENTS {
+            loss.events.remove(0);
+        }
+        loss.events.push(event);
     }
 
     /// Update the latest local NAT profile used by adaptive probe scheduling.
@@ -302,10 +357,15 @@ impl PeerManager {
         }
 
         let mut direct_reclaim_count = 0usize;
+        let mut relay_confirmation_cancellations = Vec::new();
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
+            let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             conn.direct_health.record_generation_change(reason.clone());
             conn.mark_network_generation_changed(generation, reason.clone());
+            if had_relay_confirmation && conn.relay_confirmed_at.is_none() {
+                relay_confirmation_cancellations.push(conn.node_id.clone());
+            }
             if conn.state == ConnectionState::Direct {
                 conn.transition(ConnectionState::FallbackToRelay);
             }
@@ -314,6 +374,9 @@ impl PeerManager {
             }
         }
         drop(conns);
+        for peer_id in relay_confirmation_cancellations {
+            self.bump_relay_confirm_seq(&peer_id);
+        }
         self.clear_all_fresh_mappings("network_generation_changed").await;
 
         info!(
@@ -352,10 +415,15 @@ impl PeerManager {
 
         let mut retained_confirmed_direct_count = 0usize;
         let mut direct_reclaim_count = 0usize;
+        let mut relay_confirmation_cancellations = Vec::new();
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
+            let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             let retained_confirmed_direct =
                 conn.mark_candidate_refresh_generation_changed(generation, reason.clone());
+            if had_relay_confirmation && conn.relay_confirmed_at.is_none() {
+                relay_confirmation_cancellations.push(conn.node_id.clone());
+            }
             if retained_confirmed_direct {
                 retained_confirmed_direct_count += 1;
                 continue;
@@ -370,6 +438,9 @@ impl PeerManager {
             }
         }
         drop(conns);
+        for peer_id in relay_confirmation_cancellations {
+            self.bump_relay_confirm_seq(&peer_id);
+        }
         self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
 
         info!(

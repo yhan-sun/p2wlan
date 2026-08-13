@@ -737,6 +737,55 @@ async fn peer_reflexive_signal_worker_fast_punches_a_non_direct_peer() {
 }
 
 #[tokio::test]
+async fn peer_reflexive_fast_punch_does_not_block_endpoint_signal_on_ack_grace() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("node-a");
+    let observation = PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: receiver.local_addr().unwrap(),
+    };
+
+    let started = Instant::now();
+    timeout(
+        Duration::from_millis(500),
+        run_peer_reflexive_fast_punch(&udp, &peers, &observation),
+    )
+    .await
+    .expect("the fast NAT warmer must not wait for the one-second ACK grace window");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the peer-reflexive fast punch must return before its diagnostic ACK grace window"
+    );
+
+    let mut packet = [0u8; 512];
+    timeout(Duration::from_millis(250), receiver.recv_from(&mut packet))
+        .await
+        .expect("the fast punch must still send a real UDP probe")
+        .expect("the UDP receiver must accept the probe");
+}
+
+#[tokio::test]
 async fn peer_reflexive_micro_window_is_deduplicated_bounded_and_records_actual_send() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

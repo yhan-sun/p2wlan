@@ -4,10 +4,34 @@ fn direct_probe_ack_grace(probe_interval: Duration) -> Duration {
         .clamp(Duration::from_secs(1), Duration::from_secs(2))
 }
 
+/// Return a bounded, de-duplicated immediate candidate window.
+///
+/// Candidate ordering is already produced by the peer candidate selector: the
+/// first entries carry the strongest authenticated/learned evidence. The fast
+/// window intentionally does not reorder or expand that set. A later
+/// synchronized/scatter stage still owns the complete candidate coverage.
+fn direct_fast_probe_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut selected = Vec::with_capacity(DIRECT_FAST_PROBE_MAX_CANDIDATES);
+    for candidate in candidates {
+        if selected.contains(candidate) {
+            continue;
+        }
+        selected.push(*candidate);
+        if selected.len() == DIRECT_FAST_PROBE_MAX_CANDIDATES {
+            break;
+        }
+    }
+    selected
+}
+
+fn direct_fast_probe_is_safe(remote_scatter_pool: bool, stable_remote_scatter: bool) -> bool {
+    !remote_scatter_pool && !stable_remote_scatter
+}
+
 /// Hard deadline for one owned punch session.
 ///
 /// Remote-scatter sweeps cover hundreds of ports across every bound socket and
-/// need the schedule-derived deadline (floor 45s); every other session keeps
+/// need the schedule-derived deadline (bounded at 10s); every other session keeps
 /// the fixed 24s bound.
 fn punch_session_deadline(
     candidates: &[SocketAddr],

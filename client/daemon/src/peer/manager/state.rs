@@ -130,19 +130,57 @@ pub struct PeerManager {
     /// `relay_peer_confirmed`, `direct_promoted`) emit through it, no-oping
     /// when it is not installed (unit tests).
     timeline: std::sync::Mutex<Option<Arc<ConnectionTimeline>>>,
-    /// Process-wide outbound-drop counters (packets/bytes) by stable reason
-    /// code.  `/status` reports these structurally so business-packet loss is
-    /// observable without log greps.
-    outbound_drops: Arc<tokio::sync::Mutex<HashMap<String, OutboundDropCounters>>>,
+    /// Process-wide outbound loss counters: terminal DROPS (packets/bytes) by
+    /// stable reason code plus observable send-failure ATTEMPTS.  `/status`
+    /// reports both structurally so business-packet loss is observable
+    /// without log greps.  The daemon shares the SAME sink with the WireGuard
+    /// transport (session-not-ready queue loss) so one `/status.stats` shows
+    /// every loss source.
+    outbound_loss_slot: Arc<
+        std::sync::Mutex<Option<Arc<tokio::sync::Mutex<OutboundLossCounters>>>>,
+    >,
+    outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
     /// Configuration.
     config: Config,
 }
 
-/// Aggregate counter of dropped outbound business packets for one reason code.
+/// Aggregate counter of lost outbound business packets for one reason code.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutboundDropCounters {
     pub packets: u64,
     pub bytes: u64,
+}
+
+/// Shared outbound loss accounting: terminal drops by reason code plus
+/// transient send-failure attempts (never double-counted with drops).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OutboundLossCounters {
+    /// Packets that were TERMINALLY dropped (never handed to a transport).
+    pub drops: HashMap<String, OutboundDropCounters>,
+    /// Transient send attempts that failed (the packet was re-parked and
+    /// retried; a later terminal drop lands in `drops`, never both).
+    pub send_failures: HashMap<String, OutboundDropCounters>,
+    /// Bounded event ledger for answering which peer/generation lost or
+    /// retried a packet.  The aggregate maps above remain for inexpensive
+    /// counters, while this ledger carries the correlation and time data
+    /// needed by the acceptance harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<OutboundLossEvent>,
+}
+
+/// One structured outbound-loss or send-failure event.  Every production
+/// dataplane event has a peer, generation, stable reason, byte/packet counts,
+/// and the daemon timeline correlation id; there is no log-only loss path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutboundLossEvent {
+    pub kind: String,
+    pub peer_id: String,
+    pub generation: u64,
+    pub reason_code: String,
+    pub packets: u64,
+    pub bytes: u64,
+    pub correlation_id: String,
+    pub at_ms: u64,
 }
 
 /// Metadata changes observed while applying one control-plane peer snapshot.

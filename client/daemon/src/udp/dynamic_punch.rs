@@ -1181,6 +1181,7 @@ impl UdpTransport {
     /// Used by the synchronized punch flow after a fresh-mapping generation,
     /// so the predictable mapping socket carries the whole candidate sweep
     /// while the other pool sockets stay untouched.
+    #[allow(dead_code)]
     pub(crate) async fn punch_candidates_from_dynamic_socket(
         &self,
         peer_id: &str,
