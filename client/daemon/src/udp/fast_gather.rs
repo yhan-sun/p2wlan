@@ -18,6 +18,37 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<CandidateGatherReport> {
+        // Startup must not wait for the slowest configured observer.  The
+        // caller publishes this bounded report immediately; the regular
+        // candidate-refresh loop performs the same parallel gather with the
+        // full configured timeout right afterwards, so a slow observer can
+        // enrich later signals without delaying relay-first or Direct.
+        self.gather_candidate_report_live_parallel_with_timeout(
+            stun_servers,
+            stun_timeout.min(crate::DIRECT_STARTUP_STUN_TIMEOUT),
+        )
+        .await
+    }
+
+    /// Gather the candidate set with the caller's complete observer timeout.
+    ///
+    /// This is used after the bounded startup window to obtain the full NAT
+    /// profile without serializing observers or stealing encrypted datagrams
+    /// from the inbound reader.
+    pub async fn gather_candidate_report_live_parallel_full(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
+        self.gather_candidate_report_live_parallel_with_timeout(stun_servers, stun_timeout)
+            .await
+    }
+
+    async fn gather_candidate_report_live_parallel_with_timeout(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
         let local_addr = self.local_addr()?;
         let primary_servers = stun_servers
             .iter()
@@ -74,6 +105,11 @@ impl UdpTransport {
             }
         }
 
+        if !self.peers.predicted_candidates_enabled_for_gather() {
+            report
+                .candidates
+                .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
+        }
         Ok(report)
     }
 }

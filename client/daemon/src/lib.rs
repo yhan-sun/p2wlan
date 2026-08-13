@@ -162,6 +162,11 @@ const RESPONDER_HANDSHAKE_CACHE_TTL: Duration = Duration::from_secs(120);
 /// refresh publishes/trickles UDP candidates later, so a slow STUN or gateway
 /// probe must not hold the WireGuard session hostage for several seconds.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 300;
+/// The first UDP candidate window is a latency-sensitive hint, not the final
+/// NAT diagnosis.  Bound each observer wait so one silent STUN endpoint
+/// cannot delay the first public candidate and the first Direct punch.  The
+/// normal refresh immediately follows with the configured full timeout.
+const DIRECT_STARTUP_STUN_TIMEOUT: Duration = Duration::from_millis(350);
 /// Hard cap for the post-answer candidate refresh and endpoint publish.  The
 /// answer itself never waits for this work; the bound only limits how long the
 /// per-peer responder slot can be occupied by the best-effort refresh.

@@ -1,4 +1,12 @@
 impl PeerManager {
+    /// Whether startup/live candidate gathering may advertise extrapolated
+    /// server-reflexive endpoints.  Keep this accessor in the core manager
+    /// implementation so fast startup gathering does not depend on any
+    /// experimental fresh-mapping worktree file.
+    pub(crate) fn predicted_candidates_enabled_for_gather(&self) -> bool {
+        self.config.network.predicted_candidates_enabled
+    }
+
     /// Create a new peer manager.
     pub fn new(config: Config) -> Self {
         let history_path = traversal_history_path(&config);

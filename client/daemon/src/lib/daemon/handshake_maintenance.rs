@@ -382,7 +382,7 @@ async fn refresh_candidate_cache_for_maintenance_signal(
     }
     let stun_timeout = *runtime_stun_timeout.read().await;
     let report = match udp
-        .gather_candidate_report_live(stun_servers, stun_timeout)
+        .gather_candidate_report_live_parallel(stun_servers, stun_timeout)
         .await
     {
         Ok(report) => report,

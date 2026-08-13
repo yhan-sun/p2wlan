@@ -316,7 +316,7 @@ impl Daemon {
         }
         let stun_timeout = *self.runtime_stun_timeout.read().await;
         let report = match udp
-            .gather_candidate_report_live(stun_servers, stun_timeout)
+            .gather_candidate_report_live_parallel(stun_servers, stun_timeout)
             .await
         {
             Ok(report) => report,

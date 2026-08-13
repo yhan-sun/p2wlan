@@ -244,6 +244,43 @@ async fn parallel_live_stun_gather_does_not_sum_observer_delays() {
 }
 
 #[tokio::test]
+async fn startup_parallel_gather_caps_silent_observer_wait() {
+    let peers = peer_manager();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_worker = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (_n, _client_addr) = server.recv_from(&mut buf).await.unwrap();
+        // The startup gather must return before this response arrives. Keep
+        // the worker alive so the request/reader cleanup remains exercised.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    });
+
+    let started = Instant::now();
+    let report = transport
+        .gather_candidate_report_live_parallel(vec![server_addr], Duration::from_secs(2))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "startup gather waited too long for a silent observer: {elapsed:?}"
+    );
+    assert_eq!(report.nat_profile.observations.len(), 1);
+    assert!(report.nat_profile.observations[0].error.is_some());
+
+    server_worker.await.unwrap();
+    inbound_worker.abort();
+}
+
+#[tokio::test]
 async fn run_inbound_acks_punch_and_does_not_forward_to_wireguard() {
     let peers = peer_manager();
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();

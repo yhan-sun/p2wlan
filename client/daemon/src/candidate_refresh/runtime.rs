@@ -122,7 +122,6 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         boot_epoch_ms,
     } = context;
     let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
-    ticker.tick().await;
     let mut pending_volatile: Option<VolatileCandidatePublish> = None;
     let mut volatile_coalescer = VolatilePublishCoalescer::default();
 
@@ -172,7 +171,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let refresh_guard = candidate_refresh_lock.lock().await;
 
         let report = match udp
-            .gather_candidate_report_live(stun_servers.clone(), stun_timeout)
+            .gather_candidate_report_live_parallel_full(stun_servers.clone(), stun_timeout)
             .await
         {
             Ok(report) => report,
