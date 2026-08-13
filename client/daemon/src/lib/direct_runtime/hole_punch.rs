@@ -807,6 +807,12 @@ async fn spawn_hole_punch_task(
                 if has_frozen {
                     fast_prediction_candidates = pending.frozen_targets.clone().unwrap_or_default();
                     is_frozen_prediction_window = true;
+                } else {
+                    // A newer ordinary refresh supersedes the original
+                    // prediction target. Never let the old frozen window leak
+                    // into the fast prefix of the replacement session.
+                    fast_prediction_candidates.clear();
+                    is_frozen_prediction_window = false;
                 }
                 let frozen = if has_frozen {
                     pending.frozen_targets
