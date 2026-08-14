@@ -47,6 +47,13 @@ pub struct PeerDiagnostics {
     /// being mistaken for one continuous proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_confirmed_connection_id: Option<u64>,
+    /// The two same-generation relay-first business-direction gates.  Direct
+    /// may be confirmed in the background, but it is not active until both
+    /// have been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_business_sent_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_business_received_generation: Option<u64>,
     /// Path that became first usable for this peer (`Relay` or `Direct`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_usable_path: Option<NetworkPath>,
@@ -133,7 +140,8 @@ impl PeerDiagnostics {
         let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
             || conn.relay_first_gate_generation == Some(local_generation))
             && relay_peer_confirmed
-            && conn.relay_first_business_sent_generation != Some(local_generation);
+            && (conn.relay_first_business_sent_generation != Some(local_generation)
+                || conn.relay_first_business_received_generation != Some(local_generation));
         let confirmed_direct_active =
             confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
         let mut active_path = match current_selection {
@@ -300,6 +308,8 @@ impl PeerDiagnostics {
             relay_confirmed_endpoint: conn.relay_confirmed_endpoint.clone(),
             relay_confirmed_generation: conn.relay_confirmed_generation,
             relay_confirmed_connection_id: conn.relay_confirmed_connection_id,
+            relay_first_business_sent_generation: conn.relay_first_business_sent_generation,
+            relay_first_business_received_generation: conn.relay_first_business_received_generation,
             first_usable_path: conn.first_usable_path,
             first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(

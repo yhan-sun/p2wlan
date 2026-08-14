@@ -248,6 +248,30 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Whether a candidate endpoint has recently returned an authenticated
+    /// but too-slow ACK in the current generation.  This is intentionally a
+    /// point query used by the UDP sender immediately before emission: target
+    /// planning can race a late ACK, so filtering only at plan construction
+    /// still allows the already-built sweep to keep sending into the delayed
+    /// mapping.
+    pub(crate) async fn direct_probe_endpoint_quarantined(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+    ) -> bool {
+        if generation != self.current_network_generation_sync() {
+            return true;
+        }
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|conn| {
+                conn.direct_probe_endpoint_quarantined(endpoint, generation, Instant::now())
+            })
+    }
+
     /// Whether this IP is known as a peer public candidate before any packet
     /// content is parsed.
     ///

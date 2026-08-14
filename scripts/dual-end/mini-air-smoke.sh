@@ -45,6 +45,18 @@ VALIDATE_OVERLAY=${VALIDATE_OVERLAY:-0}
 REAL_TUN=${REAL_TUN:-0}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-12}
 AUTHORIZATION_WAIT_S=${AUTHORIZATION_WAIT_S:-180}
+# Keep one run-scoped Authorization Services helper alive so repeated
+# cold-start rounds do not open a password sheet for every daemon launch or
+# teardown.  This does not change the round lifecycle: each round still stops
+# the exact daemon and starts a fresh process/config/device.
+PRIVILEGED_SUPERVISOR=${PRIVILEGED_SUPERVISOR:-0}
+# Optional cross-run mode for unattended staging batches.  The broker remains
+# an explicitly opt-in, user-owned FIFO endpoint and is never enabled by
+# default.  It survives this harness process (and normal sleep), so a later
+# run can reuse the one-time Authorization Services grant without asking the
+# operator for another password.  It is intentionally not a production
+# service and is not installed into launchd or system configuration.
+PERSIST_PRIVILEGED_SUPERVISOR=${PERSIST_PRIVILEGED_SUPERVISOR:-0}
 STUN_SERVERS=${STUN_SERVERS:-"stun.cloudflare.com:3478,stun.l.google.com:19302,stun.miwifi.com:3478"}
 P2WLAN_NETWORK_OR_TENANT=${P2WLAN_NETWORK_OR_TENANT:-}
 NETWORK_ID=${NETWORK_ID:-${P2WLAN_NETWORK_OR_TENANT:-}}
@@ -109,6 +121,24 @@ case "$ALLOW_SHARED_NETWORK" in
     exit 2
     ;;
 esac
+case "$PRIVILEGED_SUPERVISOR" in
+  0|1) ;;
+  *)
+    echo "[mini-air] PRIVILEGED_SUPERVISOR must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+case "$PERSIST_PRIVILEGED_SUPERVISOR" in
+  0|1) ;;
+  *)
+    echo "[mini-air] PERSIST_PRIVILEGED_SUPERVISOR must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" && "$PRIVILEGED_SUPERVISOR" != "1" ]]; then
+  echo "[mini-air] PERSIST_PRIVILEGED_SUPERVISOR=1 requires PRIVILEGED_SUPERVISOR=1" >&2
+  exit 2
+fi
 if [[ -z "$NETWORK_ID" ]]; then
   echo "[mini-air] NETWORK_ID (or P2WLAN_NETWORK_OR_TENANT) is required and must match on Mini and Air" >&2
   exit 2
@@ -159,6 +189,14 @@ if [[ ! "$AIR_CONSOLE_UID" =~ ^[0-9]+$ ]]; then
   AIR_CONSOLE_UID="$AIR_LOGIN_UID"
 fi
 
+# Stable, private locations used only when cross-run supervisor reuse is
+# explicitly requested.  /tmp is cleared by a reboot, which is desirable:
+# the authorization must be re-established after a machine restart instead of
+# silently becoming a long-lived system service.  Directory permissions are
+# checked before an existing broker is reused.
+LOCAL_PERSISTENT_SUPERVISOR_DIR=${P2WLAN_LOCAL_SUPERVISOR_DIR:-"/tmp/p2wlan-real-tun-supervisor-$(id -u)"}
+REMOTE_PERSISTENT_SUPERVISOR_DIR=${P2WLAN_REMOTE_SUPERVISOR_DIR:-"/tmp/p2wlan-real-tun-supervisor-$AIR_LOGIN_UID"}
+
 # Run a remote shell fragment through macOS Authorization Services without
 # putting the Air password in a command argument, log, or artifact. The
 # fragment is sent as base64 over the already-authenticated SSH channel and is
@@ -201,21 +239,14 @@ local_osascript_shell() {
   local local_command=$1
   local encoded
   encoded=$(printf '%s' "$local_command" | /usr/bin/base64 | tr -d '\n')
-  local console_uid
-  console_uid=$(/usr/bin/stat -f '%u' /dev/console 2>/dev/null || true)
-  # Use the plain Authorization Services form: it is the same global dialog
-  # that the user has already approved manually.  Extra Terminal automation
-  # can fail with AppleScript status 1 before the daemon command is reached.
-  # Keep this synchronous so startup/cleanup observe the privileged fragment's
-  # completion status; the password is never put in a shell argument, file, or
-  # artifact.
-  if [[ "$console_uid" =~ ^[0-9]+$ ]]; then
-    /bin/launchctl asuser "$console_uid" /usr/bin/osascript \
-      -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
-  else
-    /usr/bin/osascript \
-      -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
-  fi
+  # Invoke osascript directly from the user's GUI session so Authorization
+  # Services presents the global password sheet.  `launchctl asuser` is needed
+  # for Air over SSH, but using it locally can leave the sheet detached from
+  # the visible console even though osascript eventually returns.  Keep this
+  # synchronous so startup/cleanup observe the privileged fragment's status;
+  # the password is never put in a shell argument, file, or artifact.
+  /usr/bin/osascript \
+    -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
 }
 
 local_osascript_shell_launch() {
@@ -264,6 +295,256 @@ local_osascript_shell_launch() {
   return 1
 }
 
+# Run-scoped privilege broker.  The only privileged process kept alive is a
+# FIFO reader created by Authorization Services once per endpoint.  Daemon
+# START/STOP payloads are base64-framed and generated by this script; no
+# password, token, ticket, or Authorization header crosses the FIFO.  The
+# broker is deliberately opt-in because it is only useful for real-TUN runs.
+local_privileged_supervisor_reuse_existing() {
+  [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]] || return 1
+  local owner mode fifo_mode pid_mode ready_mode supervisor_pid
+  owner=$(stat -f '%Su' "$LOCAL_PRIVILEGED_SUPERVISOR_DIR" 2>/dev/null || true)
+  mode=$(stat -f '%Lp' "$LOCAL_PRIVILEGED_SUPERVISOR_DIR" 2>/dev/null || true)
+  fifo_mode=$(stat -f '%Lp' "$LOCAL_PRIVILEGED_SUPERVISOR_FIFO" 2>/dev/null || true)
+  pid_mode=$(stat -f '%Lp' "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" 2>/dev/null || true)
+  ready_mode=$(stat -f '%Lp' "$LOCAL_PRIVILEGED_SUPERVISOR_READY" 2>/dev/null || true)
+  if [[ "$owner" != "$(id -un)" || "$mode" != "700" ||
+        ! -p "$LOCAL_PRIVILEGED_SUPERVISOR_FIFO" || "$fifo_mode" != "600" ||
+        ! -s "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" || "$pid_mode" != "600" ||
+        ! -s "$LOCAL_PRIVILEGED_SUPERVISOR_READY" || "$ready_mode" != "600" ||
+        "$(tr -d '\n' <"$LOCAL_PRIVILEGED_SUPERVISOR_READY" 2>/dev/null || true)" != "ready" ]]; then
+    echo "[mini-air] refusing to reuse incomplete or unsafe persistent Mini supervisor state: $LOCAL_PRIVILEGED_SUPERVISOR_DIR" >&2
+    return 1
+  fi
+  supervisor_pid=$(tr -d '\n' <"$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" 2>/dev/null || true)
+  case "$supervisor_pid" in
+    ''|*[!0-9]*)
+      echo "[mini-air] refusing to reuse persistent Mini supervisor with invalid PID state" >&2
+      return 1
+      ;;
+  esac
+  if ! ps -p "$supervisor_pid" -o pid= >/dev/null 2>&1; then
+    echo "[mini-air] persistent Mini supervisor state is stale; refusing to delete or replace it: $LOCAL_PRIVILEGED_SUPERVISOR_DIR" >&2
+    return 1
+  fi
+  LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=1
+  echo "[mini-air] reusing persistent Mini REAL_TUN supervisor; no new authorization dialog" >&2
+  return 0
+}
+
+local_privileged_supervisor_start() {
+  [[ "$PRIVILEGED_SUPERVISOR" == "1" && "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]] || return 0
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" && -e "$LOCAL_PRIVILEGED_SUPERVISOR_DIR" ]]; then
+    local_privileged_supervisor_reuse_existing
+    return $?
+  fi
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" != "1" &&
+        ( -e "$LOCAL_PRIVILEGED_SUPERVISOR_FIFO" || -e "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" || -e "$LOCAL_PRIVILEGED_SUPERVISOR_READY" ) ]]; then
+    echo "[mini-air] refusing to reuse local privileged supervisor files" >&2
+    return 1
+  fi
+  mkdir -m 700 "$LOCAL_PRIVILEGED_SUPERVISOR_DIR"
+  mkfifo -m 600 "$LOCAL_PRIVILEGED_SUPERVISOR_FIFO"
+  : >"$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE"
+  : >"$LOCAL_PRIVILEGED_SUPERVISOR_READY"
+  chmod 600 "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" "$LOCAL_PRIVILEGED_SUPERVISOR_READY"
+
+  local supervisor_script script_q fifo_q pid_q ready_q start_command
+  IFS= read -r -d '' supervisor_script <<'SUPERVISOR' || true
+exec 3<> "$P2WLAN_PRIV_FIFO"
+printf '%s\n' "$$" > "$P2WLAN_PRIV_PID"
+printf 'ready\n' > "$P2WLAN_PRIV_READY"
+while IFS= read -r line <&3; do
+  case "$line" in
+    EXEC:*)
+      payload="${line#EXEC:}"
+      printf '%s' "$payload" | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &
+      ;;
+    STOP:*)
+      target="${line#STOP:}"
+      case "$target" in
+        ''|*[!0-9]*) ;;
+        *) kill -TERM "$target" 2>/dev/null || true; sleep 1; kill -KILL "$target" 2>/dev/null || true ;;
+      esac
+      ;;
+    EXIT) exit 0 ;;
+  esac
+done
+SUPERVISOR
+  printf -v script_q '%q' "$supervisor_script"
+  printf -v fifo_q '%q' "$LOCAL_PRIVILEGED_SUPERVISOR_FIFO"
+  printf -v pid_q '%q' "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE"
+  printf -v ready_q '%q' "$LOCAL_PRIVILEGED_SUPERVISOR_READY"
+  # Authorization Services rejects nohup here (no controlling TTY), while
+  # explicit stdio redirection already gives the detached helper a stable
+  # lifetime.
+  start_command="P2WLAN_PRIV_FIFO=$fifo_q P2WLAN_PRIV_PID=$pid_q P2WLAN_PRIV_READY=$ready_q /bin/sh -c $script_q </dev/null >/dev/null 2>&1 &"
+  echo "[mini-air] requesting one Mini REAL_TUN authorization for this entire run" >&2
+  if ! local_osascript_shell "$start_command" >/dev/null 2>&1; then
+    echo "[mini-air] Mini privileged supervisor authorization failed" >&2
+    return 1
+  fi
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
+    if [[ -s "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" && -s "$LOCAL_PRIVILEGED_SUPERVISOR_READY" ]]; then
+      LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=1
+      if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+        echo "[mini-air] Mini persistent privileged supervisor ready; later runs reuse this authorization" >&2
+      else
+        echo "[mini-air] Mini privileged supervisor ready; later rounds reuse this authorization" >&2
+      fi
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[mini-air] Mini privileged supervisor did not become ready" >&2
+  return 1
+}
+
+remote_privileged_supervisor_reuse_existing() {
+  [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]] || return 1
+  if $AIR_SSH "dir='$REMOTE_PRIVILEGED_SUPERVISOR_DIR'; fifo='$REMOTE_PRIVILEGED_SUPERVISOR_FIFO'; pid_file='$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE'; ready='$REMOTE_PRIVILEGED_SUPERVISOR_READY'; test -d \"\$dir\"; test \"\$(stat -f '%Su' \"\$dir\")\" = '$AIR_USER'; test \"\$(stat -f '%Lp' \"\$dir\")\" = 700; test -p \"\$fifo\"; test \"\$(stat -f '%Lp' \"\$fifo\")\" = 600; test -s \"\$pid_file\"; test \"\$(stat -f '%Lp' \"\$pid_file\")\" = 600; test -s \"\$ready\"; test \"\$(stat -f '%Lp' \"\$ready\")\" = 600; test \"\$(tr -d '\\n' < \"\$ready\")\" = ready; pid=\$(tr -d '\\n' < \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 1;; esac; ps -p \"\$pid\" -o pid= >/dev/null 2>&1" >/dev/null 2>&1; then
+    REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=1
+    echo "[mini-air] reusing persistent Air REAL_TUN supervisor; no new authorization dialog" >&2
+    return 0
+  fi
+  echo "[mini-air] persistent Air supervisor state is missing, unsafe or stale; refusing to delete or replace it: $REMOTE_PRIVILEGED_SUPERVISOR_DIR" >&2
+  return 1
+}
+
+remote_privileged_supervisor_start() {
+  [[ "$PRIVILEGED_SUPERVISOR" == "1" && "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]] || return 0
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+    if $AIR_SSH "test -e '$REMOTE_PRIVILEGED_SUPERVISOR_DIR'" >/dev/null 2>&1; then
+      remote_privileged_supervisor_reuse_existing
+      return $?
+    fi
+  fi
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" != "1" ]] && ! $AIR_SSH "if test -e '$REMOTE_PRIVILEGED_SUPERVISOR_FIFO' || test -e '$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE' || test -e '$REMOTE_PRIVILEGED_SUPERVISOR_READY'; then exit 1; fi"; then
+    echo "[mini-air] refusing to reuse or create Air privileged supervisor files" >&2
+    return 1
+  fi
+  if ! $AIR_SSH "umask 077; mkdir -m 700 '$REMOTE_PRIVILEGED_SUPERVISOR_DIR'; mkfifo -m 600 '$REMOTE_PRIVILEGED_SUPERVISOR_FIFO'; : > '$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE'; : > '$REMOTE_PRIVILEGED_SUPERVISOR_READY'; chmod 600 '$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE' '$REMOTE_PRIVILEGED_SUPERVISOR_READY'"; then
+    echo "[mini-air] could not create Air privileged supervisor state" >&2
+    return 1
+  fi
+
+  local supervisor_script script_q fifo_q pid_q ready_q start_command
+  IFS= read -r -d '' supervisor_script <<'SUPERVISOR' || true
+exec 3<> "$P2WLAN_PRIV_FIFO"
+printf '%s\n' "$$" > "$P2WLAN_PRIV_PID"
+printf 'ready\n' > "$P2WLAN_PRIV_READY"
+while IFS= read -r line <&3; do
+  case "$line" in
+    EXEC:*)
+      payload="${line#EXEC:}"
+      printf '%s' "$payload" | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &
+      ;;
+    STOP:*)
+      target="${line#STOP:}"
+      case "$target" in
+        ''|*[!0-9]*) ;;
+        *) kill -TERM "$target" 2>/dev/null || true; sleep 1; kill -KILL "$target" 2>/dev/null || true ;;
+      esac
+      ;;
+    EXIT) exit 0 ;;
+  esac
+done
+SUPERVISOR
+  printf -v script_q '%q' "$supervisor_script"
+  printf -v fifo_q '%q' "$REMOTE_PRIVILEGED_SUPERVISOR_FIFO"
+  printf -v pid_q '%q' "$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE"
+  printf -v ready_q '%q' "$REMOTE_PRIVILEGED_SUPERVISOR_READY"
+  start_command="P2WLAN_PRIV_FIFO=$fifo_q P2WLAN_PRIV_PID=$pid_q P2WLAN_PRIV_READY=$ready_q /bin/sh -c $script_q </dev/null >/dev/null 2>&1 &"
+  echo "[mini-air] requesting one Air REAL_TUN authorization for this entire run" >&2
+  if ! remote_osascript_shell "$start_command" >/dev/null 2>&1; then
+    echo "[mini-air] Air privileged supervisor authorization failed" >&2
+    return 1
+  fi
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
+    if $AIR_SSH "test -s '$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE' && test -s '$REMOTE_PRIVILEGED_SUPERVISOR_READY'" >/dev/null 2>&1; then
+      REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=1
+      if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+        echo "[mini-air] Air persistent privileged supervisor ready; later runs reuse this authorization" >&2
+      else
+        echo "[mini-air] Air privileged supervisor ready; later rounds reuse this authorization" >&2
+      fi
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[mini-air] Air privileged supervisor did not become ready" >&2
+  return 1
+}
+
+local_privileged_exec() {
+  [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] || return 1
+  local payload
+  payload=$(printf '%s' "$1" | /usr/bin/base64 | tr -d '\n')
+  printf 'EXEC:%s\n' "$payload" >"$LOCAL_PRIVILEGED_SUPERVISOR_FIFO"
+}
+
+remote_privileged_exec() {
+  [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] || return 1
+  local payload
+  payload=$(printf '%s' "$1" | /usr/bin/base64 | tr -d '\n')
+  $AIR_SSH "printf 'EXEC:%s\\n' '$payload' > '$REMOTE_PRIVILEGED_SUPERVISOR_FIFO'"
+}
+
+wait_for_local_pid_file() {
+  local pid_file=$1
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
+    [[ -s "$pid_file" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_remote_pid_file() {
+  local pid_file=$1
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
+    $AIR_SSH "test -s '$pid_file'" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+local_privileged_stop_supervisor() {
+  [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] || return 0
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+    echo "[mini-air] keeping persistent Mini REAL_TUN supervisor for the next run" >&2
+    LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=0
+    return 0
+  fi
+  printf 'EXIT\n' >"$LOCAL_PRIVILEGED_SUPERVISOR_FIFO" || true
+  for _ in {1..20}; do
+    if ! ps -p "$(cat "$LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE" 2>/dev/null || true)" -o pid= >/dev/null 2>&1; then break; fi
+    sleep 0.1
+  done
+  LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=0
+}
+
+remote_privileged_stop_supervisor() {
+  [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] || return 0
+  if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+    echo "[mini-air] keeping persistent Air REAL_TUN supervisor for the next run" >&2
+    REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=0
+    return 0
+  fi
+  $AIR_SSH "printf 'EXIT\\n' > '$REMOTE_PRIVILEGED_SUPERVISOR_FIFO'" >/dev/null 2>&1 || true
+  local supervisor_pid
+  supervisor_pid=$($AIR_SSH "cat '$REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE' 2>/dev/null || true")
+  for _ in {1..20}; do
+    if ! $AIR_SSH "test -n '$supervisor_pid' && ps -p '$supervisor_pid' -o pid= >/dev/null 2>&1" >/dev/null 2>&1; then break; fi
+    sleep 0.1
+  done
+  REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=0
+}
+
+stop_privileged_supervisors() {
+  remote_privileged_stop_supervisor
+  local_privileged_stop_supervisor
+}
+
 stop_auth_helpers() {
   local pid
   for pid in $LOCAL_AUTH_HELPER_PIDS $REMOTE_AUTH_HELPER_PIDS; do
@@ -282,11 +563,18 @@ if [[ "$REAL_TUN" == "1" ]]; then
     LOCAL_DAEMON_NEEDS_OSASCRIPT=1
   fi
   if [[ "$AIR_LOGIN_UID" != "0" ]]; then
-    if ! remote_osascript_shell 'test "$(id -u)" = 0' >/dev/null 2>&1; then
-      echo "[mini-air] REAL_TUN=1 could not obtain Air root through macOS Authorization Services" >&2
-      exit 2
+    if [[ "$PRIVILEGED_SUPERVISOR" == "1" ]]; then
+      # The supervisor startup below is the single authorization boundary for
+      # this run.  Do not perform a separate root probe here, otherwise the
+      # user would receive an unnecessary second Air password dialog.
+      AIR_REMOTE_NEEDS_OSASCRIPT=1
+    else
+      if ! remote_osascript_shell 'test "$(id -u)" = 0' >/dev/null 2>&1; then
+        echo "[mini-air] REAL_TUN=1 could not obtain Air root through macOS Authorization Services" >&2
+        exit 2
+      fi
+      AIR_REMOTE_NEEDS_OSASCRIPT=1
     fi
-    AIR_REMOTE_NEEDS_OSASCRIPT=1
   fi
 fi
 
@@ -436,6 +724,21 @@ REMOTE_NODE_B_DEVICE=""
 REMOTE_NODE_B_TOKEN_FILE=""
 LOCAL_AUTH_HELPER_PIDS=""
 REMOTE_AUTH_HELPER_PIDS=""
+LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=0
+REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=0
+if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
+  LOCAL_PRIVILEGED_SUPERVISOR_DIR="$LOCAL_PERSISTENT_SUPERVISOR_DIR"
+  REMOTE_PRIVILEGED_SUPERVISOR_DIR="$REMOTE_PERSISTENT_SUPERVISOR_DIR"
+else
+  LOCAL_PRIVILEGED_SUPERVISOR_DIR="$LOCAL_RUN_DIR/privileged-supervisor"
+  REMOTE_PRIVILEGED_SUPERVISOR_DIR="$REMOTE_RUN_DIR/privileged-supervisor"
+fi
+LOCAL_PRIVILEGED_SUPERVISOR_FIFO="$LOCAL_PRIVILEGED_SUPERVISOR_DIR/commands"
+LOCAL_PRIVILEGED_SUPERVISOR_PID_FILE="$LOCAL_PRIVILEGED_SUPERVISOR_DIR/supervisor.pid"
+LOCAL_PRIVILEGED_SUPERVISOR_READY="$LOCAL_PRIVILEGED_SUPERVISOR_DIR/ready"
+REMOTE_PRIVILEGED_SUPERVISOR_FIFO="$REMOTE_PRIVILEGED_SUPERVISOR_DIR/commands"
+REMOTE_PRIVILEGED_SUPERVISOR_PID_FILE="$REMOTE_PRIVILEGED_SUPERVISOR_DIR/supervisor.pid"
+REMOTE_PRIVILEGED_SUPERVISOR_READY="$REMOTE_PRIVILEGED_SUPERVISOR_DIR/ready"
 DIRECT_BLACKHOLE_ANCHOR="com.apple/p2wlan-${RUN_ID//[^A-Za-z0-9_.-]/-}"
 DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
 DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
@@ -1200,6 +1503,7 @@ cleanup() {
   local_daemon_cleanup || true
   remote_daemon_cleanup || true
   redact_local_config || true
+  stop_privileged_supervisors
   if [[ -n "$REMOTE_NODE_B_PID_FILE" ]]; then
     echo "[mini-air] remote PID file retained after cleanup verification failure: $REMOTE_NODE_B_PID_FILE" >&2
   fi
@@ -1217,7 +1521,9 @@ redact_local_config() {
     # config files are truncated after the run, never recursively removed.
     cleanup_command+="if [ -e '$file' ]; then : > '$file'; fi; "
   done
-  if [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
+  if [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+    local_privileged_exec "$cleanup_command" >/dev/null 2>&1 || true
+  elif [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
     local_osascript_shell "$cleanup_command" >/dev/null 2>&1 || true
   else
     /bin/sh -c "$cleanup_command" || true
@@ -1242,7 +1548,12 @@ local_daemon_cleanup() {
       echo "[mini-air] Mini privileged cleanup verification failed; PID retained: $privileged_pid" >&2
       return 1
     fi
-    if ! local_osascript_shell "kill -TERM '$privileged_pid' 2>/dev/null || true; sleep 1; if kill -0 '$privileged_pid' 2>/dev/null; then kill -KILL '$privileged_pid' 2>/dev/null || true; fi" >/dev/null 2>&1; then
+    if [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+      if ! local_privileged_exec "kill -TERM '$privileged_pid' 2>/dev/null || true; sleep 1; if kill -0 '$privileged_pid' 2>/dev/null; then kill -KILL '$privileged_pid' 2>/dev/null || true; fi" >/dev/null 2>&1; then
+        echo "[mini-air] Mini privileged supervisor cleanup failed; PID retained: $privileged_pid" >&2
+        return 1
+      fi
+    elif ! local_osascript_shell "kill -TERM '$privileged_pid' 2>/dev/null || true; sleep 1; if kill -0 '$privileged_pid' 2>/dev/null; then kill -KILL '$privileged_pid' 2>/dev/null || true; fi" >/dev/null 2>&1; then
       echo "[mini-air] Mini privileged cleanup authorization failed; PID retained: $privileged_pid" >&2
       return 1
     fi
@@ -1306,7 +1617,8 @@ remote_daemon_matches() {
 remote_daemon_cleanup() {
   [[ -n "$REMOTE_NODE_B_PID_FILE" ]] || return 0
   local cleanup_command="pid_file='$REMOTE_NODE_B_PID_FILE'; config='$AIR_CONFIG'; token_file='$REMOTE_NODE_B_TOKEN_FILE'; device='$REMOTE_NODE_B_DEVICE'; bin='$REMOTE_DAEMON_BIN'; run_id='$RUN_ID'; case \"\$pid_file:\$config:\$device:\$bin\" in *\"\$run_id\"*) ;; *) exit 3 ;; esac; if [ ! -r \"\$pid_file\" ]; then exit 3; fi; pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 3 ;; esac; cmd=\$(ps -ww -p \"\$pid\" -o command= 2>/dev/null) || exit 3; case \"\$cmd\" in *\"\$bin\"*\"\$config\"*\"\$device\"*) kill -TERM \"\$pid\" 2>/dev/null || true; sleep 1; if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null || true; fi; for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 \"\$pid\" 2>/dev/null || break; sleep 0.1; done; kill -0 \"\$pid\" 2>/dev/null && exit 4; : >\"\$pid_file\"; : >\"\$token_file\"; : >\"\$config\" ;; *) exit 3 ;; esac"
-  if { [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]] && remote_osascript_shell "$cleanup_command" >/dev/null 2>&1; } ||
+  if { [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] && remote_privileged_exec "$cleanup_command" >/dev/null 2>&1; } ||
+     { [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" != "1" && "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]] && remote_osascript_shell "$cleanup_command" >/dev/null 2>&1; } ||
      { [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" != "1" ]] && $AIR_SSH "$cleanup_command" >/dev/null 2>&1; }; then
     REMOTE_NODE_B_PID_FILE=""
     return 0
@@ -1317,11 +1629,19 @@ remote_daemon_cleanup() {
 
 clear_direct_udp_blackhole() {
   if [[ "$DIRECT_BLACKHOLE_LOCAL_ACTIVE" == "1" ]]; then
-    local_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    if [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+      local_privileged_exec "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    else
+      local_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    fi
     DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
   fi
   if [[ "$DIRECT_BLACKHOLE_REMOTE_ACTIVE" == "1" ]]; then
-    remote_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    if [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+      remote_privileged_exec "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    else
+      remote_osascript_shell "/sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    fi
     DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
   fi
 }
@@ -1338,14 +1658,25 @@ apply_direct_udp_blackhole() {
   air_rule="/sbin/pfctl -e >/dev/null 2>&1 || true; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -F all >/dev/null 2>&1 || true; { printf '%s\\n' 'block drop quick inet proto udp from any to $MINI_PUBLIC_IPV4'; printf '%s\\n' 'block drop quick inet proto udp from $MINI_PUBLIC_IPV4 to any'; } | /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -f -; /sbin/pfctl -a '$DIRECT_BLACKHOLE_ANCHOR' -sr"
 
   echo "[mini-air] installing Direct UDP blackhole on Mini for peer $AIR_PUBLIC_IPV4"
-  if ! local_osascript_shell "$mini_rule" >"$BASE_DIR/direct-blackhole-mini.rules"; then
+  if [[ "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+    if ! local_privileged_exec "$mini_rule" >"$BASE_DIR/direct-blackhole-mini.rules"; then
+      echo "[mini-air] failed to install the Mini Direct UDP blackhole" >&2
+      return 1
+    fi
+  elif ! local_osascript_shell "$mini_rule" >"$BASE_DIR/direct-blackhole-mini.rules"; then
     echo "[mini-air] failed to install the Mini Direct UDP blackhole" >&2
     return 1
   fi
   DIRECT_BLACKHOLE_LOCAL_ACTIVE=1
 
   echo "[mini-air] installing Direct UDP blackhole on Air for peer $MINI_PUBLIC_IPV4"
-  if ! remote_osascript_shell "$air_rule" >"$BASE_DIR/direct-blackhole-air.rules"; then
+  if [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+    if ! remote_privileged_exec "$air_rule" >"$BASE_DIR/direct-blackhole-air.rules"; then
+      echo "[mini-air] failed to install the Air Direct UDP blackhole; clearing Mini anchor" >&2
+      clear_direct_udp_blackhole
+      return 1
+    fi
+  elif ! remote_osascript_shell "$air_rule" >"$BASE_DIR/direct-blackhole-air.rules"; then
     echo "[mini-air] failed to install the Air Direct UDP blackhole; clearing Mini anchor" >&2
     clear_direct_udp_blackhole
     return 1
@@ -1446,6 +1777,11 @@ if [[ "$REMOTE_DAEMON_SHA256" != "$LOCAL_DAEMON_SHA256" ]]; then
   exit 1
 fi
 echo "[mini-air] Air daemon SHA-256 verified: $LOCAL_DAEMON_SHA256"
+if [[ "$REAL_TUN" == "1" && "$PRIVILEGED_SUPERVISOR" == "1" ]]; then
+  local_privileged_supervisor_start
+  remote_privileged_supervisor_start
+  echo "[mini-air] privileged authorization scope: one dialog per endpoint for this run" >&2
+fi
 echo "[mini-air] isolated network id: $NETWORK_ID"
 printf '%s\n' "direct_udp_blackhole=$DIRECT_UDP_BLACKHOLE" >"$BASE_DIR/scenario.txt"
 if [[ "$DIRECT_UDP_BLACKHOLE" == "1" ]]; then
@@ -1540,7 +1876,18 @@ for round in $(seq 1 "$ROUNDS"); do
   else
     LOCAL_DAEMON_COMMAND="echo \$\$ > '$LOCAL_NODE_A_PID_FILE'; exec env P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$DAEMON_BIN' --config '$LOCAL_NODE_A_CONFIG' --control '$CONTROL_URL' --network '$NETWORK_ID' --token-file '$LOCAL_NODE_A_TOKEN_FILE' --device-name '$LOCAL_NODE_A_DEVICE' --udp-bind 0.0.0.0:0 --socket-pool 3 --stun '$STUN_SERVERS' --stun-timeout-ms 1000 --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5 $PATH_POLICY_FLAG $LOCAL_VALIDATE_OVERLAY_FLAG >'$ROUND_DIR/node-a.log' 2>&1"
   fi
-  if [[ "$REAL_TUN" == "1" && "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
+  if [[ "$REAL_TUN" == "1" && "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+    if ! local_privileged_exec "$LOCAL_DAEMON_COMMAND" || ! wait_for_local_pid_file "$LOCAL_NODE_A_PID_FILE"; then
+      echo "[mini-air] ROUND $round: Mini privileged supervisor launch did not produce this round's PID file" >&2
+      overall=1
+      local_daemon_cleanup || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+      continue
+    fi
+    NODE_A_WRAPPER_PID=""
+    NODE_A_PID=$(cat "$LOCAL_NODE_A_PID_FILE")
+    LOCAL_NODE_A_PID="$NODE_A_PID"
+  elif [[ "$REAL_TUN" == "1" && "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
     if ! local_osascript_shell_launch "$LOCAL_DAEMON_COMMAND" "$LOCAL_NODE_A_PID_FILE"; then
       echo "[mini-air] ROUND $round: Mini privileged launch did not produce this round's PID file" >&2
       overall=1
@@ -1613,7 +1960,19 @@ for round in $(seq 1 "$ROUNDS"); do
     $PATH_POLICY_FLAG \
     $REMOTE_VALIDATE_OVERLAY_ARG \
      </dev/null >'$REMOTE_NODE_B_LOG' 2>&1"
-  if [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]]; then
+  if [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]]; then
+    if ! remote_privileged_exec "$REMOTE_DAEMON_COMMAND" || ! wait_for_remote_pid_file "$REMOTE_NODE_B_PID_FILE"; then
+      echo "[mini-air] ROUND $round: Air privileged supervisor launch did not produce this round's PID file" >&2
+      overall=1
+      remote_daemon_cleanup || true
+      local_daemon_cleanup || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+      continue
+    fi
+    NODE_B_PID=""
+    AIR_DAEMON_PID_FOR_ARTIFACT=$($AIR_SSH "cat '$REMOTE_NODE_B_PID_FILE' 2>/dev/null || true")
+    printf '%s\n' "$AIR_DAEMON_PID_FOR_ARTIFACT" >"$ROUND_DIR/node-b.pid"
+  elif [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]]; then
     if ! remote_osascript_shell_launch "$REMOTE_DAEMON_COMMAND" "$REMOTE_NODE_B_PID_FILE"; then
       echo "[mini-air] ROUND $round: Air privileged launch did not produce this round's PID file" >&2
       overall=1

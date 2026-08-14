@@ -126,6 +126,52 @@ impl PeerConnection {
         (pair.source, became_reachable)
     }
 
+    fn mark_candidate_pair_slow_validation(
+        &mut self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        latency: Duration,
+        local_endpoint: Option<SocketAddr>,
+    ) -> (CandidatePairSource, bool) {
+        let peer_id = self.node_id.clone();
+        let pair = self.ensure_candidate_pair(endpoint, local_generation);
+        let old_state = pair.state;
+        pair.record_slow_validation(
+            latency,
+            local_endpoint,
+            REASON_DIRECT_SLOW_RELAY_RETAINED,
+            format!(
+                "bidirectional Direct validation reached the peer but RTT={}ms exceeded the relay-retention floor {}ms",
+                duration_millis(latency),
+                SLOW_DIRECT_RELAY_VALIDATION_RTT_MS
+            ),
+        );
+        log_candidate_pair_state_changed(
+            &peer_id,
+            pair,
+            old_state,
+            "received slow UDP probe ACK; confirmed relay retained",
+        );
+        (pair.source, false)
+    }
+
+    /// A slow but authenticated ACK quarantines the remote endpoint for every
+    /// local socket in this generation.  Checking the pair table here keeps
+    /// the outbound sender from re-emitting the same destination after a
+    /// delayed ACK has already proved that it is currently queue-prone.
+    pub(crate) fn direct_probe_endpoint_quarantined(
+        &self,
+        endpoint: SocketAddr,
+        local_generation: u64,
+        now: Instant,
+    ) -> bool {
+        self.candidate_pairs.iter().any(|pair| {
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == local_generation
+                && pair.slow_validation_is_recent_at(now, SLOW_DIRECT_RELAY_RETRY_COOLDOWN)
+        })
+    }
+
     fn mark_candidate_pair_nominated(
         &mut self,
         endpoint: SocketAddr,
@@ -328,6 +374,7 @@ impl PeerConnection {
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
             self.relay_first_business_sent_generation = None;
+            self.relay_first_business_received_generation = None;
         }
         if self.relay_first_gate_generation != Some(local_generation) {
             self.relay_first_gate_generation = None;
@@ -339,6 +386,7 @@ impl PeerConnection {
             self.relay_confirmed_endpoint = None;
             self.relay_confirmed_connection_id = None;
             self.relay_first_business_sent_generation = None;
+            self.relay_first_business_received_generation = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
             if self.state == ConnectionState::Relay {
                 self.transition(ConnectionState::FallbackToRelay);
@@ -379,6 +427,7 @@ impl PeerConnection {
             self.relay_confirmed_generation = Some(local_generation);
             self.relay_ready_generation = Some(local_generation);
             self.relay_first_business_sent_generation = None;
+            self.relay_first_business_received_generation = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;
         } else {
@@ -386,6 +435,7 @@ impl PeerConnection {
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
             self.relay_first_business_sent_generation = None;
+            self.relay_first_business_received_generation = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;
         }

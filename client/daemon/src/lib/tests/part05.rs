@@ -1416,6 +1416,128 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
 }
 
 #[tokio::test]
+async fn finishing_direct_validation_session_cancels_worker_receiver() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: String::new(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let endpoint: SocketAddr = "127.0.0.1:43011".parse().unwrap();
+    let lease = match udp
+        .begin_or_merge_direct_validation("node-b", endpoint, 0)
+        .await
+    {
+        crate::udp::DirectValidationSessionStart::Spawn(lease) => lease,
+        crate::udp::DirectValidationSessionStart::Merged => {
+            panic!("the first observation must receive the worker lease")
+        }
+        crate::udp::DirectValidationSessionStart::IgnoredStaleGeneration => {
+            panic!("the current generation must receive the worker lease")
+        }
+        crate::udp::DirectValidationSessionStart::IgnoredInactive => {
+            panic!("an active non-Direct peer must receive the worker lease")
+        }
+    };
+    let target_rx = lease.target_rx;
+    assert!(!target_rx.borrow().cancelled);
+
+    assert!(udp
+        .finish_direct_validation_session("node-b", lease.owner_token)
+        .await);
+    assert!(
+        target_rx.borrow().cancelled,
+        "finishing the owner must wake the worker's watch receiver with terminal cancellation"
+    );
+    assert!(
+        udp.direct_validation_target("node-b").await.is_none(),
+        "the completed owner must be removed from the registry"
+    );
+}
+
+#[tokio::test]
+async fn slow_relay_validation_cooldown_blocks_replacement_until_generation_changes() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: String::new(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let endpoint: SocketAddr = "127.0.0.1:43012".parse().unwrap();
+    let owner_token = match udp
+        .begin_or_merge_direct_validation("node-b", endpoint, 0)
+        .await
+    {
+        crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        crate::udp::DirectValidationSessionStart::Merged => {
+            panic!("the first observation must receive the worker lease")
+        }
+        crate::udp::DirectValidationSessionStart::IgnoredStaleGeneration => {
+            panic!("the current generation must receive the worker lease")
+        }
+        crate::udp::DirectValidationSessionStart::IgnoredInactive => {
+            panic!("an active non-Direct peer must receive the worker lease")
+        }
+    };
+
+    udp.suppress_direct_validation_for_slow_relay("node-b", 0)
+        .await;
+    assert!(
+        udp.direct_validation_suppressed_by_slow_relay("node-b", 0)
+            .await,
+        "a slow ACK behind a confirmed relay must suppress replacement owners"
+    );
+    assert!(udp
+        .finish_direct_validation_session("node-b", owner_token)
+        .await);
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("node-b", endpoint, 0)
+            .await,
+        crate::udp::DirectValidationSessionStart::IgnoredInactive
+    ));
+
+    assert_eq!(
+        peers
+            .advance_network_generation("clear slow relay validation cooldown")
+            .await,
+        1
+    );
+    let next = udp.begin_or_merge_direct_validation("node-b", endpoint, 1).await;
+    assert!(
+        matches!(next, crate::udp::DirectValidationSessionStart::Spawn(_)),
+        "a new network generation must be able to restart relay-first Direct validation"
+    );
+}
+
+#[tokio::test]
 async fn direct_validation_owner_cleanup_cannot_remove_newer_expectation() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

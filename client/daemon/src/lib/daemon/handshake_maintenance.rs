@@ -472,7 +472,8 @@ async fn refresh_candidate_cache_for_maintenance_signal(
 
     if let Some(endpoint) = control_udp_endpoint_from_candidates(&candidates, &candidate_sources) {
         drop(refresh_guard);
-        if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+        let nat_type = report.nat_profile.control_label();
+        if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
             warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
         }
     } else {

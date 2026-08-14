@@ -1227,6 +1227,22 @@ impl UdpTransport {
                     );
                     break;
                 }
+                if self
+                    .peers
+                    .direct_probe_endpoint_quarantined(
+                        peer_id,
+                        candidate,
+                        self.peers.current_network_generation_sync(),
+                    )
+                    .await
+                {
+                    budget_skipped = budget_skipped.saturating_add(1);
+                    last_budget_reason = Some("direct_slow_relay_retained");
+                    trace!(
+                        "Skipped dynamic-socket punch for peer {peer_id} candidate {candidate}: recent slow ACK quarantine"
+                    );
+                    continue;
+                }
                 match self
                     .admit_outbound_connectivity_probe(peer_id, candidate, index)
                     .await

@@ -665,6 +665,23 @@ impl UdpTransport {
                         session_capped = true;
                         break 'schedule;
                     }
+                    if self
+                        .peers
+                        .direct_probe_endpoint_quarantined(
+                            peer_id,
+                            candidate,
+                            generation_at_start,
+                        )
+                        .await
+                    {
+                        budget_skipped = budget_skipped.saturating_add(1);
+                        last_budget_reason = Some("direct_slow_relay_retained");
+                        trace!(
+                            "Skipped UDP punch probe from socket {} to peer {} candidate {}: recent slow ACK quarantine",
+                            socket_index, peer_id, candidate
+                        );
+                        continue;
+                    }
                     // The recovery epoch's hard candidate-iteration budget:
                     // every endpoint enumerated here consumes one unit, so a
                     // budget-rejected session can never keep traversing the

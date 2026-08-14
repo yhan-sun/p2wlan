@@ -359,11 +359,29 @@ impl PeerConnection {
             }
             if self.relay_ready_generation == Some(local_generation)
                 && self.relay_peer_confirmed_for_generation(local_generation)
-                && self.relay_first_business_sent_generation != Some(local_generation)
+                && (self.relay_first_business_sent_generation != Some(local_generation)
+                    || self.relay_first_business_received_generation != Some(local_generation))
             {
                 return PathSelection::relay(
                     REASON_PATH_RELAY_FIRST_BUSINESS,
-                    "same-generation relay peer is confirmed; first business packet is reserved for relay",
+                    "same-generation relay peer is confirmed; both relay business directions are required before Direct",
+                )
+                .with_scores(direct_score, relay_score);
+            }
+            if self.relay_peer_confirmed_for_generation(local_generation)
+                && selected_pair.is_some_and(|pair| {
+                    pair.slow_validation_is_recent_at(
+                        Instant::now(),
+                        SLOW_DIRECT_RELAY_RETRY_COOLDOWN,
+                    )
+                })
+            {
+                return PathSelection::relay(
+                    REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
+                    format!(
+                        "probe-only Direct evidence is quarantined for {}ms after a slow ACK",
+                        SLOW_DIRECT_RELAY_RETRY_COOLDOWN.as_millis()
+                    ),
                 )
                 .with_scores(direct_score, relay_score);
             }

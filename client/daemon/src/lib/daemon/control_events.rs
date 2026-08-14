@@ -1,6 +1,7 @@
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
+use std::collections::VecDeque as InitiatorQueue;
 
 /// The serial control receiver owns fresh-prediction admission and short
 /// state commits.  Slow STUN/HTTP work runs here instead of directly in the
@@ -9,6 +10,38 @@ use std::pin::Pin;
 type ControlEventWork<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 const MAX_CONTROL_EVENT_SLOW_WORK: usize = 64;
+/// A roster burst may contain more peers than the cooperative slow-work lane
+/// can admit at once.  Do not silently lose the initiator handshake for the
+/// peers after that boundary: retain one newest-wins entry per peer and drain
+/// it whenever a slow-work slot is released.  The bound is deliberately
+/// finite so a corrupt control roster cannot grow daemon memory without
+/// limit; overflow is an explicit diagnostic event, never an implicit drop.
+const MAX_DEFERRED_INITIATOR_HANDSHAKES: usize = 256;
+
+fn enqueue_deferred_initiator_handshake(
+    queue: &mut InitiatorQueue<control::PeerInfo>,
+    peer_info: control::PeerInfo,
+) -> bool {
+    if let Some(existing) = queue
+        .iter_mut()
+        .find(|existing| existing.node_id == peer_info.node_id)
+    {
+        *existing = peer_info;
+        return true;
+    }
+    if queue.len() >= MAX_DEFERRED_INITIATOR_HANDSHAKES {
+        return false;
+    }
+    queue.push_back(peer_info);
+    true
+}
+
+fn remove_deferred_initiator_handshake(
+    queue: &mut InitiatorQueue<control::PeerInfo>,
+    peer_id: &str,
+) {
+    queue.retain(|peer_info| peer_info.node_id != peer_id);
+}
 
 /// Responder offers have their own cooperative lane.  Candidate refresh,
 /// peer-reflexive HTTP and event-triggered initiator preparation may occupy
@@ -1173,6 +1206,82 @@ impl Daemon {
         (fresh_verdict, candidate_apply_result, fresh_punch)
     }
 
+    /// Admit queued event-triggered initiator work after a cooperative
+    /// slow-work slot becomes available.
+    ///
+    /// A roster burst must not silently lose the initiator handshake for peers
+    /// after the global slow-work cap. This drain is newest-wins per peer,
+    /// checks the current online state before starting, and leaves the
+    /// per-peer reservation as the single-flight boundary for duplicates.
+    async fn drain_deferred_initiator_handshakes<'a>(
+        &'a self,
+        slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+        deferred: &mut InitiatorQueue<control::PeerInfo>,
+    ) {
+        // A reservation can be temporarily unavailable because this peer's
+        // current handshake owner is still running.  Scan each queued peer at
+        // most once per drain pass: keep blocked entries newest-wins while
+        // still admitting unrelated peers behind them.  A later completion
+        // pass will retry the preserved entry after the owner releases it.
+        let initial_queue_len = deferred.len();
+        let mut scanned = 0usize;
+        while slow_work.len() < MAX_CONTROL_EVENT_SLOW_WORK && scanned < initial_queue_len {
+            let Some(peer_info) = deferred.pop_front() else {
+                break;
+            };
+            scanned = scanned.saturating_add(1);
+            let peer_id = peer_info.node_id.clone();
+            let current_online = self
+                .peers
+                .get_connection(&peer_id)
+                .await
+                .is_some_and(|peer| peer.online);
+            if !current_online {
+                self.peers
+                    .record_direct_event(
+                        &peer_id,
+                        "initiator_handshake_deferred_dropped",
+                        None,
+                        None,
+                        None,
+                        "reason_code=peer_offline_or_removed deferred control handshake was not started",
+                    )
+                    .await;
+                self.timeline.emit(
+                    "initiator_handshake_deferred_dropped",
+                    None,
+                    Some("peer_offline_or_removed"),
+                    Some(format!("peer={peer_id}")),
+                );
+                continue;
+            }
+
+            let Some(reservation) = self.reserve_event_initiator_handshake(&peer_id).await else {
+                // An existing pending handshake or starting worker owns this
+                // peer. Keep the newest roster update for the next completion
+                // pass; dropping it here would make endpoint/incarnation
+                // changes wait for an unrelated future control poll.
+                let _ = enqueue_deferred_initiator_handshake(deferred, peer_info);
+                continue;
+            };
+            self.timeline.emit(
+                "initiator_handshake_deferred_admitted",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} queue_remaining={}",
+                    deferred.len()
+                )),
+            );
+            let daemon = self;
+            slow_work.push(Box::pin(async move {
+                daemon
+                    .run_event_initiator_handshake(peer_info, reservation)
+                    .await;
+            }));
+        }
+    }
+
     async fn run_control_event_loop(
         &mut self,
         relay_started: &mut bool,
@@ -1187,6 +1296,7 @@ impl Daemon {
         let mut control_rx = std::mem::replace(&mut self.control_rx, replacement_rx);
         let daemon: &Daemon = &*self;
         let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+        let mut deferred_initiators: InitiatorQueue<control::PeerInfo> = InitiatorQueue::new();
         // Keep responder answers out of the general slow-work budget. A
         // blocked candidate refresh or peer-reflexive HTTP task must not
         // prevent a received WireGuard initiation from producing an answer.
@@ -1209,8 +1319,15 @@ impl Daemon {
                     }
                 }
                 _ = slow_work.next(), if !slow_work.is_empty() => {
-                    // The work item logs its own outcome.  Completion only
-                    // frees one bounded slot; no state is committed here.
+                    // Completion frees a bounded slot. Admit the oldest still
+                    // live deferred peer immediately instead of waiting for a
+                    // later control poll.
+                    daemon
+                        .drain_deferred_initiator_handshakes(
+                            &mut slow_work,
+                            &mut deferred_initiators,
+                        )
+                        .await;
                 }
                 _ = responder_work.next(), if !responder_work.is_empty() => {
                     // Responder workers own their per-peer pending state and
@@ -1335,10 +1452,46 @@ impl Daemon {
                             )),
                         );
                         if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                            let queued = enqueue_deferred_initiator_handshake(
+                                &mut deferred_initiators,
+                                peer_info.clone(),
+                            );
+                            let reason_code = if queued {
+                                "control_slow_work_full_queued"
+                            } else {
+                                "control_slow_work_deferred_queue_full"
+                            };
                             warn!(
-                                "Deferring peer-join handshake for {}: control slow-work cap {} is full",
+                                "Deferring peer-join handshake for {}: reason_code={} slow_work={} deferred_queue={}",
                                 peer_info.node_id,
-                                MAX_CONTROL_EVENT_SLOW_WORK,
+                                reason_code,
+                                slow_work.len(),
+                                deferred_initiators.len(),
+                            );
+                            self.peers
+                                .record_direct_event(
+                                    &peer_info.node_id,
+                                    "initiator_handshake_deferred",
+                                    None,
+                                    None,
+                                    None,
+                                    format!(
+                                        "reason_code={reason_code} slow_work={} deferred_queue={}",
+                                        slow_work.len(),
+                                        deferred_initiators.len()
+                                    ),
+                                )
+                                .await;
+                            self.timeline.emit(
+                                "initiator_handshake_deferred",
+                                None,
+                                Some(reason_code),
+                                Some(format!(
+                                    "peer={} slow_work={} deferred_queue={}",
+                                    peer_info.node_id,
+                                    slow_work.len(),
+                                    deferred_initiators.len()
+                                )),
                             );
                         } else if let Some(reservation) = self
                             .reserve_event_initiator_handshake(&peer_info.node_id)
@@ -1383,6 +1536,10 @@ impl Daemon {
                     let previous = self.peers.get_connection(&peer_info.node_id).await;
                     let update = self.peers.add_peer(&peer_info).await;
                     if !peer_info.online {
+                        remove_deferred_initiator_handshake(
+                            &mut deferred_initiators,
+                            &peer_info.node_id,
+                        );
                         {
                             // Linearize lifecycle cleanup with the short
                             // offer/answer mutation phase.  The handler drops
@@ -1428,6 +1585,10 @@ impl Daemon {
                         continue;
                     }
                     if update.public_key_changed {
+                        remove_deferred_initiator_handshake(
+                            &mut deferred_initiators,
+                            &peer_info.node_id,
+                        );
                         {
                             // See the offline path above: a stale worker can
                             // neither stage after this identity cleanup nor
@@ -1486,10 +1647,46 @@ impl Daemon {
                             .await;
                     }
                     if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                        let queued = enqueue_deferred_initiator_handshake(
+                            &mut deferred_initiators,
+                            peer_info.clone(),
+                        );
+                        let reason_code = if queued {
+                            "control_slow_work_full_queued"
+                        } else {
+                            "control_slow_work_deferred_queue_full"
+                        };
                         warn!(
-                            "Deferring peer-update handshake for {}: control slow-work cap {} is full",
+                            "Deferring peer-update handshake for {}: reason_code={} slow_work={} deferred_queue={}",
                             peer_info.node_id,
-                            MAX_CONTROL_EVENT_SLOW_WORK,
+                            reason_code,
+                            slow_work.len(),
+                            deferred_initiators.len(),
+                        );
+                        self.peers
+                            .record_direct_event(
+                                &peer_info.node_id,
+                                "initiator_handshake_deferred",
+                                None,
+                                None,
+                                None,
+                                format!(
+                                    "reason_code={reason_code} slow_work={} deferred_queue={}",
+                                    slow_work.len(),
+                                    deferred_initiators.len()
+                                ),
+                            )
+                            .await;
+                        self.timeline.emit(
+                            "initiator_handshake_deferred",
+                            None,
+                            Some(reason_code),
+                            Some(format!(
+                                "peer={} slow_work={} deferred_queue={}",
+                                peer_info.node_id,
+                                slow_work.len(),
+                                deferred_initiators.len()
+                            )),
                         );
                     } else if let Some(reservation) = self
                         .reserve_event_initiator_handshake(&peer_info.node_id)
@@ -1506,6 +1703,7 @@ impl Daemon {
 
                 ControlEvent::PeerLeft(node_id) => {
                     info!("Peer left: {}", node_id);
+                    remove_deferred_initiator_handshake(&mut deferred_initiators, &node_id);
                     if let Some(previous) = self.peers.get_connection(&node_id).await {
                         if self.dns.is_enabled() {
                             self.dns.unregister(&previous.virtual_ip).await;

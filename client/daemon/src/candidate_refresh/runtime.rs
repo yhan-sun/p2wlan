@@ -23,9 +23,12 @@ pub(super) struct UdpCandidateRefreshContext {
 
 /// Volatile candidate churn (source-only or short-lived port changes on the
 /// same public IP) is coalesced newest-wins and published at most once per
-/// debounce window.  Pure port jitter must not fan out an offer plus a
-/// synchronized punch session to every non-Direct peer on every refresh.
-const VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(30);
+/// short, fixed debounce window.  This is deliberately sub-second: a NAT
+/// mapping change is direct-path evidence, and holding it for tens of seconds
+/// recreates the observed "old ping packets arrive one second apart" failure.
+/// The window is fixed from the first change rather than sliding on every
+/// subsequent observation, so continuous port churn cannot starve publication.
+const VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Decision a volatile churn takes against the coalescer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +64,10 @@ impl VolatilePublishCoalescer {
         }
         if self.pending_hash.is_some() {
             // Newest-wins: any churn inside the open debounce window replaces
-            // the pending set and slides the window; still no fan-out.
+            // the pending set, but the original deadline remains fixed. This
+            // bounds how long a new candidate can wait even when the NAT keeps
+            // allocating ports.
             self.pending_hash = Some(hash);
-            self.debounce_until = Some(now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE);
             return VolatileChurnAction::CoalescedNewest;
         }
         self.pending_hash = Some(hash);
@@ -74,6 +78,13 @@ impl VolatilePublishCoalescer {
     /// Whether a pending publication's debounce window has elapsed.
     pub(super) fn pending_due(&self, now: Instant) -> bool {
         self.pending_hash.is_some() && self.debounce_until.is_some_and(|until| now >= until)
+    }
+
+    pub(super) fn pending_deadline(&self) -> Option<Instant> {
+        self.pending_hash
+            .is_some()
+            .then_some(self.debounce_until)
+            .flatten()
     }
 
     /// Take the pending hash whose window elapsed.
@@ -95,7 +106,6 @@ impl VolatilePublishCoalescer {
 struct VolatileCandidatePublish {
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,
-    debounce_until: Instant,
 }
 
 pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
@@ -121,24 +131,33 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         punch_attempts,
         boot_epoch_ms,
     } = context;
-    let initial_refresh_needs_public_retry = candidate_snapshot
-        .read()
-        .await
-        .as_ref()
-        .is_none_or(|snapshot| {
-            !has_real_public_candidate(&snapshot.candidates, &snapshot.candidate_sources)
-        });
-    let mut startup_without_public = initial_refresh_needs_public_retry;
-    let mut ticker = interval(if startup_without_public {
+    let initial_snapshot = candidate_snapshot.read().await.clone();
+    let initial_nat_profile = nat_profile.read().await.clone();
+    let initial_refresh_needs_public_retry = initial_snapshot.as_ref().is_none_or(|snapshot| {
+        !has_reliable_public_candidate(
+            initial_nat_profile.as_ref(),
+            &snapshot.candidates,
+            &snapshot.candidate_sources,
+        )
+    });
+    let initial_pool_mapping_warmup = should_warm_mapping_dependent_socket_pool(
+        udp.socket_count(),
+        udp.socket_pool_active(),
+        initial_nat_profile.as_ref(),
+    );
+    let initial_refresh_needs_fast_retry =
+        initial_refresh_needs_public_retry || initial_pool_mapping_warmup;
+    let mut startup_fast_retry = initial_refresh_needs_fast_retry;
+    let mut ticker = interval(if startup_fast_retry {
         CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL
     } else {
         CANDIDATE_REFRESH_INTERVAL
     });
-    if initial_refresh_needs_public_retry {
+    if initial_refresh_needs_fast_retry {
         // The startup gather intentionally has a short budget.  If it only
-        // produced a host candidate (as on the Air when the first STUN probe
-        // reported UdpBlocked), retry discovery promptly instead of waiting
-        // for the regular 15-second refresh interval.
+        // produced a host candidate (or only an observer-specific mapping on
+        // a hard NAT), retry discovery promptly instead of waiting for the
+        // regular 15-second refresh interval.
         sleep(CANDIDATE_REFRESH_INITIAL_RETRY_DELAY).await;
     }
     // The initial UDP setup already committed the first full candidate
@@ -148,14 +167,26 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
     // host-only snapshot deliberately keeps the immediate tick: it is the
     // first bounded retry that can discover a public mapping without waiting
     // for the normal 15-second cadence.
-    if !initial_refresh_needs_public_retry {
+    if !initial_refresh_needs_fast_retry {
         ticker.tick().await;
     }
     let mut pending_volatile: Option<VolatileCandidatePublish> = None;
     let mut volatile_coalescer = VolatilePublishCoalescer::default();
 
     loop {
-        ticker.tick().await;
+        // A 15-second refresh cadence must not become the publication
+        // cadence for a volatile candidate.  Wait for either the normal
+        // gather tick or the fixed debounce deadline, whichever comes first.
+        // The latter is what prevents a changed NAT mapping from sitting in
+        // the committed snapshot while the peer keeps using an old endpoint.
+        if let Some(deadline) = volatile_coalescer.pending_deadline() {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+            }
+        } else {
+            ticker.tick().await;
+        }
 
         // Flush a coalesced volatile publication whose debounce window
         // elapsed.  The pending set is the newest committed candidate set;
@@ -317,10 +348,14 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         }
 
-        if startup_without_public
-            && has_real_public_candidate(&candidates, &candidate_sources)
+        if startup_fast_retry
+            && has_reliable_public_candidate(
+                Some(&report.nat_profile),
+                &candidates,
+                &candidate_sources,
+            )
         {
-            startup_without_public = false;
+            startup_fast_retry = false;
             ticker = interval(CANDIDATE_REFRESH_INTERVAL);
             // Consume the new interval's immediate tick; the next periodic
             // refresh is 15 seconds later.
@@ -430,7 +465,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let should_update_endpoint = should_advance_generation
             || should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint);
         if should_update_endpoint {
-            if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+            let nat_type = report.nat_profile.control_label();
+            if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
                 warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
             } else if !endpoint.is_empty() {
                 published_endpoint = Some(endpoint.clone());
@@ -460,22 +496,19 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                         .expect("coalesced pending verified above");
                     pending.candidates = candidates.clone();
                     pending.candidate_sources = candidate_sources.clone();
-                    pending.debounce_until =
-                        now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE;
                     debug!(
-                        "Volatile candidate churn coalesced newest-wins (hash={hash}); resetting the {}-s debounce window without offer fan-out",
-                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_secs()
+                        "Volatile candidate churn coalesced newest-wins (hash={hash}); retaining the fixed {}-ms publication deadline without offer fan-out",
+                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_millis()
                     );
                 }
                 VolatileChurnAction::SchedulePublish => {
                     pending_volatile = Some(VolatileCandidatePublish {
                         candidates: candidates.clone(),
                         candidate_sources: candidate_sources.clone(),
-                        debounce_until: now + VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE,
                     });
                     debug!(
-                        "Volatile candidate churn (hash={hash}) will be published once after the {}-s debounce window",
-                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_secs()
+                        "Volatile candidate churn (hash={hash}) will be published once after the {}-ms fixed debounce window",
+                        VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_millis()
                     );
                 }
             }
@@ -534,7 +567,14 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     let fanout_permits = Arc::new(tokio::sync::Semaphore::new(4));
     let mut fanout_workers = tokio::task::JoinSet::new();
     for (peer_id, peer_info) in control.peers().await {
-        if !peer_info.online {
+        // The control roster can retain historical devices and may still
+        // report them as online for one poll interval after their daemon has
+        // gone away.  Candidate refresh is a dataplane wake-up, not a roster
+        // cleanup job: sending offers to those records creates relay
+        // `peer_not_found` traffic and, with a bounded fan-out semaphore,
+        // delays the live peer's fresh public endpoint.  Lifecycle state in
+        // PeerManager is the authoritative local admission gate.
+        if !peer_info.online || !peers.peer_online(&peer_id).await {
             continue;
         }
         // A healthy confirmed Direct peer is converged: neither a refreshed

@@ -342,6 +342,8 @@ fn is_validation_evidence_stage(stage: &str) -> bool {
             | "direct_validation_request_received"
             | "direct_validation_ack_sent"
             | "direct_validation_ack_received"
+            | "direct_validation_emit_lock_timeout"
+            | "direct_validation_succeeded_relay_retained"
             | "direct_validation_promoted"
             | "direct_path_promoted"
     )

@@ -693,6 +693,7 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
         nonce,
         PendingProbe {
             sent_at: Instant::now(),
+            expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: sender_addr,
             local_endpoint: Some(local_addr),
             socket_index: 0,
@@ -758,6 +759,7 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
         nonce,
         PendingProbe {
             sent_at: Instant::now(),
+            expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: sender_addr,
             local_endpoint: Some(local_addr),
             socket_index: 0,
@@ -796,6 +798,73 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
     assert_eq!(conn.endpoint, None);
     assert_eq!(conn.direct_health.success_count, 0);
     assert_eq!(udp.socket_pool_diagnostics().await[0].probe_acks_received, 0);
+
+    worker.abort();
+}
+
+#[tokio::test]
+async fn expired_authenticated_probe_ack_is_terminal_and_cannot_learn_direct() {
+    let token = "expired-probe-ack";
+    let (peers, _wireguard, udp, _old_probe_key, pending_probe_key) =
+        pending_probe_inbound_fixture(token).await;
+    let local_addr = udp.local_addr().unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    let generation = peers.current_network_generation().await;
+    let nonce = [199u8; 8];
+    udp.pending_probes.lock().await.insert(
+        nonce,
+        PendingProbe {
+            sent_at: Instant::now() - Duration::from_secs(3),
+            expires_at: Instant::now() - Duration::from_millis(1),
+            endpoint: sender_addr,
+            local_endpoint: Some(local_addr),
+            socket_index: 0,
+            generation,
+            probe_session_id: Some("expired-session".to_string()),
+            peer_id: Some("peer-b".to_string()),
+            purpose: PendingProbePurpose::ConnectivityCheck,
+            accepts_authenticated_ack: true,
+            accepts_legacy_ack: false,
+            socket_epoch: 0,
+            cleanup_epoch: 0,
+            direct_commit_seq: 0,
+        },
+    );
+
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(udp.clone().run_inbound(tx));
+    let ack = build_authenticated_punch_ack(
+        nonce,
+        "peer-b",
+        "peer-a",
+        generation,
+        &pending_probe_key,
+    );
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if udp.socket_pool_diagnostics().await[0]
+                .authenticated_probe_acks_unmatched
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(!udp.pending_probes.lock().await.contains_key(&nonce));
+    let conn = peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(conn.endpoint, None);
+    assert_eq!(conn.direct_health.success_count, 0);
+    assert!(conn
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "direct_probe_ack_expired"));
 
     worker.abort();
 }

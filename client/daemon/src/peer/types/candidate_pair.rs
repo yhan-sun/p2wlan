@@ -105,6 +105,13 @@ pub struct CandidatePair {
     pub first_success_at: Option<Instant>,
     /// Most recent successful bidirectional probe or encrypted packet.
     pub last_success_at: Option<Instant>,
+    /// Most recent bidirectional probe/validation that was reachable but too
+    /// slow to displace a confirmed relay.  This is deliberately separate
+    /// from `last_success_at`: reachability evidence must remain observable,
+    /// while a delayed mapping must not be ranked as a fresh usable pair.
+    pub last_slow_validation_at: Option<Instant>,
+    /// Number of reachable-but-too-slow validation samples for this pair.
+    pub slow_validation_count: u64,
     /// Most recent failed probe/path event.
     pub last_failure_at: Option<Instant>,
     /// Consecutive pair-level failures since the last success.
@@ -146,6 +153,8 @@ impl CandidatePair {
             probe_count: 0,
             first_success_at: None,
             last_success_at: None,
+            last_slow_validation_at: None,
+            slow_validation_count: 0,
             last_failure_at: None,
             consecutive_failures: 0,
             last_error_code: None,
@@ -233,10 +242,35 @@ impl CandidatePair {
         local_endpoint: Option<SocketAddr>,
     ) {
         self.record_success(Some(latency), selected, local_endpoint);
+        // An exact encrypted Request -> ACK supersedes any earlier
+        // probe-only slow-path quarantine for this endpoint.  Keeping that
+        // marker would make the selector retain relay even after the current
+        // generation had a fresh, authenticated Direct proof.
+        self.last_slow_validation_at = None;
         let latency_ms = duration_millis(latency);
         self.rtt_ms = Some(latency_ms);
         self.rtt_ewma_ms = Some(latency_ms);
         self.jitter_ms = Some(0);
+    }
+
+    /// Record bidirectional reachability without treating the pair as a
+    /// usable Direct path.  A slow ACK is valuable evidence, but it commonly
+    /// comes from a delayed/queued NAT mapping.  Marking it `Succeeded` made
+    /// the same endpoint outrank newly refreshed candidates and caused the
+    /// observed repeated 500ms+ validation ACKs.
+    pub(super) fn record_slow_validation(
+        &mut self,
+        latency: Duration,
+        local_endpoint: Option<SocketAddr>,
+        reason_code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.record_success(Some(latency), false, local_endpoint);
+        self.last_slow_validation_at = Some(Instant::now());
+        self.slow_validation_count = self.slow_validation_count.saturating_add(1);
+        self.last_error_code = Some(reason_code.into());
+        self.last_error = Some(reason.into());
+        self.state = CandidatePairState::Degraded;
     }
 
     pub(super) fn clear_selection(&mut self) {
@@ -349,5 +383,27 @@ impl CandidatePair {
     pub(super) fn success_age(&self) -> Option<Duration> {
         self.last_success_at
             .map(|last_success| last_success.elapsed())
+    }
+
+    pub(super) fn slow_validation_is_recent_at(
+        &self,
+        now: Instant,
+        cooldown: Duration,
+    ) -> bool {
+        let Some(slow_validation_at) = self.last_slow_validation_at else {
+            return false;
+        };
+        if self
+            .source_observed_at
+            .is_some_and(|observed_at| observed_at > slow_validation_at)
+        {
+            return false;
+        }
+        now.saturating_duration_since(slow_validation_at) < cooldown
+    }
+
+    pub(super) fn slow_validation_age(&self) -> Option<Duration> {
+        self.last_slow_validation_at
+            .map(|last_slow_validation| last_slow_validation.elapsed())
     }
 }

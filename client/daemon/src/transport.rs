@@ -52,6 +52,23 @@ const MAX_PENDING_OUTBOUND_PER_PEER: usize = 256;
 /// still respected — the control packet only skips a locked-out attempt, it
 /// never bypasses the counter ordering.
 const CONTROL_EMIT_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Direct validation has a stricter lock budget than ordinary relay/control
+/// probes. If it waits behind live TUN traffic for hundreds of milliseconds,
+/// the resulting ACK latency is a measurement of local counter contention,
+/// not of the candidate path, and the relay-retention guard will correctly
+/// reject it. A failed attempt is retried by the bounded validation scheduler.
+pub(crate) const DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Result of the bounded per-peer counter-ordering gate used by synthetic
+/// control packets.  A lock timeout is deliberately distinct from an absent
+/// WireGuard session: the former is a retryable local scheduling condition,
+/// while the latter means there is no encrypted transport to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedEmitOutcome {
+    Sent,
+    LockTimeout,
+    SessionUnavailable,
+}
 /// Continue accepting packets encrypted with the prior receive key briefly
 /// after a successful rekey. The control-plane answer and UDP data plane are
 /// delivered independently, so either side can observe a few packets from the
@@ -1304,25 +1321,47 @@ impl WireGuardTransport {
         F: FnOnce(EncryptedPeerPacket) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        match self
+            .encrypt_and_emit_outbound_with_lock_timeout(packet, CONTROL_EMIT_LOCK_TIMEOUT, emit)
+            .await?
+        {
+            BoundedEmitOutcome::Sent => Ok(true),
+            BoundedEmitOutcome::LockTimeout | BoundedEmitOutcome::SessionUnavailable => Ok(false),
+        }
+    }
+
+    /// Encrypt and emit a synthetic packet with an explicit bounded wait for
+    /// the per-peer counter-ordering lock. This keeps Direct validation from
+    /// turning a busy live-TUN queue into a false high RTT while retaining the
+    /// same FIFO/counter invariant as the ordinary control lane.
+    pub(crate) async fn encrypt_and_emit_outbound_with_lock_timeout<F, Fut>(
+        &self,
+        packet: OutboundPacket,
+        lock_timeout: Duration,
+        emit: F,
+    ) -> Result<BoundedEmitOutcome>
+    where
+        F: FnOnce(EncryptedPeerPacket) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let peer_id = packet.peer_id.clone();
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
-        let _emit_guard = match tokio::time::timeout(CONTROL_EMIT_LOCK_TIMEOUT, emit_lock.lock())
-            .await
-        {
+        let _emit_guard = match tokio::time::timeout(lock_timeout, emit_lock.lock()).await {
             Ok(guard) => guard,
             Err(_) => {
                 debug!(
                     peer_id = %peer_id,
-                    "control/probe packet for {peer_id} skipped: the outbound emit lock is held by busy user traffic; retrying on the next probe tick"
+                    lock_timeout_ms = lock_timeout.as_millis() as u64,
+                    "control/probe packet for {peer_id} skipped: the outbound emit lock is held by busy user traffic; retrying on the next bounded tick"
                 );
-                return Ok(false);
+                return Ok(BoundedEmitOutcome::LockTimeout);
             }
         };
         let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
-            return Ok(false);
+            return Ok(BoundedEmitOutcome::SessionUnavailable);
         };
         emit(encrypted).await?;
-        Ok(true)
+        Ok(BoundedEmitOutcome::Sent)
     }
 
     /// Replace a session and return the previous value for transactional rollback.
@@ -2477,6 +2516,15 @@ impl WireGuardTransport {
                                 let generation = packet_network_generation.unwrap_or_else(|| {
                                     peer_manager.current_network_generation_sync()
                                 });
+                                if path == crate::peer::NetworkPath::Relay {
+                                    peer_manager
+                                        .mark_relay_first_business_received_for_generation(
+                                            &inbound.peer_id,
+                                            relay_id.unwrap_or("unknown"),
+                                            generation,
+                                        )
+                                        .await;
+                                }
                                 if peer_manager
                                     .record_verified_first_usable(
                                         &inbound.peer_id,
@@ -2695,12 +2743,13 @@ impl WireGuardTransport {
                 let peer_id_owned = peer_id.to_string();
                 let receive_socket_index = socket_index;
                 match self
-                    .encrypt_and_emit_outbound(
+                    .encrypt_and_emit_outbound_with_lock_timeout(
                         OutboundPacket {
                             peer_id: peer_id_owned.clone(),
                             dst_ip: ip.src_addr().to_string(),
                             packet: ack_packet,
                         },
+                        DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
                         move |encrypted| async move {
                             let Some(receive_socket_index) = receive_socket_index else {
                                 return Err(crate::error::DaemonError::Network(
@@ -2720,7 +2769,7 @@ impl WireGuardTransport {
                     )
                     .await
                 {
-                    Ok(true) => {
+                    Ok(BoundedEmitOutcome::Sent) => {
                         peers
                             .record_direct_validation_event_with_metadata(
                                 peer_id,
@@ -2754,7 +2803,7 @@ impl WireGuardTransport {
                             "Answered direct-validation request from peer {peer_id_owned} at {source} with an ACK"
                         );
                     }
-                    Ok(false) => {
+                    Ok(BoundedEmitOutcome::LockTimeout) => {
                         peers
                             .record_direct_validation_event_with_metadata(
                                 peer_id,
@@ -2770,7 +2819,34 @@ impl WireGuardTransport {
                                 None,
                                 Some(0),
                                 format!(
-                                    "WireGuard session was no longer ready for request_id={} seq={}",
+                                    "reason_code=direct_validation_ack_emit_lock_timeout lock_timeout_ms={} request_id={} seq={}; ACK was not encrypted or sent",
+                                    DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT.as_millis(),
+                                    token.request_id, token.sequence
+                                ),
+                            )
+                            .await;
+                        debug!(
+                            "Could not answer direct-validation request from {peer_id_owned}: outbound emit lock timed out after {}ms",
+                            DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT.as_millis()
+                        );
+                    }
+                    Ok(BoundedEmitOutcome::SessionUnavailable) => {
+                        peers
+                            .record_direct_validation_event_with_metadata(
+                                peer_id,
+                                local_generation,
+                                crate::peer::DirectValidationEventMetadata {
+                                    remote_validation_owner: Some(token.owner_token),
+                                    request_id: Some(token.request_id),
+                                    ..crate::peer::DirectValidationEventMetadata::default()
+                                },
+                                "direct_validation_ack_send_failed",
+                                Some(source),
+                                socket_index,
+                                None,
+                                Some(0),
+                                format!(
+                                    "reason_code=direct_validation_ack_session_unavailable request_id={} seq={}",
                                     token.request_id, token.sequence
                                 ),
                             )
@@ -2972,6 +3048,54 @@ impl WireGuardTransport {
                 } else {
                     false
                 };
+
+                // A slow encrypted ACK is still useful evidence that the
+                // candidate can reach the peer, but it is not a reason to
+                // keep starting new validation owners while the confirmed
+                // relay is healthy. The candidate-level quarantine in the
+                // peer manager cannot cover peer-reflexive endpoint churn, so
+                // retain a peer/generation cooldown in the shared UDP
+                // validation registry before the current owner is finished.
+                let slow_relay_retained = !promoted
+                    && validation_latency.is_some_and(|latency| {
+                        latency.as_millis() as u64
+                            >= crate::peer::SLOW_DIRECT_RELAY_VALIDATION_RTT_MS
+                    })
+                    && peers
+                        .is_relay_peer_confirmed_for_generation(peer_id, expectation.generation)
+                        .await
+                    && !peers
+                        .is_direct_for_generation(peer_id, expectation.generation)
+                        .await;
+                if slow_relay_retained {
+                    udp.suppress_direct_validation_for_slow_relay(peer_id, expectation.generation)
+                        .await;
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            expectation.generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                local_validation_session_id: Some(expectation.owner_token),
+                                request_id: Some(token.request_id),
+                                expected_endpoint: expectation.endpoint,
+                                observed_ack_endpoint: Some(source),
+                                ack_endpoint_authenticated: Some(endpoint_authenticated),
+                                validation_rtt_ms,
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_suppressed",
+                            Some(source),
+                            socket_index,
+                            None,
+                            Some(1),
+                            format!(
+                                "reason_code=direct_validation_slow_relay_cooldown generation={} validation_rtt_ms={} relay_retained=true",
+                                expectation.generation,
+                                validation_rtt_ms.unwrap_or_default()
+                            ),
+                        )
+                        .await;
+                }
 
                 // `record_direct_success...` normally revoked this owner on
                 // promotion.  Keep the owner-conditional finish for a peer

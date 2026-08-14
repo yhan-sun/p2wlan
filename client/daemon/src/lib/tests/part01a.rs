@@ -46,6 +46,77 @@ fn only_applied_candidate_only_signals_start_synchronized_punch() {
     ));
 }
 
+fn deferred_initiator_test_peer(node_id: &str, endpoint: &str) -> control::PeerInfo {
+    control::PeerInfo {
+        node_id: node_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: "00".to_string(),
+        endpoint: endpoint.to_string(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 1,
+        relay_rtt_ms: None,
+    }
+}
+
+#[test]
+fn deferred_initiator_queue_is_bounded_and_newest_wins_per_peer() {
+    let mut queue = InitiatorQueue::new();
+    assert!(enqueue_deferred_initiator_handshake(
+        &mut queue,
+        deferred_initiator_test_peer("peer-a", "198.51.100.10:41000"),
+    ));
+    assert!(enqueue_deferred_initiator_handshake(
+        &mut queue,
+        deferred_initiator_test_peer("peer-b", "198.51.100.11:41000"),
+    ));
+    assert!(enqueue_deferred_initiator_handshake(
+        &mut queue,
+        deferred_initiator_test_peer("peer-a", "198.51.100.10:41001"),
+    ));
+
+    assert_eq!(queue.len(), 2, "one deferred slot must exist per peer");
+    let first = queue.pop_front().expect("peer-a remains first in FIFO");
+    assert_eq!(first.node_id, "peer-a");
+    assert_eq!(first.endpoint, "198.51.100.10:41001");
+
+    for index in 0..MAX_DEFERRED_INITIATOR_HANDSHAKES.saturating_sub(1) {
+        assert!(enqueue_deferred_initiator_handshake(
+            &mut queue,
+            deferred_initiator_test_peer(&format!("peer-{index}"), "198.51.100.12:41000"),
+        ));
+    }
+    assert_eq!(queue.len(), MAX_DEFERRED_INITIATOR_HANDSHAKES);
+    assert!(!enqueue_deferred_initiator_handshake(
+        &mut queue,
+        deferred_initiator_test_peer("overflow", "198.51.100.13:41000"),
+    ));
+}
+
+#[test]
+fn deferred_initiator_queue_removes_offline_or_replaced_peer() {
+    let mut queue = InitiatorQueue::new();
+    for peer_id in ["peer-a", "peer-b", "peer-c"] {
+        assert!(enqueue_deferred_initiator_handshake(
+            &mut queue,
+            deferred_initiator_test_peer(peer_id, "198.51.100.20:41000"),
+        ));
+    }
+
+    remove_deferred_initiator_handshake(&mut queue, "peer-b");
+    assert_eq!(
+        queue
+            .iter()
+            .map(|peer| peer.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["peer-a", "peer-c"]
+    );
+    remove_deferred_initiator_handshake(&mut queue, "peer-missing");
+    assert_eq!(queue.len(), 2);
+}
+
 #[tokio::test]
 async fn candidate_snapshot_reader_observes_only_committed_tuple() {
     let daemon = Daemon::new(

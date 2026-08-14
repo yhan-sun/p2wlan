@@ -1676,7 +1676,7 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
 }
 
 #[tokio::test]
-async fn test_network_outbound_waits_for_relay_when_direct_is_unconfirmed() {
+async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_before_slot() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
     let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1705,6 +1705,13 @@ async fn test_network_outbound_waits_for_relay_when_direct_is_unconfirmed() {
             direct_endpoint,
             Some(Duration::from_millis(8)),
         )
+        .await;
+    // This is the startup race from the real Air/Mini run: Direct can become
+    // encrypted-confirmed before the relay supervisor publishes its live
+    // transport slot.  Relay-first must still retain the raw business packet
+    // until the configured relay is available and peer-confirmed.
+    peers
+        .record_direct_success("node-b", Some(direct_endpoint))
         .await;
 
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -1763,10 +1770,21 @@ async fn test_network_outbound_waits_for_relay_when_direct_is_unconfirmed() {
     tokio::time::timeout(Duration::from_millis(150), rx_b.recv())
         .await
         .expect_err("relay should not receive before relay transport is published");
+    let mut direct_buf = [0u8; 64];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), direct_sink.recv_from(&mut direct_buf))
+            .await
+            .is_err(),
+        "a configured relay must block Direct business handoff during startup"
+    );
 
     *relay_transport.write().await = Some(relay_a);
+    let generation = peers.current_network_generation().await;
+    peers
+        .mark_relay_transport_ready("node-b", &relay_endpoint, generation)
+        .await;
     assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
+        .confirm_relay_peer("node-b", &relay_endpoint, generation)
         .await);
     let _ = relay_available_tx.send(true);
 
@@ -2473,11 +2491,11 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
 }
 
 #[tokio::test]
-async fn test_network_outbound_direct_commit_flushes_waiting_first_packet_immediately() {
-    // Relay never becomes available and node-b is not confirmed, so the first
-    // business packet parks with a startup deadline.  Direct is confirmed
-    // quickly (well under the 2s timeout): the waiting packet must ride Direct
-    // IMMEDIATELY, never wait for the relay startup timeout.
+async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_never_appears() {
+    // Relay never becomes available, but it is configured and therefore gets
+    // a bounded relay-first window.  Direct is confirmed quickly, so the
+    // waiting packet must eventually ride Direct after that window — never
+    // remain queued indefinitely and never bypass relay at startup.
     let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = direct_sink.local_addr().unwrap();
 
@@ -2522,7 +2540,7 @@ async fn test_network_outbound_direct_commit_flushes_waiting_first_packet_immedi
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
-            timeout: Some(Duration::from_secs(2)),
+            timeout: Some(Duration::from_secs(4)),
         },
         relay_probe_kick_tx,
         ConnectionTimeline::new("node-a", 0),
@@ -2545,20 +2563,24 @@ async fn test_network_outbound_direct_commit_flushes_waiting_first_packet_immedi
         .await
         .unwrap();
     // Give the packet a moment to park, then confirm Direct well inside the
-    // 2s startup window.
+    // bounded relay-first window.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let generation = peers.current_network_generation().await;
     assert!(peers
         .record_direct_success_for_generation("node-b", Some(direct_endpoint), generation)
         .await);
 
-    // The waiting packet must be flushed over DIRECT, not held for the relay
-    // timeout.  The direct sink receives the worker's ENCRYPTED wire bytes.
+    // The waiting packet must be flushed over DIRECT after the bounded relay
+    // window, not dropped or held forever.  The direct sink receives the
+    // worker's ENCRYPTED wire bytes.
     let mut buf = [0u8; 256];
-    let (n, _from) = tokio::time::timeout(Duration::from_secs(1), direct_sink.recv_from(&mut buf))
-        .await
-        .expect("the waiting first packet must be sent over Direct after the commit")
-        .unwrap();
+    let (n, _from) = tokio::time::timeout(
+        Duration::from_secs(4),
+        direct_sink.recv_from(&mut buf),
+    )
+    .await
+    .expect("the waiting first packet must reach Direct after the bounded relay window")
+    .unwrap();
     assert_eq!(
         remote_session.decrypt_from_bytes(&buf[..n]).unwrap(),
         packet,

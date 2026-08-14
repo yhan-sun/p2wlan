@@ -317,6 +317,11 @@ pub(super) async fn run_network_outbound(
     // second FIFO for the same peer.
     let mut flush_tasks = JoinSet::new();
     let mut flushing_peers = HashSet::new();
+    // `relay_available` is a live transport snapshot, while this flag says
+    // that the configured topology requires a relay-first admission window.
+    // Keeping them separate closes the startup race where Direct was admitted
+    // in the few milliseconds before the relay supervisor published its slot.
+    let relay_expected = relay_startup_wait.timeout.is_some();
     let _ = relay_probe_kick_tx.send(probe_kick);
 
     loop {
@@ -332,6 +337,7 @@ pub(super) async fn run_network_outbound(
                     &udp_transport,
                     &relay_transport,
                     relay_startup_wait,
+                    relay_expected,
                     &mut probe_kick,
                     &relay_probe_kick_tx,
                     &timeline,
@@ -347,6 +353,7 @@ pub(super) async fn run_network_outbound(
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
+                    relay_expected,
                     &timeline,
                     &mut flush_tasks,
                     &mut flushing_peers,
@@ -360,6 +367,7 @@ pub(super) async fn run_network_outbound(
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
+                    relay_expected,
                     &timeline,
                     &mut flush_tasks,
                     &mut flushing_peers,
@@ -378,6 +386,7 @@ pub(super) async fn run_network_outbound(
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
+                    relay_expected,
                     &timeline,
                     &mut flush_tasks,
                     &mut flushing_peers,
@@ -391,6 +400,7 @@ pub(super) async fn run_network_outbound(
                     prefer_direct,
                     &udp_transport,
                     &relay_transport,
+                    relay_expected,
                     &timeline,
                     &mut flush_tasks,
                     &mut flushing_peers,
@@ -408,6 +418,7 @@ pub(super) async fn run_network_outbound(
                             prefer_direct,
                             &udp_transport,
                             &relay_transport,
+                            relay_expected,
                             &timeline,
                             &mut flush_tasks,
                             &mut flushing_peers,
@@ -470,6 +481,7 @@ async fn handle_ingress(
     udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
     relay_startup_wait: RelayStartupWait,
+    relay_expected: bool,
     probe_kick: &mut u64,
     relay_probe_kick_tx: &watch::Sender<u64>,
     timeline: &Arc<ConnectionTimeline>,
@@ -505,7 +517,11 @@ async fn handle_ingress(
 
     let relay_available = relay_transport.read().await.is_some();
     let usable = peers
-        .is_data_path_admitted_for_generation(&peer_id, generation, relay_available)
+        .is_data_path_admitted_for_generation(
+            &peer_id,
+            generation,
+            relay_available || relay_expected,
+        )
         .await;
     // Every business packet, including a packet arriving after confirmation,
     // enters the same per-peer FIFO. This is the critical distinction from the
@@ -585,6 +601,7 @@ async fn handle_ingress(
             prefer_direct,
             udp_transport,
             relay_transport,
+            relay_expected,
             timeline,
             flush_tasks,
             flushing_peers,
@@ -736,6 +753,7 @@ async fn start_ready_peer_flushes(
     prefer_direct: bool,
     udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+    relay_expected: bool,
     timeline: &Arc<ConnectionTimeline>,
     flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
     flushing_peers: &mut HashSet<String>,
@@ -776,7 +794,11 @@ async fn start_ready_peer_flushes(
             let generation = peers.current_network_generation().await;
             let relay_available = relay_transport.read().await.is_some();
             if peers
-                .is_data_path_admitted_for_generation(peer_id, generation, relay_available)
+                .is_data_path_admitted_for_generation(
+                    peer_id,
+                    generation,
+                    relay_available || relay_expected,
+                )
                 .await
             {
                 ready.push(peer_id.clone());
@@ -807,6 +829,7 @@ async fn start_ready_peer_flushes(
                 prefer_direct,
                 task_udp_transport,
                 task_relay_transport,
+                relay_expected,
                 task_timeline,
             )
             .await
@@ -827,6 +850,7 @@ async fn flush_one_peer(
     prefer_direct: bool,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_expected: bool,
     timeline: Arc<ConnectionTimeline>,
 ) -> (String, PeerPendingQueue) {
     let mut flushed = 0usize;
@@ -853,7 +877,11 @@ async fn flush_one_peer(
 
         let relay_available = relay_transport.read().await.is_some();
         let usable = peers
-            .is_data_path_admitted_for_generation(&peer_id, generation, relay_available)
+            .is_data_path_admitted_for_generation(
+                &peer_id,
+                generation,
+                relay_available || relay_expected,
+            )
             .await;
         if !usable {
             queue.push_front(front);
@@ -1106,6 +1134,7 @@ async fn maintenance(
     prefer_direct: bool,
     udp_transport: &Arc<RwLock<Option<UdpTransport>>>,
     relay_transport: &Arc<RwLock<Option<RelayTransport>>>,
+    relay_expected: bool,
     timeline: &Arc<ConnectionTimeline>,
     flush_tasks: &mut JoinSet<(String, PeerPendingQueue)>,
     flushing_peers: &mut HashSet<String>,
@@ -1127,7 +1156,11 @@ async fn maintenance(
             }
             let relay_available = relay_transport.read().await.is_some();
             let usable = peers
-                .is_data_path_admitted_for_generation(peer_id, generation, relay_available)
+                .is_data_path_admitted_for_generation(
+                    peer_id,
+                    generation,
+                    relay_available || relay_expected,
+                )
                 .await;
             if !usable {
                 expired.push(peer_id.clone());
@@ -1189,6 +1222,7 @@ async fn maintenance(
         prefer_direct,
         udp_transport,
         relay_transport,
+        relay_expected,
         timeline,
         flush_tasks,
         flushing_peers,

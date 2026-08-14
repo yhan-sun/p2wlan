@@ -58,11 +58,12 @@ pub(super) fn candidate_pair_source_observed_age_ms(pair: &CandidatePair) -> Opt
 }
 
 pub(super) fn candidate_pair_freshness_rank_at(pair: &CandidatePair, now: Instant) -> u8 {
-    if pair.last_success_at.is_some()
-        || matches!(
-            pair.state,
-            CandidatePairState::Selected | CandidatePairState::Succeeded
-        )
+    if pair.last_slow_validation_at.is_none()
+        && (pair.last_success_at.is_some()
+            || matches!(
+                pair.state,
+                CandidatePairState::Selected | CandidatePairState::Succeeded
+            ))
     {
         return 0;
     }

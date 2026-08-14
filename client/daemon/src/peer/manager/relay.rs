@@ -184,6 +184,7 @@ impl PeerManager {
                 conn.relay_first_gate_generation = None;
                 conn.relay_first_gate_started_at = None;
                 conn.relay_first_business_sent_generation = None;
+                conn.relay_first_business_received_generation = None;
                 debug!(
                     event = "relay_transport_ready_peer",
                     peer_id = %node_id,
@@ -281,6 +282,10 @@ impl PeerManager {
             if self.peer_quarantined_sync(node_id) {
                 return false;
             }
+            let relay_business_received_before_confirmation =
+                conn.relay_first_business_received_generation == Some(generation)
+                    && conn.relay_ready_generation == Some(generation)
+                    && conn.relay_ready_endpoint.as_deref() == Some(relay_endpoint);
             if conn.relay_confirmed_at.is_some()
                 && conn.relay_confirmed_generation == Some(generation)
                 && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
@@ -302,6 +307,7 @@ impl PeerManager {
                 conn.relay_first_gate_generation = None;
                 conn.relay_first_gate_started_at = None;
                 conn.relay_first_business_sent_generation = None;
+                conn.relay_first_business_received_generation = None;
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
                 }
@@ -319,6 +325,8 @@ impl PeerManager {
                 conn.relay_first_gate_generation = None;
                 conn.relay_first_gate_started_at = None;
                 conn.relay_first_business_sent_generation = None;
+                conn.relay_first_business_received_generation =
+                    relay_business_received_before_confirmation.then_some(generation);
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
                 }
@@ -391,6 +399,35 @@ impl PeerManager {
                     // evidence for the new session.
                     if !conn.online || conn.state == ConnectionState::Closed {
                         (false, Some("peer_offline_or_closed"))
+                    } else if path == NetworkPath::Direct
+                        && ((conn.relay_confirmed_generation == Some(generation)
+                            && conn.relay_confirmed_endpoint.is_some())
+                            || conn.relay_ready_generation == Some(generation)
+                            || conn.relay_first_gate_generation == Some(generation))
+                        && (conn.relay_first_business_received_generation != Some(generation))
+                    {
+                        // Direct validation may have succeeded in the
+                        // background, but the first real business evidence
+                        // must still cross the relay in this direction.  A
+                        // short relay-confirmation grace remains a bounded
+                        // fallback window; once it expires, a genuinely
+                        // Direct-only path may establish first usable.
+                        let relay_confirmation_pending =
+                            conn.relay_confirmed_generation != Some(generation)
+                                && conn
+                                    .relay_ready_at
+                                    .or(conn.relay_first_gate_started_at)
+                                    .is_some_and(|started_at| {
+                                        started_at.elapsed() < RELAY_FIRST_CONFIRMATION_GRACE
+                                    });
+                        let relay_confirmed_without_receive =
+                            conn.relay_confirmed_generation == Some(generation)
+                                && conn.relay_confirmed_endpoint.is_some();
+                        if relay_confirmation_pending || relay_confirmed_without_receive {
+                            (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS))
+                        } else {
+                            (conn.record_first_usable(path, generation), None)
+                        }
                     } else {
                         (conn.record_first_usable(path, generation), None)
                     }
@@ -703,6 +740,7 @@ impl PeerManager {
     /// quarantined/offline.
     pub async fn relay_probe_targets(&self) -> Vec<(String, String, u64)> {
         let generation = self.current_network_generation().await;
+        let grace_peers = self.relay_not_found_grace_peers().await;
         let candidates: Vec<_> = self
             .connections
             .read()
@@ -711,6 +749,7 @@ impl PeerManager {
             .filter(|conn| {
                 conn.online
                     && conn.state != ConnectionState::Closed
+                    && !grace_peers.contains(&conn.node_id)
                     && conn.relay_confirmed_at.is_none()
             })
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone(), generation))
@@ -722,6 +761,23 @@ impl PeerManager {
             }
         }
         targets
+    }
+
+    /// Snapshot peers currently inside the transient relay-registration grace
+    /// window. This is intentionally a snapshot rather than a mutation: an
+    /// expired entry is re-tested by the next scheduled probe, preserving the
+    /// existing bounded grace/quarantine state machine.
+    async fn relay_not_found_grace_peers(&self) -> HashSet<String> {
+        let now = Instant::now();
+        self.relay_not_found_grace
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, state)| {
+                now.saturating_duration_since(state.started_at) < RELAY_PEER_NOT_FOUND_GRACE
+            })
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect()
     }
 
     /// The per-peer relay-ready instant, if any (daemon-local monotonic).
@@ -788,6 +844,56 @@ impl PeerManager {
                 Some(format!(
                     "peer={node_id} generation={generation} relay_endpoint={}",
                     relay_endpoint.as_deref().unwrap_or("unknown")
+                )),
+            );
+        }
+        changed
+    }
+
+    /// Commit the first normal business packet received through the
+    /// same-generation confirmed relay.  This is deliberately separate from
+    /// writer completion: Direct may not become the active path until both
+    /// the local send and the remote-to-local receive direction have crossed
+    /// the relay.
+    pub(crate) async fn mark_relay_first_business_received_for_generation(
+        &self,
+        node_id: &str,
+        relay_endpoint: &str,
+        generation: u64,
+    ) -> bool {
+        let (changed, endpoint) = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            let relay_session_matches = conn.online
+                && conn.state != ConnectionState::Closed
+                && ((conn.relay_ready_generation == Some(generation)
+                    && conn.relay_ready_endpoint.as_deref() == Some(relay_endpoint))
+                    || (conn.relay_confirmed_generation == Some(generation)
+                        && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)));
+            if !relay_session_matches
+                || conn.relay_first_business_received_generation == Some(generation)
+            {
+                return false;
+            }
+            conn.relay_first_business_received_generation = Some(generation);
+            (
+                true,
+                conn.relay_confirmed_endpoint
+                    .clone()
+                    .or_else(|| conn.relay_ready_endpoint.clone())
+                    .or_else(|| Some(relay_endpoint.to_string())),
+            )
+        };
+        if changed {
+            self.emit_timeline(
+                "relay_first_business_received",
+                Some("relay"),
+                None,
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={}",
+                    endpoint.as_deref().unwrap_or("unknown")
                 )),
             );
         }
@@ -897,6 +1003,7 @@ impl PeerManager {
                     conn.relay_first_gate_generation = None;
                     conn.relay_first_gate_started_at = None;
                     conn.relay_first_business_sent_generation = None;
+                    conn.relay_first_business_received_generation = None;
                     let had_ready = conn.relay_ready_at.is_some();
                     conn.relay_ready_generation = None;
                     conn.relay_ready_at = None;
@@ -1065,6 +1172,7 @@ impl PeerManager {
                 conn.relay_first_gate_generation = None;
                 conn.relay_first_gate_started_at = None;
                 conn.relay_first_business_sent_generation = None;
+                conn.relay_first_business_received_generation = None;
                 if had_confirmed {
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                 }

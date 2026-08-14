@@ -1262,6 +1262,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_validation_lock_contention_is_bounded_below_slow_rtt_floor() {
+        let (transport, _outbound_rx) = WireGuardTransport::new();
+        let emit_lock = transport.outbound_emit_lock("peer-a").await;
+        let _guard = emit_lock.lock().await;
+        let started = std::time::Instant::now();
+
+        let emitted = transport
+            .encrypt_and_emit_outbound_with_lock_timeout(
+                OutboundPacket {
+                    peer_id: "peer-a".to_string(),
+                    dst_ip: "10.20.0.1".to_string(),
+                    packet: vec![0],
+                },
+                DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
+                |_encrypted| async { Ok(()) },
+            )
+            .await
+            .expect("lock contention must be a terminal skipped attempt, not an error");
+
+        assert_eq!(
+            emitted,
+            BoundedEmitOutcome::LockTimeout,
+            "a validation packet cannot bypass a held counter lock"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "Direct validation lock contention must not be measured as a 500ms path RTT"
+        );
+    }
+
+    #[tokio::test]
     async fn dead_peer_egress_lock_is_pruned_during_later_peer_churn() {
         let (_remote, local) = establish_sessions();
         let (transport, _outbound_rx) = WireGuardTransport::new();

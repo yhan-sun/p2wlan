@@ -286,6 +286,7 @@ async fn run_udp_direct_instance(
         _ = wait_for_udp_direct_stop(shutdown_rx.clone(), lease.shutdown_receiver()) => None,
     };
     let outcome = if let Some(initial_refresh_guard) = initial_refresh_guard {
+            let mut advertised_nat_type = "unknown".to_string();
 
             let (mut candidate_endpoints, mut candidate_sources) =
                 match udp
@@ -293,6 +294,7 @@ async fn run_udp_direct_instance(
                     .await
                 {
                     Ok(report) => {
+                        advertised_nat_type = report.nat_profile.control_label();
                         let (endpoints, sources) = candidate_endpoints_from_report(&report);
                         info!(
                             "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={}",
@@ -466,7 +468,7 @@ async fn run_udp_direct_instance(
                 // transport startup.
                 match tokio::time::timeout(
                     Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
-                    control.update_endpoint_for_handshake(&endpoint, "unknown"),
+                    control.update_endpoint_for_handshake(&endpoint, &advertised_nat_type),
                 )
                 .await
                 {

@@ -30,14 +30,14 @@ mod tests {
             coalescer.on_churn(churn_b, now + Duration::from_secs(2)),
             VolatileChurnAction::CoalescedNewest
         );
-        // Nothing publishes before the debounce window elapses.  The window
-        // slides with each churn (the last one at now+2s), so the earliest
-        // due instant is now+32s.
-        assert_eq!(coalescer.take_due(now + Duration::from_secs(20)), None);
+        // The deadline is fixed from the first churn.  A later churn must not
+        // slide it indefinitely, otherwise a busy NAT can starve the peer of
+        // its newest public endpoint.
+        assert_eq!(coalescer.take_due(now + Duration::from_millis(499)), None);
 
         // Exactly one publication after the window: the newest set.
         assert_eq!(
-            coalescer.take_due(now + Duration::from_secs(33)),
+            coalescer.take_due(now + Duration::from_millis(500)),
             Some(churn_b)
         );
         coalescer.record_published(churn_b);
@@ -159,6 +159,103 @@ mod tests {
             &previous_sources,
             &predicted,
             &predicted_sources,
+        ));
+    }
+
+    #[test]
+    fn mapping_dependent_socket_pool_gets_one_fast_post_bind_refresh() {
+        let mut profile = p2pnet_nat::NatProfile {
+            local_addr: "192.168.0.239:59270".to_string(),
+            observations: Vec::new(),
+            udp_blocked: false,
+            public_endpoint: Some("220.163.6.190:4872".to_string()),
+            public_ip_stable: Some(true),
+            public_port_stable: Some(false),
+            port_preserved: Some(false),
+            port_delta: Some(1),
+            likely_symmetric: Some(true),
+            mapping_behavior: p2pnet_nat::MappingBehavior::AddressOrPortDependent,
+            filtering_behavior: p2pnet_nat::FilteringBehavior::Unknown,
+            hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+            mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+            prediction_candidate: true,
+            predicted_endpoints: Vec::new(),
+            birthday_candidate: true,
+            confidence: 60,
+        };
+
+        assert!(should_warm_mapping_dependent_socket_pool(
+            3,
+            true,
+            Some(&profile)
+        ));
+        assert!(!should_warm_mapping_dependent_socket_pool(
+            1,
+            true,
+            Some(&profile)
+        ));
+        assert!(!should_warm_mapping_dependent_socket_pool(
+            3,
+            false,
+            Some(&profile)
+        ));
+
+        profile.mapping_behavior = p2pnet_nat::MappingBehavior::EndpointIndependent;
+        assert!(!should_warm_mapping_dependent_socket_pool(
+            3,
+            true,
+            Some(&profile)
+        ));
+    }
+
+    #[test]
+    fn pool_public_candidate_does_not_end_startup_retry_when_primary_mapping_is_blocked() {
+        let candidates = vec!["220.163.6.190:62943".to_string()];
+        let sources = HashMap::from([(candidates[0].clone(), "stun_observed".to_string())]);
+        let mut profile = p2pnet_nat::NatProfile {
+            local_addr: "192.168.0.239:59270".to_string(),
+            observations: Vec::new(),
+            udp_blocked: true,
+            public_endpoint: None,
+            public_ip_stable: None,
+            public_port_stable: None,
+            port_preserved: None,
+            port_delta: None,
+            likely_symmetric: None,
+            mapping_behavior: p2pnet_nat::MappingBehavior::UdpBlocked,
+            filtering_behavior: p2pnet_nat::FilteringBehavior::UdpBlocked,
+            hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+            mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+            prediction_candidate: false,
+            predicted_endpoints: Vec::new(),
+            birthday_candidate: false,
+            confidence: 60,
+        };
+
+        assert!(has_real_public_candidate(&candidates, &sources));
+        assert!(!has_reliable_public_candidate(
+            Some(&profile),
+            &candidates,
+            &sources,
+        ));
+
+        profile.udp_blocked = false;
+        profile.public_endpoint = Some("8.8.8.8:41000".to_string());
+        assert!(!has_reliable_public_candidate(
+            Some(&profile),
+            &candidates,
+            &sources,
+        ));
+
+        let primary = profile.public_endpoint.clone().unwrap();
+        let mut candidates = candidates;
+        candidates.push(primary.clone());
+        let mut sources = sources;
+        sources.insert(primary, "stun_observed".to_string());
+        assert!(has_reliable_public_candidate(
+            Some(&profile),
+            &candidates,
+            &sources,
         ));
     }
 }

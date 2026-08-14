@@ -140,6 +140,12 @@ type DirectValidationSessionState = Arc<Mutex<HashMap<String, DirectValidationSe
 /// by an ACK: keyed by peer, one at a time (newer requests replace older
 /// ones), with the token the peer's ACK must carry and a bounded TTL.
 type DirectValidationExpectationState = Arc<Mutex<HashMap<String, DirectValidationExpectation>>>;
+/// Peer/generation-level quarantine for a Direct validation that arrived after
+/// the confirmed relay had already carried the request for too long.  The
+/// candidate-level quarantine is intentionally not enough: peer-reflexive
+/// endpoint churn can otherwise create a fresh owner for every new endpoint
+/// and keep sending delayed validation requests indefinitely.
+type SlowRelayValidationCooldownState = Arc<Mutex<HashMap<String, (u64, Instant)>>>;
 
 /// Process-wide owner sequence for direct-validation sessions.
 ///
@@ -167,6 +173,7 @@ pub(crate) fn next_direct_validation_owner_token() -> u64 {
 pub(crate) struct DirectValidationRegistry {
     pub(crate) sessions: DirectValidationSessionState,
     pub(crate) expectations: DirectValidationExpectationState,
+    pub(crate) slow_relay_cooldowns: SlowRelayValidationCooldownState,
     /// Set permanently when the UDP transport is withdrawn. A stale
     /// scheduler/receiver may still wake after teardown, but it can never
     /// install a fresh session into the retired registry.
@@ -178,12 +185,58 @@ impl DirectValidationRegistry {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             expectations: Arc::new(Mutex::new(HashMap::new())),
+            slow_relay_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Suppress new validation owners for this peer and generation until the
+    /// relay has had time to remain the stable active path.  Extending an
+    /// existing same-generation deadline is safe; a different generation
+    /// replaces it because no old-generation cooldown may affect a rejoin.
+    pub(crate) async fn suppress_slow_relay_validation(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) {
+        let deadline = Instant::now() + crate::peer::SLOW_DIRECT_RELAY_RETRY_COOLDOWN;
+        let mut cooldowns = self.slow_relay_cooldowns.lock().await;
+        match cooldowns.get_mut(peer_id) {
+            Some((stored_generation, stored_deadline)) if *stored_generation == generation => {
+                if deadline > *stored_deadline {
+                    *stored_deadline = deadline;
+                }
+            }
+            _ => {
+                cooldowns.insert(peer_id.to_string(), (generation, deadline));
+            }
+        }
+    }
+
+    /// Check and lazily remove an expired or old-generation cooldown.  The
+    /// caller does not retain this lock while touching the session map, which
+    /// keeps the cooldown check outside the registry's session -> expectation
+    /// transaction and avoids introducing a reverse lock order.
+    pub(crate) async fn is_slow_relay_validation_suppressed(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let mut cooldowns = self.slow_relay_cooldowns.lock().await;
+        match cooldowns.get(peer_id).copied() {
+            Some((stored_generation, deadline))
+                if stored_generation == generation && deadline > now => true,
+            Some(_) => {
+                cooldowns.remove(peer_id);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Revoke one peer's worker and every expectation it owns.  This is safe
@@ -224,6 +277,7 @@ impl DirectValidationRegistry {
                 expectations.remove(peer_id);
             }
         }
+        self.slow_relay_cooldowns.lock().await.remove(peer_id);
         drop(sessions);
     }
 
@@ -253,6 +307,10 @@ impl DirectValidationRegistry {
         expectations.retain(|peer_id, expectation| {
             !cancelled_peers.contains(peer_id) && expectation.generation == current_generation
         });
+        self.slow_relay_cooldowns
+            .lock()
+            .await
+            .retain(|_, (generation, _)| *generation == current_generation);
         drop(sessions);
     }
 
@@ -276,6 +334,7 @@ impl DirectValidationRegistry {
             });
         }
         self.expectations.lock().await.clear();
+        self.slow_relay_cooldowns.lock().await.clear();
         drop(sessions_guard);
     }
 }
@@ -1036,6 +1095,10 @@ impl Default for PeerReflexiveIngress {
 #[derive(Debug, Clone)]
 struct PendingProbe {
     sent_at: Instant,
+    /// Monotonic terminal deadline for this probe's ACK.  Keeping the nonce
+    /// in the bounded map for cleanup is not permission to accept an ACK
+    /// forever: a delayed datagram must never become fresh path evidence.
+    expires_at: Instant,
     endpoint: SocketAddr,
     local_endpoint: Option<SocketAddr>,
     socket_index: usize,
@@ -1059,6 +1122,12 @@ struct PendingProbe {
     /// Direct-commit sequence at the moment this probe was sent.  A matched
     /// ACK can prove whether any newer Direct commit superseded the send.
     direct_commit_seq: u64,
+}
+
+impl PendingProbe {
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

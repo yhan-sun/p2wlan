@@ -129,9 +129,17 @@ pub struct PeerConnection {
     pub relay_confirm_seq: u64,
     /// Generation for which at least one real business packet was accepted by
     /// the confirmed relay writer.  Direct may be confirmed in the
-    /// background, but it cannot become the first data-plane path until this
-    /// marker is set.
+    /// background, but it cannot become the first data-plane path until both
+    /// directions have crossed the confirmed relay.  The receive marker is
+    /// kept separately because a peer can send its first packet over relay,
+    /// promote Direct, and then deliver the other direction's first packet
+    /// directly before this daemon has itself observed relay business.
     pub relay_first_business_sent_generation: Option<u64>,
+    /// Generation for which a normal decrypted business packet was received
+    /// through the confirmed relay.  This closes the bidirectional
+    /// relay-first race: local relay writer completion alone cannot authorize
+    /// Direct for the other direction.
+    pub relay_first_business_received_generation: Option<u64>,
     /// Local network generation of the first confirmed usable path
     /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
     /// milestone.
@@ -207,6 +215,7 @@ impl PeerConnection {
             relay_first_gate_started_at: None,
             relay_confirm_seq: 0,
             relay_first_business_sent_generation: None,
+            relay_first_business_received_generation: None,
             first_usable_generation: None,
             first_usable_at: None,
             first_usable_path: None,
@@ -249,6 +258,7 @@ impl PeerConnection {
         self.relay_first_gate_generation = None;
         self.relay_first_gate_started_at = None;
         self.relay_first_business_sent_generation = None;
+        self.relay_first_business_received_generation = None;
         self.first_usable_generation = None;
         self.first_usable_at = None;
         self.first_usable_path = None;

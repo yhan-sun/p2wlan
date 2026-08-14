@@ -164,6 +164,7 @@ impl PeerManager {
                     conn.relay_first_gate_generation = None;
                     conn.relay_first_gate_started_at = None;
                     conn.relay_first_business_sent_generation = None;
+                    conn.relay_first_business_received_generation = None;
                     conn.relay_ready_generation = None;
                     conn.relay_ready_at = None;
                     conn.relay_ready_endpoint = None;

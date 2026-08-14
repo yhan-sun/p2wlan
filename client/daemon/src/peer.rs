@@ -112,7 +112,13 @@ const MAX_CANDIDATE_PAIRS_PER_PEER: usize = 640;
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_BASE: Duration = Duration::from_secs(1);
 const CANDIDATE_PAIR_FAILURE_COOLDOWN_MAX_EXPONENT: u32 = 3;
 const PRIORITY_OUTBOUND_PROBE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
-const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
+pub(crate) const SLOW_DIRECT_RELAY_VALIDATION_RTT_MS: u64 = 300;
+/// Do not immediately retry a candidate that proved reachable only through a
+/// delayed mapping while the confirmed relay is available.  This is a
+/// peer/generation quarantine, not a send timeout: it prevents repeated
+/// validation owners while the confirmed relay is healthy, and a new network
+/// generation clears it so a rejoin can start fresh.
+pub(crate) const SLOW_DIRECT_RELAY_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const PATH_SELECTION_EVENT_LIMIT: usize = 16;
 const DIRECT_TRAVERSAL_EVENT_LIMIT: usize = 32;
 const RELAY_PEER_CONFIRMATION_MAX_AGE: Duration = Duration::from_secs(30);
@@ -228,6 +234,12 @@ pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed"
 pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
 /// Stable reason code for direct path send failure.
 pub const REASON_DIRECT_SEND_FAILED: &str = "direct_send_failed";
+/// A direct probe ACK arrived, but its RTT was too slow to displace a
+/// same-generation confirmed relay.
+pub const REASON_DIRECT_PROBE_SLOW_RELAY_RETAINED: &str = "direct_probe_slow_relay_retained";
+/// A direct candidate was bidirectionally reachable but was retained only as
+/// slow evidence while the confirmed relay remained active.
+pub const REASON_DIRECT_SLOW_RELAY_RETAINED: &str = "direct_slow_relay_retained";
 /// Direct UDP keepalive did not receive a matching authenticated ACK.
 pub const REASON_DIRECT_KEEPALIVE_TIMEOUT: &str = "direct_keepalive_timeout";
 /// A nominated Direct trial did not receive encrypted data confirmation in time.
@@ -248,6 +260,11 @@ pub const REASON_PATH_DIRECT_NO_ENDPOINT: &str = "path_direct_no_endpoint";
 pub const REASON_PATH_DIRECT_NOT_CONFIRMED: &str = "path_direct_not_confirmed";
 /// Path selector chose Relay because Direct quality is worse than Relay.
 pub const REASON_PATH_DIRECT_DEGRADED: &str = "path_direct_degraded";
+/// An encrypted Direct validation succeeded, but its measured RTT exceeded
+/// the relay-retention quality floor while the same-generation relay was
+/// already peer-confirmed.  The proof is retained as a candidate observation;
+/// it must not become the active business path.
+pub const REASON_PATH_DIRECT_SLOW_RELAY_RETAINED: &str = "path_direct_slow_relay_retained";
 /// Direct has encrypted proof, but relay transport is ready and its
 /// same-generation peer ACK is still pending.  Business data must wait here;
 /// a Direct candidate/ACK cannot bypass relay-first admission.
@@ -257,6 +274,9 @@ pub const REASON_PATH_RELAY_FIRST_PENDING: &str = "path_relay_first_pending";
 /// relay-first an observable data-plane property instead of merely a control
 /// plane ordering promise.
 pub const REASON_PATH_RELAY_FIRST_BUSINESS: &str = "path_relay_first_business";
+/// A Direct business packet arrived before the bidirectional relay-first
+/// evidence was complete; it may be delivered, but it cannot win first usable.
+pub const REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS: &str = "first_direct_before_relay_business";
 /// Path selector found no usable Direct or Relay path.
 pub const REASON_PATH_UNAVAILABLE: &str = "path_unavailable";
 
@@ -291,10 +311,10 @@ pub use diagnostics::{
 pub(crate) use endpoint::is_overlay_endpoint;
 pub(crate) use endpoint::is_public_probe_endpoint;
 use endpoint::{
-    candidate_pair_failure_cooldown, candidate_pair_probe_due, candidate_pair_probe_rank_for_mode,
-    classify_candidate_pair_path, classify_confirmed_direct_endpoint, endpoint_probe_rank,
-    is_low_latency_direct_endpoint, should_retain_confirmed_direct_pair_on_candidate_refresh,
-    should_retain_private_direct_pair,
+    candidate_pair_failure_cooldown, candidate_pair_probe_allowed_at, candidate_pair_probe_due,
+    candidate_pair_probe_rank_for_mode, classify_candidate_pair_path,
+    classify_confirmed_direct_endpoint, endpoint_probe_rank, is_low_latency_direct_endpoint,
+    should_retain_confirmed_direct_pair_on_candidate_refresh, should_retain_private_direct_pair,
 };
 #[cfg(test)]
 use probe_budget::birthday_probe_budget_for_base_count;

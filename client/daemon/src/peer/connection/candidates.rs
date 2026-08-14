@@ -68,6 +68,14 @@ impl PeerConnection {
     }
 
     fn candidate_targets_need_remote_scatter_pool(&self, endpoints: &[SocketAddr]) -> bool {
+        // Newer peers publish a compact NAT behavior hint in the existing
+        // control-plane field.  It is not path evidence and never promotes a
+        // Direct path, but it lets the stable side start the bounded scatter
+        // plan in the first synchronized window instead of waiting for one
+        // failed narrow probe to reveal that the remote mapping is volatile.
+        if self.remote_nat_requires_port_scatter() {
+            return true;
+        }
         if endpoints.iter().any(|endpoint| {
             matches!(
                 self.candidate_source_for_endpoint(*endpoint),
@@ -387,7 +395,7 @@ impl PeerConnection {
             .filter(|pair| {
                 pair.local_generation == local_generation
                     && endpoints.contains(&pair.remote_endpoint)
-                    && (mode.bypasses_pair_cooldown() || candidate_pair_probe_due(pair))
+                    && candidate_pair_probe_allowed_at(pair, mode, now)
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
@@ -502,6 +510,13 @@ impl PeerConnection {
         &self,
         local_nat_profile: Option<&NatProfile>,
     ) -> bool {
+        // If both peers report mapping-dependent allocation, neither side is
+        // a stable scanner.  Keep the symmetric case on the coordinated
+        // birthday/prediction path instead of treating the remote's moving
+        // ports as a stable socket pool.
+        if self.remote_nat_requires_port_scatter() {
+            return false;
+        }
         if !local_nat_profile.is_some_and(is_hard_nat_profile) {
             return false;
         }
@@ -617,6 +632,15 @@ impl PeerConnection {
             .any(|source| *source == CandidatePairSource::Predicted)
     }
 
+    fn remote_nat_requires_port_scatter(&self) -> bool {
+        let nat_type = self.nat_type.trim().to_ascii_lowercase();
+        nat_type.contains("address_or_port_dependent")
+            || nat_type.contains("symmetric")
+            || nat_type.contains("a=linear")
+            || nat_type.contains("a=random")
+            || nat_type.contains("a=blocked")
+    }
+
     fn explicit_predicted_window_failed(&self, local_generation: u64) -> bool {
         let mut found_predicted = false;
         for endpoint in self.candidate_sources.iter().filter_map(|(candidate, source)| {
@@ -707,7 +731,8 @@ impl PeerConnection {
             && ((!has_explicit_predicted_window
                 && local_nat_profile.is_some_and(|profile| profile.birthday_candidate))
                 || failed_prediction_fallback);
-        let peer_looks_port_dependent = peer_candidates_need_port_scatter(&bases)
+        let peer_looks_port_dependent =
+            (self.remote_nat_requires_port_scatter() || peer_candidates_need_port_scatter(&bases))
             && (!has_explicit_predicted_window || failed_prediction_fallback);
         if !local_needs_birthday && !peer_looks_port_dependent {
             return None;

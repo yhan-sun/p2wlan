@@ -130,3 +130,64 @@ fn explicit_predicted_window_defers_birthday_fallback() {
         "birthday fallback after predicted window failed"
     );
 }
+
+#[test]
+fn slow_relay_candidate_is_quarantined_until_a_new_observation() {
+    let mut conn = PeerConnection::new("peer-b", "10.20.0.2");
+    let generation = 0;
+    let slow: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let fresh: SocketAddr = "203.0.113.10:41001".parse().unwrap();
+    conn.candidates = vec![slow.to_string(), fresh.to_string()];
+    conn.candidate_sources.insert(
+        slow.to_string(),
+        CandidatePairSource::PeerReflexive,
+    );
+    conn.candidate_sources.insert(
+        fresh.to_string(),
+        CandidatePairSource::PeerReflexive,
+    );
+
+    conn.ensure_candidate_pair_with_source(slow, generation, CandidatePairSource::PeerReflexive)
+        .record_slow_validation(
+            Duration::from_millis(700),
+            None,
+            REASON_DIRECT_SLOW_RELAY_RETAINED,
+            "slow but bidirectionally reachable",
+        );
+    conn.ensure_candidate_pair_with_source(fresh, generation, CandidatePairSource::PeerReflexive);
+
+    assert!(conn.direct_probe_endpoint_quarantined(slow, generation, Instant::now()));
+    assert!(!conn.direct_probe_endpoint_quarantined(fresh, generation, Instant::now()));
+
+    let history = TraversalHistory::default();
+    let (targets, _plan) = conn.candidate_probe_endpoints(
+        generation,
+        &history,
+        None,
+        ProbeTargetMode::Synchronized,
+        None,
+    );
+    assert!(targets.contains(&fresh));
+    assert!(
+        !targets.contains(&slow),
+        "a synchronized window must not retry a recently slow relay candidate"
+    );
+
+    let slow_pair = conn
+        .candidate_pairs
+        .iter_mut()
+        .find(|pair| pair.remote_endpoint == slow)
+        .unwrap();
+    slow_pair.source_observed_at = Some(Instant::now());
+    let (targets, _plan) = conn.candidate_probe_endpoints(
+        generation,
+        &history,
+        None,
+        ProbeTargetMode::Synchronized,
+        None,
+    );
+    assert!(
+        targets.contains(&slow),
+        "a refreshed source observation must reopen the candidate immediately"
+    );
+}

@@ -651,6 +651,44 @@ async fn remote_port_churn_triggers_birthday_probe_targets() {
 }
 
 #[tokio::test]
+async fn remote_nat_behavior_hint_starts_bounded_scatter_with_one_candidate() {
+    let manager = PeerManager::new(test_config());
+    let stable_profile = NatProfile {
+        mapping_behavior: MappingBehavior::EndpointIndependent,
+        public_ip_stable: Some(true),
+        public_port_stable: Some(true),
+        likely_symmetric: Some(false),
+        birthday_candidate: false,
+        ..birthday_nat_profile()
+    };
+    manager.update_nat_profile(stable_profile).await;
+
+    let endpoint: SocketAddr = "203.0.113.10:41001".parse().unwrap();
+    let mut peer = test_peer("peer-hinted-hard", endpoint);
+    peer.nat_type = "p2:m=address_or_port_dependent;a=linear;d=32;c=90".to_string();
+    manager.add_peer(&peer).await;
+    manager
+        .add_candidates_with_sources(
+            "peer-hinted-hard",
+            &[endpoint.to_string()],
+            &HashMap::from([(endpoint.to_string(), "stun_observed".to_string())]),
+        )
+        .await;
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer-hinted-hard")
+        .await
+        .expect("the hinted peer must receive a direct target set");
+    assert!(target_set.remote_scatter_pool);
+    assert!(target_set.stable_remote_scatter);
+    assert!(
+        target_set.candidates.len() > 1,
+        "a stable local side must begin a bounded scatter plan immediately"
+    );
+    assert!(target_set.birthday_plan.is_some());
+}
+
+#[tokio::test]
 async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
     let config = test_config();
     let manager = PeerManager::new(config);

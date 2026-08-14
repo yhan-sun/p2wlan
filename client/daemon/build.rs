@@ -10,7 +10,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn git_root() -> Option<PathBuf> {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -103,6 +102,31 @@ fn repo_watch_path(repo_relative_path: &str, manifest_dir: &Path) -> PathBuf {
     manifest_dir.join(repo_relative_path)
 }
 
+/// Keep the embedded identity reproducible.  A wall-clock timestamp in a
+/// rustc environment variable changes the executable on every rebuild even
+/// when the checkout is byte-for-byte identical, which makes an A/B or
+/// Mini/Air SHA gate unusable.  Callers that need a meaningful build time can
+/// provide `P2WLAN_BUILD_EPOCH_MS`; otherwise the runtime timeline remains the
+/// source of truth and `built_at_ms` is reported as zero.
+fn build_epoch_ms() -> u128 {
+    std::env::var("P2WLAN_BUILD_EPOCH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or_default()
+}
+
+fn build_identity(commit: &str, dirty: bool, diff_hash: &str) -> String {
+    if dirty {
+        format!(
+            "{}-dirty-{}",
+            commit.get(..12).unwrap_or(commit),
+            diff_hash.get(..12).unwrap_or(diff_hash)
+        )
+    } else {
+        commit.get(..12).unwrap_or(commit).to_string()
+    }
+}
+
 fn checkout_state() -> (bool, String) {
     let Some(repo_root) = git_root() else {
         return (true, "git-unavailable".to_string());
@@ -175,7 +199,7 @@ fn checkout_state() -> (bool, String) {
 mod tests {
     use std::path::Path;
 
-    use super::{dirty_material, repo_watch_path};
+    use super::{build_identity, dirty_material, repo_watch_path};
 
     #[test]
     fn untracked_content_changes_dirty_material() {
@@ -206,9 +230,22 @@ mod tests {
         let watch = repo_watch_path("scripts/staging/example.env", Path::new("/checkout"));
         assert_eq!(watch, Path::new("/checkout/scripts/staging/example.env"));
     }
+
+    #[test]
+    fn build_identity_is_stable_and_marks_dirty_diff() {
+        assert_eq!(
+            build_identity("0123456789abcdef", false, "ignored"),
+            "0123456789ab"
+        );
+        assert_eq!(
+            build_identity("0123456789abcdef", true, "fedcba9876543210"),
+            "0123456789ab-dirty-fedcba987654"
+        );
+    }
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=P2WLAN_BUILD_EPOCH_MS");
     let commit = git_root()
         .as_deref()
         .and_then(git_head)
@@ -217,19 +254,8 @@ fn main() {
     let (dirty, diff_hash) = checkout_state();
     println!("cargo:rustc-env=P2WLAN_DIRTY={dirty}");
     println!("cargo:rustc-env=P2WLAN_DIFF_HASH={diff_hash}");
-    let build_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
-    let build_id = if dirty {
-        format!(
-            "{}-dirty-{}-{build_ms}",
-            commit.get(..12).unwrap_or(&commit),
-            diff_hash.get(..12).unwrap_or(&diff_hash)
-        )
-    } else {
-        format!("{}-{build_ms}", commit.get(..12).unwrap_or(&commit))
-    };
+    let build_ms = build_epoch_ms();
+    let build_id = build_identity(&commit, dirty, &diff_hash);
     println!("cargo:rustc-env=P2WLAN_BUILD_ID={build_id}");
     println!("cargo:rustc-env=P2WLAN_BUILD_TIME_MS={build_ms}");
     // Re-run when the checked-out commit moves so stale builds never claim a

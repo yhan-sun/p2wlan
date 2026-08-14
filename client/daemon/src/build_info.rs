@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 
 /// The exact git commit this binary was compiled from (full SHA-1).
 pub const GIT_COMMIT: &str = env!("P2WLAN_GIT_COMMIT");
-/// Per-build identifier: short commit + build wall-clock milliseconds.
+/// Stable source identity: short commit, plus `dirty` and the checkout diff
+/// hash for development builds.
 pub const BUILD_ID: &str = env!("P2WLAN_BUILD_ID");
 /// Whether the checkout contained tracked or untracked changes at build time.
 pub const DIRTY: &str = match option_env!("P2WLAN_DIRTY") {
@@ -55,7 +56,9 @@ pub struct BuildInfo {
     pub binary_path: String,
     /// Cargo profile this binary was built with.
     pub profile: &'static str,
-    /// Unix millisecond timestamp of the build (embedded by build.rs).
+    /// Unix millisecond timestamp supplied through `P2WLAN_BUILD_EPOCH_MS`.
+    /// Zero means the reproducible-build default was used; daemon timeline
+    /// events provide the actual startup wall/monotonic times.
     pub built_at_ms: u64,
     /// Explicit source-tree state. Release identity verification rejects
     /// `dirty=true`; development diagnostics must show it plainly.

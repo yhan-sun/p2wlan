@@ -110,6 +110,12 @@ impl PeerManager {
         if generation != self.current_network_generation_sync() {
             return false;
         }
+        // An exact, decrypted validation ACK is authoritative evidence for
+        // this request/generation/endpoint.  Its RTT is recorded for path
+        // quality, but must not veto make-before-break promotion: a delayed
+        // ACK is still proof that this Direct path works.  The slow-RTT
+        // quarantine remains intentionally limited to probe-only evidence,
+        // which has not exercised the encrypted business path.
         let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
@@ -120,25 +126,25 @@ impl PeerManager {
             let previous_generation = conn.direct_generation;
             let selected_endpoint = endpoint.or(conn.endpoint);
             let pair_success = selected_endpoint.map(|endpoint| {
-                conn.endpoint = Some(endpoint);
-                if let Some(latency) = validation_latency {
-                    conn.mark_candidate_pair_authoritative_success(
-                        endpoint,
-                        generation,
-                        latency,
-                        true,
-                        local_endpoint,
-                    )
-                } else {
-                    conn.mark_candidate_pair_success(
-                        endpoint,
-                        generation,
-                        None,
-                        true,
-                        local_endpoint,
-                    )
-                }
-            });
+                    conn.endpoint = Some(endpoint);
+                    if let Some(latency) = validation_latency {
+                        conn.mark_candidate_pair_authoritative_success(
+                            endpoint,
+                            generation,
+                            latency,
+                            true,
+                            local_endpoint,
+                        )
+                    } else {
+                        conn.mark_candidate_pair_success(
+                            endpoint,
+                            generation,
+                            None,
+                            true,
+                            local_endpoint,
+                        )
+                    }
+                });
             let direct_confirmation_changed = !was_direct
                 || previous_endpoint != selected_endpoint
                 || previous_generation != generation;
@@ -177,11 +183,6 @@ impl PeerManager {
             if let Some(endpoint) = selected_endpoint {
                 let mut direct_selection =
                     conn.select_path_for_data(generation, true, true);
-                // Do not overwrite a relay-first pending selection with a
-                // synthetic Direct selection.  The Direct ACK is still
-                // recorded above as background proof, but the outbound FIFO
-                // must wait for the same-generation relay peer ACK before it
-                // can consume a business counter.
                 if direct_selection.path == Some(NetworkPath::Direct) {
                     direct_selection.path = Some(NetworkPath::Direct);
                     direct_selection.direct_endpoint = Some(endpoint);
@@ -369,7 +370,9 @@ impl PeerManager {
     }
 
     /// Record a direct-path probe result for a specific local network generation.
-    /// Returns false when the result belongs to an old generation and was ignored.
+    /// Returns false when the result belongs to an old generation or when a
+    /// slow ACK was retained as candidate evidence without starting Direct
+    /// validation over a confirmed relay.
     pub async fn record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
         &self,
         node_id: &str,
@@ -382,21 +385,47 @@ impl PeerManager {
             return false;
         }
         let mut record_ack_feedback = false;
+        let retain_relay_for_slow_probe;
         let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
-            conn.endpoint = Some(endpoint);
             let ack_confirmed = latency.is_some();
+            let slow_probe_retained = ack_confirmed
+                && latency.is_some_and(|latency| {
+                    duration_millis(latency) >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS
+                })
+                && conn.relay_peer_confirmed_for_generation(generation)
+                && conn.state != ConnectionState::Direct;
+            retain_relay_for_slow_probe = slow_probe_retained;
             let pair_success = if ack_confirmed {
-                Some(conn.mark_candidate_pair_success(
-                    endpoint,
-                    generation,
-                    latency,
-                    false,
-                    local_endpoint,
-                ))
+                if slow_probe_retained {
+                    Some(conn.mark_candidate_pair_slow_validation(
+                        endpoint,
+                        generation,
+                        latency.expect("slow probe retention requires an RTT"),
+                        local_endpoint,
+                    ))
+                } else {
+                    // A probe ACK is only allowed to replace the connection's
+                    // current endpoint when it is eligible to become the
+                    // active path.  In particular, a slow ACK that is
+                    // quarantined behind a confirmed relay is candidate
+                    // evidence, not an active-endpoint update.  Writing it to
+                    // `conn.endpoint` here would make the ranking code prefer
+                    // the very endpoint we just quarantined and would cause
+                    // delayed ACKs from other sockets to keep re-validating
+                    // the same queue-prone mapping.
+                    conn.endpoint = Some(endpoint);
+                    Some(conn.mark_candidate_pair_success(
+                        endpoint,
+                        generation,
+                        latency,
+                        false,
+                        local_endpoint,
+                    ))
+                }
             } else {
                 conn.mark_candidate_pair_probing_with_local_endpoint(
                     endpoint,
@@ -407,7 +436,9 @@ impl PeerManager {
             };
             match latency {
                 Some(latency) => {
-                    conn.direct_health.record_success_with_latency(latency);
+                    if !slow_probe_retained {
+                        conn.direct_health.record_success_with_latency(latency);
+                    }
                     if let Some((source, true)) = pair_success {
                         // Matched-ACK feedback: the recovery stage machine
                         // resets to Initial so a live path is never expanded
@@ -452,6 +483,41 @@ impl PeerManager {
                             )),
                         );
                     }
+                    if slow_probe_retained {
+                        let rtt_ms = duration_millis(latency);
+                        let source = pair_success
+                            .map(|(source, _)| source)
+                            .unwrap_or_else(|| conn.candidate_source_for_endpoint(endpoint));
+                        conn.record_direct_event(
+                            generation,
+                            "direct_probe_succeeded_relay_retained",
+                            Some(endpoint),
+                            Some(1),
+                            None,
+                            format!(
+                                "probe ACK was bidirectionally valid but rtt={rtt_ms}ms; retaining confirmed relay and continuing candidate recovery"
+                            ),
+                        );
+                        info!(
+                            event = "direct_probe_succeeded_relay_retained",
+                            peer_id = %node_id,
+                            local_endpoint = ?local_endpoint,
+                            remote_endpoint = %endpoint,
+                            candidate_source = ?source,
+                            rtt_ms,
+                            reason_code = REASON_DIRECT_PROBE_SLOW_RELAY_RETAINED,
+                            relay_rtt_floor_ms = SLOW_DIRECT_RELAY_VALIDATION_RTT_MS,
+                            "slow Direct probe ACK retained confirmed relay"
+                        );
+                        self.emit_timeline(
+                            "direct_probe_succeeded_relay_retained",
+                            Some("relay"),
+                            Some(REASON_DIRECT_PROBE_SLOW_RELAY_RETAINED),
+                            Some(format!(
+                                "peer={node_id} generation={generation} remote_endpoint={endpoint} rtt_ms={rtt_ms} relay_rtt_floor_ms={SLOW_DIRECT_RELAY_VALIDATION_RTT_MS}"
+                            )),
+                        );
+                    }
                 }
                 None => conn.direct_health.record_success(),
             }
@@ -483,6 +549,11 @@ impl PeerManager {
         if let Some((source, true)) = pair_success {
             self.record_traversal_success(source).await;
         }
-        true
+        // `false` here means that the authenticated probe was valid but must
+        // not start encrypted Direct validation: a slow candidate cannot
+        // displace a same-generation confirmed relay.  The pair evidence and
+        // ACK feedback were recorded above, so the recovery scheduler can
+        // continue toward another candidate.
+        !retain_relay_for_slow_probe
     }
 }

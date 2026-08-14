@@ -97,6 +97,42 @@ fn test_build_nat_profile_endpoint_independent_mapping() {
     assert!(profile.predicted_endpoints.is_empty());
     assert!(!profile.birthday_candidate);
     assert_eq!(profile.confidence, 70);
+    assert_eq!(
+        profile.control_label(),
+        "p2:m=endpoint_independent;a=stable;d=0;c=70"
+    );
+}
+
+#[test]
+fn test_control_label_exposes_linear_prediction_hint_without_long_payload() {
+    let profile = build_nat_profile(
+        "192.168.1.2:5000".parse().unwrap(),
+        vec![
+            StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40001".to_string()),
+                rtt_ms: Some(10),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-b.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40033".to_string()),
+                rtt_ms: Some(11),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-c.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40065".to_string()),
+                rtt_ms: Some(12),
+                error: None,
+            },
+        ],
+    );
+    let label = profile.control_label();
+    assert!(label.contains("m=address_or_port_dependent"));
+    assert!(label.contains("a=linear"));
+    assert!(label.contains("d=32"));
+    assert!(label.len() <= 64, "control nat_type must stay within server cap");
 }
 
 #[test]
@@ -324,7 +360,7 @@ fn test_predicted_reflexive_window_follows_air_linear_successor_group() {
 }
 
 #[test]
-fn test_build_nat_profile_rejects_wide_delta_for_prediction() {
+fn test_build_nat_profile_accepts_constant_wide_linear_step() {
     let profile = build_nat_profile(
         "192.168.1.2:5000".parse().unwrap(),
         vec![
@@ -353,16 +389,59 @@ fn test_build_nat_profile_rejects_wide_delta_for_prediction() {
         MappingBehavior::AddressOrPortDependent
     );
     assert_eq!(profile.port_delta, Some(32));
-    assert!(!profile.prediction_candidate);
-    assert!(profile.predicted_endpoints.is_empty());
+    assert!(profile.prediction_candidate);
+    assert_eq!(
+        profile.predicted_endpoints.first().map(String::as_str),
+        Some("203.0.113.10:40097")
+    );
+    assert_eq!(
+        profile.predicted_endpoints.last().map(String::as_str),
+        Some("203.0.113.10:43137")
+    );
     assert!(profile.birthday_candidate);
 }
 
 #[test]
-fn test_predicted_reflexive_endpoints_respect_port_bounds() {
+fn test_predicted_reflexive_endpoints_wrap_on_the_port_ring() {
     let high = predicted_reflexive_endpoints("203.0.113.10:65534".parse().unwrap(), Some(2), true);
-    assert!(high.is_empty());
+    assert_eq!(high.first().map(String::as_str), Some("203.0.113.10:2"));
+    assert!(high.contains(&"203.0.113.10:190".to_string()));
 
     let low = predicted_reflexive_endpoints("203.0.113.10:3".parse().unwrap(), Some(-2), true);
-    assert_eq!(low, vec!["203.0.113.10:1".to_string()]);
+    assert_eq!(low.first().map(String::as_str), Some("203.0.113.10:1"));
+    assert!(low.contains(&"203.0.113.10:65409".to_string()));
+}
+
+#[test]
+fn test_linear_successor_prediction_handles_port_wrap() {
+    let profile = build_nat_profile(
+        "192.168.1.2:5000".parse().unwrap(),
+        vec![
+            StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:65534".to_string()),
+                rtt_ms: Some(10),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-b.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:0".to_string()),
+                rtt_ms: Some(11),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-c.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:2".to_string()),
+                rtt_ms: Some(12),
+                error: None,
+            },
+        ],
+    );
+
+    assert_eq!(profile.port_delta, Some(2));
+    assert!(profile.prediction_candidate);
+    assert_eq!(
+        profile.predicted_endpoints.first().map(String::as_str),
+        Some("203.0.113.10:4")
+    );
 }

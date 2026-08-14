@@ -215,6 +215,46 @@ pub struct NatProfile {
 }
 
 impl NatProfile {
+    /// Compact, backward-compatible NAT behavior label for the control plane.
+    ///
+    /// The existing `nat_type` field is capped by the server and historically
+    /// carried display-only values.  Keep this deliberately short and stable
+    /// so a newer daemon can tell its peer whether a prediction/scatter plan
+    /// is worthwhile, while older daemons continue to treat it as an opaque
+    /// display string.  This is a hint only; authenticated candidate and
+    /// encrypted path evidence remain the authority for promotion.
+    pub fn control_label(&self) -> String {
+        let mapping = match self.mapping_behavior {
+            MappingBehavior::Unknown => "unknown",
+            MappingBehavior::UdpBlocked => "blocked",
+            MappingBehavior::OpenInternet => "open",
+            MappingBehavior::EndpointIndependent => "endpoint_independent",
+            MappingBehavior::AddressOrPortDependent => "address_or_port_dependent",
+        };
+        let allocation = if self.udp_blocked {
+            "blocked"
+        } else if self.prediction_candidate && self.port_delta.is_some() {
+            "linear"
+        } else if matches!(
+            self.mapping_behavior,
+            MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent
+        ) {
+            "stable"
+        } else if self.likely_symmetric == Some(true) {
+            "random"
+        } else {
+            "unknown"
+        };
+        let delta = self
+            .port_delta
+            .map(|delta| delta.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        format!(
+            "p2:m={mapping};a={allocation};d={delta};c={}",
+            self.confidence
+        )
+    }
+
     fn unknown(local_addr: SocketAddr) -> Self {
         Self {
             local_addr: local_addr.to_string(),

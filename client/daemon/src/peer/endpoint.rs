@@ -238,6 +238,9 @@ pub(super) fn candidate_pair_probe_rank_for_mode(
 }
 
 pub(super) fn candidate_pair_probe_due(pair: &CandidatePair) -> bool {
+    if pair.slow_validation_is_recent_at(Instant::now(), SLOW_DIRECT_RELAY_RETRY_COOLDOWN) {
+        return false;
+    }
     let Some(retry_after) = candidate_pair_failure_cooldown(pair) else {
         return true;
     };
@@ -245,6 +248,19 @@ pub(super) fn candidate_pair_probe_due(pair: &CandidatePair) -> bool {
         return true;
     };
     failure_age >= retry_after
+}
+
+/// Decide whether a pair may enter this probe window.  Synchronized and
+/// reclaim windows intentionally bypass ordinary failure backoff, but they do
+/// not bypass the slow-validation quarantine: otherwise a 500ms+ ACK can be
+/// retried in every window and starve newly refreshed NAT mappings.
+pub(super) fn candidate_pair_probe_allowed_at(
+    pair: &CandidatePair,
+    mode: ProbeTargetMode,
+    now: Instant,
+) -> bool {
+    !pair.slow_validation_is_recent_at(now, SLOW_DIRECT_RELAY_RETRY_COOLDOWN)
+        && (mode.bypasses_pair_cooldown() || candidate_pair_probe_due(pair))
 }
 
 pub(super) fn candidate_pair_failure_cooldown(pair: &CandidatePair) -> Option<Duration> {

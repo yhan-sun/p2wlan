@@ -41,6 +41,9 @@ impl UdpTransport {
         let Some(peer_id) = pending.peer_id.as_deref() else {
             return false;
         };
+        if pending.is_expired(Instant::now()) {
+            return false;
+        }
         loop {
             let cleanup_epoch = self.peer_probe_cleanup_epoch(peer_id).await;
             if pending.cleanup_epoch != cleanup_epoch {
@@ -572,22 +575,80 @@ impl UdpTransport {
                                 .copied()
                                 .unwrap_or(0);
                             let mut pending_probes = self.pending_probes.lock().await;
-                            let matched = pending_probes
-                                .get(&packet.nonce)
-                                .filter(|pending| {
-                                    pending.generation == generation
-                                        && pending.socket_index == socket_index
-                                        && pending.peer_id.as_deref()
-                                            == Some(identity.source_node_id.as_str())
-                                        && pending.cleanup_epoch == cleanup_epoch
-                                        && pending.accepts_authenticated_ack
-                                })
+                            let now = Instant::now();
+                            let pending = pending_probes.get(&packet.nonce).cloned();
+                            let matches_identity = |pending: &PendingProbe| {
+                                pending.generation == generation
+                                    && pending.socket_index == socket_index
+                                    && pending.peer_id.as_deref()
+                                        == Some(identity.source_node_id.as_str())
+                                    && pending.cleanup_epoch == cleanup_epoch
+                                    && pending.accepts_authenticated_ack
+                            };
+                            let expired = pending
+                                .as_ref()
+                                .filter(|pending| matches_identity(pending) && pending.is_expired(now))
                                 .cloned();
-                            if matched.is_some() {
+                            let matched = pending
+                                .filter(|pending| matches_identity(pending) && !pending.is_expired(now));
+                            if matched.is_some() || expired.is_some() {
                                 pending_probes.remove(&packet.nonce);
                             }
-                            matched
+                            (matched, expired)
                         };
+
+                        let (ack_match, expired_pending) = ack_match;
+                        if let Some(expired) = expired_pending {
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.authenticated_probe_acks_unmatched = metrics
+                                    .authenticated_probe_acks_unmatched
+                                    .saturating_add(1)
+                            })
+                            .await;
+                            self.update_peer_probe_rx_diagnostics(
+                                &identity.source_node_id,
+                                received_local_generation,
+                                matched_probe_session_id.as_deref(),
+                                |snapshot| {
+                                    if known_peer_ip {
+                                        snapshot.known_peer_ip_datagrams_received = snapshot
+                                            .known_peer_ip_datagrams_received
+                                            .saturating_add(1);
+                                    }
+                                    snapshot.authenticated_probe_packets_received = snapshot
+                                        .authenticated_probe_packets_received
+                                        .saturating_add(1);
+                                    snapshot.authenticated_probe_acks_observed = snapshot
+                                        .authenticated_probe_acks_observed
+                                        .saturating_add(1);
+                                    snapshot.authenticated_probe_acks_unmatched = snapshot
+                                        .authenticated_probe_acks_unmatched
+                                        .saturating_add(1);
+                                },
+                            )
+                            .await;
+                            self.peers
+                                .record_direct_event_for_generation_with_socket(
+                                    &identity.source_node_id,
+                                    expired.generation,
+                                    "direct_probe_ack_expired",
+                                    Some(source),
+                                    Some(socket_index),
+                                    Some(1),
+                                    None,
+                                    format!(
+                                        "ignored authenticated UDP probe ACK after its terminal deadline: endpoint={} age_ms={} deadline_ms={}",
+                                        expired.endpoint,
+                                        expired.sent_at.elapsed().as_millis(),
+                                        expired
+                                            .expires_at
+                                            .saturating_duration_since(expired.sent_at)
+                                            .as_millis(),
+                                    ),
+                                )
+                                .await;
+                            continue;
+                        }
 
                         if let Some(pending) = ack_match {
                             // The peer must still be clean (no offline /
@@ -673,7 +734,6 @@ impl UdpTransport {
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;
-                            self.notify_peer_reflexive_observation(&identity.source_node_id, source);
                             let accepted = self
                                 .peers
                                 .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
@@ -685,6 +745,10 @@ impl UdpTransport {
                                 )
                                 .await;
                             if accepted {
+                                self.notify_peer_reflexive_observation(
+                                    &identity.source_node_id,
+                                    source,
+                                );
                                 // A matched ACK is the most reliable proof that
                                 // the peer's mapping works RIGHT NOW: fire the
                                 // daemon-internal encrypted validation toward
@@ -853,18 +917,30 @@ impl UdpTransport {
                                 .saturating_add(1)
                         })
                         .await;
-                        let ack_match = {
+                        let (ack_match, expired_pending) = {
                             let generation = self.peers.current_network_generation().await;
                             let mut pending_probes = self.pending_probes.lock().await;
-                            let matched = pending_probes
-                                .get(&packet.nonce)
+                            let now = Instant::now();
+                            let pending = pending_probes.get(&packet.nonce).cloned();
+                            let expired = pending
+                                .as_ref()
                                 .filter(|pending| {
                                     legacy_ack_matches_pending(
                                         pending,
                                         source,
                                         generation,
                                         socket_index,
-                                    )
+                                    ) && pending.is_expired(now)
+                                })
+                                .cloned();
+                            let matched = pending
+                                .filter(|pending| {
+                                    legacy_ack_matches_pending(
+                                        pending,
+                                        source,
+                                        generation,
+                                        socket_index,
+                                    ) && !pending.is_expired(now)
                                 })
                                 .map(|pending| {
                                     (
@@ -879,11 +955,42 @@ impl UdpTransport {
                                         pending.direct_commit_seq,
                                     )
                                 });
-                            if matched.is_some() {
+                            if matched.is_some() || expired.is_some() {
                                 pending_probes.remove(&packet.nonce);
                             }
-                            matched
+                            (matched, expired)
                         };
+                        if let Some(expired) = expired_pending {
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.legacy_probe_acks_unmatched = metrics
+                                    .legacy_probe_acks_unmatched
+                                    .saturating_add(1)
+                            })
+                            .await;
+                            if let Some(peer_id) = expired.peer_id.as_deref() {
+                                self.peers
+                                    .record_direct_event_for_generation_with_socket(
+                                        peer_id,
+                                        expired.generation,
+                                        "direct_probe_ack_expired",
+                                        Some(source),
+                                        Some(socket_index),
+                                        Some(1),
+                                        None,
+                                        format!(
+                                            "ignored legacy UDP probe ACK after its terminal deadline: endpoint={} age_ms={} deadline_ms={}",
+                                            expired.endpoint,
+                                            expired.sent_at.elapsed().as_millis(),
+                                            expired
+                                                .expires_at
+                                                .saturating_duration_since(expired.sent_at)
+                                                .as_millis(),
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            continue;
+                        }
                         let ack_matched = ack_match.is_some();
                         let pending_peer_id = ack_match
                             .as_ref()
@@ -960,7 +1067,6 @@ impl UdpTransport {
                                     SocketEvidence::Stamped(socket_epoch),
                                 )
                                 .await;
-                                self.notify_peer_reflexive_observation(&peer_id, source);
                                 let accepted = self
                                     .peers
                                     .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
@@ -970,8 +1076,9 @@ impl UdpTransport {
                                         generation,
                                         local_endpoint,
                                     )
-                                .await;
+                                    .await;
                                 if accepted {
+                                    self.notify_peer_reflexive_observation(&peer_id, source);
                                     // Legacy peers still need the same
                                     // per-pending-probe attribution. The ACK
                                     // remains only an ingress signal for the

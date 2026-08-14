@@ -228,6 +228,12 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                     .take_latest_for_peer(&observation.peer_id)
                     .unwrap_or(observation);
                 let generation = peers.current_network_generation().await;
+                let slow_relay_suppressed = udp
+                    .direct_validation_suppressed_by_slow_relay(
+                        &observation.peer_id,
+                        generation,
+                    )
+                    .await;
                 match udp
                     .begin_or_merge_direct_validation(
                         &observation.peer_id,
@@ -320,11 +326,26 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                         );
                     }
                     crate::udp::DirectValidationSessionStart::IgnoredInactive => {
+                        if slow_relay_suppressed {
+                            peers
+                                .record_direct_event(
+                                    &observation.peer_id,
+                                    "direct_validation_suppressed",
+                                    Some(observation.observed_endpoint),
+                                    None,
+                                    Some(0),
+                                    format!(
+                                        "reason_code=direct_validation_slow_relay_cooldown generation={generation}"
+                                    ),
+                                )
+                                .await;
+                        }
                         debug!(
                             peer_id = %observation.peer_id,
                             remote_endpoint = %observation.observed_endpoint,
                             generation,
-                            "ignored direct-validation observation for a Direct peer or retired UDP transport"
+                            slow_relay_suppressed,
+                            "ignored direct-validation observation for a Direct peer, retired UDP transport, or slow-relay cooldown"
                         );
                     }
                 }
@@ -749,6 +770,7 @@ async fn run_direct_encrypted_validation_session(
         "no encrypted validation ACK received within the bounded request/ACK exchange",
     );
     let mut stop_worker = false;
+    let mut emit_lock_timeouts = 0u32;
     for (sequence, delay) in DIRECT_VALIDATION_REQUEST_DELAYS.into_iter().enumerate() {
         let _ = wait_for_validation_update(&mut target_rx, delay).await;
         let Some(target) = current_validation_target(&peers, &target_rx, owner_token).await
@@ -846,12 +868,13 @@ async fn run_direct_encrypted_validation_session(
         let send_socket_index = prepared.socket_index;
         let endpoint = target.endpoint;
         match transport
-            .encrypt_and_emit_outbound(
+            .encrypt_and_emit_outbound_with_lock_timeout(
                 OutboundPacket {
                     peer_id: peer_id.clone(),
                     dst_ip: connection.virtual_ip.clone(),
                     packet,
                 },
+                crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
                 move |encrypted| async move {
                     if !send_udp
                         .mark_direct_validation_send_started(
@@ -879,7 +902,7 @@ async fn run_direct_encrypted_validation_session(
             )
             .await
         {
-            Ok(true) => {
+            Ok(crate::transport::BoundedEmitOutcome::Sent) => {
                 sent = sent.saturating_add(1);
                 tracing::info!(
                     event = "direct_validation_request_sent",
@@ -970,7 +993,36 @@ async fn run_direct_encrypted_validation_session(
                     break;
                 }
             }
-            Ok(false) => {
+            Ok(crate::transport::BoundedEmitOutcome::LockTimeout) => {
+                emit_lock_timeouts = emit_lock_timeouts.saturating_add(1);
+                udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
+                    .await;
+                record_validation_event(
+                    &peers,
+                    &peer_id,
+                    generation,
+                    owner_token,
+                    "direct_validation_emit_lock_timeout",
+                    Some(endpoint),
+                    Some(sent),
+                    format!(
+                        "reason_code=direct_validation_emit_lock_timeout lock_timeout_ms={} request_id={} sequence={} attempt={}",
+                        crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT.as_millis(),
+                        request_id,
+                        sequence,
+                        emit_lock_timeouts
+                    ),
+                )
+                .await;
+                // The request did not acquire the counter-ordering lock and
+                // therefore never received a counter or touched the wire.
+                // It is safe to continue to the next bounded request delay;
+                // treating this as a dead WireGuard session would terminate
+                // the only validation worker precisely during a live-TUN
+                // burst and force Direct to wait for a fresh observation.
+                continue;
+            }
+            Ok(crate::transport::BoundedEmitOutcome::SessionUnavailable) => {
                 debug!(
                     "Stopping encrypted Direct validation for {}; WireGuard session is no longer ready",
                     peer_id
@@ -1028,6 +1080,12 @@ async fn run_direct_encrypted_validation_session(
     if peers.is_direct_for_generation(&peer_id, generation).await {
         terminal_stage = "direct_validation_completed";
         terminal_reason = "completed: encrypted validation ACK confirmed Direct".to_string();
+    } else if emit_lock_timeouts > 0 {
+        terminal_reason = format!(
+            "no encrypted validation ACK; {} request(s) skipped by bounded emit-lock timeout ({}ms), with no counter allocated",
+            emit_lock_timeouts,
+            crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT.as_millis()
+        );
     }
 
     let final_endpoint = active_direct_validation_target(&target_rx, owner_token)

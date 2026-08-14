@@ -580,13 +580,60 @@ pub(super) fn has_real_public_candidate(
     })
 }
 
+/// Whether the candidate set is backed by the current daemon's reliable
+/// primary NAT observation, rather than only by a socket-pool observation.
+///
+/// A pool socket can discover a public endpoint while the primary socket's
+/// profile still says `UdpBlocked`.  That endpoint is useful as a bounded
+/// punch target, but it must not stop the startup retry loop: in the Air
+/// acceptance run this distinction was the difference between a fresh
+/// mapping refresh and waiting for the normal 15-second cadence.  The NAT
+/// profile is deliberately the authority for startup readiness; candidate
+/// source labels alone cannot prove that the current primary mapping is
+/// usable.
+pub(super) fn has_reliable_public_candidate(
+    nat_profile: Option<&NatProfile>,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> bool {
+    nat_profile.is_some_and(|profile| {
+        !profile.udp_blocked
+            && profile.public_endpoint.is_some()
+            && profile.public_endpoint.as_ref().is_some_and(|endpoint| {
+                has_real_public_candidate(
+                    std::slice::from_ref(endpoint),
+                    candidate_sources,
+                ) && candidates.iter().any(|candidate| candidate == endpoint)
+            })
+    })
+}
+
+/// A mapping-dependent socket pool needs one complete post-bind gather even
+/// when the bounded primary-socket gather already returned a public STUN
+/// endpoint.  That first endpoint is observer-specific evidence; for an
+/// address/port-dependent NAT it is not necessarily the mapping a peer can
+/// reach.  Waiting for the normal 15-second refresh cadence leaves the peer
+/// probing a stale observer mapping for the whole interval.
+pub(super) fn should_warm_mapping_dependent_socket_pool(
+    socket_count: usize,
+    socket_pool_active: bool,
+    nat_profile: Option<&NatProfile>,
+) -> bool {
+    socket_count > 1
+        && socket_pool_active
+        && nat_profile.is_some_and(|profile| {
+            !profile.udp_blocked
+                && profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
+        })
+}
+
 /// Whether a refresh crossed the boundary between “only private/predicted
 /// candidates” and “a locally observed public candidate is available”.
 ///
 /// A public port changing on the same mapping remains volatile churn and may
-/// use the normal debounce.  A readiness transition is different: retaining
-/// the debounce here would leave peers probing an obsolete private endpoint
-/// for up to 30 seconds after STUN has already produced a usable mapping.
+/// use the normal short debounce.  A readiness transition is different:
+/// retaining even that brief debounce here would leave peers probing an
+/// obsolete private endpoint after STUN has already produced a usable mapping.
 pub(super) fn public_candidate_readiness_changed(
     previous_candidates: &[String],
     previous_candidate_sources: &HashMap<String, String>,

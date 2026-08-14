@@ -129,14 +129,17 @@ fn predicted_reflexive_endpoints(
     let Some(delta) = port_delta else {
         return Vec::new();
     };
+    // A noisy model is deliberately restricted to the small-step range by
+    // `is_prediction_candidate`, but its ports still need modular arithmetic
+    // when the allocator crosses 65535.  Exact wide-step models are handled
+    // by `linear_successor_reflexive_endpoints` below.
     if delta == 0 || !(-8..=8).contains(&delta) {
         return Vec::new();
     }
 
     (1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES)
         .filter_map(|step| {
-            let predicted = base_endpoint.port() as i32 + delta * step as i32;
-            let port = u16::try_from(predicted).ok()?;
+            let port = modular_port_add(base_endpoint.port(), delta * step as i32);
             if port == 0 || port == base_endpoint.port() {
                 return None;
             }
@@ -191,39 +194,53 @@ fn linear_successor_reflexive_endpoints_for_run(mapped: &[SocketAddr]) -> Option
 
     let deltas = mapped
         .windows(2)
-        .map(|pair| pair[1].port() as i32 - pair[0].port() as i32)
+        .map(|pair| modular_port_delta(pair[0].port(), pair[1].port()))
         .collect::<Vec<_>>();
     if !deltas
         .iter()
-        .all(|delta| *delta != 0 && (-8..=8).contains(delta))
+        .all(|delta| *delta != 0 && delta.abs() != 32_768)
     {
         return None;
     }
 
+    let exact_step = deltas
+        .first()
+        .copied()
+        .filter(|first| deltas.iter().all(|delta| delta == first));
     let positive = deltas.iter().all(|delta| *delta > 0);
     let negative = deltas.iter().all(|delta| *delta < 0);
-    if deltas.iter().all(|delta| *delta == deltas[0]) && deltas[0].abs() != 1 {
-        return None;
-    }
     let direction = match (positive, negative) {
         (true, false) => 1,
         (false, true) => -1,
         _ => return None,
     };
+    // A constant step is the strong model: preserve its full modular value
+    // instead of rejecting UU/WebRTC-style wide allocation strides.  For a
+    // noisy run, retain the old conservative one-port successor behavior and
+    // require every observed delta to be small.
+    let step = if let Some(exact_step) = exact_step {
+        exact_step
+    } else {
+        if !deltas.iter().all(|delta| delta.abs() <= 8) {
+            return None;
+        }
+        direction
+    };
 
     let observed_ports = mapped.iter().map(SocketAddr::port).collect::<HashSet<_>>();
-    let edge_port = if direction > 0 {
+    let edge_port = if exact_step.is_some() {
+        // The last observation is the edge even when the modular sequence
+        // crossed 65535; max/min would choose the wrong side of the circle.
+        mapped.last()?.port()
+    } else if direction > 0 {
         *observed_ports.iter().max()?
     } else {
         *observed_ports.iter().min()?
     };
 
     let mut endpoints = Vec::with_capacity(MAX_PREDICTED_REFLEXIVE_CANDIDATES);
-    for step in 1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES {
-        let predicted = edge_port as i32 + direction * step as i32;
-        let Ok(port) = u16::try_from(predicted) else {
-            continue;
-        };
+    for index in 1..=MAX_PREDICTED_REFLEXIVE_CANDIDATES {
+        let port = modular_port_add(edge_port, step * index as i32);
         if port == 0 || observed_ports.contains(&port) {
             continue;
         }
@@ -231,6 +248,24 @@ fn linear_successor_reflexive_endpoints_for_run(mapped: &[SocketAddr]) -> Option
     }
 
     (!endpoints.is_empty()).then_some(endpoints)
+}
+
+/// Return the signed shortest distance from one UDP port to the next on the
+/// 16-bit port ring.  Keeping this explicit avoids treating 65535 -> 0 as a
+/// huge random jump and makes wrap-around predictions testable.
+fn modular_port_delta(previous: u16, next: u16) -> i32 {
+    let raw = i32::from(next) - i32::from(previous);
+    if raw > 32_767 {
+        raw - 65_536
+    } else if raw < -32_768 {
+        raw + 65_536
+    } else {
+        raw
+    }
+}
+
+fn modular_port_add(base: u16, delta: i32) -> u16 {
+    (i64::from(base) + i64::from(delta)).rem_euclid(65_536) as u16
 }
 
 fn add_predicted_reflexive_candidates(candidates: &mut Vec<IceCandidate>, profile: &NatProfile) {

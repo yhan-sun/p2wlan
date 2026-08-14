@@ -677,10 +677,16 @@ impl UdpTransport {
                 pending.sent_at.elapsed() < Duration::from_secs(60)
                     && pending.generation == generation
             });
+            let sent_at = Instant::now();
             pending.insert(
                 nonce,
                 PendingProbe {
-                    sent_at: Instant::now(),
+                    sent_at,
+                    // A punch/heartbeat ACK that arrives after this bound is
+                    // terminally stale.  The old 60-second map-retention
+                    // window is only a cleanup guard; it must not turn a
+                    // delayed queued packet into current connectivity proof.
+                    expires_at: sent_at + DIRECT_KEEPALIVE_ACK_TIMEOUT,
                     endpoint: peer_addr,
                     local_endpoint: socket.local_addr().ok(),
                     socket_index,

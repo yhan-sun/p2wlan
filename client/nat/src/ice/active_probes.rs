@@ -268,7 +268,16 @@ fn stable_port_delta(mapped: &[SocketAddr]) -> Option<i32> {
     }
     let deltas = mapped
         .windows(2)
-        .map(|pair| pair[1].port() as i32 - pair[0].port() as i32)
+        .map(|pair| {
+            let raw = pair[1].port() as i32 - pair[0].port() as i32;
+            if raw > 32_767 {
+                raw - 65_536
+            } else if raw < -32_768 {
+                raw + 65_536
+            } else {
+                raw
+            }
+        })
         .collect::<Vec<_>>();
     let first = deltas[0];
     if deltas.iter().all(|delta| *delta == first) {

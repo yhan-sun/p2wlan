@@ -1031,6 +1031,13 @@ impl UdpTransport {
         {
             return DirectValidationSessionStart::IgnoredInactive;
         }
+        if self
+            .direct_validation
+            .is_slow_relay_validation_suppressed(peer_id, generation)
+            .await
+        {
+            return DirectValidationSessionStart::IgnoredInactive;
+        }
         let mut sessions = self.direct_validation.sessions.lock().await;
         // `cancel_all` does not need the network epoch gate during transport
         // teardown. Recheck after waiting for its sessions lock so a stale
@@ -1095,6 +1102,33 @@ impl UdpTransport {
         self.direct_validation.cancel_all().await;
     }
 
+    /// Quarantine new Direct validation owners after an encrypted ACK proved
+    /// the candidate only through a delayed mapping while the relay remained
+    /// confirmed.  This is peer/generation scoped, so a later generation can
+    /// start relay-first validation afresh without inheriting old state.
+    pub(crate) async fn suppress_direct_validation_for_slow_relay(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) {
+        self.direct_validation
+            .suppress_slow_relay_validation(peer_id, generation)
+            .await;
+    }
+
+    /// Return whether a peer/generation is currently in the slow-relay
+    /// quarantine.  The scheduler uses this only to attach a structured
+    /// diagnostic reason to an ignored observation.
+    pub(crate) async fn direct_validation_suppressed_by_slow_relay(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.direct_validation
+            .is_slow_relay_validation_suppressed(peer_id, generation)
+            .await
+    }
+
     /// Remove a session only when the completing worker is still its owner.
     /// Returns whether the owner was current.  The expectation is cleared by
     /// the same owner check, preventing a retired worker from deleting a new
@@ -1113,6 +1147,20 @@ impl UdpTransport {
             .get(peer_id)
             .is_some_and(|session| session.target_tx.borrow().owner_token == owner_token);
         if owned {
+            // Removing the map entry is not enough: the worker owns a clone
+            // of the watch receiver and can otherwise keep sending its
+            // already-scheduled bounded request sequence after an ACK, a
+            // slow-ACK retention decision, or a terminal timeout. Publish a
+            // terminal state before removal so every worker that still holds
+            // the receiver observes cancellation and exits before another
+            // request is prepared.
+            if let Some(session) = sessions.get(peer_id) {
+                let current = *session.target_tx.borrow();
+                session.target_tx.send_replace(DirectValidationTarget {
+                    cancelled: true,
+                    ..current
+                });
+            }
             sessions.remove(peer_id);
         }
         let mut expectations = self.direct_validation.expectations.lock().await;

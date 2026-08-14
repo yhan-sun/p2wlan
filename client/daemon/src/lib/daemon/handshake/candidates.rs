@@ -246,13 +246,21 @@ impl Daemon {
         if let Some(endpoint) =
             control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1)
         {
+            let nat_type = self
+                .nat_profile
+                .read()
+                .await
+                .as_ref()
+                .map(p2pnet_nat::NatProfile::control_label)
+                .unwrap_or_else(|| "unknown".to_string());
             // The endpoint publish travels the handshake control lane with a
             // short caller budget: the ordinary lane may be congested by
             // candidate-only traffic and must never delay the signal that
             // follows this refresh.
             match tokio::time::timeout(
                 Duration::from_millis(PRE_SIGNAL_ENDPOINT_PUBLISH_BUDGET_MS),
-                self.control.update_endpoint_for_handshake(&endpoint, "unknown"),
+                self.control
+                    .update_endpoint_for_handshake(&endpoint, &nat_type),
             )
             .await
             {

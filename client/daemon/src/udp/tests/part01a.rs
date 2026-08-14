@@ -74,6 +74,7 @@ async fn drain_udp_quiet(socket: &UdpSocket, quiet: Duration) {
 fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
     let pending = PendingProbe {
         sent_at: Instant::now(),
+        expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
         endpoint: "203.0.113.10:40000".parse().unwrap(),
         local_endpoint: None,
         socket_index: 2,
@@ -604,6 +605,47 @@ fn socket_pool_rejects_udp_blocked_nat_profile() {
     report.nat_profile.udp_blocked = true;
 
     assert!(!socket_pool_is_eligible(&report));
+}
+
+#[test]
+fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
+    let mut primary = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::UdpBlocked);
+    primary.nat_profile.udp_blocked = true;
+    primary.nat_profile.public_endpoint = None;
+    primary.nat_profile.mapping_behavior = MappingBehavior::UdpBlocked;
+    primary.nat_profile.likely_symmetric = None;
+    primary.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.1:3478".to_string(),
+        mapped_address: None,
+        rtt_ms: None,
+        error: Some("primary timeout".to_string()),
+    }];
+
+    let mut pool = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    pool.candidates = vec![p2pnet_nat::IceCandidate::server_reflexive(
+        "198.51.100.20",
+        41000,
+    )];
+    pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.2:3478".to_string(),
+        mapped_address: Some("198.51.100.20:41000".to_string()),
+        rtt_ms: Some(8),
+        error: None,
+    }];
+
+    assert!(merge_pool_nat_profile(&mut primary, &pool));
+    assert!(!primary.nat_profile.udp_blocked);
+    assert_eq!(
+        primary.nat_profile.mapping_behavior,
+        MappingBehavior::AddressOrPortDependent
+    );
+    assert_eq!(
+        primary.nat_profile.public_endpoint.as_deref(),
+        Some("198.51.100.20:41000")
+    );
+    assert!(primary.nat_profile.birthday_candidate);
+    assert_eq!(primary.nat_profile.observations.len(), 2);
+    assert!(socket_pool_is_eligible(&primary));
 }
 
 #[tokio::test]
