@@ -121,7 +121,36 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         punch_attempts,
         boot_epoch_ms,
     } = context;
-    let mut ticker = interval(CANDIDATE_REFRESH_INTERVAL);
+    let initial_refresh_needs_public_retry = candidate_snapshot
+        .read()
+        .await
+        .as_ref()
+        .is_none_or(|snapshot| {
+            !has_real_public_candidate(&snapshot.candidates, &snapshot.candidate_sources)
+        });
+    let mut startup_without_public = initial_refresh_needs_public_retry;
+    let mut ticker = interval(if startup_without_public {
+        CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL
+    } else {
+        CANDIDATE_REFRESH_INTERVAL
+    });
+    if initial_refresh_needs_public_retry {
+        // The startup gather intentionally has a short budget.  If it only
+        // produced a host candidate (as on the Air when the first STUN probe
+        // reported UdpBlocked), retry discovery promptly instead of waiting
+        // for the regular 15-second refresh interval.
+        sleep(CANDIDATE_REFRESH_INITIAL_RETRY_DELAY).await;
+    }
+    // The initial UDP setup already committed the first full candidate
+    // snapshot.  When that snapshot already contains a real public mapping,
+    // consume Tokio's immediate first tick so startup does not launch a
+    // duplicate refresh in the middle of peer/session establishment.  A
+    // host-only snapshot deliberately keeps the immediate tick: it is the
+    // first bounded retry that can discover a public mapping without waiting
+    // for the normal 15-second cadence.
+    if !initial_refresh_needs_public_retry {
+        ticker.tick().await;
+    }
     let mut pending_volatile: Option<VolatileCandidatePublish> = None;
     let mut volatile_coalescer = VolatilePublishCoalescer::default();
 
@@ -168,19 +197,72 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         }
 
-        let refresh_guard = candidate_refresh_lock.lock().await;
+        let gather_started = Instant::now();
+        debug!(
+            target: "p2wlan_daemon::candidate_refresh",
+            "UDP candidate refresh started"
+        );
 
-        let report = match udp
-            .gather_candidate_report_live_parallel_full(stun_servers.clone(), stun_timeout)
-            .await
-        {
+        // STUN and gateway mapping are both slow, best-effort discovery
+        // operations. Run them concurrently without holding the shared
+        // candidate lock. A peer signal must be able to reuse the last
+        // committed snapshot while either discovery path is in flight.
+        let mapping_future = async {
+            if !upnp_enabled {
+                return (Vec::new(), HashMap::new());
+            }
+            let mapping_started = Instant::now();
+            debug!(
+                target: "p2wlan_daemon::candidate_refresh",
+                "UDP candidate refresh gateway mapping started outside refresh lock"
+            );
+            let mut discovered = Vec::new();
+            let mut discovered_sources = HashMap::new();
+            maybe_add_port_mapping_udp_candidate(
+                udp.local_addr().ok(),
+                &mut discovered,
+                &mut discovered_sources,
+                gateway_mapping_runtime.clone(),
+                gateway_mapping_diagnostics.clone(),
+            )
+            .await;
+            info!(
+                target: "p2wlan_daemon::candidate_refresh",
+                mapping_elapsed_ms = mapping_started.elapsed().as_millis() as u64,
+                candidate_count = discovered.len(),
+                "UDP candidate refresh gateway mapping completed"
+            );
+            (discovered, discovered_sources)
+        };
+        let (report_result, (mapped_candidates, mapped_sources)) = tokio::join!(
+            udp.gather_candidate_report_live_parallel_full(stun_servers.clone(), stun_timeout),
+            mapping_future,
+        );
+        let gather_elapsed_ms = gather_started.elapsed().as_millis() as u64;
+        let refresh_lock_wait_started = Instant::now();
+        let refresh_guard = candidate_refresh_lock.lock().await;
+        let refresh_lock_wait_ms = refresh_lock_wait_started.elapsed().as_millis() as u64;
+
+        let report = match report_result {
             Ok(report) => report,
             Err(err) => {
-                warn!("Periodic UDP candidate refresh failed: {err}");
+                warn!(
+                    target: "p2wlan_daemon::candidate_refresh",
+                    refresh_lock_wait_ms,
+                    gather_elapsed_ms,
+                    "Periodic UDP candidate refresh failed: {err}"
+                );
                 continue;
             }
         };
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
+        debug!(
+            target: "p2wlan_daemon::candidate_refresh",
+            refresh_lock_wait_ms,
+            gather_elapsed_ms,
+            candidate_count = candidates.len(),
+            "UDP candidate refresh gather completed"
+        );
         peers.update_nat_profile(report.nat_profile.clone()).await;
         let profile_changed = {
             let mut current_profile = nat_profile.write().await;
@@ -226,15 +308,27 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 });
         }
 
-        if upnp_enabled {
-            maybe_add_port_mapping_udp_candidate(
-                udp.local_addr().ok(),
-                &mut candidates,
-                &mut candidate_sources,
-                gateway_mapping_runtime.clone(),
-                gateway_mapping_diagnostics.clone(),
-            )
-            .await;
+        for endpoint in mapped_candidates {
+            if !candidates.contains(&endpoint) {
+                candidates.push(endpoint.clone());
+            }
+            if let Some(source) = mapped_sources.get(&endpoint) {
+                candidate_sources.insert(endpoint, source.clone());
+            }
+        }
+
+        if startup_without_public
+            && has_real_public_candidate(&candidates, &candidate_sources)
+        {
+            startup_without_public = false;
+            ticker = interval(CANDIDATE_REFRESH_INTERVAL);
+            // Consume the new interval's immediate tick; the next periodic
+            // refresh is 15 seconds later.
+            ticker.tick().await;
+            info!(
+                target: "p2wlan_daemon::candidate_refresh",
+                "UDP candidate refresh found a real public candidate; returning to the normal refresh interval"
+            );
         }
         let previous_snapshot = candidate_snapshot.read().await.clone();
         let previous_candidates = previous_snapshot
@@ -255,8 +349,16 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             .as_ref()
             .map(|snapshot| snapshot.network_identity.clone())
             .unwrap_or_default();
-        let should_advance_generation = !previous_network_identity.is_empty()
-            && previous_network_identity != next_network_identity;
+        let should_advance_generation = network_identity_changed(
+            &previous_network_identity,
+            &next_network_identity,
+        );
+        let public_candidate_readiness_changed = public_candidate_readiness_changed(
+            &previous_candidates,
+            &previous_candidate_sources,
+            &candidates,
+            &candidate_sources,
+        );
 
         let change_reason = candidate_set_change_reason(
             &previous_candidates,
@@ -317,17 +419,28 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         }
         drop(refresh_guard);
 
-        if !should_advance_generation {
+        // A pending volatile publication belongs to the old candidate state.
+        // Do not allow it to reappear after a generation or public-readiness
+        // transition and reintroduce an obsolete endpoint.
+        if should_advance_generation || public_candidate_readiness_changed {
+            pending_volatile = None;
+            volatile_coalescer = VolatilePublishCoalescer::default();
+        }
+
+        let should_update_endpoint = should_advance_generation
+            || should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint);
+        if should_update_endpoint {
+            if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
+                warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
+            } else if !endpoint.is_empty() {
+                published_endpoint = Some(endpoint.clone());
+            }
+        }
+
+        if !should_advance_generation && !public_candidate_readiness_changed {
             debug!(
                 "UDP candidate refresh changed only volatile reflexive ports; keeping network generation and signaling stable"
             );
-            if should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint) {
-                if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
-                    warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
-                } else {
-                    published_endpoint = Some(endpoint);
-                }
-            }
             // Volatile-only churn is coalesced newest-wins and published at
             // most once per debounce window instead of fanning out an offer
             // plus a synchronized punch session to every non-Direct peer on
@@ -368,10 +481,12 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
             continue;
         }
-        if let Err(err) = control.update_endpoint(&endpoint, "unknown").await {
-            warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
-        } else if !endpoint.is_empty() {
-            published_endpoint = Some(endpoint.clone());
+
+        if public_candidate_readiness_changed {
+            info!(
+                "UDP candidate readiness changed; publishing immediately instead of volatile debounce (has_real_public_candidate={})",
+                has_real_public_candidate(&candidates, &candidate_sources)
+            );
         }
 
         publish_local_candidates_to_known_peers(

@@ -239,6 +239,42 @@ impl PeerConnection {
         })
     }
 
+    /// A recent relay-health sample is not relay admission.  It can come from
+    /// a local writer completion or a validation packet that was not proven to
+    /// have reached this peer.  Only the same-generation encrypted relay ACK
+    /// may authorize a Direct -> Relay fallback for business traffic.
+    fn relay_peer_confirmed_for_generation(&self, local_generation: u64) -> bool {
+        self.relay_confirmed_at.is_some()
+            && self.relay_confirmed_generation == Some(local_generation)
+            && self
+                .relay_confirmed_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.is_empty())
+    }
+
+    fn relay_first_confirmation_pending(
+        &self,
+        local_generation: u64,
+        relay_available: bool,
+    ) -> bool {
+        let gate_started_at = if self.relay_ready_generation == Some(local_generation) {
+            self.relay_ready_at
+        } else if self.relay_first_gate_generation == Some(local_generation) {
+            self.relay_first_gate_started_at
+        } else {
+            None
+        };
+        relay_available
+            && gate_started_at.is_some()
+            && !self.relay_peer_confirmed_for_generation(local_generation)
+            && gate_started_at
+                .map(|started_at| {
+                    Instant::now().saturating_duration_since(started_at)
+                        < RELAY_FIRST_CONFIRMATION_GRACE
+                })
+                .unwrap_or(true)
+    }
+
     fn select_path_for_data(
         &self,
         local_generation: u64,
@@ -307,15 +343,45 @@ impl PeerConnection {
         let retain_private_direct = selected_pair.is_some_and(should_retain_private_direct_pair);
 
         if confirmed_direct {
+            // Direct validation is deliberately allowed to run in parallel,
+            // but it is not allowed to win the first business packet while a
+            // relay transport is already ready for this peer and its matching
+            // encrypted relay ACK is still pending.  Returning unavailable
+            // (rather than Direct or an unconfirmed Relay) makes the outbound
+            // FIFO retain the plaintext packet and keeps its WireGuard counter
+            // from being committed on the wrong path.
+            if self.relay_first_confirmation_pending(local_generation, relay_available) {
+                return PathSelection::unavailable(
+                    REASON_PATH_RELAY_FIRST_PENDING,
+                    "Direct is encrypted-confirmed, but same-generation relay peer ACK is pending",
+                )
+                .with_scores(direct_score, relay_score);
+            }
+            if self.relay_ready_generation == Some(local_generation)
+                && self.relay_peer_confirmed_for_generation(local_generation)
+                && self.relay_first_business_sent_generation != Some(local_generation)
+            {
+                return PathSelection::relay(
+                    REASON_PATH_RELAY_FIRST_BUSINESS,
+                    "same-generation relay peer is confirmed; first business packet is reserved for relay",
+                )
+                .with_scores(direct_score, relay_score);
+            }
+            // An encrypted Direct validation is the admission proof for this
+            // generation.  Probe failures accumulated before that proof are
+            // historical telemetry, not evidence that the newly validated
+            // path is currently unhealthy.  Let the path become active and
+            // let the consent/keepalive monitor provide the failure evidence
+            // needed for a relay fallback.  Otherwise a fresh Direct ACK can
+            // be immediately undone by the score's historical failure term.
+            let direct_has_current_failure = self.direct_health.consecutive_failures > 0;
             if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
-                if !retain_private_direct
+                if direct_has_current_failure
+                    && !retain_private_direct
                     && direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
                     && direct_score.score <= relay_score.score
                 {
-                    if !self
-                        .relay_health
-                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE)
-                    {
+                    if !self.relay_peer_confirmed_for_generation(local_generation) {
                         return PathSelection::direct(
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,
@@ -336,13 +402,11 @@ impl PeerConnection {
                     )
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                 }
-                if !retain_private_direct
+                if direct_has_current_failure
+                    && !retain_private_direct
                     && direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score
                 {
-                    if !self
-                        .relay_health
-                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE)
-                    {
+                    if !self.relay_peer_confirmed_for_generation(local_generation) {
                         return PathSelection::direct(
                             endpoint,
                             REASON_PATH_DIRECT_DEGRADED,

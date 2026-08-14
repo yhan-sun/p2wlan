@@ -151,6 +151,7 @@ impl Daemon {
         let punch_attempts = PunchAttemptDeduplicator::default();
         let peers = Arc::new(PeerManager::new(config.clone()));
         peers.set_timeline(timeline.clone());
+        transport.set_outbound_loss_context(&peers, timeline.clone());
         // Share ONE outbound-loss counter map between the peer manager (worker
         // drops) and the transport (session-not-ready queue drops) so
         // `/status.stats.outbound_drops` / `outbound_send_failures` report

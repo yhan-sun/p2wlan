@@ -928,6 +928,28 @@ async fn spawn_hole_punch_task(
             udp.set_socket_pool_active(true);
         }
 
+        // The bounded cold-start prefix is latency-sensitive even before NAT
+        // classification has established that the peer needs a socket pool.
+        // Use every socket that is already bound so one stale/private
+        // candidate on socket 0 cannot delay the first public mapping.  The
+        // FastPrefixPool policy is scoped to this one prefix; it does not
+        // change the later stable/scatter policy or the transport-wide gate.
+        if udp.socket_count() > 1 {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "direct_fast_probe_socket_pool_selected",
+                    candidates.first().copied(),
+                    Some(candidates.len()),
+                    Some(udp.socket_count() as u32),
+                    format!(
+                        "cold-start fast Direct prefix will use {} already-bound UDP sockets; transport-wide ActivePool remains unchanged",
+                        udp.socket_count()
+                    ),
+                )
+                .await;
+        }
+
         // A relay-coordinated punch timestamp is deliberately conservative:
         // both peers need time to receive the signal before the wide window.
         // Do not make ordinary Direct paths wait for that rendezvous. Probe a
@@ -971,7 +993,7 @@ async fn spawn_hole_punch_task(
                     )
                     .await;
                 match udp
-                    .punch_candidates_until_not_direct_report(
+                            .punch_candidates_fast_prefix_until_not_direct_report(
                         &peer_id,
                         fast_candidates.clone(),
                         Duration::ZERO,

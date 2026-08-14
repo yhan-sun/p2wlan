@@ -213,18 +213,33 @@ impl Daemon {
     ) -> Option<(Vec<String>, HashMap<String, String>)> {
         // Single-flight lease: cached candidates are never re-gathered inside
         // the TTL, so multiple peers' offers cannot rewrite the local
-        // source/port mapping in a tight loop.  An expired lease still
-        // permits a live gather, but the committed set remains the bounded
-        // old snapshot until the gather succeeds.
-        if self.candidate_snapshot_is_fresh().await {
-            if let Some(leased) = self.leased_candidate_set().await {
-                if !leased.0.is_empty() {
+        // source/port mapping in a tight loop.  A non-empty committed
+        // snapshot remains usable after the lease expires; signal paths must
+        // not start an inline STUN gather and join a startup convoy.  The
+        // periodic candidate-refresh worker owns refreshes.  Only the
+        // no-snapshot bootstrap case gathers synchronously here.
+        if let Some(leased) = self.leased_candidate_set().await {
+            if !leased.0.is_empty() {
+                if self.candidate_snapshot_is_fresh().await {
                     debug!(
-                        "Pre-signal UDP candidates reused from the snapshot lease for {reason} ({} candidates); no live STUN gather",
+                        "Pre-signal UDP candidates reused from the fresh snapshot lease for {reason} ({} candidates); no live STUN gather",
                         leased.0.len()
                     );
-                    return Some(leased);
+                } else {
+                    // A peer event must not join a convoy of live STUN
+                    // gathers after the short lease expires.  The UDP
+                    // candidate-refresh worker owns refreshes; the signal
+                    // path can use the bounded last snapshot immediately and
+                    // let that worker publish the newer set asynchronously.
+                    // This is especially important during startup when the
+                    // control roster can enqueue dozens of peer events while
+                    // the first gather still owns candidate_refresh_lock.
+                    debug!(
+                        "Pre-signal UDP candidates reused from the stale snapshot for {reason} ({} candidates); avoiding an inline STUN refresh convoy",
+                        leased.0.len()
+                    );
                 }
+                return Some(leased);
             }
         }
         let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
@@ -253,42 +268,6 @@ impl Daemon {
             }
         }
         Some(refreshed)
-    }
-
-    /// Bounded, best-effort candidate refresh that runs only AFTER a responder
-    /// answer has been issued.  The answer itself uses the cached candidate
-    /// snapshot; this background step keeps future candidate-only publishes
-    /// and the server-side endpoint fresh.  It never blocks the answer, never
-    /// re-gathers (the snapshot lease is reused, so a slow refresh failure
-    /// falls back to the bounded old snapshot), and is aborted by the caller
-    /// when PeerLeft or an owner replacement fires.
-    async fn post_answer_candidate_refresh_and_endpoint_publish(&self) {
-        let _deadline_guard = tokio::time::timeout(
-            Duration::from_secs(POST_ANSWER_REFRESH_DEADLINE_SECS),
-            async {
-                let Some((candidates, candidate_sources)) = self.leased_candidate_set().await
-                else {
-                    return;
-                };
-                if candidates.is_empty() {
-                    return;
-                }
-                if let Some(endpoint) =
-                    control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
-                {
-                    if let Err(err) = self
-                        .control
-                        .update_endpoint_for_handshake(&endpoint, "unknown")
-                        .await
-                    {
-                        warn!(
-                            "Failed to publish post-answer UDP endpoint '{endpoint}': {err}"
-                        );
-                    }
-                }
-            },
-        )
-        .await;
     }
 
     async fn refresh_local_candidates_core(
@@ -383,8 +362,10 @@ impl Daemon {
             .as_ref()
             .map(|snapshot| snapshot.network_identity.clone())
             .unwrap_or_default();
-        let should_advance_generation =
-            !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
+        let should_advance_generation = network_identity_changed(
+            &previous_network_identity,
+            &next_network_identity,
+        );
         let change_reason = candidate_set_change_reason(
             &previous_candidates,
             &candidates,

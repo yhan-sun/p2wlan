@@ -8,23 +8,39 @@
 //! hash is refreshed whenever this build script is recompiled.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn git_head() -> Option<String> {
+fn git_root() -> Option<PathBuf> {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .current_dir(manifest_dir)
+        .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!root.is_empty()).then_some(PathBuf::from(root))
+}
+
+fn git_head(repo_root: &Path) -> Option<String> {
+    let commit = git_output(repo_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     (!commit.is_empty()).then_some(commit)
 }
 
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+fn git_output(repo_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -41,13 +57,24 @@ fn git_output(args: &[&str]) -> Option<String> {
 /// identity gap while the HEAD/packed-refs watches retain detached-head and
 /// packed-ref coverage.
 fn print_git_identity_watchers() {
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
-    println!("cargo:rerun-if-changed=../../.git/packed-refs");
-    if let Some(symbolic_ref) = git_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+    let Some(repo_root) = git_root() else {
+        return;
+    };
+    for path in [".git/HEAD", ".git/index", ".git/packed-refs"] {
+        println!("cargo:rerun-if-changed={}", repo_root.join(path).display());
+    }
+    if let Some(symbolic_ref) =
+        git_output(&repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    {
         let symbolic_ref = symbolic_ref.trim();
         if !symbolic_ref.is_empty() {
-            println!("cargo:rerun-if-changed=../../.git/refs/heads/{symbolic_ref}");
+            println!(
+                "cargo:rerun-if-changed={}",
+                repo_root
+                    .join(".git/refs/heads")
+                    .join(symbolic_ref)
+                    .display()
+            );
         }
     }
 }
@@ -68,18 +95,36 @@ fn dirty_material(status: &str, tracked_diff: &str, untracked: &[(String, Vec<u8
     material
 }
 
+/// Cargo interprets `rerun-if-changed` relative to the package directory
+/// (`client/daemon`), while `git ls-files` returns paths relative to the
+/// repository root.  Always produce a path rooted at the checkout so an
+/// untracked file outside the daemon crate also invalidates the build script.
+fn repo_watch_path(repo_relative_path: &str, manifest_dir: &Path) -> PathBuf {
+    manifest_dir.join(repo_relative_path)
+}
+
 fn checkout_state() -> (bool, String) {
-    let status = git_output(&["status", "--porcelain=v1", "--untracked-files=all"])
-        .unwrap_or_else(|| "git-unavailable".to_string());
+    let Some(repo_root) = git_root() else {
+        return (true, "git-unavailable".to_string());
+    };
+    let status = git_output(
+        &repo_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .unwrap_or_else(|| "git-unavailable".to_string());
     if status.trim().is_empty() {
         return (false, String::new());
     }
     // `git hash-object` gives a deterministic content hash without adding a
     // build-script crypto dependency. Include status, the complete tracked
     // diff, and the bytes of every untracked file.
-    let diff = git_output(&["diff", "HEAD", "--no-ext-diff", "--binary"]).unwrap_or_default();
-    let untracked_paths =
-        git_output(&["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    let diff =
+        git_output(&repo_root, &["diff", "HEAD", "--no-ext-diff", "--binary"]).unwrap_or_default();
+    let untracked_paths = git_output(
+        &repo_root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .unwrap_or_default();
     let untracked: Vec<(String, Vec<u8>)> = untracked_paths
         .split('\0')
         .filter(|path| !path.is_empty())
@@ -89,8 +134,11 @@ fn checkout_state() -> (bool, String) {
             // the path is explicitly registered here. Without this, two
             // dirty builds could report the same identity after an untracked
             // staging/template file was edited in place.
-            println!("cargo:rerun-if-changed={path}");
-            let bytes = std::fs::read(path)
+            println!(
+                "cargo:rerun-if-changed={}",
+                repo_watch_path(path, &repo_root).display()
+            );
+            let bytes = std::fs::read(repo_watch_path(path, &repo_root))
                 .unwrap_or_else(|err| format!("unreadable untracked file: {err}").into_bytes());
             (path.to_string(), bytes)
         })
@@ -125,7 +173,9 @@ fn checkout_state() -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::dirty_material;
+    use std::path::Path;
+
+    use super::{dirty_material, repo_watch_path};
 
     #[test]
     fn untracked_content_changes_dirty_material() {
@@ -150,10 +200,19 @@ mod tests {
         assert_ne!(first, second);
         assert_ne!(first, third);
     }
+
+    #[test]
+    fn untracked_watch_path_is_relative_to_the_repository_root() {
+        let watch = repo_watch_path("scripts/staging/example.env", Path::new("/checkout"));
+        assert_eq!(watch, Path::new("/checkout/scripts/staging/example.env"));
+    }
 }
 
 fn main() {
-    let commit = git_head().unwrap_or_else(|| "unknown".to_string());
+    let commit = git_root()
+        .as_deref()
+        .and_then(git_head)
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=P2WLAN_GIT_COMMIT={commit}");
     let (dirty, diff_hash) = checkout_state();
     println!("cargo:rustc-env=P2WLAN_DIRTY={dirty}");

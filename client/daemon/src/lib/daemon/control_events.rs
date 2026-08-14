@@ -10,6 +10,33 @@ type ControlEventWork<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 const MAX_CONTROL_EVENT_SLOW_WORK: usize = 64;
 
+/// Responder offers have their own cooperative lane.  Candidate refresh,
+/// peer-reflexive HTTP and event-triggered initiator preparation may occupy
+/// the bounded general slow-work set, but a WireGuard answer must still be
+/// admitted and processed immediately.  One owner per peer keeps this lane
+/// bounded by the number of registered peers and coalesces retransmissions.
+const RESPONDER_WORK_RETRY_LIMIT: u8 = 3;
+const RESPONDER_WORK_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+];
+
+fn responder_offer_error_is_retryable(error: &DaemonError) -> bool {
+    // Control-plane command completion can be lost after the signal was
+    // dequeued.  The responder transaction is idempotent through its exact
+    // handshake cache, so a bounded retry is safe.  Parsing, identity and
+    // role errors are terminal and are never retried.
+    matches!(error, DaemonError::ControlPlane(_))
+}
+
+fn responder_offer_retry_delay(attempt: u8) -> Duration {
+    RESPONDER_WORK_RETRY_BACKOFF
+        .get(attempt.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or_else(|| RESPONDER_WORK_RETRY_BACKOFF[RESPONDER_WORK_RETRY_BACKOFF.len() - 1])
+}
+
 /// A control signal can arrive a few seconds before the corresponding
 /// PeerJoined event (REST polling and signal delivery are independent).  Keep
 /// one bounded responder worker alive for this interval so the authenticated
@@ -501,6 +528,181 @@ impl Daemon {
         }
     }
 
+    /// Handle one admitted responder offer with a bounded, idempotent retry.
+    ///
+    /// The control signal receiver acknowledges after local enqueue, so a
+    /// transient failure after dequeue must be repaired by the worker itself.
+    /// `handle_event_peer_offer` uses the exact responder cache keyed by the
+    /// WireGuard token, therefore retrying the same plaintext offer cannot
+    /// create a second response or a second session.  No encrypted data
+    /// packet is retained here; this is control-plane handshake material only.
+    async fn handle_admitted_responder_offer(
+        &self,
+        offer: &PendingPeerOffer,
+        owner: u64,
+        cancellation: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        let peer_id = offer.from_node_id.clone();
+        for retry_attempt in 0..=RESPONDER_WORK_RETRY_LIMIT {
+            if *cancellation.borrow() {
+                debug!(
+                    "Peer offer responder worker cancelled before handling: peer={} owner={}",
+                    peer_id, owner
+                );
+                self.peers
+                    .record_direct_event(
+                        &peer_id,
+                        "peer_offer_responder_worker_cancelled",
+                        None,
+                        None,
+                        None,
+                        format!("owner={} cancelled before handler", owner),
+                    )
+                    .await;
+                self.timeline.emit(
+                    "peer_offer_responder_worker_cancelled",
+                    None,
+                    Some("generation_cancelled"),
+                    Some(format!("peer={} owner={} before_handler=true", peer_id, owner)),
+                );
+                return;
+            }
+            self.peers
+                .record_direct_event(
+                    &peer_id,
+                    "peer_offer_responder_handler_entered",
+                    None,
+                    None,
+                    None,
+                    format!("owner={} retry_attempt={retry_attempt}", owner),
+                )
+                .await;
+            debug!(
+                "Peer offer responder handler entered: peer={} owner={} retry_attempt={}",
+                peer_id, owner, retry_attempt
+            );
+            self.timeline.emit(
+                "peer_offer_responder_handler_entered",
+                None,
+                None,
+                Some(format!("peer={} owner={} retry_attempt={retry_attempt}", peer_id, owner)),
+            );
+            match self
+                .handle_event_peer_offer(offer.clone(), owner, cancellation)
+                .await
+            {
+                Ok(()) if *cancellation.borrow() => {
+                    self.timeline.emit(
+                        "peer_offer_responder_worker_cancelled",
+                        None,
+                        Some("generation_cancelled"),
+                        Some(format!("peer={} owner={} after_handler=true", peer_id, owner)),
+                    );
+                    return;
+                }
+                Ok(()) => {
+                    debug!(
+                        "Peer offer responder handler completed: peer={} owner={}",
+                        peer_id, owner
+                    );
+                    self.peers
+                        .record_direct_event(
+                            &peer_id,
+                            "peer_offer_responder_handler_completed",
+                            None,
+                            None,
+                            None,
+                            format!("owner={} retry_attempt={retry_attempt}", owner),
+                        )
+                        .await;
+                    self.timeline.emit(
+                        "peer_offer_responder_handler_completed",
+                        None,
+                        None,
+                        Some(format!("peer={} owner={} retry_attempt={retry_attempt}", peer_id, owner)),
+                    );
+                    return;
+                }
+                Err(err)
+                    if responder_offer_error_is_retryable(&err)
+                        && retry_attempt < RESPONDER_WORK_RETRY_LIMIT =>
+                {
+                    let next_attempt = retry_attempt.saturating_add(1);
+                    let delay = responder_offer_retry_delay(next_attempt);
+                    warn!(
+                        "Peer offer responder failed transiently: peer={} owner={} retry_attempt={} delay_ms={} reason_code=control_plane_error error={}",
+                        peer_id,
+                        owner,
+                        next_attempt,
+                        delay.as_millis(),
+                        err
+                    );
+                    self.peers
+                        .record_direct_event(
+                            &peer_id,
+                            "peer_offer_responder_retry",
+                            None,
+                            None,
+                            None,
+                            format!(
+                                "owner={} retry_attempt={} delay_ms={} reason_code=control_plane_error",
+                                owner,
+                                next_attempt,
+                                delay.as_millis()
+                            ),
+                        )
+                        .await;
+                    self.timeline.emit(
+                        "peer_offer_responder_retry",
+                        None,
+                        Some("control_plane_error"),
+                        Some(format!(
+                            "peer={} owner={} retry_attempt={} delay_ms={}",
+                            peer_id,
+                            owner,
+                            next_attempt,
+                            delay.as_millis()
+                        )),
+                    );
+                    tokio::select! {
+                        _ = sleep(delay) => {}
+                        changed = cancellation.changed() => {
+                            if changed.is_err() || *cancellation.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to handle peer offer from {} owner={} reason_code=responder_terminal_error retry_attempt={} error={}",
+                        peer_id, owner, retry_attempt, err
+                    );
+                    self.peers
+                        .record_direct_event(
+                            &peer_id,
+                            "peer_offer_responder_failed",
+                            None,
+                            None,
+                            None,
+                            format!(
+                                "owner={} reason_code=responder_terminal_error retry_attempt={}",
+                                owner, retry_attempt
+                            ),
+                        )
+                        .await;
+                    self.timeline.emit(
+                        "peer_offer_responder_failed",
+                        None,
+                        Some("responder_terminal_error"),
+                        Some(format!("peer={} owner={} retry_attempt={retry_attempt}", peer_id, owner)),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     /// Finish an offer that arrived before PeerJoined.  Candidate/fresh
     /// admission is deliberately repeated after registration, because the
     /// first attempt would return `PeerMissing` and must not consume a fresh
@@ -538,7 +740,7 @@ impl Daemon {
                 continue;
             }
             // Several offers may have arrived while this worker waited for
-            // PeerJoined.  Consume the newest one before any candidate or
+            // PeerJoined. Consume the newest one before any candidate or
             // WireGuard state is touched; the same owner remains active so a
             // later arrival races only with the post-work handoff below.
             if let Some(newest) = self
@@ -555,6 +757,21 @@ impl Daemon {
                 offer.candidate_generation,
             )
             .await;
+            // The peer is now registered. Answer the encrypted initiation
+            // before candidate/fresh-prediction work, for the same reason as
+            // the normal known-peer path: a delayed candidate plane must not
+            // turn a delivered control signal into a silent handshake gap.
+            if !offer.handshake_init.is_empty() {
+                self.handle_admitted_responder_offer(
+                    &offer,
+                    reservation.owner,
+                    &mut reservation.cancellation,
+                )
+                .await;
+            }
+            if *reservation.cancellation.borrow() {
+                return;
+            }
             // The offer-ingress verdict runs before any candidate-plane
             // state: duplicates and rate-limited retransmissions never apply
             // candidates, never run a fresh transaction and never trigger a
@@ -609,19 +826,6 @@ impl Daemon {
                 fresh_punch,
             )
             .await;
-
-            if !offer.handshake_init.is_empty() {
-                if let Err(err) = self
-                    .handle_event_peer_offer(
-                        offer,
-                        reservation.owner,
-                        &mut reservation.cancellation,
-                    )
-                    .await
-                {
-                    warn!("Failed to handle deferred peer offer from {peer_id}: {err}");
-                }
-            }
 
             let Some(next) = self
                 .pending_handshakes
@@ -983,6 +1187,11 @@ impl Daemon {
         let mut control_rx = std::mem::replace(&mut self.control_rx, replacement_rx);
         let daemon: &Daemon = &*self;
         let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+        // Keep responder answers out of the general slow-work budget. A
+        // blocked candidate refresh or peer-reflexive HTTP task must not
+        // prevent a received WireGuard initiation from producing an answer.
+        let mut responder_work: FuturesUnordered<ControlEventWork<'_>> =
+            FuturesUnordered::new();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut task_shutdown_rx = self.task_manager.shutdown_rx();
         loop {
@@ -1002,6 +1211,10 @@ impl Daemon {
                 _ = slow_work.next(), if !slow_work.is_empty() => {
                     // The work item logs its own outcome.  Completion only
                     // frees one bounded slot; no state is committed here.
+                }
+                _ = responder_work.next(), if !responder_work.is_empty() => {
+                    // Responder workers own their per-peer pending state and
+                    // release it on every terminal/cancellation path.
                 }
                 event = control_rx.recv() => {
                     let Some(event) = event else {
@@ -1099,6 +1312,28 @@ impl Daemon {
                     }
 
                     if peer_info.online {
+                        // `peer_roster_ready` is a process-level control-plane
+                        // milestone and is intentionally not a usable-path
+                        // clock.  Start the per-peer data-plane clock only
+                        // after the peer has been installed locally, and bind
+                        // it to the current network generation.  This keeps
+                        // relay-first measurements from charging relay setup
+                        // for time spent waiting for a later roster poll.
+                        let session_generation = self.peers.current_network_generation().await;
+                        let session_scope = format!(
+                            "peer:{}:{session_generation}",
+                            peer_info.node_id
+                        );
+                        self.timeline.emit_first_scoped(
+                            &session_scope,
+                            "peer_session_started",
+                            None,
+                            None,
+                            Some(format!(
+                                "peer={} generation={} virtual_ip={} online=true",
+                                peer_info.node_id, session_generation, peer_info.virtual_ip
+                            )),
+                        );
                         if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
                             warn!(
                                 "Deferring peer-join handshake for {}: control slow-work cap {} is full",
@@ -1331,6 +1566,18 @@ impl Daemon {
                             ),
                         )
                         .await;
+                    self.timeline.emit(
+                        "peer_offer_received",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={} candidate_generation={} handshake_bytes={} candidates={}",
+                            from_node_id,
+                            candidate_generation,
+                            handshake_init.len(),
+                            candidates.len()
+                        )),
+                    );
                     // Signal delivery can race the peer-list poll: an offer
                     // may be received before PeerJoined has installed the
                     // sender's static public key.  Do not run candidate
@@ -1355,33 +1602,32 @@ impl Daemon {
                             .await;
                         let admitted = {
                             let mut state = self.pending_handshakes.lock().await;
-                            if !state.has_responder_worker(&from_node_id)
-                                && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
-                            {
-                                warn!(
-                                    "Dropping peer offer from {from_node_id}: control slow-work cap {} is full",
-                                    MAX_CONTROL_EVENT_SLOW_WORK,
-                                );
-                                None
-                            } else {
-                                state.enqueue_responder_work(PendingPeerOffer {
-                                    from_node_id: from_node_id.clone(),
-                                    candidates: candidates.clone(),
-                                    candidate_sources: candidate_sources.clone(),
-                                    candidate_generation,
-                                    candidates_expires_at_ms,
-                                    sender_public_key: sender_public_key.clone(),
-                                    handshake_init: handshake_init.clone(),
-                                    punch_at_ms,
-                                    punch_at_server_ms,
-                                    session_id: session_id.clone(),
-                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                    ingress_suppressed: false,
-                                })
-                            }
+                            state.enqueue_responder_work(PendingPeerOffer {
+                                from_node_id: from_node_id.clone(),
+                                candidates: candidates.clone(),
+                                candidate_sources: candidate_sources.clone(),
+                                candidate_generation,
+                                candidates_expires_at_ms,
+                                sender_public_key: sender_public_key.clone(),
+                                handshake_init: handshake_init.clone(),
+                                punch_at_ms,
+                                punch_at_server_ms,
+                                session_id: session_id.clone(),
+                                probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                ingress_suppressed: false,
+                            })
                         };
                         if let Some((reservation, offer)) = admitted {
-                            slow_work.push(Box::pin(async move {
+                            self.timeline.emit(
+                                "peer_offer_responder_work_admitted",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={} owner={} candidate_generation={} deferred_unknown=true",
+                                    from_node_id, reservation.owner, candidate_generation
+                                )),
+                            );
+                            responder_work.push(Box::pin(async move {
                                 daemon
                                     .run_deferred_peer_offer_worker(offer, reservation)
                                     .await;
@@ -1394,6 +1640,102 @@ impl Daemon {
                         candidate_generation,
                     )
                     .await;
+                    // Admit the latency-critical responder before touching
+                    // candidate/fresh-prediction state.  A candidate refresh
+                    // may wait on STUN/HTTP or the general slow-work budget;
+                    // an already-delivered WireGuard initiation must not be
+                    // acknowledged locally and then wait behind that work.
+                    if !handshake_init.is_empty() {
+                        let admitted = {
+                            let mut state = self.pending_handshakes.lock().await;
+                            state.enqueue_responder_work(PendingPeerOffer {
+                                from_node_id: from_node_id.clone(),
+                                candidates: candidates.clone(),
+                                candidate_sources: candidate_sources.clone(),
+                                candidate_generation,
+                                candidates_expires_at_ms,
+                                sender_public_key: sender_public_key.clone(),
+                                handshake_init: handshake_init.clone(),
+                                punch_at_ms,
+                                punch_at_server_ms,
+                                session_id: session_id.clone(),
+                                probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                ingress_suppressed: false,
+                            })
+                        };
+                        if let Some((reservation, offer)) = admitted {
+                            self.peers
+                                .record_direct_event(
+                                    &from_node_id,
+                                    "peer_offer_responder_work_admitted",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    format!(
+                                        "responder owner={} admitted before candidate-plane work",
+                                        reservation.owner
+                                    ),
+                                )
+                                .await;
+                            debug!(
+                                "Peer offer responder worker admitted: peer={} owner={} candidates={}",
+                                from_node_id,
+                                reservation.owner,
+                                candidates.len()
+                            );
+                            daemon.timeline.emit(
+                                "peer_offer_responder_work_admitted",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={} owner={} candidate_generation={} deferred_unknown=false",
+                                    from_node_id, reservation.owner, candidate_generation
+                                )),
+                            );
+                            responder_work.push(Box::pin(async move {
+                                let mut offer = offer;
+                                let mut reservation = reservation;
+                                loop {
+                                    let peer_id = offer.from_node_id.clone();
+                                    daemon
+                                        .handle_admitted_responder_offer(
+                                            &offer,
+                                            reservation.owner,
+                                            &mut reservation.cancellation,
+                                        )
+                                        .await;
+                                    if *reservation.cancellation.borrow() {
+                                        return;
+                                    }
+                                    let Some(next) = daemon
+                                        .pending_handshakes
+                                        .lock()
+                                        .await
+                                        .finish_responder_work(&peer_id, reservation.owner)
+                                    else {
+                                        break;
+                                    };
+                                    offer = next;
+                                }
+                            }));
+                        } else {
+                            self.peers
+                                .record_direct_event(
+                                    &from_node_id,
+                                    "peer_offer_responder_work_coalesced",
+                                    None,
+                                    Some(candidates.len()),
+                                    None,
+                                    "newest responder offer replaced the per-peer queued offer",
+                                )
+                                .await;
+                            debug!(
+                                "Peer offer responder work coalesced: peer={} candidates={}",
+                                from_node_id,
+                                candidates.len()
+                            );
+                        }
+                    }
                     // Fresh-prediction verification happens BEFORE any
                     // candidate state is touched: a superseded prediction
                     // must not pollute the candidate set, while the handshake
@@ -1445,61 +1787,6 @@ impl Daemon {
                             FreshPunchDecision::None,
                         )
                     };
-                    if !handshake_init.is_empty() {
-                        let admitted = {
-                            let mut state = self.pending_handshakes.lock().await;
-                            if !state.has_responder_worker(&from_node_id)
-                                && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
-                            {
-                                warn!(
-                                    "Deferring peer offer from {from_node_id}: control slow-work cap {} is full",
-                                    MAX_CONTROL_EVENT_SLOW_WORK,
-                                );
-                                None
-                            } else {
-                                state.enqueue_responder_work(PendingPeerOffer {
-                                    from_node_id: from_node_id.clone(),
-                                    candidates: candidates.clone(),
-                                    candidate_sources: candidate_sources.clone(),
-                                    candidate_generation,
-                                    candidates_expires_at_ms,
-                                    sender_public_key: sender_public_key.clone(),
-                                    handshake_init: handshake_init.clone(),
-                                    punch_at_ms,
-                                    punch_at_server_ms,
-                                    session_id: session_id.clone(),
-                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                    ingress_suppressed: ingress != OfferIngressVerdict::Apply,
-                                })
-                            }
-                        };
-                        if let Some((mut reservation, mut offer)) = admitted {
-                            slow_work.push(Box::pin(async move {
-                                loop {
-                                    let peer_id = offer.from_node_id.clone();
-                                    if let Err(err) = daemon
-                                        .handle_event_peer_offer(
-                                            offer,
-                                            reservation.owner,
-                                            &mut reservation.cancellation,
-                                        )
-                                        .await
-                                    {
-                                        warn!("Failed to handle peer offer from {peer_id}: {err}");
-                                    }
-                                    let Some(next) = daemon
-                                        .pending_handshakes
-                                        .lock()
-                                        .await
-                                        .finish_responder_work(&peer_id, reservation.owner)
-                                    else {
-                                        break;
-                                    };
-                                    offer = next;
-                                }
-                            }));
-                        }
-                    }
                     match fresh_punch {
                         // A valid fresh snapshot punches its frozen targets at
                         // FRESH priority, always.
@@ -1754,6 +2041,7 @@ impl Daemon {
         // Dropping these futures also releases any STUN/HTTP wait promptly on
         // daemon shutdown rather than leaving detached work behind.
         drop(slow_work);
+        drop(responder_work);
         self.control_rx = control_rx;
     }
 }

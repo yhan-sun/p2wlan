@@ -177,10 +177,17 @@ impl PeerManager {
             if let Some(endpoint) = selected_endpoint {
                 let mut direct_selection =
                     conn.select_path_for_data(generation, true, true);
-                direct_selection.path = Some(NetworkPath::Direct);
-                direct_selection.direct_endpoint = Some(endpoint);
-                direct_selection.direct_confirmed = true;
-                direct_selection.reason_code = REASON_PATH_DIRECT_CONFIRMED;
+                // Do not overwrite a relay-first pending selection with a
+                // synthetic Direct selection.  The Direct ACK is still
+                // recorded above as background proof, but the outbound FIFO
+                // must wait for the same-generation relay peer ACK before it
+                // can consume a business counter.
+                if direct_selection.path == Some(NetworkPath::Direct) {
+                    direct_selection.path = Some(NetworkPath::Direct);
+                    direct_selection.direct_endpoint = Some(endpoint);
+                    direct_selection.direct_confirmed = true;
+                    direct_selection.reason_code = REASON_PATH_DIRECT_CONFIRMED;
+                }
                 conn.record_path_selection_event(generation, &direct_selection, local_endpoint);
                 conn.last_path_selection = Some(direct_selection);
             }

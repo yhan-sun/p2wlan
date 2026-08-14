@@ -313,6 +313,41 @@ use std::collections::HashMap;
     }
 
     #[tokio::test]
+    async fn relay_selector_uses_catalog_order_for_equal_region() {
+        // Both peers receive the same catalog.  Equal region preference must
+        // have a deterministic catalog-index tie-break; otherwise each peer
+        // can choose a different healthy relay purely from connection timing
+        // and both sides then see peer_not_found on their isolated relays.
+        let primary = RelayServer::start_random().await.unwrap();
+        let standby = RelayServer::start_random().await.unwrap();
+        let specs = vec![
+            RelayCandidateConfig::catalog("local", "relay-primary", primary.addr.to_string()),
+            RelayCandidateConfig::catalog("local", "relay-standby", standby.addr.to_string()),
+        ];
+
+        let outcome = select_relay(
+            &specs,
+            &["local".to_string()],
+            Duration::from_secs(1),
+            "node-a",
+            peer_manager(),
+            None,
+            None,
+            true,
+            None,
+        )
+        .await;
+
+        let transport = outcome.transport.as_ref().unwrap();
+        assert_eq!(transport.endpoint(), primary.addr.to_string());
+        assert_eq!(outcome.diagnostics.selected_endpoint.as_deref(), Some(primary.addr.to_string().as_str()));
+
+        drop(outcome);
+        primary.shutdown().await;
+        standby.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn relay_selector_skips_cooled_down_candidate() {
         let primary = RelayServer::start_random().await.unwrap();
         let standby = RelayServer::start_random().await.unwrap();
@@ -396,7 +431,7 @@ use std::collections::HashMap;
     async fn relay_selector_publishes_first_success_without_waiting_for_black_hole_candidate() {
         // One healthy relay plus one "TCP connects but registration never
         // completes" black hole.  First-success must publish the healthy one in
-        // about the preference window (25ms), NOT wait for the black hole's
+        // about the bounded preference window, NOT wait for the black hole's
         // connect/register timeout.  The still-running black-hole task is
         // cancelled and recorded distinctly from failed/timeout.
         let healthy = RelayServer::start_random().await.unwrap();

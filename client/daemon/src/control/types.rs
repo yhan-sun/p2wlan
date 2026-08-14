@@ -465,6 +465,11 @@ pub struct ControlClient {
     /// Bounded lane for the short control transactions a handshake depends on
     /// (endpoint publish) plus worker shutdown.
     critical_ctrl_tx: mpsc::Sender<CriticalControlCommand>,
+    /// Bounded lane for candidate-only and fresh-mapping advertisements.
+    /// Each target peer gets its own FIFO worker in the independent control
+    /// runtime, so a slow candidate POST cannot block roster polling or other
+    /// peers.
+    candidate_offer_tx: mpsc::Sender<CandidateOfferCommand>,
     /// Shared state.
     state: Arc<RwLock<ClientState>>,
 }
@@ -475,6 +480,7 @@ pub struct ControlClient {
 const CRITICAL_OFFER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_ANSWER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_CTRL_QUEUE_CAPACITY: usize = 8;
+const CANDIDATE_OFFER_QUEUE_CAPACITY: usize = 32;
 /// In-flight ceilings per lane.  The answer lane gets a dedicated budget so
 /// it is never blocked behind offer traffic; the two lane ceilings together
 /// are the global handshake hard cap.
@@ -585,6 +591,25 @@ pub(crate) enum PeerOfferSendOutcome {
     Failed,
 }
 
+/// One candidate-only offer queued in the per-peer ordinary signaling lane.
+///
+/// Candidate refresh and fresh-mapping advertisements must preserve their
+/// order for one peer, but they must not make a slow peer hold up signaling
+/// for every other peer.  The registration-scoped worker owns the HTTP
+/// context; this value contains only the immutable request data and the
+/// caller's completion channel.
+struct CandidateOfferCommand {
+    to_node_id: String,
+    candidates: Vec<String>,
+    session_id: Option<String>,
+    probe_ephemeral_public_key: Option<String>,
+    candidate_sources: HashMap<String, String>,
+    handshake_init: Vec<u8>,
+    punch_at_ms: Option<u64>,
+    fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
+    response_tx: oneshot::Sender<PeerOfferSendOutcome>,
+}
+
 /// Why a peer-offer send did not place the signal on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOfferSendFailure {
@@ -614,21 +639,6 @@ enum ControlCommand {
         endpoint: String,
         nat_type: String,
         response_tx: oneshot::Sender<Result<()>>,
-    },
-    /// Send a peer offer.
-    SendPeerOffer {
-        to_node_id: String,
-        candidates: Vec<String>,
-        session_id: Option<String>,
-        probe_ephemeral_public_key: Option<String>,
-        candidate_sources: HashMap<String, String>,
-        handshake_init: Vec<u8>,
-        punch_at_ms: Option<u64>,
-        /// When this offer advertises a fresh-mapping prediction, the owning
-        /// punch session's cancellation: the HTTP worker refuses to send once
-        /// the session was superseded.
-        fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
-        response_tx: oneshot::Sender<PeerOfferSendOutcome>,
     },
     /// Send a relay-assisted peer-reflexive observation.
     SendPeerReflexive {

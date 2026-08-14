@@ -181,6 +181,33 @@ async fn test_parse_stun_servers_resolves_hostname() {
 }
 
 #[tokio::test]
+async fn test_parse_stun_servers_resolves_sources_concurrently() {
+    // The resolver timeout is intentionally much shorter than the two
+    // sequential waits this test would require.  A numeric endpoint must
+    // still survive while the dead hostname times out in parallel.
+    let started = std::time::Instant::now();
+    let servers = super::resolve_stun_specs(
+        vec![
+            "203.0.113.1:3478".to_string(),
+            "does-not-exist.invalid:3478".to_string(),
+            "198.51.100.2:3478".to_string(),
+        ],
+        true,
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+
+    assert!(servers.contains(&"203.0.113.1:3478".parse().unwrap()));
+    assert!(servers.contains(&"198.51.100.2:3478".parse().unwrap()));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "STUN DNS resolution serialized: elapsed={:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn test_parse_stun_servers_can_be_disabled() {
     assert!(
         parse_stun_servers(&["off".to_string()], Duration::from_millis(100))
@@ -620,6 +647,45 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
         .enqueue_responder_work(offer("peer-deferred", "127.0.0.1:41002"))
         .expect("rejoined peer gets a fresh owner");
     assert_ne!(replacement.0.owner, reservation.owner);
+}
+
+#[test]
+fn cancelled_responder_owner_cannot_consume_a_new_offer() {
+    fn offer(endpoint: &str) -> PendingPeerOffer {
+        PendingPeerOffer {
+            from_node_id: "peer-cancelled-responder".to_string(),
+            candidates: vec![endpoint.to_string()],
+            candidate_sources: HashMap::new(),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            sender_public_key: None,
+            handshake_init: vec![1, 2, 3],
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            ingress_suppressed: false,
+        }
+    }
+
+    let mut state = PendingHandshakeState::default();
+    let (old, _) = state
+        .enqueue_responder_work(offer("198.51.100.10:41000"))
+        .expect("first responder owner must be admitted");
+    // Simulate the cancellation notification becoming visible before a late
+    // signal reaches the state machine. The late offer must get a new owner,
+    // never enter the cancelled worker's queued slot.
+    state
+        .responder_workers
+        .get_mut("peer-cancelled-responder")
+        .expect("responder owner must exist")
+        .cancellation
+        .send_replace(true);
+    let (replacement, replacement_offer) = state
+        .enqueue_responder_work(offer("198.51.100.10:41001"))
+        .expect("cancelled owner must be replaced");
+    assert_ne!(replacement.owner, old.owner);
+    assert_eq!(replacement_offer.candidates, vec!["198.51.100.10:41001"]);
 }
 
 #[test]
@@ -1912,6 +1978,19 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
 
     let mut initiator = HandshakeInitiator::new(peer_identity.clone(), local_public, None);
     let initiation = initiator.create_initiation().unwrap().to_bytes();
+    let control = daemon.control.clone();
+    // Occupy the general slow-work lane first.  The responder answer must
+    // still reach control through its dedicated lane; this reproduces the old
+    // round-8 shape where `Received peer offer` was logged but no answer was
+    // ever produced while another slow worker owned the scheduler slot.
+    control
+        .event_sender()
+        .send(ControlEvent::PeerReflexive {
+            from_node_id: peer_id.to_string(),
+            observed_endpoint: "198.51.100.20:41001".to_string(),
+            punch_at_ms: None,
+        })
+        .unwrap();
     daemon
         .control
         .event_sender()
@@ -3642,6 +3721,87 @@ async fn test_relay_probe_old_relay_ack_never_confirms_new_relay_and_duplicate_a
         .invalidate_relay_transport("relay-a", "relay_transport_closed", "transport gone")
         .await;
     assert!(!peers.is_relay_peer_confirmed("node-b").await);
+}
+
+#[tokio::test]
+async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() {
+    // A make-before-break renewal may reuse the exact endpoint and network
+    // generation.  The probe token is intentionally also stable across the
+    // resend.  Only the local relay transport incarnation distinguishes the
+    // old reader from the replacement.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let generation = peers.current_network_generation().await;
+    let endpoint = "tcp://relay.test:18081";
+    let token = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation,
+        request_id: 17,
+        owner_token: 0xfeed,
+    };
+
+    // The replacement overwrites the old expectation with the same token but
+    // a new local connection incarnation.
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        1,
+    );
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        2,
+    );
+
+    assert!(
+        !peers
+            .consume_relay_probe_ack_with_transport("node-b", token, endpoint, Some(1))
+            .await,
+        "a same-token ACK from the superseded relay reader must be rejected"
+    );
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+
+    // The old ACK is terminally consumed as stale; the replacement must send
+    // a fresh expectation before a current-transport ACK can confirm.
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        2,
+    );
+    assert!(
+        peers
+            .consume_relay_probe_ack_with_transport("node-b", token, endpoint, Some(2))
+            .await
+    );
+    let connection = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(
+        connection.relay_confirmed_connection_id,
+        Some(2),
+        "confirmation must record the replacement transport incarnation"
+    );
 }
 
 #[tokio::test]

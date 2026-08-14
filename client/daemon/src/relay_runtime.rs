@@ -425,6 +425,29 @@ impl RelaySupervisor {
                                 std::sync::atomic::Ordering::SeqCst,
                             );
                             *self.relay_transport.write().await = Some(new_transport.clone());
+                            // Publish the replacement first, then clear all
+                            // same-endpoint expectations and confirmations.
+                            // This ordering closes a race where the old probe
+                            // loop could register one more expectation between
+                            // a cancellation and the slot swap. The next tick
+                            // registers a fresh expectation against the new
+                            // connection incarnation.
+                            self.peers
+                                .cancel_relay_probe_expectations_for_transport(
+                                    endpoint,
+                                    current_transport.connection_id(),
+                                );
+                            self.peers
+                                .invalidate_relay_transport(
+                                    endpoint,
+                                    "relay_transport_replaced",
+                                    format!(
+                                        "relay connection {} replaced by {}",
+                                        current_transport.connection_id(),
+                                        new_transport.connection_id()
+                                    ),
+                                )
+                                .await;
                             let _ = self.relay_available_tx.send(true);
                             self.timeline.emit(
                                 "relay_transport_connected",
@@ -1191,12 +1214,13 @@ pub(super) async fn run_relay_peer_probe_loop(
             // (Re)register the expectation with the SAME token.  This refreshes
             // the expectation's validity window, so an ACK that lags the probe
             // by up to the expectation TTL still matches.
-            peers.register_relay_probe_expectation(
+            peers.register_relay_probe_expectation_for_transport(
                 peer_id,
                 *target_generation,
                 request_id,
                 owner_token,
                 &relay_endpoint,
+                relay.connection_id(),
             );
             // Pace the re-send cadence (the expectation above is refreshed on
             // every tick regardless, so a late ACK always has a live window).

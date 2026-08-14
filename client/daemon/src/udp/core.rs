@@ -505,6 +505,37 @@ impl UdpTransport {
             .map(|socket| (index, socket))
     }
 
+    /// Resolve the exact socket that received an authenticated direct packet.
+    ///
+    /// A response to a hole-punch validation request must leave through the
+    /// same local mapping that received the request.  Resolving by peer
+    /// affinity here is incorrect: a concurrent candidate observation may
+    /// have pinned another pool/dynamic socket between ingress and the ACK,
+    /// causing the NAT to see the ACK from a different source port.  The
+    /// caller has already verified that `socket_index` belongs to the live
+    /// UDP publication; this method additionally checks dynamic ownership and
+    /// network generation so a stale index cannot be reused for another peer.
+    pub(crate) async fn socket_for_inbound_peer_index(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+    ) -> Option<Arc<UdpSocket>> {
+        if socket_index < self.socket_count() {
+            return self.active_sockets().get(socket_index).cloned();
+        }
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
+            return None;
+        }
+        let state = self.socket_state.lock().await;
+        let dynamic = state.dynamic.get(&socket_index)?;
+        if dynamic.peer_id != peer_id
+            || dynamic.network_generation != self.peers.current_network_generation_sync()
+        {
+            return None;
+        }
+        Some(dynamic.socket.clone())
+    }
+
     /// Dynamic punch socket index pinned for a peer, if any.
     ///
     /// A socket that no longer matches the current network generation is
@@ -1011,18 +1042,12 @@ impl UdpTransport {
             (session.target_tx.clone(), *session.target_tx.borrow())
         }) {
             if !current.cancelled && current.generation == generation {
-                // Newest-wins applies to an in-flight request too.  Clear the
-                // old endpoint's expectation before publishing the new target
-                // so a delayed ACK from the superseded endpoint cannot win
-                // after this observation has linearized.
-                if current.endpoint != endpoint {
-                    let mut expectations = self.direct_validation.expectations.lock().await;
-                    if expectations.get(peer_id).is_some_and(|expectation| {
-                        expectation.owner_token == current.owner_token
-                    }) {
-                        expectations.remove(peer_id);
-                    }
-                }
+                // Newest-wins selects the target for the next request. An
+                // already-sent request keeps its exact expectation until it
+                // is ACKed, times out, or is cancelled by owner/generation
+                // teardown. Clearing it here would reject a valid ACK just
+                // because peer-reflexive discovery observed a newer address
+                // while the old request was still in flight.
                 let updated = DirectValidationTarget {
                     endpoint,
                     ..current

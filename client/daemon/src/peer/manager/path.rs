@@ -74,6 +74,52 @@ impl PeerManager {
             == Some(NetworkPath::Direct)
     }
 
+    /// Whether a queued business packet may consume a WireGuard counter in
+    /// the current generation.  A Direct ACK is a valid background probe
+    /// result, but relay-first keeps it out of the data plane until the
+    /// per-peer relay transport has also received its matching encrypted ACK.
+    /// The predicate is intentionally evaluated from one connection snapshot
+    /// so queue admission cannot observe Direct and relay confirmation from
+    /// different generations.
+    pub async fn is_data_path_admitted_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        relay_available: bool,
+    ) -> bool {
+        if generation != self.current_network_generation().await {
+            return false;
+        }
+        self.connections
+            .write()
+            .await
+            .get_mut(node_id)
+            .map(|conn| {
+                if relay_available && conn.relay_first_gate_generation != Some(generation) {
+                    conn.relay_first_gate_generation = Some(generation);
+                    conn.relay_first_gate_started_at = Some(Instant::now());
+                }
+                if !conn.online || conn.state == ConnectionState::Closed {
+                    return false;
+                }
+                let relay_confirmed = relay_available
+                    && conn.relay_confirmed_at.is_some()
+                    && conn.relay_confirmed_generation == Some(generation)
+                    && conn
+                        .relay_confirmed_endpoint
+                        .as_deref()
+                        .is_some_and(|endpoint| !endpoint.is_empty());
+                if relay_confirmed {
+                    return true;
+                }
+                if conn.relay_first_confirmation_pending(generation, relay_available) {
+                    return false;
+                }
+                conn.state == ConnectionState::Direct && conn.direct_generation == generation
+            })
+            .unwrap_or(false)
+    }
+
     /// Whether direct retry suppression has expired for diagnostics/probing.
     pub async fn direct_retry_due(&self, node_id: &str, retry_after: Duration) -> bool {
         let Some(conn) = self.connections.read().await.get(node_id).cloned() else {

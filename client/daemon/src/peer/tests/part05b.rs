@@ -27,7 +27,11 @@ async fn very_slow_confirmed_direct_is_not_duplicated_to_relay() {
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert!(selected.direct_confirmed);
     assert!(!selected.relay_hedged);
-    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_DEGRADED);
+    // A low score can still be historical probe telemetry.  The encrypted
+    // validation ACK is the admission proof, so the selected path remains
+    // Direct and is not reported as degraded until a current consent/ACK
+    // failure is observed.
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
     assert!(
         selected.direct_score.as_ref().unwrap().score
             < selected.relay_score.as_ref().unwrap().score
@@ -86,7 +90,9 @@ async fn path_selector_keeps_relay_for_inbound_only_probe_without_ack() {
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
     let pair = diagnostics[0].current_direct_pair.as_ref().unwrap();
-    assert_eq!(diagnostics[0].direct_type, DirectPathType::Relay);
+    assert_eq!(diagnostics[0].active_path, None);
+    assert_eq!(diagnostics[0].direct_type, DirectPathType::Probing);
+    assert!(!diagnostics[0].is_relay);
     assert_eq!(pair.pair_state, CandidatePairState::Probing);
     assert!(!pair.nominated);
     assert!(!pair.selected);
@@ -215,7 +221,7 @@ async fn path_selector_does_not_treat_unselected_succeeded_pair_as_confirmed_dir
         .await;
     assert_ne!(diagnostics[0].direct_type, DirectPathType::PublicUdp);
     assert!(!diagnostics[0].is_public_udp_direct);
-    assert_eq!(diagnostics[0].direct_type, DirectPathType::Relay);
+    assert_eq!(diagnostics[0].direct_type, DirectPathType::Probing);
     assert_eq!(
         diagnostics[0]
             .current_direct_pair
@@ -230,7 +236,7 @@ async fn path_selector_does_not_treat_unselected_succeeded_pair_as_confirmed_dir
             .as_ref()
             .unwrap()
             .direct_type,
-        DirectPathType::Relay
+        DirectPathType::Probing
     );
 }
 

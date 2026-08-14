@@ -206,6 +206,23 @@ impl UdpTransport {
                 continue;
             }
 
+            let data = &buf[..n];
+
+            // STUN responses are completion signals for the live candidate
+            // gather.  Dispatch them before any peer-manager or diagnostics
+            // await: startup also receives a burst of direct probes and a
+            // slow peer/diagnostic lock must not make a healthy observer look
+            // like `UdpBlocked` after the bounded startup deadline.
+            if let Some(transaction_id) = stun_transaction_id(data) {
+                let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send((data.to_vec(), source));
+                } else {
+                    trace!("Ignored unmatched STUN response from {source}");
+                }
+                continue;
+            }
+
             self.update_socket_diagnostics(socket_index, |metrics| {
                 metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
             })
@@ -219,18 +236,6 @@ impl UdpTransport {
                         .saturating_add(1)
                 })
                 .await;
-            }
-
-            let data = &buf[..n];
-
-            if let Some(transaction_id) = stun_transaction_id(data) {
-                let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
-                if let Some(waiter) = waiter {
-                    let _ = waiter.send((data.to_vec(), source));
-                } else {
-                    trace!("Ignored unmatched STUN response from {source}");
-                }
-                continue;
             }
 
             if is_authenticated_punch_candidate(data) {
@@ -1059,6 +1064,7 @@ impl UdpTransport {
                     source: Some(source),
                     local_endpoint: socket.local_addr().ok(),
                     relay_endpoint: None,
+                    relay_connection_id: None,
                     relay_peer_id: None,
                     socket_index: Some(socket_index),
                     // The token is sampled at enqueue time, not when the
@@ -1067,6 +1073,7 @@ impl UdpTransport {
                     // packet from the retired reader instead of treating it
                     // as evidence for the replacement socket.
                     udp_transport_owner: Some(self.inbound_publication_owner()),
+                    network_generation: Some(self.peers.current_network_generation_sync()),
                     wire_bytes: data.to_vec(),
                 })
                 .await

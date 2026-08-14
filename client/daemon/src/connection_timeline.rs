@@ -1,18 +1,23 @@
 //! Per-process connection timeline: a bounded, serializable record of the
 //! observable milestones of one daemon connection/round.
 //!
-//! Every event carries the same stable `correlation_id` and a `t_ms` relative
-//! to daemon start, so the dual-end harness can correlate the two daemons'
-//! logs and diagnostics into one round without wall-clock reconciliation.
+//! Every event carries the same stable `correlation_id`, the optional bounded
+//! harness `run_id`, and a `t_ms` relative to daemon start, so the dual-end
+//! harness can correlate the two daemons' logs and diagnostics into one round
+//! without wall-clock reconciliation.
 //!
 //! Definitions (strict):
 //! - `relay_transport_connected` means only that a relay transport is
 //!   registered in the shared slot;
 //! - `relay_peer_confirmed` means a verifiably decrypted encrypted relay path
 //!   to a peer;
-//! - `first_usable_*` requires a bidirectional decrypted overlay business
-//!   loopback (produced by the validation harness's real encrypted payload),
-//!   never a single UDP send or TCP connect;
+//! - `first_real_business_ingress` is production evidence: the first normal,
+//!   authenticated, decrypted overlay business packet received by the real
+//!   dataplane, with its direct/relay ingress known from the packet envelope;
+//! - `first_usable_confirmed` and `first_usable_bidirectional_overlay_ms` are
+//!   stronger validation-harness milestones that additionally require a
+//!   nonce-matched bidirectional echo; neither local send, queue acceptance,
+//!   TCP connect, writer completion, nor metrics is business evidence;
 //! - `direct_promoted` still requires the existing encrypted validation chain.
 
 use std::collections::{HashSet, VecDeque};
@@ -28,22 +33,44 @@ pub const TIMELINE_MAX_EVENTS: usize = 64;
 /// One recorded timeline event (serializable, bounded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionTimelineEvent {
+    /// The explicit run identity supplied by the acceptance harness. It is
+    /// accepted only from `P2WLAN_TEST_RUN_ID` after strict character/length
+    /// validation; credentials and arbitrary environment values never enter
+    /// the diagnostics payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub event: String,
     pub at_ms: u64,
     pub path: Option<String>,
     pub reason_code: Option<String>,
     pub detail: Option<String>,
+    /// Structured copies of the audit dimensions when an event detail carries
+    /// the conventional `key=value` fields. The original bounded detail is
+    /// retained for backwards-compatible human diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_region: Option<String>,
 }
 
 /// Bounded, serializable snapshot exposed by diagnostics `/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConnectionTimelineDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub correlation_id: String,
     pub events: Vec<ConnectionTimelineEvent>,
 }
 
 /// Structured INFO timeline emitter shared across daemon subsystems.
 pub struct ConnectionTimeline {
+    run_id: Option<String>,
     correlation_id: String,
     started_at: Instant,
     events: Mutex<VecDeque<ConnectionTimelineEvent>>,
@@ -59,6 +86,10 @@ impl ConnectionTimeline {
     /// from the local node id and the persistent monotonic boot epoch, so it is
     /// stable across restarts of the same node and unique between nodes.
     pub fn new(node_id: &str, boot_epoch_ms: u64) -> Arc<Self> {
+        Self::new_with_run_id(node_id, boot_epoch_ms, safe_test_run_id())
+    }
+
+    fn new_with_run_id(node_id: &str, boot_epoch_ms: u64, run_id: Option<String>) -> Arc<Self> {
         let short_node = node_id.get(..8).unwrap_or(node_id).to_string();
         let correlation_id = if boot_epoch_ms == 0 {
             format!("{short_node}-boot0")
@@ -66,11 +97,16 @@ impl ConnectionTimeline {
             format!("{short_node}-{boot_epoch_ms:x}")
         };
         Arc::new(Self {
+            run_id,
             correlation_id,
             started_at: Instant::now(),
             events: Mutex::new(VecDeque::new()),
             first_events: Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     pub fn correlation_id(&self) -> &str {
@@ -96,17 +132,27 @@ impl ConnectionTimeline {
         detail: Option<String>,
     ) {
         let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let fields = detail
+            .as_deref()
+            .map(parse_detail_fields)
+            .unwrap_or_default();
         {
             let mut events = self
                 .events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             events.push_back(ConnectionTimelineEvent {
+                run_id: self.run_id.clone(),
                 event: event.to_string(),
                 at_ms,
                 path: path.map(str::to_string),
                 reason_code: reason_code.map(str::to_string),
                 detail: detail.clone(),
+                peer_id: fields.peer_id,
+                connection_generation: fields.connection_generation,
+                path_id: fields.path_id.or_else(|| path.map(str::to_string)),
+                relay_id: fields.relay_id,
+                relay_region: fields.relay_region,
             });
             while events.len() > TIMELINE_MAX_EVENTS {
                 events.pop_front();
@@ -114,12 +160,14 @@ impl ConnectionTimeline {
         }
         info!(
             event = event,
+            run_id = ?self.run_id,
             corr_id = %self.correlation_id,
             t_ms = at_ms,
             path = path,
             reason_code = reason_code,
             detail = detail,
-            "{event} corr_id={} t_ms={} path={:?} reason_code={:?} detail={:?}",
+            "{event} run_id={:?} corr_id={} t_ms={} path={:?} reason_code={:?} detail={:?}",
+            self.run_id,
             self.correlation_id,
             at_ms,
             path,
@@ -178,9 +226,55 @@ impl ConnectionTimeline {
             .cloned()
             .collect();
         ConnectionTimelineDiagnostics {
+            run_id: self.run_id.clone(),
             correlation_id: self.correlation_id.clone(),
             events,
         }
+    }
+}
+
+#[derive(Default)]
+struct TimelineDetailFields {
+    peer_id: Option<String>,
+    connection_generation: Option<u64>,
+    path_id: Option<String>,
+    relay_id: Option<String>,
+    relay_region: Option<String>,
+}
+
+fn safe_test_run_id() -> Option<String> {
+    let value = std::env::var("P2WLAN_TEST_RUN_ID").ok()?;
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn detail_value(detail: &str, keys: &[&str]) -> Option<String> {
+    detail.split_whitespace().find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if !keys.contains(&key) {
+            return None;
+        }
+        let value = value.trim_matches(|ch: char| matches!(ch, ',' | ';' | ')' | ']' | '"' | '\''));
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn parse_detail_fields(detail: &str) -> TimelineDetailFields {
+    TimelineDetailFields {
+        peer_id: detail_value(detail, &["peer_id", "peer"]),
+        connection_generation: detail_value(detail, &["connection_generation", "generation"])
+            .and_then(|value| value.parse().ok()),
+        path_id: detail_value(detail, &["path_id"]),
+        relay_id: detail_value(detail, &["relay_id", "relay_endpoint", "endpoint"]),
+        relay_region: detail_value(detail, &["relay_region", "region"]),
     }
 }
 
@@ -217,6 +311,10 @@ mod tests {
         // at_ms is a relative startup time: later events are never earlier.
         assert!(decoded.events[1].at_ms >= decoded.events[0].at_ms);
         assert_eq!(decoded.events[1].path.as_deref(), Some("relay"));
+        assert_eq!(
+            decoded.events[1].relay_id.as_deref(),
+            Some("tcp://relay.test:18081")
+        );
         assert_eq!(
             decoded.events[2].reason_code.as_deref(),
             Some("path_unavailable")

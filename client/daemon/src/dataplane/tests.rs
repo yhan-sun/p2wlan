@@ -96,6 +96,8 @@ use std::net::Ipv4Addr;
                     .send(InboundPacket {
                         peer_id: "peer-b".to_string(),
                         packet,
+                        session_instance: None,
+                        from_previous_session: false,
                     })
                     .await
                     .expect("inbound channel closed");
@@ -180,6 +182,8 @@ use std::net::Ipv4Addr;
             .send(InboundPacket {
                 peer_id: "peer-b".to_string(),
                 packet: packet.clone(),
+                session_instance: None,
+                from_previous_session: false,
             })
             .await
             .unwrap();
@@ -219,6 +223,8 @@ use std::net::Ipv4Addr;
             .send(InboundPacket {
                 peer_id: "peer-b".to_string(),
                 packet,
+                session_instance: None,
+                from_previous_session: false,
             })
             .await
             .unwrap();
@@ -258,6 +264,8 @@ use std::net::Ipv4Addr;
             .send(InboundPacket {
                 peer_id: "peer-b".to_string(),
                 packet,
+                session_instance: None,
+                from_previous_session: false,
             })
             .await
             .unwrap();
@@ -302,6 +310,8 @@ use std::net::Ipv4Addr;
             .send(InboundPacket {
                 peer_id: "peer-b".to_string(),
                 packet,
+                session_instance: None,
+                from_previous_session: false,
             })
             .await
             .unwrap();
@@ -415,6 +425,8 @@ use std::net::Ipv4Addr;
             .send(InboundPacket {
                 peer_id: "peer-b".to_string(),
                 packet,
+                session_instance: None,
+                from_previous_session: false,
             })
             .await
             .unwrap();

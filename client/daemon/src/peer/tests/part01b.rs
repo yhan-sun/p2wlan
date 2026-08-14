@@ -175,6 +175,12 @@ async fn diagnostics_classifies_relay_without_reporting_direct() {
     let remote: SocketAddr = "8.8.4.4:40000".parse().unwrap();
     manager.add_peer(&test_peer("peer1", remote)).await;
     manager.set_relay("peer1", "relay.test:443").await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)

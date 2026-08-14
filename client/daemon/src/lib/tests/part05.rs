@@ -1336,6 +1336,19 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
             panic!("an active non-Direct peer must receive the worker lease")
         }
     };
+    // Register an expectation while the first endpoint is still the active
+    // target, then publish a fresher observation while that request is in
+    // flight.  The ACK for the request already sent to `first_endpoint` must
+    // remain consumable.
+    assert!(udp
+        .expect_direct_validation_ack_owned(
+            "node-b",
+            0x4201,
+            0,
+            owner_token,
+            first_endpoint,
+        )
+        .await);
     assert!(matches!(
         udp.begin_or_merge_direct_validation("node-b", newest_endpoint, 0)
             .await,
@@ -1350,6 +1363,24 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
     assert_eq!(target.generation, 0);
     assert_eq!(target.endpoint, newest_endpoint);
     assert!(!target.cancelled);
+
+    // Candidate refresh may replace the next target without revoking a
+    // request that has already left this daemon. The exact
+    // request/owner/generation/endpoint tuple remains valid until its ACK,
+    // timeout, or lifecycle cancellation.
+    assert!(udp
+        .consume_direct_validation_ack(
+            "node-b",
+            0x4201,
+            0,
+            owner_token,
+            0,
+            first_endpoint,
+            None,
+            false,
+        )
+        .await
+        .is_some());
 
     assert!(udp
         .finish_direct_validation_session("node-b", owner_token)
@@ -1540,6 +1571,43 @@ async fn direct_validation_ingress_coalesces_to_the_newest_endpoint() {
         ingress.next().await.observed_endpoint,
         newest,
         "the scheduler must receive the newest endpoint rather than an arbitrary stale queue entry"
+    );
+}
+
+#[tokio::test]
+async fn direct_validation_ingress_skips_replaced_peer_and_preserves_fifo() {
+    let ingress = DirectValidationIngress::new();
+
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: "127.0.0.1:44101".parse().unwrap(),
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-c".to_string(),
+        observed_endpoint: "127.0.0.1:44102".parse().unwrap(),
+    });
+    // This replacement leaves the original node-b order key stale only when
+    // the scheduler has already taken node-b for lease handoff.  Exercise
+    // that exact shape directly through the test-only helper.
+    assert_eq!(
+        ingress.take_latest_for_peer("node-b").unwrap().observed_endpoint,
+        "127.0.0.1:44101".parse::<SocketAddr>().unwrap()
+    );
+
+    assert_eq!(
+        ingress.next().await.observed_endpoint,
+        "127.0.0.1:44102".parse::<SocketAddr>().unwrap(),
+        "a stale order key must not hide the next peer"
+    );
+
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: "127.0.0.1:44199".parse().unwrap(),
+    });
+    assert_eq!(
+        ingress.next().await.observed_endpoint,
+        "127.0.0.1:44199".parse::<SocketAddr>().unwrap(),
+        "a replaced peer must re-enter FIFO after its previous handoff"
     );
 }
 

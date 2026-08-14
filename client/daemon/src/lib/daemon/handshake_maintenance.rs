@@ -438,8 +438,10 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         .as_ref()
         .map(|snapshot| snapshot.network_identity.clone())
         .unwrap_or_default();
-    let should_advance_generation =
-        !previous_network_identity.is_empty() && previous_network_identity != next_network_identity;
+    let should_advance_generation = network_identity_changed(
+        &previous_network_identity,
+        &next_network_identity,
+    );
     let changed = previous_candidates != candidates
         || previous_candidate_sources != candidate_sources
         || previous_network_identity != next_network_identity;

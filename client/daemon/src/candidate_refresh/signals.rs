@@ -522,13 +522,23 @@ pub(super) fn prepare_signal_candidates_and_network_identity(
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,
 ) -> Vec<String> {
+    // A peer-reflexive endpoint is evidence about a remote path, not about
+    // this machine's active interface/NAT identity.  Keep the previous
+    // stable identity available while a STUN report is temporarily missing so
+    // a single incomplete report cannot revoke a healthy relay generation.
+    let previous_network_identity =
+        stable_network_candidate_signature(previous_candidates, previous_candidate_sources);
     preserve_peer_reflexive_candidates(
         previous_candidates,
         previous_candidate_sources,
         candidates,
         candidate_sources,
     );
-    let network_identity = stable_network_candidate_signature(candidates, candidate_sources);
+    let current_network_identity = stable_network_candidate_signature(candidates, candidate_sources);
+    let network_identity = carry_forward_missing_network_identity(
+        &previous_network_identity,
+        current_network_identity,
+    );
     compact_volatile_public_signal_candidates(candidates, candidate_sources);
     truncate_signal_candidates(candidates, candidate_sources);
     network_identity
@@ -539,6 +549,52 @@ pub(super) fn candidate_refresh_requires_commit(
     should_advance_generation: bool,
 ) -> bool {
     real_candidate_change || should_advance_generation
+}
+
+/// Return whether the candidate snapshot contains a public endpoint backed by
+/// local discovery evidence.  Predicted ports and peer-reflexive/learned
+/// endpoints are useful punch targets, but they are not proof that this
+/// daemon's current NAT mapping is ready to advertise as the primary path.
+///
+/// This distinction matters when startup publishes a host-only snapshot and a
+/// later STUN refresh discovers the public mapping.  That transition must be
+/// signaled immediately even though it does not replace the local network
+/// identity (and therefore must not advance the connection generation).
+pub(super) fn has_real_public_candidate(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> bool {
+    candidates.iter().any(|endpoint| {
+        let endpoint_text = endpoint.as_str();
+        let Ok(endpoint) = endpoint_text.parse::<SocketAddr>() else {
+            return false;
+        };
+        if !is_public_udp_candidate(endpoint) {
+            return false;
+        }
+        let source = candidate_sources
+            .get(endpoint_text)
+            .map(String::as_str);
+        !matches!(source, Some("peer_reflexive" | "learned" | "predicted"))
+            && !source.is_some_and(|source| crate::parse_fresh_prediction_source_label(source).is_some())
+    })
+}
+
+/// Whether a refresh crossed the boundary between “only private/predicted
+/// candidates” and “a locally observed public candidate is available”.
+///
+/// A public port changing on the same mapping remains volatile churn and may
+/// use the normal debounce.  A readiness transition is different: retaining
+/// the debounce here would leave peers probing an obsolete private endpoint
+/// for up to 30 seconds after STUN has already produced a usable mapping.
+pub(super) fn public_candidate_readiness_changed(
+    previous_candidates: &[String],
+    previous_candidate_sources: &HashMap<String, String>,
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> bool {
+    has_real_public_candidate(previous_candidates, previous_candidate_sources)
+        != has_real_public_candidate(candidates, candidate_sources)
 }
 
 pub(super) fn add_peer_reflexive_candidate_to_set(
@@ -568,8 +624,71 @@ pub(super) fn candidate_refresh_requires_network_generation_advance(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
 ) -> bool {
-    stable_network_candidate_signature(previous_candidates, previous_candidate_sources)
-        != stable_network_candidate_signature(candidates, candidate_sources)
+    network_identity_changed(
+        &stable_network_candidate_signature(previous_candidates, previous_candidate_sources),
+        &stable_network_candidate_signature(candidates, candidate_sources),
+    )
+}
+
+/// Decide whether a candidate refresh represents a real local network
+/// identity replacement.
+///
+/// Candidate sets are deliberately additive: a new interface, a new mapped
+/// port, or a peer-reflexive observation may be added while the established
+/// local path remains valid.  Advancing the generation for that kind of
+/// change revokes relay sessions and forces a needless Direct restart.  A
+/// generation advances only when a previously observed identity category has
+/// no surviving member in the new set.  Empty categories are treated as
+/// inconclusive because STUN can fail transiently.
+pub(super) fn network_identity_changed(previous: &[String], next: &[String]) -> bool {
+    const CATEGORIES: [&str; 3] = ["public-ip:", "physical-host-ip:", "mapped-ip:"];
+
+    for category in CATEGORIES {
+        let previous_values = previous
+            .iter()
+            .filter_map(|entry| entry.strip_prefix(category))
+            .collect::<HashSet<_>>();
+        let next_values = next
+            .iter()
+            .filter_map(|entry| entry.strip_prefix(category))
+            .collect::<HashSet<_>>();
+        if !previous_values.is_empty()
+            && !next_values.is_empty()
+            && previous_values.is_disjoint(&next_values)
+        {
+            return true;
+        }
+    }
+
+    let previous_other = previous
+        .iter()
+        .filter(|entry| !CATEGORIES.iter().any(|category| entry.starts_with(category)))
+        .collect::<HashSet<_>>();
+    let next_other = next
+        .iter()
+        .filter(|entry| !CATEGORIES.iter().any(|category| entry.starts_with(category)))
+        .collect::<HashSet<_>>();
+    !previous_other.is_empty()
+        && !next_other.is_empty()
+        && previous_other.is_disjoint(&next_other)
+}
+
+fn carry_forward_missing_network_identity(previous: &[String], mut current: Vec<String>) -> Vec<String> {
+    const CATEGORIES: [&str; 3] = ["public-ip:", "physical-host-ip:", "mapped-ip:"];
+    for category in CATEGORIES {
+        if current.iter().any(|entry| entry.starts_with(category)) {
+            continue;
+        }
+        current.extend(
+            previous
+                .iter()
+                .filter(|entry| entry.starts_with(category))
+                .cloned(),
+        );
+    }
+    current.sort();
+    current.dedup();
+    current
 }
 
 /// Order-insensitive change classification for a candidate set refresh.
@@ -737,11 +856,15 @@ pub(super) fn stable_network_candidate_signature(
         match endpoint.parse::<SocketAddr>() {
             Ok(addr) if is_public_udp_candidate(addr) => {
                 // Port churn and candidate-source promotion do not mean the
-                // host changed networks. A public IP change does.
-                signature.push(format!("public-ip:{}", addr.ip()));
+                // host changed networks. Peer-reflexive/learned endpoints are
+                // observations about a remote path and must not become this
+                // daemon's local public identity.
+                if !matches!(source, "peer_reflexive" | "learned") {
+                    signature.push(format!("public-ip:{}", addr.ip()));
+                }
             }
             Ok(addr) => match source {
-                "host" | "peer_reflexive" | "learned" => {
+                "host" => {
                     signature.push(format!("physical-host-ip:{}", addr.ip()));
                 }
                 "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
@@ -753,7 +876,7 @@ pub(super) fn stable_network_candidate_signature(
                 "host" | "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" => {
                     signature.push(format!("{source}:{endpoint}"));
                 }
-                "stun_observed" | "predicted" | "peer_reflexive" | "learned" => {
+                "stun_observed" | "predicted" => {
                     signature.push(format!("{source}:{endpoint}"));
                 }
                 _ => {}

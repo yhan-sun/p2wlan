@@ -423,15 +423,10 @@ impl PeerManager {
 
         let mut retained_confirmed_direct_count = 0usize;
         let mut direct_reclaim_count = 0usize;
-        let mut relay_confirmation_cancellations = Vec::new();
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
-            let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             let retained_confirmed_direct =
                 conn.mark_candidate_refresh_generation_changed(generation, reason.clone());
-            if had_relay_confirmation && conn.relay_confirmed_at.is_none() {
-                relay_confirmation_cancellations.push(conn.node_id.clone());
-            }
             if retained_confirmed_direct {
                 retained_confirmed_direct_count += 1;
                 continue;
@@ -446,9 +441,6 @@ impl PeerManager {
             }
         }
         drop(conns);
-        for peer_id in relay_confirmation_cancellations {
-            self.bump_relay_confirm_seq(&peer_id);
-        }
         self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
 
         info!(

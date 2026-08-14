@@ -379,6 +379,30 @@ impl UdpTransport {
         .await
     }
 
+    /// Send the bounded latency-sensitive Direct prefix through every socket
+    /// that is already bound, without enabling the transport-wide ActivePool
+    /// policy for later peers or later recovery stages.
+    pub(crate) async fn punch_candidates_fast_prefix_until_not_direct_report(
+        &self,
+        peer_id: &str,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
+        let gate_peer = peer_id.to_string();
+        let peers = self.peers.clone();
+        self.punch_candidates_with_socket_policy_and_direct_gate(
+            peer_id,
+            candidates,
+            probe_interval,
+            attempts,
+            PunchSocketPolicy::FastPrefixPool,
+            &move || !peers.is_direct_sync(&gate_peer),
+            &|| true,
+        )
+        .await
+    }
+
     /// Send active UDP probes only from the primary socket.
     ///
     /// This is reserved for explicit single-socket diagnostics and tests. The
@@ -519,7 +543,9 @@ impl UdpTransport {
             PunchSocketPolicy::RemoteScatterPool | PunchSocketPolicy::StableUniqueScatter => {
                 MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION
             }
-            PunchSocketPolicy::ActivePool | PunchSocketPolicy::PrimaryOnly => {
+            PunchSocketPolicy::FastPrefixPool
+            | PunchSocketPolicy::ActivePool
+            | PunchSocketPolicy::PrimaryOnly => {
                 MAX_PUNCH_PROBES_PER_SESSION
             }
             PunchSocketPolicy::RelayBackoffHeartbeat => {
@@ -540,7 +566,8 @@ impl UdpTransport {
             }
 
             let probe_order = match socket_policy {
-                PunchSocketPolicy::ActivePool
+                PunchSocketPolicy::FastPrefixPool
+                | PunchSocketPolicy::ActivePool
                 | PunchSocketPolicy::RemoteScatterPool
                 | PunchSocketPolicy::RelayBackoffHeartbeat
                     if socket_count > 1 =>
@@ -1002,6 +1029,7 @@ impl UdpTransport {
             .collect::<Vec<_>>()
             .join(",");
         let stage = match socket_policy {
+            PunchSocketPolicy::FastPrefixPool => "fast_prefix_pool_scan_completed",
             PunchSocketPolicy::ActivePool if socket_count > 1 => "active_pool_scan_completed",
             PunchSocketPolicy::RemoteScatterPool if socket_count > 1 => {
                 "active_pool_scan_completed"
@@ -1636,6 +1664,29 @@ impl UdpTransport {
                 packet.peer_id
             ))),
         };
+        self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
+            .await
+    }
+
+    /// Send an encrypted packet on the exact socket identified by the
+    /// receiving UDP envelope.  This is reserved for direct validation ACKs:
+    /// selecting by peer affinity can choose a different NAT mapping after a
+    /// concurrent candidate observation, so it is not equivalent.
+    pub(crate) async fn send_packet_on_socket_index(
+        &self,
+        packet: &EncryptedPeerPacket,
+        socket_index: usize,
+        endpoint: SocketAddr,
+    ) -> Result<usize> {
+        let socket = self
+            .socket_for_inbound_peer_index(&packet.peer_id, socket_index)
+            .await
+            .ok_or_else(|| {
+                DaemonError::Network(format!(
+                    "receiving UDP socket {socket_index} is no longer live for peer {}",
+                    packet.peer_id
+                ))
+            })?;
         self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
             .await
     }

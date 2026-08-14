@@ -97,6 +97,21 @@ async fn run_direct_probe_loop(
             if peers.peer_needs_local_socket_pool(&peer_id).await {
                 udp.set_socket_pool_active(true);
             }
+            if udp.socket_count() > 1 {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "direct_fast_probe_socket_pool_selected",
+                        candidates.first().copied(),
+                        Some(candidates.len()),
+                        Some(udp.socket_count() as u32),
+                        format!(
+                            "background fast Direct prefix will use {} already-bound UDP sockets; transport-wide ActivePool remains unchanged",
+                            udp.socket_count()
+                        ),
+                    )
+                    .await;
+            }
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
             tokio::spawn(async move {
@@ -197,6 +212,113 @@ async fn run_direct_probe_loop(
                         peers
                             .record_birthday_probe_plan_started(&peer_id, plan)
                             .await;
+                    }
+
+                    // Background retries do not have a relay-coordinated
+                    // punch_at_ms, but they must not wait for the wide
+                    // birthday/scatter sweep before trying the strongest
+                    // candidates.  Keep this bounded (eight targets, one
+                    // active-pool pass) and retain the relay-first invariant:
+                    // only an authenticated Direct validation ACK can make
+                    // this return early; a send or ACK failure falls through
+                    // to the existing complete sweep.
+                    let fast_candidates = direct_fast_probe_candidates(&candidates);
+                    if direct_fast_probe_is_allowed(
+                        remote_scatter_pool,
+                        stable_remote_scatter,
+                        false,
+                    ) && !fast_candidates.is_empty()
+                    {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "direct_fast_probe_started",
+                                fast_candidates.first().copied(),
+                                Some(fast_candidates.len()),
+                                None,
+                                format!(
+                                    "background retry immediate candidate window generation={} candidates={} remote_scatter_pool={} stable_remote_scatter={}",
+                                    generation,
+                                    fast_candidates.len(),
+                                    remote_scatter_pool,
+                                    stable_remote_scatter,
+                                ),
+                            )
+                            .await;
+                        let fast_result = udp
+                            .punch_candidates_fast_prefix_until_not_direct_report(
+                                &peer_id,
+                                fast_candidates.clone(),
+                                Duration::ZERO,
+                                DIRECT_FAST_PROBE_ATTEMPTS,
+                            )
+                            .await;
+                        match fast_result {
+                            Ok(report) => {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "direct_fast_probe_sent",
+                                        fast_candidates.first().copied(),
+                                        Some(fast_candidates.len()),
+                                        Some(report.packets_sent),
+                                        format!(
+                                            "background retry packets_sent={} actual_first_send_at_ms={:?}",
+                                            report.packets_sent,
+                                            report.first_send_at_ms,
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(error) => {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "direct_fast_probe_failed",
+                                        fast_candidates.first().copied(),
+                                        Some(fast_candidates.len()),
+                                        None,
+                                        format!(
+                                            "background retry fast candidate hint failed; continuing wide sweep: {error}"
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                        if peers.is_direct(&peer_id).await {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "direct_fast_probe_confirmed",
+                                    None,
+                                    Some(fast_candidates.len()),
+                                    None,
+                                    "background retry Direct validation committed before wide sweep",
+                                )
+                                .await;
+                            return;
+                        }
+                        let fast_commit_seq = peers.direct_commit_seq_sync(&peer_id);
+                        if peers
+                            .wait_for_direct_commit_or_timeout(
+                                &peer_id,
+                                fast_commit_seq,
+                                DIRECT_FAST_PROBE_ACK_WINDOW,
+                            )
+                            .await
+                        {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "direct_fast_probe_confirmed",
+                                    None,
+                                    Some(fast_candidates.len()),
+                                    None,
+                                    "background retry Direct validation committed during fast ACK window",
+                                )
+                                .await;
+                            return;
+                        }
                     }
 
                     // Fresh mapping is an optimization for later Direct

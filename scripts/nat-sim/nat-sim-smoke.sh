@@ -118,18 +118,43 @@ node_event_tms() {
   strip_ansi < "$log" | grep -m1 "event=\"${ev}\"" | grep -oE 't_ms=[0-9]+' | head -1 | cut -d= -f2 || true
 }
 
-# Extract the real ingress path of the first usable path (relay:<endpoint> or
-# direct), from the first_usable_confirmed structured event (never inferred
-# from active_path).
+# Extract the real ingress path of the first production business evidence
+# (relay:<endpoint> or direct), from first_real_business_ingress (never
+# inferred from active_path or the stronger harness-only echo event).
 node_first_usable_ingress() {
   local log="$1"
+  local line
+  line=$(strip_ansi < "$log" | grep -m1 'event="first_real_business_ingress"' || true)
+  if [[ -n "$line" ]]; then
+    local path
+    path=$(printf '%s\n' "$line" | grep -oE 'path="[^"]+"' | tail -1 | cut -d= -f2 | tr -d '"' || true)
+    if [[ "$path" == "relay" ]]; then
+      local relay_id
+      relay_id=$(printf '%s\n' "$line" | grep -oE 'relay_id=[^ ]+' | head -1 | cut -d= -f2 | sed -E 's/[",)]+$//' || true)
+      printf 'relay:%s\n' "${relay_id:-unknown}"
+    elif [[ "$path" == "direct" ]]; then
+      printf 'direct\n'
+    fi
+    return 0
+  fi
+  # Backward-compatible fallback for a harness-only log that predates the
+  # production timeline event. It is still never inferred from active_path.
   strip_ansi < "$log" | grep -m1 'event="first_usable_confirmed"' | grep -oE 'ingress=[^ ]+' | head -1 | cut -d= -f2 || true
 }
 
-# Extract the per-daemon monotonic relay-ready -> usable delta (ms) computed on
-# that daemon's own clock and reported in the first_usable_confirmed event.
+# Extract the per-daemon monotonic relay-ready -> first production business
+# delta. The subtraction is performed only on one daemon's own t_ms values;
+# a missing baseline/evidence remains missing and is never converted to zero.
 node_first_usable_delta_ms() {
   local log="$1"
+  local first_ready first_business
+  first_ready=$(node_event_tms "$log" relay_transport_ready_peer)
+  first_business=$(node_event_tms "$log" first_real_business_ingress)
+  if [[ "$first_ready" =~ ^[0-9]+$ && "$first_business" =~ ^[0-9]+$ ]]; then
+    echo $((first_business - first_ready))
+    return 0
+  fi
+  # Backward-compatible fallback for older harness logs.
   strip_ansi < "$log" | grep -m1 'event="first_usable_confirmed"' | grep -oE 'relay_ready_to_usable_ms=Some\([0-9]+\)' | head -1 | grep -oE '[0-9]+' || true
 }
 
@@ -137,6 +162,45 @@ node_first_usable_delta_ms() {
 node_failure_code() {
   local log="$1"
   strip_ansi < "$log" | grep "relay_unavailable_or_first_packet_expired" | grep -oE 'reason_code=Some\("[A-Za-z0-9_]+"\)' | head -1 | sed -E 's/.*reason_code=Some\("([A-Za-z0-9_]+)"\).*/\1/' || true
+}
+
+# A structured timeline event and its human-readable log line are both
+# emitted for each confirmation.  Never count log lines as confirmations:
+# failover evidence must be based on unique relay endpoints, otherwise the
+# diagnostic itself can report a false second confirmation.
+node_relay_confirmed_endpoints() {
+  local log="$1"
+  strip_ansi < "$log" \
+    | grep 'event="relay_peer_confirmed"' \
+    | grep -oE 'relay_endpoint=[^ ]+' \
+    | cut -d= -f2 \
+    | sed -E 's/[",)]+$//' \
+    | sort -u || true
+}
+
+node_relay_confirmed_count() {
+  local log="$1"
+  node_relay_confirmed_endpoints "$log" | awk 'NF { count++ } END { print count + 0 }'
+}
+
+node_replacement_relay_endpoint() {
+  local log="$1" active_endpoint="$2"
+  node_relay_confirmed_endpoints "$log" \
+    | grep -Fvx "$active_endpoint" \
+    | head -1 || true
+}
+
+# Only inspect business-ingress evidence written after the failover action.
+# The old endpoint's traffic before the kill is not recovery evidence.
+node_post_failover_relay_ingress() {
+  local log="$1" start_line="$2" active_endpoint="$3"
+  tail -n +"$start_line" "$log" 2>/dev/null \
+    | strip_ansi \
+    | grep 'overlay_payload_verified' \
+    | grep -oE 'ingress=relay:[^ ]+' \
+    | cut -d= -f2 \
+    | grep -Fvx "relay:${active_endpoint}" \
+    | head -1 || true
 }
 
 # Fetch a required JSON endpoint.  A failed request, an empty document, or an
@@ -284,7 +348,6 @@ for round in $(seq 1 "$ROUNDS"); do
     R_REGION="local"
     if [[ "$relay_idx" -gt 1 ]]; then
       R_AUDIENCE="relay-sim-$relay_idx"
-      R_REGION="local-b"
     fi
     RELAY_AUDIENCE="$R_AUDIENCE" RELAY_REGION="$R_REGION" "$BASE_DIR/relay-server" \
       -bind "127.0.0.1:$R_PORT" \
@@ -298,6 +361,11 @@ for round in $(seq 1 "$ROUNDS"); do
     RELAY_ENDPOINTS="${RELAY_ENDPOINTS}{\"region\":\"$R_REGION\",\"audience\":\"$R_AUDIENCE\",\"endpoint\":\"tcp://127.0.0.1:$R_PORT\"}"
   done
   RELAY_PID="${RELAY_PIDS[0]}"
+
+  if [[ "$RELAY_COUNT" -ge 2 && "$RELAY_ENDPOINTS" != *'"region":"local"'* ]]; then
+    echo "[nat-sim] relay failover catalog must contain the primary local region" >&2
+    exit 2
+  fi
 
   # Control server with the relay catalog (no UDP observer in the catalog:
   # every STUN flow must traverse the simulated NATs).
@@ -345,8 +413,10 @@ for round in $(seq 1 "$ROUNDS"); do
   TRAVERSAL_FLAGS=""
   if [[ "$RELAY_COUNT" -ge 2 ]]; then
     # Both daemons must converge on the PRIMARY relay first for the failover
-    # scenario to be deterministic (region preference wins over latency jitter).
-    TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-regions local-a"
+    # scenario to be deterministic.  Equal-region selection uses catalog
+    # order as the tie-break, while the selector still connects candidates in
+    # parallel and bounds the preference window.
+    TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-regions local"
   fi
   if [[ "$FRESH_MAPPING_PUNCH" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-fresh-mapping-punch"; fi
   if [[ "$PREDICTED_CANDIDATES" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-predicted-candidates"; fi
@@ -424,17 +494,22 @@ for round in $(seq 1 "$ROUNDS"); do
     B_DIRECT=$(grep -c '→ direct' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
     direct_ok=0
   else
-    # Direct mode: require BOTH Direct promotions and a bidirectional encrypted
-    # overlay loopback on each daemon.  The validation loop targets Direct
-    # peers only in this mode, so the payload cannot be carried by Relay.
+    # Direct mode: relay-first is still mandatory.  Require BOTH Direct
+    # promotions, a relay-ingress first usable proof, and a later bidirectional
+    # encrypted business echo whose ingress is Direct.  The validation loop
+    # targets Direct peers only after the relay-first packet, so this verifies
+    # make-before-break rather than treating Direct candidate readiness as
+    # first usability.
     direct_ok=0
     for _ in $(seq 1 $((DIRECT_TIMEOUT_S * 2))); do
       if grep -q '→ direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \
          grep -q '→ direct' "$ROUND_DIR/node-b.log" 2>/dev/null && \
          grep -q 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null && \
          grep -q 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null && \
-         grep -q 'event="first_usable_confirmed".*ingress=direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \
-         grep -q 'event="first_usable_confirmed".*ingress=direct' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+         grep -q 'event="first_real_business_ingress".*path="relay"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
+         grep -q 'event="first_real_business_ingress".*path="relay"' "$ROUND_DIR/node-b.log" 2>/dev/null && \
+         grep -q 'overlay_payload_verified.*ingress=direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \
+         grep -q 'overlay_payload_verified.*ingress=direct' "$ROUND_DIR/node-b.log" 2>/dev/null; then
         direct_ok=1
         break
       fi
@@ -478,9 +553,10 @@ for round in $(seq 1 "$ROUNDS"); do
     grep -h 'overlay_payload_verified\|overlay_payload_sent\|overlay_payload_echo\|first_usable_confirmed' "$ROUND_DIR"/node-*.log 2>/dev/null | head -6
   } >"$ROUND_DIR/evidence.log" 2>&1 || true
 
-  # Per-daemon monotonic relay-ready -> usable delta: each daemon computes it
-  # on its OWN clock and reports it in first_usable_confirmed; the harness only
-  # SUMS the two ends' deltas, never subtracts wall clocks across machines.
+  # Per-daemon monotonic relay-ready -> first production business delta: the
+  # harness computes each delta from that daemon's own t_ms values and only
+  # reports their sum as a convenience; it never subtracts wall clocks across
+  # machines.
   A_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-a.log")
   B_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-b.log")
   DELTA_OK=1
@@ -493,11 +569,12 @@ for round in $(seq 1 "$ROUNDS"); do
       B_DELTA=-1
       SUM_DELTA=-1
     else
-      # A Direct first-usable proof has no relay-ready delta by definition;
-      # preserve that as an explicit non-value rather than treating it as 0.
-      A_DELTA="n/a"
-      B_DELTA="n/a"
-      SUM_DELTA="n/a"
+      echo "[nat-sim] ROUND $round: FAIL reason_code=first_usable_delta_missing a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
+      DELTA_OK=0
+      overall=1
+      A_DELTA=-1
+      B_DELTA=-1
+      SUM_DELTA=-1
     fi
   else
     SUM_DELTA=$((A_DELTA + B_DELTA))
@@ -515,8 +592,8 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
   A_INGRESS=$(node_first_usable_ingress "$ROUND_DIR/node-a.log")
   B_INGRESS=$(node_first_usable_ingress "$ROUND_DIR/node-b.log")
-  A_RELAY_CONFIRMED=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null || echo 0)
-  B_RELAY_CONFIRMED=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null || echo 0)
+  A_RELAY_CONFIRMED=$(node_relay_confirmed_count "$ROUND_DIR/node-a.log")
+  B_RELAY_CONFIRMED=$(node_relay_confirmed_count "$ROUND_DIR/node-b.log")
   # First failure reason_code seen on either node this round (drop/cancel reason).
   FAIL_CODE=$(node_failure_code "$ROUND_DIR/node-a.log")
   [[ -z "$FAIL_CODE" ]] && FAIL_CODE=$(node_failure_code "$ROUND_DIR/node-b.log")
@@ -591,19 +668,64 @@ except Exception:
       overall=1
     fi
   else
-    # A single-sided Direct, unverified Direct payload, or relay-only round is
-    # a failure.  The direct validation loop cannot use Relay in this mode.
-    if [[ "$direct_ok" -eq 1 && "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 ]]; then
+    # A single-sided Direct, missing relay-first evidence, unverified Direct
+    # echo, loss/replay/invalid packets, or a missing/slow relay-ready delta is
+    # a failure.  The direct validation loop cannot use Relay for the post-
+    # promotion echo in this mode.
+    read -r A_DROPS A_DROP_BYTES < <(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$ROUND_DIR/node-a.status.json'))
+    drops=d.get('stats',{})['outbound_drops']
+    print(sum(int(v['packets']) for v in drops.values()), sum(int(v['bytes']) for v in drops.values()))
+except Exception:
+    print('-1 -1')")
+    read -r B_DROPS B_DROP_BYTES < <(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$ROUND_DIR/node-b.status.json'))
+    drops=d.get('stats',{})['outbound_drops']
+    print(sum(int(v['packets']) for v in drops.values()), sum(int(v['bytes']) for v in drops.values()))
+except Exception:
+    print('-1 -1')")
+    A_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    a_relay_first=0
+    b_relay_first=0
+    [[ "$A_INGRESS" == relay:* ]] && a_relay_first=1
+    [[ "$B_INGRESS" == relay:* ]] && b_relay_first=1
+    if [[ "$direct_ok" -eq 1 && "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 \
+          && "$DELTA_OK" -eq 1 && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \
+          && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 \
+          && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
+          && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \
+          && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
+          && "$A_REPLAY" -eq 0 && "$B_REPLAY" -eq 0 \
+          && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 ]]; then
       echo "[nat-sim] ROUND $round: PASS both_direct a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
     else
       if [[ "$direct_ok" -ne 1 ]]; then
         DIRECT_REASON="direct_overlay_unverified"
+      elif [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ]]; then
+        DIRECT_REASON="first_usable_delta_missing"
+      elif [[ "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
+        DIRECT_REASON="relay_first_slo_exceeded"
+      elif [[ "$A_RELAY_CONFIRMED" -lt 1 || "$B_RELAY_CONFIRMED" -lt 1 || "$a_relay_first" -ne 1 || "$b_relay_first" -ne 1 ]]; then
+        DIRECT_REASON="relay_first_evidence_missing"
+      elif [[ "$A_DROPS" -ne 0 || "$B_DROPS" -ne 0 ]]; then
+        DIRECT_REASON="outbound_drop"
+      elif [[ "$A_REPLAY" -ne 0 || "$B_REPLAY" -ne 0 ]]; then
+        DIRECT_REASON="replay_detected"
+      elif [[ "$A_INVALID" -ne 0 || "$B_INVALID" -ne 0 ]]; then
+        DIRECT_REASON="overlay_invalid"
       elif [[ "$STATUS_SCHEMA_OK" -ne 1 ]]; then
         DIRECT_REASON="status_schema_invalid"
       else
         DIRECT_REASON="metrics_schema_invalid"
       fi
-      echo "[nat-sim] ROUND $round: FAIL reason_code=$DIRECT_REASON a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$DIRECT_REASON a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
       overall=1
     fi
   fi
@@ -650,7 +772,11 @@ except Exception:
     # Kill the ACTIVE relay (the one the daemons confirmed on); with another
     # candidate in the catalog the daemon must fail over, re-probe and
     # re-confirm on the replacement relay, and the overlay must keep running.
-    ACTIVE_ENDPOINT=$(strip_ansi < "$ROUND_DIR/node-a.log" | grep -m1 'relay_peer_confirmed' | grep -oE 'relay_endpoint=[^ ]+' | head -1 | cut -d= -f2 || true)
+    # Capture line offsets before the kill so old business traffic cannot be
+    # mistaken for post-failover recovery.
+    A_FAILOVER_START_LINE=$(($(wc -l < "$ROUND_DIR/node-a.log") + 1))
+    B_FAILOVER_START_LINE=$(($(wc -l < "$ROUND_DIR/node-b.log") + 1))
+    ACTIVE_ENDPOINT=$(node_relay_confirmed_endpoints "$ROUND_DIR/node-a.log" | head -1 || true)
     if [[ -z "$ACTIVE_ENDPOINT" ]]; then
       echo "[nat-sim] ROUND $round: FAIL relay_failover (could not determine the active relay endpoint)"
       overall=1
@@ -672,18 +798,21 @@ except Exception:
       else
         re_confirmed=0
         for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
-          B_CONF=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
-          A_CONF=$(grep -c 'relay_peer_confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
-          if [[ "$A_CONF" -ge 2 && "$B_CONF" -ge 2 ]]; then
+          A_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-a.log" "$ACTIVE_ENDPOINT")
+          B_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-b.log" "$ACTIVE_ENDPOINT")
+          A_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-a.log" "$A_FAILOVER_START_LINE" "$ACTIVE_ENDPOINT")
+          B_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-b.log" "$B_FAILOVER_START_LINE" "$ACTIVE_ENDPOINT")
+          if [[ -n "$A_REPLACEMENT" && "$A_REPLACEMENT" == "$B_REPLACEMENT" \
+                && -n "$A_POST_INGRESS" && -n "$B_POST_INGRESS" ]]; then
             re_confirmed=1
             break
           fi
           sleep 0.5
         done
         if [[ "$re_confirmed" -eq 1 ]]; then
-          echo "[nat-sim] ROUND $round: PASS relay_failover_reconfirmed active=$ACTIVE_ENDPOINT confirmations_a=$A_CONF confirmations_b=$B_CONF"
+          echo "[nat-sim] ROUND $round: PASS relay_failover_reconfirmed active=$ACTIVE_ENDPOINT replacement=$A_REPLACEMENT post_ingress_a=$A_POST_INGRESS post_ingress_b=$B_POST_INGRESS"
         else
-          echo "[nat-sim] ROUND $round: FAIL relay_failover_reconfirmed (no re-confirmation on the replacement relay; active=$ACTIVE_ENDPOINT)"
+          echo "[nat-sim] ROUND $round: FAIL reason_code=relay_failover_no_replacement_business active=$ACTIVE_ENDPOINT replacement_a=${A_REPLACEMENT:-none} replacement_b=${B_REPLACEMENT:-none} post_ingress_a=${A_POST_INGRESS:-none} post_ingress_b=${B_POST_INGRESS:-none}"
           overall=1
         fi
       fi

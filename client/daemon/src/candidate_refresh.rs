@@ -113,4 +113,52 @@ mod tests {
         assert_eq!(total, 4);
         assert_eq!(identical, 2, "only the second content's repeats are silent");
     }
+
+    #[test]
+    fn public_candidate_readiness_transition_bypasses_volatile_debounce() {
+        let host = vec!["192.168.0.239:52268".to_string()];
+        let host_sources = HashMap::from([(host[0].clone(), "host".to_string())]);
+        let public = vec![host[0].clone(), "8.8.8.8:41000".to_string()];
+        let public_sources = HashMap::from([
+            (host[0].clone(), "host".to_string()),
+            ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
+        ]);
+
+        assert!(public_candidate_readiness_changed(
+            &host,
+            &host_sources,
+            &public,
+            &public_sources,
+        ));
+        assert!(public_candidate_readiness_changed(
+            &public,
+            &public_sources,
+            &host,
+            &host_sources,
+        ));
+    }
+
+    #[test]
+    fn public_port_churn_and_predicted_ports_do_not_trigger_readiness_transition() {
+        let previous = vec!["8.8.8.8:41000".to_string()];
+        let previous_sources = HashMap::from([(previous[0].clone(), "stun_observed".to_string())]);
+        let next = vec!["8.8.8.8:41001".to_string()];
+        let next_sources = HashMap::from([(next[0].clone(), "stun_observed".to_string())]);
+        assert!(!public_candidate_readiness_changed(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
+        ));
+
+        let predicted = vec!["8.8.8.8:41002".to_string()];
+        let predicted_sources = HashMap::from([(predicted[0].clone(), "predicted".to_string())]);
+        assert!(!has_real_public_candidate(&predicted, &predicted_sources));
+        assert!(public_candidate_readiness_changed(
+            &previous,
+            &previous_sources,
+            &predicted,
+            &predicted_sources,
+        ));
+    }
 }

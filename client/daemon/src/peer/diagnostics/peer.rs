@@ -42,6 +42,11 @@ pub struct PeerDiagnostics {
     /// Network generation in which the relay path was confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_confirmed_generation: Option<u64>,
+    /// Local relay transport incarnation that carried the confirming ACK.
+    /// This is diagnostic only; it prevents same-endpoint renewal races from
+    /// being mistaken for one continuous proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_confirmed_connection_id: Option<u64>,
     /// Path that became first usable for this peer (`Relay` or `Direct`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_usable_path: Option<NetworkPath>,
@@ -106,45 +111,74 @@ impl PeerDiagnostics {
         let confirmed_direct_snapshot = conn.state == ConnectionState::Direct
             && snapshot_direct_pair.is_some_and(|pair| {
                 pair.state == CandidatePairState::Selected
-                    && is_public_probe_endpoint(pair.remote_endpoint)
+                    && !is_overlay_endpoint(pair.remote_endpoint)
             });
+        // Relay health is only a local observation (for example, a writer
+        // completion or a validation packet). It is deliberately not enough
+        // to expose Relay as the active path. Status must be backed by the
+        // same-generation encrypted forced-relay ACK that gates the outbound
+        // FIFO.
+        let relay_peer_confirmed = conn.relay_confirmed_at.is_some()
+            && conn.relay_confirmed_generation == Some(local_generation)
+            && conn
+                .relay_confirmed_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.is_empty());
+        // A Direct ACK is retained as background evidence, but while this
+        // generation's relay transport is ready and its peer ACK is pending,
+        // Direct is not the active business path.  Keeping this distinction
+        // in `/status` prevents a UI from rendering a Direct probe as a
+        // usable connection or latency sample.
+        let relay_first_pending = conn.relay_first_confirmation_pending(local_generation, true);
+        let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
+            || conn.relay_first_gate_generation == Some(local_generation))
+            && relay_peer_confirmed
+            && conn.relay_first_business_sent_generation != Some(local_generation);
+        let confirmed_direct_active =
+            confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
-                Some(NetworkPath::Direct) if selection.direct_confirmed => {
-                    Some(NetworkPath::Direct)
-                }
                 Some(NetworkPath::Direct)
-                    if conn
-                        .relay_health
-                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
+                    if selection.direct_confirmed
+                        && !relay_first_pending
+                        && !relay_first_business_pending
+                        && selection
+                            .direct_endpoint
+                            .is_some_and(|endpoint| !is_overlay_endpoint(endpoint)) =>
+                    Some(NetworkPath::Direct),
+                Some(NetworkPath::Direct)
+                    if relay_peer_confirmed
+                        && !relay_first_pending =>
                 {
                     Some(NetworkPath::Relay)
                 }
-                Some(NetworkPath::Relay)
-                    if conn
-                        .relay_health
-                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
-                {
+                Some(NetworkPath::Relay) if relay_peer_confirmed => {
                     Some(NetworkPath::Relay)
                 }
                 _ => None,
             },
             None => match conn.active_path() {
-                Some(NetworkPath::Relay)
-                    if !conn
-                        .relay_health
-                        .is_confirmed_recent(RELAY_PEER_CONFIRMATION_MAX_AGE) =>
-                {
-                    None
+                Some(NetworkPath::Relay) if relay_peer_confirmed => Some(NetworkPath::Relay),
+                Some(NetworkPath::Direct) if confirmed_direct_active => {
+                    Some(NetworkPath::Direct)
                 }
-                path => path,
+                _ => None,
             },
         };
-        if confirmed_direct_snapshot {
+        // A confirmed Direct snapshot is authoritative over a stale selector
+        // snapshot, except when the current selector has already made an
+        // explicit quality-driven fallback to an actually peer-confirmed
+        // Relay. This preserves make-before-break while still allowing a
+        // real Direct ACK to correct an older `Relay` selector decision.
+        let selector_is_confirmed_relay = current_selection
+            .is_some_and(|selection| selection.path == Some(NetworkPath::Relay) && relay_peer_confirmed);
+        if confirmed_direct_active && !selector_is_confirmed_relay {
             active_path = Some(NetworkPath::Direct);
         }
         let selected_pair = conn.selected_candidate_pair_for_diagnostics(local_generation);
         if active_path.is_none()
+            && !relay_first_pending
+            && !relay_first_business_pending
             && conn.state == ConnectionState::Direct
             && selected_pair.is_some_and(|pair| !is_overlay_endpoint(pair.remote_endpoint))
             && conn.direct_health.consecutive_failures == 0
@@ -162,7 +196,7 @@ impl PeerDiagnostics {
         };
         let current_pair_endpoint = current_pair.map(|pair| pair.remote_endpoint);
         let consent_endpoint = conn.selected_direct_endpoint_for_consent(local_generation);
-        let direct_selection_confirmed = confirmed_direct_snapshot
+        let direct_selection_confirmed = confirmed_direct_active
             || (active_path == Some(NetworkPath::Direct)
             && current_selection
                 .map(|selection| selection.direct_confirmed)
@@ -265,6 +299,7 @@ impl PeerDiagnostics {
             direct_generation: conn.direct_generation,
             relay_confirmed_endpoint: conn.relay_confirmed_endpoint.clone(),
             relay_confirmed_generation: conn.relay_confirmed_generation,
+            relay_confirmed_connection_id: conn.relay_confirmed_connection_id,
             first_usable_path: conn.first_usable_path,
             first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(
@@ -277,7 +312,7 @@ impl PeerDiagnostics {
                 .map(|base| duration_millis(conn.direct_retry_after(base))),
             direct_retry_remaining_ms: direct_retry_after
                 .map(|base| duration_millis(conn.direct_retry_remaining(base))),
-            current_path_selection: if confirmed_direct_snapshot {
+            current_path_selection: if confirmed_direct_active {
                 current_pair.map(|pair| {
                     PathSelectionDiagnostics::from(&PathSelection::direct(
                         pair.remote_endpoint,
@@ -289,7 +324,7 @@ impl PeerDiagnostics {
             } else {
                 current_selection.map(PathSelectionDiagnostics::from)
             },
-            last_path_selection: if confirmed_direct_snapshot {
+            last_path_selection: if confirmed_direct_active {
                 current_pair.map(|pair| {
                     PathSelectionDiagnostics::from(&PathSelection::direct(
                         pair.remote_endpoint,

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -115,14 +116,21 @@ struct TransportSessionSlot {
     session: TransportSession,
     token: Option<String>,
     awaiting_confirmation: bool,
+    /// Local identity for this installed receive key. It is deliberately
+    /// independent of the WireGuard receiver index and of the network
+    /// generation: receiver indexes can overlap during rekey, while this
+    /// process-local instance lets the inbound worker detect removal or
+    /// replacement between decrypt and evidence processing.
+    session_instance: u64,
 }
 
 impl TransportSessionSlot {
-    fn new(session: TransportSession, token: Option<String>) -> Self {
+    fn new(session: TransportSession, token: Option<String>, session_instance: u64) -> Self {
         Self {
             session,
             token,
             awaiting_confirmation: false,
+            session_instance,
         }
     }
 }
@@ -262,11 +270,31 @@ impl PeerTransportSessions {
             has_pending_responder: !self.pending.is_empty(),
         }
     }
+
+    fn has_session_instance(&self, session_instance: u64) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|slot| slot.session_instance == session_instance)
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.slot.session_instance == session_instance)
+            || self
+                .pending
+                .values()
+                .any(|pending| pending.slot.session_instance == session_instance)
+    }
 }
 
 struct PendingOutboundPacket {
     queued_at: Instant,
     packet: OutboundPacket,
+}
+
+#[derive(Clone)]
+struct OutboundLossContext {
+    peers: Weak<PeerManager>,
+    timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
 }
 
 struct PromotedResponderToken {
@@ -283,20 +311,41 @@ pub(crate) fn build_relay_validation_payload(sent_at_ms: u64) -> Vec<u8> {
     payload
 }
 
+/// Recognize the daemon-internal relay health echo in either direction.  It
+/// is encrypted and may traverse the relay, but it is not user/TUN business
+/// traffic and must never become `first_usable` evidence.
+fn is_relay_validation_packet(packet: &[u8]) -> bool {
+    let Ok(ip) = Ipv4Packet::new(packet) else {
+        return false;
+    };
+    if ip.protocol() != Protocol::Icmp {
+        return false;
+    }
+    let icmp = ip.payload();
+    if icmp.len() < 8 + RELAY_VALIDATION_PAYLOAD_PREFIX.len() + RELAY_VALIDATION_TIMESTAMP_BYTES {
+        return false;
+    }
+    if !matches!(icmp[0], 0 | 8) || icmp[1] != 0 {
+        return false;
+    }
+    let payload = &icmp[8..];
+    payload
+        .strip_prefix(RELAY_VALIDATION_PAYLOAD_PREFIX)
+        .and_then(|payload| payload.get(..RELAY_VALIDATION_TIMESTAMP_BYTES))
+        .is_some()
+}
+
 fn relay_validation_rtt(packet: &[u8]) -> Option<Duration> {
     let ip = Ipv4Packet::new(packet).ok()?;
     if ip.protocol() != Protocol::Icmp {
         return None;
     }
     let icmp = ip.payload();
-    if icmp.len() < 8 + RELAY_VALIDATION_PAYLOAD_PREFIX.len() + RELAY_VALIDATION_TIMESTAMP_BYTES {
+    if !is_relay_validation_packet(packet) || icmp[0] != 0 {
         return None;
     }
-    if icmp[0] != 0 || icmp[1] != 0 {
-        return None;
-    }
-    let payload = &icmp[8..];
-    let timestamp = payload
+    let timestamp = icmp
+        .get(8..)?
         .strip_prefix(RELAY_VALIDATION_PAYLOAD_PREFIX)?
         .get(..RELAY_VALIDATION_TIMESTAMP_BYTES)?;
     let sent_at_ms = u64::from_be_bytes(timestamp.try_into().ok()?);
@@ -448,6 +497,10 @@ pub struct ReceivedEncryptedPacket {
     pub local_endpoint: Option<SocketAddr>,
     /// Relay endpoint that delivered this packet, when received through Relay.
     pub relay_endpoint: Option<String>,
+    /// Local relay transport incarnation that queued this packet.  This is
+    /// required to reject a late probe ACK from a superseded same-endpoint
+    /// relay connection. Direct UDP packets leave it unset.
+    pub relay_connection_id: Option<u64>,
     /// Relay-authenticated source node ID, checked against the decrypted session owner.
     pub relay_peer_id: Option<String>,
     /// Local UDP socket index that received this packet.  Only set for direct
@@ -461,6 +514,12 @@ pub struct ReceivedEncryptedPacket {
     /// against the post-decrypt UDP watch snapshot before accepting Direct
     /// evidence or affinity ownership.
     pub udp_transport_owner: Option<u64>,
+    /// Local network generation stamped at the encrypted-ingress boundary.
+    /// Direct UDP and relay readers set this before queueing the datagram, so
+    /// a packet that waits across a network handover cannot be decrypted and
+    /// then mislabeled as evidence for the newer generation. Standalone unit
+    /// callers may leave it unset for backwards-compatible transport tests.
+    pub network_generation: Option<u64>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
@@ -507,6 +566,14 @@ pub(crate) struct InboundEvidenceFeed {
     pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressEvent>>,
 }
 
+struct RelayProbeIngress<'a> {
+    peer_id: &'a str,
+    packet: &'a [u8],
+    relay_endpoint: &'a str,
+    relay_connection_id: Option<u64>,
+    token: crate::relay_probe::RelayProbeToken,
+}
+
 /// Whether a decrypted IP packet looks like an overlay business payload (UDP
 /// with the overlay magic right after the UDP header).  The overlay validation
 /// loop re-verifies fully (magic, checksum, nonce/seq, sender); this is only a
@@ -531,7 +598,7 @@ pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
 /// IPv4 protocols (ICMP, TCP, UDP, etc.) so it is not tied to the harness-only
 /// overlay echo format.
 pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
-    Ipv4Packet::new(packet).is_ok()
+    Ipv4Packet::new(packet).is_ok() && !is_relay_validation_packet(packet)
 }
 
 /// Source of the UDP transport used by WireGuard inbound after decryption.
@@ -580,6 +647,9 @@ impl InboundUdpTransport {
 #[derive(Clone)]
 pub struct WireGuardTransport {
     sessions: Arc<Mutex<HashMap<String, PeerTransportSessions>>>,
+    /// Monotonic local identity for every installed transport session. This
+    /// is not exposed on the wire and is never used as a WireGuard counter.
+    next_session_instance: Arc<AtomicU64>,
     pending_outbound: Arc<Mutex<HashMap<String, VecDeque<PendingOutboundPacket>>>>,
     /// Serializes every producer that can feed the network-outbound worker
     /// for one peer. This is deliberately separate from the WireGuard emit
@@ -604,6 +674,11 @@ pub struct WireGuardTransport {
     /// worker-level loss in one place.  `None` (unit tests) skips counting.
     outbound_loss_sink:
         Arc<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::peer::OutboundLossCounters>>>>>,
+    /// Context for the legacy session backlog's structured loss events. The
+    /// weak peer reference avoids making the transport/peer-manager lifetime
+    /// cyclic while still letting teardown events use the current generation
+    /// and the daemon's monotonic timeline correlation.
+    outbound_loss_context: Arc<std::sync::Mutex<Option<OutboundLossContext>>>,
 }
 
 /// Stable reason code for a packet dropped from the transport-level
@@ -643,6 +718,7 @@ impl WireGuardTransport {
         (
             Self {
                 sessions: Arc::new(Mutex::new(HashMap::new())),
+                next_session_instance: Arc::new(AtomicU64::new(1)),
                 pending_outbound: Arc::new(Mutex::new(HashMap::new())),
                 outbound_ingress_locks: Arc::new(Mutex::new(HashMap::new())),
                 outbound_emit_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -650,9 +726,47 @@ impl WireGuardTransport {
                 hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 outbound_tx,
                 outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
+                outbound_loss_context: Arc::new(std::sync::Mutex::new(None)),
             },
             outbound_rx,
         )
+    }
+
+    fn allocate_session_instance(&self) -> u64 {
+        // Zero is reserved for “unset” in diagnostics. A wrapping process is
+        // not expected, but skip zero if an extremely long-lived daemon ever
+        // exhausts the counter.
+        let instance = self.next_session_instance.fetch_add(1, Ordering::Relaxed);
+        if instance == 0 {
+            self.next_session_instance.fetch_add(1, Ordering::Relaxed)
+        } else {
+            instance
+        }
+    }
+
+    /// Return `(retained, current)` for the exact session which authenticated
+    /// an inbound datagram. This second lookup intentionally happens after the
+    /// decrypt await: control-plane teardown may remove or replace the session
+    /// while the datagram is waiting in the inbound worker. A retained
+    /// previous key is acceptable only for delivery overlap, never as current
+    /// path evidence.
+    async fn session_instance_state(&self, peer_id: &str, session_instance: u64) -> (bool, bool) {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        let Some(peer_sessions) = sessions.get_mut(peer_id) else {
+            return (false, false);
+        };
+        peer_sessions.prune_expired(now);
+        let retained = peer_sessions.has_session_instance(session_instance);
+        let current = peer_sessions
+            .active
+            .as_ref()
+            .is_some_and(|slot| slot.session_instance == session_instance)
+            || peer_sessions
+                .pending
+                .values()
+                .any(|pending| pending.slot.session_instance == session_instance);
+        (retained, current)
     }
 
     /// Share the peer manager's outbound-loss counters with this transport so
@@ -667,6 +781,24 @@ impl WireGuardTransport {
             .outbound_loss_sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+    }
+
+    /// Install the daemon timeline and peer-generation source used by the
+    /// transport-level session backlog. This queue is retained for handshake
+    /// handoff compatibility, so its losses must carry the same audit fields
+    /// as the network-outbound actor's losses.
+    pub(crate) fn set_outbound_loss_context(
+        &self,
+        peers: &Arc<PeerManager>,
+        timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
+    ) {
+        *self
+            .outbound_loss_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(OutboundLossContext {
+            peers: Arc::downgrade(peers),
+            timeline,
+        });
     }
 
     /// The shared loss sink, if the daemon installed one.
@@ -720,12 +852,12 @@ impl WireGuardTransport {
         }
     }
 
-    /// Record a loss event emitted by the legacy session queue.  Production
+    /// Record a loss event emitted by the legacy session queue. Production
     /// relay-first traffic is owned by `network_outbound`, but this queue is
     /// still reachable during session teardown; it must not disappear from
-    /// the same queryable event ledger.  It has no daemon timeline handle, so
-    /// it uses an explicit transport correlation and generation zero rather
-    /// than inventing a current-generation value.
+    /// the same queryable event ledger. The daemon installs a weak generation
+    /// source and the shared monotonic timeline during construction, so these
+    /// events have the same audit fields as actor-owned losses.
     async fn record_outbound_queue_event(
         &self,
         kind: &str,
@@ -740,6 +872,24 @@ impl WireGuardTransport {
         let Some(sink) = self.outbound_loss_registry() else {
             return;
         };
+        let context = self
+            .outbound_loss_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (generation, correlation_id, at_ms, timeline) = match context {
+            Some(context) => {
+                let generation = context
+                    .peers
+                    .upgrade()
+                    .map(|peers| peers.current_network_generation_sync())
+                    .unwrap_or(0);
+                let correlation_id = context.timeline.correlation_id().to_string();
+                let at_ms = context.timeline.uptime_ms();
+                (generation, correlation_id, at_ms, Some(context.timeline))
+            }
+            None => (0, "transport-session-queue".to_string(), 0, None),
+        };
         let mut loss = sink.lock().await;
         const MAX_OUTBOUND_LOSS_EVENTS: usize = 512;
         if loss.events.len() >= MAX_OUTBOUND_LOSS_EVENTS {
@@ -748,13 +898,24 @@ impl WireGuardTransport {
         loss.events.push(crate::peer::OutboundLossEvent {
             kind: kind.to_string(),
             peer_id: peer_id.to_string(),
-            generation: 0,
+            generation,
             reason_code: reason_code.to_string(),
             packets: packets as u64,
             bytes: bytes as u64,
-            correlation_id: "transport-session-queue".to_string(),
-            at_ms: 0,
+            correlation_id: correlation_id.clone(),
+            at_ms,
         });
+        drop(loss);
+        if let Some(timeline) = timeline {
+            timeline.emit(
+                "outbound_session_queue_event",
+                None,
+                Some(reason_code),
+                Some(format!(
+                    "kind={kind} peer={peer_id} generation={generation} packets={packets} bytes={bytes}"
+                )),
+            );
+        }
     }
 
     /// Install or replace an established transport session for a peer.
@@ -772,15 +933,23 @@ impl WireGuardTransport {
     ) -> bool {
         let peer_id = peer_id.into();
         let now = Instant::now();
+        let session_instance = self.allocate_session_instance();
         let replaced_existing = {
             let mut sessions = self.sessions.lock().await;
             if let Some(existing) = sessions.get_mut(&peer_id) {
                 existing.prune_expired(now);
-                existing.install_with_overlap(TransportSessionSlot::new(session, token), now)
+                existing.install_with_overlap(
+                    TransportSessionSlot::new(session, token, session_instance),
+                    now,
+                )
             } else {
                 sessions.insert(
                     peer_id.clone(),
-                    PeerTransportSessions::new(TransportSessionSlot::new(session, token)),
+                    PeerTransportSessions::new(TransportSessionSlot::new(
+                        session,
+                        token,
+                        session_instance,
+                    )),
                 );
                 false
             }
@@ -825,6 +994,7 @@ impl WireGuardTransport {
         allow_seen_restage: bool,
     ) -> ResponderSessionStage {
         let now = Instant::now();
+        let session_instance = self.allocate_session_instance();
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get_mut(&peer_id) {
             existing.prune_expired(now);
@@ -870,10 +1040,15 @@ impl WireGuardTransport {
             if existing.pending.len() >= MAX_PENDING_RESPONDER_SESSIONS_PER_PEER {
                 return ResponderSessionStage::Busy;
             }
+            let pending_session_instance = session_instance;
             existing.pending.insert(
                 token.clone(),
                 PendingTransportSession {
-                    slot: TransportSessionSlot::new(session, Some(token.clone())),
+                    slot: TransportSessionSlot::new(
+                        session,
+                        Some(token.clone()),
+                        pending_session_instance,
+                    ),
                     expires_at: now + PENDING_RESPONDER_SESSION_GRACE,
                     answer_committed: false,
                 },
@@ -882,7 +1057,7 @@ impl WireGuardTransport {
             ResponderSessionStage::Staged { had_active }
         } else {
             let mut peer_sessions = PeerTransportSessions::pending_only(PendingTransportSession {
-                slot: TransportSessionSlot::new(session, Some(token.clone())),
+                slot: TransportSessionSlot::new(session, Some(token.clone()), session_instance),
                 expires_at: now + PENDING_RESPONDER_SESSION_GRACE,
                 answer_committed: false,
             });
@@ -1165,12 +1340,20 @@ impl WireGuardTransport {
             existing.clear_pending_as_terminal(now);
             existing
                 .active
-                .replace(TransportSessionSlot::new(session, None))
+                .replace(TransportSessionSlot::new(
+                    session,
+                    None,
+                    self.allocate_session_instance(),
+                ))
                 .map(|previous| previous.session)
         } else {
             sessions.insert(
                 peer_id,
-                PeerTransportSessions::new(TransportSessionSlot::new(session, None)),
+                PeerTransportSessions::new(TransportSessionSlot::new(
+                    session,
+                    None,
+                    self.allocate_session_instance(),
+                )),
             );
             None
         }
@@ -1183,7 +1366,11 @@ impl WireGuardTransport {
         if let Some(previous) = previous {
             sessions.insert(
                 peer_id.to_string(),
-                PeerTransportSessions::new(TransportSessionSlot::new(previous, None)),
+                PeerTransportSessions::new(TransportSessionSlot::new(
+                    previous,
+                    None,
+                    self.allocate_session_instance(),
+                )),
             );
         } else {
             sessions.remove(peer_id);
@@ -1675,7 +1862,8 @@ impl WireGuardTransport {
                         .then(|| active.token.clone())
                         .flatten();
                     active.awaiting_confirmation = false;
-                    confirmed_active = Some((peer_id.clone(), packet, token));
+                    confirmed_active =
+                        Some((peer_id.clone(), packet, token, active.session_instance));
                     break;
                 }
                 Err(error) => {
@@ -1688,13 +1876,18 @@ impl WireGuardTransport {
                 }
             }
         }
-        if let Some((peer_id, packet, token)) = confirmed_active {
+        if let Some((peer_id, packet, token, session_instance)) = confirmed_active {
             drop(sessions);
             if let Some(token) = token {
                 self.remember_promoted_responder_token(&peer_id, token)
                     .await;
             }
-            return Ok(Some(InboundPacket { peer_id, packet }));
+            return Ok(Some(InboundPacket {
+                peer_id,
+                packet,
+                session_instance: Some(session_instance),
+                from_previous_session: false,
+            }));
         }
 
         // A responder stages the new receive key before publishing its answer.
@@ -1714,9 +1907,15 @@ impl WireGuardTransport {
                 .expect("pending responder token checked above");
             match pending.slot.session.decrypt(&msg) {
                 Ok(packet) => {
+                    let session_instance = pending.slot.session_instance;
                     peer_sessions.pending.insert(pending_token.clone(), pending);
                     peer_sessions.promote_pending(&pending_token, now);
-                    promoted = Some((peer_id.clone(), packet, Some(pending_token)));
+                    promoted = Some((
+                        peer_id.clone(),
+                        packet,
+                        Some(pending_token),
+                        session_instance,
+                    ));
                     break;
                 }
                 Err(error) => {
@@ -1730,14 +1929,19 @@ impl WireGuardTransport {
                 }
             }
         }
-        if let Some((peer_id, packet, token)) = promoted {
+        if let Some((peer_id, packet, token, session_instance)) = promoted {
             drop(sessions);
             if let Some(token) = token {
                 self.remember_promoted_responder_token(&peer_id, token)
                     .await;
             }
             self.flush_pending_outbound_for_peer(&peer_id).await;
-            return Ok(Some(InboundPacket { peer_id, packet }));
+            return Ok(Some(InboundPacket {
+                peer_id,
+                packet,
+                session_instance: Some(session_instance),
+                from_previous_session: false,
+            }));
         }
 
         for (peer_id, peer_sessions) in sessions.iter_mut() {
@@ -1752,6 +1956,8 @@ impl WireGuardTransport {
                     return Ok(Some(InboundPacket {
                         peer_id: peer_id.clone(),
                         packet,
+                        session_instance: Some(previous.slot.session_instance),
+                        from_previous_session: true,
                     }));
                 }
                 Err(error) => {
@@ -1943,9 +2149,11 @@ impl WireGuardTransport {
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
+            let relay_connection_id = packet.relay_connection_id;
             let relay_peer_id = packet.relay_peer_id;
             let socket_index = packet.socket_index;
             let udp_transport_owner = packet.udp_transport_owner;
+            let packet_network_generation = packet.network_generation;
             debug!(
                 event = "wireguard_inbound_envelope_received",
                 bytes = packet.wire_bytes.len(),
@@ -1956,6 +2164,65 @@ impl WireGuardTransport {
             );
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
+                    if let (Some(packet_generation), Some(peer_manager)) =
+                        (packet_network_generation, peers.as_ref())
+                    {
+                        let current_generation = peer_manager.current_network_generation_sync();
+                        if packet_generation != current_generation {
+                            if let Some(feed) = evidence.as_ref() {
+                                if let Some(timeline) = feed.timeline.as_ref() {
+                                    timeline.emit(
+                                        "stale_network_generation_packet",
+                                        None,
+                                        Some("stale_network_generation"),
+                                        Some(format!(
+                                            "peer={} packet_generation={packet_generation} current_generation={current_generation}",
+                                            inbound.peer_id
+                                        )),
+                                    );
+                                }
+                            }
+                            debug!(
+                                peer_id = %inbound.peer_id,
+                                packet_generation,
+                                current_generation,
+                                "dropping encrypted packet queued before the current network generation"
+                            );
+                            continue;
+                        }
+                    }
+                    if let Some(session_instance) = inbound.session_instance {
+                        let (retained, current) = self
+                            .session_instance_state(&inbound.peer_id, session_instance)
+                            .await;
+                        if !retained || (!inbound.from_previous_session && !current) {
+                            if let Some(feed) = evidence.as_ref() {
+                                if let Some(timeline) = feed.timeline.as_ref() {
+                                    timeline.emit(
+                                        "stale_session_packet",
+                                        None,
+                                        Some("session_replaced_or_removed"),
+                                        Some(format!(
+                                            "peer={} session_instance={session_instance}",
+                                            inbound.peer_id
+                                        )),
+                                    );
+                                }
+                            }
+                            debug!(
+                                peer_id = %inbound.peer_id,
+                                session_instance,
+                                "dropping packet decrypted by a removed or replaced transport session"
+                            );
+                            continue;
+                        }
+                    }
+                    // The previous receive key is retained only as a bounded
+                    // WireGuard rekey grace period. It may deliver an
+                    // in-flight user packet, but it must never confirm a
+                    // relay/direct path, advance affinity, or create current
+                    // generation first-usable evidence.
+                    let session_evidence_eligible = !inbound.from_previous_session;
                     // Do not retain a UDP watch snapshot across decrypt. A
                     // datagram can sit in the channel while its reader fails
                     // or its socket is rebound; only the current owner after
@@ -1973,6 +2240,35 @@ impl WireGuardTransport {
                         );
                         continue;
                     }
+                    // The relay probe loop is intentionally paced and can
+                    // lose a scheduling race with the first encrypted frame
+                    // arriving from a newly published relay reader.  Publish
+                    // the per-peer transport-ready milestone at the decrypt
+                    // boundary as well, before any probe/business evidence is
+                    // processed.  Bind it to the current transport
+                    // incarnation so a draining replacement reader cannot
+                    // make a stale generation look ready.
+                    if let (Some(relay_endpoint), Some(peer_manager), Some(feed)) =
+                        (relay_endpoint.as_deref(), peers.as_ref(), evidence.as_ref())
+                    {
+                        let current_connection_id = feed
+                            .relay_transport
+                            .read()
+                            .await
+                            .as_ref()
+                            .map(RelayTransport::connection_id);
+                        if relay_connection_id == current_connection_id {
+                            let generation = packet_network_generation
+                                .unwrap_or_else(|| peer_manager.current_network_generation_sync());
+                            peer_manager
+                                .mark_relay_transport_ready(
+                                    &inbound.peer_id,
+                                    relay_endpoint,
+                                    generation,
+                                )
+                                .await;
+                        }
+                    }
                     // A decrypted relay datagram keeps the relay health
                     // bookkeeping fresh below, but it does NOT set
                     // RelayPeerConfirmed: per the relay-first contract that
@@ -1983,100 +2279,112 @@ impl WireGuardTransport {
                     let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
                     let direct_validation = parse_direct_validation_token(&inbound.packet);
                     let relay_probe = crate::relay_probe::parse_relay_probe_token(&inbound.packet);
-                    if let Some(peers) = peers.as_ref() {
-                        // Forced-relay path-probe / path-ack: consumed here and
-                        // never forwarded to TUN.  Only a probe that ACTUALLY
-                        // arrived over the relay may confirm the relay path (or
-                        // be answered over it); a probe that somehow decrypted
-                        // on a non-relay ingress is ignored.
-                        if let Some(token) = relay_probe {
-                            if relay_endpoint.is_some() {
-                                self.handle_relay_probe_packet(
-                                    peers,
-                                    evidence.as_ref().map(|feed| &feed.relay_transport),
-                                    &inbound.peer_id,
-                                    &inbound.packet,
-                                    relay_endpoint.as_deref().unwrap_or("unknown"),
-                                    token,
-                                )
-                                .await;
-                            } else {
-                                debug!(
-                                    peer_id = %inbound.peer_id,
-                                    "ignored relay probe {} that arrived without relay ingress",
-                                    if token.kind == crate::relay_probe::RelayProbeKind::Ack {
-                                        "ack"
-                                    } else {
-                                        "request"
-                                    }
-                                );
-                            }
-                        }
-                        let promoted_tokens = self
-                            .pending_promoted_responder_tokens(&inbound.peer_id)
-                            .await;
-                        for token in promoted_tokens {
-                            if peers
-                                .confirm_pending_probe_session_binding(&inbound.peer_id, &token)
-                                .await
-                            {
-                                self.acknowledge_promoted_responder_token(&inbound.peer_id, &token)
+                    if session_evidence_eligible {
+                        if let Some(peers) = peers.as_ref() {
+                            // Forced-relay path-probe / path-ack: consumed here and
+                            // never forwarded to TUN.  Only a probe that ACTUALLY
+                            // arrived over the relay may confirm the relay path (or
+                            // be answered over it); a probe that somehow decrypted
+                            // on a non-relay ingress is ignored.
+                            if let Some(token) = relay_probe {
+                                if relay_endpoint.is_some() {
+                                    self.handle_relay_probe_packet(
+                                        peers,
+                                        evidence.as_ref().map(|feed| &feed.relay_transport),
+                                        RelayProbeIngress {
+                                            peer_id: &inbound.peer_id,
+                                            packet: &inbound.packet,
+                                            relay_endpoint: relay_endpoint
+                                                .as_deref()
+                                                .unwrap_or("unknown"),
+                                            relay_connection_id,
+                                            token,
+                                        },
+                                    )
                                     .await;
-                                debug!(
+                                } else {
+                                    debug!(
+                                        peer_id = %inbound.peer_id,
+                                        "ignored relay probe {} that arrived without relay ingress",
+                                        if token.kind == crate::relay_probe::RelayProbeKind::Ack {
+                                            "ack"
+                                        } else {
+                                            "request"
+                                        }
+                                    );
+                                }
+                            }
+                            let promoted_tokens = self
+                                .pending_promoted_responder_tokens(&inbound.peer_id)
+                                .await;
+                            for token in promoted_tokens {
+                                if peers
+                                    .confirm_pending_probe_session_binding(&inbound.peer_id, &token)
+                                    .await
+                                {
+                                    self.acknowledge_promoted_responder_token(
+                                        &inbound.peer_id,
+                                        &token,
+                                    )
+                                    .await;
+                                    debug!(
                                     "Promoted Probe v2 binding for peer {} after WireGuard rekey confirmation",
                                     inbound.peer_id
                                 );
+                                }
                             }
-                        }
-                        if let Some(token) = direct_validation {
-                            // Daemon-internal direct-validation packets are
-                            // consumed here and never forwarded to TUN: the
-                            // request/ACK protocol proves the direct UDP path
-                            // with the WireGuard session alone, without an OS
-                            // ICMP echo reply or user traffic.
-                            if owns_direct_packet {
-                                self.handle_direct_validation_packet(
-                                    peers,
-                                    udp.as_ref(),
-                                    &inbound.peer_id,
-                                    &inbound.packet,
-                                    source,
-                                    local_endpoint,
-                                    socket_index,
-                                    token,
-                                )
-                                .await;
-                            } else {
+                            if let Some(token) = direct_validation {
+                                // Daemon-internal direct-validation packets are
+                                // consumed here and never forwarded to TUN: the
+                                // request/ACK protocol proves the direct UDP path
+                                // with the WireGuard session alone, without an OS
+                                // ICMP echo reply or user traffic.
+                                if owns_direct_packet {
+                                    self.handle_direct_validation_packet(
+                                        peers,
+                                        udp.as_ref(),
+                                        &inbound.peer_id,
+                                        &inbound.packet,
+                                        source,
+                                        local_endpoint,
+                                        socket_index,
+                                        token,
+                                    )
+                                    .await;
+                                } else {
+                                    debug!(
+                                        peer_id = %inbound.peer_id,
+                                        packet_owner = ?udp_transport_owner,
+                                        "ignored direct-validation packet from retired or unpublished UDP transport"
+                                    );
+                                }
+                            } else if internal_rekey_confirmation {
                                 debug!(
-                                    peer_id = %inbound.peer_id,
-                                    packet_owner = ?udp_transport_owner,
-                                    "ignored direct-validation packet from retired or unpublished UDP transport"
-                                );
-                            }
-                        } else if internal_rekey_confirmation {
-                            debug!(
                                 "Consumed internal WireGuard rekey confirmation from peer {} without changing path health",
                                 inbound.peer_id
                             );
-                        } else if let Some(source) = source {
-                            if !owns_direct_packet {
-                                debug!(
-                                    peer_id = %inbound.peer_id,
-                                    packet_owner = ?udp_transport_owner,
-                                    "forwarding decrypted data from retired or unpublished UDP transport without Direct evidence"
-                                );
-                            } else {
-                                peers
-                                    .learn_authenticated_endpoint(&inbound.peer_id, source)
-                                    .await;
-                                // A decrypted UDP payload is authenticated
-                                // endpoint evidence, not a Direct proof.  Feed
-                                // it into the same owned request/ACK worker as
-                                // peer-reflexive evidence; do not adopt socket
-                                // affinity or promote from this path alone.
-                                if let Some(udp) = udp.as_ref() {
-                                    let generation = peers.current_network_generation().await;
+                            } else if let Some(source) = source {
+                                if !owns_direct_packet {
+                                    debug!(
+                                        peer_id = %inbound.peer_id,
+                                        packet_owner = ?udp_transport_owner,
+                                        "forwarding decrypted data from retired or unpublished UDP transport without Direct evidence"
+                                    );
+                                } else {
                                     peers
+                                        .learn_authenticated_endpoint(&inbound.peer_id, source)
+                                        .await;
+                                    // A decrypted UDP payload is authenticated
+                                    // endpoint evidence, not a Direct proof.  Feed
+                                    // it into the same owned request/ACK worker as
+                                    // peer-reflexive evidence; do not adopt socket
+                                    // affinity or promote from this path alone.
+                                    if let Some(udp) = udp.as_ref() {
+                                        let generation =
+                                            packet_network_generation.unwrap_or_else(|| {
+                                                peers.current_network_generation_sync()
+                                            });
+                                        peers
                                         .record_direct_event_for_generation_with_socket(
                                             &inbound.peer_id,
                                             generation,
@@ -2088,49 +2396,53 @@ impl WireGuardTransport {
                                             "decrypted direct UDP payload requested owned encrypted validation",
                                         )
                                         .await;
-                                    if let Some(socket_index) = socket_index {
-                                        // Decryption is sufficient to remember
-                                        // the receiving socket as evidence for
-                                        // the next owned validation request,
-                                        // but not to promote the path.
-                                        udp.remember_peer_socket(
-                                            &inbound.peer_id,
-                                            socket_index,
-                                            crate::udp::SocketEvidence::Fresh,
-                                        )
-                                        .await;
+                                        if let Some(socket_index) = socket_index {
+                                            // Decryption is sufficient to remember
+                                            // the receiving socket as evidence for
+                                            // the next owned validation request,
+                                            // but not to promote the path.
+                                            udp.remember_peer_socket(
+                                                &inbound.peer_id,
+                                                socket_index,
+                                                crate::udp::SocketEvidence::Fresh,
+                                            )
+                                            .await;
+                                        }
+                                        udp.enqueue_direct_validation_observation(
+                                            crate::udp::PeerReflexiveObservation {
+                                                peer_id: inbound.peer_id.clone(),
+                                                observed_endpoint: source,
+                                            },
+                                        );
                                     }
-                                    udp.enqueue_direct_validation_observation(
-                                        crate::udp::PeerReflexiveObservation {
-                                            peer_id: inbound.peer_id.clone(),
-                                            observed_endpoint: source,
-                                        },
+                                    debug!(
+                                        "Confirmed direct UDP data path from {source} for peer {}",
+                                        inbound.peer_id
                                     );
                                 }
+                            } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
+                                if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
+                                    peers
+                                        .record_relay_observation(
+                                            &inbound.peer_id,
+                                            relay_endpoint,
+                                            Some(rtt),
+                                        )
+                                        .await;
+                                } else {
+                                    peers
+                                        .record_relay_observation(
+                                            &inbound.peer_id,
+                                            relay_endpoint,
+                                            None,
+                                        )
+                                        .await;
+                                }
                                 debug!(
-                                    "Confirmed direct UDP data path from {source} for peer {}",
-                                    inbound.peer_id
-                                );
-                            }
-                        } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
-                            if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
-                                peers
-                                    .record_relay_success_with_latency(
-                                        &inbound.peer_id,
-                                        relay_endpoint,
-                                        true,
-                                        rtt,
-                                    )
-                                    .await;
-                            } else {
-                                peers
-                                    .record_relay_success(&inbound.peer_id, relay_endpoint, true)
-                                    .await;
-                            }
-                            debug!(
-                                "Confirmed relay data path through {relay_endpoint} for peer {}",
+                                "Observed decrypted relay ingress through {relay_endpoint} for peer {}; relay confirmation still requires a matching encrypted ACK",
                                 inbound.peer_id
                             );
+                            }
                         }
                     }
                     if internal_rekey_confirmation
@@ -2145,7 +2457,8 @@ impl WireGuardTransport {
                     // that harness to ever emit first_usable. The ingress is
                     // taken from this packet's envelope and never inferred
                     // from the current selected path.
-                    if is_real_overlay_business_packet(&inbound.packet) {
+                    if session_evidence_eligible && is_real_overlay_business_packet(&inbound.packet)
+                    {
                         if let Some(feed) = evidence.as_ref() {
                             let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref() {
                                 Some((
@@ -2161,7 +2474,9 @@ impl WireGuardTransport {
                             if let (Some(peer_manager), Some((path, ingress_label, relay_id))) =
                                 (peers.as_ref(), ingress)
                             {
-                                let generation = peer_manager.current_network_generation().await;
+                                let generation = packet_network_generation.unwrap_or_else(|| {
+                                    peer_manager.current_network_generation_sync()
+                                });
                                 if peer_manager
                                     .record_verified_first_usable(
                                         &inbound.peer_id,
@@ -2183,11 +2498,10 @@ impl WireGuardTransport {
                                         }),
                                         None,
                                         Some(format!(
-                                            "peer={} generation={generation} path_id={} relay_id={} source={:?}",
+                                            "peer={} generation={generation} path_id={} relay_id={}",
                                             inbound.peer_id,
                                             ingress_label,
                                             relay_id.unwrap_or("none"),
-                                            source,
                                         )),
                                     );
                                     }
@@ -2198,31 +2512,37 @@ impl WireGuardTransport {
                     // Forward a decrypted overlay candidate to the independent
                     // overlay validation harness WITH its real ingress (derived
                     // from this envelope, never from the active path).
-                    if let Some(feed) = evidence.as_ref() {
-                        if is_overlay_payload_candidate(&inbound.packet) {
-                            let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref() {
-                                Some(OverlayIngress::Relay(relay_endpoint.clone()))
-                            } else if owns_direct_packet && source.is_some() {
-                                Some(OverlayIngress::Direct)
-                            } else {
-                                // No attributable ingress (relay nor owned
-                                // direct): do not guess.
-                                None
-                            };
-                            if let Some(ingress) = ingress {
-                                if let Some(tx) = &feed.overlay_ingress_tx {
-                                    let connection_generation = peers
-                                        .as_ref()
-                                        .map(|manager| manager.current_network_generation_sync())
-                                        .unwrap_or_default();
-                                    let _ = tx
-                                        .send(OverlayIngressEvent {
-                                            peer_id: inbound.peer_id.clone(),
-                                            packet: inbound.packet.clone(),
-                                            ingress,
-                                            connection_generation,
-                                        })
-                                        .await;
+                    if session_evidence_eligible {
+                        if let Some(feed) = evidence.as_ref() {
+                            if is_overlay_payload_candidate(&inbound.packet) {
+                                let ingress = if let Some(relay_endpoint) = relay_endpoint.as_ref()
+                                {
+                                    Some(OverlayIngress::Relay(relay_endpoint.clone()))
+                                } else if owns_direct_packet && source.is_some() {
+                                    Some(OverlayIngress::Direct)
+                                } else {
+                                    // No attributable ingress (relay nor owned
+                                    // direct): do not guess.
+                                    None
+                                };
+                                if let Some(ingress) = ingress {
+                                    if let Some(tx) = &feed.overlay_ingress_tx {
+                                        let connection_generation = packet_network_generation
+                                            .or_else(|| {
+                                                peers.as_ref().map(|manager| {
+                                                    manager.current_network_generation_sync()
+                                                })
+                                            })
+                                            .unwrap_or_default();
+                                        let _ = tx
+                                            .send(OverlayIngressEvent {
+                                                peer_id: inbound.peer_id.clone(),
+                                                packet: inbound.packet.clone(),
+                                                ingress,
+                                                connection_generation,
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
                         }
@@ -2373,6 +2693,7 @@ impl WireGuardTransport {
                 );
                 let send_udp = udp.clone();
                 let peer_id_owned = peer_id.to_string();
+                let receive_socket_index = socket_index;
                 match self
                     .encrypt_and_emit_outbound(
                         OutboundPacket {
@@ -2381,8 +2702,18 @@ impl WireGuardTransport {
                             packet: ack_packet,
                         },
                         move |encrypted| async move {
+                            let Some(receive_socket_index) = receive_socket_index else {
+                                return Err(crate::error::DaemonError::Network(
+                                    "direct validation request had no receiving UDP socket index"
+                                        .to_string(),
+                                ));
+                            };
                             send_udp
-                                .send_packet_to(&encrypted, source)
+                                .send_packet_on_socket_index(
+                                    &encrypted,
+                                    receive_socket_index,
+                                    source,
+                                )
                                 .await
                                 .map(|_| ())
                         },
@@ -2767,11 +3098,38 @@ impl WireGuardTransport {
         &self,
         peers: &Arc<PeerManager>,
         relay_transport: Option<&Arc<RwLock<Option<RelayTransport>>>>,
-        peer_id: &str,
-        packet: &[u8],
-        relay_endpoint: &str,
-        token: crate::relay_probe::RelayProbeToken,
+        probe: RelayProbeIngress<'_>,
     ) {
+        let RelayProbeIngress {
+            peer_id,
+            packet,
+            relay_endpoint,
+            relay_connection_id,
+            token,
+        } = probe;
+        // A relay renewal can leave an old reader draining briefly after the
+        // shared slot publishes its replacement.  Reject that reader before
+        // either answering a request or consuming an ACK; endpoint and
+        // network generation are intentionally not enough to identify the
+        // current transport.
+        if let Some(relay_transport) = relay_transport {
+            let current_connection_id = relay_transport
+                .read()
+                .await
+                .as_ref()
+                .map(RelayTransport::connection_id);
+            if relay_connection_id != current_connection_id {
+                peers.emit_timeline(
+                    "relay_probe_packet_stale",
+                    Some("relay"),
+                    Some("relay_transport_replaced"),
+                    Some(format!(
+                        "peer={peer_id} relay_endpoint={relay_endpoint} packet_connection_id={relay_connection_id:?} current_connection_id={current_connection_id:?}"
+                    )),
+                );
+                return;
+            }
+        }
         match token.kind {
             crate::relay_probe::RelayProbeKind::Request => {
                 // Without a live relay transport there is nothing to answer
@@ -2854,7 +3212,12 @@ impl WireGuardTransport {
                 // sent on (real ingress binding); only then does it set
                 // RelayPeerConfirmed.
                 let confirmed = peers
-                    .consume_relay_probe_ack(peer_id, token, relay_endpoint)
+                    .consume_relay_probe_ack_with_transport(
+                        peer_id,
+                        token,
+                        relay_endpoint,
+                        relay_connection_id,
+                    )
                     .await;
                 if !confirmed {
                     debug!(

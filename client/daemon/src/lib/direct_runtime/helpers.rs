@@ -42,20 +42,25 @@ fn direct_fast_probe_candidates_with_preferred(
 }
 
 fn direct_fast_probe_is_safe(remote_scatter_pool: bool, stable_remote_scatter: bool) -> bool {
-    !remote_scatter_pool && !stable_remote_scatter
+    // This is only the bounded immediate prefix (at most eight candidates,
+    // one attempt, through the active socket pool).  It does not replace or
+    // accelerate the unbounded scatter sweep, so it is safe to run before the
+    // synchronized rendezvous even when the broad target set is classified as
+    // remote scatter/stable scatter.
+    let _ = (remote_scatter_pool, stable_remote_scatter);
+    true
 }
 
-/// A fresh prediction is an explicitly signaled, generation-bound rendezvous
-/// window. It is safe to probe a small prefix immediately even when the broad
-/// target set is classified as remote scatter; an unqualified scatter target
-/// still requires the synchronized window below.
+/// A fresh prediction remains useful for ordering the immediate prefix, but it
+/// is not a prerequisite for the bounded prefix.  Waiting for a prediction or
+/// the full synchronized window made a newly learned public endpoint sit
+/// idle while relay carried the only usable path.
 fn direct_fast_probe_is_allowed(
     remote_scatter_pool: bool,
     stable_remote_scatter: bool,
-    has_fresh_prediction_window: bool,
+    _has_fresh_prediction_window: bool,
 ) -> bool {
     direct_fast_probe_is_safe(remote_scatter_pool, stable_remote_scatter)
-        || has_fresh_prediction_window
 }
 
 /// Hard deadline for one owned punch session.

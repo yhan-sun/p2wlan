@@ -50,6 +50,11 @@ pub const DIRECT_RECLAIM_WINDOW: Duration = Duration::from_secs(10);
 /// window. Recovery epoch budgets and per-peer probe admission remain the
 /// safety limits; this cap does not create an unbounded probe storm.
 pub const DIRECT_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum time to reserve the first business packet for the relay probe
+/// after a per-peer relay transport becomes ready.  Direct validation keeps
+/// running during this window; if the relay peer ACK does not arrive, a
+/// genuinely encrypted-confirmed Direct path is the bounded fallback.
+pub(crate) const RELAY_FIRST_CONFIRMATION_GRACE: Duration = Duration::from_secs(3);
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
@@ -243,6 +248,15 @@ pub const REASON_PATH_DIRECT_NO_ENDPOINT: &str = "path_direct_no_endpoint";
 pub const REASON_PATH_DIRECT_NOT_CONFIRMED: &str = "path_direct_not_confirmed";
 /// Path selector chose Relay because Direct quality is worse than Relay.
 pub const REASON_PATH_DIRECT_DEGRADED: &str = "path_direct_degraded";
+/// Direct has encrypted proof, but relay transport is ready and its
+/// same-generation peer ACK is still pending.  Business data must wait here;
+/// a Direct candidate/ACK cannot bypass relay-first admission.
+pub const REASON_PATH_RELAY_FIRST_PENDING: &str = "path_relay_first_pending";
+/// Direct is already encrypted-confirmed, but the first real business packet
+/// is deliberately reserved for the newly confirmed Relay path.  This keeps
+/// relay-first an observable data-plane property instead of merely a control
+/// plane ordering promise.
+pub const REASON_PATH_RELAY_FIRST_BUSINESS: &str = "path_relay_first_business";
 /// Path selector found no usable Direct or Relay path.
 pub const REASON_PATH_UNAVAILABLE: &str = "path_unavailable";
 

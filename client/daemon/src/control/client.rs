@@ -23,6 +23,8 @@ impl ControlClient {
         let (critical_answer_tx, critical_answer_rx) =
             mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
         let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
+        let (candidate_offer_tx, candidate_offer_rx) =
+            mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
         let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
 
         let state = Arc::new(RwLock::new(ClientState {
@@ -38,6 +40,7 @@ impl ControlClient {
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
+            candidate_offer_tx,
             state: state.clone(),
         };
 
@@ -58,18 +61,36 @@ impl ControlClient {
                     .build()
                     .expect("no_proxy control HTTP client must build")
             });
+            // Keep candidate refresh on a separate connection pool.  The
+            // policy is identical to the ordinary/critical client, but a
+            // stalled signal connection must not consume its only HTTP/1
+            // connection slot while a handshake or another peer is trying
+            // to publish candidates.
+            let candidate_http = control_http_client(config.control.proxy_mode).unwrap_or_else(|err| {
+                warn!(
+                    "Candidate control HTTP client build failed for proxy mode {} ({err}); falling back to a direct no_proxy client",
+                    config.control.proxy_mode.as_label()
+                );
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("candidate no_proxy control HTTP client must build")
+            });
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
             let critical_http = Arc::new(http.clone());
+            let candidate_http = Arc::new(candidate_http);
             tokio::spawn(async move {
                 run_critical_control_loop(
                     critical_http,
+                    candidate_http,
                     critical_answer_rx,
                     critical_offer_rx,
                     critical_ctrl_rx,
+                    candidate_offer_rx,
                     critical_auth_rx,
                     critical_event_tx,
                     critical_relay_selection,
@@ -114,9 +135,12 @@ impl ControlClient {
         let (critical_answer_tx, critical_answer_rx) =
             mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
         let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
+        let (candidate_offer_tx, candidate_offer_rx) =
+            mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
         drop(critical_offer_rx);
         drop(critical_answer_rx);
         drop(critical_ctrl_rx);
+        drop(candidate_offer_rx);
         let state = Arc::new(RwLock::new(ClientState {
             registered: false,
             peers: HashMap::new(),
@@ -129,6 +153,7 @@ impl ControlClient {
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
+            candidate_offer_tx,
             state,
         }
     }
@@ -258,9 +283,9 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
-        // Candidate-only and fresh-mapping advertisements deliberately remain
-        // on the ordinary lane.  A payload carrying a WireGuard initiation is
-        // latency-sensitive and must bypass that FIFO.
+        // Candidate-only and fresh-mapping advertisements use the independent
+        // bounded lane.  A payload carrying a WireGuard initiation is
+        // latency-sensitive and uses the critical handshake lane below.
         if !handshake_init.is_empty() {
             return self
                 .send_critical_peer_offer(
@@ -275,8 +300,8 @@ impl ControlClient {
                 .await;
         }
         let (response_tx, response_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ControlCommand::SendPeerOffer {
+        self.candidate_offer_tx
+            .try_send(CandidateOfferCommand {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 session_id: None,
@@ -287,7 +312,10 @@ impl ControlClient {
                 fresh_ownership,
                 response_tx,
             })
-            .map_err(|_| PeerOfferSendFailure::ChannelClosed)?;
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PeerOfferSendFailure::SendFailed,
+                mpsc::error::TrySendError::Closed(_) => PeerOfferSendFailure::ChannelClosed,
+            })?;
         match response_rx.await {
             Ok(PeerOfferSendOutcome::Sent) => Ok(()),
             Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),
@@ -316,8 +344,8 @@ impl ControlClient {
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ControlCommand::SendPeerOffer {
+        self.candidate_offer_tx
+            .try_send(CandidateOfferCommand {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 session_id: None,
@@ -328,7 +356,10 @@ impl ControlClient {
                 fresh_ownership: Some(fresh_ownership),
                 response_tx,
             })
-            .map_err(|_| PeerOfferSendFailure::ChannelClosed)?;
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PeerOfferSendFailure::SendFailed,
+                mpsc::error::TrySendError::Closed(_) => PeerOfferSendFailure::ChannelClosed,
+            })?;
         match response_rx.await {
             Ok(PeerOfferSendOutcome::Sent) => Ok(()),
             Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),

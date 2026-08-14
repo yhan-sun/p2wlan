@@ -83,8 +83,8 @@ use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
     candidate_refresh_requires_commit, candidate_set_change_reason, candidate_set_hash,
     control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
-    prepare_signal_candidates_and_network_identity, publish_local_candidates_to_known_peers,
-    run_udp_candidate_refresh, UdpCandidateRefreshContext,
+    network_identity_changed, prepare_signal_candidates_and_network_identity,
+    publish_local_candidates_to_known_peers, run_udp_candidate_refresh, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
@@ -167,10 +167,6 @@ const CANDIDATE_READY_TIMEOUT_MS: u64 = 300;
 /// cannot delay the first public candidate and the first Direct punch.  The
 /// normal refresh immediately follows with the configured full timeout.
 const DIRECT_STARTUP_STUN_TIMEOUT: Duration = Duration::from_millis(350);
-/// Hard cap for the post-answer candidate refresh and endpoint publish.  The
-/// answer itself never waits for this work; the bound only limits how long the
-/// per-peer responder slot can be occupied by the best-effort refresh.
-const POST_ANSWER_REFRESH_DEADLINE_SECS: u64 = 4;
 /// Caller-side budget for the startup endpoint publish.  The publish travels
 /// the handshake control lane; a pathological lane must never stall UDP
 /// transport startup or the signal that follows a candidate refresh.
@@ -184,6 +180,17 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
 ];
 /// Re-gather candidates often enough to notice Wi-Fi/hotspot changes.
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+/// Retry candidate discovery promptly when the bounded startup STUN probe
+/// yielded only host/predicted candidates.  A normal snapshot keeps the
+/// 15-second network-change refresh cadence; only the not-ready startup case
+/// gets this extra attempt.
+const CANDIDATE_REFRESH_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Keep retrying a host-only startup snapshot while no locally observed
+/// public mapping exists. A single retry followed by the normal 15-second
+/// cadence left Air unable to publish a usable endpoint until ~16 seconds
+/// after boot, which made Direct miss the desired sub-10-second window even
+/// though relay-first was already available.
+const CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Server-side signaling currently rejects candidate lists above this size.
 ///
 /// Keep this large enough for a linear symmetric NAT to publish its observed

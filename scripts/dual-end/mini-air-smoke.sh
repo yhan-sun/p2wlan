@@ -17,6 +17,9 @@ ALLOW_STAGING_TEST=${ALLOW_STAGING_TEST:-0}
 ALLOW_REAL_DUAL_MACHINE_TEST=${ALLOW_REAL_DUAL_MACHINE_TEST:-0}
 ALLOW_REMOTE_RESTART=${ALLOW_REMOTE_RESTART:-0}
 ALLOW_LEGACY_PLAINTEXT_RELAY=${ALLOW_LEGACY_PLAINTEXT_RELAY:-0}
+# Never relax isolation implicitly. This opt-in permits only a target-scoped
+# availability diagnostic on shared staging; it is not strict acceptance.
+ALLOW_SHARED_NETWORK=${ALLOW_SHARED_NETWORK:-0}
 ROUNDS=${ROUNDS:-}
 ACCEPTANCE_MODE=${ACCEPTANCE_MODE:-strict}
 STRICT_PHASE=${STRICT_PHASE:-preflight}
@@ -41,6 +44,7 @@ AVAILABILITY_FIRST_USABLE_TARGET_MS=${AVAILABILITY_FIRST_USABLE_TARGET_MS:-3000}
 VALIDATE_OVERLAY=${VALIDATE_OVERLAY:-0}
 REAL_TUN=${REAL_TUN:-0}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-12}
+AUTHORIZATION_WAIT_S=${AUTHORIZATION_WAIT_S:-180}
 STUN_SERVERS=${STUN_SERVERS:-"stun.cloudflare.com:3478,stun.l.google.com:19302,stun.miwifi.com:3478"}
 P2WLAN_NETWORK_OR_TENANT=${P2WLAN_NETWORK_OR_TENANT:-}
 NETWORK_ID=${NETWORK_ID:-${P2WLAN_NETWORK_OR_TENANT:-}}
@@ -49,6 +53,7 @@ RUN_ID=${RUN_ID:-$(date +%s)-$$}
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-}
 AB_SEQUENCE_DIR=${AB_SEQUENCE_DIR:-${ARTIFACT_ROOT:-}}
 STRICT_PARSER="$HARNESS_ROOT/scripts/dual-end/strict-direct-parser.py"
+PRODUCTION_AVAILABILITY_PARSER="$HARNESS_ROOT/scripts/dual-end/production-availability-parser.py"
 REMOTE_RUN_DIR="/tmp/p2wlan-direct-$RUN_ID"
 LOCAL_RUN_DIR="/tmp/p2wlan-direct-$RUN_ID"
 REMOTE_DAEMON_BIN="$REMOTE_RUN_DIR/p2wlan-daemon"
@@ -94,6 +99,13 @@ case "$REMOTE_CONTROL_URL" in
     ;;
   *)
     echo "[mini-air] REMOTE_CONTROL_URL must use https://, or http:// with ALLOW_LEGACY_PLAINTEXT_RELAY=1" >&2
+    exit 2
+    ;;
+  esac
+case "$ALLOW_SHARED_NETWORK" in
+  0|1) ;;
+  *)
+    echo "[mini-air] ALLOW_SHARED_NETWORK must be 0 or 1" >&2
     exit 2
     ;;
 esac
@@ -163,18 +175,22 @@ remote_osascript_shell_launch() {
   local pid_file=$2
   local encoded
   encoded=$(printf '%s' "$remote_command" | /usr/bin/base64 | tr -d '\n')
-  # Do not hold an SSH/osascript process for the lifetime of the daemon.  The
-  # privileged shell backgrounds only the decoded daemon command, then the
-  # normal SSH user waits for the root-owned PID file.  This leaves the
-  # authorization channel available for deterministic cleanup and prevents
-  # one round's pending osascript from blocking the next round's prompt.
-  $AIR_SSH "/bin/launchctl asuser '$AIR_CONSOLE_UID' /usr/bin/osascript -e 'do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\"'"
-  for _ in $(seq 1 50); do
+  # Do not hold the harness on the SSH/osascript wrapper. Authorization
+  # Services can keep that wrapper alive after the privileged daemon has
+  # detached. The daemon-owned PID file is the startup acknowledgement;
+  # cleanup terminates the local SSH helper if it remains open.
+  $AIR_SSH "/bin/launchctl asuser '$AIR_CONSOLE_UID' /usr/bin/osascript -e 'do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\"'" \
+    >/dev/null 2>&1 &
+  local auth_pid=$!
+  REMOTE_AUTH_HELPER_PIDS="$REMOTE_AUTH_HELPER_PIDS $auth_pid"
+  echo "[mini-air] waiting up to ${AUTHORIZATION_WAIT_S}s for Air REAL_TUN authorization" >&2
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
     if $AIR_SSH "test -s '$pid_file'" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
   done
+  kill "$auth_pid" 2>/dev/null || true
   return 1
 }
 
@@ -185,37 +201,77 @@ local_osascript_shell() {
   local local_command=$1
   local encoded
   encoded=$(printf '%s' "$local_command" | /usr/bin/base64 | tr -d '\n')
+  local console_uid
+  console_uid=$(/usr/bin/stat -f '%u' /dev/console 2>/dev/null || true)
   # Use the plain Authorization Services form: it is the same global dialog
   # that the user has already approved manually.  Extra Terminal automation
   # can fail with AppleScript status 1 before the daemon command is reached.
   # Keep this synchronous so startup/cleanup observe the privileged fragment's
   # completion status; the password is never put in a shell argument, file, or
   # artifact.
-  /usr/bin/osascript \
-    -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
+  if [[ "$console_uid" =~ ^[0-9]+$ ]]; then
+    /bin/launchctl asuser "$console_uid" /usr/bin/osascript \
+      -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
+  else
+    /usr/bin/osascript \
+      -e "do shell script \"printf %s $encoded | /usr/bin/base64 -D | /bin/sh\" with administrator privileges with prompt \"P2WLAN staging REAL_TUN authorization\""
+  fi
 }
 
 local_osascript_shell_launch() {
   local local_command=$1
   local pid_file=$2
+  local auth_status_file="${pid_file}.auth-status"
+  local auth_log_file="${pid_file}.auth.log"
   local encoded
   encoded=$(printf '%s' "$local_command" | /usr/bin/base64 | tr -d '\n')
-  # Keep the Authorization Services call synchronous so its global dialog is
-  # visible to the user and its failure is observable by the harness.  The
-  # privileged shell detaches only the daemon pipeline, then waits for the
-  # daemon-owned PID file.  This avoids a hidden Terminal-tab launcher while
-  # still returning before the long-lived daemon exits.
-  # The background boundary is inside the privileged shell.  The decoded
-  # daemon command owns its log/PID file; the caller below performs the
-  # readiness wait as the unprivileged user.
-  local_osascript_shell "printf %s '$encoded' | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &"
-  for _ in $(seq 1 50); do
+  : >"$auth_status_file"
+  : >"$auth_log_file"
+  # Authorization Services can keep the `do shell script ... &` wrapper alive
+  # after the privileged daemon has detached. Run only that wrapper in the
+  # background; the daemon-owned PID file is the startup acknowledgement, and
+  # cleanup terminates the helper. The user still receives the same global
+  # osascript password dialog.
+  (
+    if local_osascript_shell "printf %s '$encoded' | /usr/bin/base64 -D | /bin/sh >/dev/null 2>&1 &" \
+      >"$auth_log_file" 2>&1; then
+      printf '%s\n' authorized >"$auth_status_file"
+    else
+      rc=$?
+      printf 'osascript_exit=%s\n' "$rc" >"$auth_status_file"
+    fi
+  ) &
+  local auth_pid=$!
+  LOCAL_AUTH_HELPER_PIDS="$LOCAL_AUTH_HELPER_PIDS $auth_pid"
+  echo "[mini-air] waiting up to ${AUTHORIZATION_WAIT_S}s for Mini REAL_TUN authorization" >&2
+  for _ in $(seq 1 $((AUTHORIZATION_WAIT_S * 10))); do
     if [[ -s "$pid_file" ]]; then
       return 0
     fi
+    if [[ -s "$auth_status_file" ]]; then
+      echo "[mini-air] Mini REAL_TUN authorization result: $(tr '\n' ' ' <"$auth_status_file")" >&2
+      if [[ -s "$auth_log_file" ]]; then
+        echo "[mini-air] Mini REAL_TUN authorization diagnostics:" >&2
+        sed -E 's/(Authorization:|Bearer[[:space:]]+)[^[:space:]]+/\1<redacted>/g' \
+          "$auth_log_file" >&2 || true
+      fi
+      return 1
+    fi
     sleep 0.1
   done
+  kill "$auth_pid" 2>/dev/null || true
+  printf 'timeout=%ss\n' "$AUTHORIZATION_WAIT_S" >"$auth_status_file"
   return 1
+}
+
+stop_auth_helpers() {
+  local pid
+  for pid in $LOCAL_AUTH_HELPER_PIDS $REMOTE_AUTH_HELPER_PIDS; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  LOCAL_AUTH_HELPER_PIDS=""
+  REMOTE_AUTH_HELPER_PIDS=""
 }
 
 AIR_REMOTE_NEEDS_OSASCRIPT=0
@@ -378,6 +434,8 @@ LOCAL_NODE_A_DEVICE=""
 REMOTE_NODE_B_LOG=""
 REMOTE_NODE_B_DEVICE=""
 REMOTE_NODE_B_TOKEN_FILE=""
+LOCAL_AUTH_HELPER_PIDS=""
+REMOTE_AUTH_HELPER_PIDS=""
 DIRECT_BLACKHOLE_ANCHOR="com.apple/p2wlan-${RUN_ID//[^A-Za-z0-9_.-]/-}"
 DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
 DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
@@ -390,15 +448,35 @@ if [[ -z "$REMOTE_CONTROL_URL" ]]; then
   echo "[mini-air] REMOTE_CONTROL_URL is required; this harness must not start a local control or relay service" >&2
   exit 2
 fi
+case "$AUTHORIZATION_WAIT_S" in
+  ''|*[!0-9]*|0)
+    echo "[mini-air] AUTHORIZATION_WAIT_S must be a positive integer" >&2
+    exit 2
+    ;;
+esac
 if [[ ! -f "$ISOLATION_HELPER" ]]; then
   echo "[mini-air] network isolation helper is missing: $ISOLATION_HELPER" >&2
   exit 2
 fi
+if [[ ! -f "$PRODUCTION_AVAILABILITY_PARSER" ]]; then
+  echo "[mini-air] production availability parser is missing: $PRODUCTION_AVAILABILITY_PARSER" >&2
+  exit 2
+fi
 # Isolation is proven live per round (the active roster must be exactly this
-# round's two nodes), so the default network is usable for a two-device test
-# run without ever being exempted from the isolation requirement.
-if [[ "$ACCEPTANCE_MODE" == "strict" && "$NETWORK_ID" == "default" ]]; then
-  echo "[mini-air] strict verification on the default network requires the per-round isolation proof and device cleanup" >&2
+# round's two nodes).  REAL_TUN availability is production dataplane evidence;
+# allowing an unrelated live device to remain in the roster can make one side
+# spend its peer budget on stale nodes and never even instantiate the target
+# peer.  Target-scoped cleanup is therefore not sufficient for a real-TUN
+# result, including availability mode.
+if [[ "$REAL_TUN" == "1" || "$ACCEPTANCE_MODE" == "strict" ]]; then
+  echo "[mini-air] real verification requires the per-round isolation proof and device cleanup" >&2
+fi
+if [[ "$ALLOW_SHARED_NETWORK" == "1" ]]; then
+  if [[ "$ACCEPTANCE_MODE" != "availability" || "$REAL_TUN" != "1" ]]; then
+    echo "[mini-air] ALLOW_SHARED_NETWORK=1 is only valid for REAL_TUN availability diagnostics" >&2
+    exit 2
+  fi
+  echo "[mini-air] WARNING: target-scoped shared-network diagnostic; strict isolation acceptance is disabled" >&2
 fi
 
 count_log_events() {
@@ -722,9 +800,8 @@ log_first_event_path() {
 }
 
 # The value of a `Some(N)` numeric structured field on the FIRST log line
-# matching a regexp, or empty.  Used to read the daemon's OWN monotonic
-# relay-ready -> usable delta (`relay_ready_to_usable_ms=Some(N)` on the
-# `first_usable_confirmed` event), so availability timing is never computed by
+# matching a regexp, or empty.  Used to read a daemon's OWN monotonic
+# relay-ready -> usable delta, so availability timing is never computed by
 # subtracting wall clocks across the two machines.
 log_first_event_field() {
   local log_file=$1
@@ -736,59 +813,12 @@ log_first_event_field() {
 # Read the production TUN dataplane milestone for one target peer.  The daemon
 # records this only after a normal decrypted business packet is received, and
 # records the actual ingress envelope (relay/direct) rather than the currently
-# selected path.  Output is `path|delta_ms|generation`; the delta uses one
-# daemon's own monotonic t_ms and is never derived from the other machine's
-# wall clock.
+# selected path.  The standalone parser uses one daemon's monotonic t_ms and
+# never derives a delta from the other machine's wall clock.
 production_first_business_info() {
   local log_file=$1
   local peer_id=$2
-  python3 - "$log_file" "$peer_id" <<'PY'
-import re
-import sys
-
-log_file, target = sys.argv[1:]
-relay_at = {}
-first = {}
-event_re = re.compile(
-    r'event="(relay_transport_ready_peer|first_real_business_ingress)"'
-)
-t_re = re.compile(r'\bt_ms=(\d+)')
-detail_re = re.compile(r'detail=(?:Some\()?"([^"]*)"')
-peer_re = re.compile(r'\bpeer=([^ ]+)')
-gen_re = re.compile(r'\bgeneration=(\d+)')
-path_re = re.compile(r'\bpath=(?:Some\()?"([^"]+)"')
-try:
-    stream = open(log_file, encoding="utf-8", errors="replace")
-except OSError:
-    raise SystemExit(0)
-with stream:
-    for line in stream:
-        event = event_re.search(line)
-        if not event:
-            continue
-        timestamp = t_re.search(line)
-        detail = detail_re.search(line)
-        if not timestamp or not detail:
-            continue
-        detail_text = detail.group(1)
-        peer = peer_re.search(detail_text)
-        generation = gen_re.search(detail_text)
-        if not peer or not generation or peer.group(1) != target:
-            continue
-        generation = int(generation.group(1))
-        at_ms = int(timestamp.group(1))
-        if event.group(1) == "relay_transport_ready_peer":
-            relay_at.setdefault(generation, at_ms)
-        elif event.group(1) == "first_real_business_ingress":
-            path = path_re.search(line)
-            if path:
-                first.setdefault(generation, (path.group(1), at_ms))
-for generation in sorted(first):
-    path, at_ms = first[generation]
-    if generation in relay_at:
-        print("%s|%d|%d" % (path, at_ms - relay_at[generation], generation))
-        break
-PY
+  python3 "$PRODUCTION_AVAILABILITY_PARSER" "$log_file" "$peer_id"
 }
 
 run_real_tun_business_pair() {
@@ -1147,7 +1177,7 @@ PY
   fi
 
   local cleanup_proof_mode="--prove-cleaned"
-  if [[ "$ACCEPTANCE_MODE" != "strict" ]]; then
+  if [[ ( "$REAL_TUN" != "1" && "$ACCEPTANCE_MODE" != "strict" ) || "$ISOLATION_MODE" == "target-scoped-shared" ]]; then
     cleanup_proof_mode="--prove-cleaned-scoped"
   fi
   if [[ "$cleanup_ok" -eq 1 && -n "$deleted_ids" ]] && ! python3 "$ISOLATION_HELPER" "$cleanup_proof_mode" \
@@ -1165,6 +1195,7 @@ PY
 }
 
 cleanup() {
+  stop_auth_helpers
   clear_direct_udp_blackhole
   local_daemon_cleanup || true
   remote_daemon_cleanup || true
@@ -1468,6 +1499,10 @@ for round in $(seq 1 "$ROUNDS"); do
   REAL_OVERLAY_OK=0
   REAL_OVERLAY_MINI_REPLIES=0
   REAL_OVERLAY_AIR_REPLIES=0
+  ISOLATION_MODE="strict-exact-two"
+  if [[ "$ALLOW_SHARED_NETWORK" == "1" ]]; then
+    ISOLATION_MODE="target-scoped-shared"
+  fi
 
   CONTROL_URL="$REMOTE_CONTROL_URL"
   for _ in {1..40}; do
@@ -1506,7 +1541,13 @@ for round in $(seq 1 "$ROUNDS"); do
     LOCAL_DAEMON_COMMAND="echo \$\$ > '$LOCAL_NODE_A_PID_FILE'; exec env P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID='$RUN_ID' RUST_LOG='$HARNESS_RUST_LOG' '$DAEMON_BIN' --config '$LOCAL_NODE_A_CONFIG' --control '$CONTROL_URL' --network '$NETWORK_ID' --token-file '$LOCAL_NODE_A_TOKEN_FILE' --device-name '$LOCAL_NODE_A_DEVICE' --udp-bind 0.0.0.0:0 --socket-pool 3 --stun '$STUN_SERVERS' --stun-timeout-ms 1000 --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5 $PATH_POLICY_FLAG $LOCAL_VALIDATE_OVERLAY_FLAG >'$ROUND_DIR/node-a.log' 2>&1"
   fi
   if [[ "$REAL_TUN" == "1" && "$LOCAL_DAEMON_NEEDS_OSASCRIPT" == "1" ]]; then
-    local_osascript_shell_launch "$LOCAL_DAEMON_COMMAND" "$LOCAL_NODE_A_PID_FILE"
+    if ! local_osascript_shell_launch "$LOCAL_DAEMON_COMMAND" "$LOCAL_NODE_A_PID_FILE"; then
+      echo "[mini-air] ROUND $round: Mini privileged launch did not produce this round's PID file" >&2
+      overall=1
+      local_daemon_cleanup || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+      continue
+    fi
     NODE_A_WRAPPER_PID=""
     NODE_A_PID=$(cat "$LOCAL_NODE_A_PID_FILE")
     LOCAL_NODE_A_PID="$NODE_A_PID"
@@ -1734,10 +1775,13 @@ PY
   # third-party active node, a control-plane listing failure, or a proof
   # timeout aborts the run immediately as isolation-invalid — it is never
   # counted as a product failure or a PASS.
-  if [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
+  if [[ "$REAL_TUN" == "1" || "$ACCEPTANCE_MODE" == "strict" ]]; then
     ISOLATION_REPORT="$ROUND_DIR/isolation-prove.json"
-    if python3 "$ISOLATION_HELPER" --prove "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" \
-      "$MINI_NODE_ID" "$AIR_NODE_ID" --deadline 25 \
+    isolation_command=(--prove "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" "$MINI_NODE_ID" "$AIR_NODE_ID")
+    if [[ "$ISOLATION_MODE" == "target-scoped-shared" ]]; then
+      isolation_command=(--prove-target "$CONTROL_URL" "$TOKEN" "$NETWORK_ID" "$MINI_NODE_ID" "$AIR_NODE_ID")
+    fi
+    if python3 "$ISOLATION_HELPER" "${isolation_command[@]}" --deadline 25 \
       >"$ISOLATION_REPORT" 2>"$ROUND_DIR/isolation-prove.err"; then
       ISOLATION_OK=1
     else
@@ -2071,13 +2115,19 @@ PY
   A_FIRST_USABLE_PATH=""
   B_FIRST_USABLE_PATH=""
   FIRST_USABLE_AFTER_RELAY_MS=""
+  A_PRODUCTION_REASON=""
+  B_PRODUCTION_REASON=""
   if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
     # REAL_TUN uses the production `first_real_business_ingress` milestone:
     # it is emitted only after a normal decrypted packet arrives from the
     # target peer.  The mock validator's nonce/echo milestone is retained for
     # non-production local runs only.  Each side computes its own monotonic
-    # relay-confirmed -> business-ingress delta; the harness takes max(side A,
-    # side B) and never subtracts cross-machine wall clocks.
+    # relay-transport-ready -> business-ingress delta; the harness takes
+    # max(side A, side B) and never subtracts cross-machine wall clocks.  The
+    # receiver may see the peer's real relay business packet before consuming
+    # its own locally initiated probe ACK; that is valid ingress evidence, not
+    # a Direct bypass.  `relay_peer_confirmed` remains a separate admission
+    # gate below.
     if [[ "$REAL_TUN" == "1" ]]; then
       A_PRODUCTION_INFO=$(production_first_business_info "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" || true)
       B_PRODUCTION_INFO=$(production_first_business_info "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" || true)
@@ -2085,13 +2135,16 @@ PY
       B_FIRST_USABLE_PATH=$(printf '%s' "$B_PRODUCTION_INFO" | cut -d'|' -f1)
       A_RELAY_READY_TO_USABLE_MS=$(printf '%s' "$A_PRODUCTION_INFO" | cut -d'|' -f2)
       B_RELAY_READY_TO_USABLE_MS=$(printf '%s' "$B_PRODUCTION_INFO" | cut -d'|' -f2)
+      A_PRODUCTION_REASON=$(printf '%s' "$A_PRODUCTION_INFO" | cut -d'|' -f4)
+      B_PRODUCTION_REASON=$(printf '%s' "$B_PRODUCTION_INFO" | cut -d'|' -f4)
     else
       A_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-a.log" 'first_usable_bidirectional_overlay_ms')
       B_FIRST_USABLE_PATH=$(log_first_event_path "$ROUND_DIR/node-b.log" 'first_usable_bidirectional_overlay_ms')
       A_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-a.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
       B_RELAY_READY_TO_USABLE_MS=$(log_first_event_field "$ROUND_DIR/node-b.log" 'first_usable_confirmed' 'relay_ready_to_usable_ms')
     fi
-    if [[ -n "$A_RELAY_READY_TO_USABLE_MS" && -n "$B_RELAY_READY_TO_USABLE_MS" ]]; then
+    if [[ "$A_RELAY_READY_TO_USABLE_MS" =~ ^[0-9]+$ &&
+          "$B_RELAY_READY_TO_USABLE_MS" =~ ^[0-9]+$ ]]; then
       FIRST_USABLE_AFTER_RELAY_MS=$((A_RELAY_READY_TO_USABLE_MS > B_RELAY_READY_TO_USABLE_MS ? A_RELAY_READY_TO_USABLE_MS : B_RELAY_READY_TO_USABLE_MS))
     else
       FIRST_USABLE_AFTER_RELAY_MS=""
@@ -2142,8 +2195,8 @@ PY
       echo "snapshot_a_sha256=$SNAPSHOT_A_SHA256 snapshot_b_sha256=$SNAPSHOT_B_SHA256 snapshot_result_sha256=$SNAPSHOT_RESULT_SHA256"
     } >"$ROUND_DIR/metrics.env"
   elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
-    A_RELAY_PEER_CONFIRMED=$(count_log_events "$ROUND_DIR/node-a.log" 'relay_peer_confirmed')
-    B_RELAY_PEER_CONFIRMED=$(count_log_events "$ROUND_DIR/node-b.log" 'relay_peer_confirmed')
+    A_RELAY_PEER_CONFIRMED=$(count_log_events_for_peer "$ROUND_DIR/node-a.log" "$AIR_NODE_ID" 'event="relay_peer_confirmed"|relay_peer_confirmed')
+    B_RELAY_PEER_CONFIRMED=$(count_log_events_for_peer "$ROUND_DIR/node-b.log" "$MINI_NODE_ID" 'event="relay_peer_confirmed"|relay_peer_confirmed')
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$round" "$ACCEPTANCE_MODE" "$FIRST_USABLE_AFTER_RELAY_MS" "$ELAPSED_MS" \
       "$A_FIRST_USABLE_PATH" "$B_FIRST_USABLE_PATH" "$A_DIRECT" "$B_DIRECT" \
@@ -2154,6 +2207,7 @@ PY
     {
       echo "round=$round acceptance_mode=availability first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS elapsed_ms=$ELAPSED_MS"
       echo "first_usable_path_a=$A_FIRST_USABLE_PATH first_usable_path_b=$B_FIRST_USABLE_PATH"
+      echo "production_reason_a=${A_PRODUCTION_REASON:-not_applicable} production_reason_b=${B_PRODUCTION_REASON:-not_applicable}"
       echo "network_id=$NETWORK_ID"
       echo "mini_node_id=$MINI_NODE_ID air_node_id=$AIR_NODE_ID"
       echo "a_direct=$A_DIRECT b_direct=$B_DIRECT (informational; direct is not a usability gate)"
@@ -2266,7 +2320,7 @@ PY
       grep -h 'relay_selection_started\|relay_transport_connected\|relay_peer_confirmed\|selected relay region' "$ROUND_DIR/node-a.log" | head -4
       grep -h 'relay_selection_started\|relay_transport_connected\|relay_peer_confirmed\|selected relay region' "$ROUND_DIR/node-b.log" | head -4
     fi
-    if [[ "$ACCEPTANCE_MODE" == "strict" ]]; then
+    if [[ "$ACCEPTANCE_MODE" == "strict" || "$ISOLATION_MODE" == "target-scoped-shared" ]]; then
       echo "== network isolation proof =="
       cat "$ROUND_DIR/isolation-prove.json" 2>/dev/null || echo "isolation-prove.json missing"
       echo "== device cleanup proof =="

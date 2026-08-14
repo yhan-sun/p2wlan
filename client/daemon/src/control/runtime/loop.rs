@@ -88,6 +88,19 @@ async fn run_control_loop(
                             relay_catalog,
                         });
 
+                        // Candidate refresh and relay-first setup may begin
+                        // as soon as registration succeeds.  Publish the
+                        // currently authoritative registration token before
+                        // the optional Ed25519 credential challenge; the
+                        // later update below replaces it atomically if the
+                        // challenge issues a device credential.
+                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            base_url: base_url.clone(),
+                            token: token.clone(),
+                            self_node_id: node_id.clone(),
+                            signal_signing_identity: signal_signing_identity.clone(),
+                        }));
+
                         // Attempt Ed25519 challenge for device credential
                         if !config.control.credential_issued
                             && !config.node.ed25519_private_key.is_empty()

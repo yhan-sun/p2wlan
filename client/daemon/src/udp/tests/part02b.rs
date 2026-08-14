@@ -181,6 +181,57 @@ async fn live_stun_refresh_does_not_steal_encrypted_datagrams() {
 }
 
 #[tokio::test]
+async fn live_stun_response_is_dispatched_before_slow_datagram_diagnostics() {
+    let peers = peer_manager();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let stun_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stun_addr = stun_server.local_addr().unwrap();
+    let stun_worker = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (n, client_addr) = stun_server.recv_from(&mut buf).await.unwrap();
+        let request = StunMessage::decode(&buf[..n]).unwrap();
+        let mut response =
+            StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+        response.add_attribute(StunAttribute::XorMappedAddress(
+            "203.0.113.7:45678".parse().unwrap(),
+        ));
+        stun_server
+            .send_to(&response.encode(), client_addr)
+            .await
+            .unwrap();
+    });
+
+    // Hold the diagnostics mutex to model a burst of direct packets or a
+    // contended status snapshot.  STUN completion must not wait behind that
+    // path: the bounded startup gather would otherwise misclassify a healthy
+    // UDP observer as `UdpBlocked`.
+    let diagnostics_guard = transport.socket_pool_diagnostics.lock().await;
+    let report = timeout(
+        Duration::from_millis(500),
+        transport.gather_candidate_report_live_parallel(vec![stun_addr], Duration::from_secs(1)),
+    )
+    .await
+    .expect("STUN response was delayed by datagram diagnostics")
+    .unwrap();
+    drop(diagnostics_guard);
+
+    assert_eq!(report.nat_profile.observations.len(), 1);
+    assert!(report.nat_profile.observations[0].error.is_none());
+    assert_eq!(
+        report.nat_profile.observations[0].mapped_address.as_deref(),
+        Some("203.0.113.7:45678")
+    );
+
+    stun_worker.await.unwrap();
+    inbound_worker.abort();
+}
+
+#[tokio::test]
 async fn parallel_live_stun_gather_does_not_sum_observer_delays() {
     let peers = peer_manager();
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)

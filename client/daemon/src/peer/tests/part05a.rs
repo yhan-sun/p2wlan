@@ -40,6 +40,131 @@ async fn path_selector_prefers_relay_until_direct_is_confirmed() {
 }
 
 #[tokio::test]
+async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.41:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .record_relay_observation("peer1", relay_endpoint, None)
+        .await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(8)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    let pending = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(pending.path, None);
+    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
+    assert!(!manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+        .await;
+    assert_eq!(diagnostics[0].active_path, None);
+
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+    let first = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(first.path, Some(NetworkPath::Relay));
+    assert_eq!(first.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
+    assert!(manager
+        .mark_relay_first_business_sent_for_generation("peer1", generation)
+        .await);
+    let admitted = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(admitted.path, Some(NetworkPath::Direct));
+    assert!(manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+}
+
+#[tokio::test]
+async fn direct_confirmation_is_bounded_fallback_when_relay_probe_does_not_ack() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.42:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(8)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    {
+        let mut connections = manager.connections.write().await;
+        connections
+            .get_mut("peer1")
+            .expect("peer exists")
+            .relay_ready_at = Some(
+                Instant::now()
+                    .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
+                    .expect("test instant is representable"),
+            );
+    }
+
+    let selection = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+}
+
+#[tokio::test]
+async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.43:51831".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(8)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    // A shared relay transport exists, but this peer has not published its
+    // relay-ready milestone yet. Admission arms the bounded gate before the
+    // selector is consulted, so Direct cannot consume a counter here.
+    assert!(!manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+    let pending = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(pending.path, None);
+    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
+
+    // If the per-peer relay setup never publishes ready/ACK, the gate still
+    // has a hard deadline and a real Direct ACK becomes the safe fallback.
+    {
+        let mut connections = manager.connections.write().await;
+        connections
+            .get_mut("peer1")
+            .expect("peer exists")
+            .relay_first_gate_started_at = Some(
+                Instant::now()
+                    .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
+                    .expect("test instant is representable"),
+            );
+    }
+    assert!(manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+    let fallback = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(fallback.path, Some(NetworkPath::Direct));
+    assert_eq!(fallback.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+}
+
+#[tokio::test]
 async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
     let config = test_config();
     let manager = PeerManager::new(config);
@@ -95,6 +220,49 @@ async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
 }
 
 #[tokio::test]
+async fn encrypted_direct_confirmation_ignores_stale_probe_failures_for_admission() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.32:51832".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(700)),
+        )
+        .await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(20),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    {
+        let mut connections = manager.connections.write().await;
+        let connection = connections.get_mut("peer1").unwrap();
+        // These failures happened while Direct was still a probe candidate.
+        // The encrypted Request/ACK below has already reset the current
+        // failure streak, but the cumulative counter remains diagnostic data.
+        connection.direct_health.failure_count = 5;
+        connection.direct_health.consecutive_failures = 0;
+        connection.direct_health.rtt_ewma_ms = Some(500);
+        connection.direct_health.jitter_ms = Some(0);
+    }
+
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(selected.direct_confirmed);
+    assert_eq!(selected.direct_endpoint, Some(endpoint));
+}
+
+#[tokio::test]
 async fn path_selector_uses_scores_and_hysteresis_for_degraded_direct() {
     let config = test_config();
     let manager = PeerManager::new(config);
@@ -112,6 +280,12 @@ async fn path_selector_uses_scores_and_hysteresis_for_degraded_direct() {
     manager
         .record_relay_success("peer1", "relay.test:443", false)
         .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     let healthy = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(healthy.path, Some(NetworkPath::Direct));
@@ -151,6 +325,12 @@ async fn path_selector_retains_low_latency_private_direct_over_relay() {
     manager
         .record_relay_success("peer1", "relay.test:443", false)
         .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     {
         let mut conns = manager.connections.write().await;
@@ -214,6 +394,36 @@ async fn candidate_refresh_retains_low_latency_private_direct() {
             .should_use_direct_for_data("peer1", true, true)
             .await
     );
+}
+
+#[tokio::test]
+async fn candidate_refresh_generation_keeps_confirmed_relay_admission() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "192.168.2.11:51840".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .confirm_relay_peer("peer1", "relay.test:443", generation)
+        .await;
+    assert!(
+        manager
+            .is_relay_peer_confirmed_for_generation("peer1", generation)
+            .await
+    );
+
+    let refreshed_generation = manager
+        .advance_candidate_refresh_generation("refreshed UDP candidates")
+        .await;
+    assert_eq!(refreshed_generation, generation + 1);
+    assert!(
+        manager
+            .is_relay_peer_confirmed_for_generation("peer1", refreshed_generation)
+            .await,
+        "candidate refresh must not revoke an already encrypted-confirmed relay ingress"
+    );
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.relay_confirmed_endpoint.as_deref(), Some("relay.test:443"));
 }
 
 #[tokio::test]
@@ -414,6 +624,12 @@ async fn path_selector_prefers_relay_when_confirmed_direct_quality_is_poor() {
     manager
         .record_relay_success("peer1", "relay.test:443", false)
         .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     {
         let mut conns = manager.connections.write().await;

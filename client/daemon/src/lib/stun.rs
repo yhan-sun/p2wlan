@@ -24,16 +24,24 @@ async fn parse_stun_servers(
         return Ok(Vec::new());
     }
 
-    let mut resolved = Vec::new();
-    for spec in specs {
+    resolve_stun_specs(specs, using_defaults, resolve_timeout).await
+}
+
+/// Resolve Direct-only STUN sources concurrently while preserving their
+/// configured order.  Relay setup must not wait for a sequence of unrelated
+/// DNS deadlines, but an explicitly configured malformed source remains a
+/// configuration error rather than being silently discarded.
+async fn resolve_stun_specs(
+    specs: Vec<String>,
+    using_defaults: bool,
+    resolve_timeout: Duration,
+) -> Result<Vec<SocketAddr>> {
+    let outcomes = futures_util::future::join_all(specs.into_iter().map(|spec| async move {
         if is_stun_clear_value(&spec) {
-            continue;
+            return Ok(Vec::new());
         }
         if let Ok(addr) = spec.parse::<SocketAddr>() {
-            if !resolved.contains(&addr) {
-                resolved.push(addr);
-            }
-            continue;
+            return Ok(vec![addr]);
         }
 
         let addrs = match tokio::time::timeout(resolve_timeout, lookup_host(&spec)).await {
@@ -43,7 +51,7 @@ async fn parse_stun_servers(
                     "Default STUN server {spec} resolution timed out after {} ms",
                     resolve_timeout.as_millis()
                 );
-                continue;
+                return Ok(Vec::new());
             }
             Err(_) => {
                 // STUN is Direct-only best effort.  A resolver timeout must
@@ -54,11 +62,11 @@ async fn parse_stun_servers(
                     "STUN server {spec} resolution timed out after {} ms; skipping this Direct candidate source",
                     resolve_timeout.as_millis()
                 );
-                continue;
+                return Ok(Vec::new());
             }
             Ok(Err(err)) if using_defaults => {
                 warn!("Default STUN server {spec} could not be resolved: {err}");
-                continue;
+                return Ok(Vec::new());
             }
             Ok(Err(err)) => {
                 return Err(DaemonError::Config(format!(
@@ -66,13 +74,18 @@ async fn parse_stun_servers(
                 )));
             }
         };
-        for addr in addrs {
+        Ok(addrs.collect::<Vec<_>>())
+    }))
+    .await;
+
+    let mut resolved = Vec::new();
+    for outcome in outcomes {
+        for addr in outcome? {
             if !resolved.contains(&addr) {
                 resolved.push(addr);
             }
         }
     }
-
     Ok(resolved)
 }
 

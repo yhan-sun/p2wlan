@@ -472,6 +472,72 @@ fn candidate_refresh_generation_advances_on_host_or_public_ip_change() {
 }
 
 #[test]
+fn candidate_refresh_generation_ignores_additive_interfaces_and_peer_reflexive_endpoints() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let mut next = previous.clone();
+    next.push("192.168.2.10:59288".to_string());
+    next.push("198.51.100.44:49001".to_string());
+    let next_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        ("192.168.2.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+        (
+            "198.51.100.44:49001".to_string(),
+            "peer_reflexive".to_string(),
+        ),
+    ]);
+
+    assert!(
+        !candidate_refresh_requires_network_generation_advance(
+            &previous,
+            &previous_sources,
+            &next,
+            &next_sources,
+        ),
+        "an additive interface or remote peer-reflexive endpoint must not revoke the current generation"
+    );
+}
+
+#[test]
+fn candidate_refresh_carries_identity_through_transient_stun_loss() {
+    let previous = vec![
+        "192.168.1.10:59288".to_string(),
+        "93.184.216.34:27106".to_string(),
+    ];
+    let previous_sources = HashMap::from([
+        ("192.168.1.10:59288".to_string(), "host".to_string()),
+        (
+            "93.184.216.34:27106".to_string(),
+            "stun_observed".to_string(),
+        ),
+    ]);
+    let mut next = vec!["192.168.1.10:60000".to_string()];
+    let mut next_sources = HashMap::from([("192.168.1.10:60000".to_string(), "host".to_string())]);
+    let identity = prepare_signal_candidates_and_network_identity(
+        &previous,
+        &previous_sources,
+        &mut next,
+        &mut next_sources,
+    );
+
+    assert!(identity.contains(&"public-ip:93.184.216.34".to_string()));
+    assert!(identity.contains(&"physical-host-ip:192.168.1.10".to_string()));
+}
+
+#[test]
 fn candidate_set_change_reason_ignores_order_only_reshuffles() {
     let previous = vec![
         "222.221.150.140:2073".to_string(),

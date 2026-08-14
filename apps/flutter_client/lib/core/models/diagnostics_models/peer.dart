@@ -93,16 +93,32 @@ class PeerSnapshot {
 
   String get path {
     if (!online) return 'offline';
-    if (activePath != null && activePath!.isNotEmpty) return activePath!;
+    // A daemon state/selection is not a usable path until the corresponding
+    // encrypted evidence is present. Fail closed so a relay reconnect or a
+    // candidate probe cannot be rendered as an established connection.
+    if (activePath == 'relay' && _hasRelayConfirmation) return 'relay';
+    if (activePath == 'direct' && state == 'direct') return 'direct';
+    // Keep the confirmed relay active while Direct is only a background trial.
+    // A selector snapshot may already say `direct` before the encrypted Direct
+    // ACK is committed to `active_path`; it must not make the UI hide the
+    // verified relay in that interval.
+    if (_hasRelayConfirmation &&
+        (state == 'relay' || isRelay || activePath == 'relay')) {
+      return 'relay';
+    }
     final selected = currentPathSelection?.path;
     if (selected == 'direct') {
       return currentPathSelection?.directConfirmed == true
           ? 'direct'
           : 'direct_trial';
     }
-    if (selected == 'relay' && _hasFreshRelayConfirmation) return 'relay';
-    if (state == 'direct') return 'direct';
-    if (state == 'relay' || isRelay) return 'relay';
+    if (selected == 'relay' && _hasRelayConfirmation) return 'relay';
+    // The daemon may retain `state == direct` as background encrypted proof
+    // while relay-first promotion is still waiting for the same-generation
+    // relay ACK.  Without an active path, this is probing—not a usable Direct
+    // connection and not a latency sample.
+    if (state == 'direct') return 'probing';
+    if (state == 'relay' || isRelay || activePath == 'relay') return 'probing';
     if (state == 'fallback_to_relay' ||
         state == 'hole_punching' ||
         state == 'connecting') {
@@ -136,8 +152,11 @@ class PeerSnapshot {
   /// [path] is `direct` or `relay`.  Used ONLY for the "探测中" label.
   int? get probeLatencyMs {
     if (!online) return null;
-    if (path == 'direct_trial' || path == 'probing') {
-      return direct.displayLatencyMs ?? relay.displayLatencyMs;
+    if (path == 'direct_trial') return direct.displayLatencyMs;
+    if (path == 'probing' &&
+        currentPathSelection?.path == 'direct' &&
+        currentPathSelection?.directConfirmed != true) {
+      return direct.displayLatencyMs;
     }
     return null;
   }
@@ -147,7 +166,7 @@ class PeerSnapshot {
   /// transport connect, a queued registration, or a candidate RTT never sets
   /// this.
   bool get isRelayVerified =>
-      path == 'relay' && relayConfirmedEndpoint != null && relayConfirmedEndpoint!.isNotEmpty;
+      path == 'relay' && _hasRelayConfirmation;
 
   /// Whether the direct path to this peer is VERIFIED by a matching encrypted
   /// direct validation exchange (daemon `active_path == direct` requires the
@@ -169,10 +188,10 @@ class PeerSnapshot {
     return 0;
   }
 
-  bool get _hasFreshRelayConfirmation {
-    final age = relay.lastSuccessAgeMs;
-    return age != null && age <= 15000 && relay.consecutiveFailures == 0;
-  }
+  bool get _hasRelayConfirmation =>
+      relayConfirmedEndpoint != null &&
+      relayConfirmedEndpoint!.isNotEmpty &&
+      relayConfirmedGeneration != null;
 
   String? get lastError {
     if (warning case final warning?) return warning;

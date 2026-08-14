@@ -17,12 +17,15 @@
 ///   never sends and never holds a lane slot;
 /// - retries reuse the exact prepared payload and are cut off by one overall
 ///   deadline, so a successful round can never become a 3 x 5 s sequence.
+#[allow(clippy::too_many_arguments)]
 async fn run_critical_control_loop(
     http: Arc<reqwest::Client>,
+    candidate_http: Arc<reqwest::Client>,
     mut answer_rx: mpsc::Receiver<CriticalAnswerCommand>,
     mut offer_rx: mpsc::Receiver<CriticalOfferCommand>,
     mut ctrl_rx: mpsc::Receiver<CriticalControlCommand>,
-    auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
+    mut candidate_rx: mpsc::Receiver<CandidateOfferCommand>,
+    mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
 ) {
@@ -32,6 +35,10 @@ async fn run_critical_control_loop(
     let mut answers = JoinSet::new();
     let mut offers = JoinSet::new();
     let mut ctrls = JoinSet::new();
+    let mut candidate_tasks = JoinSet::new();
+    let mut candidate_workers: HashMap<String, mpsc::Sender<CandidateOfferCommand>> =
+        HashMap::new();
+    let mut candidate_auth: Option<CriticalControlAuth> = None;
 
     loop {
         tokio::select! {
@@ -72,12 +79,221 @@ async fn run_critical_control_loop(
                         answers.abort_all();
                         offers.abort_all();
                         ctrls.abort_all();
+                        candidate_tasks.abort_all();
                         return;
+                    }
+                }
+            }
+            changed = auth_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let current = auth_rx.borrow().clone();
+                let identity_changed = candidate_auth.as_ref().is_some_and(|previous| {
+                    current
+                        .as_ref()
+                        .is_none_or(|current| !previous.same_identity_as(current))
+                });
+                if identity_changed {
+                    // No queued candidate from a previous registration may be
+                    // published using a new identity.  Aborting a request
+                    // makes the caller observe a terminal channel failure;
+                    // the candidate payload itself remains generation/expiry
+                    // checked if the HTTP request was already ambiguous.
+                    candidate_tasks.abort_all();
+                    while candidate_tasks.join_next().await.is_some() {}
+                    candidate_workers.clear();
+                }
+                candidate_auth = current;
+            }
+            Some(command) = candidate_rx.recv() => {
+                if command
+                    .fresh_ownership
+                    .as_ref()
+                    .is_some_and(|ownership| ownership.is_cancelled())
+                {
+                    let _ = command.response_tx.send(PeerOfferSendOutcome::Cancelled);
+                    continue;
+                }
+
+                let peer_id = command.to_node_id.clone();
+                let worker_tx = if let Some(sender) = candidate_workers.get(&peer_id) {
+                    sender.clone()
+                } else {
+                    let (sender, receiver) = mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
+                    candidate_tasks.spawn(run_candidate_offer_worker(
+                        receiver,
+                        candidate_http.clone(),
+                        auth_rx.clone(),
+                        event_tx.clone(),
+                    ));
+                    candidate_workers.insert(peer_id.clone(), sender.clone());
+                    sender
+                };
+                match worker_tx.try_send(command) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(command)) => {
+                        warn!(
+                            "Candidate offer queue full for {peer_id}; reason_code=candidate_offer_queue_full"
+                        );
+                        let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(command)) => {
+                        candidate_workers.remove(&peer_id);
+                        warn!(
+                            "Candidate offer worker closed for {peer_id}; reason_code=candidate_offer_worker_closed"
+                        );
+                        let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
                     }
                 }
             }
             else => break,
         }
+    }
+
+    candidate_tasks.abort_all();
+}
+
+/// One per-peer candidate worker.  Requests for different peers run in
+/// parallel, while this receiver preserves the strict order for one peer.
+async fn run_candidate_offer_worker(
+    mut rx: mpsc::Receiver<CandidateOfferCommand>,
+    http: Arc<reqwest::Client>,
+    mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
+    event_tx: mpsc::UnboundedSender<ControlEvent>,
+) {
+    while let Some(command) = rx.recv().await {
+        let CandidateOfferCommand {
+            to_node_id,
+            candidates,
+            session_id,
+            probe_ephemeral_public_key,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            fresh_ownership,
+            response_tx,
+        } = command;
+        let mut response_tx = response_tx;
+        let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
+        let Some(auth) = wait_for_critical_control_auth(
+            auth_rx.clone(),
+            &mut response_tx,
+            deadline,
+        )
+        .await
+        else {
+            continue;
+        };
+        if fresh_ownership
+            .as_ref()
+            .is_some_and(|ownership| ownership.is_cancelled())
+        {
+            let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+            continue;
+        }
+        // `wait_for_critical_control_auth` uses a clone of this receiver. Mark
+        // the worker's receiver as having observed the same registration so a
+        // duplicate publication of an unchanged token cannot cancel the
+        // request before it reaches the control server.
+        let current_auth = auth_rx.borrow_and_update().clone();
+        if current_auth.as_ref().is_some_and(|current| {
+            !auth.same_identity_as(current)
+        }) {
+            let _ = response_tx.send(PeerOfferSendOutcome::Failed);
+            continue;
+        }
+
+        let payload = match prepare_signal_payload(
+            &auth.self_node_id,
+            &to_node_id,
+            "peer_offer",
+            &candidates,
+            &candidate_sources,
+            &handshake_init,
+            punch_at_ms,
+            None,
+            session_id.as_deref(),
+            probe_ephemeral_public_key.as_deref(),
+            auth.signal_signing_identity.as_ref(),
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let _ = event_tx.send(ControlEvent::ServerError {
+                    code: 4000,
+                    message: error.to_string(),
+                });
+                let _ = response_tx.send(PeerOfferSendOutcome::Failed);
+                continue;
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = if remaining.is_zero() {
+            Err(DaemonError::ControlPlane(
+                "candidate offer deadline exceeded before delivery".into(),
+            ))
+        } else {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(DaemonError::ControlPlane(
+                        "candidate offer deadline exceeded before delivery".into(),
+                    ));
+                }
+                let result = tokio::select! {
+                    result = timeout(remaining, send_prepared_signal(
+                        &http,
+                        &auth.base_url,
+                        &auth.token,
+                        &payload,
+                    )) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(DaemonError::ControlPlane(
+                                "candidate offer deadline exceeded during request".into(),
+                            )),
+                        }
+                    }
+                    _ = response_tx.closed() => return,
+                    changed = auth_rx.changed() => {
+                        if changed.is_err() {
+                            break Err(DaemonError::ControlPlane(
+                                "candidate offer control identity watch closed".into(),
+                            ));
+                        }
+                        if auth_rx.borrow().as_ref().is_some_and(|current| {
+                            !auth.same_identity_as(current)
+                        }) {
+                            break Err(DaemonError::ControlPlane(
+                                "candidate offer control identity changed during request".into(),
+                            ));
+                        }
+                        // A duplicate publication of the same identity (for
+                        // example, after credential issuance) did not change
+                        // the authority.  No request was selected in this
+                        // branch, so retrying the immutable payload is safe.
+                        continue;
+                    }
+                };
+                break result;
+            }
+        };
+        let outcome = match result {
+            Ok(()) => {
+                debug!("Sent candidate peer_offer to {to_node_id} punch_at_ms={punch_at_ms:?}");
+                let _ = event_tx.send(ControlEvent::ControlHealthy);
+                PeerOfferSendOutcome::Sent
+            }
+            Err(error) => {
+                let _ = event_tx.send(ControlEvent::ServerError {
+                    code: 4000,
+                    message: error.to_string(),
+                });
+                PeerOfferSendOutcome::Failed
+            }
+        };
+        let _ = response_tx.send(outcome);
     }
 }
 

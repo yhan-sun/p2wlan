@@ -112,10 +112,26 @@ pub struct PeerConnection {
     pub relay_confirmed_at: Option<Instant>,
     /// Relay endpoint whose ingress carried the confirming ACK.
     pub relay_confirmed_endpoint: Option<String>,
+    /// Local relay transport incarnation whose encrypted probe ACK confirmed
+    /// the endpoint.  A reconnect/renewal can reuse the same endpoint, so an
+    /// endpoint string alone cannot identify the connection that was proven.
+    pub relay_confirmed_connection_id: Option<u64>,
+    /// Generation in which the first-business relay gate began waiting.  This
+    /// is distinct from `relay_ready_at`: the gate may start as soon as the
+    /// shared relay transport exists, before the per-peer session publishes
+    /// its ready milestone.
+    pub relay_first_gate_generation: Option<u64>,
+    /// Monotonic start of the bounded first-business relay gate.
+    pub relay_first_gate_started_at: Option<Instant>,
     /// Monotonic relay-confirm sequence.  Bumped (and mirrored in the peer
     /// manager, notified to outbound waiters) every time the peer's relay
     /// confirmation changes, mirroring [`direct_commit_seq`].
     pub relay_confirm_seq: u64,
+    /// Generation for which at least one real business packet was accepted by
+    /// the confirmed relay writer.  Direct may be confirmed in the
+    /// background, but it cannot become the first data-plane path until this
+    /// marker is set.
+    pub relay_first_business_sent_generation: Option<u64>,
     /// Local network generation of the first confirmed usable path
     /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
     /// milestone.
@@ -186,7 +202,11 @@ impl PeerConnection {
             relay_confirmed_generation: None,
             relay_confirmed_at: None,
             relay_confirmed_endpoint: None,
+            relay_confirmed_connection_id: None,
+            relay_first_gate_generation: None,
+            relay_first_gate_started_at: None,
             relay_confirm_seq: 0,
+            relay_first_business_sent_generation: None,
             first_usable_generation: None,
             first_usable_at: None,
             first_usable_path: None,
@@ -225,6 +245,10 @@ impl PeerConnection {
         self.relay_confirmed_generation = None;
         self.relay_confirmed_at = None;
         self.relay_confirmed_endpoint = None;
+        self.relay_confirmed_connection_id = None;
+        self.relay_first_gate_generation = None;
+        self.relay_first_gate_started_at = None;
+        self.relay_first_business_sent_generation = None;
         self.first_usable_generation = None;
         self.first_usable_at = None;
         self.first_usable_path = None;
@@ -316,12 +340,15 @@ impl PeerConnection {
         self.bytes_received += n;
     }
 
-    /// Record the first confirmed usable path for this peer + generation.
+    /// Record the first usable production ingress for this peer + generation.
     ///
-    /// `path` is `Direct` or `Relay` and only a CONFIRMED path may reach here
-    /// (a matching direct-validation ACK, or a matching forced-relay probe ACK
-    /// whose real ingress was relay). Emits exactly once per peer + generation;
-    /// later calls in the same generation no-op.
+    /// `path` is `Direct` or `Relay`.  The manager caller must supply the
+    /// authenticated ingress of a normal decrypted overlay business packet;
+    /// path confirmation and transport-local events are not substitutes for
+    /// that evidence.  The validation harness may impose an additional
+    /// bidirectional nonce/echo requirement before calling this method.
+    /// Emits exactly once per peer + generation; later calls in the same
+    /// generation no-op.
     pub fn record_first_usable(&mut self, path: NetworkPath, generation: u64) -> bool {
         if self.first_usable_generation == Some(generation) && self.first_usable_at.is_some() {
             return false;

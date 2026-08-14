@@ -63,7 +63,19 @@ impl Daemon {
         {
             return Ok(());
         }
-        let handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        let handshake_guard = match cancellation.as_deref_mut() {
+            Some(cancellation) => {
+                tokio::select! {
+                    biased;
+                    changed = cancellation.changed() => {
+                        let _ = changed;
+                        return Ok(());
+                    }
+                    guard = self.handshake_arbiter.acquire(from_node_id) => guard,
+                }
+            }
+            None => self.handshake_arbiter.acquire(from_node_id).await,
+        };
         if cancellation
             .as_deref()
             .is_some_and(|cancellation| *cancellation.borrow())
@@ -429,7 +441,19 @@ impl Daemon {
         // Re-enter the state boundary after the slow POST.  Lifecycle cleanup
         // can cancel this exact responder owner while the request is in
         // flight; a stale task must not refresh grace or commit a replacement.
-        let _handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        let _handshake_guard = match cancellation.as_deref_mut() {
+            Some(cancellation) => {
+                tokio::select! {
+                    biased;
+                    changed = cancellation.changed() => {
+                        let _ = changed;
+                        return Ok(());
+                    }
+                    guard = self.handshake_arbiter.acquire(from_node_id) => guard,
+                }
+            }
+            None => self.handshake_arbiter.acquire(from_node_id).await,
+        };
         if cancellation
             .as_deref()
             .is_some_and(|cancellation| *cancellation.borrow())
@@ -463,6 +487,16 @@ impl Daemon {
         // receive-only staged keys alive until their short TTL, allowing an
         // authenticated new-key packet to commit without changing outbound.
         answer_result?;
+        self.timeline.emit(
+            "peer_answer_control_accepted",
+            None,
+            None,
+            Some(format!(
+                "peer={} session_id={}",
+                from_node_id,
+                session_id.as_deref().unwrap_or("legacy")
+            )),
+        );
 
         let commit = self
             .transport
@@ -510,20 +544,23 @@ impl Daemon {
                 ),
             )
             .await;
+        self.timeline.emit(
+            "peer_answer_committed",
+            None,
+            None,
+            Some(format!(
+                "peer={} session_id={} commit={commit:?}",
+                from_node_id,
+                session_id.as_deref().unwrap_or("legacy")
+            )),
+        );
 
-        // The endpoint update and candidate refresh are NOT prerequisites of
-        // the answer: they run after it as bounded best-effort work and are
-        // aborted on PeerLeft or owner replacement.
-        let post_answer = self.post_answer_candidate_refresh_and_endpoint_publish();
-        match cancellation {
-            Some(cancellation) => {
-                tokio::select! {
-                    _ = post_answer => {}
-                    _ = cancellation.changed() => {}
-                }
-            }
-            None => post_answer.await,
-        }
+        // Candidate/endpoint publication is deliberately not awaited here.
+        // The answer owner is latency-critical and must be released as soon
+        // as the encrypted session is committed.  The regular candidate
+        // refresh worker publishes the cached/new mapping independently;
+        // doing that work in this owner made retransmissions wait behind an
+        // otherwise harmless four-second best-effort operation.
         Ok(())
     }
 

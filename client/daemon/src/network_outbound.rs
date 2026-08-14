@@ -33,6 +33,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,9 @@ use tracing::{debug, warn};
 
 use crate::connection_timeline::ConnectionTimeline;
 use crate::dataplane::OutboundPacket;
-use crate::peer::{NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED};
+use crate::peer::{
+    NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED, REASON_PATH_UNAVAILABLE,
+};
 use crate::relay::RelayTransport;
 use crate::transport::{EncryptedPeerPacket, WireGuardTransport};
 use crate::udp::UdpTransport;
@@ -130,6 +133,20 @@ enum RetryableSendFailure {
 
 enum TerminalSendFailure {
     DeliveryUncertain { reason: &'static str, err: String },
+}
+
+/// Result of an already-encrypted packet attempt on a confirmed Direct path.
+/// A successful UDP `send_to` is only a local kernel handoff, not a peer ACK;
+/// once it succeeds the WireGuard counter is consumed and the same ciphertext
+/// must never be replayed through Relay.
+enum DirectSendOutcome {
+    /// No datagram was handed to the local kernel. The counter can still be
+    /// handed to a confirmed Relay without replaying it.
+    NotHanded { err: String },
+    /// The kernel accepted the datagram; peer delivery remains unknown.
+    HandoffAccepted,
+    /// The result cannot be safely replayed through another path.
+    DeliveryUncertain { err: String },
 }
 
 impl RetryableSendFailure {
@@ -486,10 +503,10 @@ async fn handle_ingress(
         .await;
     }
 
-    let usable = peers.is_direct(&peer_id).await
-        || peers
-            .is_relay_peer_confirmed_for_generation(&peer_id, generation)
-            .await;
+    let relay_available = relay_transport.read().await.is_some();
+    let usable = peers
+        .is_data_path_admitted_for_generation(&peer_id, generation, relay_available)
+        .await;
     // Every business packet, including a packet arriving after confirmation,
     // enters the same per-peer FIFO. This is the critical distinction from the
     // old relay-first implementation, which could send a new live packet
@@ -757,10 +774,10 @@ async fn start_ready_peer_flushes(
                 continue;
             }
             let generation = peers.current_network_generation().await;
-            if peers.is_direct(peer_id).await
-                || peers
-                    .is_relay_peer_confirmed_for_generation(peer_id, generation)
-                    .await
+            let relay_available = relay_transport.read().await.is_some();
+            if peers
+                .is_data_path_admitted_for_generation(peer_id, generation, relay_available)
+                .await
             {
                 ready.push(peer_id.clone());
             }
@@ -799,8 +816,8 @@ async fn start_ready_peer_flushes(
 
 /// Flush one peer's queue. This is the sole owner of that peer's queue while
 /// it is in flight. A terminal/uncertain handoff stops the batch immediately:
-/// that counter is consumed, and later plaintext packets wait for a transport
-/// replacement instead of repeatedly timing out behind a dead writer.
+/// that counter is consumed, while later plaintext packets remain available
+/// for a replacement path and receive fresh counters.
 #[allow(clippy::too_many_arguments)]
 async fn flush_one_peer(
     peer_id: String,
@@ -834,10 +851,10 @@ async fn flush_one_peer(
             return (peer_id, PeerPendingQueue::new());
         }
 
-        let usable = peers.is_direct(&peer_id).await
-            || peers
-                .is_relay_peer_confirmed_for_generation(&peer_id, generation)
-                .await;
+        let relay_available = relay_transport.read().await.is_some();
+        let usable = peers
+            .is_data_path_admitted_for_generation(&peer_id, generation, relay_available)
+            .await;
         if !usable {
             queue.push_front(front);
             break;
@@ -888,23 +905,23 @@ async fn flush_one_peer(
                     &timeline,
                 )
                 .await;
-                // Do not push this packet back: its counter may have reached
-                // the transport. The remaining plaintext packets cannot be
-                // sent behind an uncertain handoff without a new, proven
-                // path; account them as the same terminal loss now instead
-                // of leaving a queue that can spin forever while the stale
-                // confirmation remains visible.
-                while let Some(PendingPacket::Plain(remaining)) = queue.pop_front() {
-                    record_terminal_drop(
-                        &transport,
-                        &peers,
-                        &peer_id,
-                        remaining,
-                        reason_code,
-                        "remaining FIFO entries abandoned after uncertain handoff".to_string(),
-                        &timeline,
-                    )
-                    .await;
+                // The failed packet's counter is terminal, but later entries
+                // are still plaintext and have no counter yet. Keep them in
+                // FIFO order so a newly confirmed path can encrypt them with
+                // fresh counters. Never replay the uncertain ciphertext and
+                // never silently erase later business packets.
+                if !queue.queue.is_empty() {
+                    queue.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
+                    timeline.emit(
+                        "outbound_fifo_reparked_after_terminal",
+                        None,
+                        Some(reason_code),
+                        Some(format!(
+                            "peer={peer_id} remaining_packets={} remaining_bytes={} prior_counter_terminal=true",
+                            queue.queue.len(),
+                            queue.bytes
+                        )),
+                    );
                 }
                 break;
             }
@@ -1057,20 +1074,26 @@ async fn record_terminal_drop(
 }
 
 fn relay_send_failure(err: &crate::error::DaemonError) -> SendOutcome {
-    let text = err.to_string();
     // These typed relay outcomes prove the frame was rejected before the
     // writer owned it, so plaintext may be re-encrypted. A writer completion
-    // loss or an interrupted write is deliberately not in this set.
-    if text.contains("reason_code=relay_command_queue_full")
-        || text.contains("reason_code=relay_writer_stopped_before_accept")
-    {
-        SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded { err: text })
-    } else {
-        SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
-            reason: REASON_RELAY_DELIVERY_UNCERTAIN,
-            err: text,
-        })
+    // loss or an interrupted write is deliberately not in this set. Do not
+    // classify by formatted text: that would turn a future wording change
+    // into a possible replay of an old WireGuard counter.
+    if let crate::error::DaemonError::RelaySend { error, .. } = err {
+        if matches!(
+            error,
+            p2pnet_relay::RelayError::CommandQueueFull
+                | p2pnet_relay::RelayError::WriterStoppedBeforeAccept
+        ) {
+            return SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded {
+                err: err.to_string(),
+            });
+        }
     }
+    SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+        reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+        err: err.to_string(),
+    })
 }
 
 /// Periodic maintenance: expire startup deadlines, cancel waits on peer
@@ -1102,10 +1125,10 @@ async fn maintenance(
             if !entry.wait_deadline.is_some_and(|deadline| now >= deadline) {
                 continue;
             }
+            let relay_available = relay_transport.read().await.is_some();
             let usable = peers
-                .is_relay_peer_confirmed_for_generation(peer_id, generation)
-                .await
-                || peers.is_direct(peer_id).await;
+                .is_data_path_admitted_for_generation(peer_id, generation, relay_available)
+                .await;
             if !usable {
                 expired.push(peer_id.clone());
             }
@@ -1273,31 +1296,54 @@ async fn send_encrypted_packet_bounded(
     relay_transport: &RwLock<Option<RelayTransport>>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
-    // If the supervisor replaces it while this send is stalled, abort only
-    // the old writer; never tear down the replacement transport.
-    let relay_at_start = relay_transport.read().await.clone();
+    // The same snapshot is passed into the send operation, so a supervisor
+    // replacement cannot make the timeout abort one relay while the packet is
+    // actually blocked on another. The replacement remains available for the
+    // next plaintext retry.
+    let relay_for_send = relay_transport.read().await.clone();
+    let relay_at_start = relay_for_send.clone();
+    let relay_send_started = AtomicBool::new(false);
     match timeout(
         OUTBOUND_SEND_TIMEOUT,
-        send_encrypted_packet_once(packet, peers, prefer_direct, udp_transport, relay_transport),
+        send_encrypted_packet_once(
+            packet,
+            peers,
+            prefer_direct,
+            udp_transport,
+            relay_for_send,
+            &relay_send_started,
+        ),
     )
     .await
     {
         Ok(outcome) => outcome,
         Err(_) => {
-            if let Some(relay) = relay_at_start {
-                relay.abort_writer();
+            if relay_send_started.load(Ordering::Acquire) {
+                if let Some(relay) = relay_at_start {
+                    relay.abort_writer();
+                }
             }
-            outbound_send_timeout_failure()
+            // UDP `send_to` normally completes immediately, but classify the
+            // timeout from the committed state as well: a Direct timeout is
+            // not a relay writer timeout, and the loss counters must preserve
+            // that distinction for incident diagnosis.
+            if relay_send_started.load(Ordering::Acquire) {
+                outbound_send_timeout_failure_for_path(REASON_RELAY_DELIVERY_UNCERTAIN)
+            } else if peers.is_direct_sync(&packet.peer_id) && prefer_direct {
+                outbound_send_timeout_failure_for_path(REASON_DIRECT_DELIVERY_UNCERTAIN)
+            } else {
+                outbound_send_timeout_failure_for_path(REASON_PATH_UNAVAILABLE)
+            }
         }
     }
 }
 
-fn outbound_send_timeout_failure() -> SendOutcome {
+fn outbound_send_timeout_failure_for_path(reason: &'static str) -> SendOutcome {
     // A timeout does not tell us whether the relay accepted the ciphertext.
     // The caller therefore terminally consumes this counter and records the
     // original plaintext as a loss; it must never re-encrypt/retry this packet.
     SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
-        reason: REASON_RELAY_DELIVERY_UNCERTAIN,
+        reason,
         err: "outbound send timed out".to_string(),
     })
 }
@@ -1307,9 +1353,13 @@ async fn send_encrypted_packet_once(
     peers: &PeerManager,
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
-    relay_transport: &RwLock<Option<RelayTransport>>,
+    relay: Option<RelayTransport>,
+    relay_send_started: &AtomicBool,
 ) -> SendOutcome {
-    let relay = relay_transport.read().await.clone();
+    let generation = peers.current_network_generation().await;
+    let relay_peer_confirmed = peers
+        .is_relay_peer_confirmed_for_generation(&packet.peer_id, generation)
+        .await;
     let relay_available = relay.is_some();
     let udp = udp_transport.read().await.clone();
     let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
@@ -1323,92 +1373,71 @@ async fn send_encrypted_packet_once(
     .await;
 
     if selection.direct_confirmed {
-        let sent_direct =
-            send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await;
-
-        if sent_direct && !selection.relay_hedged {
-            return SendOutcome::Sent;
+        match send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await {
+            DirectSendOutcome::HandoffAccepted => return SendOutcome::Sent,
+            DirectSendOutcome::DeliveryUncertain { err } => {
+                // The Direct counter may have reached the kernel. Never send
+                // this ciphertext over Relay; terminally account this packet
+                // and let later plaintext entries receive fresh counters.
+                return SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+                    reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
+                    err,
+                });
+            }
+            DirectSendOutcome::NotHanded { err } => {
+                // No Direct handoff occurred, so a confirmed Relay may safely
+                // carry this same ciphertext without replaying its counter.
+                if relay_peer_confirmed {
+                    if let Some(relay) = relay {
+                        relay_send_started.store(true, Ordering::Release);
+                        return match relay.send_packet(packet).await {
+                            Ok(_) => {
+                                peers
+                                    .mark_relay_first_business_sent_for_generation(
+                                        &packet.peer_id,
+                                        generation,
+                                    )
+                                    .await;
+                                SendOutcome::Sent
+                            }
+                            Err(err) => relay_send_failure(&err),
+                        };
+                    }
+                }
+                return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+                    reason: format!("confirmed Direct was not handed off: {err}"),
+                    reason_code: REASON_PATH_UNAVAILABLE,
+                });
+            }
         }
+    }
 
+    // Until Direct is confirmed by decrypted traffic, Relay is the only
+    // business data-plane.  It must also be peer-confirmed: a relay client
+    // connection or writer completion is not enough to admit a counter.
+    if relay_peer_confirmed {
         if let Some(relay) = relay {
+            relay_send_started.store(true, Ordering::Release);
             return match relay.send_packet(packet).await {
-                Ok(_) => SendOutcome::Sent,
-                Err(err) if sent_direct => {
-                    debug!(
-                        "Relay hedge send failed for peer {} after confirmed direct send: {err}",
-                        packet.peer_id
-                    );
+                Ok(_) => {
+                    peers
+                        .mark_relay_first_business_sent_for_generation(&packet.peer_id, generation)
+                        .await;
                     SendOutcome::Sent
                 }
                 Err(err) => relay_send_failure(&err),
             };
         }
-
-        return if sent_direct {
-            SendOutcome::Sent
-        } else {
-            SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
-                reason: selection.reason,
-                reason_code: selection.reason_code,
-            })
-        };
+        return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+            reason: "relay peer was confirmed but relay transport is unavailable".to_string(),
+            reason_code: REASON_PATH_UNAVAILABLE,
+        });
     }
-
-    // Until Direct is confirmed by decrypted traffic, Relay is the reliable
-    // data-plane. A UDP send during Direct trial is only a hedge/probe: it must
-    // never make the user packet look delivered if Relay is absent or fails.
-    if let Some(relay) = relay {
-        match relay.send_packet(packet).await {
-            Ok(_) => {
-                let _ = send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint)
-                    .await;
-                SendOutcome::Sent
-            }
-            Err(err) => {
-                // A confirmed direct send is sufficient evidence that this
-                // packet was delivered even if the optional relay hedge
-                // failed. An unconfirmed direct send may still rescue a
-                // relay failure; only retry/drop when both paths fail.
-                // This is the ONLY Direct handoff in the relay-failure path.
-                // Never call send_direct_if_selected twice for one ciphertext:
-                // UDP send completion is an uncertain handoff, and a second
-                // copy with the same WireGuard counter would be a deliberate
-                // replay at the receiver.
-                let direct_handed =
-                    send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint)
-                        .await;
-                if direct_handed {
-                    // This is only a UDP handoff while Direct is still a
-                    // trial. It is not end-to-end evidence, so the packet's
-                    // counter is consumed and the payload is terminally
-                    // accounted for rather than re-encrypted and duplicated.
-                    direct_delivery_uncertain()
-                } else {
-                    relay_send_failure(&err)
-                }
-            }
-        }
-    } else {
-        let direct_handed =
-            send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await;
-        if direct_handed {
-            // UDP send_to completed, but the Direct path is unconfirmed. The
-            // receiver may have accepted this counter, therefore retrying the
-            // plaintext with a fresh counter would create a duplicate.
-            direct_delivery_uncertain()
-        } else {
-            SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
-                reason: selection.reason,
-                reason_code: selection.reason_code,
-            })
-        }
-    }
-}
-
-fn direct_delivery_uncertain() -> SendOutcome {
-    SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
-        reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
-        err: "Direct UDP handoff completed before end-to-end confirmation".to_string(),
+    // A candidate RTT / Direct trial is not a data-plane admission proof.
+    // Keep the raw packet queued until Relay or a real Direct ACK exists.
+    SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
+        reason: selection.reason,
+        reason_code: selection.reason_code,
     })
 }
 
@@ -1444,7 +1473,7 @@ async fn send_direct_if_selected(
     udp: Option<UdpTransport>,
     selection: &PathSelection,
     udp_local_endpoint: Option<SocketAddr>,
-) -> bool {
+) -> DirectSendOutcome {
     // A candidate probe or nomination is not an encrypted data-plane proof.
     // Business packets must never use a Direct trial: sending the same
     // ciphertext as a relay hedge can create duplicate/reordered delivery,
@@ -1452,15 +1481,17 @@ async fn send_direct_if_selected(
     // status unknowable.  The direct-validation worker owns trial probes;
     // this function accepts only the committed Direct state.
     if selection.path != Some(NetworkPath::Direct) || !selection.direct_confirmed {
-        return false;
+        return DirectSendOutcome::NotHanded {
+            err: "Direct path is not encrypted-confirmed".to_string(),
+        };
     }
 
     match (udp, selection.direct_endpoint) {
         (Some(udp), Some(endpoint)) => match udp.send_packet_to(packet, endpoint).await {
-            Ok(_) => true,
+            Ok(_) => DirectSendOutcome::HandoffAccepted,
             Err(err) => {
                 warn!(
-                    "Direct UDP send failed for peer {}; trying relay fallback: {err}",
+                    "Direct UDP send failed for peer {}; delivery is uncertain and the ciphertext will not be replayed: {err}",
                     packet.peer_id
                 );
                 peers
@@ -1471,7 +1502,9 @@ async fn send_direct_if_selected(
                         udp_local_endpoint,
                     )
                     .await;
-                false
+                DirectSendOutcome::DeliveryUncertain {
+                    err: format!("Direct UDP send result uncertain: {err}"),
+                }
             }
         },
         (None, _) => {
@@ -1483,7 +1516,9 @@ async fn send_direct_if_selected(
                     udp_local_endpoint,
                 )
                 .await;
-            false
+            DirectSendOutcome::NotHanded {
+                err: "UDP transport unavailable for encrypted packet".to_string(),
+            }
         }
         (_, None) => {
             peers
@@ -1494,7 +1529,9 @@ async fn send_direct_if_selected(
                     udp_local_endpoint,
                 )
                 .await;
-            false
+            DirectSendOutcome::NotHanded {
+                err: "path selector chose direct without an endpoint".to_string(),
+            }
         }
     }
 }
@@ -1505,11 +1542,14 @@ mod tests {
 
     #[test]
     fn relay_queue_full_and_writer_closed_are_safe_plaintext_retries() {
-        for message in [
-            "reason_code=relay_command_queue_full",
-            "reason_code=relay_writer_stopped_before_accept",
+        for error in [
+            p2pnet_relay::RelayError::CommandQueueFull,
+            p2pnet_relay::RelayError::WriterStoppedBeforeAccept,
         ] {
-            let outcome = relay_send_failure(&crate::error::DaemonError::Relay(message.into()));
+            let outcome = relay_send_failure(&crate::error::DaemonError::RelaySend {
+                endpoint: "tcp://relay.test:1".to_string(),
+                error,
+            });
             assert!(matches!(
                 outcome,
                 SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded { .. })
@@ -1519,9 +1559,12 @@ mod tests {
 
     #[test]
     fn unknown_relay_failure_is_terminal_delivery_uncertain() {
-        let outcome = relay_send_failure(&crate::error::DaemonError::Relay(
-            "relay protocol rejected frame after write".into(),
-        ));
+        let outcome = relay_send_failure(&crate::error::DaemonError::RelaySend {
+            endpoint: "tcp://relay.test:1".to_string(),
+            error: p2pnet_relay::RelayError::WriteUncertain(
+                "relay protocol rejected frame after write".into(),
+            ),
+        });
         assert!(matches!(
             outcome,
             SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
@@ -1534,7 +1577,7 @@ mod tests {
     #[test]
     fn send_timeout_is_terminal_delivery_uncertain() {
         assert!(matches!(
-            outbound_send_timeout_failure(),
+            outbound_send_timeout_failure_for_path(REASON_RELAY_DELIVERY_UNCERTAIN),
             SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
                 reason: REASON_RELAY_DELIVERY_UNCERTAIN,
                 ..
@@ -1543,9 +1586,13 @@ mod tests {
     }
 
     #[test]
-    fn unconfirmed_direct_handoff_is_terminal_not_a_plaintext_retry() {
+    fn uncertain_direct_handoff_is_terminal_and_not_relay_replayed() {
+        let outcome = SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
+            reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
+            err: "Direct UDP send result uncertain".to_string(),
+        });
         assert!(matches!(
-            direct_delivery_uncertain(),
+            outcome,
             SendOutcome::Terminal(TerminalSendFailure::DeliveryUncertain {
                 reason: REASON_DIRECT_DELIVERY_UNCERTAIN,
                 ..

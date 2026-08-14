@@ -21,6 +21,31 @@ fn flood_peer_113(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> Peer
 }
 
 #[tokio::test]
+async fn relay_probe_targets_keep_direct_peer_for_background_upgrade() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.113:51820".parse().unwrap();
+    manager.add_peer(&test_peer("peer-direct", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer-direct",
+            endpoint,
+            Some(Duration::from_millis(8)),
+        )
+        .await;
+    manager
+        .record_direct_success("peer-direct", Some(endpoint))
+        .await;
+
+    let targets = manager.relay_probe_targets().await;
+    assert!(
+        targets
+            .iter()
+            .any(|(peer_id, _, _)| peer_id == "peer-direct"),
+        "a Direct peer must still receive background relay-first confirmation"
+    );
+}
+
+#[tokio::test]
 async fn budget_exhausted_recovery_does_not_spin_or_rebuild_wide_plan() {
     let manager = PeerManager::new(test_config());
     manager

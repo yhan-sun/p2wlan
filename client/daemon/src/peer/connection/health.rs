@@ -319,10 +319,26 @@ impl PeerConnection {
             self.first_usable_at = None;
             self.first_usable_path = None;
         }
+        // A true network handover invalidates the local relay transport
+        // milestone as well as the encrypted peer confirmation. Keeping the
+        // old ready timestamp would make a new generation look relay-ready
+        // before its session/writer has actually been rebuilt.
+        if self.relay_ready_generation != Some(local_generation) {
+            self.relay_ready_generation = None;
+            self.relay_ready_at = None;
+            self.relay_ready_endpoint = None;
+            self.relay_first_business_sent_generation = None;
+        }
+        if self.relay_first_gate_generation != Some(local_generation) {
+            self.relay_first_gate_generation = None;
+            self.relay_first_gate_started_at = None;
+        }
         if self.relay_confirmed_generation != Some(local_generation) {
             self.relay_confirmed_generation = None;
             self.relay_confirmed_at = None;
             self.relay_confirmed_endpoint = None;
+            self.relay_confirmed_connection_id = None;
+            self.relay_first_business_sent_generation = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
             if self.state == ConnectionState::Relay {
                 self.transition(ConnectionState::FallbackToRelay);
@@ -353,14 +369,25 @@ impl PeerConnection {
             self.first_usable_at = None;
             self.first_usable_path = None;
         }
-        if self.relay_confirmed_generation != Some(local_generation) {
-            self.relay_confirmed_generation = None;
-            self.relay_confirmed_at = None;
-            self.relay_confirmed_endpoint = None;
-            self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
-            if self.state == ConnectionState::Relay {
-                self.transition(ConnectionState::FallbackToRelay);
-            }
+        // A candidate-refresh generation is a Direct-candidate epoch, not a
+        // relay-session replacement. Keep the already encrypted-confirmed
+        // relay ingress usable while new UDP candidates are probed in the
+        // background. True network handover, peer restart and relay transport
+        // replacement use the separate invalidation paths and still revoke
+        // this proof.
+        if self.relay_confirmed_at.is_some() && self.relay_confirmed_endpoint.is_some() {
+            self.relay_confirmed_generation = Some(local_generation);
+            self.relay_ready_generation = Some(local_generation);
+            self.relay_first_business_sent_generation = None;
+            self.relay_first_gate_generation = None;
+            self.relay_first_gate_started_at = None;
+        } else {
+            self.relay_ready_generation = None;
+            self.relay_ready_at = None;
+            self.relay_ready_endpoint = None;
+            self.relay_first_business_sent_generation = None;
+            self.relay_first_gate_generation = None;
+            self.relay_first_gate_started_at = None;
         }
         let retained_confirmed_direct = (self.state == ConnectionState::Direct)
             .then(|| {

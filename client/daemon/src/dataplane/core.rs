@@ -16,6 +16,16 @@ pub struct InboundPacket {
     pub peer_id: String,
     /// Raw IP packet bytes decrypted from the peer transport session.
     pub packet: Vec<u8>,
+    /// Opaque local transport-session instance that authenticated this
+    /// packet. Synthetic/unit-test dataplane packets leave this unset. The
+    /// inbound worker uses it to reject a packet that was decrypted just as
+    /// the session was removed or replaced.
+    pub session_instance: Option<u64>,
+    /// True when the packet authenticated with the receive-only overlap key
+    /// from the previous session. Such packets may still be delivered during
+    /// the bounded WireGuard overlap window, but they are never path or
+    /// first-usable evidence for the current session.
+    pub from_previous_session: bool,
 }
 
 /// Reads packets from a virtual interface and routes them by destination IP.

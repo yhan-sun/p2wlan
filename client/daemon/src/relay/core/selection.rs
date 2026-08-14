@@ -7,7 +7,7 @@ fn duration_millis(duration: Duration) -> u64 {
 /// is the explicit preference window: it must be very short so a black-hole
 /// candidate never stretches the total selection time, while still letting a
 /// preferred candidate that is already mid-connect win.
-const RELAY_SELECTION_PREFERENCE_WINDOW: Duration = Duration::from_millis(25);
+const RELAY_SELECTION_PREFERENCE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Connect to all valid relay candidates concurrently and select the best one.
 /// Preferred regions win first; connection latency and config order break ties.
@@ -174,18 +174,23 @@ pub(crate) async fn select_relay_with_cooldowns(
     let mut preference_deadline: Option<Instant> = None;
 
     loop {
-        // Best-ranked preference rank among ALL connectable candidates.
+        // Best-ranked candidate among ALL connectable candidates.  The
+        // catalog index is an intentional deterministic tie-break: both
+        // peers must normally select the same relay, otherwise an isolated
+        // relay pair reports peer_not_found even though both TCP connects
+        // succeeded.  We still connect candidates concurrently, and the
+        // short preference window below prevents a dead first candidate from
+        // delaying a reachable fallback.
         let best_rank = candidates
             .iter()
-            .map(|candidate| candidate.preference_rank)
+            .map(|candidate| (candidate.preference_rank, candidate.index))
             .min();
         // Once we have a success, stop early if the best-ranked candidate has
         // succeeded (publish immediately) or the preference window elapsed.
         if first_success_at.is_some() {
-            if connected
-                .iter()
-                .any(|c: &ConnectedCandidate| Some(c.candidate.preference_rank) == best_rank)
-            {
+            if connected.iter().any(|c: &ConnectedCandidate| {
+                Some((c.candidate.preference_rank, c.candidate.index)) == best_rank
+            }) {
                 break;
             }
             if preference_deadline

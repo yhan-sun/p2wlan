@@ -1070,6 +1070,9 @@ enum PendingProbePurpose {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PunchSocketPolicy {
+    /// Bounded latency-sensitive prefix: use every already-bound socket for
+    /// this one sweep without changing the transport-wide NAT-profile gate.
+    FastPrefixPool,
     ActivePool,
     RemoteScatterPool,
     StableUniqueScatter,
@@ -1085,6 +1088,7 @@ enum PunchSocketPolicy {
 impl PunchSocketPolicy {
     fn socket_count(self, transport: &UdpTransport) -> usize {
         match self {
+            Self::FastPrefixPool => transport.socket_count(),
             Self::ActivePool => transport.punch_socket_count(),
             Self::RemoteScatterPool => transport.socket_count(),
             Self::StableUniqueScatter => 1,
@@ -1095,6 +1099,7 @@ impl PunchSocketPolicy {
 
     fn label(self) -> &'static str {
         match self {
+            Self::FastPrefixPool => "fast_prefix_pool",
             Self::ActivePool => "active_pool",
             Self::RemoteScatterPool => "remote_scatter_pool",
             Self::StableUniqueScatter => "stable_unique_scatter",

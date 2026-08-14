@@ -1,6 +1,10 @@
 /// Sends and receives encrypted WireGuard datagrams through a relay server.
 #[derive(Clone)]
 pub struct RelayTransport {
+    /// Process-local incarnation of this relay connection. Clones retain the
+    /// same id; reconnects and make-before-break replacements receive a new
+    /// id even when endpoint and network generation are unchanged.
+    relay_connection_id: u64,
     relay_region: String,
     relay_endpoint: String,
     connect_latency_ms: u64,
@@ -14,6 +18,9 @@ pub struct RelayTransport {
     /// schedules the make-before-break renewal from this deadline.
     ticket_expires_at_unix: Option<i64>,
 }
+
+static NEXT_RELAY_CONNECTION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 impl RelayTransport {
     /// Connect to a relay server and register this node ID (legacy, no TLS/ticket).
@@ -102,6 +109,10 @@ impl RelayTransport {
 
         Ok((
             Self {
+                relay_connection_id: NEXT_RELAY_CONNECTION_ID.fetch_add(
+                    1,
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
                 relay_region: relay_region.to_string(),
                 relay_endpoint: relay_endpoint.to_string(),
                 connect_latency_ms: duration_millis(started.elapsed()),
@@ -152,6 +163,10 @@ impl RelayTransport {
         peers: Arc<PeerManager>,
     ) -> Self {
         Self {
+            relay_connection_id: NEXT_RELAY_CONNECTION_ID.fetch_add(
+                1,
+                std::sync::atomic::Ordering::Relaxed,
+            ),
             relay_region: relay_region.to_string(),
             relay_endpoint: relay_endpoint.to_string(),
             connect_latency_ms: 0,
@@ -173,6 +188,12 @@ impl RelayTransport {
         &self.relay_endpoint
     }
 
+    /// Process-local connection incarnation used to reject ACKs delivered by
+    /// a superseded relay reader after a same-endpoint replacement.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.relay_connection_id
+    }
+
     /// TCP connect plus relay registration latency.
     pub fn connect_latency_ms(&self) -> u64 {
         self.connect_latency_ms
@@ -191,13 +212,9 @@ impl RelayTransport {
         self.client
             .send_data(&packet.peer_id, &packet.wire_bytes)
             .await
-            .map_err(|e| {
-                DaemonError::Relay(format!(
-                    "relay send to peer {} via {} failed reason_code={}: {e}",
-                    packet.peer_id,
-                    self.relay_endpoint,
-                    e.to_snake_case()
-                ))
+            .map_err(|error| DaemonError::RelaySend {
+                endpoint: self.relay_endpoint.clone(),
+                error,
             })?;
 
         self.peers
@@ -319,9 +336,11 @@ impl RelayTransport {
                             source: None,
                             local_endpoint: None,
                             relay_endpoint: Some(self.relay_endpoint.clone()),
+                            relay_connection_id: Some(self.relay_connection_id),
                             relay_peer_id: Some(from_node),
                             socket_index: None,
                             udp_transport_owner: None,
+                            network_generation: Some(self.peers.current_network_generation_sync()),
                             wire_bytes: data,
                         })
                         .await

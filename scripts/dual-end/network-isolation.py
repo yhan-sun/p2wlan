@@ -122,6 +122,63 @@ def prove_isolation(control_url, token, network_id, expected_ids, deadline_s=20,
     }
 
 
+def prove_target_nodes(control_url, token, network_id, expected_ids, deadline_s=20, poll_s=0.5):
+    """Prove target nodes are online without claiming network isolation.
+
+    This is an explicitly opt-in diagnostic for shared staging. It records
+    every unrelated active device and never deletes or ignores those devices,
+    so its result cannot be mistaken for a strict isolated acceptance.
+    """
+    expected = set(expected_ids)
+    if len(expected) != 2:
+        return {
+            "ok": False,
+            "reason": "expected_exactly_two_nodes",
+            "expected_ids": sorted(expected),
+        }
+    deadline = time.time() + deadline_s
+    last_error = None
+    probes = []
+    while time.time() < deadline:
+        try:
+            nodes = list_nodes(control_url, token, network_id)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+            last_error = {"reason": "nodes_list_failed", "detail": str(exc)}
+            time.sleep(poll_s)
+            continue
+        active = active_node_ids(nodes)
+        probes.append({
+            "device_rows": len(nodes),
+            "active_ids": sorted(active),
+            "missing": sorted(expected - active),
+            "third_party_active": sorted(active - expected),
+        })
+        if expected <= active:
+            return {
+                "ok": True,
+                "reason": "target_nodes_online_shared_network",
+                "active_ids": sorted(active),
+                "expected_ids": sorted(expected),
+                "third_party_active": sorted(active - expected),
+                "device_rows": len(nodes),
+                "inert_historical_rows": len(nodes) - len(active),
+                "probes": probes,
+            }
+        last_error = {
+            "reason": "target_roster_not_converged",
+            "active": sorted(active),
+            "expected": sorted(expected),
+        }
+        time.sleep(poll_s)
+    return {
+        "ok": False,
+        "reason": (last_error or {"reason": "target_roster_deadline"})["reason"],
+        "detail": last_error.get("detail") if last_error else None,
+        "expected_ids": sorted(expected),
+        "probes": probes[-8:],
+    }
+
+
 def delete_device(control_url, token, device_id, timeout_s=8):
     """DELETE /api/v1/devices/{id} with the round account token.
 
@@ -256,6 +313,16 @@ def main(argv):
         )
         print(json.dumps(report, sort_keys=True))
         return 0 if report["ok"] else 1
+    if len(argv) >= 7 and argv[1] == "--prove-target":
+        control_url, token, network_id, mini_id, air_id = argv[2:7]
+        deadline = 20
+        if "--deadline" in argv:
+            deadline = int(argv[argv.index("--deadline") + 1])
+        report = prove_target_nodes(
+            control_url, token, network_id, [mini_id, air_id], deadline_s=deadline
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["ok"] else 1
     if len(argv) >= 5 and argv[1] == "--delete":
         control_url, token, device_id = argv[2:5]
         ok, status, body = delete_device(control_url, token, device_id)
@@ -298,6 +365,7 @@ def main(argv):
         return 0 if report["ok"] else 1
     raise SystemExit(
         "usage: network-isolation.py --prove CONTROL_URL TOKEN NETWORK_ID MINI_ID AIR_ID [--deadline S]\n"
+        "       network-isolation.py --prove-target CONTROL_URL TOKEN NETWORK_ID MINI_ID AIR_ID [--deadline S]\n"
         "       network-isolation.py --delete CONTROL_URL TOKEN DEVICE_ID\n"
         "       network-isolation.py --delete-by-name CONTROL_URL TOKEN NETWORK_ID NAME...\n"
         "       network-isolation.py --prove-cleaned CONTROL_URL TOKEN NETWORK_ID DEVICE_ID... [--deadline S]\n"

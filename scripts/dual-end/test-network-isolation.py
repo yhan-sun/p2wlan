@@ -118,6 +118,27 @@ class NetworkIsolationTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["reason"], "third_party_active_node")
 
+    def test_target_scoped_proof_records_third_party_without_claiming_isolation(self):
+        FakeControl.nodes = [
+            node("mini", True, 100),
+            node("air", True, 100),
+            node("intruder", True, 100),
+        ]
+        report = ISO.prove_target_nodes(
+            self.url, "tok", "default", ["mini", "air"], deadline_s=5
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["reason"], "target_nodes_online_shared_network")
+        self.assertEqual(report["third_party_active"], ["intruder"])
+
+    def test_target_scoped_proof_still_requires_both_targets(self):
+        FakeControl.nodes = [node("mini", True, 100), node("intruder", True, 100)]
+        report = ISO.prove_target_nodes(
+            self.url, "tok", "default", ["mini", "air"], deadline_s=3
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["reason"], "target_roster_not_converged")
+
     def test_registration_transient_then_converged_passes(self):
         def gradually_activate():
             FakeControl.nodes = [node("mini", True, 100)]
@@ -220,6 +241,18 @@ class NetworkIsolationTest(unittest.TestCase):
         self.assertNotEqual(bad.returncode, 0)
         report = json.loads(bad.stdout)
         self.assertEqual(report["reason"], "third_party_active_node")
+
+    def test_cli_target_proof_is_explicit_and_reports_shared_devices(self):
+        FakeControl.nodes = [node("mini", True, 100), node("air", True, 100), node("x", True, 1)]
+        result = subprocess.run(
+            ["python3", str(pathlib.Path(__file__).with_name("network-isolation.py")),
+             "--prove-target", self.url, "tok", "default", "mini", "air", "--deadline", "5"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reason"], "target_nodes_online_shared_network")
+        self.assertEqual(report["third_party_active"], ["x"])
 
     def test_cli_delete_exit_code_distinguishes_failure(self):
         FakeControl.delete_results = [(200, "{}")]

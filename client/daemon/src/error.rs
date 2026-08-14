@@ -32,6 +32,19 @@ pub enum DaemonError {
     #[error("relay error: {0}")]
     Relay(String),
 
+    /// A relay data command failed after the daemon handed it to the relay
+    /// client's command boundary.  Keeping the original typed relay error is
+    /// important here: `try_send` rejection is safe to re-encrypt from
+    /// plaintext, while a writer completion error is delivery-uncertain and
+    /// must consume the WireGuard counter terminally.  Flattening both into a
+    /// string makes that distinction brittle and can reintroduce replay.
+    #[error("relay send to {endpoint} failed reason_code={}: {error}", error.to_snake_case())]
+    RelaySend {
+        endpoint: String,
+        #[source]
+        error: p2pnet_relay::RelayError,
+    },
+
     /// Port mapping error.
     #[error("port mapping error: {0}")]
     PortMapping(String),

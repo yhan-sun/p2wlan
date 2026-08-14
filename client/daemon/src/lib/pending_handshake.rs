@@ -23,10 +23,12 @@ enum ResponderHandshakeCacheLookup {
 
 /// A peer offer admitted to the single responder worker for that peer.
 ///
-/// The control event loop performs candidate/fresh-generation admission before
-/// constructing this value.  The worker only owns the WireGuard response and
-/// its slow candidate/control-plane work.  When another offer arrives while
-/// the worker is active, the newest value replaces the one queued here.
+/// Candidate admission may run after this value has been queued.  The
+/// responder worker owns the latency-critical WireGuard response and must not
+/// wait behind candidate refresh or fresh-generation work.  When another
+/// offer arrives while the worker is active, the newest value replaces the
+/// one queued here.
+#[derive(Clone)]
 struct PendingPeerOffer {
     from_node_id: String,
     candidates: Vec<String>,
@@ -355,6 +357,18 @@ impl PendingHandshakeState {
         &mut self,
         offer: PendingPeerOffer,
     ) -> Option<(ResponderWorkReservation, PendingPeerOffer)> {
+        // A lifecycle cancellation must never leave a dead owner accepting
+        // newer offers.  `clear_peer` normally removes the owner atomically,
+        // but checking the watch here also closes the boundary where a
+        // cancellation notification has become visible before a late event
+        // reaches this state machine.
+        let cancelled = self
+            .responder_workers
+            .get(&offer.from_node_id)
+            .is_some_and(|worker| *worker.cancellation.borrow());
+        if cancelled {
+            self.responder_workers.remove(&offer.from_node_id);
+        }
         if let Some(worker) = self.responder_workers.get_mut(&offer.from_node_id) {
             worker.queued = Some(offer);
             return None;
@@ -379,10 +393,6 @@ impl PendingHandshakeState {
             },
             offer,
         ))
-    }
-
-    fn has_responder_worker(&self, peer_id: &str) -> bool {
-        self.responder_workers.contains_key(peer_id)
     }
 
     /// Take a newer offer without releasing the current responder owner.

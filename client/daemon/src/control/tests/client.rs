@@ -516,6 +516,8 @@ enum MockAction {
     Stall,
     /// Respond with HTTP 500 immediately.
     Fail500,
+    /// Delay a successful response without holding the connection forever.
+    Delay200,
 }
 
 struct HttpRequest {
@@ -658,6 +660,15 @@ impl MockControlServer {
                                     .await;
                                 }
                                 MockAction::Fail500 => mock_respond(stream, 500, "{}").await,
+                                MockAction::Delay200 => {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    mock_respond(
+                                        stream,
+                                        200,
+                                        r#"{"success":true,"protocol_version":1}"#,
+                                    )
+                                    .await;
+                                }
                                 MockAction::Stall => {
                                     tokio::time::sleep(Duration::from_secs(120)).await;
                                 }
@@ -748,6 +759,22 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
     .expect("the critical answer must not wait behind the stalled ordinary POST")
     .expect("the critical answer must be delivered");
 
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("peer-c") && body.contains("\"handshake\":\"\""))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the candidate worker must reach the stalled request independently");
     let posts = server.signal_posts.lock().unwrap().clone();
     assert!(
         posts.iter().any(|body| {
@@ -764,6 +791,130 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
 
     drop(client);
     stalled.abort();
+    server.task.abort();
+}
+
+/// Candidate-only requests for different peers must run concurrently: a
+/// stalled peer cannot hold up a fresh candidate advertisement for another
+/// peer.  Requests for one peer still use a single FIFO worker.
+#[tokio::test]
+async fn candidate_offer_workers_are_fair_and_fifo() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind != "signal" {
+            return MockAction::Ok;
+        }
+        if body.contains("peer-slow") {
+            MockAction::Stall
+        } else if body.contains("peer-fifo") && body.contains("51010") {
+            MockAction::Delay200
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    let slow = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-slow",
+                    &["203.0.113.90:51000".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_offer_with_sources_and_punch_at(
+            "peer-fast",
+            &["203.0.113.91:51001".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("a fast peer must not wait behind a stalled peer")
+    .expect("the fast peer offer must be accepted");
+
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-fifo",
+                    &["203.0.113.92:51010".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-fifo",
+                    &["203.0.113.92:51011".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(3), first)
+        .await
+        .expect("the first FIFO offer must finish")
+        .expect("the first FIFO task must not panic")
+        .expect("the first FIFO offer must succeed");
+    timeout(Duration::from_secs(3), second)
+        .await
+        .expect("the second FIFO offer must finish")
+        .expect("the second FIFO task must not panic")
+        .expect("the second FIFO offer must succeed");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    let first_fifo = posts
+        .iter()
+        .position(|body| body.contains("peer-fifo") && body.contains("51010"))
+        .expect("the first FIFO request must reach the server");
+    let second_fifo = posts
+        .iter()
+        .position(|body| body.contains("peer-fifo") && body.contains("51011"))
+        .expect("the second FIFO request must reach the server");
+    assert!(
+        first_fifo < second_fifo,
+        "same-peer candidate offers must reach control in FIFO order: {posts:?}"
+    );
+
+    drop(client);
+    slow.abort();
     server.task.abort();
 }
 

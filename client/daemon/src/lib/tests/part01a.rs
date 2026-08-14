@@ -510,19 +510,19 @@ fn direct_fast_probe_window_preserves_candidate_order_and_is_bounded() {
 }
 
 #[test]
-fn direct_fast_probe_skips_rendezvous_dependent_target_sets() {
+fn direct_fast_probe_prefix_is_safe_for_rendezvous_dependent_target_sets() {
     assert!(direct_fast_probe_is_safe(false, false));
-    assert!(!direct_fast_probe_is_safe(true, false));
-    assert!(!direct_fast_probe_is_safe(false, true));
-    assert!(!direct_fast_probe_is_safe(true, true));
+    assert!(direct_fast_probe_is_safe(true, false));
+    assert!(direct_fast_probe_is_safe(false, true));
+    assert!(direct_fast_probe_is_safe(true, true));
 }
 
 #[test]
-fn fresh_prediction_allows_bounded_fast_probe_for_scatter_target_sets() {
+fn bounded_fast_probe_is_available_before_fresh_prediction_for_scatter_target_sets() {
     assert!(direct_fast_probe_is_allowed(true, false, true));
     assert!(direct_fast_probe_is_allowed(false, true, true));
-    assert!(!direct_fast_probe_is_allowed(true, false, false));
-    assert!(!direct_fast_probe_is_allowed(false, true, false));
+    assert!(direct_fast_probe_is_allowed(true, false, false));
+    assert!(direct_fast_probe_is_allowed(false, true, false));
 }
 
 #[test]
@@ -547,6 +547,35 @@ fn direct_fast_probe_prefers_fresh_prediction_window_without_expanding_budget() 
         selected.iter().collect::<HashSet<_>>().len(),
         selected.len()
     );
+}
+
+#[tokio::test]
+async fn cold_start_fast_prefix_uses_existing_socket_pool_without_global_activation() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = receiver.local_addr().unwrap();
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_socket_pool(3)
+        .await
+        .unwrap();
+
+    assert!(!udp.socket_pool_active());
+    let report = udp
+        .punch_candidates_fast_prefix_until_not_direct_report(
+            "peer-b",
+            vec![receiver_addr],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.packets_sent, 3);
+    assert_eq!(report.per_socket_sent, vec![(0, 1), (1, 1), (2, 1)]);
+    assert!(!udp.socket_pool_active());
 }
 
 #[tokio::test]

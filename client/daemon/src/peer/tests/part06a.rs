@@ -75,6 +75,63 @@ async fn path_selector_honors_relay_policy_and_reports_no_path() {
 }
 
 #[tokio::test]
+async fn first_usable_rejects_stale_generation_and_retired_peer_packets() {
+    let manager = PeerManager::new(test_config());
+    manager
+        .add_peer(&test_peer("peer1", "127.0.0.1:51834".parse().unwrap()))
+        .await;
+
+    let old_generation = manager.current_network_generation().await;
+    assert!(manager
+        .record_verified_first_usable(
+            "peer1",
+            old_generation,
+            NetworkPath::Relay,
+            "relay:relay.test:443",
+        )
+        .await);
+
+    let new_generation = manager.advance_network_generation("air_restart").await;
+    assert!(new_generation > old_generation);
+    assert!(!manager
+        .record_verified_first_usable(
+            "peer1",
+            old_generation,
+            NetworkPath::Relay,
+            "relay:relay.test:443",
+        )
+        .await);
+
+    {
+        let mut connections = manager.connections.write().await;
+        connections.get_mut("peer1").unwrap().online = false;
+    }
+    assert!(!manager
+        .record_verified_first_usable(
+            "peer1",
+            new_generation,
+            NetworkPath::Relay,
+            "relay:relay.test:443",
+        )
+        .await);
+
+    {
+        let mut connections = manager.connections.write().await;
+        let connection = connections.get_mut("peer1").unwrap();
+        connection.online = true;
+        connection.transition(ConnectionState::Closed);
+    }
+    assert!(!manager
+        .record_verified_first_usable(
+            "peer1",
+            new_generation,
+            NetworkPath::Relay,
+            "relay:relay.test:443",
+        )
+        .await);
+}
+
+#[tokio::test]
 async fn path_selection_diagnostics_exposes_current_and_last_selection() {
     let config = test_config();
     let manager = PeerManager::new(config);
@@ -129,6 +186,12 @@ async fn relay_failure_clears_confirmed_active_path() {
 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     manager.set_relay("peer1", "relay.test:443").await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
     let before = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
@@ -266,6 +329,12 @@ async fn peer_manager_stats_can_follow_selected_path_not_stale_state() {
     manager
         .record_relay_success("peer1", "relay.test:443", false)
         .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     {
         let mut conns = manager.connections.write().await;

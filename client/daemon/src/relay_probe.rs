@@ -129,6 +129,12 @@ pub(crate) struct RelayProbeExpectation {
     pub(crate) owner_token: u64,
     /// Relay endpoint the probe was sent over (diagnostics).
     pub(crate) relay_endpoint: String,
+    /// Local relay-transport incarnation that carried the probe.  The
+    /// endpoint alone is insufficient during make-before-break renewal: the
+    /// old and new connections can have the same endpoint and generation.
+    /// `None` is retained only for standalone unit callers that do not model
+    /// a live relay transport.
+    pub(crate) relay_connection_id: Option<u64>,
     /// When the probe was sent; the expectation expires after
     /// [`RELAY_PROBE_EXPECTATION_TTL`].
     pub(crate) sent_at: Instant,
@@ -154,6 +160,14 @@ impl RelayProbeExpectation {
     /// current path.
     pub(crate) fn accepts(&self, token: &RelayProbeToken, now: Instant, ack_ingress: &str) -> bool {
         self.matches(token) && self.fresh(now) && self.relay_endpoint == ack_ingress
+    }
+
+    /// Whether the ACK came from the same local relay connection as the
+    /// probe.  Production ingress always carries an ID; the `None`/`None`
+    /// case keeps the small protocol unit tests backwards-compatible without
+    /// weakening the live daemon path.
+    pub(crate) fn accepts_connection(&self, connection_id: Option<u64>) -> bool {
+        self.relay_connection_id == connection_id
     }
 }
 
@@ -204,6 +218,7 @@ mod tests {
             request_id: 42,
             owner_token: 0xabc,
             relay_endpoint: "tcp://relay.test:18081".to_string(),
+            relay_connection_id: None,
             sent_at: Instant::now(),
         };
         let ack = RelayProbeToken {

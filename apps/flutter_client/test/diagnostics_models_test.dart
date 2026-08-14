@@ -186,6 +186,8 @@ void main() {
       'active_path': 'relay',
       'direct_type': 'relay',
       'is_relay': true,
+      'relay_confirmed_endpoint': 'relay.test:443',
+      'relay_confirmed_generation': 0,
       'direct': {
         'last_error_code': 'network_generation_changed',
         'last_error': 'network_generation_changed: refreshed UDP candidates',
@@ -231,6 +233,8 @@ void main() {
       'active_path': 'relay',
       'direct_type': 'relay',
       'is_relay': true,
+      'relay_confirmed_endpoint': 'relay.test:443',
+      'relay_confirmed_generation': 0,
       'direct': {
         'last_error_code': 'direct_probe_failed',
         'last_error': 'direct probe timed out',
@@ -317,11 +321,13 @@ void main() {
       'direct': <String, dynamic>{},
       'relay': {'latency_ms': 33},
     });
-    expect(notVerified.path, 'relay');
+    expect(notVerified.path, 'probing');
     expect(notVerified.relayConfirmedEndpoint, isNull);
     expect(notVerified.isRelayVerified, isFalse);
     expect(notVerified.latencyMs, isNull,
         reason: 'relay RTT without encrypted relay confirmation is not usable latency');
+    expect(notVerified.probeLatencyMs, isNull,
+        reason: 'relay health RTT is not a candidate probe RTT');
 
     // A matching encrypted relay probe ACK sets relay_confirmed_endpoint; only
     // then is the peer "中继已验证".
@@ -359,5 +365,29 @@ void main() {
     expect(peer.path, 'direct');
     expect(peer.isDirectVerified, isTrue);
     expect(peer.latencyMs, 12);
+  });
+
+  test('direct proof pending relay-first promotion is still probing', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'relay-first-peer',
+      'device_name': 'air-mac',
+      'virtual_ip': '10.20.0.53',
+      'online': true,
+      'state': 'direct',
+      'active_path': null,
+      'direct_type': 'public_udp',
+      'is_relay': false,
+      'direct': {'latency_ms': 8, 'rtt_ewma_ms': 8},
+      'relay': {'latency_ms': 4},
+      'current_path_selection': {
+        'path': null,
+        'reason_code': 'path_relay_first_pending',
+        'direct_confirmed': false,
+      },
+    });
+
+    expect(peer.path, 'probing');
+    expect(peer.isDirectVerified, isFalse);
+    expect(peer.latencyMs, isNull);
   });
 }

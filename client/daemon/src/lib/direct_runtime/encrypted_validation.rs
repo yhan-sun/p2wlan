@@ -29,14 +29,20 @@ fn new_direct_validation_worker_permits() -> Arc<tokio::sync::Semaphore> {
 /// [`MAX_PENDING_DIRECT_VALIDATION_PEERS`].
 #[derive(Clone)]
 struct DirectValidationIngress {
-    latest: Arc<std::sync::Mutex<HashMap<String, PeerReflexiveObservation>>>,
+    state: Arc<std::sync::Mutex<DirectValidationIngressState>>,
     notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct DirectValidationIngressState {
+    latest: HashMap<String, PeerReflexiveObservation>,
+    order: std::collections::VecDeque<String>,
 }
 
 impl DirectValidationIngress {
     fn new() -> Self {
         Self {
-            latest: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            state: Arc::new(std::sync::Mutex::new(DirectValidationIngressState::default())),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -47,18 +53,27 @@ impl DirectValidationIngress {
     fn submit(&self, observation: PeerReflexiveObservation) {
         let peer_id = observation.peer_id.clone();
         let inserted = {
-            let mut latest = self
-                .latest
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if latest.contains_key(&peer_id) || latest.len() < MAX_PENDING_DIRECT_VALIDATION_PEERS {
-                latest.insert(peer_id.clone(), observation);
+            if state.latest.contains_key(&peer_id)
+                || state.latest.len() < MAX_PENDING_DIRECT_VALIDATION_PEERS
+            {
+                let is_new_peer = state.latest.insert(peer_id.clone(), observation).is_none();
+                if is_new_peer {
+                    state.order.push_back(peer_id.clone());
+                }
                 true
             } else {
                 false
             }
         };
         if inserted {
+            // There is one authoritative scheduler consumer.  `notify_one`
+            // preserves the permit if the consumer is between its map check
+            // and await; it then drains the remaining FIFO entries without
+            // sleeping again.
             self.notify.notify_one();
         } else {
             debug!(
@@ -75,15 +90,22 @@ impl DirectValidationIngress {
             // and await leaves a stored notification for this waiter.
             let notified = self.notify.notified();
             let observation = {
-                let mut latest = self
-                    .latest
+                let mut state = self
+                    .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                latest
-                    .keys()
-                    .next()
-                    .cloned()
-                    .and_then(|peer_id| latest.remove(&peer_id))
+                // `take_latest_for_peer` removes the map entry after the
+                // peer has already been placed in `order`.  Drain those
+                // stale order entries here instead of sleeping with a live
+                // peer still queued behind one stale key.
+                let mut selected = None;
+                while let Some(peer_id) = state.order.pop_front() {
+                    if let Some(observation) = state.latest.remove(&peer_id) {
+                        selected = Some(observation);
+                        break;
+                    }
+                }
+                selected
             };
             if let Some(observation) = observation {
                 return observation;
@@ -99,17 +121,19 @@ impl DirectValidationIngress {
     /// that session's watch target immediately, even while worker capacity is
     /// saturated.
     fn take_latest_for_peer(&self, peer_id: &str) -> Option<PeerReflexiveObservation> {
-        self.latest
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest
             .remove(peer_id)
     }
 
     #[cfg(test)]
     fn pending_len(&self) -> usize {
-        self.latest
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest
             .len()
     }
 }
@@ -925,12 +949,15 @@ async fn run_direct_encrypted_validation_session(
                         stop_worker = true;
                         break;
                     }
-                    // A newer endpoint cleared this request's expectation in
-                    // the registry.  Stop waiting for the stale ACK and move
-                    // to the next bounded attempt.
-                    if current.endpoint != endpoint {
-                        break;
-                    }
+                    // A newer observation only changes the target for the
+                    // next bounded attempt. This request was already sent to
+                    // `endpoint`, so its ACK remains valid evidence when it
+                    // arrives within the same owner/generation/request lease.
+                    // Do not abort the wait merely because candidate
+                    // discovery learned a fresher endpoint: doing so turns
+                    // normal peer-reflexive churn into validation starvation
+                    // and can make a healthy ACK arrive after its expectation
+                    // was incorrectly withdrawn.
                     let remaining = DIRECT_VALIDATION_ACK_WAIT
                         .saturating_sub(ack_wait_started.elapsed());
                     let _ = wait_for_validation_update(
