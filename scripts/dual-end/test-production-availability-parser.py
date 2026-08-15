@@ -49,6 +49,36 @@ class ProductionAvailabilityParserTest(unittest.TestCase):
         )
         self.assertEqual(result, "|missing|7|first_business_not_relay")
 
+    def test_direct_first_with_relay_confirmed_is_positive_note(self):
+        result = self.parse(
+            line("relay_transport_ready_peer", 100)
+            + line("relay_peer_confirmed", 110)
+            + line("relay_first_business_sent", 115)
+            + line("first_real_business_ingress", 140, path="direct")
+        )
+        self.assertEqual(
+            result, "direct|40|7|direct_first_relay_confirmed"
+        )
+
+    def test_direct_first_with_relay_received_evidence_is_positive_note(self):
+        result = self.parse(
+            line("relay_transport_ready_peer", 100)
+            + line("relay_peer_confirmed", 120)
+            + line("relay_first_business_received", 130)
+            + line("first_real_business_ingress", 150, path="direct")
+        )
+        self.assertEqual(
+            result, "direct|50|7|direct_first_relay_confirmed"
+        )
+
+    def test_direct_first_without_any_relay_business_still_fails(self):
+        result = self.parse(
+            line("relay_transport_ready_peer", 100)
+            + line("relay_peer_confirmed", 110)
+            + line("first_real_business_ingress", 140, path="direct")
+        )
+        self.assertEqual(result, "|missing|7|first_business_not_relay")
+
     def test_stale_generation_does_not_supply_current_ready_boundary(self):
         result = self.parse(
             line("relay_transport_ready_peer", 100, generation=6)

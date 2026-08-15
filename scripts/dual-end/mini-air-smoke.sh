@@ -1812,13 +1812,35 @@ printf '%s\n' "$DIRTY_DIFF_SHA256" >"$BASE_DIR/dirty-diff.sha256"
 
 echo "[mini-air] Air reachability check..."
 $AIR_SSH 'uname -m' | tail -1
-AIR_PUBLIC_IPV4=$($AIR_SSH 'curl --noproxy "*" -s --max-time 8 ifconfig.me || true' | tail -1 | tr -d '[:space:]')
-MINI_PUBLIC_IPV4=$(curl -s4 --max-time 8 ifconfig.me || true)
-MINI_PUBLIC_IPV4=$(printf '%s\n' "$MINI_PUBLIC_IPV4" | tail -1 | tr -d '[:space:]')
-echo "[mini-air] Air public IPv4: $AIR_PUBLIC_IPV4"
-echo "[mini-air] Mini public IPv4: $MINI_PUBLIC_IPV4"
+PUBLIC_V4_SOURCES=(
+  "curl -4 --noproxy '*' -fsS --max-time 8 https://api.ipify.org"
+  "curl -4 --noproxy '*' -fsS --max-time 8 ifconfig.me"
+  "curl -4 --noproxy '*' -fsS --max-time 8 ifconfig.co"
+)
+collect_public_ipv4() {
+  # $1: optional remote shell prefix (e.g. "$AIR_SSH"); empty means local.
+  local shell_prefix=${1:-}
+  local source
+  local value
+  for source in "${PUBLIC_V4_SOURCES[@]}"; do
+    if [[ -n "$shell_prefix" ]]; then
+      value=$($shell_prefix "$source" 2>/dev/null | tail -1 | tr -d '[:space:]')
+    else
+      value=$(eval "$source" 2>/dev/null | tail -1 | tr -d '[:space:]')
+    fi
+    if is_public_ipv4_endpoint "$value:1"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+AIR_PUBLIC_IPV4=$(collect_public_ipv4 "$AIR_SSH" || true)
+MINI_PUBLIC_IPV4=$(collect_public_ipv4 || true)
+echo "[mini-air] Air public IPv4: ${AIR_PUBLIC_IPV4:-<unresolved>}"
+echo "[mini-air] Mini public IPv4: ${MINI_PUBLIC_IPV4:-<unresolved>}"
 if [[ -z "$AIR_PUBLIC_IPV4" || -z "$MINI_PUBLIC_IPV4" ]]; then
-  echo "[mini-air] could not determine both public IPv4 addresses" >&2
+  echo "[mini-air] could not determine both public IPv4 addresses (must be globally routable)" >&2
   exit 2
 fi
 
@@ -1952,6 +1974,10 @@ for round in $(seq 1 "$ROUNDS"); do
 
   # Daemon A on the Mini.
   LOCAL_NODE_A_CONFIG="$LOCAL_RUN_DIR/node-a-$RUN_ID-round-$round.json"
+  # A torn/empty config left behind by an interrupted run makes the daemon
+  # exit with "failed to parse config: EOF" before diagnostics come up.
+  # daemon first-start regenerates a fresh config, so remove any stale file.
+  rm -f "$LOCAL_NODE_A_CONFIG"
   LOCAL_NODE_A_DEVICE="mini-a-$RUN_ID-round-$round"
   LOCAL_NODE_A_PID_FILE="$ROUND_DIR/node-a.pid"
   if [[ "$REAL_TUN" == "1" ]]; then
@@ -2019,6 +2045,9 @@ for round in $(seq 1 "$ROUNDS"); do
 
   # Daemon B on the Air (fresh config every round).
   AIR_CONFIG="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.json"
+  # Same stale-config guard as the Mini side: an empty leftover config from an
+  # interrupted run aborts the daemon before diagnostics can come up.
+  $AIR_SSH "rm -f '$AIR_CONFIG'" 2>/dev/null || true
   REMOTE_NODE_B_PID_FILE="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.pid"
   REMOTE_NODE_B_LOG="$REMOTE_RUN_DIR/node-b-$RUN_ID-round-$round.log"
   REMOTE_NODE_B_DEVICE="air-b-$RUN_ID-round-$round"
@@ -2848,7 +2877,8 @@ PY
      [[ "$overlay_ok" -eq 1 ]] && [[ "$STATUS_CAPTURE_OK" -eq 1 ]] && \
      [[ "$A_CRASH_PANIC" -eq 0 ]] && [[ "$B_CRASH_PANIC" -eq 0 ]] && \
      [[ "$A_RELAY_PEER_CONFIRMED" -ge 1 ]] && [[ "$B_RELAY_PEER_CONFIRMED" -ge 1 ]] && \
-     [[ "$A_FIRST_USABLE_PATH" == "relay" ]] && [[ "$B_FIRST_USABLE_PATH" == "relay" ]] && \
+     [[ "$A_FIRST_USABLE_PATH" == "relay" || "$A_PRODUCTION_REASON" == "direct_first_relay_confirmed" ]] && \
+     [[ "$B_FIRST_USABLE_PATH" == "relay" || "$B_PRODUCTION_REASON" == "direct_first_relay_confirmed" ]] && \
      [[ "$A_TARGET_PEER_OK" -ge 1 ]] && [[ "$B_TARGET_PEER_OK" -ge 1 ]] && \
      [[ -n "$FIRST_USABLE_AFTER_RELAY_MS" ]] && \
      [[ "$FIRST_USABLE_AFTER_RELAY_MS" -ge 0 ]] && \
@@ -2861,7 +2891,7 @@ PY
     if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
       echo "[mini-air] ROUND $round: FUNCTIONAL-DIRECT baseline functional_direct_ms=$FUNCTIONAL_DIRECT_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
-      echo "[mini-air] ROUND $round: PASS availability first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_path=$A_FIRST_USABLE_PATH b_path=$B_FIRST_USABLE_PATH a_direct=$A_DIRECT b_direct=$B_DIRECT evidence=$ROUND_DIR/evidence.log"
+      echo "[mini-air] ROUND $round: PASS availability first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_path=$A_FIRST_USABLE_PATH b_path=$B_FIRST_USABLE_PATH a_reason=${A_PRODUCTION_REASON:-ok} b_reason=${B_PRODUCTION_REASON:-ok} a_direct=$A_DIRECT b_direct=$B_DIRECT evidence=$ROUND_DIR/evidence.log"
     else
       echo "[mini-air] ROUND $round: PASS strict_convergence_ms=$STRICT_CONVERGENCE_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     fi
@@ -2869,7 +2899,7 @@ PY
     if [[ "$ACCEPTANCE_MODE" == "compat" ]]; then
       echo "[mini-air] ROUND $round: FUNCTIONAL-DIRECT baseline incomplete a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     elif [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
-      echo "[mini-air] ROUND $round: NO-FIRST-USABLE overlay_ok=$overlay_ok first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/evidence.log"
+      echo "[mini-air] ROUND $round: NO-FIRST-USABLE overlay_ok=$overlay_ok first_usable_after_relay_ms=$FIRST_USABLE_AFTER_RELAY_MS a_reason=${A_PRODUCTION_REASON:-none} b_reason=${B_PRODUCTION_REASON:-none} a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/evidence.log"
     else
       echo "[mini-air] ROUND $round: NO-DIRECT-or-nonpublic-path a_direct=$A_DIRECT b_direct=$B_DIRECT elapsed_ms=$ELAPSED_MS a_ep=$A_EP b_ep=$B_EP evidence=$ROUND_DIR/evidence.log"
     fi
@@ -2888,10 +2918,14 @@ PY
       cp "$CURRENT_A_POLL" "$ROUND_DIR/teardown-node-a.json"
       cp "$CURRENT_B_POLL" "$ROUND_DIR/teardown-node-b.json"
       cp "$CURRENT_RESULT" "$ROUND_DIR/teardown-strict-result.json"
+      cp "$CURRENT_A_POLL" "$ROUND_DIR/node-a.status.json"
+      cp "$CURRENT_B_POLL" "$ROUND_DIR/node-b.status.json"
     else
       printf '{}\n' >"$ROUND_DIR/teardown-node-a.json"
       printf '{}\n' >"$ROUND_DIR/teardown-node-b.json"
       printf '{"ok":false,"reason":"status_capture_failed"}\n' >"$ROUND_DIR/teardown-strict-result.json"
+      printf '{}\n' >"$ROUND_DIR/node-a.status.json"
+      printf '{}\n' >"$ROUND_DIR/node-b.status.json"
     fi
     collect_air_log || true
   fi
