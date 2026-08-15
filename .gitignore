@@ -58,6 +58,13 @@ docs/
 # Staging deployment templates (kept on disk, never published)
 deploy/staging/*.env.example
 
+# Test scripts that hardcode real infra/device IPs (kept on disk, never published)
+scripts/mac-remote-smoke.sh
+scripts/windows-remote-smoke.ps1
+scripts/dual-end/run-ab-sequence.sh
+scripts/dual-end/link-health-check.sh
+scripts/tun-ping-smoke.sh
+
 # Release packages and archives
 *.pdf
 *.dmg
