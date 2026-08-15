@@ -131,7 +131,8 @@ use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, Relay
 use transport::parse_direct_validation_token;
 use transport::{
     build_direct_validation_payload, DirectValidationKind, InboundEvidenceFeed,
-    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, WireGuardTransport,
+    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, TransportSessionStatus,
+    WireGuardTransport,
 };
 use udp::{
     FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveIngress,
@@ -236,6 +237,11 @@ const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
 /// Keeping this window small preserves the per-peer probe budget and leaves the
 /// full candidate/scatter sweep as the lossless fallback.
 const DIRECT_FAST_PROBE_MAX_CANDIDATES: usize = 8;
+/// A fresh-prediction/peer-reflexive window is already authenticated control
+/// evidence, but its useful port may sit behind the ordinary signaled prefix.
+/// Give that bounded window a larger immediate opportunity without widening
+/// the normal candidate prefix or bypassing the per-peer probe budget.
+const DIRECT_FAST_PROBE_PREDICTED_MAX_CANDIDATES: usize = 32;
 const DIRECT_FAST_PROBE_ATTEMPTS: u32 = 1;
 const DIRECT_FAST_PROBE_ACK_WINDOW: Duration = Duration::from_millis(250);
 /// Ignore very stale relay-assisted windows and punch immediately instead.

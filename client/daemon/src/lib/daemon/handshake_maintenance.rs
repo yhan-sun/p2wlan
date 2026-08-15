@@ -15,6 +15,10 @@ struct HandshakeMaintenanceContext {
     runtime_stun_timeout: Arc<RwLock<Duration>>,
     udp_advertise: Option<String>,
     node_private_key: String,
+    /// A first business packet or relay replacement wakes maintenance
+    /// immediately. The ten-second tick remains the recovery backstop, but it
+    /// must not be the first chance to recreate a missing encrypted session.
+    kick_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
@@ -35,14 +39,37 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         runtime_stun_timeout,
         udp_advertise,
         node_private_key,
+        mut kick_rx,
     } = ctx;
 
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            changed = kick_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                kick_rx.borrow_and_update();
+            }
+        }
         let conns = peers.all_connections().await;
         for conn in conns {
             if !conn.online {
+                continue;
+            }
+            // The maintenance tick is another initiator producer.  Do not
+            // let it briefly claim the per-peer handshake arbiter on a node
+            // whose static identity makes it the responder; an inbound offer
+            // is the latency-critical transaction in that case.
+            if matches!(
+                should_start_initiator_for_encoded_keys(&node_private_key, &conn.public_key),
+                Some(false)
+            ) {
+                debug!(
+                    "Skipping maintenance initiator for {}: deterministic responder role",
+                    conn.node_id
+                );
                 continue;
             }
             let handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
@@ -75,14 +102,24 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     conn.node_id
                 );
             }
+            let handshake_generation = peers.current_network_generation_sync();
 
             // Reserve before any further awaits.  The peer-join path can run at
             // the same time as this maintenance loop; without this reservation,
             // both paths could create an initiator and the later one would
             // overwrite the former pending handshake.
+            let stale_session_id = pending
+                .lock()
+                .await
+                .remove_stale_pending_for_generation(&conn.node_id, handshake_generation);
+            if let Some(session_id) = stale_session_id {
+                peers
+                    .discard_pending_probe_session_binding(&conn.node_id, &session_id)
+                    .await;
+            }
             let reserved = {
                 let mut state = pending.lock().await;
-                if !state.reserve_start(&conn.node_id) {
+                if !state.reserve_start_at_generation(&conn.node_id, handshake_generation) {
                     false
                 } else {
                     if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
@@ -215,13 +252,20 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             let (probe_ephemeral, probe_ephemeral_public_key) =
                 new_probe_ephemeral_keypair();
             let Some((attempt_no, pending_id)) = ({
+                let epoch_gate = peers.network_epoch_gate();
+                let _epoch_guard = epoch_gate.lock().await;
+                if peers.current_network_generation_sync() != handshake_generation {
+                    pending.lock().await.cancel_reservation(&conn.node_id);
+                    continue;
+                }
                 let mut state = pending.lock().await;
                 state
-                    .insert_reserved(
+                    .insert_reserved_with_generation(
                         conn.node_id.clone(),
                         initiator,
                         Some(session_id.clone()),
                         Some(probe_ephemeral),
+                        handshake_generation,
                     )
                     .map(|pending_id| {
                         let attempts =
@@ -314,7 +358,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             } else {
                 HANDSHAKE_TIMEOUT_SECS
             };
-            let generation = peers.current_network_generation().await;
+            let generation = handshake_generation;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
                 let status = transport2.session_status(&timeout_peer).await;

@@ -1018,24 +1018,52 @@ impl UdpTransport {
         // an old owner after that advance had already cleared every old
         // session.  The gate makes the check and insert one transaction.
         let _epoch_gate = self.network_epoch_gate.lock().await;
-        if self.peers.current_network_generation_sync() != generation {
+        let current_generation = self.peers.current_network_generation_sync();
+        if current_generation != generation {
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_admission_rejected",
+                peer_id = %peer_id,
+                remote_endpoint = %endpoint,
+                requested_generation = generation,
+                current_generation,
+                reason_code = "direct_validation_stale_generation",
+                "direct validation admission rejected before registry lookup"
+            );
             return DirectValidationSessionStart::IgnoredStaleGeneration;
         }
         // Direct promotion and its registry cancellation share this epoch
         // gate. A queued observation that waited behind the promotion must
         // therefore be suppressed instead of recreating the session it just
         // cancelled.
-        if self.peers.is_direct_sync(peer_id)
-            || !self.peers.is_direct_validation_eligible(peer_id).await
-            || self.direct_validation.is_closed()
-        {
-            return DirectValidationSessionStart::IgnoredInactive;
-        }
-        if self
+        let direct_confirmed = self.peers.is_direct_sync(peer_id);
+        let peer_eligible = self.peers.is_direct_validation_eligible(peer_id).await;
+        let transport_closed = self.direct_validation.is_closed();
+        let slow_relay_suppressed = self
             .direct_validation
             .is_slow_relay_validation_suppressed(peer_id, generation)
-            .await
-        {
+            .await;
+        if direct_confirmed || !peer_eligible || transport_closed || slow_relay_suppressed {
+            let reason_code = if direct_confirmed {
+                "direct_validation_peer_already_direct"
+            } else if !peer_eligible {
+                "direct_validation_peer_ineligible"
+            } else if transport_closed {
+                "direct_validation_transport_registry_closed"
+            } else {
+                "direct_validation_slow_relay_cooldown"
+            };
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_admission_rejected",
+                peer_id = %peer_id,
+                remote_endpoint = %endpoint,
+                generation,
+                reason_code,
+                direct_confirmed,
+                peer_eligible,
+                transport_closed,
+                slow_relay_suppressed,
+                "direct validation admission rejected by lifecycle gate"
+            );
             return DirectValidationSessionStart::IgnoredInactive;
         }
         let mut sessions = self.direct_validation.sessions.lock().await;
@@ -1043,6 +1071,14 @@ impl UdpTransport {
         // teardown. Recheck after waiting for its sessions lock so a stale
         // scheduler cannot create an owner after the terminal cancellation.
         if self.direct_validation.is_closed() {
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_admission_rejected",
+                peer_id = %peer_id,
+                remote_endpoint = %endpoint,
+                generation,
+                reason_code = "direct_validation_transport_registry_closed_after_lock",
+                "direct validation admission rejected after waiting for registry lock"
+            );
             return DirectValidationSessionStart::IgnoredInactive;
         }
         if let Some((target_tx, current)) = sessions.get(peer_id).map(|session| {
@@ -1060,6 +1096,14 @@ impl UdpTransport {
                     ..current
                 };
                 target_tx.send_replace(updated);
+                debug!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_observation_merged",
+                    peer_id = %peer_id,
+                    remote_endpoint = %endpoint,
+                    previous_endpoint = %current.endpoint,
+                    generation,
+                    "merged newest direct-validation endpoint into existing worker"
+                );
                 return DirectValidationSessionStart::Merged;
             }
 
@@ -1070,6 +1114,15 @@ impl UdpTransport {
                 cancelled: true,
                 ..current
             });
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_session_replaced",
+                peer_id = %peer_id,
+                previous_endpoint = %current.endpoint,
+                previous_generation = current.generation,
+                replacement_endpoint = %endpoint,
+                replacement_generation = generation,
+                "replaced stale direct-validation worker before spawning the new generation"
+            );
             let mut expectations = self.direct_validation.expectations.lock().await;
             if expectations
                 .get(peer_id)
@@ -1088,6 +1141,13 @@ impl UdpTransport {
         };
         let (target_tx, target_rx) = watch::channel(target);
         sessions.insert(peer_id.to_string(), DirectValidationSession { target_tx });
+        debug!(target: "p2pnet_daemon::direct_validation",
+            event = "direct_validation_session_spawned",
+            peer_id = %peer_id,
+            remote_endpoint = %endpoint,
+            generation,
+            "created one owned direct-validation worker"
+        );
         DirectValidationSessionStart::Spawn(DirectValidationSessionLease {
             peer_id: peer_id.to_string(),
             owner_token,
@@ -1445,49 +1505,73 @@ impl UdpTransport {
         source: SocketAddr,
         socket_index: Option<usize>,
         endpoint_authenticated: bool,
-    ) -> Option<DirectValidationExpectation> {
+    ) -> std::result::Result<
+        DirectValidationExpectation,
+        crate::udp::DirectValidationAckRejectReason,
+    > {
         if token_generation != current_generation {
-            return None;
+            return Err(crate::udp::DirectValidationAckRejectReason::TokenGenerationMismatch);
         }
         let sessions = self.direct_validation.sessions.lock().await;
         let mut expectations = self.direct_validation.expectations.lock().await;
         let now = Instant::now();
         {
-            let expectation = expectations.get(peer_id)?;
+            let Some(expectation) = expectations.get(peer_id) else {
+                return Err(crate::udp::DirectValidationAckRejectReason::NoExpectation);
+            };
             if expectation.expires_at <= now {
                 expectations.remove(peer_id);
-                return None;
+                return Err(crate::udp::DirectValidationAckRejectReason::ExpectationExpired);
             }
-            if expectation.request_id != request_id
-                || expectation.generation != token_generation
-                || expectation.owner_token != token_owner
-                || (expectation
-                    .endpoint
-                    .is_some_and(|endpoint| endpoint != source)
-                    && !endpoint_authenticated)
-                || expectation
-                    .socket_index
-                    .is_some_and(|expected| Some(expected) != socket_index)
+            if expectation.request_id != request_id {
+                return Err(crate::udp::DirectValidationAckRejectReason::RequestIdMismatch);
+            }
+            if expectation.generation != token_generation {
+                return Err(
+                    crate::udp::DirectValidationAckRejectReason::ExpectationGenerationMismatch,
+                );
+            }
+            if expectation.owner_token != token_owner {
+                return Err(crate::udp::DirectValidationAckRejectReason::OwnerMismatch);
+            }
+            if expectation
+                .endpoint
+                .is_some_and(|endpoint| endpoint != source)
+                && !endpoint_authenticated
             {
-                return None;
+                return Err(crate::udp::DirectValidationAckRejectReason::EndpointMismatch);
+            }
+            if expectation
+                .socket_index
+                .is_some_and(|expected| Some(expected) != socket_index)
+            {
+                return Err(crate::udp::DirectValidationAckRejectReason::SocketMismatch);
             }
         }
-        let target = sessions
-            .get(peer_id)
-            .map(|session| *session.target_tx.borrow())?;
+        let Some(session) = sessions.get(peer_id) else {
+            return Err(crate::udp::DirectValidationAckRejectReason::SessionMissing);
+        };
+        let target = *session.target_tx.borrow();
         // `expectation.owner_token` equals `token_owner` (verified above), so
         // the active target is checked against the same owner the consumed
         // expectation carried.
-        if target.cancelled
-            || target.generation != current_generation
-            || target.owner_token != token_owner
-        {
-            return None;
+        if target.cancelled {
+            return Err(crate::udp::DirectValidationAckRejectReason::TargetCancelled);
+        }
+        if target.generation != current_generation {
+            return Err(
+                crate::udp::DirectValidationAckRejectReason::TargetGenerationMismatch,
+            );
+        }
+        if target.owner_token != token_owner {
+            return Err(crate::udp::DirectValidationAckRejectReason::TargetOwnerMismatch);
         }
         // Move the expectation out: it owns the send lease of the socket that
         // carried the request, released exactly when the caller drops the
         // consumed expectation after the promotion transaction.
-        expectations.remove(peer_id)
+        Ok(expectations
+            .remove(peer_id)
+            .expect("expectation remained present while the registry locks were held"))
     }
 
     /// Whether an ACK token confirms the outstanding validation request for

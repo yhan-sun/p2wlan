@@ -367,6 +367,11 @@ impl CandidatePair {
         retained.consecutive_failures = 0;
         retained.last_error_code = None;
         retained.last_error = None;
+        // A retained endpoint crosses a candidate-refresh generation only as
+        // a transport hint.  Slow-validation quarantine is proof scoped to
+        // the old generation and must not suppress the new generation's own
+        // Direct validation.
+        retained.last_slow_validation_at = None;
         retained
     }
 

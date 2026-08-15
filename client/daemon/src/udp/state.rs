@@ -244,7 +244,11 @@ impl DirectValidationRegistry {
     /// takes the session lock before the expectation lock, so either the
     /// expectation is inserted first and removed here, or the worker observes
     /// no matching owner and refuses to insert it.
-    pub(crate) async fn cancel_peer(&self, peer_id: &str) {
+    /// Cancel one peer's validation ownership and publish the lifecycle
+    /// reason. The reason is diagnostic only; the cleanup transaction is
+    /// shared by every caller so improving observability cannot weaken
+    /// stale-worker invalidation.
+    pub(crate) async fn cancel_peer_with_reason(&self, peer_id: &str, reason_code: &str) {
         // Keep the session guard while taking the expectation guard. Session
         // creation and expectation registration use this same order, so a
         // same-ID rejoin cannot install a replacement expectation between the
@@ -261,6 +265,8 @@ impl DirectValidationRegistry {
             None
         };
         let mut expectations = self.expectations.lock().await;
+        let expectation_before = expectations.contains_key(peer_id);
+        let mut expectation_cancelled = false;
         match owner_token {
             Some(owner_token) => {
                 if expectations
@@ -268,16 +274,29 @@ impl DirectValidationRegistry {
                     .is_some_and(|expectation| expectation.owner_token == owner_token)
                 {
                     expectations.remove(peer_id);
+                    expectation_cancelled = true;
                 }
             }
             // An expectation without a session is stale state (the
             // compatibility test helper can create one); clean it while the
             // session lock still excludes a concurrent replacement.
             None => {
-                expectations.remove(peer_id);
+                expectation_cancelled = expectations.remove(peer_id).is_some();
             }
         }
-        self.slow_relay_cooldowns.lock().await.remove(peer_id);
+        let cooldown_cancelled = self.slow_relay_cooldowns.lock().await.remove(peer_id).is_some();
+        debug!(target: "p2pnet_daemon::direct_validation",
+            event = "direct_validation_registry_peer_cancelled",
+            peer_id = %peer_id,
+            reason_code,
+            session_cancelled = owner_token.is_some(),
+            expectation_present_before = expectation_before,
+            expectation_cancelled,
+            cooldown_cancelled,
+            "direct validation ownership cancelled peer_id={} reason_code={}",
+            peer_id,
+            reason_code,
+        );
         drop(sessions);
     }
 
@@ -287,6 +306,7 @@ impl DirectValidationRegistry {
     /// invalidation one transaction.
     pub(crate) async fn cancel_before_generation(&self, current_generation: u64) {
         let mut cancelled_peers = HashSet::new();
+        let mut cancelled_session_count = 0usize;
         // Keep the session guard through expectation cleanup. This is the
         // registry's cancellation transaction and follows the same
         // session -> expectation order as registration/ACK consumption.
@@ -301,16 +321,34 @@ impl DirectValidationRegistry {
                 ..current
             });
             cancelled_peers.insert(peer_id.clone());
+            cancelled_session_count = cancelled_session_count.saturating_add(1);
             false
         });
         let mut expectations = self.expectations.lock().await;
+        let mut cancelled_expectation_count = 0usize;
         expectations.retain(|peer_id, expectation| {
-            !cancelled_peers.contains(peer_id) && expectation.generation == current_generation
+            let keep = !cancelled_peers.contains(peer_id) && expectation.generation == current_generation;
+            if !keep {
+                cancelled_expectation_count = cancelled_expectation_count.saturating_add(1);
+            }
+            keep
         });
-        self.slow_relay_cooldowns
-            .lock()
-            .await
-            .retain(|_, (generation, _)| *generation == current_generation);
+        let mut cancelled_cooldown_count = 0usize;
+        self.slow_relay_cooldowns.lock().await.retain(|_, (generation, _)| {
+            let keep = *generation == current_generation;
+            if !keep {
+                cancelled_cooldown_count = cancelled_cooldown_count.saturating_add(1);
+            }
+            keep
+        });
+        debug!(target: "p2pnet_daemon::direct_validation",
+            event = "direct_validation_registry_generation_cancelled",
+            generation = current_generation,
+            cancelled_session_count,
+            cancelled_expectation_count,
+            cancelled_cooldown_count,
+            "direct validation ownership cancelled before generation={current_generation}"
+        );
         drop(sessions);
     }
 
@@ -326,6 +364,7 @@ impl DirectValidationRegistry {
         // transport teardown.
         let mut sessions_guard = self.sessions.lock().await;
         let sessions = std::mem::take(&mut *sessions_guard);
+        let cancelled_session_count = sessions.len();
         for session in sessions.into_values() {
             let current = *session.target_tx.borrow();
             session.target_tx.send_replace(DirectValidationTarget {
@@ -333,8 +372,19 @@ impl DirectValidationRegistry {
                 ..current
             });
         }
-        self.expectations.lock().await.clear();
-        self.slow_relay_cooldowns.lock().await.clear();
+        let mut expectations = self.expectations.lock().await;
+        let cancelled_expectation_count = expectations.len();
+        expectations.clear();
+        let mut cooldowns = self.slow_relay_cooldowns.lock().await;
+        let cancelled_cooldown_count = cooldowns.len();
+        cooldowns.clear();
+        debug!(target: "p2pnet_daemon::direct_validation",
+            event = "direct_validation_registry_cancelled_all",
+            cancelled_session_count,
+            cancelled_expectation_count,
+            cancelled_cooldown_count,
+            "all direct validation ownership cancelled for UDP transport teardown"
+        );
         drop(sessions_guard);
     }
 }
@@ -378,6 +428,46 @@ pub(crate) enum DirectValidationSessionStart {
     /// The peer is already Direct or this UDP registry was withdrawn. Neither
     /// case may allocate a replacement validation worker from queued evidence.
     IgnoredInactive,
+}
+
+/// Why an authenticated direct-validation ACK did not consume the currently
+/// owned request expectation.  These values are diagnostic classifications;
+/// they do not weaken the exact-match checks below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationAckRejectReason {
+    TokenGenerationMismatch,
+    NoExpectation,
+    ExpectationExpired,
+    RequestIdMismatch,
+    ExpectationGenerationMismatch,
+    OwnerMismatch,
+    EndpointMismatch,
+    SocketMismatch,
+    SessionMissing,
+    TargetCancelled,
+    TargetGenerationMismatch,
+    TargetOwnerMismatch,
+}
+
+impl DirectValidationAckRejectReason {
+    pub(crate) const fn reason_code(self) -> &'static str {
+        match self {
+            Self::TokenGenerationMismatch => "direct_validation_ack_generation_mismatch",
+            Self::NoExpectation => "direct_validation_ack_no_expectation",
+            Self::ExpectationExpired => "direct_validation_ack_expectation_expired",
+            Self::RequestIdMismatch => "direct_validation_ack_request_id_mismatch",
+            Self::ExpectationGenerationMismatch => {
+                "direct_validation_ack_expectation_generation_mismatch"
+            }
+            Self::OwnerMismatch => "direct_validation_ack_owner_mismatch",
+            Self::EndpointMismatch => "direct_validation_ack_endpoint_mismatch",
+            Self::SocketMismatch => "direct_validation_ack_socket_mismatch",
+            Self::SessionMissing => "direct_validation_ack_session_missing",
+            Self::TargetCancelled => "direct_validation_ack_target_cancelled",
+            Self::TargetGenerationMismatch => "direct_validation_ack_target_generation_mismatch",
+            Self::TargetOwnerMismatch => "direct_validation_ack_target_owner_mismatch",
+        }
+    }
 }
 
 /// The token a daemon-internal direct-validation ACK must carry to confirm a

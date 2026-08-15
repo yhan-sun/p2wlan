@@ -357,6 +357,13 @@ impl PeerConnection {
     ) {
         let reason = reason.into();
         let peer_id = self.node_id.clone();
+        let previous_state = self.state;
+        let previous_direct_generation = self.direct_generation;
+        let previous_relay_ready_generation = self.relay_ready_generation;
+        let previous_relay_confirmed_generation = self.relay_confirmed_generation;
+        let previous_relay_confirmed_connection_id = self.relay_confirmed_connection_id;
+        let previous_first_usable_generation = self.first_usable_generation;
+        let previous_candidate_pair_count = self.candidate_pairs.len();
         // `first_usable` is intentionally scoped to peer + generation. A
         // restart or interface handover must not reuse proof from an old NAT
         // mapping, even when the old connection object is retained.
@@ -373,8 +380,11 @@ impl PeerConnection {
             self.relay_ready_generation = None;
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
+            self.relay_ready_connection_id = None;
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
+            self.relay_first_business_exchange_generation = None;
+            self.relay_preconfirmation_business = None;
         }
         if self.relay_first_gate_generation != Some(local_generation) {
             self.relay_first_gate_generation = None;
@@ -387,6 +397,8 @@ impl PeerConnection {
             self.relay_confirmed_connection_id = None;
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
+            self.relay_first_business_exchange_generation = None;
+            self.relay_preconfirmation_business = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
             if self.state == ConnectionState::Relay {
                 self.transition(ConnectionState::FallbackToRelay);
@@ -402,6 +414,28 @@ impl PeerConnection {
             }
         }
         self.ensure_current_candidate_pairs(local_generation);
+        debug!(target: "p2pnet_daemon::peer::connection",
+            event = "peer_network_generation_invalidated",
+            peer_id = %peer_id,
+            generation = local_generation,
+            reason = %reason,
+            previous_state = ?previous_state,
+            current_state = ?self.state,
+            previous_direct_generation,
+            previous_relay_ready_generation = ?previous_relay_ready_generation,
+            previous_relay_confirmed_generation = ?previous_relay_confirmed_generation,
+            previous_relay_confirmed_connection_id = ?previous_relay_confirmed_connection_id,
+            previous_first_usable_generation = ?previous_first_usable_generation,
+            current_relay_ready_generation = ?self.relay_ready_generation,
+            current_relay_confirmed_generation = ?self.relay_confirmed_generation,
+            current_first_usable_generation = ?self.first_usable_generation,
+            previous_candidate_pair_count,
+            current_candidate_pair_count = self.candidate_pairs.len(),
+            "peer network generation invalidated peer_id={} generation={} reason={}",
+            peer_id,
+            local_generation,
+            reason,
+        );
     }
 
     fn mark_candidate_refresh_generation_changed(
@@ -410,6 +444,14 @@ impl PeerConnection {
         reason: impl Into<String>,
     ) -> bool {
         let reason = reason.into();
+        let peer_id = self.node_id.clone();
+        let previous_state = self.state;
+        let previous_direct_generation = self.direct_generation;
+        let previous_relay_ready_generation = self.relay_ready_generation;
+        let previous_relay_confirmed_generation = self.relay_confirmed_generation;
+        let previous_relay_confirmed_connection_id = self.relay_confirmed_connection_id;
+        let previous_first_usable_generation = self.first_usable_generation;
+        let previous_candidate_pair_count = self.candidate_pairs.len();
         // Candidate refresh creates a new generation even when a private Direct
         // pair is retained. Its first-usable evidence must be earned again.
         if self.first_usable_generation != Some(local_generation) {
@@ -426,16 +468,22 @@ impl PeerConnection {
         if self.relay_confirmed_at.is_some() && self.relay_confirmed_endpoint.is_some() {
             self.relay_confirmed_generation = Some(local_generation);
             self.relay_ready_generation = Some(local_generation);
+            self.relay_ready_connection_id = self.relay_confirmed_connection_id;
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
+            self.relay_first_business_exchange_generation = None;
+            self.relay_preconfirmation_business = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;
         } else {
             self.relay_ready_generation = None;
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
+            self.relay_ready_connection_id = None;
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
+            self.relay_first_business_exchange_generation = None;
+            self.relay_preconfirmation_business = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;
         }
@@ -451,7 +499,6 @@ impl PeerConnection {
             .as_ref()
             .map(|pair| pair.remote_endpoint);
 
-        let peer_id = self.node_id.clone();
         self.candidate_pairs
             .retain(|pair| pair.local_generation.saturating_add(1) >= local_generation);
         for pair in &mut self.candidate_pairs {
@@ -462,6 +509,29 @@ impl PeerConnection {
             }
         }
         self.ensure_current_candidate_pairs(local_generation);
+
+        debug!(target: "p2pnet_daemon::peer::connection",
+            event = "peer_candidate_refresh_generation_advanced",
+            peer_id = %peer_id,
+            generation = local_generation,
+            reason = %reason,
+            previous_state = ?previous_state,
+            current_state = ?self.state,
+            previous_direct_generation,
+            previous_relay_ready_generation = ?previous_relay_ready_generation,
+            previous_relay_confirmed_generation = ?previous_relay_confirmed_generation,
+            previous_relay_confirmed_connection_id = ?previous_relay_confirmed_connection_id,
+            previous_first_usable_generation = ?previous_first_usable_generation,
+            current_relay_ready_generation = ?self.relay_ready_generation,
+            current_relay_confirmed_generation = ?self.relay_confirmed_generation,
+            current_first_usable_generation = ?self.first_usable_generation,
+            previous_candidate_pair_count,
+            current_candidate_pair_count = self.candidate_pairs.len(),
+            "peer candidate-refresh generation advanced peer_id={} generation={} reason={}",
+            peer_id,
+            local_generation,
+            reason,
+        );
 
         if let Some(retained) = retained_confirmed_direct {
             if let Some(index) = self.candidate_pairs.iter().position(|pair| {

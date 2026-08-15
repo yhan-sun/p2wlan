@@ -61,6 +61,23 @@ fn responder_offer_error_is_retryable(error: &DaemonError) -> bool {
     // handshake cache, so a bounded retry is safe.  Parsing, identity and
     // role errors are terminal and are never retried.
     matches!(error, DaemonError::ControlPlane(_))
+        || matches!(
+            error,
+            DaemonError::Network(reason)
+                if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+        )
+}
+
+fn responder_offer_error_reason_code(error: &DaemonError) -> &'static str {
+    match error {
+        DaemonError::ControlPlane(_) => "control_plane_error",
+        DaemonError::Network(reason)
+            if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT =>
+        {
+            REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+        }
+        _ => "responder_offer_error",
+    }
 }
 
 fn responder_offer_retry_delay(attempt: u8) -> Duration {
@@ -607,7 +624,13 @@ impl Daemon {
                     None,
                     None,
                     None,
-                    format!("owner={} retry_attempt={retry_attempt}", owner),
+                    format!(
+                        "owner={} retry_attempt={} generation={} session_fp={}",
+                        owner,
+                        retry_attempt,
+                        offer.network_generation,
+                        handshake_token_fingerprint(offer.session_id.as_deref())
+                    ),
                 )
                 .await;
             debug!(
@@ -618,7 +641,14 @@ impl Daemon {
                 "peer_offer_responder_handler_entered",
                 None,
                 None,
-                Some(format!("peer={} owner={} retry_attempt={retry_attempt}", peer_id, owner)),
+                Some(format!(
+                    "peer={} owner={} retry_attempt={} generation={} session_fp={}",
+                    peer_id,
+                    owner,
+                    retry_attempt,
+                    offer.network_generation,
+                    handshake_token_fingerprint(offer.session_id.as_deref())
+                )),
             );
             match self
                 .handle_event_peer_offer(offer.clone(), owner, cancellation)
@@ -645,14 +675,27 @@ impl Daemon {
                             None,
                             None,
                             None,
-                            format!("owner={} retry_attempt={retry_attempt}", owner),
+                            format!(
+                                "owner={} retry_attempt={} generation={} session_fp={}",
+                                owner,
+                                retry_attempt,
+                                offer.network_generation,
+                                handshake_token_fingerprint(offer.session_id.as_deref())
+                            ),
                         )
                         .await;
                     self.timeline.emit(
                         "peer_offer_responder_handler_completed",
                         None,
                         None,
-                        Some(format!("peer={} owner={} retry_attempt={retry_attempt}", peer_id, owner)),
+                        Some(format!(
+                            "peer={} owner={} retry_attempt={} generation={} session_fp={}",
+                            peer_id,
+                            owner,
+                            retry_attempt,
+                            offer.network_generation,
+                            handshake_token_fingerprint(offer.session_id.as_deref())
+                        )),
                     );
                     return;
                 }
@@ -662,12 +705,14 @@ impl Daemon {
                 {
                     let next_attempt = retry_attempt.saturating_add(1);
                     let delay = responder_offer_retry_delay(next_attempt);
+                    let reason_code = responder_offer_error_reason_code(&err);
                     warn!(
-                        "Peer offer responder failed transiently: peer={} owner={} retry_attempt={} delay_ms={} reason_code=control_plane_error error={}",
+                        "Peer offer responder failed transiently: peer={} owner={} retry_attempt={} delay_ms={} reason_code={} error={}",
                         peer_id,
                         owner,
                         next_attempt,
                         delay.as_millis(),
+                        reason_code,
                         err
                     );
                     self.peers
@@ -678,7 +723,7 @@ impl Daemon {
                             None,
                             None,
                             format!(
-                                "owner={} retry_attempt={} delay_ms={} reason_code=control_plane_error",
+                                "owner={} retry_attempt={} delay_ms={} reason_code={reason_code}",
                                 owner,
                                 next_attempt,
                                 delay.as_millis()
@@ -688,7 +733,7 @@ impl Daemon {
                     self.timeline.emit(
                         "peer_offer_responder_retry",
                         None,
-                        Some("control_plane_error"),
+                        Some(reason_code),
                         Some(format!(
                             "peer={} owner={} retry_attempt={} delay_ms={}",
                             peer_id,
@@ -1256,6 +1301,10 @@ impl Daemon {
                 continue;
             }
 
+            if !self.should_start_initiator_handshake(&peer_info) {
+                continue;
+            }
+
             let Some(reservation) = self.reserve_event_initiator_handshake(&peer_id).await else {
                 // An existing pending handshake or starting worker owns this
                 // peer. Keep the newest roster update for the next completion
@@ -1358,9 +1407,11 @@ impl Daemon {
                         let relay_candidates =
                             relay_candidates_from_sources(&relay_catalog, &relay_servers);
                         if relay_candidates.is_empty() {
+                            self.peers.configure_relay_first(false).await;
                             debug!("No relay servers advertised by control plane");
                             continue;
                         }
+                        self.peers.configure_relay_first(true).await;
                         *relay_started = true;
                         let allow_insecure_plaintext = effective_relay_allow_insecure_plaintext(
                             &self.config.control.server_url,
@@ -1451,7 +1502,11 @@ impl Daemon {
                                 peer_info.node_id, session_generation, peer_info.virtual_ip
                             )),
                         );
-                        if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                        let should_start_initiator =
+                            self.should_start_initiator_handshake(&peer_info);
+                        if should_start_initiator
+                            && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
+                        {
                             let queued = enqueue_deferred_initiator_handshake(
                                 &mut deferred_initiators,
                                 peer_info.clone(),
@@ -1493,21 +1548,23 @@ impl Daemon {
                                     deferred_initiators.len()
                                 )),
                             );
-                        } else if let Some(reservation) = self
-                            .reserve_event_initiator_handshake(&peer_info.node_id)
-                            .await
-                        {
-                            debug!(
-                                "PeerJoined handshake reserved: peer={} elapsed_ms={}",
-                                peer_info.node_id,
-                                peer_join_started.elapsed().as_millis()
-                            );
-                            let peer_info = peer_info.clone();
-                            slow_work.push(Box::pin(async move {
-                                daemon
-                                    .run_event_initiator_handshake(peer_info, reservation)
-                                    .await;
-                            }));
+                        } else if should_start_initiator {
+                            if let Some(reservation) = self
+                                .reserve_event_initiator_handshake(&peer_info.node_id)
+                                .await
+                            {
+                                debug!(
+                                    "PeerJoined handshake reserved: peer={} elapsed_ms={}",
+                                    peer_info.node_id,
+                                    peer_join_started.elapsed().as_millis()
+                                );
+                                let peer_info = peer_info.clone();
+                                slow_work.push(Box::pin(async move {
+                                    daemon
+                                        .run_event_initiator_handshake(peer_info, reservation)
+                                        .await;
+                                }));
+                            }
                         }
 
                         if self.dns.is_enabled() {
@@ -1646,7 +1703,11 @@ impl Daemon {
                             )
                             .await;
                     }
-                    if slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK {
+                    let should_start_initiator =
+                        self.should_start_initiator_handshake(&peer_info);
+                    if should_start_initiator
+                        && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
+                    {
                         let queued = enqueue_deferred_initiator_handshake(
                             &mut deferred_initiators,
                             peer_info.clone(),
@@ -1688,16 +1749,18 @@ impl Daemon {
                                 deferred_initiators.len()
                             )),
                         );
-                    } else if let Some(reservation) = self
-                        .reserve_event_initiator_handshake(&peer_info.node_id)
-                        .await
-                    {
-                        let peer_info = peer_info.clone();
-                        slow_work.push(Box::pin(async move {
-                            daemon
-                                .run_event_initiator_handshake(peer_info, reservation)
-                                .await;
-                        }));
+                    } else if should_start_initiator {
+                        if let Some(reservation) = self
+                            .reserve_event_initiator_handshake(&peer_info.node_id)
+                            .await
+                        {
+                            let peer_info = peer_info.clone();
+                            slow_work.push(Box::pin(async move {
+                                daemon
+                                    .run_event_initiator_handshake(peer_info, reservation)
+                                    .await;
+                            }));
+                        }
                     }
                 }
 
@@ -1746,6 +1809,7 @@ impl Daemon {
                     punch_at_server_ms,
                     sender_public_key,
                 } => {
+                    let network_generation = self.peers.current_network_generation_sync();
                     info!(
                         "Received peer offer from {} ({} candidates)",
                         from_node_id,
@@ -1805,6 +1869,7 @@ impl Daemon {
                                 candidates: candidates.clone(),
                                 candidate_sources: candidate_sources.clone(),
                                 candidate_generation,
+                                network_generation,
                                 candidates_expires_at_ms,
                                 sender_public_key: sender_public_key.clone(),
                                 handshake_init: handshake_init.clone(),
@@ -1821,8 +1886,12 @@ impl Daemon {
                                 None,
                                 None,
                                 Some(format!(
-                                    "peer={} owner={} candidate_generation={} deferred_unknown=true",
-                                    from_node_id, reservation.owner, candidate_generation
+                                    "peer={} owner={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=true",
+                                    from_node_id,
+                                    reservation.owner,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref())
                                 )),
                             );
                             responder_work.push(Box::pin(async move {
@@ -1830,6 +1899,19 @@ impl Daemon {
                                     .run_deferred_peer_offer_worker(offer, reservation)
                                     .await;
                             }));
+                        } else {
+                            self.timeline.emit(
+                                "peer_offer_responder_work_coalesced",
+                                None,
+                                Some("newest_wins_coalesced"),
+                                Some(format!(
+                                    "peer={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=true queued=true",
+                                    from_node_id,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref())
+                                )),
+                            );
                         }
                         continue;
                     }
@@ -1851,6 +1933,7 @@ impl Daemon {
                                 candidates: candidates.clone(),
                                 candidate_sources: candidate_sources.clone(),
                                 candidate_generation,
+                                network_generation,
                                 candidates_expires_at_ms,
                                 sender_public_key: sender_public_key.clone(),
                                 handshake_init: handshake_init.clone(),
@@ -1870,8 +1953,10 @@ impl Daemon {
                                     Some(candidates.len()),
                                     None,
                                     format!(
-                                        "responder owner={} admitted before candidate-plane work",
-                                        reservation.owner
+                                        "responder owner={} generation={} session_fp={} admitted before candidate-plane work",
+                                        reservation.owner,
+                                        offer.network_generation,
+                                        handshake_token_fingerprint(offer.session_id.as_deref())
                                     ),
                                 )
                                 .await;
@@ -1882,12 +1967,16 @@ impl Daemon {
                                 candidates.len()
                             );
                             daemon.timeline.emit(
-                                "peer_offer_responder_work_admitted",
+                                    "peer_offer_responder_work_admitted",
                                 None,
                                 None,
-                                Some(format!(
-                                    "peer={} owner={} candidate_generation={} deferred_unknown=false",
-                                    from_node_id, reservation.owner, candidate_generation
+                                    Some(format!(
+                                    "peer={} owner={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=false",
+                                    from_node_id,
+                                    reservation.owner,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref())
                                 )),
                             );
                             responder_work.push(Box::pin(async move {
@@ -1931,6 +2020,18 @@ impl Daemon {
                                 "Peer offer responder work coalesced: peer={} candidates={}",
                                 from_node_id,
                                 candidates.len()
+                            );
+                            self.timeline.emit(
+                                "peer_offer_responder_work_coalesced",
+                                None,
+                                Some("newest_wins_coalesced"),
+                                Some(format!(
+                                    "peer={} network_generation={} candidate_generation={} session_fp={} queued=true",
+                                    from_node_id,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref())
+                                )),
                             );
                         }
                     }
@@ -2079,19 +2180,26 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    // Fresh-prediction verification happens BEFORE any
-                    // candidate state is touched (see the offer path).
-                    let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
-                        .fresh_prediction_transaction(
-                            &from_node_id,
-                            &candidates,
-                            &candidate_sources,
-                            candidate_generation,
-                            candidates_expires_at_ms,
-                            sender_public_key.as_deref(),
-                        )
-                        .await;
+                    // Consume the WireGuard answer before candidate refresh or
+                    // fresh-mapping work. Those paths may perform HTTP/STUN
+                    // I/O and must remain a background upgrade; delaying the
+                    // answer here leaves the responder staged but prevents
+                    // the initiator from ever publishing its active session.
                     if !handshake_response.is_empty() {
+                        self.peers
+                            .record_direct_event(
+                                &from_node_id,
+                                "peer_answer_dispatch_started",
+                                None,
+                                Some(candidates.len()),
+                                None,
+                                format!(
+                                    "dispatching handshake response before candidate/fresh work bytes={} session_fp={}",
+                                    handshake_response.len(),
+                                    handshake_token_fingerprint(session_id.as_deref())
+                                ),
+                            )
+                            .await;
                         if let Err(err) = self
                             .handle_peer_answer(
                                 &from_node_id,
@@ -2104,6 +2212,19 @@ impl Daemon {
                             warn!("Failed to handle peer answer from {from_node_id}: {err}");
                         }
                     }
+                    // Fresh-prediction verification happens after the
+                    // handshake transaction and before candidate state is
+                    // used for background punching (see the offer path).
+                    let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
+                        .fresh_prediction_transaction(
+                            &from_node_id,
+                            &candidates,
+                            &candidate_sources,
+                            candidate_generation,
+                            candidates_expires_at_ms,
+                            sender_public_key.as_deref(),
+                        )
+                        .await;
                     match fresh_punch {
                         FreshPunchDecision::Fresh(id, frozen_targets) => {
                             self.start_hole_punch_at(

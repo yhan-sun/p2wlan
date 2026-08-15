@@ -82,6 +82,12 @@ async fn first_usable_rejects_stale_generation_and_retired_peer_packets() {
         .await;
 
     let old_generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+        .await);
     assert!(manager
         .record_verified_first_usable(
             "peer1",
@@ -129,6 +135,146 @@ async fn first_usable_rejects_stale_generation_and_retired_peer_packets() {
             "relay:relay.test:443",
         )
         .await);
+}
+
+#[tokio::test]
+async fn first_usable_commit_is_serialized_with_generation_advance() {
+    let manager = std::sync::Arc::new(PeerManager::new(test_config()));
+    manager
+        .add_peer(&test_peer("peer1", "127.0.0.1:51835".parse().unwrap()))
+        .await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", "relay.test:443", generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", "relay.test:443", generation)
+        .await);
+
+    // Hold the same gate as Air/network restart. A stale evidence writer may
+    // not pass its generation check and mutate the connection until the
+    // lifecycle transition has released the gate.
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    let record_task = tokio::spawn({
+        let manager = manager.clone();
+        async move {
+            manager
+                .record_verified_first_usable(
+                    "peer1",
+                    generation,
+                    NetworkPath::Relay,
+                    "relay:relay.test:443",
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!record_task.is_finished());
+    drop(epoch_guard);
+    assert!(record_task.await.unwrap());
+
+    let next_generation = manager.advance_network_generation("serialized_restart").await;
+    assert!(next_generation > generation);
+    assert_eq!(
+        manager
+            .get_connection("peer1")
+            .await
+            .unwrap()
+            .first_usable_generation,
+        None
+    );
+}
+
+#[tokio::test]
+async fn relay_confirmation_and_business_markers_reject_retired_generation() {
+    let manager = PeerManager::new(test_config());
+    manager
+        .add_peer(&test_peer("peer1", "127.0.0.1:51836".parse().unwrap()))
+        .await;
+
+    let old_generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+        .await);
+
+    let new_generation = manager.advance_network_generation("retire_relay_state").await;
+    assert!(new_generation > old_generation);
+
+    // Every relay state writer must fail closed after the generation advance;
+    // none may recreate READY, confirmation, or first-business evidence for
+    // the retired generation.
+    manager
+        .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
+        .await;
+    assert!(!manager
+        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+        .await);
+    assert!(!manager
+        .mark_relay_first_business_sent_for_generation("peer1", old_generation)
+        .await);
+    assert!(!manager
+        .mark_relay_first_business_received_for_generation(
+            "peer1",
+            "relay.test:443",
+            old_generation,
+        )
+        .await);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_ready_generation, None);
+    assert_eq!(connection.relay_confirmed_generation, None);
+    assert_eq!(connection.relay_first_business_sent_generation, None);
+    assert_eq!(connection.relay_first_business_received_generation, None);
+    assert_eq!(connection.relay_first_business_exchange_generation, None);
+}
+
+#[tokio::test]
+async fn generation_advance_wins_over_queued_relay_confirmation() {
+    let manager = std::sync::Arc::new(PeerManager::new(test_config()));
+    manager
+        .add_peer(&test_peer("peer1", "127.0.0.1:51837".parse().unwrap()))
+        .await;
+
+    let old_generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
+        .await;
+
+    // Queue the lifecycle transition ahead of the stale confirmation while
+    // the epoch gate is held. Tokio's mutex is FIFO, so releasing the gate
+    // deterministically lets the generation advance retire the state before
+    // the old ACK's commit attempt runs.
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    let advance_task = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.advance_network_generation("queued_before_old_ack").await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!advance_task.is_finished());
+
+    let confirm_task = tokio::spawn({
+        let manager = manager.clone();
+        async move {
+            manager
+                .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!confirm_task.is_finished());
+    drop(epoch_guard);
+
+    let new_generation = advance_task.await.unwrap();
+    assert!(new_generation > old_generation);
+    assert!(!confirm_task.await.unwrap());
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_confirmed_generation, None);
+    assert_eq!(connection.relay_ready_generation, None);
 }
 
 #[tokio::test]

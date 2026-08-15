@@ -21,7 +21,10 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
-NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info}
+# Keep the local regression logs at the same diagnostic granularity as the
+# dual-end harness: per-packet counter/order and transport handoff boundaries
+# are DEBUG, while the rest remains INFO. Override this for a quieter run.
+  NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info,p2pnet_daemon::transport=debug,p2pnet_daemon::network_outbound=debug,p2pnet_daemon::relay=debug,p2pnet_daemon::relay_runtime=debug,p2pnet_daemon::connection_timeline=debug,p2pnet_daemon::direct_validation=debug,p2pnet_daemon::peer::connection=debug,p2pnet_daemon::peer::connection::events=debug,p2pnet_daemon::peer::manager::relay=debug,p2pnet_relay::client=debug}
 ROUNDS=${ROUNDS:-5}
 NAT_SEED_BASE=${NAT_SEED_BASE:-20260806}
  # Avoid collisions between locally parallel/recent smoke invocations.  The
@@ -47,6 +50,12 @@ BASE_B=${BASE_B:-46000}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-60}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-30}
 NAT_SIM_ARTIFACT_DIR=${NAT_SIM_ARTIFACT_DIR:-}
+# Give every local daemon timeline an explicit, bounded correlation namespace.
+# The dual-end harness already supplies P2WLAN_TEST_RUN_ID; NAT-sim used to
+# leave it unset, which made the logs harder to join even though each daemon
+# still had a correlation_id.  This value is diagnostic-only and never carries
+# credentials or control-plane material.
+NAT_SIM_RUN_ID=${NAT_SIM_RUN_ID:-nat-sim-${MODE}-${NAT_SEED_BASE}}
 # Post-first-usable burst verification: fire this many business payloads per
 # peer right after first-usable evidence and require EVERY echo (zero loss /
 # duplicate / replay).  Relay-only rounds default to a 256-packet burst.
@@ -78,6 +87,10 @@ STATUS_SCHEMA_INJECTION=${STATUS_SCHEMA_INJECTION:-0}
 
 if ! [[ "$NAT_SEED_BASE" =~ ^[0-9]+$ ]]; then
   echo "[nat-sim] NAT_SEED_BASE must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$NAT_SIM_RUN_ID" =~ ^[A-Za-z0-9_.-]{1,80}$ ]]; then
+  echo "[nat-sim] NAT_SIM_RUN_ID must contain only letters, digits, '.', '_' or '-' and be <= 80 characters" >&2
   exit 2
 fi
 
@@ -115,7 +128,16 @@ strip_ansi() {
 # SUMS the two ends' deltas, never subtracts wall clocks across machines.
 node_event_tms() {
   local log="$1" ev="$2"
-  strip_ansi < "$log" | grep -m1 "event=\"${ev}\"" | grep -oE 't_ms=[0-9]+' | head -1 | cut -d= -f2 || true
+  # The same event is intentionally logged twice: a subsystem DEBUG line and
+  # a structured ConnectionTimeline INFO line.  The DEBUG line has no t_ms.
+  # Do not use grep -m1 before extracting t_ms, or a perfectly valid timeline
+  # event is reported as missing (this made Direct rounds fail closed with
+  # first_usable_delta_missing even though both timestamps were present).
+  strip_ansi < "$log" \
+    | grep "event=\"${ev}\"" \
+    | grep -oE 't_ms=[0-9]+' \
+    | head -1 \
+    | cut -d= -f2 || true
 }
 
 # Extract the real ingress path of the first production business evidence
@@ -301,6 +323,7 @@ for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
   mkdir -p "$ROUND_DIR"
   NAT_SEED=$((NAT_SEED_BASE + round))
+  ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
 
   echo "[nat-sim] round $round: starting NAT simulator (mode=$MODE step_a=$STEP_A step_b=$STEP_B consume_a=$CONSUME_A consume_b=$CONSUME_B loss=$LOSS reorder=$REORDER strict_filtering=$STRICT_FILTERING seed=$NAT_SEED)"
   REORDER_FLAG=""
@@ -424,7 +447,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ -n "$SOCKET_POOL" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --socket-pool $SOCKET_POOL"; fi
   if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-a.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -447,7 +470,7 @@ for round in $(seq 1 "$ROUNDS"); do
     sleep 0.25
   done
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-b.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -542,13 +565,17 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "== matched punch ACKs =="
     grep -h 'received authenticated UDP punch ACK\|received UDP punch ACK' "$ROUND_DIR"/node-*.log 2>/dev/null | head -2
     echo "== direct validation request/ack =="
-    grep -h 'direct_validation_request_sent\|direct_validation_request_received\|direct_validation_ack_received\|direct_validation_promoted' "$ROUND_DIR"/node-*.log 2>/dev/null | head -4
+    grep -h -E 'direct_validation_(queued|started|waiting_for_session|session_ready|request_sent|request_received|request_dropped|ack_sent|ack_received|ack_wait_timeout|ack_unmatched|ack_not_promoted|ack_send_failed|emit_lock_timeout|timed_out|failed|cancelled|completed|promoted|suppressed)|direct_path_promoted' "$ROUND_DIR"/node-*.log 2>/dev/null | head -120
+    echo "== direct traversal plan lifecycle =="
+    grep -h -E 'direct_punch_(started|completed|failed|cancelled)|direct_fast_probe_(started|sent|failed|confirmed)|direct_probe_(ack_timeout|budget_exhausted)|direct_candidates_ready|candidate_pair_probe_succeeded|retry_(punch_started|probes_sent|ack_timeout|probe_succeeded|send_error)|direct_reclaim_(punch_started|probes_sent|ack_timeout|probe_succeeded|send_error)|fresh_mapping_(generation_started|generation_completed|generation_failed|prediction_signaled)' "$ROUND_DIR"/node-*.log 2>/dev/null | head -160
     echo "== promotion times =="
     grep -h 'direct_path_promoted\|candidate_pair_selected' "$ROUND_DIR"/node-*.log 2>/dev/null | head -2
     echo "== relay hedge =="
     grep -h 'relay' "$ROUND_DIR"/node-*.log 2>/dev/null | grep -i 'selected\|fallback' | head -2
     echo "== connection timeline (first usable / relay / direct milestones) =="
     grep -hE 'relay_selection_started|relay_transport_connected|relay_transport_ready_peer|relay_probe_sent|relay_probe_ack_consumed|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|outbound_first_packet_wait_started|outbound_first_packet_flushed|first_usable_path|first_usable_bidirectional_overlay_ms|relay_unavailable_or_first_packet_expired' "$ROUND_DIR"/node-*.log 2>/dev/null | head -16
+    echo "== per-packet dataplane boundaries (counter -> handoff -> peer decrypt) =="
+    grep -hE 'wireguard_outbound_counter_allocated|outbound_business_emit_lock_acquired|outbound_counter_allocation_rejected|outbound_transport_handoff_started|control_transport_handoff_started|control_transport_handoff_completed|relay_writer_queue_accepted|relay_writer_queue_rejected|relay_writer_completion_received|relay_writer_completion_missing|relay_write_started|relay_write_completed|relay_write_failed|relay_data_send_started|relay_data_write_started|relay_data_write_completed|relay_data_send_failed|relay_outbound_write_started|relay_outbound_write_completed|relay_outbound_write_failed|relay_inbound_frame_accepted|direct_data_send_started|direct_data_handoff_accepted|direct_data_send_failed|wireguard_inbound_decrypt_succeeded|hedge_duplicate_replay|outbound_send_timeout|outbound_terminal_drop' "$ROUND_DIR"/node-*.log 2>/dev/null | head -220
     echo "== overlay loopback evidence =="
     grep -h 'overlay_payload_verified\|overlay_payload_sent\|overlay_payload_echo\|first_usable_confirmed' "$ROUND_DIR"/node-*.log 2>/dev/null | head -6
   } >"$ROUND_DIR/evidence.log" 2>&1 || true

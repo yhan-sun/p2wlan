@@ -118,6 +118,13 @@ impl RelayClient {
                             }
                             ClientCommand::SendData { dst, data, completion } => {
                                 let data_len = data.len();
+                                let write_started = std::time::Instant::now();
+                                debug!(
+                                    event = "relay_write_started",
+                                    peer_id = %dst,
+                                    bytes = data_len,
+                                    "legacy relay writer dequeued an accepted data command and is entering write_all"
+                                );
                                 let result = match Frame::forward(&dst, &data) {
                                     Ok(frame) if frame.payload.len() > max_payload => {
                                         Err(RelayError::FrameTooLarge(frame.payload.len(), max_payload))
@@ -138,7 +145,18 @@ impl RelayClient {
                                         event = "relay_write_completed",
                                         peer_id = %dst,
                                         bytes = data_len,
+                                        write_duration_ms = write_started.elapsed().as_millis() as u64,
                                         "relay writer completed write_all; this is not a peer-delivery acknowledgement"
+                                    );
+                                } else {
+                                    warn!(
+                                        event = "relay_write_failed",
+                                        peer_id = %dst,
+                                        bytes = data_len,
+                                        write_duration_ms = write_started.elapsed().as_millis() as u64,
+                                        reason_code = "relay_write_uncertain_or_failed",
+                                        error = ?result.as_ref().err(),
+                                        "legacy relay writer failed after command acceptance; ciphertext delivery is uncertain"
                                     );
                                 }
                                 let _ = completion.send(result);

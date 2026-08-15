@@ -29,6 +29,7 @@ AIR_HOST=${AIR_HOST:-}
 AIR_USER=${AIR_USER:-}
 AIR_SSH_PORT=${AIR_SSH_PORT:-22}
 AIR_SSH_KEY=${AIR_SSH_KEY:-}
+AIR_KNOWN_HOSTS_FILE=${AIR_KNOWN_HOSTS_FILE:-"$HOME/.ssh/known_hosts"}
 AIR_DAEMON_BIN=${AIR_DAEMON_BIN:-}
 MINI_TAILSCALE_IP=${MINI_TAILSCALE_IP:-}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-30}
@@ -151,6 +152,10 @@ if [[ "$AIR_SSH_KEY" != /* || ! -f "$AIR_SSH_KEY" ]]; then
   echo "[mini-air] AIR_SSH_KEY must be an existing absolute path" >&2
   exit 2
 fi
+if [[ "$AIR_KNOWN_HOSTS_FILE" != /* || ! -f "$AIR_KNOWN_HOSTS_FILE" ]]; then
+  echo "[mini-air] AIR_KNOWN_HOSTS_FILE must be an existing absolute path" >&2
+  exit 2
+fi
 MINI_TAILSCALE_IP=${MINI_TAILSCALE_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}
 if [[ -z "$MINI_TAILSCALE_IP" ]]; then
   echo "[mini-air] MINI_TAILSCALE_IP is required when tailscale is unavailable" >&2
@@ -175,7 +180,7 @@ fi
 # auditable run ids exceed macOS's sockaddr_un limit before the first SSH
 # command. `%C` is the OpenSSH hash of the connection tuple and keeps runs
 # isolated without making the path unbounded.
-AIR_SSH="${SSH_RUN_PREFIX}ssh -i $AIR_SSH_KEY -p $AIR_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=/tmp/p2wlan-direct-%C $AIR_USER@$AIR_HOST"
+AIR_SSH="${SSH_RUN_PREFIX}ssh -i $AIR_SSH_KEY -p $AIR_SSH_PORT -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$AIR_KNOWN_HOSTS_FILE -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=/tmp/p2wlan-direct-%C $AIR_USER@$AIR_HOST"
 
 # An SSH login can belong to the same account as the logged-in Air user while
 # still being outside that user's GUI launchd bootstrap.  Authorization
@@ -743,9 +748,11 @@ DIRECT_BLACKHOLE_ANCHOR="com.apple/p2wlan-${RUN_ID//[^A-Za-z0-9_.-]/-}"
 DIRECT_BLACKHOLE_LOCAL_ACTIVE=0
 DIRECT_BLACKHOLE_REMOTE_ACTIVE=0
 # Do not inherit an ambient application-level RUST_LOG (often `warn`) here:
-# this harness needs Info promotion telemetry in both logs. Callers that need
-# a different filter can override the harness-specific variable explicitly.
-HARNESS_RUST_LOG=${HARNESS_RUST_LOG:-info,p2pnet_daemon::network_outbound=debug}
+# this harness needs the bounded dataplane boundary telemetry in both logs.
+# Keep the filter targeted: enabling all peer debug logs would include noisy
+# candidate churn and legacy validation internals. Callers can override the
+# harness-specific variable explicitly for a deeper one-off capture.
+HARNESS_RUST_LOG=${HARNESS_RUST_LOG:-info,p2pnet_daemon::transport=debug,p2pnet_daemon::network_outbound=debug,p2pnet_daemon::relay=debug,p2pnet_daemon::relay_runtime=debug,p2pnet_daemon::connection_timeline=debug,p2pnet_daemon::direct_validation=debug,p2pnet_daemon::peer::connection=debug,p2pnet_daemon::peer::connection::events=debug,p2pnet_daemon::peer::manager::relay=debug,p2pnet_relay::client=debug}
 
 if [[ -z "$REMOTE_CONTROL_URL" ]]; then
   echo "[mini-air] REMOTE_CONTROL_URL is required; this harness must not start a local control or relay service" >&2
@@ -1156,6 +1163,82 @@ run_real_tun_business_pair() {
   printf 'mini_replies=%s air_replies=%s mini_successful_commands=%s air_successful_commands=%s\n' \
     "$REAL_OVERLAY_MINI_REPLIES" "$REAL_OVERLAY_AIR_REPLIES" "$successful_mini" "$successful_air" \
     >"$round_dir/real-overlay-summary.env"
+}
+
+# Do not inject the first real TUN packet while one endpoint is still waiting
+# for its peer session or relay ACK.  That is a useful queue/failure-injection
+# scenario, but it is not a clean relay-first availability measurement: a
+# later Direct ACK can consume the queued ciphertext while the relay side is
+# still only READY, making the test conflate startup ordering with path
+# availability.  The daemon still starts relay and Direct in parallel; this
+# barrier only makes the real-business measurement begin after both daemons
+# have independently proved the relay peer path.
+wait_for_target_relay_pair() {
+  local round_dir=$1
+  local timeout_s=${RELAY_CONFIRM_WAIT_S:-10}
+  local deadline_ms=$(( $(python3 -c 'import time; print(int(time.time()*1000))') + timeout_s * 1000 ))
+  local mini_live="$round_dir/relay-confirm-mini-live.json"
+  local air_live="$round_dir/relay-confirm-air-live.json"
+  : >"$round_dir/relay-confirm-wait.log"
+  while :; do
+    local now_ms
+    now_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+    if [[ "$now_ms" -ge "$deadline_ms" ]]; then
+      printf 'timeout_s=%s mini_confirmed=0 air_confirmed=0\n' "$timeout_s" \
+        >>"$round_dir/relay-confirm-wait.log"
+      return 1
+    fi
+
+    local mini_confirmed=0
+    local air_confirmed=0
+    if curl -fsS --max-time 3 \
+      "http://127.0.0.1:$DIAG_A_PORT/status/peer/$AIR_NODE_ID" >"$mini_live" 2>/dev/null; then
+      mini_confirmed=$(python3 - "$mini_live" "$AIR_NODE_ID" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+    peer = value.get("peer") or {}
+    print(int(
+        peer.get("node_id") == sys.argv[2]
+        and peer.get("online") is True
+        and peer.get("relay_confirmed_endpoint")
+        and peer.get("relay_confirmed_generation") == value.get("network_generation")
+    ))
+except (OSError, ValueError, TypeError):
+    print(0)
+PY
+      )
+    fi
+    if $AIR_SSH "curl --noproxy '*' -fsS --max-time 3 http://127.0.0.1:$DIAG_B_PORT/status/peer/$MINI_NODE_ID" \
+      >"$air_live" 2>/dev/null; then
+      air_confirmed=$(python3 - "$air_live" "$MINI_NODE_ID" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+    peer = value.get("peer") or {}
+    print(int(
+        peer.get("node_id") == sys.argv[2]
+        and peer.get("online") is True
+        and peer.get("relay_confirmed_endpoint")
+        and peer.get("relay_confirmed_generation") == value.get("network_generation")
+    ))
+except (OSError, ValueError, TypeError):
+    print(0)
+PY
+      )
+    fi
+    printf 't_wall_ms=%s mini_confirmed=%s air_confirmed=%s\n' "$now_ms" \
+      "$mini_confirmed" "$air_confirmed" >>"$round_dir/relay-confirm-wait.log"
+    if [[ "$mini_confirmed" == "1" && "$air_confirmed" == "1" ]]; then
+      printf 'result=both_confirmed\n' >>"$round_dir/relay-confirm-wait.log"
+      return 0
+    fi
+    sleep 0.1
+  done
 }
 
 count_stage() {
@@ -2161,6 +2244,16 @@ PY
   fi
 
   if [[ "$REAL_TUN" == "1" ]]; then
+    if ! wait_for_target_relay_pair "$ROUND_DIR"; then
+      echo "[mini-air] ROUND $round: FAIL (both target relay peer ACKs did not arrive before real TUN traffic)" >&2
+      overall=1
+      collect_air_log || true
+      remote_daemon_cleanup || true
+      kill_remote_wrapper
+      local_daemon_cleanup || true
+      if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+      continue
+    fi
     echo "[mini-air] ROUND $round: sending bounded real TUN ICMP probes $MINI_VIRTUAL_IP <-> $AIR_VIRTUAL_IP"
     run_real_tun_business_pair "$ROUND_DIR" "$MINI_VIRTUAL_IP" "$AIR_VIRTUAL_IP"
   fi
@@ -2385,6 +2478,7 @@ PY
   else
     python3 - "$EVIDENCE_A_STATUS" "$AIR_NODE_ID" "$EVIDENCE_B_STATUS" "$MINI_NODE_ID" <<'PY' >"$ROUND_DIR/round-audit.json"
 import json
+import os
 import sys
 
 def endpoint_of(status_path, peer_id):
@@ -2401,9 +2495,15 @@ def endpoint_of(status_path, peer_id):
         return ""
     return ""
 
+mode = os.environ.get("ACCEPTANCE_MODE", "unknown")
+classification = {
+    "availability": "relay_first_availability",
+    "compat": "functional_direct_baseline",
+}.get(mode, "unclassified")
+
 print(json.dumps({
-    "acceptance_mode": "compat",
-    "classification": "functional_direct_baseline",
+    "acceptance_mode": mode,
+    "classification": classification,
     "mini_peer_id": sys.argv[2],
     "air_peer_id": sys.argv[4],
     "mini_endpoint": endpoint_of(sys.argv[1], sys.argv[2]),
@@ -2666,6 +2766,27 @@ PY
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-a.log" | head -4
     echo "== B relay hedge/fallback/selection =="
     grep -h -i -E 'relay_hedged=true|relay_fallback_selected|selected relay region' "$ROUND_DIR/node-b.log" | head -4
+    echo "== relay proof boundaries (queue -> write -> encrypted peer ACK) =="
+    grep -h -E 'relay_writer_queue_accepted|relay_writer_queue_rejected|relay_writer_completion_received|relay_writer_completion_missing|relay_write_started|relay_write_completed|relay_write_failed|relay_probe_sent|relay_probe_send_failed|relay_probe_send_timeout|relay_probe_ack_consumed|relay_peer_confirmed|relay_probe_ack_stale' \
+      "$ROUND_DIR"/node-*.log | head -40
+    echo "== Direct validation lifecycle (request -> ACK/timeout/cancel) =="
+    grep -h -E 'direct_validation_(queued|started|waiting_for_session|session_ready|request_sent|request_received|request_dropped|ack_sent|ack_received|ack_wait_timeout|ack_unmatched|ack_not_promoted|ack_send_failed|emit_lock_timeout|timed_out|failed|cancelled|completed|promoted|suppressed)|direct_path_promoted' \
+      "$ROUND_DIR"/node-*.log | head -120
+    echo "== Direct traversal plan lifecycle (candidate -> fast probe -> retry) =="
+    grep -h -E 'direct_punch_(started|completed|failed|cancelled)|direct_fast_probe_(started|sent|failed|confirmed)|direct_probe_(ack_timeout|budget_exhausted)|direct_candidates_ready|candidate_pair_probe_succeeded|retry_(punch_started|probes_sent|ack_timeout|probe_succeeded|send_error)|direct_reclaim_(punch_started|probes_sent|ack_timeout|probe_succeeded|send_error)|fresh_mapping_(generation_started|generation_completed|generation_failed|prediction_signaled)' \
+      "$ROUND_DIR"/node-*.log | head -160
+    echo "== path selector state snapshots =="
+    grep -h -E 'path_state_snapshot|outbound_path_decision' \
+      "$ROUND_DIR"/node-*.log | head -40
+    echo "== first real business ingress vs first usable =="
+    grep -h -E 'first_real_business_ingress|first_usable_(path|rejected|fallback)|relay_first_business_(sent|received|exchange)' \
+      "$ROUND_DIR"/node-*.log | head -40
+    echo "== queue/loss/generation terminal evidence =="
+    grep -h -E 'outbound_packet_dropped|outbound_send_failure|relay_unavailable_or_first_packet_expired|stale_network_generation_packet|stale_session_evidence|generation_cancel' \
+      "$ROUND_DIR"/node-*.log | head -40
+    echo "== per-packet dataplane boundaries (counter -> handoff -> peer decrypt) =="
+    grep -h -E 'wireguard_outbound_counter_allocated|outbound_business_emit_lock_acquired|outbound_counter_allocation_rejected|outbound_transport_handoff_started|control_transport_handoff_started|control_transport_handoff_completed|relay_data_send_started|relay_data_write_started|relay_data_write_completed|relay_data_send_failed|relay_outbound_write_started|relay_outbound_write_completed|relay_outbound_write_failed|relay_inbound_frame_accepted|direct_data_send_started|direct_data_handoff_accepted|direct_data_send_failed|wireguard_inbound_decrypt_succeeded|hedge_duplicate_replay|outbound_send_timeout|outbound_terminal_drop' \
+      "$ROUND_DIR"/node-*.log | head -160
     if [[ "$ACCEPTANCE_MODE" == "availability" ]]; then
       echo "== A first-usable timeline (all timepoints with corr_id + t_ms + path) =="
       grep -E 'daemon_started|control_registered|relay_selection_started|relay_transport_connected|relay_peer_confirmed|first_direct_probe_sent|direct_promoted|first_usable_path|first_usable_bidirectional_overlay_ms|first_real_business_ingress|relay_unavailable_or_first_packet_expired' "$ROUND_DIR/node-a.log" | head -14

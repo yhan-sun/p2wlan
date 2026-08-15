@@ -274,9 +274,23 @@ pub const REASON_PATH_RELAY_FIRST_PENDING: &str = "path_relay_first_pending";
 /// relay-first an observable data-plane property instead of merely a control
 /// plane ordering promise.
 pub const REASON_PATH_RELAY_FIRST_BUSINESS: &str = "path_relay_first_business";
+/// Relay was confirmed, but the bidirectional first-business evidence did not
+/// arrive before the bounded relay-first grace.  Direct remains eligible only
+/// because it has its own same-generation encrypted confirmation; this is an
+/// observable fallback, never a relay confirmation.
+pub const REASON_PATH_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE: &str =
+    "path_direct_after_relay_business_deadline";
 /// A Direct business packet arrived before the bidirectional relay-first
 /// evidence was complete; it may be delivered, but it cannot win first usable.
 pub const REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS: &str = "first_direct_before_relay_business";
+/// Direct became first usable after the bounded relay-business gate expired.
+/// This is deliberately distinct from a relay-first result in acceptance
+/// artifacts and diagnostics.
+pub const REASON_FIRST_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE: &str =
+    "first_direct_after_relay_business_deadline";
+/// A decrypted relay business packet arrived before the same-generation relay
+/// peer ACK.  It is a health observation only, never relay-first evidence.
+pub const REASON_FIRST_RELAY_BEFORE_CONFIRMATION: &str = "first_relay_before_peer_confirmation";
 /// Path selector found no usable Direct or Relay path.
 pub const REASON_PATH_UNAVAILABLE: &str = "path_unavailable";
 

@@ -28,25 +28,71 @@ fn direct_fast_probe_candidates_with_preferred(
     candidates: &[SocketAddr],
     preferred: &[SocketAddr],
 ) -> Vec<SocketAddr> {
-    let mut selected = Vec::with_capacity(DIRECT_FAST_PROBE_MAX_CANDIDATES);
+    direct_fast_probe_candidates_with_preferred_limit(
+        candidates,
+        preferred,
+        DIRECT_FAST_PROBE_MAX_CANDIDATES,
+    )
+}
+
+/// Build the larger but still bounded immediate window for an already
+/// classified predicted/peer-reflexive candidate set.  The preferred list is
+/// ordered by the candidate selector; the ordinary list remains the fallback
+/// suffix, so no FIFO work is discarded or reordered.
+fn direct_fast_probe_candidates_with_predicted_window(
+    candidates: &[SocketAddr],
+    preferred: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    direct_fast_probe_candidates_with_preferred_limit(
+        candidates,
+        preferred,
+        DIRECT_FAST_PROBE_PREDICTED_MAX_CANDIDATES,
+    )
+}
+
+fn direct_fast_probe_candidates_with_preferred_limit(
+    candidates: &[SocketAddr],
+    preferred: &[SocketAddr],
+    max_candidates: usize,
+) -> Vec<SocketAddr> {
+    let mut selected = Vec::with_capacity(max_candidates);
     for candidate in preferred.iter().chain(candidates) {
         if selected.contains(candidate) {
             continue;
         }
         selected.push(*candidate);
-        if selected.len() == DIRECT_FAST_PROBE_MAX_CANDIDATES {
+        if selected.len() == max_candidates {
             break;
         }
     }
     selected
 }
 
+/// Merge a newer candidate snapshot without changing the order of the
+/// already-owned punch plan.
+///
+/// The active per-peer session owns the current FIFO of probe work.  A late
+/// control-plane refresh must therefore be appended to that FIFO, not replace
+/// it or start a second worker.  The latency-sensitive prefix can still use
+/// the refresh separately before this merged list reaches the broad sweep.
+fn merge_unique_socket_addresses(base: &mut Vec<SocketAddr>, additions: &[SocketAddr]) -> usize {
+    let mut added = 0;
+    for endpoint in additions {
+        if !base.contains(endpoint) {
+            base.push(*endpoint);
+            added += 1;
+        }
+    }
+    added
+}
+
 fn direct_fast_probe_is_safe(remote_scatter_pool: bool, stable_remote_scatter: bool) -> bool {
-    // This is only the bounded immediate prefix (at most eight candidates,
-    // one attempt, through the active socket pool).  It does not replace or
-    // accelerate the unbounded scatter sweep, so it is safe to run before the
-    // synchronized rendezvous even when the broad target set is classified as
-    // remote scatter/stable scatter.
+    // This is only the bounded immediate prefix (at most 32 candidates for an
+    // explicitly preferred prediction window, otherwise eight; one attempt,
+    // through the active socket pool). It does not replace or accelerate the
+    // unbounded scatter sweep, so it is safe to run before the synchronized
+    // rendezvous even when the broad target set is classified as remote
+    // scatter/stable scatter.
     let _ = (remote_scatter_pool, stable_remote_scatter);
     true
 }

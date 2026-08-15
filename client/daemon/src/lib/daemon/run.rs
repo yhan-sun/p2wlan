@@ -162,6 +162,12 @@ impl Daemon {
         // task below and can publish/upgrade after relay is serving.
         let relay_candidates = relay_candidates_from_sources(&relay_catalog, &relay_servers);
         let relay_candidates_present = !relay_candidates.is_empty();
+        // Arm the per-peer relay-first gate before either direct validation or
+        // the relay supervisor can publish a transport. A Direct ACK that
+        // arrives during relay startup is background evidence only.
+        self.peers
+            .configure_relay_first(relay_candidates_present)
+            .await;
         let mut relay_started = false;
         if relay_candidates_present {
             relay_started = true;
@@ -250,6 +256,10 @@ impl Daemon {
         // up), so the probe fires immediately instead of waiting for the next
         // poll tick.
         let (relay_probe_kick_tx, relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+        // The probe loop and handshake maintenance each keep their own watch
+        // cursor. A first business packet therefore wakes both paths without
+        // making either consumer steal the other's notification.
+        let handshake_kick_rx = relay_probe_kick_rx.clone();
         self.task_manager
             .spawn(
                 "network-outbound",
@@ -431,6 +441,7 @@ self.task_manager
             runtime_stun_timeout: self.runtime_stun_timeout.clone(),
             udp_advertise: self.config.network.udp_advertise.clone(),
             node_private_key: self.config.node.private_key.clone(),
+            kick_rx: handshake_kick_rx,
         }),
     )
     .await;

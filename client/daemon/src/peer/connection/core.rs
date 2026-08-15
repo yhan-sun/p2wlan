@@ -22,6 +22,18 @@ struct PendingProbeSessionBinding {
     promote_on_match: bool,
 }
 
+/// A real decrypted relay business packet can arrive a few milliseconds
+/// before this daemon receives the matching encrypted relay-probe ACK.  Keep
+/// only that bounded evidence tuple so the later confirmation can complete
+/// the proof without replaying the WireGuard ciphertext.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRelayBusinessEvidence {
+    pub generation: u64,
+    pub relay_endpoint: String,
+    pub relay_connection_id: Option<u64>,
+    pub received_at: Instant,
+}
+
 /// Information about a connection to a specific peer.
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -103,6 +115,11 @@ pub struct PeerConnection {
     pub relay_ready_at: Option<Instant>,
     /// Relay endpoint that carried the per-peer relay-ready milestone.
     pub relay_ready_endpoint: Option<String>,
+    /// Local relay transport incarnation that carried the per-peer
+    /// relay-ready milestone.  The endpoint may be reused by a reconnect, so
+    /// endpoint + generation alone is not enough to bind readiness to the
+    /// current writer/reader pair.
+    pub relay_ready_connection_id: Option<u64>,
     /// Local network generation in which the relay path to this peer was
     /// confirmed by a matching forced-relay encrypted probe/ACK (the ACK's real
     /// ingress was relay).  Never set by a local TCP/TLS connect or by a
@@ -140,6 +157,17 @@ pub struct PeerConnection {
     /// relay-first race: local relay writer completion alone cannot authorize
     /// Direct for the other direction.
     pub relay_first_business_received_generation: Option<u64>,
+    /// Generation for which a relay business packet was sent locally and a
+    /// normal relay business packet was received.  Writer completion is not a
+    /// peer-delivery proof; this two-direction marker is the minimum local
+    /// evidence that both directions crossed the confirmed relay before a
+    /// Direct data-plane promotion may win.  The two component markers may
+    /// arrive in either order.
+    pub relay_first_business_exchange_generation: Option<u64>,
+    /// Real relay business ingress observed before local RelayPeerConfirmed.
+    /// It is promoted only when the later confirmation matches generation,
+    /// endpoint and transport incarnation; any lifecycle reset clears it.
+    pub(crate) relay_preconfirmation_business: Option<PendingRelayBusinessEvidence>,
     /// Local network generation of the first confirmed usable path
     /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
     /// milestone.
@@ -207,6 +235,7 @@ impl PeerConnection {
             relay_ready_generation: None,
             relay_ready_at: None,
             relay_ready_endpoint: None,
+            relay_ready_connection_id: None,
             relay_confirmed_generation: None,
             relay_confirmed_at: None,
             relay_confirmed_endpoint: None,
@@ -216,6 +245,8 @@ impl PeerConnection {
             relay_confirm_seq: 0,
             relay_first_business_sent_generation: None,
             relay_first_business_received_generation: None,
+            relay_first_business_exchange_generation: None,
+            relay_preconfirmation_business: None,
             first_usable_generation: None,
             first_usable_at: None,
             first_usable_path: None,
@@ -251,6 +282,7 @@ impl PeerConnection {
         self.relay_ready_generation = None;
         self.relay_ready_at = None;
         self.relay_ready_endpoint = None;
+        self.relay_ready_connection_id = None;
         self.relay_confirmed_generation = None;
         self.relay_confirmed_at = None;
         self.relay_confirmed_endpoint = None;
@@ -259,6 +291,8 @@ impl PeerConnection {
         self.relay_first_gate_started_at = None;
         self.relay_first_business_sent_generation = None;
         self.relay_first_business_received_generation = None;
+        self.relay_first_business_exchange_generation = None;
+        self.relay_preconfirmation_business = None;
         self.first_usable_generation = None;
         self.first_usable_at = None;
         self.first_usable_path = None;
@@ -296,6 +330,23 @@ impl PeerConnection {
     /// Transition to a new state.
     pub fn transition(&mut self, new_state: ConnectionState) {
         if self.state != new_state {
+            let previous_state = self.state;
+            info!(target: "p2pnet_daemon::peer::connection",
+                event = "peer_connection_state_changed",
+                peer_id = %self.node_id,
+                previous_state = ?previous_state,
+                new_state = ?new_state,
+                direct_generation = self.direct_generation,
+                relay_ready_generation = ?self.relay_ready_generation,
+                relay_confirmed_generation = ?self.relay_confirmed_generation,
+                relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
+                relay_server = ?self.relay_server,
+                direct_endpoint = ?self.endpoint,
+                "peer connection state changed peer_id={} previous={:?} new={:?}",
+                self.node_id,
+                previous_state,
+                new_state,
+            );
             info!(
                 "Peer {} state: {} → {}",
                 self.node_id, self.state, new_state

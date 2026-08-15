@@ -2,6 +2,10 @@
 pub(crate) struct DirectProbeTargetSet {
     pub peer_id: String,
     pub candidates: Vec<SocketAddr>,
+    /// Authenticated/learned candidate sources that should get the larger
+    /// bounded fast prefix.  The complete `candidates` vector remains the
+    /// authoritative FIFO for the broad punch plan.
+    pub preferred_fast_candidates: Vec<SocketAddr>,
     pub remote_scatter_pool: bool,
     pub stable_remote_scatter: bool,
     pub birthday_plan: Option<BirthdayProbePlan>,
@@ -161,6 +165,7 @@ impl PeerManager {
                     self.config.network.socket_pool_size,
                 );
             }
+            let preferred_fast_candidates = conn.preferred_fast_candidates(&endpoints);
             Some(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
                 stable_remote_scatter: remote_scatter_pool
@@ -169,6 +174,7 @@ impl PeerManager {
                         .is_some_and(|plan| plan.stable_side_unique_scatter),
                 remote_scatter_pool,
                 candidates: endpoints,
+                preferred_fast_candidates,
                 birthday_plan,
                 recovery_epoch,
             })
@@ -629,14 +635,16 @@ impl PeerManager {
                 relay_safety_net,
                 self.config.network.socket_pool_size,
             );
+            let preferred_fast_candidates = conn.preferred_fast_candidates(&endpoints);
             sets.push(DirectProbeTargetSet {
                 peer_id: conn.node_id.clone(),
                 stable_remote_scatter: remote_scatter_pool
                     && birthday_plan
                         .as_ref()
-                        .is_some_and(|plan| plan.stable_side_unique_scatter),
+                    .is_some_and(|plan| plan.stable_side_unique_scatter),
                 remote_scatter_pool,
                 candidates: endpoints,
+                preferred_fast_candidates,
                 birthday_plan,
                 recovery_epoch: epoch,
             });

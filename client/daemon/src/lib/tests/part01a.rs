@@ -620,6 +620,46 @@ fn direct_fast_probe_prefers_fresh_prediction_window_without_expanding_budget() 
     );
 }
 
+#[test]
+fn direct_fast_probe_predicted_window_reaches_late_candidate_with_bound() {
+    let candidates = (40000..40032)
+        .map(|port| format!("198.51.100.10:{port}").parse::<SocketAddr>().unwrap())
+        .collect::<Vec<_>>();
+    let preferred = candidates[8..].to_vec();
+
+    let selected = direct_fast_probe_candidates_with_predicted_window(&candidates, &preferred);
+
+    assert_eq!(selected.len(), DIRECT_FAST_PROBE_PREDICTED_MAX_CANDIDATES);
+    assert_eq!(selected[0], candidates[8]);
+    assert!(selected.contains(&candidates[31]));
+}
+
+#[test]
+fn deferred_candidate_merge_preserves_fifo_and_adds_only_new_endpoints() {
+    let mut current = vec![
+        "198.51.100.10:40000".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40001".parse::<SocketAddr>().unwrap(),
+    ];
+    let refreshed = vec![
+        "198.51.100.10:40002".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40001".parse::<SocketAddr>().unwrap(),
+        "198.51.100.10:40003".parse::<SocketAddr>().unwrap(),
+    ];
+
+    let added = merge_unique_socket_addresses(&mut current, &refreshed);
+
+    assert_eq!(added, 2);
+    assert_eq!(
+        current,
+        vec![
+            "198.51.100.10:40000".parse::<SocketAddr>().unwrap(),
+            "198.51.100.10:40001".parse::<SocketAddr>().unwrap(),
+            "198.51.100.10:40002".parse::<SocketAddr>().unwrap(),
+            "198.51.100.10:40003".parse::<SocketAddr>().unwrap(),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn cold_start_fast_prefix_uses_existing_socket_pool_without_global_activation() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -391,6 +391,98 @@ async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
 }
 
 #[tokio::test]
+async fn wireguard_answer_from_previous_network_generation_cannot_install_session() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-old-network-generation-answer";
+    let peer_identity = NodeIdentity::generate();
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        peer_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(peer_identity, None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+
+    {
+        let mut state = daemon.pending_handshakes.lock().await;
+        state.insert_with_generation(
+            peer_id.to_string(),
+            initiator,
+            None,
+            None,
+            None,
+            0,
+        );
+    }
+    assert_eq!(
+        daemon
+            .peers
+            .advance_network_generation("late handshake answer test")
+            .await,
+        1
+    );
+
+    daemon
+        .handle_peer_answer(peer_id, &response.to_bytes(), None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        daemon.pending_handshakes.lock().await.pending.contains_key(peer_id),
+        "a stale answer must not consume the pending transaction"
+    );
+    assert!(
+        !daemon.transport.has_session(peer_id).await,
+        "a stale answer must not install WireGuard key material"
+    );
+}
+
+#[tokio::test]
+async fn responder_offer_from_previous_network_generation_cannot_stage_session() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-old-network-generation-offer";
+    let offer = PendingPeerOffer {
+        from_node_id: peer_id.to_string(),
+        candidates: Vec::new(),
+        candidate_sources: HashMap::new(),
+        candidate_generation: 0,
+        network_generation: 0,
+        candidates_expires_at_ms: None,
+        sender_public_key: None,
+        handshake_init: Vec::new(),
+        punch_at_ms: None,
+        punch_at_server_ms: None,
+        session_id: None,
+        probe_ephemeral_public_key: None,
+        ingress_suppressed: false,
+    };
+    let (reservation, offer) = daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .enqueue_responder_work(offer)
+        .expect("the offer must acquire a responder worker");
+
+    daemon
+        .peers
+        .advance_network_generation("late responder offer test")
+        .await;
+    let mut cancellation = reservation.cancellation;
+    daemon
+        .handle_admitted_responder_offer(&offer, reservation.owner, &mut cancellation)
+        .await;
+
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(!status.has_active);
+    assert!(!status.has_pending_responder);
+}
+
+#[tokio::test]
 async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let daemon = Daemon::new(config);
@@ -599,6 +691,46 @@ fn stale_handshake_start_owner_cannot_clear_replacement_reservation() {
 }
 
 #[test]
+fn new_generation_replaces_stale_pending_initiator_before_retry() {
+    let mut state = PendingHandshakeState::default();
+    let peer_id = "peer-stale-pending-generation";
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let initiator = HandshakeInitiator::new(local_identity, peer_identity.public_key(), None);
+    let reservation = state
+        .reserve_start_with_owner(peer_id)
+        .expect("initial generation must admit the initiator");
+    let pending_id = state
+        .insert_reserved_if_current_with_generation(
+            peer_id.to_string(),
+            reservation.owner,
+            initiator,
+            Some("stale-session".to_string()),
+            None,
+            0,
+        )
+        .expect("reservation must become pending");
+    assert!(state.is_current(peer_id, pending_id));
+
+    let stale_token = state
+        .remove_stale_pending_for_generation(peer_id, 1)
+        .expect("generation advance must retire the old pending transaction");
+    assert_eq!(stale_token, "stale-session");
+    assert!(!state.pending.contains_key(peer_id));
+
+    let replacement = state
+        .reserve_start_with_owner_at_generation(peer_id, 1)
+        .expect("new generation must not wait for the stale answer timeout");
+    assert!(state.starting.contains(peer_id));
+    assert_eq!(
+        state.starting_network_generations.get(peer_id),
+        Some(&1),
+        "the replacement reservation must carry the new generation"
+    );
+    assert_ne!(replacement.owner, reservation.owner);
+}
+
+#[test]
 fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
     fn offer(peer_id: &str, endpoint: &str) -> PendingPeerOffer {
         PendingPeerOffer {
@@ -606,6 +738,7 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
             candidates: vec![endpoint.to_string()],
             candidate_sources: HashMap::from([(endpoint.to_string(), "stun".to_string())]),
             candidate_generation: 1,
+            network_generation: 0,
             candidates_expires_at_ms: None,
             sender_public_key: None,
             handshake_init: vec![1, 2, 3],
@@ -657,6 +790,7 @@ fn cancelled_responder_owner_cannot_consume_a_new_offer() {
             candidates: vec![endpoint.to_string()],
             candidate_sources: HashMap::new(),
             candidate_generation: 1,
+            network_generation: 0,
             candidates_expires_at_ms: None,
             sender_public_key: None,
             handshake_init: vec![1, 2, 3],
@@ -736,6 +870,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         candidates: vec![candidate.to_string()],
         candidate_sources: HashMap::from([(candidate.to_string(), "stun".to_string())]),
         candidate_generation: 1,
+        network_generation: 0,
         candidates_expires_at_ms: None,
         sender_public_key: Some(hex::encode(peer_identity.public_key())),
         handshake_init: Vec::new(),
@@ -1165,6 +1300,12 @@ fn handshake_role_is_deterministic_from_decoded_static_public_keys() {
     assert!(local_is_designated_handshake_initiator(&lower, &higher));
     assert!(!local_is_designated_handshake_initiator(&higher, &lower));
     assert!(!local_is_designated_handshake_initiator(&lower, &lower));
+    assert!(should_start_initiator_for_keys(&lower, &higher));
+    assert!(!should_start_initiator_for_keys(&higher, &lower));
+    // Equal static keys are invalid configuration, but must remain visible to
+    // the normal handshake validator instead of being silently suppressed by
+    // the scheduling gate.
+    assert!(should_start_initiator_for_keys(&lower, &lower));
 }
 
 #[tokio::test]
@@ -1176,6 +1317,29 @@ async fn handshake_arbiter_prunes_dead_peer_locks_on_churn() {
     drop(second);
 
     assert!(!arbiter.peer_locks.lock().await.contains_key("peer-old"));
+}
+
+#[tokio::test]
+async fn handshake_arbiter_wait_is_bounded_and_recovers_after_owner_release() {
+    let arbiter = HandshakeArbiter::default();
+    let owner = arbiter.acquire("peer-lock-timeout").await;
+
+    assert!(
+        arbiter
+            .acquire_with_timeout("peer-lock-timeout", Duration::from_millis(10))
+            .await
+            .is_none(),
+        "a responder must not wait forever behind a stale handshake owner"
+    );
+
+    drop(owner);
+    assert!(
+        arbiter
+            .acquire_with_timeout("peer-lock-timeout", Duration::from_millis(100))
+            .await
+            .is_some(),
+        "the same peer must recover immediately after the owner releases"
+    );
 }
 
 #[test]
@@ -3450,7 +3614,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
         timeline.clone(),
     ));
 
-    let total = 300usize;
+    let total = 1100usize;
     let packet_len = Ipv4Packet::build_icmp_echo_request(
         "10.20.0.1".parse().unwrap(),
         "10.20.0.2".parse().unwrap(),
@@ -3479,7 +3643,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     // Wait for the worker to drain the input and the overflow counters to
     // reach their FINAL value (the first overflow drop lands while later
     // packets are still in flight).
-    let expected_dropped = (total - 256) as u64;
+    let expected_dropped = (total - 1024) as u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (dropped, bytes) = loop {
         let stats = peers.outbound_loss_stats().await;
@@ -3494,7 +3658,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
 
     assert_eq!(
         dropped, expected_dropped,
-        "exactly the packets beyond the 256-per-peer bound must be counted"
+        "exactly the packets beyond the 1024-per-peer bound must be counted"
     );
     assert_eq!(
         bytes,

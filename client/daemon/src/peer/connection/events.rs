@@ -44,6 +44,40 @@ impl PeerConnection {
         let direct_type =
             classify_candidate_pair_path(selection.path, pair, selection.direct_confirmed);
 
+        // Emit one compact state snapshot for every selector transition.  The
+        // individual path events below describe the user-visible transition;
+        // this snapshot explains why a transition was admitted or withheld
+        // when relay setup, Direct validation, and the two-direction relay
+        // business gate race each other.  It intentionally contains only
+        // bounded diagnostic state (no ticket, key, or validation owner).
+        debug!(
+            event = "path_state_snapshot",
+            peer_id = %self.node_id,
+            generation = local_generation,
+            connection_state = ?self.state,
+            previous_path = ?previous_path,
+            selected_path = ?selection.path,
+            path_id = ?selection.direct_endpoint
+                .map(|endpoint| endpoint.to_string())
+                .or_else(|| selection.relay_server.clone()),
+            reason_code = selection.reason_code,
+            direct_confirmed = selection.direct_confirmed,
+            relay_hedged = selection.relay_hedged,
+            relay_ready_generation = ?self.relay_ready_generation,
+            relay_confirmed_generation = ?self.relay_confirmed_generation,
+            relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
+            relay_first_gate_generation = ?self.relay_first_gate_generation,
+            relay_first_business_sent_generation = ?self.relay_first_business_sent_generation,
+            relay_first_business_received_generation = ?self.relay_first_business_received_generation,
+            relay_first_business_exchange_generation = ?self.relay_first_business_exchange_generation,
+            first_usable_generation = ?self.first_usable_generation,
+            first_usable_path = ?self.first_usable_path,
+            "path selector state changed: path={:?} reason_code={} reason={}",
+            selection.path,
+            selection.reason_code,
+            selection.reason,
+        );
+
         if selection.path == Some(NetworkPath::Direct) && selection.direct_confirmed {
             info!(
                 event = "candidate_pair_selected",
@@ -343,7 +377,6 @@ fn is_validation_evidence_stage(stage: &str) -> bool {
             | "direct_validation_ack_sent"
             | "direct_validation_ack_received"
             | "direct_validation_emit_lock_timeout"
-            | "direct_validation_succeeded_relay_retained"
             | "direct_validation_promoted"
             | "direct_path_promoted"
     )

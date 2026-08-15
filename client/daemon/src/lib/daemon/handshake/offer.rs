@@ -1,4 +1,82 @@
 impl Daemon {
+    /// Acquire the responder's short mutation turn with both cancellation and
+    /// a hard lock-wait bound.  A control signal is already acknowledged when
+    /// it enters the responder worker, so an unbounded arbiter wait would turn
+    /// one stale initiator/lifecycle task into a permanent session blackout.
+    async fn acquire_responder_handshake_guard(
+        &self,
+        from_node_id: &str,
+        cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let wait_started = Instant::now();
+        let generation = self.peers.current_network_generation_sync();
+        self.timeline.emit(
+            "peer_offer_responder_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={generation} wait_budget_ms={}",
+                RESPONDER_HANDSHAKE_ARBITER_TIMEOUT.as_millis()
+            )),
+        );
+        let guard = match cancellation {
+            Some(cancellation) => {
+                tokio::select! {
+                    biased;
+                    changed = cancellation.changed() => {
+                        let _ = changed;
+                        self.timeline.emit(
+                            "peer_offer_responder_lock_cancelled",
+                            None,
+                            Some("generation_cancelled"),
+                            Some(format!(
+                                "peer={from_node_id} generation={generation} wait_ms={}",
+                                wait_started.elapsed().as_millis()
+                            )),
+                        );
+                        return Ok(None);
+                    }
+                    guard = self.handshake_arbiter.acquire_with_timeout(
+                        from_node_id,
+                        RESPONDER_HANDSHAKE_ARBITER_TIMEOUT,
+                    ) => guard,
+                }
+            }
+            None => self
+                .handshake_arbiter
+                .acquire_with_timeout(from_node_id, RESPONDER_HANDSHAKE_ARBITER_TIMEOUT)
+                .await,
+        };
+        match guard {
+            Some(guard) => {
+                self.timeline.emit(
+                    "peer_offer_responder_lock_acquired",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={generation} wait_ms={}",
+                        wait_started.elapsed().as_millis()
+                    )),
+                );
+                Ok(Some(guard))
+            }
+            None => {
+                self.timeline.emit(
+                    "peer_offer_responder_lock_timeout",
+                    None,
+                    Some(REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT),
+                    Some(format!(
+                        "peer={from_node_id} generation={generation} wait_ms={}",
+                        RESPONDER_HANDSHAKE_ARBITER_TIMEOUT.as_millis()
+                    )),
+                );
+                Err(DaemonError::Network(
+                    REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT.to_string(),
+                ))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments, dead_code)]
     async fn handle_peer_offer(
         &self,
@@ -20,6 +98,7 @@ impl Daemon {
             probe_ephemeral_public_key,
             None,
             None,
+            None,
         )
         .await
     }
@@ -30,6 +109,20 @@ impl Daemon {
         owner: u64,
         cancellation: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
+        if self.peers.current_network_generation_sync() != offer.network_generation {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_network_generation"),
+                Some(format!(
+                    "peer={} offer_generation={} current_generation={}",
+                    offer.from_node_id,
+                    offer.network_generation,
+                    self.peers.current_network_generation_sync()
+                )),
+            );
+            return Ok(());
+        }
         self.handle_peer_offer_with_cancellation(
             &offer.from_node_id,
             &offer.candidates,
@@ -40,6 +133,7 @@ impl Daemon {
             offer.probe_ephemeral_public_key,
             Some(cancellation),
             Some(owner),
+            Some(offer.network_generation),
         )
         .await
     }
@@ -56,6 +150,7 @@ impl Daemon {
         probe_ephemeral_public_key: Option<String>,
         mut cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
         responder_work_owner: Option<u64>,
+        expected_network_generation: Option<u64>,
     ) -> Result<()> {
         if cancellation
             .as_deref()
@@ -63,18 +158,27 @@ impl Daemon {
         {
             return Ok(());
         }
-        let handshake_guard = match cancellation.as_deref_mut() {
-            Some(cancellation) => {
-                tokio::select! {
-                    biased;
-                    changed = cancellation.changed() => {
-                        let _ = changed;
-                        return Ok(());
-                    }
-                    guard = self.handshake_arbiter.acquire(from_node_id) => guard,
-                }
-            }
-            None => self.handshake_arbiter.acquire(from_node_id).await,
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+        {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_network_generation"),
+                Some(format!(
+                    "peer={} offer_generation={:?} current_generation={}",
+                    from_node_id,
+                    expected_network_generation,
+                    self.peers.current_network_generation_sync()
+                )),
+            );
+            return Ok(());
+        }
+        let Some(handshake_guard) = self
+            .acquire_responder_handshake_guard(from_node_id, cancellation.as_deref_mut())
+            .await?
+        else {
+            return Ok(());
         };
         if cancellation
             .as_deref()
@@ -171,6 +275,22 @@ impl Daemon {
                     &expected_peer_public,
                 )
         };
+        let cache_state = match &cached {
+            ResponderHandshakeCacheLookup::Hit(_) => "hit",
+            ResponderHandshakeCacheLookup::Miss => "miss",
+            ResponderHandshakeCacheLookup::FingerprintMismatch => "fingerprint_mismatch",
+        };
+        self.timeline.emit(
+            "peer_offer_responder_cache_lookup",
+            None,
+            (cache_state == "fingerprint_mismatch").then_some("handshake_fingerprint_mismatch"),
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={} cache={cache_state}",
+                expected_network_generation
+                    .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
         let (
             response_bytes,
             keys,
@@ -258,6 +378,27 @@ impl Daemon {
                 .await;
         }
 
+        // Stage the responder key and its Probe binding as short per-peer
+        // mutations. Do not hold the network-generation gate while waiting
+        // for the transport ingress/session locks: the outbound actor uses
+        // `emit -> generation`, and the old `generation -> ingress` order was
+        // the source of a responder-answer deadlock.
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+        {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_network_generation"),
+                Some(format!(
+                    "peer={} offer_generation={:?} current_generation={}",
+                    from_node_id,
+                    expected_network_generation,
+                    self.peers.current_network_generation_sync()
+                )),
+            );
+            return Ok(());
+        }
         let responder_transport_session = TransportSession::new(keys.clone());
         let initial_stage = self
             .transport
@@ -333,10 +474,48 @@ impl Daemon {
             }
         }
 
+        self.timeline.emit(
+            "peer_answer_staged",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={} had_active={} cached_replay={} probe_binding={staged_probe_binding}",
+                expected_network_generation
+                    .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                handshake_token_fingerprint(Some(&handshake_token)),
+                had_active,
+                cached_replay,
+            )),
+        );
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+        {
+            self.timeline.emit(
+                "peer_answer_stage_invalidated",
+                None,
+                Some("stale_network_generation"),
+                Some(format!(
+                    "peer={from_node_id} answer_generation={expected_network_generation:?} current_generation={}",
+                    self.peers.current_network_generation_sync()
+                )),
+            );
+            if responder_staged_new {
+                self.transport
+                    .discard_responder_session(from_node_id, &handshake_token)
+                    .await;
+            }
+            if staged_probe_binding {
+                self.peers
+                    .discard_pending_probe_session_binding(from_node_id, &handshake_token)
+                    .await;
+            }
+            return Ok(());
+        }
+
         // Publish newly generated responder bytes only after both transport
-        // layers accepted the offer. In particular, an expired cache entry for
-        // an already-active token must not be replaced by fresh key material
-        // merely because the first duplicate request reached this handler.
+        // layers and the generation check accepted the offer. In particular,
+        // an old-generation offer must not leave a cache entry that can be
+        // replayed into a later session.
         if let Some(cache_entry) = cache_entry_to_commit {
             self.pending_handshakes
                 .lock()
@@ -437,22 +616,31 @@ impl Daemon {
                 )
                 .await,
         };
+        self.timeline.emit(
+            "peer_answer_control_result",
+            None,
+            answer_result
+                .as_ref()
+                .err()
+                .map(|_| "control_plane_error"),
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={} candidates={} delivered={}",
+                expected_network_generation
+                    .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                handshake_token_fingerprint(Some(&handshake_token)),
+                candidates.len(),
+                answer_result.is_ok(),
+            )),
+        );
 
         // Re-enter the state boundary after the slow POST.  Lifecycle cleanup
         // can cancel this exact responder owner while the request is in
         // flight; a stale task must not refresh grace or commit a replacement.
-        let _handshake_guard = match cancellation.as_deref_mut() {
-            Some(cancellation) => {
-                tokio::select! {
-                    biased;
-                    changed = cancellation.changed() => {
-                        let _ = changed;
-                        return Ok(());
-                    }
-                    guard = self.handshake_arbiter.acquire(from_node_id) => guard,
-                }
-            }
-            None => self.handshake_arbiter.acquire(from_node_id).await,
+        let Some(_handshake_guard) = self
+            .acquire_responder_handshake_guard(from_node_id, cancellation.as_deref_mut())
+            .await?
+        else {
+            return Ok(());
         };
         if cancellation
             .as_deref()
@@ -492,16 +680,101 @@ impl Daemon {
             None,
             None,
             Some(format!(
-                "peer={} session_id={}",
+                "peer={} generation={} session_fp={}",
                 from_node_id,
-                session_id.as_deref().unwrap_or("legacy")
+                expected_network_generation
+                    .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                handshake_token_fingerprint(session_id.as_deref())
             )),
         );
 
+        // Commit in the canonical order `emit -> generation -> sessions`.
+        // In particular, never call `discard_*` or `commit_*` while holding
+        // generation without first owning the emit guard.
+        self.timeline.emit(
+            "peer_answer_commit_emit_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} session_fp={} generation={}",
+                handshake_token_fingerprint(Some(&handshake_token)),
+                self.peers.current_network_generation_sync()
+            )),
+        );
+        let emit_guard = self
+            .transport
+            .acquire_outbound_emit_guard(from_node_id)
+            .await;
+        self.timeline.emit(
+            "peer_answer_commit_emit_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} session_fp={} generation={}",
+                handshake_token_fingerprint(Some(&handshake_token)),
+                self.peers.current_network_generation_sync()
+            )),
+        );
+        let epoch_gate = self.peers.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+        {
+            drop(epoch_guard);
+            drop(emit_guard);
+            self.transport
+                .discard_responder_session(from_node_id, &handshake_token)
+                .await;
+            if staged_probe_binding {
+                self.peers
+                    .discard_pending_probe_session_binding(from_node_id, &handshake_token)
+                    .await;
+            }
+            self.timeline.emit(
+                "peer_answer_rejected",
+                None,
+                Some("stale_network_generation"),
+                Some(format!(
+                    "peer={} session_fp={} answer_generation={:?} current_generation={}",
+                    from_node_id,
+                    handshake_token_fingerprint(Some(&handshake_token)),
+                    expected_network_generation,
+                    self.peers.current_network_generation_sync()
+                )),
+            );
+            return Ok(());
+        }
+        self.timeline.emit(
+            "peer_answer_commit_started",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={}",
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(Some(&handshake_token))
+            )),
+        );
         let commit = self
             .transport
-            .commit_responder_session(from_node_id, &handshake_token)
+            .commit_responder_session_locked(from_node_id, &handshake_token)
             .await;
+        drop(epoch_guard);
+        drop(emit_guard);
+        if commit == ResponderSessionCommit::ActivatedInitial {
+            self.transport
+                .flush_pending_outbound_for_peer(from_node_id)
+                .await;
+        }
+        self.timeline.emit(
+            "peer_answer_commit_result",
+            None,
+            (commit == ResponderSessionCommit::Missing).then_some("responder_session_missing"),
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={} result={commit:?}",
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(Some(&handshake_token))
+            )),
+        );
         if commit == ResponderSessionCommit::Missing {
             if staged_probe_binding {
                 self.peers
@@ -538,9 +811,9 @@ impl Daemon {
                 Some(candidates.len()),
                 None,
                 format!(
-                    "sent answer handshake_bytes={} session_id={}",
+                    "sent answer handshake_bytes={} session_fp={}",
                     response_bytes.len(),
-                    session_id.as_deref().unwrap_or("legacy")
+                    handshake_token_fingerprint(session_id.as_deref())
                 ),
             )
             .await;
@@ -549,9 +822,10 @@ impl Daemon {
             None,
             None,
             Some(format!(
-                "peer={} session_id={} commit={commit:?}",
+                "peer={} generation={} session_fp={} commit={commit:?}",
                 from_node_id,
-                session_id.as_deref().unwrap_or("legacy")
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(session_id.as_deref())
             )),
         );
 

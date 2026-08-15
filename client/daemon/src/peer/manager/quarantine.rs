@@ -3,10 +3,11 @@
 // ============================================================
 //
 // A relay `peer_not_found` (404) is evidence that the destination is not
-// currently registered on this relay.  Registration handoff/reconnects can
+// currently registered on this relay. Registration handoff/reconnects can
 // leave a short 404 window while the control plane still reports the same
 // incarnation online, so relay errors are first held in a bounded grace state
-// (see `RelayNotFoundGraceState`) before the destructive quarantine below.
+// (see `RelayNotFoundGraceState`) while the forced-relay probe loop performs
+// fast, token-rotated retries, before the destructive quarantine below.
 //
 // A quarantined peer:
 //   - cannot start fresh-mapping generations, candidate plans, sessions or
@@ -153,7 +154,9 @@ impl PeerManager {
         // the peer's RelayPeerConfirmed: the peer is not registered on the
         // relay, so a future relay path needs a fresh forced-probe
         // confirmation.  Direct stays authoritative.
-        let relay_confirm_revoked = {
+        let _relay_confirm_revoked = {
+            let epoch_gate = self.network_epoch_gate();
+            let _epoch_guard = epoch_gate.lock().await;
             let mut conns = self.connections.write().await;
             match conns.get_mut(peer_id) {
                 Some(conn) if conn.relay_confirmed_at.is_some() => {
@@ -165,22 +168,22 @@ impl PeerManager {
                     conn.relay_first_gate_started_at = None;
                     conn.relay_first_business_sent_generation = None;
                     conn.relay_first_business_received_generation = None;
+                    conn.relay_first_business_exchange_generation = None;
+                    conn.relay_preconfirmation_business = None;
                     conn.relay_ready_generation = None;
                     conn.relay_ready_at = None;
                     conn.relay_ready_endpoint = None;
+                    conn.relay_ready_connection_id = None;
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     if conn.state == ConnectionState::Relay {
                         conn.transition(ConnectionState::FallbackToRelay);
                     }
+                    self.bump_relay_confirm_seq(peer_id);
                     true
                 }
                 _ => false,
             }
         };
-        if relay_confirm_revoked {
-            self.bump_relay_confirm_seq(peer_id);
-        }
-
         if fresh {
             let consecutive = self.quarantine_consecutive(peer_id).await;
             info!(

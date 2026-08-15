@@ -42,11 +42,36 @@ impl Daemon {
         &self,
         peer_id: &str,
     ) -> Option<HandshakeStartReservation> {
+        // Serialize replacement cleanup with offer/answer processing.  Without
+        // this short arbiter boundary a new-generation trigger could remove a
+        // stale pending initiator while the responder path was simultaneously
+        // staging its Probe binding for the same peer.
+        let _handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
+        let network_generation = self.peers.current_network_generation_sync();
+        let stale_session_id = self
+            .pending_handshakes
+            .lock()
+            .await
+            .remove_stale_pending_for_generation(peer_id, network_generation);
+        if let Some(session_id) = stale_session_id {
+            self.peers
+                .discard_pending_probe_session_binding(peer_id, &session_id)
+                .await;
+        }
         let mut state = self.pending_handshakes.lock().await;
-        let reservation = state.reserve_start_with_owner(peer_id)?;
+        let reservation = state.reserve_start_with_owner_at_generation(peer_id, network_generation)?;
         if state.attempts.get(peer_id).copied().unwrap_or(0) >= MAX_HANDSHAKE_ATTEMPTS {
             state.attempts.remove(peer_id);
         }
+        self.timeline.emit(
+            "initiator_handshake_reserved",
+            None,
+            None,
+            Some(format!(
+                "peer={peer_id} owner={} generation={network_generation}",
+                reservation.owner
+            )),
+        );
         Some(reservation)
     }
 
@@ -66,7 +91,41 @@ impl Daemon {
             return Ok(None);
         }
 
+        // Bind the entire initiator transaction to the generation captured by
+        // its reservation.  The answer may arrive much later; it must not be
+        // allowed to turn an old initiation into a session for a newer network
+        // incarnation, nor may an old task silently retag itself as new.
+        let handshake_generation = reservation.network_generation;
+        if self.peers.current_network_generation_sync() != handshake_generation {
+            self.pending_handshakes
+                .lock()
+                .await
+                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+            return Ok(None);
+        }
+        let lock_wait_started = Instant::now();
+        self.timeline.emit(
+            "initiator_handshake_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} phase=preparation",
+                peer_info.node_id, reservation.owner, handshake_generation
+            )),
+        );
         let handshake_guard = self.handshake_arbiter.acquire(&peer_info.node_id).await;
+        self.timeline.emit(
+            "initiator_handshake_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} phase=preparation wait_ms={}",
+                peer_info.node_id,
+                reservation.owner,
+                handshake_generation,
+                lock_wait_started.elapsed().as_millis()
+            )),
+        );
         let status = self.transport.session_status(&peer_info.node_id).await;
         if status.has_active || status.has_pending_responder {
             drop(handshake_guard);
@@ -196,7 +255,46 @@ impl Daemon {
         // Re-enter the short mutation boundary.  A responder may have won
         // while gathering candidates; only the owner that is still current may
         // turn its reservation into a pending initiator transaction.
+        let lock_wait_started = Instant::now();
+        self.timeline.emit(
+            "initiator_handshake_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} phase=publish",
+                peer_info.node_id, reservation.owner, handshake_generation
+            )),
+        );
         let handshake_guard = self.handshake_arbiter.acquire(&peer_info.node_id).await;
+        self.timeline.emit(
+            "initiator_handshake_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} phase=publish wait_ms={}",
+                peer_info.node_id,
+                reservation.owner,
+                handshake_generation,
+                lock_wait_started.elapsed().as_millis()
+            )),
+        );
+        // The outbound worker establishes the canonical lifecycle order
+        // `emit -> generation -> session/connection`. Acquire emit before the
+        // generation gate so a rekey or generation advance cannot deadlock
+        // against a live TUN encryption turn.
+        let emit_guard = self
+            .transport
+            .acquire_outbound_emit_guard(&peer_info.node_id)
+            .await;
+        let epoch_gate = self.peers.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        if self.peers.current_network_generation_sync() != handshake_generation {
+            self.pending_handshakes
+                .lock()
+                .await
+                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+            return Ok(None);
+        }
         let status = self.transport.session_status(&peer_info.node_id).await;
         if status.has_active || status.has_pending_responder {
             drop(handshake_guard);
@@ -213,12 +311,13 @@ impl Daemon {
         let Some((attempt_no, pending_id)) = ({
             let mut state = self.pending_handshakes.lock().await;
             state
-                .insert_reserved_if_current(
+                .insert_reserved_if_current_with_generation(
                     peer_id.clone(),
                     reservation.owner,
                     initiator,
                     Some(session_id.clone()),
                     Some(probe_ephemeral),
+                    handshake_generation,
                 )
                 .map(|pending_id| {
                     let attempts = state.attempts.entry(peer_id.clone()).or_insert(0);
@@ -260,6 +359,18 @@ impl Daemon {
                 "failed to stage Probe v2 handshake binding for {peer_id}"
             )));
         }
+        self.timeline.emit(
+            "initiator_session_staged",
+            None,
+            None,
+            Some(format!(
+                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} session_fp={}",
+                reservation.owner,
+                handshake_token_fingerprint(Some(&session_id))
+            )),
+        );
+        drop(epoch_guard);
+        drop(emit_guard);
 
         // The pending-id now owns cleanup of the committed initiator.  Release
         // the arbiter before the HTTP request; an answer arriving while this
@@ -280,8 +391,30 @@ impl Daemon {
         )
         .await
         else {
+            self.timeline.emit(
+                "initiator_offer_cancelled_before_control_result",
+                None,
+                Some("generation_cancelled"),
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} session_fp={}",
+                    reservation.owner,
+                    handshake_token_fingerprint(Some(&session_id))
+                )),
+            );
             return Ok(None);
         };
+
+        self.timeline.emit(
+            "initiator_offer_control_result",
+            None,
+            offer_result.as_ref().err().map(|_| "control_plane_error"),
+            Some(format!(
+                "peer={peer_id} owner={} generation={handshake_generation} session_fp={} delivered={}",
+                reservation.owner,
+                handshake_token_fingerprint(Some(&session_id)),
+                offer_result.is_ok()
+            )),
+        );
 
         if offer_result.is_ok() {
             info!(
@@ -318,7 +451,7 @@ impl Daemon {
         let transport = self.transport.clone();
         let peers = self.peers.clone();
         let timeout_session_id = session_id;
-        let generation = self.peers.current_network_generation().await;
+        let generation = handshake_generation;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
             if !transport.has_session(&timeout_peer).await {

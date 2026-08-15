@@ -156,7 +156,7 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
         )
         .await);
 
-    assert!(udp
+    let endpoint_rejection = udp
         .consume_direct_validation_ack(
             "peer-b",
             0x4101,
@@ -168,7 +168,11 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
             false,
         )
         .await
-        .is_none());
+        .expect_err("an ACK from an unauthenticated endpoint must be rejected");
+    assert_eq!(
+        endpoint_rejection.reason_code(),
+        "direct_validation_ack_endpoint_mismatch"
+    );
     assert!(udp.has_direct_validation_expectation("peer-b").await);
     assert!(udp
         .consume_direct_validation_ack(
@@ -182,7 +186,7 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
             false,
         )
         .await
-        .is_none());
+        .is_err());
     assert!(udp.has_direct_validation_expectation("peer-b").await);
     assert!(udp
         .consume_direct_validation_ack(
@@ -196,7 +200,7 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
             false,
         )
         .await
-        .is_some());
+        .is_ok());
 }
 
 #[tokio::test]

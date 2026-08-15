@@ -35,12 +35,11 @@ impl PeerManager {
         max_success_age: Duration,
     ) -> Vec<(String, String)> {
         // A relay `peer_not_found` starts a bounded registration-handoff
-        // grace window. Keep recovery state alive during that window, but
-        // stop emitting another validation frame every tick: the destination
-        // is not registered on this relay, so repeated sends only create a
-        // 404/error storm and consume the shared relay writer lane. Once the
-        // grace expires the next scheduled validation is allowed to re-check
-        // the registration; a second 404 then enters quarantine.
+        // grace window. The dedicated forced-relay probe loop owns the fast,
+        // per-peer retry during that window. This slower validation loop must
+        // stay quiet so it does not duplicate the retry or consume the shared
+        // relay writer lane; once the grace expires it may re-check the
+        // registration and a second 404 can enter quarantine.
         let grace_peers = self.relay_not_found_grace_peers().await;
         let candidates: Vec<_> = self
             .connections

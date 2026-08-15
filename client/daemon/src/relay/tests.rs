@@ -99,6 +99,7 @@ use std::collections::HashMap;
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 wire_bytes: payload.clone(),
+                is_business: false,
             })
             .await
             .unwrap();
@@ -146,6 +147,7 @@ use std::collections::HashMap;
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 wire_bytes: vec![4, 1, 2, 3],
+                is_business: false,
             })
             .await
             .unwrap();

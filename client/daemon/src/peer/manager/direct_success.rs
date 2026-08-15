@@ -112,10 +112,10 @@ impl PeerManager {
         }
         // An exact, decrypted validation ACK is authoritative evidence for
         // this request/generation/endpoint.  Its RTT is recorded for path
-        // quality, but must not veto make-before-break promotion: a delayed
-        // ACK is still proof that this Direct path works.  The slow-RTT
-        // quarantine remains intentionally limited to probe-only evidence,
-        // which has not exercised the encrypted business path.
+        // quality and the make-before-break selector can switch immediately.
+        // Probe-only ACKs still use the slow-candidate quarantine below; an
+        // owned encrypted Request -> ACK is stronger evidence and must not be
+        // hidden behind an arbitrary relay cooldown.
         let pair_success = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
@@ -124,6 +124,23 @@ impl PeerManager {
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
+            let relay_first_required = self.relay_first_required();
+            if relay_first_required && conn.relay_first_gate_generation != Some(generation) {
+                // Direct validation can complete before the relay supervisor
+                // publishes its transport. Arm the gate here as well as at
+                // catalog/peer admission so an inbound peer cannot use this
+                // ACK to become the first business path.
+                conn.relay_first_gate_generation = Some(generation);
+                conn.relay_first_gate_started_at = Some(Instant::now());
+                self.emit_timeline(
+                    "relay_first_gate_armed",
+                    Some("relay"),
+                    Some("direct_ack_raced_relay_startup"),
+                    Some(format!(
+                        "peer={node_id} generation={generation} source=direct_ack"
+                    )),
+                );
+            }
             let selected_endpoint = endpoint.or(conn.endpoint);
             let pair_success = selected_endpoint.map(|endpoint| {
                     conn.endpoint = Some(endpoint);
@@ -182,7 +199,7 @@ impl PeerManager {
             // without observing the newer connection state.
             if let Some(endpoint) = selected_endpoint {
                 let mut direct_selection =
-                    conn.select_path_for_data(generation, true, true);
+                    conn.select_path_for_data(generation, true, relay_first_required);
                 if direct_selection.path == Some(NetworkPath::Direct) {
                     direct_selection.path = Some(NetworkPath::Direct);
                     direct_selection.direct_endpoint = Some(endpoint);
@@ -209,7 +226,11 @@ impl PeerManager {
                         endpoint
                     );
                 }
-                if !was_direct {
+                let selection_is_direct = conn
+                    .last_path_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.path == Some(NetworkPath::Direct));
+                if !was_direct && selection_is_direct {
                     info!(
                         event = "direct_path_promoted",
                         peer_id = %node_id,
@@ -223,7 +244,7 @@ impl PeerManager {
                         endpoint
                     );
                 }
-                if direct_confirmation_changed {
+                if direct_confirmation_changed && selection_is_direct {
                     match direct_type {
                         DirectPathType::PublicUdp => info!(
                             event = "public_udp_direct_selected",
@@ -279,16 +300,18 @@ impl PeerManager {
             }
             pair_success
         };
-        // Direct confirmation is the terminal condition for the relay-backed
-        // recovery worker. Revoke its lease before any later recovery trigger
-        // can attempt to start another owner.
-        self.cancel_relay_backoff_heartbeat(node_id);
+        // Direct validation is a background upgrade, not permission to tear
+        // down the relay safety path. Keep the relay heartbeat alive so a
+        // later Direct failure can fall back without waiting for a new relay
+        // registration. The peer lifecycle/revoke paths still cancel it.
         // A confirmed Direct path supersedes every outstanding validation
         // lease for this peer.  This happens under the same epoch gate as the
         // state transition, so a worker from the just-confirmed generation
         // cannot keep sending requests or leave an ACK expectation behind.
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
-            registry.cancel_peer(node_id).await;
+            registry
+                .cancel_peer_with_reason(node_id, "direct_confirmed")
+                .await;
         }
         // The recovery epoch for this peer is over: Direct is confirmed, so
         // no traversal work may continue under the old plan.

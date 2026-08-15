@@ -85,6 +85,13 @@ pub struct PeerManager {
     /// re-verify "is this peer Direct?" inside its socket-state lock without
     /// ever awaiting the async peer manager there.
     direct_peers: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Whether this daemon currently has a relay-backed topology. This is
+    /// set from the resolved relay catalog, not only from the initial static
+    /// config, so a peer cannot become the first Direct data path merely
+    /// because the relay supervisor has not published its transport slot yet.
+    /// The value is process-wide; the generation-bound gate lives on each
+    /// `PeerConnection`.
+    relay_first_required: Arc<std::sync::atomic::AtomicBool>,
     /// The authoritative failure-recovery scheduler: one traversal plan per
     /// `(peer_id, network_generation, recovery_epoch)` with hard per-epoch
     /// budgets (probe credit, fresh generations, HTTP publishes) and the

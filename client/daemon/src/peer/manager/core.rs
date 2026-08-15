@@ -37,6 +37,7 @@ impl PeerManager {
             pending_fresh_applies: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_identity_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_peers: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            relay_first_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
@@ -63,6 +64,49 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeline);
     }
 
+    /// Install or remove the relay-first topology gate after control has
+    /// resolved the current relay catalog. The gate is armed for every live
+    /// peer under the same network-epoch lock used by Direct/relay commits,
+    /// so a Direct ACK racing relay startup cannot win by arriving first.
+    pub(crate) async fn configure_relay_first(&self, required: bool) {
+        self.relay_first_required
+            .store(required, std::sync::atomic::Ordering::Release);
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let generation = self.current_network_generation_sync();
+        let now = Instant::now();
+        let mut conns = self.connections.write().await;
+        for conn in conns.values_mut() {
+            if !conn.online || conn.state == ConnectionState::Closed {
+                continue;
+            }
+            if required {
+                if conn.relay_first_gate_generation != Some(generation) {
+                    conn.relay_first_gate_generation = Some(generation);
+                    conn.relay_first_gate_started_at = Some(now);
+                    self.emit_timeline(
+                        "relay_first_gate_armed",
+                        Some("relay"),
+                        None,
+                        Some(format!(
+                            "peer={} generation={} source=relay_catalog",
+                            conn.node_id, generation
+                        )),
+                    );
+                }
+            } else if conn.relay_confirmed_generation != Some(generation) {
+                conn.relay_first_gate_generation = None;
+                conn.relay_first_gate_started_at = None;
+            }
+        }
+    }
+
+    /// Whether the resolved topology requires relay-first admission.
+    pub(crate) fn relay_first_required(&self) -> bool {
+        self.relay_first_required
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Emit a connection-timeline event; no-op when no timeline is installed.
     pub(crate) fn emit_timeline(
         &self,
@@ -78,6 +122,27 @@ impl PeerManager {
             .clone();
         if let Some(timeline) = timeline {
             timeline.emit(event, path, reason_code, detail);
+        }
+    }
+
+    /// Emit a correlation-aware diagnostic event at DEBUG level.  High-volume
+    /// Direct lifecycle records are intentionally log-only; the peer's
+    /// protected `direct_events` ring remains the structured `/status` source
+    /// while the process milestone ring is not evicted by probe bursts.
+    pub(crate) fn emit_timeline_debug(
+        &self,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.log_debug(event, path, reason_code, detail);
         }
     }
 
@@ -320,7 +385,9 @@ impl PeerManager {
         let epoch_gate = self.network_epoch_gate();
         let _epoch_gate = epoch_gate.lock().await;
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
-            registry.cancel_peer(peer_id).await;
+            registry
+                .cancel_peer_with_reason(peer_id, "peer_lifecycle_or_session_removed")
+                .await;
         }
     }
 
@@ -381,7 +448,9 @@ impl PeerManager {
                 direct_reclaim_count += 1;
             }
         }
+        let peer_count = conns.len();
         drop(conns);
+        let relay_confirmation_cancellation_count = relay_confirmation_cancellations.len();
         for peer_id in relay_confirmation_cancellations {
             self.bump_relay_confirm_seq(&peer_id);
         }
@@ -389,6 +458,17 @@ impl PeerManager {
 
         info!(
             "Local network generation advanced to {generation}: {reason}; opened {direct_reclaim_count} Direct reclaim window(s)"
+        );
+        self.emit_timeline(
+            "network_generation_advanced",
+            None,
+            Some("network_generation_changed"),
+            Some(format!(
+                "generation={generation} reason={reason} peers={} direct_reclaim_windows={} relay_confirmations_cancelled={}",
+                peer_count,
+                direct_reclaim_count,
+                relay_confirmation_cancellation_count
+            )),
         );
         generation
     }
@@ -440,11 +520,23 @@ impl PeerManager {
                 direct_reclaim_count += 1;
             }
         }
+        let peer_count = conns.len();
         drop(conns);
         self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
 
         info!(
             "Local network generation advanced to {generation}: {reason}; retained {retained_confirmed_direct_count} confirmed direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"
+        );
+        self.emit_timeline(
+            "candidate_refresh_generation_advanced",
+            None,
+            Some("candidate_refresh_generation_changed"),
+            Some(format!(
+                "generation={generation} reason={reason} peers={} retained_direct={} direct_reclaim_windows={}",
+                peer_count,
+                retained_confirmed_direct_count,
+                direct_reclaim_count
+            )),
         );
         generation
     }

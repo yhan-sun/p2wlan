@@ -202,6 +202,9 @@ pub(crate) struct PendingRecoveryTarget {
     pub peer_id: String,
     /// Shared candidate set snapshot at trigger time.
     pub candidates: Vec<SocketAddr>,
+    /// Authenticated/learned candidates that deserve the larger bounded fast
+    /// prefix when this snapshot is consumed by an already-running session.
+    pub preferred_fast_candidates: Vec<SocketAddr>,
     /// Immutable frozen targets for a fresh-prediction session.
     pub frozen_targets: Option<Vec<SocketAddr>>,
     /// Fresh-prediction identity when the trigger is a fresh signal.

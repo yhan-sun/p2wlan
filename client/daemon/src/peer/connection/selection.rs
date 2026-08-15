@@ -275,6 +275,28 @@ impl PeerConnection {
                 .unwrap_or(true)
     }
 
+    fn relay_first_business_pending(
+        &self,
+        local_generation: u64,
+        relay_available: bool,
+    ) -> bool {
+        if !relay_available
+            || self.relay_ready_generation != Some(local_generation)
+            || !self.relay_peer_confirmed_for_generation(local_generation)
+            || self.relay_first_business_exchange_generation == Some(local_generation)
+        {
+            return false;
+        }
+        // A confirmed relay is the safety path for this generation.  Do not
+        // let a wall-clock grace window turn a missing business ingress into
+        // a Direct promotion: that would make the first real TUN packet
+        // depend on scheduling rather than on the relay-first invariant.
+        // The relay transport itself has already been proven by the encrypted
+        // probe ACK; the only remaining gate is that both local business
+        // directions have crossed this same confirmed relay.
+        true
+    }
+
     fn select_path_for_data(
         &self,
         local_generation: u64,
@@ -357,11 +379,7 @@ impl PeerConnection {
                 )
                 .with_scores(direct_score, relay_score);
             }
-            if self.relay_ready_generation == Some(local_generation)
-                && self.relay_peer_confirmed_for_generation(local_generation)
-                && (self.relay_first_business_sent_generation != Some(local_generation)
-                    || self.relay_first_business_received_generation != Some(local_generation))
-            {
+            if self.relay_first_business_pending(local_generation, relay_available) {
                 return PathSelection::relay(
                     REASON_PATH_RELAY_FIRST_BUSINESS,
                     "same-generation relay peer is confirmed; both relay business directions are required before Direct",

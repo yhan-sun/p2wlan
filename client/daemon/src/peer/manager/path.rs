@@ -18,7 +18,30 @@ impl PeerManager {
         relay_available: bool,
         local_endpoint: Option<SocketAddr>,
     ) -> PathSelection {
-        let generation = self.current_network_generation().await;
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let generation = self.current_network_generation_sync();
+        self.select_path_for_data_with_local_endpoint_in_epoch(
+            node_id,
+            prefer_direct,
+            relay_available,
+            local_endpoint,
+            generation,
+        )
+        .await
+    }
+
+    /// Select a path while the caller already owns the network epoch gate.
+    /// This is used by the outbound counter/send transaction; taking the
+    /// public wrapper there would attempt to lock the same async mutex twice.
+    pub(crate) async fn select_path_for_data_with_local_endpoint_in_epoch(
+        &self,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+        local_endpoint: Option<SocketAddr>,
+        generation: u64,
+    ) -> PathSelection {
         let mut conns = self.connections.write().await;
         match conns.get_mut(node_id) {
             Some(conn) => {
@@ -87,7 +110,20 @@ impl PeerManager {
         generation: u64,
         relay_available: bool,
     ) -> bool {
-        if generation != self.current_network_generation().await {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        self.is_data_path_admitted_for_generation_in_epoch(node_id, generation, relay_available)
+            .await
+    }
+
+    /// Admission check for callers that already hold the network epoch gate.
+    pub(crate) async fn is_data_path_admitted_for_generation_in_epoch(
+        &self,
+        node_id: &str,
+        generation: u64,
+        relay_available: bool,
+    ) -> bool {
+        if generation != self.current_network_generation_sync() {
             return false;
         }
         self.connections
@@ -95,7 +131,9 @@ impl PeerManager {
             .await
             .get_mut(node_id)
             .map(|conn| {
-                if relay_available && conn.relay_first_gate_generation != Some(generation) {
+                if (relay_available || self.relay_first_required())
+                    && conn.relay_first_gate_generation != Some(generation)
+                {
                     conn.relay_first_gate_generation = Some(generation);
                     conn.relay_first_gate_started_at = Some(Instant::now());
                 }

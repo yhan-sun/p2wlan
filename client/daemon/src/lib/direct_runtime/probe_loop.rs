@@ -33,6 +33,7 @@ async fn run_direct_probe_loop(
         for target in peers.direct_probe_targets_due(retry_after).await {
             let peer_id = target.peer_id;
             let candidates = target.candidates;
+            let preferred_fast_candidates = target.preferred_fast_candidates;
             let remote_scatter_pool = target.remote_scatter_pool;
             let stable_remote_scatter = target.stable_remote_scatter;
             let birthday_plan = target.birthday_plan;
@@ -69,6 +70,7 @@ async fn run_direct_probe_loop(
                     .stash_recovery_target(PendingRecoveryTarget {
                         peer_id: peer_id.clone(),
                         candidates: candidates.clone(),
+                        preferred_fast_candidates: preferred_fast_candidates.clone(),
                         frozen_targets: None,
                         fresh_prediction: None,
                         punch_at_ms: None,

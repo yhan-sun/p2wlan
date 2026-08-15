@@ -438,8 +438,9 @@ impl RelaySupervisor {
                                     current_transport.connection_id(),
                                 );
                             self.peers
-                                .invalidate_relay_transport(
+                                .invalidate_relay_transport_for_connection(
                                     endpoint,
+                                    Some(current_transport.connection_id()),
                                     "relay_transport_replaced",
                                     format!(
                                         "relay connection {} replaced by {}",
@@ -1143,11 +1144,13 @@ pub(super) async fn run_relay_peer_probe_loop(
     };
     let mut ticker = interval(RELAY_PROBE_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Per-peer STABLE probe token: (owner token, request id).  It is chosen
-    // once per peer (while the peer still needs a probe) and re-sent verbatim,
-    // so a late ACK — relay latency up to the expectation TTL — always echoes
-    // the token the expectation currently holds.  A fresh expectation is never
-    // overwritten with a mismatched token.
+    // Per-peer probe token: (owner token, request id). It remains stable while
+    // a probe is in flight so a late ACK — relay latency up to the expectation
+    // TTL — can still confirm the path. When the expectation disappears
+    // without confirmation (the relay's `peer_not_found` path, a stale ACK,
+    // or a transport/generation invalidation), the token is rotated before a
+    // retry. This prevents an ACK for a rejected old probe from confirming a
+    // later registration attempt.
     let mut probe_tokens: HashMap<String, (u64, u16)> = HashMap::new();
     // Per-peer last-send time, to pace re-sends (bounded cadence) without
     // changing the token.
@@ -1193,15 +1196,48 @@ pub(super) async fn run_relay_peer_probe_loop(
                 debug!("Skipping relay probe for {peer_id}; peer virtual IP '{peer_virtual_ip}' is not IPv4");
                 continue;
             };
-            if !transport.session_status(peer_id).await.has_active {
+            let session_status = transport.session_status(peer_id).await;
+            if !session_status.has_active {
+                // The relay probe is encrypted with the WireGuard session, so
+                // it cannot be sent before that session exists. Do not turn
+                // this necessary ordering into a silent wait: a missed/late
+                // PeerJoined event otherwise looks like a relay failure until
+                // the business queue deadline expires.
+                let scope = format!("peer:{peer_id}:{target_generation}");
+                timeline.emit_first_scoped(
+                    &scope,
+                    "relay_probe_waiting_for_session",
+                    Some("relay"),
+                    Some("wireguard_session_unavailable"),
+                    Some(format!(
+                        "peer={peer_id} generation={target_generation} relay_endpoint={relay_endpoint} relay_connection_id={} has_pending_responder={} needs_rekey={} expired={}",
+                        relay.connection_id(),
+                        session_status.has_pending_responder,
+                        session_status.needs_rekey,
+                        session_status.expired,
+                    )),
+                );
                 continue;
             }
             // The relay is genuinely usable for this peer: record the
             // per-peer RelayTransportConnected milestone.
             peers
-                .mark_relay_transport_ready(peer_id, &relay_endpoint, *target_generation)
+                .mark_relay_transport_ready_with_transport(
+                    peer_id,
+                    &relay_endpoint,
+                    *target_generation,
+                    Some(relay.connection_id()),
+                )
                 .await;
-            // Stable per-peer token: chosen once, reused for every re-send.
+            // Stable per-peer token: chosen once, reused for every re-send
+            // until the manager reports that the outstanding expectation was
+            // consumed/invalidated. In that case rotate before installing the
+            // next expectation, so old-generation/old-registration ACKs cannot
+            // confirm the retry.
+            if last_sent.contains_key(peer_id) && !peers.relay_probe_expectation_present(peer_id) {
+                next_request_id = next_request_id.wrapping_add(1);
+                probe_tokens.insert(peer_id.clone(), (unix_time_millis(), next_request_id));
+            }
             let (owner_token, request_id) = match probe_tokens.get(peer_id) {
                 Some(&token) => token,
                 None => {
@@ -1303,9 +1339,25 @@ pub(super) async fn run_relay_peer_probe_loop(
                     );
                 }
                 Ok(Ok(false)) => {
+                    timeline.emit(
+                        "relay_probe_send_skipped",
+                        Some("relay"),
+                        Some("wireguard_session_unavailable"),
+                        Some(format!(
+                            "peer={peer_id} generation={generation} relay_endpoint={endpoint} request_id={request_id}"
+                        )),
+                    );
                     debug!("Relay probe skipped for {peer_id}: WireGuard session is not ready");
                 }
                 Ok(Err(err)) => {
+                    timeline.emit(
+                        "relay_probe_send_failed",
+                        Some("relay"),
+                        Some("relay_send_failed"),
+                        Some(format!(
+                            "peer={peer_id} generation={generation} relay_endpoint={endpoint} request_id={request_id} error={err}"
+                        )),
+                    );
                     debug!("Relay probe send failed for {peer_id} via {endpoint}: {err}");
                 }
                 Err(_) => {

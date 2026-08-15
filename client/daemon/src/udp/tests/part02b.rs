@@ -18,6 +18,7 @@ async fn sends_encrypted_packet_to_peer_endpoint() {
             peer_id: "peer-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             wire_bytes: payload.clone(),
+            is_business: false,
         })
         .await
         .unwrap();
@@ -46,6 +47,7 @@ async fn drops_packet_when_endpoint_is_unknown() {
             peer_id: "peer-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             wire_bytes: vec![4, 1, 2, 3],
+            is_business: false,
         })
         .await
         .unwrap();
@@ -83,6 +85,7 @@ async fn run_outbound_sends_wireguard_datagram_that_peer_can_decrypt() {
         peer_id: "peer-b".to_string(),
         dst_ip: "10.20.0.2".to_string(),
         wire_bytes,
+        is_business: false,
     })
     .await
     .unwrap();

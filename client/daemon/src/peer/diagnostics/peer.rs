@@ -47,6 +47,27 @@ pub struct PeerDiagnostics {
     /// being mistaken for one continuous proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_confirmed_connection_id: Option<u64>,
+    /// Relay transport readiness is deliberately separate from
+    /// `relay_confirmed_*`: a ready writer/TLS connection is not peer-delivery
+    /// evidence. These fields make that boundary visible in `/status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_ready_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_ready_generation: Option<u64>,
+    /// Local relay transport incarnation that carried the ready milestone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_ready_connection_id: Option<u64>,
+    /// Generation in which the relay-first admission gate began, plus its
+    /// daemon-local age. This is useful for diagnosing a Direct ACK that is
+    /// valid but intentionally not yet allowed to carry business traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_gate_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_gate_age_ms: Option<u64>,
+    #[serde(default)]
+    pub relay_first_confirmation_pending: bool,
+    #[serde(default)]
+    pub relay_first_business_pending: bool,
     /// The two same-generation relay-first business-direction gates.  Direct
     /// may be confirmed in the background, but it is not active until both
     /// have been observed.
@@ -54,6 +75,8 @@ pub struct PeerDiagnostics {
     pub relay_first_business_sent_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_first_business_received_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_business_exchange_generation: Option<u64>,
     /// Path that became first usable for this peer (`Relay` or `Direct`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_usable_path: Option<NetworkPath>,
@@ -132,16 +155,15 @@ impl PeerDiagnostics {
                 .as_deref()
                 .is_some_and(|endpoint| !endpoint.is_empty());
         // A Direct ACK is retained as background evidence, but while this
-        // generation's relay transport is ready and its peer ACK is pending,
-        // Direct is not the active business path.  Keeping this distinction
-        // in `/status` prevents a UI from rendering a Direct probe as a
-        // usable connection or latency sample.
+        // generation's relay transport is ready and the two-direction relay
+        // business gate is incomplete, Direct is not the active business
+        // path.  Keeping this distinction in `/status` prevents a UI from
+        // rendering a Direct probe as a usable connection or latency sample.
         let relay_first_pending = conn.relay_first_confirmation_pending(local_generation, true);
         let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
             || conn.relay_first_gate_generation == Some(local_generation))
             && relay_peer_confirmed
-            && (conn.relay_first_business_sent_generation != Some(local_generation)
-                || conn.relay_first_business_received_generation != Some(local_generation));
+            && conn.relay_first_business_exchange_generation != Some(local_generation);
         let confirmed_direct_active =
             confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
         let mut active_path = match current_selection {
@@ -308,8 +330,18 @@ impl PeerDiagnostics {
             relay_confirmed_endpoint: conn.relay_confirmed_endpoint.clone(),
             relay_confirmed_generation: conn.relay_confirmed_generation,
             relay_confirmed_connection_id: conn.relay_confirmed_connection_id,
+            relay_ready_endpoint: conn.relay_ready_endpoint.clone(),
+            relay_ready_generation: conn.relay_ready_generation,
+            relay_ready_connection_id: conn.relay_ready_connection_id,
+            relay_first_gate_generation: conn.relay_first_gate_generation,
+            relay_first_gate_age_ms: conn
+                .relay_first_gate_started_at
+                .map(|started_at| duration_millis(started_at.elapsed())),
+            relay_first_confirmation_pending: relay_first_pending,
+            relay_first_business_pending,
             relay_first_business_sent_generation: conn.relay_first_business_sent_generation,
             relay_first_business_received_generation: conn.relay_first_business_received_generation,
+            relay_first_business_exchange_generation: conn.relay_first_business_exchange_generation,
             first_usable_path: conn.first_usable_path,
             first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(

@@ -168,6 +168,29 @@ async fn record_validation_event(
         .await;
 }
 
+/// Render the WireGuard session snapshot used by Direct-validation logs.
+/// Session instances are process-local diagnostic identities, not receiver
+/// indexes or credentials; exposing them lets a real dual-end run distinguish
+/// an old worker/previous-key overlap from a peer that simply did not answer.
+fn format_validation_session_status(status: TransportSessionStatus) -> String {
+    format!(
+        "session_active={} session_expired={} session_needs_rekey={} active_session_instance={} previous_session_instance={} pending_responder_count={} expires_in_ms={}",
+        status.has_active,
+        status.expired,
+        status.needs_rekey,
+        status
+            .active_session_instance
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        status
+            .previous_session_instance
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        status.pending_responder_count,
+        status
+            .expires_in
+            .map_or_else(|| "none".to_string(), |value| value.as_millis().to_string()),
+    )
+}
+
 /// The one authoritative task spawner for daemon-internal validation.
 ///
 /// Both authenticated-punch ACKs and peer-reflexive observations feed the
@@ -267,7 +290,6 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                                 .await;
                             debug!(
                                 peer_id = %lease.peer_id,
-                                owner_token = lease.owner_token,
                                 max_pending_peers = MAX_PENDING_DIRECT_VALIDATION_PEERS,
                                 removed,
                                 "direct-validation pending lease cap reached; dropping newest distinct peer"
@@ -282,8 +304,7 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                                 Some(queued_target.endpoint),
                                 Some(0),
                                 format!(
-                                    "queued encrypted validation session owner={} generation={} pending_leases={}",
-                                    lease.owner_token,
+                                    "queued encrypted validation session generation={} pending_leases={}",
                                     queued_target.generation,
                                     pending_leases.len().saturating_add(1)
                                 ),
@@ -589,12 +610,26 @@ async fn run_direct_encrypted_validation_session(
         udp.finish_direct_validation_session(&peer_id, owner_token).await;
         return;
     };
+    let initial_session_status = transport.session_status(&peer_id).await;
+    let initial_session_detail = format_validation_session_status(initial_session_status);
+    tracing::debug!(target: "p2pnet_daemon::direct_validation",
+        event = "direct_validation_session_snapshot",
+        peer_id = %peer_id,
+        remote_endpoint = %initial_target.endpoint,
+        generation,
+        session_active = initial_session_status.has_active,
+        session_expired = initial_session_status.expired,
+        session_needs_rekey = initial_session_status.needs_rekey,
+        active_session_instance = ?initial_session_status.active_session_instance,
+        previous_session_instance = ?initial_session_status.previous_session_instance,
+        pending_responder_count = initial_session_status.pending_responder_count,
+        "captured WireGuard session snapshot before Direct validation"
+    );
     tracing::info!(
         event = "encrypted_trial_started",
         peer_id = %peer_id,
         remote_endpoint = %initial_target.endpoint,
         generation,
-        owner_token,
         "encrypted direct-validation session started"
     );
     record_validation_event(
@@ -605,9 +640,7 @@ async fn run_direct_encrypted_validation_session(
         "direct_validation_started",
         Some(initial_target.endpoint),
         Some(0),
-        format!(
-            "started encrypted direct-validation request/ACK exchange owner={owner_token} generation={generation}"
-        ),
+        format!("started encrypted direct-validation request/ACK exchange generation={generation} {initial_session_detail}"),
     )
     .await;
     peers
@@ -618,7 +651,7 @@ async fn run_direct_encrypted_validation_session(
             None,
             None,
             format!(
-                "starting bounded direct-validation request/ACK exchange owner={owner_token} generation={generation}"
+                "starting bounded direct-validation request/ACK exchange generation={generation}"
             ),
         )
         .await;
@@ -683,7 +716,7 @@ async fn run_direct_encrypted_validation_session(
         }
         let status = transport.session_status(&peer_id).await;
         if status.has_active && !status.expired {
-        if waiting_for_session {
+            if waiting_for_session {
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -692,8 +725,9 @@ async fn run_direct_encrypted_validation_session(
                         None,
                         Some(0),
                         format!(
-                            "WireGuard session became ready after {}ms",
-                            session_wait_started.elapsed().as_millis()
+                            "WireGuard session became ready after {}ms {}",
+                            session_wait_started.elapsed().as_millis(),
+                            format_validation_session_status(status)
                         ),
                     )
                     .await;
@@ -710,16 +744,28 @@ async fn run_direct_encrypted_validation_session(
                     Some(target.endpoint),
                     None,
                     Some(0),
-                    "peer-reflexive endpoint arrived before the WireGuard session; waiting for the handshake",
+                    format!(
+                        "peer-reflexive endpoint arrived before the WireGuard session; waiting for the handshake {}",
+                        format_validation_session_status(status)
+                    ),
                 )
                 .await;
         }
         let elapsed = session_wait_started.elapsed();
         if elapsed >= DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT {
-            debug!(
-                "Skipping encrypted Direct validation for {}; WireGuard session was not ready within {}ms",
-                peer_id,
-                DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_session_wait_timeout",
+                peer_id = %peer_id,
+                remote_endpoint = %target.endpoint,
+                generation,
+                wait_ms = DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis(),
+                session_active = status.has_active,
+                session_expired = status.expired,
+                session_needs_rekey = status.needs_rekey,
+                active_session_instance = ?status.active_session_instance,
+                previous_session_instance = ?status.previous_session_instance,
+                pending_responder_count = status.pending_responder_count,
+                "Direct validation stopped while waiting for a ready WireGuard session"
             );
             record_validation_event(
                 &peers,
@@ -730,8 +776,9 @@ async fn run_direct_encrypted_validation_session(
                 Some(target.endpoint),
                 Some(0),
                 format!(
-                    "timed out waiting for a ready WireGuard session after {}ms",
-                    DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis()
+                    "timed out waiting for a ready WireGuard session after {}ms {}",
+                    DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.as_millis(),
+                    format_validation_session_status(status)
                 ),
             )
             .await;
@@ -822,6 +869,16 @@ async fn run_direct_encrypted_validation_session(
         {
             Ok(prepared) => prepared,
             Err(crate::udp::DirectValidationSendError::OwnerRevoked) => {
+                tracing::debug!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_request_prepare_rejected",
+                    peer_id = %peer_id,
+                    remote_endpoint = %target.endpoint,
+                    generation,
+                    request_id,
+                    sequence,
+                    reason_code = "direct_validation_owner_revoked",
+                    "Direct validation request was not prepared because its ownership lease was revoked"
+                );
                 terminal_stage = "direct_validation_cancelled";
                 terminal_reason = format!(
                     "cancelled before request {request_id}: validation owner no longer owns endpoint {}",
@@ -830,6 +887,16 @@ async fn run_direct_encrypted_validation_session(
                 break;
             }
             Err(crate::udp::DirectValidationSendError::NoSocket) => {
+                tracing::debug!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_request_prepare_rejected",
+                    peer_id = %peer_id,
+                    remote_endpoint = %target.endpoint,
+                    generation,
+                    request_id,
+                    sequence,
+                    reason_code = "direct_validation_no_udp_socket",
+                    "Direct validation request was not prepared because no UDP socket was available"
+                );
                 terminal_stage = "direct_validation_failed";
                 terminal_reason =
                     "failed to prepare validation send: no UDP socket resolved for the peer"
@@ -848,6 +915,44 @@ async fn run_direct_encrypted_validation_session(
             }
         };
         let socket_index = Some(prepared.socket_index);
+        let request_session_status = transport.session_status(&peer_id).await;
+        tracing::debug!(target: "p2pnet_daemon::direct_validation",
+            event = "direct_validation_request_prepared",
+            peer_id = %peer_id,
+            remote_endpoint = %target.endpoint,
+            generation,
+            request_id,
+            sequence,
+            socket_index = prepared.socket_index,
+            session_active = request_session_status.has_active,
+            session_expired = request_session_status.expired,
+            session_needs_rekey = request_session_status.needs_rekey,
+            active_session_instance = ?request_session_status.active_session_instance,
+            previous_session_instance = ?request_session_status.previous_session_instance,
+            pending_responder_count = request_session_status.pending_responder_count,
+            "prepared exact UDP socket and captured WireGuard session before encryption"
+        );
+        peers
+            .record_direct_validation_event_with_metadata(
+                &peer_id,
+                generation,
+                crate::peer::DirectValidationEventMetadata {
+                    local_validation_session_id: Some(owner_token),
+                    request_id: Some(request_id),
+                    expected_endpoint: Some(target.endpoint),
+                    ..crate::peer::DirectValidationEventMetadata::default()
+                },
+                "direct_validation_request_prepared",
+                Some(target.endpoint),
+                socket_index,
+                None,
+                Some(sent),
+                format!(
+                    "prepared exact UDP socket before encryption {}",
+                    format_validation_session_status(request_session_status)
+                ),
+            )
+            .await;
         let payload = build_direct_validation_payload(
             DirectValidationKind::Request,
             generation,
@@ -909,7 +1014,6 @@ async fn run_direct_encrypted_validation_session(
                     peer_id = %peer_id,
                     remote_endpoint = %endpoint,
                     generation,
-                    owner_token,
                     request_id,
                     sequence,
                     sent,
@@ -931,7 +1035,7 @@ async fn run_direct_encrypted_validation_session(
                         None,
                         Some(sent),
                         format!(
-                            "sent direct-validation request owner={owner_token} generation={generation} request_id={request_id} seq={sequence}"
+                            "sent direct-validation request generation={generation} request_id={request_id} seq={sequence}"
                         ),
                     )
                     .await;
@@ -992,9 +1096,50 @@ async fn run_direct_encrypted_validation_session(
                 if stop_worker {
                     break;
                 }
+                // Keep each bounded request's terminal wait visible.  The
+                // worker-level timeout alone cannot distinguish a dead
+                // endpoint from a request that was sent successfully but
+                // never received an authenticated ACK.
+                if ack_wait_started.elapsed() >= DIRECT_VALIDATION_ACK_WAIT {
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            &peer_id,
+                            generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                local_validation_session_id: Some(owner_token),
+                                request_id: Some(request_id),
+                                expected_endpoint: Some(endpoint),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_wait_timeout",
+                            Some(endpoint),
+                            socket_index,
+                            None,
+                            Some(sent),
+                            format!(
+                                "reason_code=direct_validation_ack_timeout request_id={} sequence={} ack_wait_ms={} sent_requests={}",
+                                request_id,
+                                sequence,
+                                DIRECT_VALIDATION_ACK_WAIT.as_millis(),
+                                sent,
+                            ),
+                        )
+                        .await;
+                }
             }
             Ok(crate::transport::BoundedEmitOutcome::LockTimeout) => {
                 emit_lock_timeouts = emit_lock_timeouts.saturating_add(1);
+                tracing::debug!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_emit_lock_timeout",
+                    peer_id = %peer_id,
+                    remote_endpoint = %endpoint,
+                    generation,
+                    request_id,
+                    sequence,
+                    socket_index = ?socket_index,
+                    lock_timeout_ms = crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT.as_millis(),
+                    "Direct validation did not allocate a WireGuard counter because the per-peer emit lock was busy"
+                );
                 udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
                     .await;
                 record_validation_event(
@@ -1023,9 +1168,22 @@ async fn run_direct_encrypted_validation_session(
                 continue;
             }
             Ok(crate::transport::BoundedEmitOutcome::SessionUnavailable) => {
-                debug!(
-                    "Stopping encrypted Direct validation for {}; WireGuard session is no longer ready",
-                    peer_id
+                let terminal_session_status = transport.session_status(&peer_id).await;
+                debug!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_session_unavailable",
+                    peer_id = %peer_id,
+                    remote_endpoint = %endpoint,
+                    generation,
+                    request_id,
+                    sequence,
+                    socket_index = ?socket_index,
+                    session_active = terminal_session_status.has_active,
+                    session_expired = terminal_session_status.expired,
+                    session_needs_rekey = terminal_session_status.needs_rekey,
+                    active_session_instance = ?terminal_session_status.active_session_instance,
+                    previous_session_instance = ?terminal_session_status.previous_session_instance,
+                    pending_responder_count = terminal_session_status.pending_responder_count,
+                    "stopping encrypted Direct validation because the WireGuard session was unavailable"
                 );
                 terminal_stage = "direct_validation_cancelled";
                 terminal_reason =
@@ -1049,6 +1207,17 @@ async fn run_direct_encrypted_validation_session(
                 break;
             }
             Err(err) => {
+                tracing::warn!(target: "p2pnet_daemon::direct_validation",
+                    event = "direct_validation_emit_failed",
+                    peer_id = %peer_id,
+                    remote_endpoint = %endpoint,
+                    generation,
+                    request_id,
+                    sequence,
+                    socket_index = ?socket_index,
+                    error = %err,
+                    "encrypted Direct validation emit failed"
+                );
                 warn!(
                     "Failed to send encrypted Direct validation to {} at {}: {err}",
                     peer_id, endpoint
@@ -1098,7 +1267,7 @@ async fn run_direct_encrypted_validation_session(
             final_endpoint,
             None,
             Some(sent),
-            format!("sent {sent} bounded WireGuard validation requests owner={owner_token}"),
+            format!("sent {sent} bounded WireGuard validation requests"),
         )
         .await;
     record_validation_event(

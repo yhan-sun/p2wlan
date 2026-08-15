@@ -1380,7 +1380,7 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
             false,
         )
         .await
-        .is_some());
+        .is_ok());
 
     assert!(udp
         .finish_direct_validation_session("node-b", owner_token)

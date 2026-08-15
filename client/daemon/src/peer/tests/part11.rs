@@ -355,12 +355,12 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
         "transient relay 404s must not cancel the current recovery"
     );
     assert!(
-        !manager
+        manager
             .relay_probe_targets()
             .await
             .iter()
             .any(|(peer_id, _, _)| peer_id == "peer-online"),
-        "a peer in relay registration grace must not generate repeated forced-relay probes"
+        "an online peer in relay registration grace must keep receiving fast forced-relay retries"
     );
     assert!(
         !manager

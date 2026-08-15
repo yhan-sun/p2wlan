@@ -67,6 +67,28 @@ impl PeerConnection {
             .unwrap_or(CandidatePairSource::Signaled)
     }
 
+    /// Return the candidate endpoints whose provenance is strong enough to
+    /// receive the larger bounded fast-probe prefix.  The caller still owns
+    /// the full candidate FIFO; this is only a latency hint for authenticated
+    /// predictions and on-wire learned endpoints.
+    pub(crate) fn preferred_fast_candidates(
+        &self,
+        candidates: &[SocketAddr],
+    ) -> Vec<SocketAddr> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|endpoint| {
+                matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Predicted
+                        | CandidatePairSource::PeerReflexive
+                        | CandidatePairSource::Learned
+                )
+            })
+            .collect()
+    }
+
     fn candidate_targets_need_remote_scatter_pool(&self, endpoints: &[SocketAddr]) -> bool {
         // Newer peers publish a compact NAT behavior hint in the existing
         // control-plane field.  It is not path evidence and never promotes a

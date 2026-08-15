@@ -58,6 +58,13 @@ where
     let direct_validation_worker_permits = new_direct_validation_worker_permits();
     let peer_reflexive_signal_worker_permits = new_peer_reflexive_signal_worker_permits();
     let mut retry_delay = udp_direct_retry_initial_delay();
+    // A successful UDP instance owns the Direct evidence for the current
+    // socket incarnation.  If that instance exits and a later bind succeeds,
+    // the old PeerConnection Direct state must not survive the rebind: its
+    // endpoint/affinity may belong to a closed NAT mapping and its validation
+    // ACKs may still be in flight.  The generation advance below fences both
+    // before the replacement starts probing.
+    let mut had_live_udp_instance = false;
     loop {
         if udp_direct_shutdown_requested(&ctx.shutdown_rx) {
             return Ok(());
@@ -65,6 +72,17 @@ where
 
         let (result, instance_runtime) = match bind(ctx.udp_bind, ctx.peers.clone()).await {
             Ok(udp) => {
+                if had_live_udp_instance {
+                    let generation = ctx
+                        .peers
+                        .advance_network_generation("udp_transport_rebind")
+                        .await;
+                    info!(
+                        generation,
+                        "UDP transport rebound; invalidated the previous Direct socket generation before publishing replacement"
+                    );
+                }
+                had_live_udp_instance = true;
                 let instance_started_at = Instant::now();
                 (
                     run_udp_direct_instance(

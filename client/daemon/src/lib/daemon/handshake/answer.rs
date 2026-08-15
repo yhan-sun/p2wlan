@@ -6,15 +6,103 @@ impl Daemon {
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
     ) -> Result<()> {
+        let lock_wait_started = Instant::now();
+        let ingress_generation = self.peers.current_network_generation_sync();
+        self.timeline.emit(
+            "peer_answer_received",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={ingress_generation} response_bytes={} session_fp={}",
+                handshake_response.len(),
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
+        self.timeline.emit(
+            "initiator_answer_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={ingress_generation} session_fp={}",
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
         let _handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
+        self.timeline.emit(
+            "initiator_answer_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} wait_ms={} session_fp={}",
+                self.peers.current_network_generation_sync(),
+                lock_wait_started.elapsed().as_millis(),
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
+        // The pending initiator and its answer must cross the local network
+        // generation boundary as one short transaction.  Acquire the emit
+        // guard first: the outbound actor uses `emit -> generation`, and
+        // taking this in the opposite order can deadlock an answer behind a
+        // live TUN packet.
+        self.timeline.emit(
+            "peer_answer_emit_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={}",
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
+        let emit_guard = self.transport.acquire_outbound_emit_guard(from_node_id).await;
+        self.timeline.emit(
+            "peer_answer_emit_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={}",
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(session_id.as_deref())
+            )),
+        );
+        let epoch_gate = self.peers.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        let current_generation = self.peers.current_network_generation_sync();
         let (keys, expected_session_id, probe_ephemeral_shared) = {
             let mut state = self.pending_handshakes.lock().await;
             let expected_session_id = state.session_id(from_node_id).map(str::to_string);
+            let expected_generation = state
+                .network_generation(from_node_id)
+                .unwrap_or(current_generation);
+            if expected_generation != current_generation {
+                warn!(
+                    "Ignoring WireGuard answer from {from_node_id}: pending handshake belongs to generation {expected_generation}, current generation is {current_generation}"
+                );
+                self.timeline.emit(
+                    "peer_answer_rejected",
+                    None,
+                    Some("stale_network_generation"),
+                    Some(format!(
+                        "peer={from_node_id} answer_generation={expected_generation} current_generation={current_generation}"
+                    )),
+                );
+                return Ok(());
+            }
             if expected_session_id.as_deref() != session_id.as_deref() {
                 warn!(
                     "Ignoring WireGuard answer from {from_node_id} with missing or mismatched session_id"
+                );
+                self.timeline.emit(
+                    "peer_answer_rejected",
+                    None,
+                    Some("session_id_mismatch"),
+                    Some(format!(
+                        "peer={from_node_id} generation={current_generation} expected_session_fp={} received_session_fp={}",
+                        handshake_token_fingerprint(expected_session_id.as_deref()),
+                        handshake_token_fingerprint(session_id.as_deref())
+                    )),
                 );
                 return Ok(());
             }
@@ -79,7 +167,7 @@ impl Daemon {
         let transport_token = expected_session_id.clone().or_else(|| session_id.clone());
         let replaced_existing_session = self
             .transport
-            .install_active_session(from_node_id.to_string(), transport_token, new_session)
+            .install_active_session_locked(from_node_id, transport_token, new_session)
             .await;
         if let Some(received_session_id) = session_id.clone() {
             let binding_token = expected_session_id
@@ -94,6 +182,13 @@ impl Daemon {
                 )
                 .await;
         }
+        drop(epoch_guard);
+        drop(emit_guard);
+        // Match the public install wrapper: session-ready backlog is flushed
+        // only after the emit/generation transaction is fully released.
+        self.transport
+            .flush_pending_outbound_for_peer(from_node_id)
+            .await;
 
         let current_state = self
             .peers

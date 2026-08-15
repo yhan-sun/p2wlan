@@ -25,10 +25,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
-/// Bound on the diagnostics ring so `/status` stays small.
-pub const TIMELINE_MAX_EVENTS: usize = 64;
+/// Bound on the diagnostics ring so `/status` stays bounded while retaining
+/// a complete burst/failure window. 64 events was too small for a 256-packet
+/// acceptance burst: the timeline evicted its own queue-overflow records even
+/// though the structured counters still retained them. Keep the ring bounded,
+/// but large enough to correlate a burst, handshake, retries, and teardown.
+pub const TIMELINE_MAX_EVENTS: usize = 512;
 
 /// One recorded timeline event (serializable, bounded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,16 +125,13 @@ impl ConnectionTimeline {
         self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 
-    /// Record and log one timeline event with the shared correlation id and the
-    /// relative startup time (`t_ms`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(
+    fn record_event(
         &self,
         event: &'static str,
         path: Option<&str>,
         reason_code: Option<&str>,
         detail: Option<String>,
-    ) {
+    ) -> u64 {
         let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let fields = detail
             .as_deref()
@@ -158,7 +159,52 @@ impl ConnectionTimeline {
                 events.pop_front();
             }
         }
+        at_ms
+    }
+
+    /// Record and log one timeline event with the shared correlation id and the
+    /// relative startup time (`t_ms`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(
+        &self,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let at_ms = self.record_event(event, path, reason_code, detail.clone());
         info!(
+            event = event,
+            run_id = ?self.run_id,
+            corr_id = %self.correlation_id,
+            t_ms = at_ms,
+            path = path,
+            reason_code = reason_code,
+            detail = detail,
+            "{event} run_id={:?} corr_id={} t_ms={} path={:?} reason_code={:?} detail={:?}",
+            self.run_id,
+            self.correlation_id,
+            at_ms,
+            path,
+            reason_code,
+            detail,
+        );
+    }
+
+    /// Emit a correlation-aware DEBUG line without retaining another event in
+    /// the bounded process timeline.  High-volume Direct request attempts use
+    /// this path: `/status` keeps its own protected direct-validation ring,
+    /// while the process-level milestone ring remains useful after a burst.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_debug(
+        &self,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        debug!(
             event = event,
             run_id = ?self.run_id,
             corr_id = %self.correlation_id,
@@ -191,11 +237,33 @@ impl ConnectionTimeline {
         reason_code: Option<&str>,
         detail: Option<String>,
     ) -> bool {
+        self.emit_first_scoped_with_key(scope, event, event, path, reason_code, detail)
+    }
+
+    /// Emit a bounded diagnostic milestone once for a caller-defined identity
+    /// within a peer+generation scope.  This is useful for a state transition
+    /// that is not process-global: for example, record the first business
+    /// ingress observed on Direct and the first one observed on the current
+    /// Relay connection, while suppressing the remaining packets in a burst.
+    ///
+    /// `key` is diagnostic-only and must not contain secrets.  The event ring
+    /// still has the same global bound, and the identity is kept in the same
+    /// bounded-lifetime timeline object as the existing first-milestone set.
+    pub fn emit_first_scoped_with_key(
+        &self,
+        scope: &str,
+        key: &str,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+    ) -> bool {
         let mut firsts = self
             .first_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !firsts.insert((scope.to_string(), event.to_string())) {
+        let identity = format!("{event}:{key}");
+        if !firsts.insert((scope.to_string(), identity)) {
             return false;
         }
         drop(firsts);
@@ -385,5 +453,49 @@ mod tests {
             usable, 3,
             "three distinct peer+generation scopes must each emit once"
         );
+    }
+
+    #[test]
+    fn timeline_emit_first_scoped_with_key_keeps_path_race_evidence() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+        let scope = "peer:node-b:7";
+
+        assert!(timeline.emit_first_scoped_with_key(
+            scope,
+            "path=direct relay_connection_id=none usable=false",
+            "business_ingress_observed",
+            Some("direct"),
+            Some("first_usable_not_recorded"),
+            Some("peer=node-b generation=7".to_string()),
+        ));
+        assert!(!timeline.emit_first_scoped_with_key(
+            scope,
+            "path=direct relay_connection_id=none usable=false",
+            "business_ingress_observed",
+            Some("direct"),
+            Some("first_usable_not_recorded"),
+            None,
+        ));
+        // A later Relay ingress is a distinct, useful transition even though
+        // the scope is unchanged.  This is the exact Direct-first/Relay-later
+        // race that must remain diagnosable after a WireGuard replay rejection.
+        assert!(timeline.emit_first_scoped_with_key(
+            scope,
+            "path=relay relay_connection_id=12 usable=true",
+            "business_ingress_observed",
+            Some("relay"),
+            Some("first_usable_recorded"),
+            Some("peer=node-b generation=7 relay_id=relay.test".to_string()),
+        ));
+
+        let events = timeline.snapshot().events;
+        let observed: Vec<_> = events
+            .iter()
+            .filter(|event| event.event == "business_ingress_observed")
+            .collect();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].path.as_deref(), Some("direct"));
+        assert_eq!(observed[1].path.as_deref(), Some("relay"));
+        assert_eq!(observed[1].relay_id.as_deref(), Some("relay.test"));
     }
 }

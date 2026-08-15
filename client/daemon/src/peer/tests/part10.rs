@@ -133,6 +133,7 @@ async fn recovery_epoch_probe_credit_cannot_be_bypassed_by_new_candidates() {
         manager.stash_recovery_target(PendingRecoveryTarget {
             peer_id: "peer-fail".to_string(),
             candidates: vec!["5.6.7.8:6001".parse().unwrap()],
+            preferred_fast_candidates: Vec::new(),
             frozen_targets: None,
             fresh_prediction: None,
             punch_at_ms: None,
@@ -249,6 +250,7 @@ async fn offer_storm_cannot_reset_backoff_or_spawn_fresh_sockets() {
         manager.stash_recovery_target(PendingRecoveryTarget {
             peer_id: "peer-fail".to_string(),
             candidates: vec!["5.6.7.8:7001".parse().unwrap()],
+            preferred_fast_candidates: Vec::new(),
             frozen_targets: None,
             fresh_prediction: None,
             punch_at_ms: None,

@@ -85,7 +85,9 @@ impl PeerManager {
         else {
             return false;
         };
-        let (had_relay_confirmation, should_reset) = {
+        let (had_relay_confirmation, old_incarnation, new_incarnation) = {
+            let epoch_gate = self.network_epoch_gate();
+            let _epoch_guard = epoch_gate.lock().await;
             let mut connections = self.connections.write().await;
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
@@ -102,26 +104,31 @@ impl PeerManager {
             conn.reset_for_peer_session();
             if had_relay_confirmation {
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+                self.bump_relay_confirm_seq(node_id);
             }
-            (had_relay_confirmation, true)
+            (had_relay_confirmation, old_incarnation, new_incarnation)
         };
-        if had_relay_confirmation {
-            self.bump_relay_confirm_seq(node_id);
-        }
         self.emit_timeline(
             "peer_restart_detected",
             None,
             Some(reason),
             Some(format!(
-                "peer={node_id} reason={reason} remote_incarnation_changed"
+                "peer={node_id} reason={reason} old_incarnation={old_incarnation} new_incarnation={new_incarnation} relay_confirmation_cleared={had_relay_confirmation}"
             )),
         );
-        should_reset
+        true
     }
 
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
-        let generation = self.current_network_generation().await;
+        // Control-plane incarnation updates are another writer of the same
+        // relay/session state that network handover invalidates. Serialize
+        // the generation snapshot and the connection mutation as one epoch
+        // transaction; otherwise a public-key/session reset could be
+        // published immediately before an old ACK commits.
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        let generation = self.current_network_generation_sync();
         // Un-quarantine evidence is computed under the connection lock but the
         // quarantine map is re-opened only AFTER the lock is dropped:
         // `unquarantine_peer` records a diagnostics event that re-locks the
@@ -286,6 +293,7 @@ impl PeerManager {
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
         drop(conns);
         drop(ip_map);
+        drop(epoch_guard);
         if let Some(reason) = reset_remote_fresh_after_lock {
             self.reset_remote_fresh_generation(&info.node_id, reason).await;
         }
@@ -317,10 +325,31 @@ impl PeerManager {
     /// supersedes the old one anyway.  Only a public-key / identity change
     /// resets the fresh space.
     pub async fn remove_peer(&self, node_id: &str) {
-        let removed_virtual_ip = {
+        let (removed_virtual_ip, removed_relay_expectation) = {
+            let epoch_gate = self.network_epoch_gate();
+            let _epoch_guard = epoch_gate.lock().await;
             let mut conns = self.connections.write().await;
-            conns.remove(node_id).map(|conn| conn.virtual_ip)
+            let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
+            // PeerLeft is a terminal boundary for the current peer session.
+            // Cancel the forced-relay token while the same epoch gate covers
+            // removal, so an old ACK cannot race a later re-add of this node
+            // ID and confirm the replacement connection.
+            let removed_relay_expectation = self
+                .relay_probe_expectations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id)
+                .is_some();
+            (removed_virtual_ip, removed_relay_expectation)
         };
+        if removed_relay_expectation {
+            self.emit_timeline(
+                "relay_probe_expectation_cancelled",
+                Some("relay"),
+                Some("peer_removed"),
+                Some(format!("peer={node_id}")),
+            );
+        }
         if let Some(virtual_ip) = removed_virtual_ip {
             let mut ip_map = self.ip_to_node.write().await;
             ip_map.remove(&virtual_ip);
@@ -408,16 +437,28 @@ impl PeerManager {
         detail: impl Into<String>,
     ) {
         let generation = self.current_network_generation().await;
+        let stage = stage.into();
+        let detail = detail.into();
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.record_direct_event(
                 generation,
-                stage,
+                stage.clone(),
                 endpoint,
                 candidate_count,
                 sent_probes,
-                detail,
+                detail.clone(),
             );
         }
+        self.emit_direct_traversal_debug(
+            node_id,
+            generation,
+            &stage,
+            endpoint,
+            None,
+            candidate_count,
+            sent_probes,
+            &detail,
+        );
     }
 
     /// Generation-stable direct-event recorder with the actual UDP socket
@@ -434,8 +475,57 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
+        let stage = stage.into();
+        let detail = detail.into();
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.record_direct_event_with_socket(
+                generation,
+                stage.clone(),
+                endpoint,
+                socket_index,
+                candidate_count,
+                sent_probes,
+                detail.clone(),
+            );
+        }
+        self.emit_direct_traversal_debug(
+            node_id,
+            generation,
+            &stage,
+            endpoint,
+            socket_index,
+            candidate_count,
+            sent_probes,
+            &detail,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_direct_traversal_debug(
+        &self,
+        node_id: &str,
+        generation: u64,
+        stage: &str,
+        endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: &str,
+    ) {
+        let Some(event) = direct_traversal_timeline_event(stage) else {
+            return;
+        };
+        let reason_code = detail
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("reason_code="))
+            .filter(|value| !value.is_empty())
+            .or_else(|| direct_traversal_default_reason(stage));
+        self.emit_timeline_debug(
+            event,
+            Some("direct"),
+            reason_code,
+            Some(format_direct_traversal_timeline_detail(
+                node_id,
                 generation,
                 stage,
                 endpoint,
@@ -443,8 +533,8 @@ impl PeerManager {
                 candidate_count,
                 sent_probes,
                 detail,
-            );
-        }
+            )),
+        );
     }
 
     /// Record a lifecycle event for one owned encrypted direct-validation
@@ -523,16 +613,49 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
+        let stage = stage.into();
+        let detail = detail.into();
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
             conn.record_direct_validation_event_with_metadata(
                 generation,
                 metadata,
-                stage,
+                stage.clone(),
                 endpoint,
                 socket_index,
                 candidate_count,
                 sent_probes,
-                detail,
+                detail.clone(),
+            );
+        }
+
+        // The `/status` direct-event ring already has the full typed record,
+        // but it is only collected after a round.  Mirror the lifecycle into
+        // the process timeline at DEBUG level so a live failure can be
+        // diagnosed from one log stream with the same corr_id/t_ms as relay,
+        // WireGuard and generation events.  Do not copy validation owner
+        // tokens from the legacy detail strings into this log line.
+        if let Some(event) = direct_validation_timeline_event(&stage) {
+            let reason_code = detail
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("reason_code="))
+                .filter(|value| !value.is_empty())
+                .or_else(|| direct_validation_default_reason(&stage));
+            let timeline_detail = format_direct_validation_timeline_detail(
+                node_id,
+                generation,
+                &stage,
+                endpoint,
+                socket_index,
+                candidate_count,
+                sent_probes,
+                metadata,
+                &detail,
+            );
+            self.emit_timeline_debug(
+                event,
+                Some("direct"),
+                reason_code,
+                Some(timeline_detail),
             );
         }
     }
@@ -951,5 +1074,236 @@ impl PeerManager {
             .into_iter()
             .map(|candidate| candidate.key)
             .collect()
+    }
+}
+
+/// Stages that are useful in the live, correlation-id based timeline.  The
+/// high-volume candidate/scatter events remain in the bounded `/status` ring;
+/// these are the owned request/ACK lifecycle boundaries needed to explain a
+/// Direct success, timeout, cancellation, or stale ACK from a daemon log.
+fn direct_validation_timeline_event(stage: &str) -> Option<&'static str> {
+    match stage {
+        "direct_validation_queued" => Some("direct_validation_queued"),
+        "direct_validation_dropped" => Some("direct_validation_dropped"),
+        "direct_validation_started" => Some("direct_validation_started"),
+        "direct_validation_waiting_for_session" => Some("direct_validation_waiting_for_session"),
+        "direct_validation_session_ready" => Some("direct_validation_session_ready"),
+        "direct_validation_request_prepared" => Some("direct_validation_request_prepared"),
+        "direct_validation_request_sent" => Some("direct_validation_request_sent"),
+        "direct_validation_request_received" => Some("direct_validation_request_received"),
+        "direct_validation_request_dropped" => Some("direct_validation_request_dropped"),
+        "direct_validation_ack_sent" => Some("direct_validation_ack_sent"),
+        "direct_validation_ack_received" => Some("direct_validation_ack_received"),
+        "direct_validation_ack_wait_timeout" => Some("direct_validation_ack_wait_timeout"),
+        "direct_validation_ack_unmatched" => Some("direct_validation_ack_unmatched"),
+        "direct_validation_ack_not_promoted" => Some("direct_validation_ack_not_promoted"),
+        "direct_validation_ack_send_failed" => Some("direct_validation_ack_send_failed"),
+        "direct_validation_emit_lock_timeout" => Some("direct_validation_emit_lock_timeout"),
+        "direct_validation_timed_out" => Some("direct_validation_timed_out"),
+        "direct_validation_failed" => Some("direct_validation_failed"),
+        "direct_validation_cancelled" => Some("direct_validation_cancelled"),
+        "direct_validation_completed" => Some("direct_validation_completed"),
+        "direct_validation_promoted" => Some("direct_validation_promoted"),
+        "direct_validation_suppressed" => Some("direct_validation_suppressed"),
+        "direct_validation_slow_relay_retained" => Some("direct_validation_slow_relay_retained"),
+        "direct_path_promoted" => Some("direct_path_promoted"),
+        _ => None,
+    }
+}
+
+fn direct_validation_default_reason(stage: &str) -> Option<&'static str> {
+    match stage {
+        "direct_validation_timed_out" => Some("direct_validation_timeout"),
+        "direct_validation_failed" => Some("direct_validation_send_failed"),
+        "direct_validation_cancelled" => Some("direct_validation_cancelled"),
+        "direct_validation_ack_unmatched" => Some("direct_validation_ack_unmatched"),
+        "direct_validation_ack_wait_timeout" => Some("direct_validation_ack_timeout"),
+        "direct_validation_ack_send_failed" => Some("direct_validation_ack_send_failed"),
+        "direct_validation_emit_lock_timeout" => Some("direct_validation_emit_lock_timeout"),
+        "direct_validation_dropped" => Some("direct_validation_queue_dropped"),
+        "direct_validation_request_dropped" => Some("direct_validation_request_dropped"),
+        "direct_validation_ack_not_promoted" => Some("direct_validation_promotion_rejected"),
+        "direct_validation_suppressed" => Some("direct_validation_suppressed"),
+        _ => None,
+    }
+}
+
+fn direct_traversal_timeline_event(stage: &str) -> Option<&'static str> {
+    match stage {
+        "direct_punch_started" => Some("direct_punch_started"),
+        "direct_punch_completed" => Some("direct_punch_completed"),
+        "direct_punch_failed" => Some("direct_punch_failed"),
+        "direct_punch_cancelled" => Some("direct_punch_cancelled"),
+        "direct_fast_probe_started" => Some("direct_fast_probe_started"),
+        "direct_fast_probe_sent" => Some("direct_fast_probe_sent"),
+        "direct_fast_probe_failed" => Some("direct_fast_probe_failed"),
+        "direct_fast_probe_confirmed" => Some("direct_fast_probe_confirmed"),
+        "direct_probe_ack_timeout" => Some("direct_probe_ack_timeout"),
+        "direct_probe_budget_exhausted" => Some("direct_probe_budget_exhausted"),
+        "direct_candidates_ready" => Some("direct_candidates_ready"),
+        "candidate_pair_probe_succeeded" => Some("candidate_pair_probe_succeeded"),
+        "retry_punch_started" => Some("retry_punch_started"),
+        "retry_probes_sent" => Some("retry_probes_sent"),
+        "retry_ack_timeout" => Some("retry_ack_timeout"),
+        "retry_probe_succeeded" => Some("retry_probe_succeeded"),
+        "retry_send_error" => Some("retry_send_error"),
+        "direct_reclaim_punch_started" => Some("direct_reclaim_punch_started"),
+        "direct_reclaim_probes_sent" => Some("direct_reclaim_probes_sent"),
+        "direct_reclaim_ack_timeout" => Some("direct_reclaim_ack_timeout"),
+        "direct_reclaim_probe_succeeded" => Some("direct_reclaim_probe_succeeded"),
+        "direct_reclaim_send_error" => Some("direct_reclaim_send_error"),
+        "fresh_mapping_generation_started" => Some("fresh_mapping_generation_started"),
+        "fresh_mapping_generation_completed" => Some("fresh_mapping_generation_completed"),
+        "fresh_mapping_generation_failed" => Some("fresh_mapping_generation_failed"),
+        "fresh_mapping_prediction_signaled" => Some("fresh_mapping_prediction_signaled"),
+        "direct_validation_observation_merged" => Some("direct_validation_observation_merged"),
+        "direct_validation_suppressed" => Some("direct_validation_suppressed"),
+        _ => None,
+    }
+}
+
+fn direct_traversal_default_reason(stage: &str) -> Option<&'static str> {
+    match stage {
+        "direct_punch_failed"
+        | "direct_fast_probe_failed"
+        | "retry_send_error"
+        | "direct_reclaim_send_error"
+        | "fresh_mapping_generation_failed" => Some("direct_probe_failed"),
+        "direct_punch_cancelled" => Some("direct_probe_cancelled"),
+        "direct_probe_ack_timeout" | "retry_ack_timeout" | "direct_reclaim_ack_timeout" => {
+            Some("direct_probe_ack_timeout")
+        }
+        "direct_probe_budget_exhausted" => Some("direct_probe_budget_exhausted"),
+        "direct_validation_suppressed" => Some("direct_validation_suppressed"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_direct_traversal_timeline_detail(
+    peer_id: &str,
+    generation: u64,
+    stage: &str,
+    endpoint: Option<SocketAddr>,
+    socket_index: Option<usize>,
+    candidate_count: Option<usize>,
+    sent_probes: Option<u32>,
+    detail: &str,
+) -> String {
+    format!(
+        "peer_id={peer_id} generation={generation} stage={stage} endpoint={} socket_index={} candidate_count={} sent_probes={} detail={}",
+        endpoint_text(endpoint),
+        socket_index.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        candidate_count.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        sent_probes.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        sanitized_validation_detail(detail),
+    )
+}
+
+fn endpoint_text(endpoint: Option<SocketAddr>) -> String {
+    endpoint
+        .map(|endpoint| endpoint.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Keep the legacy human detail useful while ensuring local validation owner
+/// handles (and anything accidentally labelled as a token) are not copied to
+/// the live correlation log.  The typed `/status` record remains unchanged so
+/// existing local diagnostics consumers keep working.
+fn sanitized_validation_detail(detail: &str) -> String {
+    detail
+        .split_whitespace()
+        .filter(|part| {
+            let key = part.split_once('=').map(|(key, _)| key).unwrap_or_default();
+            !matches!(
+                key,
+                "owner" | "owner_token" | "validation_session_id" | "token" | "ticket"
+            )
+        })
+        .take(48)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_direct_validation_timeline_detail(
+    peer_id: &str,
+    generation: u64,
+    stage: &str,
+    endpoint: Option<SocketAddr>,
+    socket_index: Option<usize>,
+    candidate_count: Option<usize>,
+    sent_probes: Option<u32>,
+    metadata: DirectValidationEventMetadata,
+    detail: &str,
+) -> String {
+    format!(
+        "peer_id={peer_id} generation={generation} stage={stage} endpoint={} socket_index={} candidate_count={} sent_probes={} request_id={} expected_endpoint={} observed_ack_endpoint={} selected_endpoint={} ack_endpoint_authenticated={} validation_rtt_ms={} detail={}",
+        endpoint_text(endpoint),
+        socket_index.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        candidate_count.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        sent_probes.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        metadata
+            .request_id
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        endpoint_text(metadata.expected_endpoint),
+        endpoint_text(metadata.observed_ack_endpoint),
+        endpoint_text(metadata.selected_endpoint),
+        metadata
+            .ack_endpoint_authenticated
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        metadata
+            .validation_rtt_ms
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        sanitized_validation_detail(detail),
+    )
+}
+
+#[cfg(test)]
+mod direct_validation_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_mapping_keeps_terminal_and_ack_boundaries() {
+        assert_eq!(
+            direct_validation_timeline_event("direct_validation_request_sent"),
+            Some("direct_validation_request_sent")
+        );
+        assert_eq!(
+            direct_validation_timeline_event("direct_validation_request_prepared"),
+            Some("direct_validation_request_prepared")
+        );
+        assert_eq!(
+            direct_validation_timeline_event("direct_validation_ack_unmatched"),
+            Some("direct_validation_ack_unmatched")
+        );
+        assert_eq!(
+            direct_validation_timeline_event("direct_validation_timed_out"),
+            Some("direct_validation_timed_out")
+        );
+        assert_eq!(direct_validation_timeline_event("birthday_probe_sent"), None);
+        assert_eq!(
+            direct_validation_default_reason("direct_validation_timed_out"),
+            Some("direct_validation_timeout")
+        );
+        assert_eq!(
+            direct_traversal_timeline_event("direct_fast_probe_started"),
+            Some("direct_fast_probe_started")
+        );
+        assert_eq!(
+            direct_traversal_default_reason("retry_ack_timeout"),
+            Some("direct_probe_ack_timeout")
+        );
+    }
+
+    #[test]
+    fn live_detail_redacts_local_owner_handles() {
+        let detail = sanitized_validation_detail(
+            "owner=123 owner_token=456 request_id=7 generation=9 reason_code=timeout",
+        );
+        assert!(!detail.contains("owner="));
+        assert!(!detail.contains("owner_token="));
+        assert!(detail.contains("request_id=7"));
+        assert!(detail.contains("reason_code=timeout"));
     }
 }

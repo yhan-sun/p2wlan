@@ -34,6 +34,10 @@ struct PendingPeerOffer {
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,
     candidate_generation: u64,
+    /// Local generation at signal ingress.  The offer may wait in the
+    /// per-peer responder worker while the control-plane answer is sent; a
+    /// local handover during that wait makes the old offer terminal.
+    network_generation: u64,
     candidates_expires_at_ms: Option<u64>,
     sender_public_key: Option<String>,
     handshake_init: Vec<u8>,
@@ -67,6 +71,7 @@ struct PendingPeerReflexive {
 /// lifecycle cleanup.
 struct HandshakeStartReservation {
     owner: u64,
+    network_generation: u64,
     cancellation: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -106,12 +111,22 @@ fn normalize_probe_ephemeral_public_key(value: Option<&str>) -> Option<String> {
 struct PendingHandshakeState {
     pending: HashMap<String, HandshakeInitiator>,
     pending_session_ids: HashMap<String, String>,
+    /// Local network generation captured when the initiator transaction was
+    /// published.  A session answer is useful only for the generation that
+    /// created its initiation; without this binding a late answer can arrive
+    /// after a network handover and install old key material as if it were a
+    /// fresh session.
+    pending_network_generations: HashMap<String, u64>,
     pending_probe_ephemeral: HashMap<String, DhKeyPair>,
     /// Peers for which a handshake is being prepared.  Candidate gathering and
     /// control-peer lookups await, so a plain `pending` check is not enough to
     /// prevent another trigger from creating and overwriting an initiator in
     /// that window.
     starting: HashSet<String>,
+    /// Local network generation captured when an initiator preparation was
+    /// reserved. A reservation that survived a network handover is cancelled
+    /// before a new-generation attempt is admitted.
+    starting_network_generations: HashMap<String, u64>,
     /// Owner token for every `starting` reservation.  This is deliberately
     /// separate from `pending_ids`: a preparation has no WireGuard session ID
     /// yet, but it still must not be allowed to clean up a newer reservation.
@@ -148,11 +163,43 @@ impl PendingHandshakeState {
     ///
     /// A caller must later either commit it with `insert_reserved` or release
     /// it with `cancel_reservation`.
+    #[cfg(test)]
     fn reserve_start(&mut self, peer_id: &str) -> bool {
         self.reserve_start_with_owner(peer_id).is_some()
     }
 
+    #[cfg(test)]
     fn reserve_start_with_owner(&mut self, peer_id: &str) -> Option<HandshakeStartReservation> {
+        self.reserve_start_with_owner_at_generation(peer_id, 0)
+    }
+
+    fn reserve_start_at_generation(&mut self, peer_id: &str, network_generation: u64) -> bool {
+        self.reserve_start_with_owner_at_generation(peer_id, network_generation)
+            .is_some()
+    }
+
+    fn reserve_start_with_owner_at_generation(
+        &mut self,
+        peer_id: &str,
+        network_generation: u64,
+    ) -> Option<HandshakeStartReservation> {
+        if self.pending.contains_key(peer_id) {
+            // A pending transaction from an older network incarnation can no
+            // longer produce a valid session. The caller removes its Probe
+            // binding before admitting the replacement.
+            if self.pending_network_generations.get(peer_id) != Some(&network_generation) {
+                self.remove(peer_id);
+            } else {
+                return None;
+            }
+        }
+        if self.starting.contains(peer_id) {
+            if self.starting_network_generations.get(peer_id) != Some(&network_generation) {
+                self.cancel_reservation(peer_id);
+            } else {
+                return None;
+            }
+        }
         if self.pending.contains_key(peer_id) || self.starting.contains(peer_id) {
             return None;
         }
@@ -160,17 +207,21 @@ impl PendingHandshakeState {
         let owner = self.next_start_id;
         let (cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
         self.starting.insert(peer_id.to_string());
+        self.starting_network_generations
+            .insert(peer_id.to_string(), network_generation);
         self.starting_ids.insert(peer_id.to_string(), owner);
         self.starting_cancellations
             .insert(peer_id.to_string(), cancellation_tx);
         Some(HandshakeStartReservation {
             owner,
+            network_generation,
             cancellation,
         })
     }
 
     fn cancel_reservation(&mut self, peer_id: &str) {
         self.starting.remove(peer_id);
+        self.starting_network_generations.remove(peer_id);
         self.starting_ids.remove(peer_id);
         if let Some(cancellation) = self.starting_cancellations.remove(peer_id) {
             cancellation.send_replace(true);
@@ -185,27 +236,34 @@ impl PendingHandshakeState {
         true
     }
 
-    fn insert_reserved(
+    fn insert_reserved_with_generation(
         &mut self,
         peer_id: String,
         initiator: HandshakeInitiator,
         session_id: Option<String>,
         probe_ephemeral: Option<DhKeyPair>,
+        network_generation: u64,
     ) -> Option<u64> {
-        if !self.starting.remove(&peer_id) {
+        if !self.starting_ids.contains_key(&peer_id)
+            || self.starting_network_generations.get(&peer_id) != Some(&network_generation)
+        {
             return None;
         }
+        self.starting.remove(&peer_id);
+        self.starting_network_generations.remove(&peer_id);
         self.starting_ids.remove(&peer_id);
         let cancellation = self.starting_cancellations.remove(&peer_id);
-        Some(self.insert_with_cancellation(
+        Some(self.insert_with_generation(
             peer_id,
             initiator,
             session_id,
             probe_ephemeral,
             cancellation,
+            network_generation,
         ))
     }
 
+    #[cfg(test)]
     fn insert_reserved_if_current(
         &mut self,
         peer_id: String,
@@ -214,18 +272,41 @@ impl PendingHandshakeState {
         session_id: Option<String>,
         probe_ephemeral: Option<DhKeyPair>,
     ) -> Option<u64> {
-        if self.starting_ids.get(&peer_id).copied() != Some(owner) {
+        self.insert_reserved_if_current_with_generation(
+            peer_id,
+            owner,
+            initiator,
+            session_id,
+            probe_ephemeral,
+            0,
+        )
+    }
+
+    fn insert_reserved_if_current_with_generation(
+        &mut self,
+        peer_id: String,
+        owner: u64,
+        initiator: HandshakeInitiator,
+        session_id: Option<String>,
+        probe_ephemeral: Option<DhKeyPair>,
+        network_generation: u64,
+    ) -> Option<u64> {
+        if self.starting_ids.get(&peer_id).copied() != Some(owner)
+            || self.starting_network_generations.get(&peer_id) != Some(&network_generation)
+        {
             return None;
         }
         self.starting.remove(&peer_id);
+        self.starting_network_generations.remove(&peer_id);
         self.starting_ids.remove(&peer_id);
         let cancellation = self.starting_cancellations.remove(&peer_id);
-        Some(self.insert_with_cancellation(
+        Some(self.insert_with_generation(
             peer_id,
             initiator,
             session_id,
             probe_ephemeral,
             cancellation,
+            network_generation,
         ))
     }
 
@@ -240,6 +321,7 @@ impl PendingHandshakeState {
         self.insert_with_cancellation(peer_id, initiator, session_id, probe_ephemeral, None)
     }
 
+    #[cfg(test)]
     fn insert_with_cancellation(
         &mut self,
         peer_id: String,
@@ -247,6 +329,25 @@ impl PendingHandshakeState {
         session_id: Option<String>,
         probe_ephemeral: Option<DhKeyPair>,
         cancellation: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> u64 {
+        self.insert_with_generation(
+            peer_id,
+            initiator,
+            session_id,
+            probe_ephemeral,
+            cancellation,
+            0,
+        )
+    }
+
+    fn insert_with_generation(
+        &mut self,
+        peer_id: String,
+        initiator: HandshakeInitiator,
+        session_id: Option<String>,
+        probe_ephemeral: Option<DhKeyPair>,
+        cancellation: Option<tokio::sync::watch::Sender<bool>>,
+        network_generation: u64,
     ) -> u64 {
         // Defend against a direct replacement: wake the old owner before
         // replacing its slot so a late slow POST cannot outlive the new
@@ -262,6 +363,8 @@ impl PendingHandshakeState {
         } else {
             self.pending_session_ids.remove(&peer_id);
         }
+        self.pending_network_generations
+            .insert(peer_id.clone(), network_generation);
         if let Some(probe_ephemeral) = probe_ephemeral {
             self.pending_probe_ephemeral
                 .insert(peer_id.clone(), probe_ephemeral);
@@ -281,12 +384,37 @@ impl PendingHandshakeState {
         }
         self.pending_ids.remove(peer_id);
         self.pending_session_ids.remove(peer_id);
+        self.pending_network_generations.remove(peer_id);
         self.pending_probe_ephemeral.remove(peer_id);
         self.pending.remove(peer_id)
     }
 
     fn session_id(&self, peer_id: &str) -> Option<&str> {
         self.pending_session_ids.get(peer_id).map(String::as_str)
+    }
+
+    fn network_generation(&self, peer_id: &str) -> Option<u64> {
+        self.pending_network_generations.get(peer_id).copied()
+    }
+
+    /// Remove a pending initiator that belongs to an older local network
+    /// incarnation and return its Probe token so the connection-level binding
+    /// can be removed before a replacement is staged.
+    fn remove_stale_pending_for_generation(
+        &mut self,
+        peer_id: &str,
+        network_generation: u64,
+    ) -> Option<String> {
+        let is_stale = self
+            .pending_network_generations
+            .get(peer_id)
+            .is_some_and(|pending_generation| *pending_generation != network_generation);
+        if !is_stale {
+            return None;
+        }
+        let token = self.session_id(peer_id).map(str::to_string);
+        self.remove(peer_id);
+        token
     }
 
     fn probe_ephemeral(&self, peer_id: &str) -> Option<DhKeyPair> {

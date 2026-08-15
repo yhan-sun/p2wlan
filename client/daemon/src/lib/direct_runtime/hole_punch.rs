@@ -21,6 +21,10 @@ struct HolePunchSignalContext {
 #[derive(Clone)]
 struct PunchCandidateSnapshot {
     candidates: Vec<SocketAddr>,
+    /// Candidate sources already authenticated or learned by this daemon.
+    /// These are safe to prioritize in the bounded immediate prefix, while
+    /// `candidates` remains the authoritative FIFO for the full punch plan.
+    preferred_fast_candidates: Vec<SocketAddr>,
     hash: u64,
     /// Number of candidate endpoints for which provenance was captured.  An
     /// unknown provenance is deliberately retained as an explicit category
@@ -54,6 +58,10 @@ async fn punch_candidate_snapshot(
 
     let connection = peers.get_connection(peer_id).await;
     let mut source_counts = HashMap::<String, usize>::new();
+    let preferred_fast_candidates = connection
+        .as_ref()
+        .map(|connection| connection.preferred_fast_candidates(&candidates))
+        .unwrap_or_default();
     for candidate in &candidates {
         let source = connection
             .as_ref()
@@ -74,6 +82,7 @@ async fn punch_candidate_snapshot(
 
     PunchCandidateSnapshot {
         candidates,
+        preferred_fast_candidates,
         hash,
         source_count,
         source_category_count,
@@ -453,6 +462,9 @@ async fn spawn_hole_punch_task(
                     .stash_recovery_target(PendingRecoveryTarget {
                         peer_id: peer_id.clone(),
                         candidates: trigger_snapshot.candidates.clone(),
+                        preferred_fast_candidates: trigger_snapshot
+                            .preferred_fast_candidates
+                            .clone(),
                         // A valid fresh snapshot stays immutable even when it
                         // is deferred behind the first ordinary send. An
                         // ordinary refresh remains a normal latest snapshot.
@@ -764,20 +776,24 @@ async fn spawn_hole_punch_task(
         let pending_target = peers.take_recovery_target(&peer_id).await;
         let merge_frozen = |ordinary: Option<DirectProbeTargetSet>,
                             frozen: Option<Vec<SocketAddr>>,
+                            preferred_fast_candidates: Option<Vec<SocketAddr>>,
                             recovery_epoch: u64|
          -> Option<DirectProbeTargetSet> {
-            let mut frozen = frozen.unwrap_or_default();
+            let frozen = frozen.unwrap_or_default();
+            let preferred_fast_candidates =
+                preferred_fast_candidates.unwrap_or_else(|| frozen.clone());
             match ordinary {
                 Some(mut ordinary) => {
-                    for endpoint in frozen.drain(..) {
-                        if !ordinary.candidates.contains(&endpoint) {
-                            ordinary.candidates.push(endpoint);
-                        }
-                    }
+                    merge_unique_socket_addresses(&mut ordinary.candidates, &frozen);
+                    merge_unique_socket_addresses(
+                        &mut ordinary.preferred_fast_candidates,
+                        &preferred_fast_candidates,
+                    );
                     Some(ordinary)
                 }
                 None if !frozen.is_empty() => Some(DirectProbeTargetSet {
                     peer_id: peer_id.clone(),
+                    preferred_fast_candidates,
                     candidates: frozen,
                     remote_scatter_pool: false,
                     stable_remote_scatter: false,
@@ -804,14 +820,20 @@ async fn spawn_hole_punch_task(
                     );
                 }
                 let has_frozen = pending.frozen_targets.is_some();
+                let pending_preferred_fast_candidates = if has_frozen {
+                    pending.frozen_targets.clone().unwrap_or_default()
+                } else {
+                    pending.preferred_fast_candidates.clone()
+                };
                 if has_frozen {
-                    fast_prediction_candidates = pending.frozen_targets.clone().unwrap_or_default();
+                    fast_prediction_candidates = pending_preferred_fast_candidates.clone();
                     is_frozen_prediction_window = true;
                 } else {
                     // A newer ordinary refresh supersedes the original
                     // prediction target. Never let the old frozen window leak
-                    // into the fast prefix of the replacement session.
-                    fast_prediction_candidates.clear();
+                    // into the fast prefix of the replacement session, but do
+                    // retain the refresh's authenticated/learned sources.
+                    fast_prediction_candidates = pending_preferred_fast_candidates.clone();
                     is_frozen_prediction_window = false;
                 }
                 let frozen = if has_frozen {
@@ -824,12 +846,17 @@ async fn spawn_hole_punch_task(
                 } else {
                     None
                 };
-                merge_frozen(ordinary, frozen, epoch)
+                merge_frozen(
+                    ordinary,
+                    frozen,
+                    Some(pending_preferred_fast_candidates),
+                    epoch,
+                )
             }
             None => match frozen_targets {
                 Some(frozen) => {
                     let ordinary = peers.direct_probe_target_set_for(&peer_id).await;
-                    merge_frozen(ordinary, Some(frozen), epoch)
+                    merge_frozen(ordinary, Some(frozen), None, epoch)
                 }
                 None => peers.direct_probe_target_set_for(&peer_id).await,
             },
@@ -867,7 +894,10 @@ async fn spawn_hole_punch_task(
                 .await;
             return;
         };
-        let candidates = target.candidates;
+        let mut candidates = target.candidates;
+        if fast_prediction_candidates.is_empty() {
+            fast_prediction_candidates = target.preferred_fast_candidates;
+        }
         let remote_scatter_pool = target.remote_scatter_pool;
         let stable_remote_scatter = target.stable_remote_scatter;
         let birthday_plan = target.birthday_plan;
@@ -899,7 +929,7 @@ async fn spawn_hole_punch_task(
                 .await;
             return;
         }
-        let dispatch_snapshot = punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
+        let mut dispatch_snapshot = punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
         peers
             .record_direct_event(
                 &peer_id,
@@ -971,7 +1001,7 @@ async fn spawn_hole_punch_task(
             let fast_candidates = if fast_prediction_candidates.is_empty() {
                 direct_fast_probe_candidates(&candidates)
             } else {
-                direct_fast_probe_candidates_with_preferred(
+                direct_fast_probe_candidates_with_predicted_window(
                     &candidates,
                     &fast_prediction_candidates,
                 )
@@ -1138,6 +1168,164 @@ async fn spawn_hole_punch_task(
                         .await;
                     return;
                 }
+            }
+        }
+
+        // A control-plane candidate refresh can arrive while the owned
+        // rendezvous session is waiting for its scheduled broad window.  The
+        // recovery scheduler intentionally folds that refresh into a
+        // newest-wins pending target instead of starting a second per-peer
+        // worker.  Consume that target at the last safe boundary before the
+        // broad sweep: first give its strongest candidates the same bounded
+        // fast-prefix opportunity, then append the complete snapshot to this
+        // session's existing FIFO.  This keeps the original punch_at_ms and
+        // epoch budgets intact while preventing a fresh peer-reflexive/public
+        // endpoint from waiting for the next one-second retry tick.
+        if !session.is_cancelled()
+            && !peers.is_direct(&peer_id).await
+            && peers.current_network_generation().await == generation
+            && peers.peer_online(&peer_id).await
+        {
+            if let Some(pending) = peers.take_recovery_target(&peer_id).await {
+                let frozen_targets = pending.frozen_targets;
+                let mut preferred = frozen_targets
+                    .clone()
+                    .unwrap_or(pending.preferred_fast_candidates);
+                let mut pending_candidates = pending.candidates;
+                if !preferred.is_empty() {
+                    // A fresh prediction carries only its immutable window.
+                    // Keep the current ordinary candidates in the same
+                    // refresh, because an authenticated/STUN endpoint is a
+                    // stronger fallback than a prediction that may already be
+                    // one NAT allocation behind.
+                    if let Some(current) = peers.direct_probe_target_set_for(&peer_id).await {
+                        merge_unique_socket_addresses(&mut pending_candidates, &current.candidates);
+                        merge_unique_socket_addresses(
+                            &mut preferred,
+                            &current.preferred_fast_candidates,
+                        );
+                    }
+                }
+                let fast_candidates = if preferred.is_empty() {
+                    direct_fast_probe_candidates(&pending_candidates)
+                } else {
+                    direct_fast_probe_candidates_with_predicted_window(
+                        &pending_candidates,
+                        &preferred,
+                    )
+                };
+                let fast_probe_is_allowed = direct_fast_probe_is_allowed(
+                    remote_scatter_pool,
+                    stable_remote_scatter,
+                    !preferred.is_empty(),
+                );
+                let mut direct_committed = peers.is_direct(&peer_id).await;
+                if fast_probe_is_allowed && !fast_candidates.is_empty() && !direct_committed {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "deferred_candidate_fast_probe_started",
+                            fast_candidates.first().copied(),
+                            Some(fast_candidates.len()),
+                            None,
+                            format!(
+                                "consuming newest-wins candidate refresh before broad sweep session_id={} generation={} pending_candidates={} preferred_candidates={} original_punch_at_ms={punch_at_ms:?}",
+                                session.session_id(),
+                                generation,
+                                pending_candidates.len(),
+                                preferred.len(),
+                            ),
+                        )
+                        .await;
+                    let commit_seq = peers.direct_commit_seq_sync(&peer_id);
+                    match udp
+                        .punch_candidates_fast_prefix_until_not_direct_report(
+                            &peer_id,
+                            fast_candidates.clone(),
+                            Duration::ZERO,
+                            DIRECT_FAST_PROBE_ATTEMPTS,
+                        )
+                        .await
+                    {
+                        Ok(report) => {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "deferred_candidate_fast_probe_sent",
+                                    fast_candidates.first().copied(),
+                                    Some(fast_candidates.len()),
+                                    Some(report.packets_sent),
+                                    format!(
+                                        "session_id={} packets_sent={} actual_first_send_at_ms={:?}",
+                                        session.session_id(),
+                                        report.packets_sent,
+                                        report.first_send_at_ms,
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "deferred_candidate_fast_probe_failed",
+                                    fast_candidates.first().copied(),
+                                    Some(fast_candidates.len()),
+                                    None,
+                                    format!(
+                                        "session_id={} newest candidate refresh fast probe failed; continuing broad sweep: {error}",
+                                        session.session_id(),
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                    direct_committed = peers.is_direct(&peer_id).await;
+                    if !direct_committed {
+                        direct_committed = peers
+                            .wait_for_direct_commit_or_timeout(
+                                &peer_id,
+                                commit_seq,
+                                DIRECT_FAST_PROBE_ACK_WINDOW,
+                            )
+                            .await;
+                    }
+                }
+                if direct_committed {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "deferred_candidate_fast_probe_confirmed",
+                            fast_candidates.first().copied(),
+                            Some(fast_candidates.len()),
+                            None,
+                            format!(
+                                "session_id={} Direct committed from newest candidate refresh before broad sweep",
+                                session.session_id(),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+
+                let added = merge_unique_socket_addresses(&mut candidates, &pending_candidates);
+                dispatch_snapshot =
+                    punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "deferred_candidate_target_consumed",
+                        pending_candidates.first().copied(),
+                        Some(pending_candidates.len()),
+                        Some(added as u32),
+                        format!(
+                            "session_id={} appended newest-wins candidate refresh before broad sweep; added={} total_candidates={} original_punch_at_ms={punch_at_ms:?}",
+                            session.session_id(),
+                            added,
+                            candidates.len(),
+                        ),
+                    )
+                    .await;
             }
         }
 

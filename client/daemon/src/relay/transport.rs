@@ -100,19 +100,23 @@ impl RelayTransport {
         let (client, relay_rx) =
             RelayClient::connect_with_endpoint(relay_endpoint, node_id, config).await?;
 
+        let relay_connection_id = NEXT_RELAY_CONNECTION_ID.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         info!(
-            "Connected to relay {} (region={}, {}ms)",
-            relay_endpoint,
-            relay_region,
-            duration_millis(started.elapsed())
+            event = "relay_transport_connected",
+            relay_connection_id,
+            relay_endpoint = %relay_endpoint,
+            relay_region = %relay_region,
+            connect_latency_ms = duration_millis(started.elapsed()),
+            "relay transport connected and registered locally; peer delivery still requires encrypted confirmation"
         );
 
         Ok((
             Self {
-                relay_connection_id: NEXT_RELAY_CONNECTION_ID.fetch_add(
-                    1,
-                    std::sync::atomic::Ordering::Relaxed,
-                ),
+                relay_connection_id,
                 relay_region: relay_region.to_string(),
                 relay_endpoint: relay_endpoint.to_string(),
                 connect_latency_ms: duration_millis(started.elapsed()),
@@ -209,13 +213,41 @@ impl RelayTransport {
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
-        self.client
+        debug!(
+            event = "relay_outbound_write_started",
+            peer_id = %packet.peer_id,
+            relay_connection_id = self.relay_connection_id,
+            relay_region = %self.relay_region,
+            bytes = packet.wire_bytes.len(),
+            counter = ?crate::transport::wire_counter(&packet.wire_bytes),
+            is_business = packet.is_business,
+            wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
+            relay_endpoint = %self.relay_endpoint,
+            "opaque encrypted frame entered the relay client's writer"
+        );
+        if let Err(error) = self
+            .client
             .send_data(&packet.peer_id, &packet.wire_bytes)
             .await
-            .map_err(|error| DaemonError::RelaySend {
+        {
+            warn!(
+                event = "relay_outbound_write_failed",
+                peer_id = %packet.peer_id,
+                relay_connection_id = self.relay_connection_id,
+                relay_region = %self.relay_region,
+                bytes = packet.wire_bytes.len(),
+                counter = ?crate::transport::wire_counter(&packet.wire_bytes),
+                is_business = packet.is_business,
+                wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
+                relay_endpoint = %self.relay_endpoint,
+                error = %error,
+                "relay client writer rejected or failed the encrypted frame"
+            );
+            return Err(DaemonError::RelaySend {
                 endpoint: self.relay_endpoint.clone(),
                 error,
-            })?;
+            });
+        }
 
         self.peers
             .record_relay_attempt(&packet.peer_id, &self.relay_endpoint)
@@ -223,7 +255,11 @@ impl RelayTransport {
         debug!(
             event = "relay_outbound_write_completed",
             peer_id = %packet.peer_id,
+            relay_connection_id = self.relay_connection_id,
+            relay_region = %self.relay_region,
             bytes = packet.wire_bytes.len(),
+            counter = ?crate::transport::wire_counter(&packet.wire_bytes),
+            is_business = packet.is_business,
             wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
             relay_endpoint = %self.relay_endpoint,
             "opaque encrypted frame completed the relay client write boundary"
@@ -256,6 +292,14 @@ impl RelayTransport {
             match message {
                 RelayMessage::Closed { reason } => {
                     let reason_label = relay_close_reason_label(reason);
+                    warn!(
+                        event = "relay_transport_closed",
+                        relay_connection_id = self.relay_connection_id,
+                        relay_endpoint = %self.relay_endpoint,
+                        relay_region = %self.relay_region,
+                        reason_code = %reason_label,
+                        "relay reader closed; any later reconnect has a new connection incarnation"
+                    );
                     return Err(DaemonError::Relay(format!(
                         "relay {} connection closed; reason={reason_label}",
                         self.relay_endpoint
@@ -327,6 +371,7 @@ impl RelayTransport {
                         event = "relay_inbound_frame_accepted",
                         peer_id = %from_node,
                         bytes = data.len(),
+                        counter = ?crate::transport::wire_counter(&data),
                         wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&data)),
                         relay_endpoint = %self.relay_endpoint,
                         "opaque encrypted frame accepted by the relay client reader"
@@ -339,6 +384,7 @@ impl RelayTransport {
                             relay_connection_id: Some(self.relay_connection_id),
                             relay_peer_id: Some(from_node),
                             socket_index: None,
+                            direct_socket: None,
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
                             wire_bytes: data,
@@ -351,7 +397,13 @@ impl RelayTransport {
             }
         }
 
-        warn!("Relay inbound stream from {} ended", self.relay_endpoint);
+        warn!(
+            event = "relay_transport_eof",
+            relay_connection_id = self.relay_connection_id,
+            relay_endpoint = %self.relay_endpoint,
+            relay_region = %self.relay_region,
+            "relay inbound stream ended; any later reconnect has a new connection incarnation"
+        );
         Ok(())
     }
 }

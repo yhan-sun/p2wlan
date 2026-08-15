@@ -97,6 +97,139 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
 }
 
 #[tokio::test]
+async fn relay_transport_replacement_revokes_old_confirmation_and_rejects_old_ack() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.52:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await;
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await);
+    assert!(manager
+        .is_relay_peer_confirmed_for_generation("peer1", generation)
+        .await);
+
+    // Same endpoint and generation, but a new TCP/TLS connection: the old
+    // encrypted ACK is no longer evidence for the replacement transport.
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(202),
+        )
+        .await;
+    let replaced = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(replaced.relay_ready_connection_id, Some(202));
+    assert_eq!(replaced.relay_confirmed_generation, None);
+    assert_eq!(replaced.relay_confirmed_connection_id, None);
+    assert!(!manager
+        .is_relay_peer_confirmed_for_generation("peer1", generation)
+        .await);
+
+    // A delayed ACK from the retired connection cannot re-admit the peer.
+    assert!(!manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await);
+    assert!(!manager
+        .is_relay_peer_confirmed_for_generation("peer1", generation)
+        .await);
+
+    // The replacement must earn its own encrypted ACK.
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(202),
+        )
+        .await);
+    let confirmed = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(confirmed.relay_confirmed_connection_id, Some(202));
+}
+
+#[tokio::test]
+async fn retiring_old_relay_transport_does_not_clear_replacement_confirmation() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.53:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(301),
+        )
+        .await;
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(301),
+        )
+        .await);
+
+    // Make-before-break publishes and confirms the replacement before the
+    // retired reader's cleanup callback runs.
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(302),
+        )
+        .await;
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(302),
+        )
+        .await);
+
+    manager
+        .invalidate_relay_transport_for_connection(
+            relay_endpoint,
+            Some(301),
+            "relay_transport_replaced",
+            "retired reader closed",
+        )
+        .await;
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_ready_connection_id, Some(302));
+    assert_eq!(connection.relay_confirmed_connection_id, Some(302));
+    assert!(manager
+        .is_relay_peer_confirmed_for_generation("peer1", generation)
+        .await);
+}
+
+#[tokio::test]
 async fn direct_business_cannot_be_first_usable_before_relay_receive() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.44:51831".parse().unwrap();
@@ -137,7 +270,88 @@ async fn direct_business_cannot_be_first_usable_before_relay_receive() {
 }
 
 #[tokio::test]
-async fn relay_first_receive_before_ack_survives_initial_confirmation() {
+async fn relay_receive_before_local_send_completes_after_local_send() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.47:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+    assert!(manager
+        .mark_relay_first_business_received_for_generation(
+            "peer1",
+            relay_endpoint,
+            generation,
+        )
+        .await);
+
+    // The inbound relay packet arrived before this daemon had sent its own
+    // first relay business packet. It is valid same-generation receive
+    // evidence, but Direct remains gated until this daemon also sends one.
+    assert!(!manager
+        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+        .await);
+    assert!(manager
+        .mark_relay_first_business_sent_for_generation("peer1", generation)
+        .await);
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    // Receive-before-send is not discarded: the send marker completes the
+    // two-direction gate without requiring an unrelated later TUN packet.
+    let selection = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
+    assert!(manager
+        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+        .await);
+}
+
+#[tokio::test]
+async fn confirmed_relay_without_business_receive_keeps_direct_background_only() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.46:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    {
+        let mut connections = manager.connections.write().await;
+        let connection = connections.get_mut("peer1").expect("peer exists");
+        let expired_at = Instant::now()
+            .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
+            .expect("test instant is representable");
+        connection.relay_ready_at = Some(expired_at);
+        connection.relay_confirmed_at = Some(expired_at);
+    }
+    let selection = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selection.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
+    assert_eq!(selection.path, Some(NetworkPath::Relay));
+    assert!(!manager
+        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+        .await);
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.first_usable_path, None);
+}
+
+#[tokio::test]
+async fn relay_first_receive_before_ack_is_promoted_on_confirmation() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.45:51831".parse().unwrap();
     let relay_endpoint = "tcp://relay.test:18081";
@@ -147,7 +361,7 @@ async fn relay_first_receive_before_ack_survives_initial_confirmation() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
+    assert!(!manager
         .mark_relay_first_business_received_for_generation(
             "peer1",
             relay_endpoint,
@@ -157,11 +371,142 @@ async fn relay_first_receive_before_ack_survives_initial_confirmation() {
     assert!(manager
         .confirm_relay_peer("peer1", relay_endpoint, generation)
         .await);
+    // Confirmation consumes the bounded pre-confirmation evidence.  The
+    // packet cannot be replayed through WireGuard a second time just to make
+    // this marker, so the later call is intentionally idempotent.
+    assert!(!manager
+        .mark_relay_first_business_received_for_generation(
+            "peer1",
+            relay_endpoint,
+            generation,
+        )
+        .await);
 
     let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_first_business_received_generation, Some(generation));
+    assert_eq!(connection.first_usable_generation, Some(generation));
+    assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
+}
+
+#[tokio::test]
+async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.50:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+
+    // This models the real ordering seen in dual-end logs: the peer's
+    // encrypted business packet crossed the relay before this daemon
+    // consumed its forced path-probe ACK.  Business ingress is an
+    // end-to-end proof and must close the relay confirmation race.
+    assert!(manager
+        .confirm_relay_peer_from_business_ingress(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(17),
+        )
+        .await);
+    assert!(manager
+        .mark_relay_first_business_received_for_generation_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(17),
+        )
+        .await);
+    assert!(manager
+        .record_verified_first_usable(
+            "peer1",
+            generation,
+            NetworkPath::Relay,
+            "relay:tcp://relay.test:18081",
+        )
+        .await);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_confirmed_generation, Some(generation));
+    assert_eq!(connection.relay_confirmed_connection_id, Some(17));
+    assert_eq!(connection.relay_first_business_received_generation, Some(generation));
+    assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
+}
+
+#[tokio::test]
+async fn preconfirmation_business_from_replaced_relay_transport_is_rejected() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.49:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+
+    // The business packet belonged to the old connection incarnation.  A
+    // same-endpoint replacement must not inherit that evidence.
+    assert!(!manager
+        .mark_relay_first_business_received_for_generation_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(11),
+        )
+        .await);
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(12),
+        )
+        .await);
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.relay_first_business_received_generation, None);
+    assert_eq!(connection.first_usable_generation, None);
+
+    assert!(manager
+        .mark_relay_first_business_received_for_generation_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(12),
+        )
+        .await);
+}
+
+#[tokio::test]
+async fn unconfirmed_relay_ingress_cannot_be_first_usable() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.48:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+
+    assert!(!manager
+        .record_verified_first_usable(
+            "peer1",
+            generation,
+            NetworkPath::Relay,
+            "relay:tcp://relay.test:18081",
+        )
+        .await);
     assert_eq!(
-        connection.relay_first_business_received_generation,
-        Some(generation)
+        manager
+            .get_connection("peer1")
+            .await
+            .unwrap()
+            .first_usable_path,
+        None
     );
 }
 
@@ -244,6 +589,34 @@ async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
 }
 
 #[tokio::test]
+async fn relay_catalog_gate_blocks_direct_ack_before_any_business_ingress() {
+    let manager = PeerManager::new(test_config());
+    manager.configure_relay_first(true).await;
+    let endpoint: SocketAddr = "198.51.100.64:51864".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(6)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    // The Direct ACK is real background evidence, but no outbound business
+    // packet may consume a WireGuard counter until relay confirmation and the
+    // first relay business exchange have both completed.
+    let pending = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(pending.path, None);
+    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
+    assert!(!manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.state, ConnectionState::Direct);
+    assert_eq!(connection.relay_first_gate_generation, Some(generation));
+}
+
+#[tokio::test]
 async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
     let config = test_config();
     let manager = PeerManager::new(config);
@@ -299,7 +672,7 @@ async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
 }
 
 #[tokio::test]
-async fn slow_encrypted_direct_validation_promotes_on_exact_ack() {
+async fn slow_encrypted_direct_validation_confirms_and_promotes_direct() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.61:51861".parse().unwrap();
     let relay_endpoint = "tcp://relay.test:18081";
@@ -364,13 +737,23 @@ async fn slow_encrypted_direct_validation_promotes_on_exact_ack() {
         .direct_events
         .iter()
         .any(|event| event.stage == "direct_validation_succeeded_relay_retained"));
+    // An exact encrypted Request -> ACK is the make-before-break proof.  A
+    // later probe observation must not demote that proof or put the business
+    // path back behind an arbitrary slow-relay cooldown.
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(490)),
+        )
+        .await;
+    let selection = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
     assert_eq!(
-        manager
-            .select_path_for_data("peer1", true, true)
-            .await
-            .path,
-        Some(NetworkPath::Direct)
+        selection.reason_code,
+        REASON_PATH_DIRECT_CONFIRMED
     );
+    assert!(selection.direct_confirmed);
 }
 
 #[tokio::test]
@@ -495,7 +878,6 @@ async fn slow_confirmed_direct_is_not_active_over_confirmed_relay() {
         )
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
-
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.path, Some(NetworkPath::Relay));
     assert_eq!(

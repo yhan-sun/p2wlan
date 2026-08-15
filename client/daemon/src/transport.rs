@@ -36,6 +36,20 @@ pub(crate) fn wire_fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Extract the WireGuard transport counter from an already serialized
+/// transport message for local diagnostics.  The counter is authenticated by
+/// WireGuard and is never sent as a separate diagnostic field on the network;
+/// this helper only avoids putting opaque `wire_fp` values in a trace where a
+/// replay/order incident needs to be reconstructed.
+pub(crate) fn wire_counter(bytes: &[u8]) -> Option<u64> {
+    // MessageTransport::to_bytes() starts with the little-endian type-4
+    // header, then receiver_index (4 bytes), then counter (8 bytes).
+    if bytes.len() < 16 || bytes.get(..4) != Some(&[4, 0, 0, 0]) {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?))
+}
+
 const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
 const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
 const RELAY_VALIDATION_MAX_RTT: Duration = Duration::from_secs(600);
@@ -88,6 +102,20 @@ pub struct TransportSessionStatus {
     pub expired: bool,
     pub expires_in: Option<Duration>,
     pub has_pending_responder: bool,
+    /// Process-local identity of the active receive/send session.  This is
+    /// deliberately not a WireGuard receiver index: indexes may overlap
+    /// during rekey, while this value lets diagnostics distinguish a stale
+    /// worker from the currently installed session.
+    pub active_session_instance: Option<u64>,
+    /// Process-local identity retained for the bounded previous-session
+    /// receive overlap.  A packet accepted through this slot is useful for
+    /// diagnosing rekey races, but must not be treated as current-session
+    /// relay/direct evidence.
+    pub previous_session_instance: Option<u64>,
+    /// Number of responder sessions still waiting for authenticated adoption.
+    /// A non-zero value explains why a peer can have no active session while
+    /// the handshake path is still intentionally alive.
+    pub pending_responder_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +313,12 @@ impl PeerTransportSessions {
             expired: active.is_some_and(|active| active.session.is_expired()),
             expires_in: active.map(|active| active.session.expires_in()),
             has_pending_responder: !self.pending.is_empty(),
+            active_session_instance: active.map(|active| active.session_instance),
+            previous_session_instance: self
+                .previous
+                .as_ref()
+                .map(|previous| previous.slot.session_instance),
+            pending_responder_count: self.pending.len(),
         }
     }
 
@@ -503,10 +537,16 @@ pub struct EncryptedPeerPacket {
     pub dst_ip: String,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
+    /// Whether this ciphertext came from a normal packet read from the
+    /// production TUN data plane.  Synthetic relay/direct validation and
+    /// rekey packets are deliberately false: a writer completion for one of
+    /// those packets is not a real business ingress proof and must not open
+    /// the relay-first promotion gate.
+    pub is_business: bool,
 }
 
 /// An encrypted WireGuard packet received from UDP or relay transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReceivedEncryptedPacket {
     /// Source socket address when known.
     pub source: Option<SocketAddr>,
@@ -525,6 +565,14 @@ pub struct ReceivedEncryptedPacket {
     /// decryption uses it so the decrypting peer is pinned to the socket that
     /// actually carried its traffic.
     pub socket_index: Option<usize>,
+    /// Exact socket handle that received a dynamic-socket datagram, when the
+    /// reader had one. The handle is carried with the envelope because the
+    /// dynamic entry may be removed before the WireGuard worker reaches a
+    /// direct-validation request. Keeping this Arc alive lets the responder
+    /// send the encrypted ACK on the original NAT mapping instead of trying
+    /// to resolve an index that is already detached. Pool sockets do not need
+    /// this: their fixed index remains valid for the publication.
+    pub(crate) direct_socket: Option<Arc<tokio::net::UdpSocket>>,
     /// Owner of the UDP publication that queued this envelope. Direct UDP
     /// readers always set this (zero means their transport was already
     /// unpublished); relay packets keep it `None`. Live inbound compares it
@@ -540,6 +588,26 @@ pub struct ReceivedEncryptedPacket {
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
+
+// The socket handle is an in-process lifetime guard, not packet identity.
+// Keep equality useful for transport tests without treating two envelopes
+// that carry the same wire bytes differently merely because one was queued
+// by a dynamic UDP reader.
+impl PartialEq for ReceivedEncryptedPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.local_endpoint == other.local_endpoint
+            && self.relay_endpoint == other.relay_endpoint
+            && self.relay_connection_id == other.relay_connection_id
+            && self.relay_peer_id == other.relay_peer_id
+            && self.socket_index == other.socket_index
+            && self.udp_transport_owner == other.udp_transport_owner
+            && self.network_generation == other.network_generation
+            && self.wire_bytes == other.wire_bytes
+    }
+}
+
+impl Eq for ReceivedEncryptedPacket {}
 
 /// Real ingress path of one decrypted inbound overlay payload, derived from
 /// the `ReceivedEncryptedPacket` metadata at the transport layer — never
@@ -615,7 +683,11 @@ pub(crate) fn is_overlay_payload_candidate(packet: &[u8]) -> bool {
 /// IPv4 protocols (ICMP, TCP, UDP, etc.) so it is not tied to the harness-only
 /// overlay echo format.
 pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
-    Ipv4Packet::new(packet).is_ok() && !is_relay_validation_packet(packet)
+    Ipv4Packet::new(packet).is_ok()
+        && !is_relay_validation_packet(packet)
+        && !is_rekey_confirmation_packet(packet)
+        && parse_direct_validation_token(packet).is_none()
+        && crate::relay_probe::parse_relay_probe_token(packet).is_none()
 }
 
 /// Source of the UDP transport used by WireGuard inbound after decryption.
@@ -786,6 +858,44 @@ impl WireGuardTransport {
         (retained, current)
     }
 
+    /// Re-check a decrypted packet's session immediately before it is allowed
+    /// to mutate path/evidence state.  The initial check in the inbound loop
+    /// only protects the decrypt-to-dispatch boundary; relay-slot and UDP
+    /// validation awaits can otherwise let a rekey/remove publish a new
+    /// session in between.
+    async fn session_instance_is_current(
+        &self,
+        peer_id: &str,
+        session_instance: Option<u64>,
+    ) -> bool {
+        let Some(session_instance) = session_instance else {
+            // Legacy standalone callers do not attach a process-local session
+            // instance. Preserve their historical behavior; production
+            // daemon packets always carry one.
+            return true;
+        };
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let _emit_guard = emit_lock.lock().await;
+        let (_, current) = self.session_instance_state(peer_id, session_instance).await;
+        current
+    }
+
+    /// Acquire the per-peer emit guard and verify that a decrypted packet was
+    /// authenticated by the currently published session. The guard remains
+    /// held for the caller's evidence commit, so session replacement/removal
+    /// cannot cross the check and the corresponding path-state mutation.
+    async fn acquire_current_session_evidence_guard(
+        &self,
+        peer_id: &str,
+        session_instance: Option<u64>,
+    ) -> Option<OwnedMutexGuard<()>> {
+        let session_instance = session_instance?;
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let emit_guard = emit_lock.lock_owned().await;
+        let (_, current) = self.session_instance_state(peer_id, session_instance).await;
+        current.then_some(emit_guard)
+    }
+
     /// Share the peer manager's outbound-loss counters with this transport so
     /// session-not-ready queue loss lands in `/status.stats.outbound_drops`
     /// under the same map as the worker's drops.  Installed once by the
@@ -949,11 +1059,46 @@ impl WireGuardTransport {
         session: TransportSession,
     ) -> bool {
         let peer_id = peer_id.into();
+        let token_present = token.is_some();
+        // Session replacement is a lifecycle boundary for the same counter
+        // stream.  Wait for any in-flight business/control emission before
+        // publishing the new active key; otherwise an old-key ciphertext can
+        // be handed to the network after the new key is visible and become a
+        // previous-session packet with no current-path evidence.
+        let emit_lock = self.outbound_emit_lock(&peer_id).await;
+        let emit_lock_started = Instant::now();
+        let emit_guard = emit_lock.lock_owned().await;
+        let replaced_existing = self
+            .install_active_session_locked(&peer_id, token, session)
+            .await;
+        debug!(
+            event = "wireguard_session_installed",
+            peer_id = %peer_id,
+            replaced_existing,
+            token_present,
+            emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64,
+            "active WireGuard session published after the per-peer emit lock boundary"
+        );
+        drop(emit_guard);
+        self.flush_pending_outbound_for_peer(&peer_id).await;
+        replaced_existing
+    }
+
+    /// Publish an active session while the caller already owns the peer emit
+    /// guard. Callers may compose this with the network-generation gate, but
+    /// must acquire locks in the canonical order `emit -> generation ->
+    /// sessions`.
+    pub(crate) async fn install_active_session_locked(
+        &self,
+        peer_id: &str,
+        token: Option<String>,
+        session: TransportSession,
+    ) -> bool {
         let now = Instant::now();
         let session_instance = self.allocate_session_instance();
         let replaced_existing = {
             let mut sessions = self.sessions.lock().await;
-            if let Some(existing) = sessions.get_mut(&peer_id) {
+            if let Some(existing) = sessions.get_mut(peer_id) {
                 existing.prune_expired(now);
                 existing.install_with_overlap(
                     TransportSessionSlot::new(session, token, session_instance),
@@ -961,7 +1106,7 @@ impl WireGuardTransport {
                 )
             } else {
                 sessions.insert(
-                    peer_id.clone(),
+                    peer_id.to_string(),
                     PeerTransportSessions::new(TransportSessionSlot::new(
                         session,
                         token,
@@ -971,7 +1116,13 @@ impl WireGuardTransport {
                 false
             }
         };
-        self.flush_pending_outbound_for_peer(&peer_id).await;
+        debug!(
+            event = "wireguard_session_install_locked",
+            peer_id = %peer_id,
+            session_instance,
+            replaced_existing,
+            "active WireGuard session published under the caller-owned emit boundary"
+        );
         replaced_existing
     }
 
@@ -1010,6 +1161,12 @@ impl WireGuardTransport {
         session: TransportSession,
         allow_seen_restage: bool,
     ) -> ResponderSessionStage {
+        // Staging is a session-lifecycle mutation even though it does not
+        // publish an outbound key yet. Serialize it with remove/flush/live
+        // ingress so a late responder answer cannot recreate a pending
+        // session after the peer was removed.
+        let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         let now = Instant::now();
         let session_instance = self.allocate_session_instance();
         let mut sessions = self.sessions.lock().await;
@@ -1092,6 +1249,8 @@ impl WireGuardTransport {
     /// answer delivery attempt completes. Signaling latency must not consume
     /// the authenticated adoption window.
     pub async fn refresh_responder_session_grace(&self, peer_id: &str, token: &str) -> bool {
+        let ingress_lock = self.outbound_ingress_lock(peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         let mut sessions = self.sessions.lock().await;
         let Some(existing) = sessions.get_mut(peer_id) else {
             return false;
@@ -1111,57 +1270,69 @@ impl WireGuardTransport {
         peer_id: &str,
         token: &str,
     ) -> ResponderSessionCommit {
-        let now = Instant::now();
-        let (result, flush_pending) = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(existing) = sessions.get_mut(peer_id) else {
-                return ResponderSessionCommit::Missing;
-            };
-            existing.prune_expired(now);
-            if existing
-                .active
-                .as_ref()
-                .and_then(|active| active.token.as_deref())
-                == Some(token)
-            {
-                (ResponderSessionCommit::AlreadyPromoted, false)
-            } else if existing.pending.contains_key(token) {
-                let activate_initial = existing.active.is_none();
-                {
-                    let pending = existing
-                        .pending
-                        .get_mut(token)
-                        .expect("pending responder token checked above");
-                    pending.answer_committed = true;
-                    if activate_initial {
-                        pending.slot.awaiting_confirmation = true;
-                    }
-                }
-                existing.remember_responder_token(
-                    token,
-                    ResponderTokenDisposition::Restageable,
-                    now,
-                );
-                if activate_initial {
-                    existing.promote_pending(token, now);
-                    (ResponderSessionCommit::ActivatedInitial, true)
-                } else {
-                    (ResponderSessionCommit::PendingConfirmation, false)
-                }
-            } else {
-                (ResponderSessionCommit::Missing, false)
-            }
-        };
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let emit_guard = emit_lock.lock_owned().await;
+        let result = self.commit_responder_session_locked(peer_id, token).await;
+        let flush_pending = result == ResponderSessionCommit::ActivatedInitial;
+        drop(emit_guard);
         if flush_pending {
             self.flush_pending_outbound_for_peer(peer_id).await;
         }
         result
     }
 
+    /// Commit a staged responder session while the caller already owns the
+    /// peer emit guard. This lets a handshake compose the operation with the
+    /// network-generation gate without ever waiting for emit while holding
+    /// that gate.
+    pub(crate) async fn commit_responder_session_locked(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> ResponderSessionCommit {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        let Some(existing) = sessions.get_mut(peer_id) else {
+            return ResponderSessionCommit::Missing;
+        };
+        existing.prune_expired(now);
+        if existing
+            .active
+            .as_ref()
+            .and_then(|active| active.token.as_deref())
+            == Some(token)
+        {
+            ResponderSessionCommit::AlreadyPromoted
+        } else if existing.pending.contains_key(token) {
+            let activate_initial = existing.active.is_none();
+            {
+                let pending = existing
+                    .pending
+                    .get_mut(token)
+                    .expect("pending responder token checked above");
+                pending.answer_committed = true;
+                if activate_initial {
+                    pending.slot.awaiting_confirmation = true;
+                }
+            }
+            existing.remember_responder_token(token, ResponderTokenDisposition::Restageable, now);
+            if activate_initial {
+                existing.promote_pending(token, now);
+                ResponderSessionCommit::ActivatedInitial
+            } else {
+                ResponderSessionCommit::PendingConfirmation
+            }
+        } else {
+            ResponderSessionCommit::Missing
+        }
+    }
+
     /// Discard an unpublished responder session. Returns false when the token
     /// was already promoted by authenticated traffic, which proves the answer
     /// reached the peer despite a control-plane response error.
     pub async fn discard_responder_session(&self, peer_id: &str, token: &str) -> bool {
+        let ingress_lock = self.outbound_ingress_lock(peer_id).await;
+        let _ingress_guard = ingress_lock.lock().await;
         let mut sessions = self.sessions.lock().await;
         let Some(existing) = sessions.get_mut(peer_id) else {
             return true;
@@ -1192,6 +1363,8 @@ impl WireGuardTransport {
         peer_id: &str,
         token: &str,
     ) -> ResponderSessionConfirmation {
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let _emit_guard = emit_lock.lock().await;
         let now = Instant::now();
         let (result, flush_pending) = {
             let mut sessions = self.sessions.lock().await;
@@ -1239,6 +1412,7 @@ impl WireGuardTransport {
                 (ResponderSessionConfirmation::Missing, false)
             }
         };
+        drop(_emit_guard);
         if flush_pending {
             // Probe-v2 still has to commit the matching key before the caller
             // can ACK or learn Direct. Do not make that cross-layer commit
@@ -1346,21 +1520,53 @@ impl WireGuardTransport {
     {
         let peer_id = packet.peer_id.clone();
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
+        let lock_wait_started = Instant::now();
         let _emit_guard = match tokio::time::timeout(lock_timeout, emit_lock.lock()).await {
             Ok(guard) => guard,
             Err(_) => {
                 debug!(
+                    event = "control_emit_lock_timeout",
                     peer_id = %peer_id,
                     lock_timeout_ms = lock_timeout.as_millis() as u64,
-                    "control/probe packet for {peer_id} skipped: the outbound emit lock is held by busy user traffic; retrying on the next bounded tick"
+                    lock_wait_ms = lock_wait_started.elapsed().as_millis() as u64,
+                    bytes = packet.packet.len(),
+                    "control/probe packet skipped: the outbound emit lock is held by busy user traffic; retrying on the next bounded tick"
                 );
                 return Ok(BoundedEmitOutcome::LockTimeout);
             }
         };
-        let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
+        debug!(
+            event = "control_emit_lock_acquired",
+            peer_id = %peer_id,
+            lock_wait_ms = lock_wait_started.elapsed().as_millis() as u64,
+            bytes = packet.packet.len(),
+            "control/probe packet acquired the same per-peer counter-ordering lock as business traffic"
+        );
+        let packet_bytes = packet.packet.len();
+        let Some(encrypted) = self.encrypt_outbound_inner(packet, false, false).await? else {
             return Ok(BoundedEmitOutcome::SessionUnavailable);
         };
+        let counter = wire_counter(&encrypted.wire_bytes);
+        let wire_fp = wire_fingerprint(&encrypted.wire_bytes);
+        let encrypted_bytes = encrypted.wire_bytes.len();
+        debug!(
+            event = "control_transport_handoff_started",
+            peer_id = %peer_id,
+            counter = ?counter,
+            bytes = encrypted_bytes,
+            plaintext_bytes = packet_bytes,
+            wire_fp = format_args!("{wire_fp:016x}"),
+            "encrypted control packet entered its caller-provided transport handoff"
+        );
         emit(encrypted).await?;
+        debug!(
+            event = "control_transport_handoff_completed",
+            peer_id = %peer_id,
+            counter = ?counter,
+            bytes = encrypted_bytes,
+            wire_fp = format_args!("{wire_fp:016x}"),
+            "control packet handoff completed locally; peer delivery still requires its matching ACK"
+        );
         Ok(BoundedEmitOutcome::Sent)
     }
 
@@ -1371,6 +1577,8 @@ impl WireGuardTransport {
         session: TransportSession,
     ) -> Option<TransportSession> {
         let peer_id = peer_id.into();
+        let emit_lock = self.outbound_emit_lock(&peer_id).await;
+        let _emit_guard = emit_lock.lock().await;
         let now = Instant::now();
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get_mut(&peer_id) {
@@ -1400,6 +1608,8 @@ impl WireGuardTransport {
 
     /// Restore the session state captured before a transactional replacement.
     pub async fn restore_session(&self, peer_id: &str, previous: Option<TransportSession>) {
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let _emit_guard = emit_lock.lock().await;
         let restored_previous = previous.is_some();
         let mut sessions = self.sessions.lock().await;
         if let Some(previous) = previous {
@@ -1415,6 +1625,8 @@ impl WireGuardTransport {
             sessions.remove(peer_id);
         }
         drop(sessions);
+        drop(_emit_guard);
+        drop(emit_lock);
         if restored_previous {
             self.flush_pending_outbound_for_peer(peer_id).await;
         } else {
@@ -1430,8 +1642,33 @@ impl WireGuardTransport {
         // removal and later resurrect an obsolete session queue.
         let ingress_lock = self.outbound_ingress_lock(peer_id).await;
         let _ingress_guard = ingress_lock.lock().await;
-        self.sessions.lock().await.remove(peer_id);
+        // Keep active-session removal and the legacy pending queue removal
+        // behind the same per-peer emit lock used by encryption.  A packet
+        // that already owns the lock is allowed to finish; after this point
+        // no old-key packet can be created or handed to a transport.
+        let emit_lock = self.outbound_emit_lock(peer_id).await;
+        let emit_lock_started = Instant::now();
+        let _emit_guard = emit_lock.lock().await;
+        let removed_session = self.sessions.lock().await.remove(peer_id).is_some();
         let removed = self.pending_outbound.lock().await.remove(peer_id);
+        let removed_queue_packets = removed.as_ref().map_or(0, |queue| queue.len());
+        let removed_queue_bytes = removed.as_ref().map_or(0, |queue| {
+            queue
+                .iter()
+                .map(|item| item.packet.packet.len())
+                .sum::<usize>()
+        });
+        debug!(
+            event = "wireguard_session_removed",
+            peer_id = %peer_id,
+            removed_session,
+            removed_queue_packets,
+            removed_queue_bytes,
+            emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64,
+            "WireGuard session and legacy session backlog were removed at one per-peer lifecycle boundary"
+        );
+        drop(_emit_guard);
+        drop(emit_lock);
         if let Some(queue) = removed {
             let bytes = queue
                 .iter()
@@ -1501,7 +1738,7 @@ impl WireGuardTransport {
     ) -> Result<Option<EncryptedPeerPacket>> {
         let emit_lock = self.outbound_emit_lock(&packet.peer_id).await;
         let _emit_guard = emit_lock.lock().await;
-        self.encrypt_outbound_inner(packet, false).await
+        self.encrypt_outbound_inner(packet, false, false).await
     }
 
     /// Encrypt one outbound user packet, or queue it briefly if the session is
@@ -1525,7 +1762,7 @@ impl WireGuardTransport {
         // ordering domain while the production network-outbound worker owns
         // plaintext parking. If the session is absent, park the raw packet in
         // the same transport backlog under the ingress guard below.
-        let encrypted = self.encrypt_outbound_inner(packet, false).await?;
+        let encrypted = self.encrypt_outbound_inner(packet, false, true).await?;
         drop(emit_guard);
         if encrypted.is_none() {
             self.queue_pending_outbound_locked(queued_packet, "session not ready")
@@ -1534,33 +1771,46 @@ impl WireGuardTransport {
         Ok(encrypted)
     }
 
-    /// Encrypt one business packet for the network outbound worker, holding
-    /// the per-peer emit lock through the actual send.
-    ///
-    /// The returned guard MUST be kept alive until the packet has been handed
-    /// to the selected transport (UDP datagram sent or relay frame written):
-    /// WireGuard counters are allocated under this lock, so holding it through
-    /// the send guarantees wire order == counter order per peer.  A control
-    /// packet (relay probe / direct-validation) can only be encrypted after a
-    /// lower-counter business packet has completed its send, so a queued
-    /// business packet can never be overtaken by a higher-counter control
-    /// packet into the receiver's 64-packet replay window.
-    ///
-    /// When the peer's WireGuard session is not ready, `None` is returned and
-    /// the network outbound actor retains the plaintext in its single
-    /// per-peer FIFO. There is deliberately no second production queue here:
-    /// session-ready flush, live TUN traffic and retry all share that actor.
+    #[cfg(test)]
+    /// Test-only compatibility wrapper that returns the guard with the
+    /// encrypted packet for counter-ordering unit tests.
     pub(crate) async fn encrypt_outbound_with_guard(
         &self,
         packet: OutboundPacket,
     ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedMutexGuard<()>>)>> {
         let peer_id = packet.peer_id.clone();
-        let emit_lock = self.outbound_emit_lock(&peer_id).await;
-        let emit_guard = Arc::new(emit_lock.lock_owned().await);
-        let Some(encrypted) = self.encrypt_outbound_inner(packet, false).await? else {
+        let emit_guard = Arc::new(self.acquire_outbound_emit_guard(&peer_id).await);
+        let Some(encrypted) = self.encrypt_outbound_with_emit_guard(packet).await? else {
             return Ok(None);
         };
         Ok(Some((encrypted, emit_guard)))
+    }
+
+    /// Acquire the per-peer counter-ordering guard without doing any session
+    /// work.  Callers that must compose this guard with another lifecycle
+    /// transaction (for example the network-generation gate) acquire it
+    /// first, so every production path uses the lock order
+    /// `emit -> epoch -> sessions`.
+    pub(crate) async fn acquire_outbound_emit_guard(&self, peer_id: &str) -> OwnedMutexGuard<()> {
+        self.outbound_emit_lock(peer_id).await.lock_owned().await
+    }
+
+    /// Encrypt while the caller already owns the peer's emit guard.  Keeping
+    /// this separate prevents a caller from taking the global epoch gate and
+    /// then waiting for emit: inbound relay ACK/business evidence takes emit
+    /// first and then commits generation-bound state, so the opposite order
+    /// would create an ABBA deadlock.
+    pub(crate) async fn encrypt_outbound_with_emit_guard(
+        &self,
+        packet: OutboundPacket,
+    ) -> Result<Option<EncryptedPeerPacket>> {
+        // The network-outbound actor owns the sole production plaintext FIFO.
+        // Do not enter the legacy session backlog while holding emit_lock:
+        // remove_session takes ingress_lock before emit_lock, so queueing
+        // here would create an emit -> ingress wait against its ingress ->
+        // emit teardown order.  Returning None lets the actor re-park the
+        // plaintext without allocating a WireGuard counter.
+        self.encrypt_outbound_inner(packet, false, true).await
     }
 
     async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
@@ -1605,6 +1855,7 @@ impl WireGuardTransport {
         &self,
         packet: OutboundPacket,
         queue_if_unavailable: bool,
+        is_business: bool,
     ) -> Result<Option<EncryptedPeerPacket>> {
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
@@ -1652,16 +1903,28 @@ impl WireGuardTransport {
             return Ok(None);
         }
 
+        let session_instance = active.session_instance;
         let wire_bytes = active
             .session
             .encrypt_to_bytes(&packet.packet)
             .map_err(|e| DaemonError::Peer(format!("WireGuard encrypt failed: {e}")))?;
+        debug!(
+            event = "wireguard_outbound_counter_allocated",
+            peer_id = %packet.peer_id,
+            session_instance,
+            counter = ?wire_counter(&wire_bytes),
+            bytes = wire_bytes.len(),
+            is_business,
+            wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
+            "WireGuard counter allocated under the per-peer emit ordering lock"
+        );
         drop(sessions);
 
         Ok(Some(EncryptedPeerPacket {
             peer_id: packet.peer_id,
             dst_ip: packet.dst_ip,
             wire_bytes,
+            is_business,
         }))
     }
 
@@ -1948,7 +2211,6 @@ impl WireGuardTransport {
                 Ok(packet) => {
                     let session_instance = pending.slot.session_instance;
                     peer_sessions.pending.insert(pending_token.clone(), pending);
-                    peer_sessions.promote_pending(&pending_token, now);
                     promoted = Some((
                         peer_id.clone(),
                         packet,
@@ -1970,11 +2232,50 @@ impl WireGuardTransport {
         }
         if let Some((peer_id, packet, token, session_instance)) = promoted {
             drop(sessions);
-            if let Some(token) = token {
-                self.remember_promoted_responder_token(&peer_id, token)
-                    .await;
+            let Some(token) = token else {
+                return Ok(None);
+            };
+
+            // The first packet under a staged responder key promotes that key
+            // to active.  Do not perform that replacement while only the
+            // sessions mutex is held: an outbound packet for the old active
+            // key may already own the per-peer emit lock.  Recheck the exact
+            // session instance after acquiring the lock; a concurrent
+            // remove/replace is then a terminal stale packet rather than an
+            // old-key packet published after the new key.
+            let emit_lock = self.outbound_emit_lock(&peer_id).await;
+            let _emit_guard = emit_lock.lock().await;
+            let (promoted_now, still_retained) = {
+                let mut sessions = self.sessions.lock().await;
+                match sessions.get_mut(&peer_id) {
+                    None => (false, false),
+                    Some(existing) => {
+                        if existing.pending.get(&token).is_some_and(|pending| {
+                            pending.slot.session_instance == session_instance
+                        }) {
+                            existing.promote_pending(&token, now);
+                            (true, true)
+                        } else {
+                            (false, existing.has_session_instance(session_instance))
+                        }
+                    }
+                }
+            };
+            drop(_emit_guard);
+            drop(emit_lock);
+            if !still_retained {
+                debug!(
+                    peer_id = %peer_id,
+                    session_instance,
+                    "dropping responder packet whose staged session was replaced before promotion"
+                );
+                return Ok(None);
             }
-            self.flush_pending_outbound_for_peer(&peer_id).await;
+            self.remember_promoted_responder_token(&peer_id, token)
+                .await;
+            if promoted_now {
+                self.flush_pending_outbound_for_peer(&peer_id).await;
+            }
             return Ok(Some(InboundPacket {
                 peer_id,
                 packet,
@@ -2013,7 +2314,7 @@ impl WireGuardTransport {
         if let Some(error) = first_decrypt_error {
             let replay_peers = std::mem::take(&mut replay_attributed_peers);
             if !replay_peers.is_empty() {
-                self.note_hedge_duplicate_replay(&replay_peers);
+                self.note_hedge_duplicate_replay(&replay_peers, msg.counter);
             }
             return Err(DaemonError::Peer(format!(
                 "WireGuard decrypt failed: {error}"
@@ -2049,27 +2350,33 @@ impl WireGuardTransport {
     /// of the WARN log while security-class errors (parse failures, unknown
     /// receiver index, wrong key) still log at WARN through the ordinary
     /// error path.
-    fn note_hedge_duplicate_replay(&self, peers: &[String]) {
+    fn note_hedge_duplicate_replay(&self, peers: &[String], counter: u64) {
         let mut counters = self
             .hedge_replay_counters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for peer_id in peers {
-            let counter = counters.entry(peer_id.clone()).or_default();
-            counter.count = counter.count.saturating_add(1);
-            let loud = counter
+            let replay_counter = counters.entry(peer_id.clone()).or_default();
+            replay_counter.count = replay_counter.count.saturating_add(1);
+            let loud = replay_counter
                 .last_loud_at
                 .is_none_or(|at| at.elapsed() >= HEDGE_REPLAY_WARN_INTERVAL);
             if loud {
-                counter.last_loud_at = Some(Instant::now());
+                replay_counter.last_loud_at = Some(Instant::now());
                 warn!(
-                    "hedge_duplicate_replay peer={peer_id} total={} WireGuard replay protection dropped a duplicate copy of an already-decrypted ciphertext (relay-hedge duplicate); no path state changes",
-                    counter.count
+                    event = "hedge_duplicate_replay",
+                    peer_id = %peer_id,
+                    wireguard_counter = counter,
+                    total = replay_counter.count,
+                    "WireGuard replay protection dropped a duplicate copy of an already-decrypted ciphertext; no path state changes"
                 );
             } else {
                 debug!(
-                    "hedge_duplicate_replay peer={peer_id} total={} duplicate copy dropped; no path state changes",
-                    counter.count
+                    event = "hedge_duplicate_replay",
+                    peer_id = %peer_id,
+                    wireguard_counter = counter,
+                    total = replay_counter.count,
+                    "duplicate ciphertext copy dropped; no path state changes"
                 );
             }
         }
@@ -2191,18 +2498,38 @@ impl WireGuardTransport {
             let relay_connection_id = packet.relay_connection_id;
             let relay_peer_id = packet.relay_peer_id;
             let socket_index = packet.socket_index;
+            let direct_socket = packet.direct_socket;
             let udp_transport_owner = packet.udp_transport_owner;
             let packet_network_generation = packet.network_generation;
             debug!(
                 event = "wireguard_inbound_envelope_received",
                 bytes = packet.wire_bytes.len(),
+                counter = ?wire_counter(&packet.wire_bytes),
                 wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
+                source = ?source,
+                local_endpoint = ?local_endpoint,
+                socket_index = ?socket_index,
                 relay_endpoint = ?relay_endpoint,
+                relay_connection_id = ?relay_connection_id,
                 relay_peer_id = ?relay_peer_id,
+                network_generation = ?packet_network_generation,
                 "encrypted datagram reached the daemon transport decrypt boundary"
             );
             match self.decrypt_inbound(&packet.wire_bytes).await {
                 Ok(Some(inbound)) => {
+                    debug!(
+                        event = "wireguard_inbound_decrypt_succeeded",
+                        peer_id = %inbound.peer_id,
+                        counter = ?wire_counter(&packet.wire_bytes),
+                        wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
+                        session_instance = ?inbound.session_instance,
+                        from_previous_session = inbound.from_previous_session,
+                        source = ?source,
+                        relay_endpoint = ?relay_endpoint,
+                        relay_connection_id = ?relay_connection_id,
+                        network_generation = ?packet_network_generation,
+                        "WireGuard authenticated and decrypted the envelope before lifecycle/path evidence gates"
+                    );
                     if let (Some(packet_generation), Some(peer_manager)) =
                         (packet_network_generation, peers.as_ref())
                     {
@@ -2284,26 +2611,109 @@ impl WireGuardTransport {
                     // arriving from a newly published relay reader.  Publish
                     // the per-peer transport-ready milestone at the decrypt
                     // boundary as well, before any probe/business evidence is
-                    // processed.  Bind it to the current transport
-                    // incarnation so a draining replacement reader cannot
-                    // make a stale generation look ready.
-                    if let (Some(relay_endpoint), Some(peer_manager), Some(feed)) =
-                        (relay_endpoint.as_deref(), peers.as_ref(), evidence.as_ref())
+                    // processed.  Bind every relay envelope—not only probe
+                    // ACKs—to the current transport incarnation: a draining
+                    // old reader with the same endpoint must not deliver a
+                    // user packet or create first-usable evidence for the new
+                    // relay session.
+                    let relay_ingress_is_current = if relay_endpoint.is_some() {
+                        match evidence.as_ref() {
+                            Some(feed) => {
+                                let current_connection_id = feed
+                                    .relay_transport
+                                    .read()
+                                    .await
+                                    .as_ref()
+                                    .map(RelayTransport::connection_id);
+                                match (relay_connection_id, current_connection_id) {
+                                    (Some(packet_id), Some(current_id)) => packet_id == current_id,
+                                    (None, None) => true,
+                                    _ => false,
+                                }
+                            }
+                            // Standalone transport tests may not install a
+                            // shared relay slot; without that owner there is
+                            // no incarnation claim to compare.
+                            None => true,
+                        }
+                    } else {
+                        true
+                    };
+                    if !relay_ingress_is_current {
+                        if let Some(feed) = evidence.as_ref() {
+                            if let Some(timeline) = feed.timeline.as_ref() {
+                                timeline.emit(
+                                    "stale_relay_transport_packet",
+                                    Some("relay"),
+                                    Some("relay_transport_replaced"),
+                                    Some(format!(
+                                        "peer={} packet_connection_id={relay_connection_id:?}",
+                                        inbound.peer_id
+                                    )),
+                                );
+                            }
+                        }
+                        debug!(
+                            peer_id = %inbound.peer_id,
+                            relay_endpoint = ?relay_endpoint,
+                            relay_connection_id = ?relay_connection_id,
+                            "dropping encrypted relay packet from a superseded transport incarnation"
+                        );
+                        continue;
+                    }
+                    if let (Some(relay_endpoint), Some(peer_manager)) =
+                        (relay_endpoint.as_deref(), peers.as_ref())
                     {
-                        let current_connection_id = feed
-                            .relay_transport
-                            .read()
-                            .await
-                            .as_ref()
-                            .map(RelayTransport::connection_id);
-                        if relay_connection_id == current_connection_id {
-                            let generation = packet_network_generation
-                                .unwrap_or_else(|| peer_manager.current_network_generation_sync());
+                        let generation = packet_network_generation
+                            .unwrap_or_else(|| peer_manager.current_network_generation_sync());
+                        // A relay frame can decrypt successfully just before
+                        // a rekey publishes a replacement session.  Keep the
+                        // old packet deliverable during receive overlap, but
+                        // do not let it recreate the new generation's
+                        // relay-ready milestone.
+                        let session_guard = self
+                            .acquire_current_session_evidence_guard(
+                                &inbound.peer_id,
+                                inbound.session_instance,
+                            )
+                            .await;
+                        let session_current =
+                            inbound.session_instance.is_none() || session_guard.is_some();
+                        if session_current {
                             peer_manager
-                                .mark_relay_transport_ready(
+                                .mark_relay_transport_ready_with_transport(
                                     &inbound.peer_id,
                                     relay_endpoint,
                                     generation,
+                                    relay_connection_id,
+                                )
+                                .await;
+                        }
+                        let business_ingress_session_current = session_current;
+                        drop(session_guard);
+                        // A real encrypted overlay packet arriving through
+                        // the current relay is itself an end-to-end relay
+                        // proof.  It is legal for it to win the race against
+                        // the forced path-probe ACK; waiting for the ACK in
+                        // that case used to reject the packet as
+                        // `first_relay_before_peer_confirmation`, lose the
+                        // only WireGuard delivery evidence to replay
+                        // protection, and leave the generation without a
+                        // first-usable path.  Promote the relay confirmation
+                        // from this business ingress before the evidence
+                        // markers below are committed.  Direct remains
+                        // independently gated by encrypted Direct validation
+                        // and the bidirectional relay-business exchange.
+                        if business_ingress_session_current
+                            && session_evidence_eligible
+                            && is_real_overlay_business_packet(&inbound.packet)
+                        {
+                            peer_manager
+                                .confirm_relay_peer_from_business_ingress(
+                                    &inbound.peer_id,
+                                    relay_endpoint,
+                                    generation,
+                                    relay_connection_id,
                                 )
                                 .await;
                         }
@@ -2327,20 +2737,65 @@ impl WireGuardTransport {
                             // on a non-relay ingress is ignored.
                             if let Some(token) = relay_probe {
                                 if relay_endpoint.is_some() {
-                                    self.handle_relay_probe_packet(
-                                        peers,
-                                        evidence.as_ref().map(|feed| &feed.relay_transport),
-                                        RelayProbeIngress {
-                                            peer_id: &inbound.peer_id,
-                                            packet: &inbound.packet,
-                                            relay_endpoint: relay_endpoint
-                                                .as_deref()
-                                                .unwrap_or("unknown"),
-                                            relay_connection_id,
-                                            token,
-                                        },
-                                    )
-                                    .await;
+                                    let token_kind = token.kind;
+                                    // ACK consumption changes relay path state,
+                                    // so keep the emit guard through the
+                                    // manager commit. A request only sends an
+                                    // idempotent response; its handler must
+                                    // acquire the emit lock itself, therefore
+                                    // it uses a final check without retaining
+                                    // the guard here.
+                                    let session_guard =
+                                        if token_kind == crate::relay_probe::RelayProbeKind::Ack {
+                                            self.acquire_current_session_evidence_guard(
+                                                &inbound.peer_id,
+                                                inbound.session_instance,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                    let session_current = if inbound.session_instance.is_none() {
+                                        true
+                                    } else if token_kind == crate::relay_probe::RelayProbeKind::Ack
+                                    {
+                                        session_guard.is_some()
+                                    } else {
+                                        self.session_instance_is_current(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await
+                                    };
+                                    if session_current {
+                                        self.handle_relay_probe_packet(
+                                            peers,
+                                            evidence.as_ref().map(|feed| &feed.relay_transport),
+                                            RelayProbeIngress {
+                                                peer_id: &inbound.peer_id,
+                                                packet: &inbound.packet,
+                                                relay_endpoint: relay_endpoint
+                                                    .as_deref()
+                                                    .unwrap_or("unknown"),
+                                                relay_connection_id,
+                                                token,
+                                            },
+                                        )
+                                        .await;
+                                    } else {
+                                        peers.emit_timeline(
+                                            "stale_session_evidence",
+                                            Some("relay"),
+                                            Some("session_replaced_or_removed"),
+                                            Some(format!(
+                                                "peer={} session_instance={:?} relay_probe={:?}",
+                                                inbound.peer_id,
+                                                inbound.session_instance,
+                                                token_kind,
+                                            )),
+                                        );
+                                    }
+                                    drop(session_guard);
                                 } else {
                                     debug!(
                                         peer_id = %inbound.peer_id,
@@ -2353,25 +2808,49 @@ impl WireGuardTransport {
                                     );
                                 }
                             }
-                            let promoted_tokens = self
-                                .pending_promoted_responder_tokens(&inbound.peer_id)
+                            let binding_guard = self
+                                .acquire_current_session_evidence_guard(
+                                    &inbound.peer_id,
+                                    inbound.session_instance,
+                                )
                                 .await;
-                            for token in promoted_tokens {
-                                if peers
-                                    .confirm_pending_probe_session_binding(&inbound.peer_id, &token)
-                                    .await
-                                {
-                                    self.acknowledge_promoted_responder_token(
-                                        &inbound.peer_id,
-                                        &token,
-                                    )
+                            let binding_session_current =
+                                inbound.session_instance.is_none() || binding_guard.is_some();
+                            if binding_session_current {
+                                let promoted_tokens = self
+                                    .pending_promoted_responder_tokens(&inbound.peer_id)
                                     .await;
-                                    debug!(
-                                    "Promoted Probe v2 binding for peer {} after WireGuard rekey confirmation",
-                                    inbound.peer_id
-                                );
+                                for token in promoted_tokens {
+                                    if peers
+                                        .confirm_pending_probe_session_binding(
+                                            &inbound.peer_id,
+                                            &token,
+                                        )
+                                        .await
+                                    {
+                                        self.acknowledge_promoted_responder_token(
+                                            &inbound.peer_id,
+                                            &token,
+                                        )
+                                        .await;
+                                        debug!(
+                                        "Promoted Probe v2 binding for peer {} after WireGuard rekey confirmation",
+                                        inbound.peer_id
+                                    );
+                                    }
                                 }
+                            } else {
+                                peers.emit_timeline(
+                                    "stale_session_evidence",
+                                    Some("relay"),
+                                    Some("session_replaced_or_removed"),
+                                    Some(format!(
+                                        "peer={} session_instance={:?} responder_binding=stale",
+                                        inbound.peer_id, inbound.session_instance,
+                                    )),
+                                );
                             }
+                            drop(binding_guard);
                             if let Some(token) = direct_validation {
                                 // Daemon-internal direct-validation packets are
                                 // consumed here and never forwarded to TUN: the
@@ -2379,17 +2858,54 @@ impl WireGuardTransport {
                                 // with the WireGuard session alone, without an OS
                                 // ICMP echo reply or user traffic.
                                 if owns_direct_packet {
-                                    self.handle_direct_validation_packet(
-                                        peers,
-                                        udp.as_ref(),
-                                        &inbound.peer_id,
-                                        &inbound.packet,
-                                        source,
-                                        local_endpoint,
-                                        socket_index,
-                                        token,
-                                    )
-                                    .await;
+                                    let token_kind = token.kind;
+                                    let session_guard = if token_kind == DirectValidationKind::Ack {
+                                        self.acquire_current_session_evidence_guard(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    };
+                                    let session_current = if inbound.session_instance.is_none() {
+                                        true
+                                    } else if token_kind == DirectValidationKind::Ack {
+                                        session_guard.is_some()
+                                    } else {
+                                        self.session_instance_is_current(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await
+                                    };
+                                    if session_current {
+                                        self.handle_direct_validation_packet(
+                                            peers,
+                                            udp.as_ref(),
+                                            &inbound.peer_id,
+                                            &inbound.packet,
+                                            source,
+                                            local_endpoint,
+                                            socket_index,
+                                            direct_socket,
+                                            token,
+                                        )
+                                        .await;
+                                    } else {
+                                        peers.emit_timeline(
+                                            "stale_session_evidence",
+                                            Some("direct"),
+                                            Some("session_replaced_or_removed"),
+                                            Some(format!(
+                                                "peer={} session_instance={:?} direct_validation={:?}",
+                                                inbound.peer_id,
+                                                inbound.session_instance,
+                                                token_kind,
+                                            )),
+                                        );
+                                    }
+                                    drop(session_guard);
                                 } else {
                                     debug!(
                                         peer_id = %inbound.peer_id,
@@ -2403,7 +2919,25 @@ impl WireGuardTransport {
                                 inbound.peer_id
                             );
                             } else if let Some(source) = source {
-                                if !owns_direct_packet {
+                                let session_guard = self
+                                    .acquire_current_session_evidence_guard(
+                                        &inbound.peer_id,
+                                        inbound.session_instance,
+                                    )
+                                    .await;
+                                let session_current =
+                                    inbound.session_instance.is_none() || session_guard.is_some();
+                                if !session_current {
+                                    peers.emit_timeline(
+                                        "stale_session_evidence",
+                                        Some("direct"),
+                                        Some("session_replaced_or_removed"),
+                                        Some(format!(
+                                            "peer={} session_instance={:?} direct_ingress=stale",
+                                            inbound.peer_id, inbound.session_instance,
+                                        )),
+                                    );
+                                } else if !owns_direct_packet {
                                     debug!(
                                         peer_id = %inbound.peer_id,
                                         packet_owner = ?udp_transport_owner,
@@ -2459,28 +2993,50 @@ impl WireGuardTransport {
                                         inbound.peer_id
                                     );
                                 }
+                                drop(session_guard);
                             } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
-                                if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
-                                    peers
-                                        .record_relay_observation(
-                                            &inbound.peer_id,
-                                            relay_endpoint,
-                                            Some(rtt),
-                                        )
-                                        .await;
+                                let session_guard = self
+                                    .acquire_current_session_evidence_guard(
+                                        &inbound.peer_id,
+                                        inbound.session_instance,
+                                    )
+                                    .await;
+                                let session_current =
+                                    inbound.session_instance.is_none() || session_guard.is_some();
+                                if session_current {
+                                    if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
+                                        peers
+                                            .record_relay_observation(
+                                                &inbound.peer_id,
+                                                relay_endpoint,
+                                                Some(rtt),
+                                            )
+                                            .await;
+                                    } else {
+                                        peers
+                                            .record_relay_observation(
+                                                &inbound.peer_id,
+                                                relay_endpoint,
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                    debug!(
+                                    "Observed decrypted relay ingress through {relay_endpoint} for peer {}; relay confirmation still requires a matching encrypted ACK",
+                                    inbound.peer_id
+                                );
                                 } else {
-                                    peers
-                                        .record_relay_observation(
-                                            &inbound.peer_id,
-                                            relay_endpoint,
-                                            None,
-                                        )
-                                        .await;
+                                    peers.emit_timeline(
+                                        "stale_session_evidence",
+                                        Some("relay"),
+                                        Some("session_replaced_or_removed"),
+                                        Some(format!(
+                                            "peer={} session_instance={:?} relay_observation=stale",
+                                            inbound.peer_id, inbound.session_instance,
+                                        )),
+                                    );
                                 }
-                                debug!(
-                                "Observed decrypted relay ingress through {relay_endpoint} for peer {}; relay confirmation still requires a matching encrypted ACK",
-                                inbound.peer_id
-                            );
+                                drop(session_guard);
                             }
                         }
                     }
@@ -2513,47 +3069,132 @@ impl WireGuardTransport {
                             if let (Some(peer_manager), Some((path, ingress_label, relay_id))) =
                                 (peers.as_ref(), ingress)
                             {
-                                let generation = packet_network_generation.unwrap_or_else(|| {
-                                    peer_manager.current_network_generation_sync()
-                                });
-                                if path == crate::peer::NetworkPath::Relay {
-                                    peer_manager
-                                        .mark_relay_first_business_received_for_generation(
+                                // The packet was decrypted before this point,
+                                // but path evidence is a separate commit. Hold
+                                // the same per-peer lifecycle fence through
+                                // both relay-business and first-usable writes
+                                // so a rekey cannot turn an old-session packet
+                                // into evidence for the new session.
+                                let session_guard = self
+                                    .acquire_current_session_evidence_guard(
+                                        &inbound.peer_id,
+                                        inbound.session_instance,
+                                    )
+                                    .await;
+                                let session_current =
+                                    inbound.session_instance.is_none() || session_guard.is_some();
+                                if session_current {
+                                    let generation =
+                                        packet_network_generation.unwrap_or_else(|| {
+                                            peer_manager.current_network_generation_sync()
+                                        });
+                                    if path == crate::peer::NetworkPath::Relay {
+                                        peer_manager
+                                            .mark_relay_first_business_received_for_generation_with_transport(
+                                                &inbound.peer_id,
+                                                relay_id.unwrap_or("unknown"),
+                                                generation,
+                                                relay_connection_id,
+                                            )
+                                            .await;
+                                    }
+                                    let first_usable_recorded = peer_manager
+                                        .record_verified_first_usable(
                                             &inbound.peer_id,
-                                            relay_id.unwrap_or("unknown"),
                                             generation,
+                                            path,
+                                            &ingress_label,
                                         )
                                         .await;
-                                }
-                                if peer_manager
-                                    .record_verified_first_usable(
-                                        &inbound.peer_id,
-                                        generation,
-                                        path,
-                                        &ingress_label,
-                                    )
-                                    .await
-                                {
+                                    // This is an ingress observation, not the
+                                    // same milestone as first_usable_path.
+                                    // Keep the first ingress event for backwards
+                                    // compatibility, and also retain one event
+                                    // for each meaningful path/transport/result
+                                    // identity.  If a too-early Direct packet
+                                    // is rejected and a later Relay packet is
+                                    // accepted, the second event must remain
+                                    // visible; a single first-event key would
+                                    // otherwise hide the actual relay proof.
                                     if let Some(timeline) = feed.timeline.as_ref() {
                                         let scope =
                                             format!("peer:{}:{generation}", inbound.peer_id);
-                                        timeline.emit_first_scoped(
-                                        &scope,
-                                        "first_real_business_ingress",
-                                        Some(match path {
+                                        let path_label = match path {
                                             crate::peer::NetworkPath::Relay => "relay",
                                             crate::peer::NetworkPath::Direct => "direct",
-                                        }),
-                                        None,
-                                        Some(format!(
-                                            "peer={} generation={generation} path_id={} relay_id={}",
+                                        };
+                                        let first_usable_result = if first_usable_recorded {
+                                            "first_usable_recorded"
+                                        } else {
+                                            "first_usable_not_recorded"
+                                        };
+                                        let relay_transport_key = relay_connection_id.map_or_else(
+                                            || "none".to_string(),
+                                            |id| id.to_string(),
+                                        );
+                                        let packet_identity = Ipv4Packet::new(&inbound.packet)
+                                            .map(|packet| {
+                                                format!(
+                                                    "protocol={} src={} dst={}",
+                                                    packet.protocol(),
+                                                    packet.src_addr(),
+                                                    packet.dst_addr(),
+                                                )
+                                            })
+                                            .unwrap_or_else(|_| {
+                                                "protocol=unknown src=unknown dst=unknown"
+                                                    .to_string()
+                                            });
+                                        let detail = format!(
+                                            "peer={} generation={generation} path_id={} relay_id={} relay_connection_id={} counter={} bytes={} {} overlay_fp={:016x} usable_recorded={first_usable_recorded}",
                                             inbound.peer_id,
                                             ingress_label,
                                             relay_id.unwrap_or("none"),
-                                        )),
-                                    );
+                                            relay_transport_key,
+                                            wire_counter(&packet.wire_bytes).map_or_else(
+                                                || "none".to_string(),
+                                                |counter| counter.to_string(),
+                                            ),
+                                            inbound.packet.len(),
+                                            packet_identity,
+                                            wire_fingerprint(&inbound.packet),
+                                        );
+                                        timeline.emit_first_scoped_with_key(
+                                            &scope,
+                                            &format!(
+                                                "path={path_label} relay_connection_id={relay_transport_key} usable={first_usable_recorded}"
+                                            ),
+                                            "business_ingress_observed",
+                                            Some(path_label),
+                                            Some(first_usable_result),
+                                            Some(detail.clone()),
+                                        );
+                                        timeline.emit_first_scoped(
+                                            &scope,
+                                            "first_real_business_ingress",
+                                            Some(path_label),
+                                            (!first_usable_recorded)
+                                                .then_some("first_usable_gate_rejected"),
+                                            Some(detail),
+                                        );
+                                    }
+                                } else {
+                                    if let Some(timeline) = feed.timeline.as_ref() {
+                                        timeline.emit(
+                                            "stale_session_evidence",
+                                            Some(match path {
+                                                crate::peer::NetworkPath::Relay => "relay",
+                                                crate::peer::NetworkPath::Direct => "direct",
+                                            }),
+                                            Some("session_replaced_or_removed"),
+                                            Some(format!(
+                                                "peer={} session_instance={:?} business_ingress=stale",
+                                                inbound.peer_id, inbound.session_instance,
+                                            )),
+                                        );
                                     }
                                 }
+                                drop(session_guard);
                             }
                         }
                     }
@@ -2644,18 +3285,60 @@ impl WireGuardTransport {
         source: Option<SocketAddr>,
         local_endpoint: Option<SocketAddr>,
         socket_index: Option<usize>,
+        direct_socket: Option<Arc<tokio::net::UdpSocket>>,
         token: crate::transport::DirectValidationToken,
     ) {
         match token.kind {
             crate::transport::DirectValidationKind::Request => {
                 let Some(source) = source else {
-                    // No direct source to confirm or answer: consume silently.
+                    let generation = peers.current_network_generation().await;
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                remote_validation_owner: Some(token.owner_token),
+                                request_id: Some(token.request_id),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_request_dropped",
+                            None,
+                            socket_index,
+                            None,
+                            Some(0),
+                            format!(
+                                "reason_code=direct_validation_request_missing_source remote_generation={} local_generation={} request_id={} seq={}",
+                                token.generation, generation, token.request_id, token.sequence
+                            ),
+                        )
+                        .await;
                     return;
                 };
                 let Some(udp) = udp else {
                     // A direct-validation request without the owning UDP
                     // transport cannot be serialized with peer lifecycle
                     // cleanup or safely answered on the receiving socket.
+                    let generation = peers.current_network_generation().await;
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                remote_validation_owner: Some(token.owner_token),
+                                request_id: Some(token.request_id),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_request_dropped",
+                            Some(source),
+                            socket_index,
+                            None,
+                            Some(0),
+                            format!(
+                                "reason_code=direct_validation_udp_transport_unavailable remote_generation={} local_generation={} request_id={} seq={}",
+                                token.generation, generation, token.request_id, token.sequence
+                            ),
+                        )
+                        .await;
                     return;
                 };
                 // No generation gate here: network generations are PER-SIDE
@@ -2723,6 +3406,26 @@ impl WireGuardTransport {
                 // uses the request's own IP header with source/destination
                 // swapped: no virtual IP state required.
                 let Ok(ip) = Ipv4Packet::new(packet) else {
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            local_generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                remote_validation_owner: Some(token.owner_token),
+                                request_id: Some(token.request_id),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_send_failed",
+                            Some(source),
+                            socket_index,
+                            None,
+                            Some(0),
+                            format!(
+                                "reason_code=direct_validation_request_invalid_ipv4 request_id={} seq={}",
+                                token.request_id, token.sequence
+                            ),
+                        )
+                        .await;
                     return;
                 };
                 let ack_payload = crate::transport::build_direct_validation_payload(
@@ -2742,6 +3445,7 @@ impl WireGuardTransport {
                 let send_udp = udp.clone();
                 let peer_id_owned = peer_id.to_string();
                 let receive_socket_index = socket_index;
+                let receive_socket = direct_socket;
                 match self
                     .encrypt_and_emit_outbound_with_lock_timeout(
                         OutboundPacket {
@@ -2757,14 +3461,26 @@ impl WireGuardTransport {
                                         .to_string(),
                                 ));
                             };
-                            send_udp
-                                .send_packet_on_socket_index(
-                                    &encrypted,
-                                    receive_socket_index,
-                                    source,
-                                )
-                                .await
-                                .map(|_| ())
+                            if let Some(receive_socket) = receive_socket {
+                                send_udp
+                                    .send_encrypted_packet_on_socket(
+                                        &receive_socket,
+                                        receive_socket_index,
+                                        &encrypted,
+                                        source,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            } else {
+                                send_udp
+                                    .send_packet_on_socket_index(
+                                        &encrypted,
+                                        receive_socket_index,
+                                        source,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            }
                         },
                     )
                     .await
@@ -2884,6 +3600,25 @@ impl WireGuardTransport {
             }
             crate::transport::DirectValidationKind::Ack => {
                 let Some(udp) = udp else {
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            peers.current_network_generation().await,
+                            crate::peer::DirectValidationEventMetadata {
+                                request_id: Some(token.request_id),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_unmatched",
+                            source,
+                            socket_index,
+                            None,
+                            None,
+                            format!(
+                                "reason_code=direct_validation_ack_udp_transport_unavailable request_id={} token_generation={}",
+                                token.request_id, token.generation
+                            ),
+                        )
+                        .await;
                     return;
                 };
                 let Some(source) = source else {
@@ -2891,6 +3626,25 @@ impl WireGuardTransport {
                     // path.  Keep the owned expectation alive for a real ACK
                     // rather than consuming it merely because the packet
                     // decrypted through a non-UDP transport.
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            peers.current_network_generation().await,
+                            crate::peer::DirectValidationEventMetadata {
+                                request_id: Some(token.request_id),
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_unmatched",
+                            None,
+                            socket_index,
+                            None,
+                            None,
+                            format!(
+                                "reason_code=direct_validation_ack_missing_source request_id={} token_generation={}",
+                                token.request_id, token.generation
+                            ),
+                        )
+                        .await;
                     return;
                 };
                 // Serialize this encrypted ACK transaction with PeerLeft /
@@ -2912,7 +3666,7 @@ impl WireGuardTransport {
                 let endpoint_authenticated = udp
                     .is_authenticated_direct_endpoint(peer_id, source, current_generation)
                     .await;
-                let Some(expectation) = udp
+                let expectation = match udp
                     .consume_direct_validation_ack(
                         peer_id,
                         token.request_id,
@@ -2924,48 +3678,72 @@ impl WireGuardTransport {
                         endpoint_authenticated,
                     )
                     .await
-                else {
-                    debug!(
-                        "Ignored direct-validation ACK from {peer_id}: no current owned expectation (request_id={} token_generation={} token_owner={} current_generation={})",
-                        token.request_id, token.generation, token.owner_token, current_generation
-                    );
-                    peers
-                        .record_direct_event_for_generation_with_socket(
-                            peer_id,
+                {
+                    Ok(expectation) => expectation,
+                    Err(rejection) => {
+                        let reason_code = rejection.reason_code();
+                        debug!(
+                            event = "direct_validation_ack_unmatched",
+                            peer_id = %peer_id,
+                            remote_endpoint = %source,
+                            request_id = token.request_id,
+                            token_generation = token.generation,
                             current_generation,
-                            "direct_validation_ack_unmatched",
-                            Some(source),
-                            socket_index,
-                            None,
-                            None,
-                            format!(
-                                "ignored encrypted validation ACK request_id={} generation={} socket_index={} because no exact owned expectation matched",
-                                token.request_id,
-                                token.generation,
-                                socket_index
-                                    .map_or_else(|| "none".to_string(), |index| index.to_string())
-                            ),
-                        )
-                        .await;
-                    peers
-                        .record_direct_validation_event_with_metadata(
-                            peer_id,
-                            current_generation,
-                            crate::peer::DirectValidationEventMetadata {
-                                request_id: Some(token.request_id),
-                                observed_ack_endpoint: Some(source),
-                                ack_endpoint_authenticated: Some(endpoint_authenticated),
-                                ..crate::peer::DirectValidationEventMetadata::default()
-                            },
-                            "direct_validation_ack_unmatched",
-                            Some(source),
-                            socket_index,
-                            None,
-                            None,
-                            "unmatched encrypted validation ACK; no local owner was consumed",
-                        )
-                        .await;
-                    return;
+                            socket_index = ?socket_index,
+                            endpoint_authenticated,
+                            reason_code,
+                            "direct-validation ACK rejected before promotion"
+                        );
+                        peers
+                            .record_direct_event_for_generation_with_socket(
+                                peer_id,
+                                current_generation,
+                                "direct_validation_ack_unmatched",
+                                Some(source),
+                                socket_index,
+                                None,
+                                None,
+                                format!(
+                                    "reason_code={reason_code} request_id={} token_generation={} current_generation={} socket_index={} endpoint_authenticated={endpoint_authenticated}",
+                                    token.request_id,
+                                    token.generation,
+                                    current_generation,
+                                    socket_index.map_or_else(
+                                        || "none".to_string(),
+                                        |index| index.to_string()
+                                    ),
+                                ),
+                            )
+                            .await;
+                        peers
+                            .record_direct_validation_event_with_metadata(
+                                peer_id,
+                                current_generation,
+                                crate::peer::DirectValidationEventMetadata {
+                                    request_id: Some(token.request_id),
+                                    observed_ack_endpoint: Some(source),
+                                    ack_endpoint_authenticated: Some(endpoint_authenticated),
+                                    ..crate::peer::DirectValidationEventMetadata::default()
+                                },
+                                "direct_validation_ack_unmatched",
+                                Some(source),
+                                socket_index,
+                                None,
+                                None,
+                                format!(
+                                    "reason_code={reason_code} rejected encrypted validation ACK request_id={} token_generation={} current_generation={} socket_index={}",
+                                    token.request_id,
+                                    token.generation,
+                                    current_generation,
+                                    socket_index.map_or_else(
+                                        || "none".to_string(),
+                                        |index| index.to_string()
+                                    ),
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
                 };
 
                 let validation_latency = expectation.sent_at.map(|sent_at| sent_at.elapsed());
@@ -3108,6 +3886,35 @@ impl WireGuardTransport {
                 drop(adoption_guard);
 
                 if !promoted {
+                    peers
+                        .record_direct_validation_event_with_metadata(
+                            peer_id,
+                            expectation.generation,
+                            crate::peer::DirectValidationEventMetadata {
+                                local_validation_session_id: Some(expectation.owner_token),
+                                request_id: Some(token.request_id),
+                                expected_endpoint: expectation.endpoint,
+                                observed_ack_endpoint: Some(source),
+                                ack_endpoint_authenticated: Some(endpoint_authenticated),
+                                validation_rtt_ms,
+                                ..crate::peer::DirectValidationEventMetadata::default()
+                            },
+                            "direct_validation_ack_not_promoted",
+                            Some(source),
+                            socket_index,
+                            None,
+                            Some(1),
+                            format!(
+                                "reason_code=direct_validation_promotion_rejected request_id={} generation={} expected_endpoint={} observed_endpoint={} endpoint_authenticated={endpoint_authenticated}",
+                                token.request_id,
+                                expectation.generation,
+                                expectation
+                                    .endpoint
+                                    .map_or_else(|| "none".to_string(), |endpoint| endpoint.to_string()),
+                                source,
+                            ),
+                        )
+                        .await;
                     debug!(
                         "Ignored direct-validation ACK from {peer_id}: owned expectation could not promote generation {}",
                         expectation.generation

@@ -1174,6 +1174,8 @@ impl UdpTransport {
                     relay_connection_id: None,
                     relay_peer_id: None,
                     socket_index: Some(socket_index),
+                    direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE)
+                        .then(|| socket.clone()),
                     // The token is sampled at enqueue time, not when the
                     // WireGuard worker later decrypts this datagram. A
                     // publication replacement can therefore reject a queued
