@@ -143,6 +143,34 @@ impl Daemon {
             self.route_manager.set_interface(tun.name().to_string());
         }
 
+        // Detect ambient proxy / TUN-capture environments before any STUN
+        // or relay traffic.  A proxied egress makes the observed public
+        // endpoint meaningless and explains UdpBlocked profiles on an
+        // otherwise healthy broadband line (e.g. a Clash/Surge TUN client
+        // egressing STUN through a Tencent-OpenedSNS tunnel instead of the
+        // operator's own NAT).  The daemon still runs, but the NAT verdict
+        // is reported with that context.
+        let excluded_interfaces = tun
+            .as_ref()
+            .map(|tun| vec![tun.name().to_string()])
+            .unwrap_or_default();
+        let proxy_env = crate::netenv::detect_proxy_environment(&excluded_interfaces);
+        if proxy_env.intercepted() {
+            warn!(
+                "Network egress appears intercepted: verdict={} env_proxies={:?} system_proxy={:?} default_route_interface={:?} (STUN public endpoints and NAT profile may describe the proxy egress, not the local NAT)",
+                proxy_env.label(),
+                proxy_env.env_proxies,
+                proxy_env.system_proxy,
+                proxy_env.default_route_interface,
+            );
+        } else {
+            info!(
+                "Network egress checked: verdict={} default_route_interface={:?}",
+                proxy_env.label(),
+                proxy_env.default_route_interface,
+            );
+        }
+
         // Install overlay route
         self.route_manager.add_cidr_route(&cidr)?;
 
@@ -425,6 +453,7 @@ let udp_direct_context = UdpDirectTaskContext {
     udp_punch_interval: punch_interval,
     udp_punch_attempts: punch_attempts,
     boot_epoch_ms: self.boot_epoch_ms,
+    proxy_env,
     shutdown_rx: self.shutdown_rx.clone(),
 };
 self.task_manager

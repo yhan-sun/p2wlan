@@ -28,6 +28,10 @@ struct UdpDirectTaskContext {
     udp_punch_attempts: u32,
     /// Daemon incarnation epoch embedded in fresh-prediction labels.
     boot_epoch_ms: u64,
+    /// Ambient proxy / TUN-capture environment detected at daemon startup.
+    /// Included in the NAT profile log so a proxied egress cannot masquerade
+    /// as a healthy `UdpBlocked`/`EndpointIndependent` local mapping.
+    proxy_env: crate::netenv::ProxyEnvironment,
     /// Daemon-wide shutdown signal.  UDP bind retry and every per-instance
     /// reader/worker observe this instead of making a failed bind permanent.
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -169,6 +173,7 @@ async fn run_udp_direct_instance(
         udp_punch_interval,
         udp_punch_attempts,
         boot_epoch_ms,
+        proxy_env,
         shutdown_rx,
     } = ctx;
 
@@ -315,7 +320,7 @@ async fn run_udp_direct_instance(
                         advertised_nat_type = report.nat_profile.control_label();
                         let (endpoints, sources) = candidate_endpoints_from_report(&report);
                         info!(
-                            "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={}",
+                            "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={} egress={}",
                             report.nat_profile.mapping_behavior,
                             report.nat_profile.public_endpoint,
                             report
@@ -325,7 +330,8 @@ async fn run_udp_direct_instance(
                                 .filter(|observation| observation.mapped_address.is_some())
                                 .count(),
                             report.nat_profile.observations.len(),
-                            report.nat_profile.confidence
+                            report.nat_profile.confidence,
+                            proxy_env.label(),
                         );
                         peers.update_nat_profile(report.nat_profile.clone()).await;
                         let pool_eligible = socket_pool_enabled
@@ -806,6 +812,7 @@ mod udp_direct_tests {
             udp_punch_interval: Duration::from_millis(10),
             udp_punch_attempts: 1,
             boot_epoch_ms: 0,
+            proxy_env: crate::netenv::ProxyEnvironment::default(),
             shutdown_rx,
         }
     }

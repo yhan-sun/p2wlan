@@ -42,6 +42,7 @@ pub mod error;
 pub mod gateway_mapping;
 pub mod incarnation;
 mod network_outbound;
+pub mod netenv;
 pub mod peer;
 pub mod port_mapping;
 pub mod relay;
