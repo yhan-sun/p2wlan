@@ -43,6 +43,7 @@ impl UdpTransport {
         self.set_socket_pool_active(socket_pool_is_eligible(&report));
         self.append_pool_socket_candidates_direct(&mut report, &config)
             .await;
+        self.filter_predicted_candidates(&mut report).await;
         Ok(report)
     }
 
@@ -73,7 +74,21 @@ impl UdpTransport {
         self.set_socket_pool_active(socket_pool_is_eligible(&report));
         self.append_pool_socket_candidates_live(&mut report, &stun_servers, stun_timeout)
             .await;
+        self.filter_predicted_candidates(&mut report).await;
         Ok(report)
+    }
+
+    /// The static-STUN ablation must remove predicted candidates after every
+    /// gathering source, including optional socket-pool observers. Filtering
+    /// here also leaves the NAT profile intact for diagnostics and for the
+    /// independent fresh/birthday policy gates.
+    async fn filter_predicted_candidates(&self, report: &mut CandidateGatherReport) {
+        if self.peers.predicted_candidates_enabled().await {
+            return;
+        }
+        report
+            .candidates
+            .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
     }
 
     async fn query_stun_live_on_socket(

@@ -16,7 +16,7 @@ mod tests {
         assert!(config.relay.servers.is_empty());
         assert!(config.relay.prefer_direct);
         assert!(config.relay.preferred_regions.is_empty());
-        assert_eq!(config.relay.selection_timeout_ms, 3000);
+        assert_eq!(config.relay.selection_timeout_ms, 2000);
         assert!(!config.diagnostics.enabled);
         assert_eq!(config.diagnostics.bind, "127.0.0.1:39277");
         assert!(config.port_mappings.is_empty());
@@ -137,7 +137,7 @@ mod tests {
         assert!(!decoded.network.socket_pool_enabled);
         assert_eq!(decoded.network.socket_pool_size, 1);
         assert!(decoded.relay.preferred_regions.is_empty());
-        assert_eq!(decoded.relay.selection_timeout_ms, 3000);
+        assert_eq!(decoded.relay.selection_timeout_ms, 2000);
         // The deprecated fallback_timeout_ms alias must map onto the new
         // relay_startup_timeout_ms field so old configs keep their semantics.
         assert_eq!(decoded.relay.relay_startup_timeout_ms, 5000);

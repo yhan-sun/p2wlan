@@ -210,6 +210,13 @@ pub struct RelayClientConfig {
     pub allow_insecure_plaintext: bool,
     /// Relay ticket JWT for authenticated registration.
     pub relay_ticket: Option<String>,
+    /// Upper bound for the raw TCP connect (SYN/SYN-ACK) stage only.
+    ///
+    /// A slow but livable WAN link completes the TCP handshake within this
+    /// budget; a black-holed or severely congested link fails fast so the
+    /// relay supervisor can retry instead of burning the whole selection
+    /// budget.  The registration handshake keeps its own `register_timeout`.
+    pub connect_timeout: Duration,
 }
 
 impl Default for RelayClientConfig {
@@ -230,6 +237,7 @@ impl Default for RelayClientConfig {
             tls_ca_cert_path: None,
             allow_insecure_plaintext: false,
             relay_ticket: None,
+            connect_timeout: Duration::from_millis(1500),
         }
     }
 }
@@ -249,6 +257,11 @@ impl RelayClientConfig {
         if self.register_timeout.is_zero() {
             return Err(error::RelayError::Protocol(
                 "register_timeout must be > 0".into(),
+            ));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(error::RelayError::Protocol(
+                "connect_timeout must be > 0".into(),
             ));
         }
         if self.idle_timeout.is_zero() {

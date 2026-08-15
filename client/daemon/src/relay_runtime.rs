@@ -731,7 +731,7 @@ async fn spawn_relay_renewal_task_impl(
 
 impl RelaySupervisor {
     pub(super) async fn run(self) {
-        let mut retry_delay = Duration::from_secs(1);
+        let mut retry_delay = Duration::from_millis(100);
         let max_retry_delay = Duration::from_secs(30);
         let mut cooldowns: HashMap<String, Instant> = HashMap::new();
         loop {
@@ -791,7 +791,7 @@ impl RelaySupervisor {
                         relay.connect_latency_ms()
                     )),
                 );
-                retry_delay = Duration::from_secs(1);
+retry_delay = Duration::from_millis(100);
 
                 let endpoint = relay.endpoint().to_string();
                 // The proactive ticket renewal runs make-before-break: a
@@ -929,8 +929,8 @@ impl RelaySupervisor {
                     retry_delay = max_retry_delay;
                 }
                 warn!(
-                    "No configured relay candidate was reachable ({failure_summary}); retrying in {} seconds",
-                    retry_delay.as_secs()
+                    "No configured relay candidate was reachable ({failure_summary}); retrying in {:?}",
+                    retry_delay
                 );
             }
 

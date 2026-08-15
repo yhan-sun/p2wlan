@@ -375,7 +375,7 @@ fn default_relay_timeout() -> u64 {
     3000
 }
 fn default_relay_selection_timeout() -> u64 {
-    3000
+    2000
 }
 
 /// Local diagnostics HTTP endpoint configuration.

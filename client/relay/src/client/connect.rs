@@ -88,7 +88,7 @@ impl RelayClient {
                 // Use host:port directly — TcpStream::connect handles DNS resolution
                 let host_port = parsed.host_port();
                 let tcp_stream = tokio::time::timeout(
-                    config.register_timeout,
+                    config.connect_timeout,
                     tokio::net::TcpStream::connect(&host_port),
                 )
                 .await
@@ -109,7 +109,7 @@ impl RelayClient {
             "tcp" => {
                 let host_port = parsed.host_port();
                 let stream = tokio::time::timeout(
-                    config.register_timeout,
+                    config.connect_timeout,
                     tokio::net::TcpStream::connect(&host_port),
                 )
                 .await

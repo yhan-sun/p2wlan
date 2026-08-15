@@ -162,6 +162,11 @@ impl PeerManager {
         self.config.network.gather_host_candidates
     }
 
+    /// Whether extrapolated server-reflexive candidates may be advertised.
+    pub(crate) async fn predicted_candidates_enabled(&self) -> bool {
+        self.config.network.predicted_candidates_enabled
+    }
+
     /// Whether the local NAT profile needs fresh-socket mapping prediction.
     ///
     /// Endpoint-independent / open NATs have a stable public port; only
