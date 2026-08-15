@@ -204,13 +204,25 @@ impl Daemon {
         })?;
         let udp_advertise = self.config.network.udp_advertise.clone();
         let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
-        let mut stun_servers =
-            parse_stun_servers(&self.config.network.stun_servers, stun_timeout).await?;
-        let udp_observers = if self.config.network.udp_observers.is_empty() {
-            Vec::new()
-        } else {
-            parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await?
-        };
+        // Resolve both STUN source lists concurrently.  A failing resolver
+        // deadline is Direct-only best effort and must not stall the control
+        // event loop: two serial 1-second timeouts here delayed roster/offer
+        // ingress (and direct validation) behind relay readiness
+        // (field evidence: fresh_mapping acceptance round with two
+        // stun.l.google.com resolution timeouts pushing the event loop 2s
+        // after peer join was already polled).
+        let (resolved_stun, resolved_observers) = tokio::join!(
+            parse_stun_servers(&self.config.network.stun_servers, stun_timeout),
+            async {
+                if self.config.network.udp_observers.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await
+                }
+            },
+        );
+        let mut stun_servers = resolved_stun?;
+        let udp_observers = resolved_observers?;
         for observer in &udp_observers {
             if !stun_servers.contains(observer) {
                 stun_servers.push(*observer);

@@ -147,8 +147,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
     );
     let initial_refresh_needs_fast_retry =
         initial_refresh_needs_public_retry || initial_pool_mapping_warmup;
-    let mut startup_fast_retry = initial_refresh_needs_fast_retry;
-    let mut ticker = interval(if startup_fast_retry {
+    let mut fast_retry_active = initial_refresh_needs_fast_retry;
+    let mut ticker = interval(if fast_retry_active {
         CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL
     } else {
         CANDIDATE_REFRESH_INTERVAL
@@ -348,22 +348,52 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         }
 
-        if startup_fast_retry
-            && has_reliable_public_candidate(
-                Some(&report.nat_profile),
-                &candidates,
-                &candidate_sources,
-            )
-        {
-            startup_fast_retry = false;
-            ticker = interval(CANDIDATE_REFRESH_INTERVAL);
+        // The Gather cadence is a state machine, not a one-shot startup
+        // smoothing.  An intermittent UDP blackhole can flip the profile to
+        // `UdpBlocked` (or lose the public mapping) after startup already
+        // recovered; without a re-entry path the next discovery attempt would
+        // wait for the full 15-second interval.  Re-enter the fast retry
+        // cadence whenever the committed profile stops providing a reliable
+        // public mapping (field evidence: fresh-mapping acceptance rounds
+        // where a recovered NAT still took 8-26s to converge because
+        // discovery had stepped back to the slow cadence).
+        let reliable_public = has_reliable_public_candidate(
+            Some(&report.nat_profile),
+            &candidates,
+            &candidate_sources,
+        );
+        let want_fast = !reliable_public;
+        if want_fast != fast_retry_active {
+            fast_retry_active = want_fast;
+            let interval_ms = if fast_retry_active {
+                CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL
+            } else {
+                CANDIDATE_REFRESH_INTERVAL
+            };
+            ticker = interval(interval_ms);
             // Consume the new interval's immediate tick; the next periodic
-            // refresh is 15 seconds later.
+            // refresh happens one full cadence later.
             ticker.tick().await;
-            info!(
-                target: "p2wlan_daemon::candidate_refresh",
-                "UDP candidate refresh found a real public candidate; returning to the normal refresh interval"
-            );
+            if reliable_public {
+                info!(
+                    target: "p2wlan_daemon::candidate_refresh",
+                    "UDP candidate refresh found a real public candidate; returning to the normal refresh interval"
+                );
+            } else {
+                info!(
+                    target: "p2wlan_daemon::candidate_refresh",
+                    "UDP candidate refresh lost its reliable public mapping (mapping={:?}, public={:?}, stun={}/{}); re-entering the fast retry interval",
+                    report.nat_profile.mapping_behavior,
+                    report.nat_profile.public_endpoint,
+                    report
+                        .nat_profile
+                        .observations
+                        .iter()
+                        .filter(|observation| observation.mapped_address.is_some())
+                        .count(),
+                    report.nat_profile.observations.len(),
+                );
+            }
         }
         let previous_snapshot = candidate_snapshot.read().await.clone();
         let previous_candidates = previous_snapshot
