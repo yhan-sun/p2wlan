@@ -49,17 +49,14 @@ coverage/
 ~$*
 .~lock.*#
 
-# Local-only project notes and research drafts
+# Local-only project notes, research drafts and internal docs (kept on disk, never published)
 P2PNet-Design.md
 PRODUCT.md
 research/nat-traversal-paper/
-docs/*
-!docs/production-hardening.zh.md
-!docs/production-hardening.en.md
-!docs/nat-traversal-matrix.zh.md
-!docs/nat-traversal-matrix.en.md
-!docs/v2-architecture-roadmap.zh.md
-!docs/v2-architecture-roadmap.en.md
+docs/
+
+# Staging deployment templates (kept on disk, never published)
+deploy/staging/*.env.example
 
 # Release packages and archives
 *.pdf
