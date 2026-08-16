@@ -128,6 +128,7 @@ impl PeerManager {
                 recovery_stage,
                 relay_safety_net,
                 self.config.network.socket_pool_size,
+                conn.remote_nat_requires_port_scatter(),
             ),
         );
         if !endpoints.is_empty() {
@@ -599,6 +600,7 @@ impl PeerManager {
                     Some(stage),
                     relay_safety_net,
                     self.config.network.socket_pool_size,
+                    conn.remote_nat_requires_port_scatter(),
                 ),
             );
             if endpoints.is_empty() {
@@ -816,22 +818,65 @@ fn recovery_target_cap(
     stage: Option<RecoveryStage>,
     relay_safety_net: bool,
     socket_count: usize,
+    remote_port_dependent: bool,
 ) -> Option<usize> {
     let stage = stage?;
-    let max_probes = if relay_safety_net && stage >= RecoveryStage::ScatterExtended {
+    // A port-dependent remote's predicted window is destination-specific, so
+    // the stage machine must not trickle through Predicted/ScatterSmall at
+    // the small ceilings: the wide scatter is the only coverage of its real
+    // mapping (field evidence v0.1.116, R9).  The Initial stage still opens
+    // with the predicted window untouched; the wide ceiling opens as soon as
+    // that window had no matched ACK.  A relay safety net does NOT suppress
+    // this: the relay is only the fallback data plane, and for a
+    // destination-dependent remote the wide scatter is the ONLY route to
+    // Direct (field evidence v0.1.116: availability runs always have the
+    // relay confirmed within ~100 ms, so a `!relay_safety_net` gate left the
+    // stable side permanently capped at 64 unique ports).
+    let effective_stage = if remote_port_dependent
+        && stage >= RecoveryStage::Predicted
+        && stage < RecoveryStage::ScatterExtended
+    {
+        RecoveryStage::ScatterExtended
+    } else {
+        stage
+    };
+    let max_probes = if relay_safety_net && effective_stage >= RecoveryStage::ScatterExtended {
         RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES
     } else {
-        stage.max_probes()
+        effective_stage.max_probes()
     };
-    let sockets = socket_count.max(1) as u32;
-    Some((max_probes / sockets).max(1) as usize)
+    // The physical-datagram ceiling counts kernel datagrams, while an
+    // ActivePool sweep fan-outs every candidate to every socket — so the
+    // plan is sized `ceiling / sockets` so one session covers a COMPLETE
+    // window (field evidence: a 512-cap/3-socket truncation left a window
+    // half-scanned).  A port-dependent remote makes the local side the
+    // asymmetric STABLE role, which sweeps through `StableUniqueScatter`
+    // (ONE socket, one datagram per distinct remote port): the fan-out
+    // division must NOT apply there, otherwise a 192-datagram ceiling is
+    // spent as a 64-port window (field evidence v0.1.116, R4/R7/R8: the
+    // stable side covered only 64 unique CGNAT ports per session; at ~0.1%
+    // per-port hit odds that is why 3/10 rounds stayed on relay).
+    let max_candidates = if remote_port_dependent
+        && effective_stage >= RecoveryStage::ScatterExtended
+    {
+        max_probes as usize
+    } else {
+        (max_probes / socket_count.max(1) as u32).max(1) as usize
+    };
+    Some(max_candidates)
 }
 
 /// Bound a target set by the recovery stage machine.
 ///
 /// - Wide scatter (birthday plans / remote scatter pool) is only built at
-///   [`RecoveryStage::ScatterExtended`], which is only reachable after the
-///   smaller stages produced explicit zero-matched-ACK feedback.
+///   [`RecoveryStage::ScatterExtended`] — UNLESS the remote peer's NAT is
+///   address/port-dependent, in which case the Predicted stage already
+///   carries it: the remote's own fresh window is destination-specific
+///   evidence that two different local ports see two different remote
+///   renderings, so the wide scatter must start as soon as the first
+///   (predicted-window) burst had no matched ACK.  Waiting for the small
+///   scatter stages to fail sequentially costs the epoch several extra
+///   no-ACK rounds (field evidence v0.1.116, R9).
 /// - Every stage has a hard probe ceiling (`RecoveryStage::max_probes`).
 /// - The Initial stage drops only locally-generated Birthday speculation
 ///   (never peer-signaled Predicted ports: for an address/port-dependent
@@ -839,8 +884,12 @@ fn recovery_target_cap(
 ///   would leave only LAN hosts that cannot traverse the NATs).
 /// - A relay-backed peer (`relay_safety_net == true`) is capped at the
 ///   bounded trusted-endpoint ceiling even in the wide-scatter stage: relay
-///   is the data plane, so traversal is a low-frequency heartbeat and the
-///   wide birthday capability is reserved for cold starts without a relay.
+///   is the data plane, so traversal keeps probing at a bounded rate while
+///   the wide birthday pool stays reachable — a destination-dependent remote
+///   cannot rely on its step prediction, so its wide scatter must NOT be
+///   suppressed just because a relay fallback exists (field evidence
+///   v0.1.116: availability runs confirm the relay within ~100 ms, which
+///   otherwise left the stable side permanently capped at 64 unique ports).
 fn cap_targets_by_recovery_stage(
     conn: &PeerConnection,
     endpoints: &mut Vec<SocketAddr>,
@@ -850,7 +899,10 @@ fn cap_targets_by_recovery_stage(
     relay_safety_net: bool,
     socket_count: usize,
 ) {
-    if stage < RecoveryStage::ScatterExtended {
+    let remote_port_dependent = conn.remote_nat_requires_port_scatter();
+    let wide_scatter_allowed = stage >= RecoveryStage::ScatterExtended
+        || (remote_port_dependent && stage >= RecoveryStage::Predicted);
+    if !wide_scatter_allowed {
         *birthday_plan = None;
         *remote_scatter_pool = false;
     }
@@ -867,19 +919,40 @@ fn cap_targets_by_recovery_stage(
             *endpoints = trusted;
         }
     }
-    let max_probes = if relay_safety_net && stage >= RecoveryStage::ScatterExtended {
+    // Mirror `recovery_target_cap`: a port-dependent remote opens the
+    // wide-scatter ceiling right after its predicted window had no matched
+    // ACK instead of trickling through the small-stage ceilings.
+    let effective_stage = if remote_port_dependent
+        && stage >= RecoveryStage::Predicted
+        && stage < RecoveryStage::ScatterExtended
+    {
+        RecoveryStage::ScatterExtended
+    } else {
+        stage
+    };
+    let max_probes = if relay_safety_net && effective_stage >= RecoveryStage::ScatterExtended {
         // Relay is available: wide scatter is downgraded to a bounded
         // trusted-endpoint heartbeat (the full cold-start capability stays
         // reachable for peers without a relay safety net).
         RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES
     } else {
-        stage.max_probes()
+        effective_stage.max_probes()
     };
     // Same physical-datagram semantics as `recovery_target_cap`: the ceiling
-    // is per-datagram, every candidate is sent from every socket, so the
-    // truncation boundary is `ceiling / socket_count` candidates — anything
-    // wider would be cut mid-window by the session cap.
-    let max_candidates = (max_probes / socket_count.max(1) as u32).max(1) as usize;
+    // is per-datagram; an ActivePool sweep sends every candidate from every
+    // socket, so the truncation boundary is `ceiling / socket_count` — but a
+    // port-dependent remote's stable side sweeps through
+    // `StableUniqueScatter` (one socket, one datagram per distinct port), so
+    // the fan-out division is skipped there.  Field evidence v0.1.116:
+    // applying the division capped the stable side at 64 unique CGNAT ports
+    // while the session budget allowed 192.
+    let max_candidates = if remote_port_dependent
+        && effective_stage >= RecoveryStage::ScatterExtended
+    {
+        max_probes as usize
+    } else {
+        (max_probes / socket_count.max(1) as u32).max(1) as usize
+    };
     if endpoints.len() > max_candidates {
         endpoints.truncate(max_candidates);
     }

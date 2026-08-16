@@ -689,6 +689,143 @@ async fn remote_nat_behavior_hint_starts_bounded_scatter_with_one_candidate() {
 }
 
 #[tokio::test]
+async fn port_dependent_remote_explicit_predicted_window_never_silences_stable_scatter() {
+    // Field evidence (v0.1.116, R9): the `a=random` remote advertised a fresh
+    // prediction window whose ports covered only ITS rendering for its other
+    // targets — the mapping the local peer actually needs sat outside it.  The
+    // explicit (unfailed) window used to suppress the stable side's scatter
+    // until the window had fully failed, so the punch expired before the wide
+    // scan ever covered the real mapping.
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let observed: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_008)
+        .map(|port| SocketAddr::new(observed.ip(), port))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+
+    let mut peer = test_peer("peer-r9-apd", registry_endpoint);
+    peer.nat_type = "p2:m=address_or_port_dependent;a=random;d=32;c=90".to_string();
+    manager.add_peer(&peer).await;
+    manager
+        .add_candidates_with_sources("peer-r9-apd", &candidates, &sources)
+        .await;
+    let mut stable_profile = birthday_nat_profile();
+    stable_profile.mapping_behavior = MappingBehavior::EndpointIndependent;
+    stable_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
+    stable_profile.public_port_stable = Some(true);
+    stable_profile.likely_symmetric = Some(false);
+    stable_profile.birthday_candidate = false;
+    manager.update_nat_profile(stable_profile).await;
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer-r9-apd")
+        .await
+        .expect("the port-dependent remote must receive a direct target set");
+    assert!(
+        target_set.remote_scatter_pool,
+        "a port-dependent remote's explicit prediction window is destination-specific and must not silence the stable side's scatter"
+    );
+    assert!(target_set.stable_remote_scatter);
+    assert!(
+        target_set.birthday_plan.is_some(),
+        "the wide scatter plan must be generated immediately, without waiting for the predicted window to fail"
+    );
+    assert!(
+        target_set.candidates.iter().any(|candidate| {
+            candidate.ip() == observed.ip() && !predicted.contains(candidate)
+        }),
+        "the scatter must reach ports outside the advertised prediction window"
+    );
+}
+
+#[tokio::test]
+async fn port_dependent_remote_predicted_stage_offers_full_192_unique_scatter_window() {
+    // Field evidence v0.1.116 (R4/R7/R8): the stable side of an
+    // address/port-dependent remote reached only 64 unique CGNAT ports per
+    // recovery session.  StableUniqueScatter uses ONE socket (one datagram
+    // per distinct port), so the recovery stage's `ceiling / socket_count`
+    // division was wrongly halving the 192-datagram budget by three — at
+    // ~0.1% per-port hit odds on a destination-dependent mapping, that 64 vs
+    // 192 coverage gap is why 3/10 real rounds stayed on relay.  Once the
+    // epoch reaches Predicted (predicted window had no matched ACK), the
+    // window must grow to ~192 distinct ports.
+    let manager = PeerManager::new(test_config());
+    let registry_endpoint: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    let observed: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let predicted = (41_001..=41_008)
+        .map(|port| SocketAddr::new(observed.ip(), port))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+
+    let mut peer = test_peer("peer-r9-apd-stage", registry_endpoint);
+    peer.nat_type = "p2:m=address_or_port_dependent;a=random;d=32;c=90".to_string();
+    manager.add_peer(&peer).await;
+    manager
+        .add_candidates_with_sources("peer-r9-apd-stage", &candidates, &sources)
+        .await;
+    let mut stable_profile = birthday_nat_profile();
+    stable_profile.mapping_behavior = MappingBehavior::EndpointIndependent;
+    stable_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
+    stable_profile.public_port_stable = Some(true);
+    stable_profile.likely_symmetric = Some(false);
+    stable_profile.birthday_candidate = false;
+    manager.update_nat_profile(stable_profile).await;
+
+    // Open the recovery epoch and advance Initial -> Predicted (one
+    // zero-matched-ACK feedback round), the stage where the APD remote's wide
+    // scatter is released.
+    let admission = manager
+        .recovery_epoch_admit("peer-r9-apd-stage")
+        .await;
+    assert!(matches!(
+        admission,
+        RecoveryAdmission::Accepted { .. }
+    ));
+    manager
+        .advance_recovery_stage_after_no_ack("peer-r9-apd-stage", "predicted window no ack")
+        .await;
+    assert_eq!(
+        manager
+            .recovery_stage_for("peer-r9-apd-stage")
+            .await,
+        RecoveryStage::Predicted
+    );
+
+    let target_set = manager
+        .direct_probe_target_set_for("peer-r9-apd-stage")
+        .await
+        .expect("APD remote must receive a target set");
+    assert!(target_set.remote_scatter_pool);
+    assert!(target_set.stable_remote_scatter);
+    assert!(
+        target_set.birthday_plan.is_some(),
+        "wide scatter must survive the Predicted stage for a port-dependent remote"
+    );
+    assert!(
+        target_set.candidates.len() >= 128,
+        "stable-side unique scatter must cover ~192 distinct ports (one socket, one datagram each), not 64: got {}",
+        target_set.candidates.len()
+    );
+    assert!(
+        target_set.candidates.len() <= STABLE_SCATTER_PLAN_SLICE,
+        "the window stays bounded by the per-plan slice"
+    );
+}
+
+#[tokio::test]
 async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
     let config = test_config();
     let manager = PeerManager::new(config);

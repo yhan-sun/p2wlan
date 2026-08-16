@@ -654,7 +654,7 @@ impl PeerConnection {
             .any(|source| *source == CandidatePairSource::Predicted)
     }
 
-    fn remote_nat_requires_port_scatter(&self) -> bool {
+    pub(crate) fn remote_nat_requires_port_scatter(&self) -> bool {
         let nat_type = self.nat_type.trim().to_ascii_lowercase();
         nat_type.contains("address_or_port_dependent")
             || nat_type.contains("symmetric")
@@ -753,9 +753,24 @@ impl PeerConnection {
             && ((!has_explicit_predicted_window
                 && local_nat_profile.is_some_and(|profile| profile.birthday_candidate))
                 || failed_prediction_fallback);
-        let peer_looks_port_dependent =
-            (self.remote_nat_requires_port_scatter() || peer_candidates_need_port_scatter(&bases))
-            && (!has_explicit_predicted_window || failed_prediction_fallback);
+        // A remote peer with an address/port-dependent (or symmetric) NAT is
+        // never "settled" by its own signaled prediction window: endpoint-
+        // dependent mapping means the window it advertised for ITS rendering
+        // of THIS side must not suppress the wide scatter that covers its
+        // rendering of the OTHER side.  Field evidence (v0.1.116, R9): a
+        // `a=random` remote advertised a fresh window while its real mapping
+        // for the local peer sat outside it, and the explicit window
+        // silenced the stable side's scatter until the window had fully
+        // failed — the punch expired long before that.
+        //
+        // The failed-prediction fallback below therefore only gates
+        // peer-candidate-derived scatter (destinations whose port ranges are
+        // not tight enough to trust without a hit); an explicit remote
+        // prediction can never silence the scatter a port-dependent remote
+        // mandates by its NAT nature.
+        let peer_looks_port_dependent = self.remote_nat_requires_port_scatter()
+            || (peer_candidates_need_port_scatter(&bases)
+                && (!has_explicit_predicted_window || failed_prediction_fallback));
         if !local_needs_birthday && !peer_looks_port_dependent {
             return None;
         }

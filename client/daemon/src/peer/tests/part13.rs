@@ -334,32 +334,47 @@ async fn recovery_target_cap_scales_with_socket_count_for_complete_windows() {
     // never scanned and the birthday cursor could not advance.  v0.1.116
     // bounds every ActivePool stage by the 192-datagram session cap so a
     // window always fits one controlled coverage.
-    let three_sockets = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 3);
+    let three_sockets = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 3, false);
     assert_eq!(
         three_sockets,
         Some(192 / 3),
         "ScatterSmall with 3 sockets must plan candidates that a 192-datagram session can fully cover"
     );
-    let one_socket = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 1);
+    let one_socket = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 1, false);
     assert_eq!(
         one_socket,
         Some(192),
         "a single socket keeps the full 192-candidate window"
     );
-    let predicted = recovery_target_cap(Some(RecoveryStage::Predicted), false, 3);
+    let predicted = recovery_target_cap(Some(RecoveryStage::Predicted), false, 3, false);
     assert_eq!(
         predicted,
         Some(192 / 3),
         "Predicted with 3 sockets must fit the 192-datagram ceiling"
     );
-    let relay_backed = recovery_target_cap(Some(RecoveryStage::ScatterExtended), true, 3);
+    let relay_backed = recovery_target_cap(Some(RecoveryStage::ScatterExtended), true, 3, false);
     assert_eq!(
         relay_backed,
         Some(96 / 3),
         "a relay-backed wide stage is downgraded to the bounded heartbeat ceiling, socket-scaled"
     );
+    let port_dependent_predicted =
+        recovery_target_cap(Some(RecoveryStage::Predicted), false, 3, true);
+    assert_eq!(
+        port_dependent_predicted,
+        Some(192),
+        "a port-dependent remote opens the wide ceiling as soon as its predicted window had no ACK; the stable side sweeps via StableUniqueScatter (one socket), so the full 192-datagram ceiling is 192 distinct ports, NOT ceiling/sockets (field evidence v0.1.116: the 192/3=64 division spent only 64 unique CGNAT ports)"
+    );
+    let port_dependent_relay_backed =
+        recovery_target_cap(Some(RecoveryStage::Predicted), true, 3, true);
+    assert_eq!(
+        port_dependent_relay_backed,
+        Some(96),
+        "relay downgrades the ceiling to the bounded heartbeat 96, but the port-dependent remote still sweeps it via StableUniqueScatter (one socket): 96 distinct ports, NOT 96/3 (field evidence v0.1.116: the relay safety net is confirmed within ~100 ms in availability runs, so a relay gate must not shrink the stable side to 32 unique ports)"
+    );
     // No socket (unit context) must not degenerate to zero candidates.
-    assert!(recovery_target_cap(Some(RecoveryStage::Initial), false, 0).is_some_and(|cap| cap > 0));
+    assert!(recovery_target_cap(Some(RecoveryStage::Initial), false, 0, false)
+        .is_some_and(|cap| cap > 0));
 }
 
 #[tokio::test]
