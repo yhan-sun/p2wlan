@@ -1,20 +1,37 @@
-[B] NAT profile: mapping=address_dependent allocation=linear step=-624 public=127.0.0.1:34658 confidence=1.00 filtering=endpoint_independent reuse=False legacy=2 degraded=False
-[B]   obs same_target  target=203.0.113.2:34001    socket=127.0.0.1:31000 mapped=127.0.0.1:34658
-[B]   obs same_target  target=203.0.113.2:34001    socket=127.0.0.1:31000 mapped=127.0.0.1:34658
-[B]   obs diff_port    target=203.0.113.2:34002    socket=127.0.0.1:31000 mapped=127.0.0.1:34658
-[B]   obs diff_ip      target=203.0.113.3:34003    socket=127.0.0.1:31000 mapped=127.0.0.1:34034
-[B]   obs new_socket   target=203.0.113.2:34001    socket=127.0.0.1:31001 mapped=127.0.0.1:34795
+[B] NAT profile: mapping=endpoint_independent allocation=stable step=0 public=127.0.0.1:34795 confidence=1.00 filtering=endpoint_independent filtering_state=allow reuse=False legacy=1 degraded=False
+[B]   obs same_target  target=203.0.113.2:34001    socket=127.0.0.1:31000 mapped=127.0.0.1:34795
+[B]   obs same_target  target=203.0.113.2:34001    socket=127.0.0.1:31000 mapped=127.0.0.1:34795
+[B]   obs diff_port    target=203.0.113.2:34002    socket=127.0.0.1:31000 mapped=127.0.0.1:34795
+[B]   obs diff_ip      target=203.0.113.3:34003    socket=127.0.0.1:31000 mapped=127.0.0.1:34795
+[B]   obs new_socket   target=203.0.113.2:34001    socket=127.0.0.1:31001 mapped=127.0.0.1:34658
 [B] peer: A nat=1 profile=(endpoint_independent/stable) addr=('127.0.0.1', 33598)
-[B] Enhanced Hole Punching 1  mode=LinearSymmericPunchToCone  local_port=31000
-[B] start nat traversal analysis  local=m=address_dependent/a=linear/s=-624/f=endpoint_independent  remote=m=endpoint_independent/a=stable/s=0/f=address_port_dependent
-[B] execute: LinearSymmericPunchToCone  (epoch 1)
-[B] predict punch address: base=33598 step=1 N=16 first=[33582, 33583, 33584, 33585, 33586, 33587, 33588, 33589]
+[B] pair cache expired for 127.0.0.1 (age 4970s > ttl 3600s)
+[B] Enhanced Hole Punching 1  mode=DirectConePunch  local_port=31000
+[B] start nat traversal analysis  local=m=endpoint_independent/a=stable/s=0/f=endpoint_independent  remote=m=endpoint_independent/a=stable/s=0/f=address_port_dependent
+[B] execute: DirectConePunch  (epoch 1)
 [B] retry in 0.8s (epoch 1)
-[B] learned candidate 127.0.0.1:33598 (upgrade)
-[B] saved pair cache (127.0.0.1)
-[B] ★ P2P ESTABLISHED via 127.0.0.1:33598 (bidirectional confirm, recv=2)
-[B] P2P established, holding 4s for keepalive validation
-[B] keepalive to 127.0.0.1:33598
-[B] keepalive to 127.0.0.1:33598
-[B] result: p2p
-[B] stats: {"cache_hits": 0, "cache_saves": 1, "epoch": 1, "establish_ms": 808, "keptalive": 2, "learn_events": 1, "mode": "LinearSymmericPunchToCone", "predicted_hits": 0, "punches_recv": 2, "punches_sent": 40, "step_history": []}
+[B] execute: DirectConePunch  (epoch 2)
+[B] retry in 0.8s (epoch 2)
+[B] execute: DirectConePunch  (epoch 3)
+[B] retry in 0.8s (epoch 3)
+[B] execute: DirectConePunch  (epoch 4)
+[B] retry in 0.8s (epoch 4)
+[B] execute: DirectConePunch  (epoch 5)
+[B] retry in 0.8s (epoch 5)
+[B] execute: DirectConePunch  (epoch 6)
+[B] retry in 0.8s (epoch 6)
+[B] execute: DirectConePunch  (epoch 7)
+[B] retry in 0.8s (epoch 7)
+[B] execute: DirectConePunch  (epoch 8)
+[B] retry in 0.8s (epoch 8)
+[B] execute: DirectConePunch  (epoch 9)
+[B] retry in 0.8s (epoch 9)
+[B] execute: DirectConePunch  (epoch 10)
+[B] retry in 0.8s (epoch 10)
+[B] PunchCheckFireWall, punch_epoch: 10
+[B] firewall check udp 127.0.0.1:53 -> blocked
+[B] firewall check udp 127.0.0.1:54 -> blocked
+[B] firewall check tcp 127.0.0.1:443 -> blocked
+[B] found firewall, stop punch -> 转 TURN 中继
+[B] result: firewall
+[B] stats: {"budget_split": null, "cache_hits": 0, "cache_saves": 0, "confirmation_overhead_ms": null, "epoch": 10, "establish_ms": null, "firewall": "yes", "hit_metrics": null, "keptalive": 0, "learn_events": 0, "mapping_drift_count": 0, "mode": "DirectConePunch", "pattern": null, "pool_sockets": 1, "precision_top_n": null, "predicted_hits": 0, "punches_recv": 0, "punches_sent": 10, "step_final": 0, "step_history": [], "step_revisions": 0}

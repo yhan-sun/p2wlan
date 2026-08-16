@@ -32,6 +32,13 @@ import sys
 import threading
 import time
 
+try:
+    # S1 预测引擎升级模块（同目录，零依赖；缺失时降级为内置双向预测）
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import predict as _predict
+except ImportError:
+    _predict = None
+
 # ===== 常量（[H] 反汇编确认） =====
 STUN_MAGIC_COOKIE = 0x2112A442
 ATTR_XOR_MAPPED = 0x0020            # 标准 XOR-MAPPED-ADDRESS
@@ -405,8 +412,12 @@ def parse_stun_targets(raw):
 
 # ===== 防火墙检测（[H] 0x3e2b48 PunchCheckFireWall + TCP 对照） =====
 def check_firewall(dns_targets=None, tcp_targets=None, timeout=2.0):
-    """UDP ping 公网DNS:53 双目标 + TCP:443 对照。仅 UDP 全失败 且 TCP 也失败 → 防火墙。
-    返回 (blocked, results)。"""
+    """防火墙三通道探测（S3.4）：UDP DNS:53×2 + TCP:443×1 → verdict=yes|no|mixed。
+
+    - no     UDP 任一通（无防火墙）
+    - mixed  UDP 全败但 TCP 通（UDP 被限/丢包，不判防火墙 → 继续打洞）
+    - yes    UDP 全败且 TCP 败（防火墙拦截 → 转 TURN）
+    返回 (verdict, results)。"""
     dns_targets = dns_targets or FIREWALL_DNS
     udp_results = []
     for ip, port in dns_targets:
@@ -432,8 +443,13 @@ def check_firewall(dns_targets=None, tcp_targets=None, timeout=2.0):
             tcp_results.append((f"{ip}:{port}", False))
     udp_ok = any(r[1] for r in udp_results)
     tcp_ok = any(r[1] for r in tcp_results)
-    blocked = (not udp_ok) and (not tcp_ok)
-    return blocked, {"udp": udp_results, "tcp": tcp_results}
+    if udp_ok:
+        verdict = "no"
+    elif tcp_ok:
+        verdict = "mixed"
+    else:
+        verdict = "yes"
+    return verdict, {"udp": udp_results, "tcp": tcp_results}
 
 
 # ===== 成功 pair 缓存 =====
@@ -683,6 +699,8 @@ class NatDetector:
                 for (mapped, _) in self._stun_probe_batch(s1, seq_targets):
                     if mapped is not None and mapped[1] is not None:
                         port_sequence.append(mapped[1])
+        # EI 映射同 socket 复用（RFC 5780 单 socket 框架的可观察行为 = stable 复用）；
+        # 新会话分配（linear/random）无法在此框架下区分，依赖信令提示（control_label a=..）补充。
         # 相邻去重（复用映射不产生新分配）
         dedup = []
         for p in port_sequence:
@@ -690,28 +708,38 @@ class NatDetector:
                 dedup.append(p)
         allocation, step = classify_port_allocation(dedup)
 
-        # filtering 尽力探测（CHANGE-REQUEST；依据「响应源地址变化」判定。
-        # mock 环境按响应源端口归因到 t1(同IP异端口)/t2(异IP)；真实环境源端口 != t0 即视为 changed。
-        # 仅在 --filtering-probe 显式开启时执行；服务器不支持 change 时保守判 APD。）
+        # filtering 三态尽力探测（S2）：CHANGE-REQUEST 换源端口/换源 IP；
+        # 判定：响应源变化 → allow（EI/AD）；服务器活着但 change 请求无响应 → deny（被过滤，判 APD）；
+        # 服务器从未响应 → no-response（无法探测，降级 unknown）。仅在 --filtering-probe 开启时执行。
         filtering = FILT_UNKNOWN
+        filtering_state = "no-response"
         if filtering_probe:
             cp = self._stun_probe_batch(s1, [(t0, False, True)])[0]
             ci = self._stun_probe_batch(s1, [(t0, True, False)])[0]
             cp_src = cp[1] if cp else None
             ci_src = ci[1] if ci else None
-            cp_changed = cp_src is not None and cp_src[1] != t0.real_port
-            ci_changed = ci_src is not None and ci_src[1] != t0.real_port
+            cp_resp = cp_src is not None
+            ci_resp = ci_src is not None
+            # 服务器存活基线：主目标普通响应
+            server_alive = any(mapped is not None for mapped, _ in
+                                [batch.get(t, (None, None)) for t in ("same_target", "diff_port", "diff_ip")])
+            cp_changed = cp_resp and cp_src[1] != t0.real_port
+            ci_changed = ci_resp and ci_src[1] != t0.real_port
             # 归因增强：mock 环境响应源端口精确匹配伙伴目标
             if ci_src is not None and t2 is not None and ci_src[1] == t2.real_port:
                 ci_changed = True
             if cp_src is not None and t1 is not None and cp_src[1] == t1.real_port:
                 cp_changed = True
-            if ci_changed:
-                filtering = FILT_EI
-            elif cp_changed:
-                filtering = FILT_AD
-            else:
+            if ci_changed or cp_changed:
+                filtering_state = "allow"
+                filtering = FILT_EI if ci_changed else FILT_AD
+            elif server_alive:
+                # 服务器可达但 change 请求被拦截/无响应 → deny（被 NAT 过滤）
+                filtering_state = "deny"
                 filtering = FILT_APD
+            else:
+                filtering_state = "no-response"
+                filtering = FILT_UNKNOWN
 
         # 公网端点（服务器视角映射，真实可路由地址）
         public_ip = None
@@ -729,6 +757,8 @@ class NatDetector:
             "public_port": public_port,
             "confidence": confidence,
             "filtering": filtering,
+            "filtering_state": filtering_state,
+            "hairpin": None,
             "port_reuse": reuse,
             "legacy_nat_type": legacy_nat_type(mapping, allocation),
             "listen_port": s1.getsockname()[1],
@@ -747,6 +777,8 @@ class NatDetector:
             "public": None, "public_ip": None, "public_port": None,
             "confidence": 0.0,
             "filtering": FILT_UNKNOWN,
+            "filtering_state": "no-response",
+            "hairpin": None,
             "port_reuse": False,
             "legacy_nat_type": NAT_UNKNOWN,
             "listen_port": sock.getsockname()[1],
@@ -754,6 +786,37 @@ class NatDetector:
             "observations": [],
             "port_sequence": [],
         }
+
+
+def hairpin_probe(sock, public_ip, public_port, timeout=1.0):
+    """S2 hairpin 探测：向本端自身出口映射发包，观察回环。
+    返回 "supported"（收到回环响应且 XOR-MAPPED == 本端出口）| "unknown"（不判失败）。"""
+    if not public_ip or not public_port:
+        return "unknown"
+    try:
+        pub_int = struct.unpack(">I", socket.inet_aton(public_ip))[0]
+    except OSError:
+        return "unknown"
+    m = StunMsg(BINDING_REQUEST)
+    try:
+        sock.sendto(m.encode(), (public_ip, public_port))
+    except OSError:
+        return "unknown"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            data, src = sock.recvfrom(512)
+        except socket.timeout:
+            continue
+        except OSError:
+            return "unknown"
+        msg = StunMsg.decode(data)
+        if msg is None:
+            continue
+        mapped = msg.get_xor_mapped()
+        if mapped is not None and mapped == (pub_int, public_port):
+            return "supported"
+    return "unknown"
 
 
 def force_profile(profile, force_nat):
@@ -776,8 +839,8 @@ class PunchEngine:
                  keepalive_s=KEEPALIVE_S, hold_s=0.0, cache_path=None,
                  predict_n=8, random_m=64, seed=None, force_mode=None,
                  probe_port_min=None, probe_port_max=None, fw_dns=None,
-                 fw_tcp=None, fw_timeout=2.0,
-                 log=None):
+                 fw_tcp=None, fw_timeout=2.0, window_w=2, pool=None,
+                 budget_s=2.0, sweep=False, log=None):
         self.name = name
         self.local = local
         self.remote = remote
@@ -793,6 +856,10 @@ class PunchEngine:
         self.cache_path = cache_path
         self.predict_n = predict_n
         self.random_m = random_m
+        self.window_w = window_w           # S1.1 窗口乘数
+        self.pool = pool                   # S1.4 源 socket 池（None=按策略自动）
+        self.budget_s = budget_s           # S1.5 每轮预算（秒）
+        self.sweep = sweep                 # S1.5 是否启用全端口降采样兜底层
         self.rng = random.Random(seed)
         self.probe_port_min = probe_port_min
         self.probe_port_max = probe_port_max
@@ -817,10 +884,22 @@ class PunchEngine:
         self.local_public_port = local.get("public_port")
         self.local_bind = None
         self.cache_hint = None
+        # S1 状态：StepLearner / ReverseDetector / 命中量化
+        self.step_learner = _predict.StepLearner() if _predict else None
+        self.reverse_detector = _predict.ReverseDetector() if _predict else None
+        self.budget_scanner = _predict.BudgetScanner(budget_s=budget_s) if _predict else None
+        self.probe_hits = []             # 命中所在探针序号（1-based，本轮从 0 计数）
+        self._probe_seq = 0
+        self._round_hits = []
+        self._first_recv_ts = None
+        self.events = []                 # S4 统一时间线事件（环形缓冲，有界 1000）
         self.stats = {
             "punches_sent": 0, "punches_recv": 0, "learn_events": 0,
             "predicted_hits": 0, "keptalive": 0, "cache_hits": 0, "cache_saves": 0,
             "epoch": 0, "establish_ms": None, "step_history": [], "mode": self.mode,
+            "step_final": 0, "step_revisions": 0, "pool_sockets": 1,
+            "budget_split": None, "pattern": None, "mapping_drift_count": 0,
+            "confirmation_overhead_ms": None, "precision_top_n": None, "hit_metrics": None,
         }
 
     # ---- socket 管理 ----
@@ -856,6 +935,15 @@ class PunchEngine:
             threading.Thread(target=self._recv_loop, args=(s,), daemon=True).start()
 
     # ---- 主流程 ----
+    def _evt(self, evt, **fields):
+        """S4 统一时间线事件：att=+ms evt=...（att 相对 start_ts）。"""
+        att = int((time.monotonic() - self.start_ts) * 1000) if self.start_ts else 0
+        rec = {"att": att, "evt": evt}
+        rec.update(fields)
+        self.events.append(rec)
+        if len(self.events) > 1000:
+            del self.events[: len(self.events) - 1000]
+
     def start(self):
         self.start_ts = time.monotonic()
         self.start_wall = time.time()
@@ -865,10 +953,16 @@ class PunchEngine:
         self._load_cache_hint()
         if self.mode in ("BothRandomSymmericPunch", "ConePunchToRandomSymmeric",
                          "RandomSymmericPunchToCone"):
-            self._open_extra_socks(3)
+            self._open_extra_socks(self._pool_size())
         self.log(f"Enhanced Hole Punching 1  mode={self.mode}  local_port={self.local_bind[1]}")
         self.log(f"start nat traversal analysis  local={self._short(self.local)}  "
                  f"remote={self._short(self.remote)}")
+        self._evt("nat_detect", mapping=self.local.get("mapping"),
+                  allocation=self.local.get("allocation"),
+                  filtering=self.local.get("filtering"),
+                  confidence=self.local.get("confidence"))
+        self._evt("strategy_selected", strategy=self.mode, pool=self._pool_size(),
+                  predict_n=self.predict_n, window_w=self._effective_w())
         threading.Thread(target=self._recv_loop, args=(self.sock,), daemon=True).start()
         deadline = time.time() + self.window_s
         while not self.p2p and time.time() < deadline:
@@ -878,21 +972,38 @@ class PunchEngine:
             self.log(f"retry in {self.retry_s:.1f}s (epoch {self.epoch})")
             time.sleep(self.retry_s)
         if not self.p2p:
-            blocked, results = check_firewall(dns_targets=self.fw_dns, tcp_targets=self._tcp_targets(),
+            verdict, results = check_firewall(dns_targets=self.fw_dns, tcp_targets=self._tcp_targets(),
                                               timeout=self.fw_timeout)
             self.log(f"PunchCheckFireWall, punch_epoch: {self.epoch}")
             for r in results["udp"]:
                 self.log(f"firewall check udp {r[0]} -> {'connected' if r[1] else 'blocked'}")
+                self._evt("firewall_probe", proto="udp", target=r[0], ok=r[1])
             for r in results["tcp"]:
                 self.log(f"firewall check tcp {r[0]} -> {'connected' if r[1] else 'blocked'}")
-            if blocked:
+                self._evt("firewall_probe", proto="tcp", target=r[0], ok=r[1])
+            self.stats["firewall"] = verdict
+            self._evt("fallback_decided", verdict=verdict, reason="punch_timeout")
+            if verdict == "yes":
                 self.log("found firewall, stop punch -> 转 TURN 中继")
                 return "firewall"
-            self.log("firewall check ok, but punch failed -> 转 TURN 中继")
+            if verdict == "mixed":
+                self.log("firewall mixed (udp blocked, tcp ok) -> 继续打洞 (转 TURN 候选)")
+            else:
+                self.log("firewall check ok, but punch failed -> 转 TURN 中继")
             return "fail"
         self.p2p_ts = time.time()
         self.stats["establish_ms"] = int((time.time() - self.start_wall) * 1000)
+        self.stats["step_final"] = self._remote_step_value()
+        self.stats["step_revisions"] = self.step_learner.revision_count if self.step_learner else 0
+        self.stats["pool_sockets"] = len(self._all_socks())
+        self.stats["pattern"] = self.reverse_detector.pattern if self.reverse_detector else None
+        if _predict and self._round_hits:
+            self.stats["precision_top_n"] = _predict.precision_at_top_n(
+                self._round_hits, self.predict_n, max(1, self.stats["punches_sent"]))
         self._save_cache()
+        self._evt("p2p_established", peer=f"{self.p2p_peer[0]}:{self.p2p_peer[1]}",
+                  recv=self.recv_count,
+                  confirmation_overhead_ms=self.stats["confirmation_overhead_ms"])
         self.log(f"★ P2P ESTABLISHED via {self.p2p_peer[0]}:{self.p2p_peer[1]} "
                  f"(bidirectional confirm, recv={self.recv_count})")
         if self.hold_s > 0:
@@ -911,8 +1022,6 @@ class PunchEngine:
     # ---- 策略执行 ----
     def _execute_once(self):
         self.log(f"execute: {self.mode}  (epoch {self.epoch + 1})")
-        for c in self.candidates:
-            self._send(self.sock, c[0], c[1])
         # 缓存预测区间入口优先
         if self.cache_hint is not None:
             for p in self.cache_hint:
@@ -926,8 +1035,11 @@ class PunchEngine:
             self._random_punch_once()
         else:
             self._standard_punch_once()
-        # learned 置底：本端 mapping.dest 停在「对端真实映射端口」——本端 APD filtering 只放行
-        # 恰好命中 dest 的源；对端从该端口回包即命中（解决 dest 被预测区间覆盖导致的时序竞态）
+        # 主候选置底：dest 停在「对端真实映射端口」——本端 APD filtering 只放行
+        # 恰好命中 dest 的源；对端从该端口回包即命中（解决 dest 被预测区间/cache
+        # 覆盖导致的时序竞态；learned 为空时此兜底保证 dest 不漂移）
+        for c in self.candidates:
+            self._send(self.sock, c[0], c[1])
         if self.learned:
             ip, p = self.learned[-1]
             self._send(self.sock, ip, p)
@@ -941,7 +1053,19 @@ class PunchEngine:
             return self.learned[-1][1]
         return self.remote_candidate[1]
 
+    def _pool_size(self):
+        # S1.4 BirthdayPool：显式 --pool 优先；否则按 random 模式推荐（M 固定时的源多样性收益）
+        if self.pool is not None:
+            return max(1, self.pool)
+        if _predict and self.mode in ("BothRandomSymmericPunch", "ConePunchToRandomSymmeric",
+                                      "RandomSymmericPunchToCone"):
+            return _predict.recommend_pool(self.random_m, target_p=0.6)
+        return 3
+
     def _remote_step_value(self):
+        # S1.2 StepLearner 融合（0xc057 通告 w=0.6 + 差分众数 w=0.4）
+        if self.step_learner is not None and self.step_learner.estimate is not None:
+            return self.step_learner.estimate
         if self.remote_step:
             return self.remote_step           # 对端 0xc057 实时通告（最新）
         step = infer_step(self.remote_ports)
@@ -951,12 +1075,32 @@ class PunchEngine:
             return self.remote.get("step")     # 对端信令通告的检测值
         return 1
 
-    def _linear_predict_once(self):
+    def _effective_w(self):
+        # S1.3 回拨模式识别：reverse 时 W+1 扩大窗口
+        if self.reverse_detector is not None:
+            return self.reverse_detector.suggest_window(self.window_w)
+        return self.window_w
+
+    def _window_predict(self):
+        # S1.1 双向窗口预测：N 按对端置信度 8/16 两档，W 窗口乘数，剔除已探测
         base = self._remote_base()
         step = self._remote_step_value()
         N = self.predict_n * (2 if self.remote.get("confidence", 0) >= 0.75 else 1)
-        ports = predict_ports(base, step, N, bidirectional=True)
-        self.log(f"predict punch address: base={base} step={step} N={N} first={ports[:8]}")
+        W = self._effective_w()
+        exclude = [p for (_, p) in self.learned] + list(self.cache_hint or [])
+        if _predict:
+            ports = _predict.predict_ports(base, step, N, W=W, exclude=exclude)
+            self._last_interval = _predict.predict_interval(base, step, N, W)
+        else:
+            ports = predict_ports(base, step, N, bidirectional=True)
+            self._last_interval = None
+        self._last_base, self._last_step, self._last_window = base, step, ports
+        return base, step, N, W, ports
+
+    def _linear_predict_once(self):
+        base, step, N, W, ports = self._window_predict()
+        self.log(f"predict punch address: base={base} step={step} N={N} W={W} "
+                 f"interval={self._last_interval} first={ports[:8]}")
         for p in ports:
             self._send(self.sock, self._remote_ip(), p)
         # 本端若为 symmetric-linear：开新 socket 产生递增映射端口，供对端学习回打
@@ -974,18 +1118,40 @@ class PunchEngine:
             self._send(s, c[0], c[1])
 
     def _random_punch_once(self):
-        self._open_extra_socks(3)
-        self.log(f"find enough random remote ports for punching (M={self.random_m})")
+        pool = self._pool_size()
+        self._open_extra_socks(pool)
+        self.log(f"find enough random remote ports for punching (M={self.random_m}, pool={pool})")
         rp = self.remote
         if rp.get("mapping") == MAPPING_EI:
             target_ports = [rp.get("public_port") or self.remote_candidate[1]]
         else:
             base = self._remote_base()
             step = self._remote_step_value()
+            _, _, _, _, win = self._window_predict()
             target_ports = [self.remote_candidate[1]]
             target_ports += [p for (_, p) in self.learned]
-            target_ports += predict_ports(base, step, 8, bidirectional=True)
+            target_ports += win
             target_ports = list(dict.fromkeys(target_ports))
+        # S1.5 分层预算扫描：精确 → 窗口 → 随机 → （可选）全端口降采样
+        if self.budget_scanner is not None:
+            stages = self.budget_scanner.plan(target_ports, [], self.random_m, seed=id(self) ^ self.epoch)
+            stages = [s for s in stages if s[0] != "sweep" or self.sweep]
+            self.stats["budget_split"] = self.budget_scanner.last_decomposition
+            for kind, ports, _ in stages:
+                if kind == "random":
+                    ports = ports[: self.random_m]
+                for s in self._all_socks():
+                    for p in ports:
+                        self._send(s, self._remote_ip(), p)
+                if kind == "exact":
+                    self.log(f"budget stage exact: {len(ports)} ports")
+                elif kind == "window":
+                    self.log(f"budget stage window: {len(ports)} ports")
+                elif kind == "random":
+                    self.log(f"budget stage random: {len(ports)} ports")
+                elif kind == "sweep":
+                    self.log(f"budget stage sweep: {len(ports)} ports (step 8)")
+            return
         for s in self._all_socks():
             for p in target_ports:
                 self._send(s, self._remote_ip(), p)
@@ -1015,6 +1181,11 @@ class PunchEngine:
         try:
             sock.sendto(m.encode(), (ip, port))
             self.stats["punches_sent"] += 1
+            try:
+                idx = self._all_socks().index(sock)
+            except ValueError:
+                idx = 0
+            self._evt("probe_sent", target=f"{ip}:{port}", socket=idx)
         except OSError:
             pass
 
@@ -1036,14 +1207,30 @@ class PunchEngine:
                 self.log(f"recv: magic mismatch")
                 continue
             if self.p2p:
-                # P2P 已建立：不再回打（避免 loopback 下互喂雪崩），仅保持 keepalive 通道
+                # P2P 已建立：不再回打（避免 loopback 下互喂雪崩）；
+                # S3.1 对端端口漂移检测 → 触发重预测 + 候选更新
+                if addr != self.p2p_peer and addr[1] != self.p2p_peer[1]:
+                    with self._lock:
+                        self.stats["mapping_drift_count"] += 1
+                        self.log(f"drift detected: peer {self.p2p_peer[0]}:{self.p2p_peer[1]} "
+                                 f"-> {addr[0]}:{addr[1]}  (re-predict)")
+                        self._evt("drift_detected", old=f"{self.p2p_peer[0]}:{self.p2p_peer[1]}",
+                                  new=f"{addr[0]}:{addr[1]}")
+                        if addr not in self.learned:
+                            self.learned.append(addr)
+                        self.p2p_peer = addr
+                        self._last_base = addr[1]
                 continue
             with self._lock:
                 self.recv_count += 1
                 self.stats["punches_recv"] += 1
+                if self.recv_count == 1:
+                    self._first_recv_ts = time.monotonic()
             nr = m.get_nr()
             if nr and nr[0]:
                 self.remote_step = nr[0]   # 对端 0xc057 通告的本端 step
+                if self.step_learner is not None:
+                    self.step_learner.observe_advertised(nr[0])
             mapped = m.get_xor_mapped()
             if mapped:
                 ip, port = mapped
@@ -1051,8 +1238,11 @@ class PunchEngine:
             if not self.p2p and self.recv_count >= 2:
                 # 双向确认：收到对端第 2 个合法 punch 包。对端只在收到本端包后才回包，
                 # 故收到第 2 个包证明「对端已收到本端回打」→ 双向数据面贯通（多 1 RTT 防假阳性）。
+                # S3.3 confirmation_overhead_ms = 第 1 包 → 第 2 包的等待（相对「收到 MAGIC 即建」的代价）
                 with self._lock:
                     if not self.p2p:
+                        self.stats["confirmation_overhead_ms"] = int(
+                            (time.monotonic() - self._first_recv_ts) * 1000)
                         self.p2p = True
                         self.p2p_peer = addr
 
@@ -1068,19 +1258,41 @@ class PunchEngine:
             if c not in self.learned:
                 self.learned.append(c)
                 self.stats["learn_events"] += 1
+                self._evt("learned_candidate", target=f"{c[0]}:{c[1]}")
                 self.log(f"learned candidate {c[0]}:{c[1]} (upgrade)")
         self.remote_ports.append(mapped_port)
-        # 自适应重估 step（差分众数）
-        if len(self.remote_ports) >= 3:
+        # S1.3 回拨模式识别 + S1.2 StepLearner 差分观测
+        if self.reverse_detector is not None:
+            pat = self.reverse_detector.observe_port(mapped_port)
+            if self.stats["pattern"] is None:
+                self.stats["pattern"] = pat
+        if self.step_learner is not None:
+            if len(self.remote_ports) >= 2:
+                self.step_learner.observe_diff(self.remote_ports[-1] - self.remote_ports[-2])
+            est, conf, rev = self.step_learner.get()
+            if est:
+                self.remote_step = est
+                self.stats["step_final"] = est
+                self.stats["step_revisions"] = rev
+                self.stats["step_history"].append((self.epoch, list(self.remote_ports[-3:]), est))
+        elif len(self.remote_ports) >= 3:
             new_step = infer_step(self.remote_ports)
             if new_step and new_step != self.remote_step:
                 self.remote_step = new_step
                 self.stats["step_history"].append((self.epoch, list(self.remote_ports[-3:]), new_step))
                 self.log(f"adaptive step re-estimate -> {new_step}")
-        predicted = predict_ports(self._remote_base(), self._remote_step_value(),
-                                  self.predict_n, bidirectional=True)
-        if mapped_port in predicted:
+        # S1.6 命中量化：检查该端口是否落在当前预测窗口
+        base = getattr(self, "_last_base", None)
+        step = getattr(self, "_last_step", None)
+        window = getattr(self, "_last_window", None)
+        if base is not None and window is not None and mapped_port in window:
             self.stats["predicted_hits"] += 1
+            self._round_hits.append(self._probe_seq)
+            self._evt("punch_hit", port=mapped_port, base=base, socket=0)
+            if _predict:
+                hm = _predict.hit_metrics(mapped_port, base, step or 0, window)
+                self.stats["hit_metrics"] = hm
+        self._probe_seq += 1
         # 立即回打 learned + 所有候选（[H] 0x3f17e8: for addr in candidates: send_punch）
         self._reply_all(sock)
 
@@ -1111,6 +1323,7 @@ class PunchEngine:
                 if self.p2p_peer:
                     self._send(self.sock, self.p2p_peer[0], self.p2p_peer[1])
                     self.stats["keptalive"] += 1
+                    self._evt("keepalive_sent", target=f"{self.p2p_peer[0]}:{self.p2p_peer[1]}")
                     self.log(f"keepalive to {self.p2p_peer[0]}:{self.p2p_peer[1]}")
         self._keepalive_thread = threading.Thread(target=loop, daemon=True)
         self._keepalive_thread.start()
@@ -1119,11 +1332,22 @@ class PunchEngine:
         if not self.cache_path or not os.path.exists(self.cache_path):
             return
         rip = self.remote_candidate[0]
+        now = time.time()
         for pair in load_pair_cache(self.cache_path):
             if pair.get("remote_ip") == rip:
+                # S3.2 缓存热启动：ttl 过期（默认 1 小时）不启用；记录命中
+                ttl = int(pair.get("ttl", 3600))
+                ts = pair.get("ts", 0)
+                if ts and now - ts > ttl:
+                    self.log(f"pair cache expired for {rip} (age {int(now - ts)}s > ttl {ttl}s)")
+                    return
                 rng = pair.get("range") or []
                 self.cache_hint = [int(p) & 0xFFFF for p in rng if 0 <= int(p) <= 0xFFFF]
-                self.log(f"pair cache hit for {rip}: range={rng}")
+                self.cache_meta = {k: pair.get(k) for k in ("base", "step", "pattern", "ts", "ttl")}
+                self.stats["cache_hits"] = 1
+                self._evt("cache_hot_start", base=pair.get("base"), step=pair.get("step"),
+                          pattern=pair.get("pattern"))
+                self.log(f"pair cache hit for {rip}: range={rng} meta={self.cache_meta}")
                 return
 
     def _save_cache(self):
@@ -1140,6 +1364,8 @@ class PunchEngine:
             "base": base,
             "step": step,
             "range": rng,
+            "pattern": self.reverse_detector.pattern if self.reverse_detector else None,
+            "ttl": 3600,
             "ts": int(time.time()),
         }
         pairs = [p for p in pairs if p.get("remote_ip") != rip]
@@ -1217,9 +1443,15 @@ def run_peer(role, host, port, name, args):
                                     filtering_probe=args.filtering_probe)
     if args.force_nat is not None:
         profile = force_profile(profile, args.force_nat)
+    if args.hairpin_probe:
+        profile["hairpin"] = hairpin_probe(punch_sock, profile.get("public_ip"),
+                                           profile.get("public_port"),
+                                           timeout=min(args.probe_timeout, 1.5))
+        print(f"[{name}] hairpin probe: {profile['hairpin']}", flush=True)
     print(f"[{name}] NAT profile: mapping={profile['mapping']} allocation={profile['allocation']} "
           f"step={profile['step']} public={profile['public']} confidence={profile['confidence']:.2f} "
-          f"filtering={profile['filtering']} reuse={profile['port_reuse']} "
+          f"filtering={profile['filtering']} filtering_state={profile['filtering_state']} "
+          f"reuse={profile['port_reuse']} "
           f"legacy={profile['legacy_nat_type']} degraded={profile['degraded']}", flush=True)
     for o in profile["observations"]:
         print(f"[{name}]   obs {o['group']:<12} target={o['target']:<20} socket={o['socket_bind']:<15} "
@@ -1260,11 +1492,27 @@ def run_peer(role, host, port, name, args):
                          retry_s=args.retry_ms / 1000.0, window_s=args.window_s,
                          keepalive_s=args.keepalive_s, hold_s=args.hold_s,
                          cache_path=args.cache, predict_n=args.predict_n, random_m=args.random_m,
+                         window_w=args.window_w, pool=args.pool, budget_s=args.budget_s,
+                         sweep=args.sweep,
                          probe_port_min=args.probe_port_min, probe_port_max=args.probe_port_max,
                          fw_dns=fw_dns, fw_tcp=fw_tcp, fw_timeout=args.fw_timeout)
     result = engine.start()
     print(f"[{name}] result: {result}", flush=True)
     print(f"[{name}] stats: {json.dumps(engine.stats, sort_keys=True)}", flush=True)
+    # S4 每会话 JSON（时间线事件 + 指纹 + 指标）
+    if args.session_out:
+        session = {
+            "name": name, "role": role, "result": result,
+            "profile": profile, "peer_profile": peer_profile,
+            "peer_addr": list(peer_addr) if peer_addr else None,
+            "stats": engine.stats, "events": engine.events,
+        }
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.session_out)), exist_ok=True)
+            with open(args.session_out, "w", encoding="utf-8") as f:
+                json.dump(session, f, indent=1, sort_keys=True)
+        except OSError:
+            pass
     return result
 
 
@@ -1380,6 +1628,7 @@ def main():
     ap.add_argument("--probe-port-max", type=int, default=None)
     ap.add_argument("--probe-timeout", type=float, default=2.0)
     ap.add_argument("--filtering-probe", action="store_true", help="尽力做 RFC5780 filtering 探测（需服务器支持 CHANGE-REQUEST）")
+    ap.add_argument("--hairpin-probe", action="store_true", help="S2 hairpin 回环探测（supported/unknown，不判失败）")
     ap.add_argument("--retry-ms", type=int, default=5000)
     ap.add_argument("--window-s", type=float, default=PUNCH_WINDOW_S)
     ap.add_argument("--keepalive-s", type=float, default=KEEPALIVE_S)
@@ -1388,6 +1637,11 @@ def main():
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--predict-n", type=int, default=8)
     ap.add_argument("--random-m", type=int, default=64)
+    ap.add_argument("--window-w", type=int, default=2, help="S1.1 预测窗口乘数（默认 2；reverse 模式自动 +1）")
+    ap.add_argument("--pool", type=int, default=None, help="S1.4 随机模式源 socket 池大小（默认按 BirthdayPool 推荐）")
+    ap.add_argument("--budget-s", type=float, default=2.0, help="S1.5 每轮分层扫描总预算（秒）")
+    ap.add_argument("--sweep", action="store_true", help="S1.5 启用全端口降采样兜底层（默认关，包量大）")
+    ap.add_argument("--session-out", default=None, help="S4 会话 JSON 输出路径（时间线 + 指纹 + 指标）")
     ap.add_argument("--fw-dns", default=None, help="防火墙 UDP DNS 探测目标覆盖（ip:port,ip:port，供 mock 环境确定性）")
     ap.add_argument("--fw-tcp", default=None, help="防火墙 TCP 对照探测目标覆盖（ip:port,ip:port）")
     ap.add_argument("--fw-timeout", type=float, default=2.0, help="防火墙探测每目标超时（秒）")

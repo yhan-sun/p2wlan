@@ -1,23 +1,32 @@
-[A] NAT profile: mapping=address_port_dependent allocation=linear step=3 public=127.0.0.1:33100 confidence=1.00 filtering=endpoint_independent reuse=False legacy=2 degraded=False
+[A] NAT profile: mapping=address_port_dependent allocation=linear step=3 public=127.0.0.1:33100 confidence=1.00 filtering=endpoint_independent filtering_state=allow reuse=False legacy=2 degraded=False
 [A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33100
 [A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33100
 [A]   obs diff_port    target=203.0.113.1:33002    socket=127.0.0.1:30000 mapped=127.0.0.1:33106
 [A]   obs diff_ip      target=203.0.113.3:33003    socket=127.0.0.1:30000 mapped=127.0.0.1:33109
 [A]   obs new_socket   target=203.0.113.1:33001    socket=127.0.0.1:30001 mapped=127.0.0.1:33103
 [A] peer: B nat=2 profile=(address_port_dependent/linear) addr=('127.0.0.1', 34100)
+[A] pair cache expired for 127.0.0.1 (age 4984s > ttl 3600s)
 [A] Enhanced Hole Punching 1  mode=BothLinearSymmericPunch  local_port=30000
 [A] start nat traversal analysis  local=m=address_port_dependent/a=linear/s=3/f=endpoint_independent  remote=m=address_port_dependent/a=linear/s=3/f=endpoint_independent
 [A] execute: BothLinearSymmericPunch  (epoch 1)
-[A] predict punch address: base=34100 step=3 N=16 first=[34052, 34055, 34058, 34061, 34064, 34067, 34070, 34073]
+[A] predict punch address: base=34100 step=3 N=16 W=2 interval=(34004, 34196, 64) first=[34196, 34193, 34190, 34187, 34184, 34181, 34178, 34175]
 [A] retry in 0.8s (epoch 1)
 [A] learned candidate 127.0.0.1:34100 (upgrade)
 [A] learned candidate 127.0.0.1:34118 (upgrade)
 [A] learned candidate 127.0.0.1:34121 (upgrade)
-[A] learned candidate 127.0.0.1:34124 (upgrade)
+[A] learned candidate 127.0.0.1:34130 (upgrade)
+[A] drift detected: peer 127.0.0.1:34130 -> 127.0.0.1:34124  (re-predict)
+[A] drift detected: peer 127.0.0.1:34124 -> 127.0.0.1:34127  (re-predict)
+[A] drift detected: peer 127.0.0.1:34127 -> 127.0.0.1:34133  (re-predict)
+[A] drift detected: peer 127.0.0.1:34133 -> 127.0.0.1:34136  (re-predict)
+[A] drift detected: peer 127.0.0.1:34136 -> 127.0.0.1:34133  (re-predict)
+[A] drift detected: peer 127.0.0.1:34133 -> 127.0.0.1:34139  (re-predict)
+[A] drift detected: peer 127.0.0.1:34139 -> 127.0.0.1:34142  (re-predict)
 [A] saved pair cache (127.0.0.1)
-[A] ★ P2P ESTABLISHED via 127.0.0.1:34121 (bidirectional confirm, recv=3)
+[A] ★ P2P ESTABLISHED via 127.0.0.1:34142 (bidirectional confirm, recv=3)
 [A] P2P established, holding 4s for keepalive validation
-[A] keepalive to 127.0.0.1:34121
-[A] keepalive to 127.0.0.1:34121
+[A] keepalive to 127.0.0.1:34142
+[A] drift detected: peer 127.0.0.1:34142 -> 127.0.0.1:34145  (re-predict)
+[A] keepalive to 127.0.0.1:34145
 [A] result: p2p
-[A] stats: {"cache_hits": 0, "cache_saves": 1, "epoch": 1, "establish_ms": 810, "keptalive": 2, "learn_events": 4, "mode": "BothLinearSymmericPunch", "predicted_hits": 3, "punches_recv": 3, "punches_sent": 42, "step_history": []}
+[A] stats: {"budget_split": null, "cache_hits": 0, "cache_saves": 1, "confirmation_overhead_ms": 0, "epoch": 1, "establish_ms": 804, "hit_metrics": null, "keptalive": 2, "learn_events": 4, "mapping_drift_count": 8, "mode": "BothLinearSymmericPunch", "pattern": "forward", "pool_sockets": 2, "precision_top_n": null, "predicted_hits": 0, "punches_recv": 3, "punches_sent": 74, "step_final": 3, "step_history": [[1, [34100], 3], [1, [34100, 34100], 3], [1, [34100, 34100, 34100], 3]], "step_revisions": 1}

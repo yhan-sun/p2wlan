@@ -173,7 +173,7 @@ class Fabric:
 
 class SimNat:
     def __init__(self, name, vip_self, port_base, port_pool, mapping,
-                 allocation, step, filtering, seed, fabric=None):
+                 allocation, step, filtering, seed, fabric=None, hairpin=False):
         if mapping not in MAPPING_MODES:
             raise ValueError(f"--mapping must be one of {MAPPING_MODES}")
         if allocation not in ALLOC_MODES:
@@ -188,6 +188,7 @@ class SimNat:
         self.allocation = allocation
         self.step = step if allocation == "linear" else 0
         self.filtering = filtering
+        self.hairpin = hairpin
         self.rng = random.Random(seed)
         self.fabric = fabric
         self.next_port = port_base + 100      # 动态映射端口从 pub+100 起
@@ -264,11 +265,13 @@ class SimNat:
             return p
         raise RuntimeError(f"NAT {self.name} port pool exhausted")
 
-    def alloc_port(self, key):
+    def alloc_port(self, client, key):
         if self.allocation == "stable":
-            if key not in self.stable_home:
-                self.stable_home[key] = self._raw_alloc_free()
-            return self.stable_home[key]
+            # stable 语义：同一内部会话（client）端口永久复用（跨目标、跨时间不变）。
+            # 若按 key 缓存，同 socket 的多目标探测会得到顺序分配的假 linear 序列。
+            if client not in self.stable_home:
+                self.stable_home[client] = self._raw_alloc_free()
+            return self.stable_home[client]
         return self._raw_alloc_free()
 
     def mapping_for(self, client, dest_vip, dest_port):
@@ -279,7 +282,7 @@ class SimNat:
             m.dest_vip = dest_vip
             m.dest_port = dest_port
             return m
-        port = self.alloc_port(key)
+        port = self.alloc_port(client, key)
         m = Mapping(key, client, dest_vip, dest_port, port)
         self.mappings[key] = m
         self.mapping_by_port[port] = m
@@ -318,6 +321,9 @@ class SimNat:
                 data, dst = m.pending.popleft()
                 if m.transport is not None:
                     m.transport.sendto(data, dst)
+                    if self.fabric is not None:
+                        self.fabric.record("outbound_flushed", nat=self.name,
+                                           mapping_port=m.port, dst=dst)
         except OSError:
             m.pending.clear()
         finally:
@@ -372,8 +378,10 @@ class SimNat:
     # ---- 数据面 ----
     def handle_forward(self, port, data, src):
         owner = self.fabric.owner_of_private(src) if self.fabric else None
-        if owner is not None and owner is not self:
-            # 私有客户端直发 → 发送方 NAT 源翻译后重发
+        if owner is not None:
+            # src 是某 NAT 的私有客户端（含本 NAT 自身）→ 由该 NAT 源翻译后重发。
+            # （之前 `owner is not self` 把「本端私有客户端发往本端公网 forwarder」
+            #  误入 handle_inbound → hairpin/回环路径断裂）
             owner.translate_outbound(src, port, data)
             return
         self.handle_inbound(port, data, src)
@@ -384,6 +392,10 @@ class SimNat:
             dst_vip = "loopback"
         mapping = self.mapping_for(client, dst_vip, dst_port)
         mapping.pending.append((data, ("127.0.0.1", dst_port)))
+        if self.fabric is not None:
+            self.fabric.record("outbound_translated", nat=self.name,
+                               client=f"{client[0]}:{client[1]}", dst_port=dst_port,
+                               mapping_port=mapping.port, transport=mapping.transport is not None)
         if mapping.send_task is None or mapping.send_task.done():
             mapping.send_task = self.loop.create_task(self._flush_mapping(mapping))
 
@@ -404,7 +416,25 @@ class SimNat:
         src_vip = self.fabric.vip_of_public_port(src[1]) if self.fabric else None
         if src_vip is None:
             return
-        if not self.filtering_allows(mapping, src_vip, src[1]):
+        # S2 hairpin 轴：源 == 本 NAT 自身公网端点（自回环）。
+        # 真实 NAT 的 hairpin 回环由 NAT 自身发起，不受外部入站 filtering 限制；
+        # hairpin=no 时丢弃（模拟不支持回环）。
+        if src_vip == self.vip_self:
+            if not self.hairpin:
+                if self.fabric is not None:
+                    self.fabric.record("hairpin_drop", nat=self.name, port=port, src=src)
+                return
+            if self.fabric is not None:
+                self.fabric.record("hairpin_admitted", nat=self.name, port=port, src=src)
+            # hairpin echo：客户端向自身出口映射发 STUN Binding → 以本 NAT 公网端点
+            # （即该映射端口）回显响应（XOR-MAPPED=客户端出口）→ 观察回环。
+            txn, change = parse_stun(data)
+            if txn is not None and mapping.transport is not None:
+                mapping.transport.sendto(binding_response(txn, "127.0.0.1", mapping.port),
+                                         mapping.client)
+                return
+            # 非 STUN：正常回环投递
+        elif not self.filtering_allows(mapping, src_vip, src[1]):
             if self.fabric is not None:
                 self.fabric.record("inbound_filter_drop", nat=self.name,
                                    port=port, src=src, expected=(
@@ -425,7 +455,8 @@ class SimNat:
 def build_puncher_cmd(puncher_path, role, name, signal_port, stun, priv_min,
                       retry_ms, window_s, probe_timeout, keepalive_s, hold_s,
                       cache_path, predict_n, random_m, filtering_probe, fw_dns,
-                      fw_tcp, fw_timeout):
+                      fw_tcp, fw_timeout, window_w=2, pool=None, budget_s=2.0,
+                      sweep=False, session_out=None, hairpin_probe=False):
     cmd = [
         sys.executable, puncher_path,
         "--role", role,
@@ -449,8 +480,20 @@ def build_puncher_cmd(puncher_path, role, name, signal_port, stun, priv_min,
     ]
     if filtering_probe:
         cmd += ["--filtering-probe"]
+    if hairpin_probe:
+        cmd += ["--hairpin-probe"]
     if role == "connect":
         cmd += ["--host", "127.0.0.1"]
+    if window_w != 2:
+        cmd += ["--window-w", str(window_w)]
+    if pool is not None:
+        cmd += ["--pool", str(pool)]
+    if budget_s != 2.0:
+        cmd += ["--budget-s", str(budget_s)]
+    if sweep:
+        cmd += ["--sweep"]
+    if session_out:
+        cmd += ["--session-out", session_out]
     return cmd
 
 
@@ -458,12 +501,13 @@ def parse_peer_output(lines):
     data = {"lines": lines}
     for ln in lines:
         if "NAT profile:" in ln:
-            m = re.search(r"mapping=(\S+) allocation=(\S+) step=(\S+) public=(\S+) confidence=([\d.]+) filtering=(\S+) reuse=(\S+)", ln)
+            m = re.search(r"mapping=(\S+) allocation=(\S+) step=(\S+) public=(\S+) confidence=([\d.]+) filtering=(\S+) filtering_state=(\S+) reuse=(\S+)", ln)
             if m:
                 data["detected"] = {
                     "mapping": m.group(1), "allocation": m.group(2), "step": int(m.group(3)),
                     "public": m.group(4), "confidence": float(m.group(5)),
-                    "filtering": m.group(6), "reuse": m.group(7) == "True",
+                    "filtering": m.group(6), "filtering_state": m.group(7),
+                    "reuse": m.group(8) == "True",
                 }
         if "result:" in ln:
             data["result"] = ln.split("result:")[1].strip()
@@ -488,9 +532,11 @@ def parse_peer_output(lines):
 async def run_pair(args):
     fabric = Fabric()
     nat_a = SimNat("A", VIP_A, args.pub_a, args.pub_pool,
-                   args.mapping_a, args.allocation_a, args.step_a, args.filtering_a, args.seed, fabric)
+                   args.mapping_a, args.allocation_a, args.step_a, args.filtering_a, args.seed, fabric,
+                   args.hairpin_a)
     nat_b = SimNat("B", VIP_B, args.pub_b, args.pub_pool,
-                   args.mapping_b, args.allocation_b, args.step_b, args.filtering_b, args.seed + 1, fabric)
+                   args.mapping_b, args.allocation_b, args.step_b, args.filtering_b, args.seed + 1, fabric,
+                   args.hairpin_b)
     await nat_a.start(fabric)
     await nat_b.start(fabric)
     fabric.set_nats([nat_a, nat_b],
@@ -510,12 +556,18 @@ async def run_pair(args):
                               args.priv_a, args.retry_ms, args.window_s, args.probe_timeout,
                               args.keepalive_s, args.hold_s, cache_a,
                               args.predict_n, args.random_m, args.filtering_probe, fw_dns,
-                              "127.0.0.1:443", 1.0)
+                              "127.0.0.1:443", 1.0,
+                              args.window_w, args.pool, args.budget_s, args.sweep,
+                              os.path.join(args.workdir, "session_a.json"),
+                              args.hairpin_probe)
     cmd_b = build_puncher_cmd(args.puncher, "connect", "B", args.signal_port, stun_b,
                               args.priv_b, args.retry_ms, args.window_s, args.probe_timeout,
                               args.keepalive_s, args.hold_s, cache_b,
                               args.predict_n, args.random_m, args.filtering_probe, fw_dns,
-                              "127.0.0.1:443", 1.0)
+                              "127.0.0.1:443", 1.0,
+                              args.window_w, args.pool, args.budget_s, args.sweep,
+                              os.path.join(args.workdir, "session_b.json"),
+                              args.hairpin_probe)
 
     start_wall = time.time()
     proc_a = await asyncio.create_subprocess_exec(
@@ -602,6 +654,8 @@ def main():
     ap.add_argument("--step-b", type=int, default=3)
     ap.add_argument("--filtering-a", choices=FILTER_MODES, default="ei")
     ap.add_argument("--filtering-b", choices=FILTER_MODES, default="ei")
+    ap.add_argument("--hairpin-a", action="store_true", help="NAT A 支持 hairpin（自回环）")
+    ap.add_argument("--hairpin-b", action="store_true", help="NAT B 支持 hairpin（自回环）")
     ap.add_argument("--seed", type=int, default=20260816)
     ap.add_argument("--priv-a", type=int, default=30000)
     ap.add_argument("--priv-b", type=int, default=31000)
@@ -618,6 +672,11 @@ def main():
     ap.add_argument("--filtering-probe", action="store_true")
     ap.add_argument("--predict-n", type=int, default=8)
     ap.add_argument("--random-m", type=int, default=64)
+    ap.add_argument("--window-w", type=int, default=2)
+    ap.add_argument("--pool", type=int, default=None)
+    ap.add_argument("--budget-s", type=float, default=2.0)
+    ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--hairpin-probe", action="store_true", help="驱动 puncher 做 hairpin 回环探测")
     ap.add_argument("--fw-dns", default=None)
     ap.add_argument("--workdir", default="/tmp/punch_sim")
     ap.add_argument("--json-out", default=None)

@@ -1,0 +1,73 @@
+# MIGRATION_RFC.md — UU 远程 NAT 打洞算法 → p2wlan Rust 迁移蓝图（S7）
+
+- 状态：Draft（待 Gate1 验收后评审）
+- 依据：
+  - `/Users/pyu/Downloads/README.md`（UU 远程 v4.35.0 逆向协议，算法唯一依据）
+  - `scripts/punch-research/`（本次研究工程化验证成果：puncher.py / predict.py / fingerprint.py / nat_sim.py）
+  - p2wlan 现状调研（见「现状对照表」）
+
+## 1. 现状对照表
+
+| 能力 | p2wlan 现状 | punch-research 验证成果 | 差距 |
+|---|---|---|---|
+| NAT 检测 | `client/nat/src/detection.rs`：单 socket 双 STUN 服务器端口比较（简化法）；`detect_full`（RFC 3489）备选未启用 | 行为分类三轴（mapping/allocation/filtering）+ 四态映射 {ei,ad,apd,unknown}，多源交叉注入准确率 100%（fingerprint.py 单测 48/48） | 生产未走 detect_full；无 filtering 三态/全交叉探测 |
+| 端口预测 | `client/nat/src/mapping.rs`：PortModelKind{FixedStep,Linear,NoisyLinear,MonotonicWindow,Periodic,Stable}，predict_ports 窗口 24/96 | predict.py：双向窗口 predict_ports、StepLearner（EWMA 0.6/0.4）、ReverseDetector（forward/reverse/mixed）、BirthdayPool（cap 128）、BudgetScanner 四段预算 | 已有主体，缺：反向/漂移检测、双窗口双向、池化散射调度、预算拆分回退链 |
+| 打洞 | `direct_runtime/hole_punch.rs` + `udp/outbound.rs`：PUNCH/ACK 14B、同步 punch_at、fresh-mapping 预测并发、PunchSocketPolicy 散射 | 7 策略表 + 三层预算回退（exact→window→random→sweep）、三态防火墙判定、hairpin 探测、drift 重预测 | 缺：预测失败逐级回退预算、防火墙三态接入散射决策 |
+| 生命周期 | candidate_refresh 15s 周期、3s 快重试、volatile 防抖 500ms、keepalive 25s 建议 | 参数化 keepalive、漂移检测+重预测、pair 缓存热启动（ttl+pattern）、事件时间线 | 缺：漂移检测接入 refresh 循环、缓存热启动协议化 |
+| 信令 | nat_type ≤64B 字符串 hint（`p2:m=..;a=..;d=..;c=..`）；server 纯存储透传 | 无（研究仅客户端视角） | 缺：结构化字段（mapping/allocation/filtering/hairpin/置信度）、指纹版本号、预测窗口向量下发 |
+| 环境 | netenv.rs 仅代理/TUN 捕获 | 无新增（检测链路在 nat 探测中） | 无 |
+| 验证 | mock/ 仅有 Rust harness 冒烟 | nat_sim.py 双 NAT 全谱模拟（4×3×3 注入）+ 36 组回归 + 324 格网格校准 | 迁移后需同一测试向量回放 |
+
+## 2. 迁移范围与落点（Phase R1-R4）
+
+### R1 检测链路升级（低风险，独立）
+- `client/nat/src/detection.rs`：启用/扩展现有 active probes（`apply_active_behavior_probes`）为**三态 filtering**（allow/deny/no-response）+ **hairpin**（supported/unknown）+ **mapping lifetime** 探测；输出与 `NatProfile` 合并。
+- 新增 `NatFingerprint`（mapping/allocation/filtering/hairpin/mapping_confidence + observations 摘要），`control_label()` 扩展为 `p2:m=..;a=..;f=..;h=..;c=..`（向后兼容：旧客户端忽略未知字段）。
+- 落点：`client/nat/src/ice.rs`（NatProfile）、`active_probes.rs`。
+- 验收：nat_sim 注入矩阵 36 组回放，detection 与注入一致率 ≥95%。
+
+### R2 预测引擎升级（中风险，核心收益）
+- `client/nat/src/mapping.rs`：
+  - predict_ports 改双窗口双向（W=2 默认，向下回绕保护，UINT16 wrap 防护）；
+  - 新增 StepLearner（EWMA 差分学习：`next = 0.6*advertised + 0.4*(last_diff)`）替代当前纯差分；
+  - 新增 ReverseDetector：batch 内 diff 符号翻转 → 计数 forward/reverse/mixed，reverse 时建议窗口 W+1；
+  - 新增 drift 检测：连续 2+ 映射变化偏离模型 → 标记 drift，触发 refresh 重建模。
+- `client/daemon/src/udp/outbound.rs`：`build_probe_schedule` 插入**预算分层**：exact→window（predict_ports）→random（birthday 池）→sweep（大步进 8），每层独立预算，上一层全败才进入下一层（对齐 punch-research BudgetScanner）。
+- 落点：`client/nat/src/mapping.rs`、`udp/outbound.rs`、`udp/dynamic_punch.rs`（fresh-mapping 批量测量已具备，接 StepLearner）。
+- 验收：双 linear 场景 P50 命中轮次 ≤2（nat_sim 回放 + 真实网络）。
+
+### R3 生命周期与缓存（低风险）
+- candidate_refresh 循环接入 drift 信号（R2）与 caching hint（对端预测窗口缓存）：cache 命中时跳过重 gather，直接打洞；
+- keepalive 参数化（默认 25s，配置可调），与 relay-backoff heartbeat 共存；
+- 落点：`client/daemon/src/candidate_refresh/runtime.rs`、`hole_punch.rs`。
+
+### R4 信令与对端散射（中风险，需服务端小改）
+- 服务端（Go）`UpdateDeviceEndpoint` 校验改为结构化解析（mapping/allocation/filtering/hairpin 枚举 + confidence），仍存 TEXT 兼容旧格式；
+- `remote_nat_requires_port_scatter` 扩展：使用 filtering 字段（apd → 散射 + 预测窗口全量），hairpin 字段（本地 hairpin=no 时对端直连不可用 → 快速回落中继）；
+- 落点：`server/api/device_handlers.go`、`client/daemon/src/peer/connection/candidates.rs`。
+- 注：信令仅 hint，Direct 提升仍以加密验证 ACK 为准（不改变现有安全模型）。
+
+## 3. 明确不迁移项
+- RFC 3489 `NatType` 枚举（Full/Restricted/PortRestricted/Symmetric）保留兼容，但不再作为决策输入；
+- `detect()` 简化双服务器法保留为 fallback（服务器不支持 CHANGE-REQUEST 时）；
+- punch-research 的 asyncio mock 结构不迁移（仅行为语义迁移到 tokio）。
+
+## 4. 风险与缓解
+| 风险 | 缓解 |
+|---|---|
+| CHANGE-REQUEST 探测被现实 NAT 忽略 | no-response 三态 → 按 APD/deny 保守决策 + 全量散射兜底 |
+| 预测窗口过大挤占信号带宽 | MAX_SIGNAL_FRESH_WINDOW_CANDIDATES=96 截断保留，按置信度排序 |
+| 服务端格式演进兼容 | nat_type TEXT 字段前缀版本化（`p2v2:...`），旧客户端字符串直接透传 |
+| 迁移回归无环境 | nat_sim 全谱矩阵（36 组）作为 Rust 集成测试向量库回放（GTest/nextest） |
+
+## 5. 验收与回放
+1. nat_sim 36 组矩阵注入 → Rust 检测/预测模块输出一致（mapping/allocation/filtering/hairpin/step）；
+2. 网格推荐参数（见 RECOMMENDED_PARAMS.md）作为 Rust 默认配置；
+3. 双 linear 场景真实网络 P50 建立 ≤1.5s、成功率 ≥95%（Gate2 实测）。
+
+## 6. 里程碑
+- R1: 检测三态 + 指纹信令（1 周）
+- R2: 预测升级 + 预算分层（2 周）
+- R3: 生命周期接入（1 周）
+- R4: 服务端结构化 + 散射决策（1 周）
+- 回归：nat_sim 向量库回放 + 真实网络 A/B（1 周）

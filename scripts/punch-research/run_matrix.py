@@ -107,10 +107,13 @@ def run_one(c, idx, args):
         "--workdir", os.path.join(ARTIFACTS, "work", c["id"]),
         "--seed", str(args.seed),
     ]
-    # 清理上一组合可能残留的孤儿 puncher（nat_sim 被超时 kill 后无法回收子进程）
-    subprocess.run(["pkill", "-f", "punch-research/puncher.py"],
+    # 清理上一组合可能残留的孤儿进程（nat_sim 被超时 kill 后无法回收 puncher 子进程，
+    # 其绑定的 observer/forwarder/信号端口会阻塞下一轮 → EADDRINUSE 秒退）
+    subprocess.run(["pkill", "-9", "-f", "punch-research/nat_sim.py"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.3)
+    subprocess.run(["pkill", "-9", "-f", "punch-research/puncher.py"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
     t0 = time.time()
     crash_dir = os.path.join(ARTIFACTS, "work", c["id"])
     os.makedirs(crash_dir, exist_ok=True)
@@ -131,6 +134,17 @@ def run_one(c, idx, args):
         report = {"success": False, "timed_out": False, "wall_ms": int((time.time() - t0) * 1000),
                   "a": {}, "b": {}, "error": "json:" + str(e)}
     report["_elapsed"] = int((time.time() - t0) * 1000)
+    # 秒退通常是端口冲突（前轮残留）：自动重试一次
+    if report.get("wall_ms", 0) < 1000 and report.get("error") is None and not report.get("success"):
+        time.sleep(1.0)
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.combo_timeout)
+            report = json.loads(r.stdout)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+        report["_retried"] = True
+        report["_elapsed"] = int((time.time() - t0) * 1000)
     return report
 
 

@@ -1,10 +1,11 @@
-[A] NAT profile: mapping=endpoint_independent allocation=stable step=0 public=127.0.0.1:33480 confidence=1.00 filtering=endpoint_independent reuse=False legacy=1 degraded=False
+[A] NAT profile: mapping=endpoint_independent allocation=stable step=0 public=127.0.0.1:33480 confidence=1.00 filtering=endpoint_independent filtering_state=allow reuse=False legacy=1 degraded=False
 [A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
 [A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
 [A]   obs diff_port    target=203.0.113.1:33002    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
 [A]   obs diff_ip      target=203.0.113.3:33003    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
 [A]   obs new_socket   target=203.0.113.1:33001    socket=127.0.0.1:30001 mapped=127.0.0.1:33598
 [A] peer: B nat=1 profile=(endpoint_independent/stable) addr=('127.0.0.1', 34795)
+[A] pair cache expired for 127.0.0.1 (age 4971s > ttl 3600s)
 [A] Enhanced Hole Punching 1  mode=DirectConePunch  local_port=30000
 [A] start nat traversal analysis  local=m=endpoint_independent/a=stable/s=0/f=endpoint_independent  remote=m=endpoint_independent/a=stable/s=0/f=endpoint_independent
 [A] execute: DirectConePunch  (epoch 1)
@@ -16,4 +17,4 @@
 [A] keepalive to 127.0.0.1:34795
 [A] keepalive to 127.0.0.1:34795
 [A] result: p2p
-[A] stats: {"cache_hits": 0, "cache_saves": 1, "epoch": 1, "establish_ms": 800, "keptalive": 2, "learn_events": 1, "mode": "DirectConePunch", "predicted_hits": 0, "punches_recv": 2, "punches_sent": 7, "step_history": []}
+[A] stats: {"budget_split": null, "cache_hits": 0, "cache_saves": 1, "confirmation_overhead_ms": 0, "epoch": 1, "establish_ms": 805, "hit_metrics": null, "keptalive": 2, "learn_events": 1, "mapping_drift_count": 0, "mode": "DirectConePunch", "pattern": "forward", "pool_sockets": 1, "precision_top_n": null, "predicted_hits": 0, "punches_recv": 2, "punches_sent": 7, "step_final": 1, "step_history": [], "step_revisions": 0}

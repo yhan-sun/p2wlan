@@ -1,0 +1,63 @@
+session	side	result	establish_ms	strategy	predict_hit	hit_offset	step_final	step_revisions	pool_sockets	budget_split	confirmation_overhead	mapping_drift_count	pattern	firewall	mapping	allocation	filtering	filtering_state	hairpin
+p2-b-ad-linear	A	p2p	807	ConePunchToLinearSymmeric	0		6	1	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ad-linear	B	p2p	806	LinearSymmericPunchToCone	0		1	0	2		0	0	forward		address_dependent	linear	endpoint_independent	allow	supported
+p2-b-ad-random	A	p2p	803	ConePunchToLinearSymmeric	0		64912	1	1		0	4	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ad-random	B	p2p	803	LinearSymmericPunchToCone	0		1	0	2		6	0	forward		address_dependent	linear	endpoint_independent	allow	supported
+p2-b-ad-stable	A	p2p	806	DirectConePunch	0		1	0	1		1	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ad-stable	B	p2p	806	DirectConePunch	0		1	0	1		1	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-b-apd-linear	A	p2p	806	ConePunchToLinearSymmeric	0		3	1	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-apd-linear	B	p2p	807	LinearSymmericPunchToCone	0		1	0	2		0	0	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-b-apd-random	A	p2p	1220	ConePunchToRandomSymmeric	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	0	124	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-apd-random	B	p2p	1036	RandomSymmericPunchToCone	0		1	0	129	{"exact": 0.2, "random": 12.8, "sweep": 1638.4}	20	138	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-b-apd-stable	A	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-apd-stable	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-b-ei-linear	A	p2p	801	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ei-linear	B	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ei-random	A	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ei-random	B	p2p	804	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ei-stable	A	p2p	803	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-b-ei-stable	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fad-b-apd-linear	A	p2p	810	ConePunchToLinearSymmeric	0		3	1	1		0	2	forward		endpoint_independent	stable	address_dependent	allow	supported
+p2-fad-b-apd-linear	B	p2p	810	LinearSymmericPunchToCone	0		1	0	2		1	0	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-fad-b-apd-random	A	p2p	2332	ConePunchToRandomSymmeric	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	18	130	forward		endpoint_independent	stable	address_dependent	allow	supported
+p2-fad-b-apd-random	B	p2p	1658	RandomSymmericPunchToCone	0		1	0	129	{"exact": 0.2, "random": 12.8, "sweep": 1638.4}	7	79	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-fad-b-ei-linear	A	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	address_dependent	allow	supported
+p2-fad-b-ei-linear	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fapd-b-apd-linear	A	firewall		ConePunchToLinearSymmeric	0		0	0	1			0		yes	endpoint_independent	stable	address_port_dependent	deny	supported
+p2-fapd-b-apd-linear	B	p2p	802	LinearSymmericPunchToCone	0		1	0	2		0	0	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-fapd-b-apd-random	A	p2p	1279	ConePunchToRandomSymmeric	0		1	0	129	{"exact": 11.4, "random": 12.8, "sweep": 1638.4}	0	1038	forward		endpoint_independent	stable	address_port_dependent	deny	supported
+p2-fapd-b-apd-random	B	p2p	1046	RandomSymmericPunchToCone	0		1	0	129	{"exact": 0.2, "random": 12.8, "sweep": 1638.4}	0	50	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-fapd-b-ei-linear	A	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	address_port_dependent	deny	supported
+p2-fapd-b-ei-linear	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fei-b-apd-linear	A	p2p	806	ConePunchToLinearSymmeric	0		3	1	1		0	2	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fei-b-apd-linear	B	p2p	805	LinearSymmericPunchToCone	0		1	0	2		0	0	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-fei-b-apd-random	A	p2p	1667	ConePunchToRandomSymmeric	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	0	193	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fei-b-apd-random	B	p2p	1393	RandomSymmericPunchToCone	0		1	0	129	{"exact": 0.2, "random": 12.8, "sweep": 1638.4}	34	198	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-fei-b-ei-linear	A	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-fei-b-ei-linear	B	p2p	804	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-filt-ad	A	p2p	809	LinearSymmericPunchToCone	0		1	0	2		0	0	forward		address_port_dependent	linear	address_port_dependent	deny	supported
+p2-filt-ad	B	p2p	806	ConePunchToLinearSymmeric	0		3	1	1		0	2	forward		endpoint_independent	stable	address_dependent	allow	supported
+p2-filt-apd	A	p2p	1615	LinearSymmericPunchToCone	0		1	0	3		9	0	forward		address_port_dependent	linear	address_port_dependent	deny	supported
+p2-filt-apd	B	firewall		ConePunchToLinearSymmeric	0		0	0	1			0		yes	endpoint_independent	stable	address_port_dependent	deny	supported
+p2-filt-ei	A	p2p	812	LinearSymmericPunchToCone	0		1	0	2		1	0	forward		address_port_dependent	linear	address_port_dependent	deny	supported
+p2-filt-ei	B	p2p	807	ConePunchToLinearSymmeric	0		3	1	1		0	2	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-hp00	A	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-hp00	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-hp01	A	p2p	806	DirectConePunch	0		1	0	1		1	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-hp01	B	p2p	803	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-hp10	A	p2p	802	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-hp10	B	p2p	804	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	unknown
+p2-hp11	A	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-hp11	B	p2p	805	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-sym0	A	p2p	803	BothLinearSymmericPunch	0		3	1	2		0	11	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-sym0	B	p2p	802	BothLinearSymmericPunch	0		3	1	2		0	9	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-sym1	A	p2p	805	BothLinearSymmericPunch	0		3	1	2		0	4	forward		address_dependent	linear	endpoint_independent	allow	supported
+p2-sym1	B	p2p	807	BothLinearSymmericPunch	0		6	1	2		0	4	forward		address_dependent	linear	endpoint_independent	allow	supported
+p2-sym2	A	p2p	802	ConePunchToLinearSymmeric	0		3	1	1		0	2	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-sym2	B	p2p	804	LinearSymmericPunchToCone	0		1	0	2		1	0	forward		address_port_dependent	linear	endpoint_independent	allow	supported
+p2-sym3	A	p2p	1794	BothRandomSymmericPunch	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	97	509	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-sym3	B	p2p	1785	BothRandomSymmericPunch	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	0	351	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-sym4	A	p2p	1538	ConePunchToRandomSymmeric	0		1	0	129	{"exact": 13.0, "random": 12.8, "sweep": 1638.4}	0	138	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-sym4	B	p2p	1186	RandomSymmericPunchToCone	0		1	0	129	{"exact": 0.2, "random": 12.8, "sweep": 1638.4}	24	42	forward		address_port_dependent	random	endpoint_independent	allow	supported
+p2-sym5	A	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
+p2-sym5	B	p2p	806	DirectConePunch	0		1	0	1		0	0	forward		endpoint_independent	stable	endpoint_independent	allow	supported
