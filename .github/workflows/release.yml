@@ -63,6 +63,7 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
       - name: Build Android arm64 release APK
         working-directory: apps/flutter_client
@@ -117,6 +118,7 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
       - name: Build unsigned iOS release app
         working-directory: apps/flutter_client
@@ -193,6 +195,7 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
       - name: Build macOS release app
         working-directory: apps/flutter_client
@@ -208,8 +211,12 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
 
+      - name: Diagnose checkout dirt
+        run: |
+          git status --porcelain=v1 --untracked-files=all
       - name: Create architecture-specific DMG
         run: |
           set -euo pipefail
@@ -311,6 +318,7 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
       - name: Build Linux daemon
         run: cargo build -p p2wlan-daemon --release
@@ -327,8 +335,12 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
 
+      - name: Diagnose checkout dirt
+        run: |
+          git status --porcelain=v1 --untracked-files=all
       - name: Assemble Linux Flutter artifact
         run: |
           set -euo pipefail
@@ -401,6 +413,7 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
       - name: Build Windows daemon
         run: cargo build -p p2wlan-daemon --release
@@ -420,8 +433,12 @@ jobs:
           git checkout --
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
 
 
+      - name: Diagnose checkout dirt
+        run: |
+          git status --porcelain=v1 --untracked-files=all
       - name: Build Windows installer
         shell: pwsh
         env:
