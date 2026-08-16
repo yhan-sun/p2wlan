@@ -108,6 +108,7 @@ where
         })
         .collect();
 
+    // always probe at least one round even if retries is misconfigured to 0
     let rounds = cfg.retries.max(1) as usize;
     for round in 0..rounds {
         let mut set = tokio::task::JoinSet::new();
@@ -116,15 +117,23 @@ where
             let fut = run_target(round, target); // FnMut borrow; returns Fut
             set.spawn(async move { (idx, fut.await) }); // Fut: Send + 'static
         }
-        while let Some(Ok((idx, res))) = set.join_next().await {
-            match res {
-                TargetProbeResult::Responded { elapsed } => {
-                    any_responded = true;
-                    per_target[idx].responded = true;
-                    per_target[idx].elapsed_ms = Some(elapsed.as_millis() as u64);
-                }
-                TargetProbeResult::NoResponse => {}
-                TargetProbeResult::SocketError => {
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok((idx, res)) => match res {
+                    TargetProbeResult::Responded { elapsed } => {
+                        any_responded = true;
+                        per_target[idx].responded = true;
+                        per_target[idx].elapsed_ms = Some(elapsed.as_millis() as u64);
+                    }
+                    TargetProbeResult::NoResponse => {}
+                    TargetProbeResult::SocketError => {
+                        any_socket_error = true;
+                    }
+                },
+                Err(_) => {
+                    // A spawned probe future panicked: classify as a socket/system
+                    // fault (Unknown), never as silence — silence is what certifies
+                    // Blocked, and a panic is not silence.
                     any_socket_error = true;
                 }
             }
@@ -164,7 +173,7 @@ mod tests {
         ["10.0.0.1:53".parse().unwrap(), "10.0.0.2:53".parse().unwrap()]
     }
 
-    /// Map a target SocketAddr back to its index (0 or 1) via the last IP octet.
+    /// Map a probe target back to its script index (test-only; full-string match).
     fn target_idx(target: SocketAddr) -> usize {
         match target {
             t if t.to_string() == "10.0.0.1:53" => 0,
@@ -271,5 +280,32 @@ mod tests {
         let cells = [Script::Timeout, Script::Respond, Script::Timeout, Script::Timeout];
         let outcome = probe(&cfg_2(&cells), stub(&cells)).await;
         assert_eq!(outcome.verdict, LivenessVerdict::Ok);
+    }
+
+    #[tokio::test]
+    async fn panicked_probe_future_maps_to_unknown_not_blocked() {
+        // A run_target whose future panics must be classified Unknown (socket/system
+        // fault), never Blocked (firewall proof).  Use a fresh socket per target so
+        // no real network is touched; the panic is injected at await time.
+        let targets: Vec<SocketAddr> =
+            ["10.9.9.1:53".parse().unwrap(), "10.9.9.2:53".parse().unwrap()].to_vec();
+        let cfg = LivenessConfig {
+            targets,
+            timeout: Duration::from_millis(10),
+            retries: 1,
+        };
+        let outcome = probe(&cfg, |_round, _target| {
+            Box::pin(async move { panic!("injected probe panic") })
+        })
+        .await;
+        assert_eq!(
+            outcome.verdict,
+            LivenessVerdict::Unknown,
+            "a panicked probe is a system fault, not firewall proof"
+        );
+        assert!(
+            outcome.per_target.iter().all(|t| !t.responded),
+            "no target marked responded"
+        );
     }
 }
