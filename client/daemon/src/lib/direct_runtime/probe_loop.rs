@@ -1,3 +1,5 @@
+use crate::peer::RecoveryStage;
+
 #[allow(clippy::too_many_arguments)]
 async fn run_direct_probe_loop(
     peers: Arc<PeerManager>,
@@ -655,6 +657,38 @@ async fn run_direct_probe_loop(
                                 .await
                                 .delta_since(rx_before);
                             if success_count_after == success_count_before {
+                                {
+                                    // Outbound-UDP liveness (P1: spawned, never awaited here).
+                                    // Trigger only at the ScatterExtended boundary where the
+                                    // wide window has actually been sent (`window_completed`)
+                                    // — triggering earlier (Initial/Predicted/ScatterSmall)
+                                    // would judge a firewall before enough of the window was
+                                    // scanned, and a birthday `Some((false,_))` window was not
+                                    // fully sent so "exhausted" is not yet proven. The probe
+                                    // runs in its own task; a Blocked verdict it writes is
+                                    // consumed at the next tick's admission
+                                    // (apply_cached_liveness_block).
+                                    let stage = peers.recovery_stage_for(&peer_id).await;
+                                    // `birthday_window_completion` is `Option<(bool, bool)>`;
+                                    // borrow it (do NOT move — the `match` below consumes it).
+                                    // Non-birthday sweeps (None) have sent their full window,
+                                    // so `window_completed` is true.
+                                    let window_completed = birthday_window_completion
+                                        .as_ref()
+                                        .map(|(cursor_advanced, _)| *cursor_advanced)
+                                        .unwrap_or(!stable_remote_scatter);
+                                    if stage == RecoveryStage::ScatterExtended
+                                        && window_completed
+                                        && peers.liveness_probe_due(&peer_id, generation).await
+                                    {
+                                        let p = peers.clone(); // Arc<PeerManager> → owned by the task
+                                        let pid = peer_id.clone();
+                                        tokio::spawn(async move {
+                                            p.run_outbound_liveness_probe(&pid, generation)
+                                                .await;
+                                        });
+                                    }
+                                }
                                 let timeout_detail = format!(
                                     "no matched direct probe ACK after {sent} {retry_label} probes; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
                                     probe_rx_session_id.as_deref().unwrap_or("legacy"),
