@@ -125,7 +125,6 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "profile",
         "built_at_ms",
         "dirty",
-        "diff_hash",
     )
     for field in required:
         if field not in info or info[field] in (None, ""):
@@ -141,6 +140,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         fail("release daemon was built from a dirty checkout")
     if not args.release and bool(info["dirty"]) and not info["diff_hash"]:
         fail("dirty development daemon has no diff_hash")
+    if bool(info["dirty"]) and "diff_hash" not in info:
+        fail("dirty build-info is missing diff_hash")
     binary = Path(args.daemon) if args.daemon else Path(str(info["binary_path"]))
     if not binary.is_file():
         fail(f"daemon binary does not exist: {binary}")
