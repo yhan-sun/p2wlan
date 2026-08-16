@@ -1,0 +1,27 @@
+name: Build Linux Daemon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-x86_64:
+    name: Build p2wlan-daemon (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release daemon
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-daemon-linux-x86_64
+          path: target/release/p2wlan-daemon
+          retention-days: 7
