@@ -97,6 +97,12 @@ pub struct PeerManager {
     /// budgets (probe credit, fresh generations, HTTP publishes) and the
     /// feedback-driven stage machine.
     recovery_epochs: Arc<RwLock<HashMap<String, RecoveryEpochState>>>,
+    /// Outbound-UDP liveness verdict cache, keyed by `(peer_id, generation)`.
+    /// TTL-bounded (`config.network.udp_liveness_ttl_ms`) and invalidated on
+    /// generation change (a new egress IP makes the old verdict meaningless —
+    /// same reset semantics as the adaptive port-learner cache).  Written by
+    /// the spawned probe task; consumed at the next tick's admission.
+    outbound_liveness_cache: Arc<RwLock<HashMap<(String, u64), LivenessCacheEntry>>>,
     /// Lock-free per-peer direct-commit sequence mirror.  Bumped inside the
     /// network-epoch critical section together with the Direct state
     /// transition, so outbound punch loops can gate every actual UDP send on
