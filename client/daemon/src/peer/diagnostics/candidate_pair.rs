@@ -130,6 +130,10 @@ pub struct PathHealthDiagnostics {
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+    /// Most recent outbound-UDP liveness verdict ("ok" / "blocked" / "unknown"),
+    /// or `None` until the first probe.  Surfaced for the CLI so an operator can
+    /// tell a firewalled egress (blocked) apart from a plain NAT miss.
+    pub last_liveness: Option<String>,
     pub latency_ms: Option<u64>,
     pub rtt_ewma_ms: Option<u64>,
     pub jitter_ms: Option<u64>,
@@ -145,11 +149,25 @@ impl From<&PathHealth> for PathHealthDiagnostics {
             consecutive_failures: health.consecutive_failures,
             last_error: health.last_error.clone(),
             last_error_code: health.last_error_code.clone(),
+            last_liveness: health.last_liveness.map(liveness_verdict_string),
             latency_ms: health.latency_ms,
             rtt_ewma_ms: health.rtt_ewma_ms,
             jitter_ms: health.jitter_ms,
             success_count: health.success_count,
             failure_count: health.failure_count,
         }
+    }
+}
+
+/// Map a liveness verdict to its wire string form.  `LivenessVerdict` is a
+/// plain enum in the nat crate without `Serialize`, so the CLI-facing JSON
+/// carries the short "ok" / "blocked" / "unknown" label instead.
+fn liveness_verdict_string(
+    verdict: p2pnet_nat::outbound_liveness::LivenessVerdict,
+) -> String {
+    match verdict {
+        p2pnet_nat::outbound_liveness::LivenessVerdict::Ok => "ok".to_string(),
+        p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked => "blocked".to_string(),
+        p2pnet_nat::outbound_liveness::LivenessVerdict::Unknown => "unknown".to_string(),
     }
 }

@@ -159,6 +159,35 @@ fn doctor_reports_generation_reprobe_reason() {
 }
 
 #[test]
+fn doctor_formats_direct_liveness_verdict() {
+    let snapshot = serde_json::json!({
+        "peers": [{
+            "node_id": "peer1",
+            "device_name": "laptop",
+            "virtual_ip": "10.20.0.5",
+            "direct": {
+                "last_error_code": "firewall_blocked",
+                "last_error": "outbound UDP liveness probe: all targets silent",
+                "last_liveness": "blocked"
+            }
+        }]
+    });
+    let peer = &snapshot["peers"][0];
+
+    assert_eq!(
+        direct_liveness_summary(peer).as_deref(),
+        Some("出站 UDP 被阻断，已转中继")
+    );
+    assert!(direct_failure_stage(peer)
+        .as_deref()
+        .is_some_and(|stage| stage.contains("出站 UDP 被防火墙阻断")));
+
+    // Older daemons omit the key entirely; nothing is rendered in that case.
+    let legacy = serde_json::json!({ "direct": { "last_error_code": "firewall_blocked" } });
+    assert_eq!(direct_liveness_summary(&legacy), None);
+}
+
+#[test]
 fn normalizes_control_url() {
     assert_eq!(
         normalize_control_server(" http://127.0.0.1:18080/// ").unwrap(),

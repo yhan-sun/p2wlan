@@ -118,11 +118,27 @@ fn direct_error_code(peer: &Value) -> Option<&str> {
         .and_then(|direct| direct.get("last_error_code"))
         .and_then(Value::as_str)
 }
+/// Outbound-UDP liveness verdict from the daemon's per-peer `direct` object
+/// (`PathHealthDiagnostics.last_liveness`).  None until the first probe; older
+/// daemons omit the key entirely, which this also tolerates.
+pub(crate) fn direct_liveness_summary(peer: &Value) -> Option<String> {
+    let verdict = peer
+        .get("direct")
+        .and_then(|direct| direct.get("last_liveness"))
+        .and_then(Value::as_str)?;
+    Some(match verdict {
+        "blocked" => "出站 UDP 被阻断，已转中继".to_string(),
+        "ok" => "出站 UDP 可达（直连失败另有原因：窗口 miss / C=0）".to_string(),
+        "unknown" => "出站 UDP 探测异常（未据此决策）".to_string(),
+        _ => format!("出站 UDP liveness={verdict}"),
+    })
+}
 fn reason_label(code: &str) -> &'static str {
     match code {
         "network_generation_changed" => "网络切换后 Direct 状态失效",
         "direct_probe_failed" => "UDP 探测未确认",
         "direct_send_failed" => "Direct UDP 发送失败",
+        "firewall_blocked" => "出站 UDP 被防火墙阻断",
         "handshake_timeout" => "WireGuard 握手超时",
         _ => "Direct 失败",
     }

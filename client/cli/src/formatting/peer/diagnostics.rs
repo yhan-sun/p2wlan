@@ -60,6 +60,9 @@ pub(crate) fn print_peer_diagnostics(snapshot: &Value) {
         if let Some(stage) = direct_failure_stage(peer) {
             println!("  direct-stage={stage}");
         }
+        if let Some(liveness) = direct_liveness_summary(peer) {
+            println!("  direct-liveness={liveness}");
+        }
         if let Some(summary) = direct_health_summary(peer) {
             println!("  direct-health={summary}");
         }
