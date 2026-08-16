@@ -54,6 +54,16 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
+      # flutter pub get re-resolves SDK-pinned transitive dependencies and
+      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
+      # checkout.  Restore before the daemon build so the binary is not
+      # stamped dirty; the gated jobs restore again after flutter build.
+      - name: Restore SDK-migrated files (pre-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+
       - name: Build Android arm64 release APK
         working-directory: apps/flutter_client
         run: >
@@ -97,6 +107,16 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
+
+      # flutter pub get re-resolves SDK-pinned transitive dependencies and
+      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
+      # checkout.  Restore before the daemon build so the binary is not
+      # stamped dirty; the gated jobs restore again after flutter build.
+      - name: Restore SDK-migrated files (pre-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
 
       - name: Build unsigned iOS release app
         working-directory: apps/flutter_client
@@ -163,6 +183,16 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
+
+      # flutter pub get re-resolves SDK-pinned transitive dependencies and
+      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
+      # checkout.  Restore before the daemon build so the binary is not
+      # stamped dirty; the gated jobs restore again after flutter build.
+      - name: Restore SDK-migrated files (pre-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
 
       - name: Build macOS release app
         working-directory: apps/flutter_client
@@ -272,6 +302,16 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
+      # flutter pub get re-resolves SDK-pinned transitive dependencies and
+      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
+      # checkout.  Restore before the daemon build so the binary is not
+      # stamped dirty; the gated jobs restore again after flutter build.
+      - name: Restore SDK-migrated files (pre-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+
       - name: Build Linux daemon
         run: cargo build -p p2wlan-daemon --release
 
@@ -351,6 +391,16 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
+
+      # flutter pub get re-resolves SDK-pinned transitive dependencies and
+      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
+      # checkout.  Restore before the daemon build so the binary is not
+      # stamped dirty; the gated jobs restore again after flutter build.
+      - name: Restore SDK-migrated files (pre-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
 
       - name: Build Windows daemon
         run: cargo build -p p2wlan-daemon --release
