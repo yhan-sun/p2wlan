@@ -8,17 +8,22 @@
 
 /// One cached outbound-UDP liveness verdict for a `(peer, generation)` pair.
 /// Written by the spawned probe task; the `verdict`/`consumed`/`probed_at`
-/// fields are read by `apply_cached_liveness_block` at the next admission
-/// tick.  `per_target`/`total_elapsed_ms` are written-only in the current
-/// build (observability for the pre-flight gate, Task 9).
+/// fields are read by `apply_cached_liveness_block` and the read-only
+/// evaluation paths at the next admission tick.  `per_target`/`total_elapsed_ms`
+/// are stored for per-target observability but are write-only in the current
+/// build (no reader reads them back from the cache yet), hence the targeted
+/// `#[allow(dead_code)]` below.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct LivenessCacheEntry {
     /// The 3-state verdict (Ok / Blocked / Unknown).
     verdict: p2pnet_nat::outbound_liveness::LivenessVerdict,
     /// Per-target detail (ip:port, responded, elapsed) for observability.
+    /// Written-only for now: kept in the cache but not yet read back.
+    #[allow(dead_code)]
     per_target: Vec<p2pnet_nat::outbound_liveness::LivenessTargetResult>,
-    /// Total wall time of the probe in milliseconds.
+    /// Total wall time of the probe in milliseconds.  Written-only for now:
+    /// kept in the cache but not yet read back.
+    #[allow(dead_code)]
     total_elapsed_ms: u64,
     /// When this verdict was produced; TTL-bounded before re-probing.
     probed_at: Instant,
@@ -31,10 +36,8 @@ impl PeerManager {
     /// Read the current cached outbound-UDP liveness verdict for
     /// `(peer_id, generation)` if it is fresh (within TTL).  Returns
     /// `None` on a cache miss or TTL expiry.  Used by the pre-flight gate
-    /// (Task 9) — read-only, never spawns, never writes.  Staged: the
-    /// production caller is not wired in yet, so only the unit tests exercise
-    /// it in the current build.
-    #[allow(dead_code)]
+    /// (`pre_flight_liveness_blocked`) — read-only, never spawns, never
+    /// writes.
     pub(crate) async fn evaluate_outbound_liveness(
         &self,
         peer_id: &str,
@@ -57,14 +60,9 @@ impl PeerManager {
 
     /// Whether a liveness probe should be SPAWNED for `(peer, generation)`
     /// right now: feature enabled AND no fresh (within-TTL) cached verdict.
-    /// Side-effect-free.  The caller (probe_loop, Task 8) does the spawn.
-    /// Staged: no production caller yet — the unit tests exercise it.
-    #[allow(dead_code)]
-    pub(crate) async fn liveness_probe_due(
-        &self,
-        peer_id: &str,
-        generation: u64,
-    ) -> bool {
+    /// Side-effect-free.  The caller (the probe_loop 0-ACK trigger) does
+    /// the spawn.
+    pub(crate) async fn liveness_probe_due(&self, peer_id: &str, generation: u64) -> bool {
         let cfg = &self.config.network;
         if !cfg.udp_liveness_enabled {
             return false;
@@ -82,15 +80,9 @@ impl PeerManager {
 
     /// The spawned probe task (P1).  Holds NO peers write lock across the
     /// socket I/O: the `probe()` call (socket I/O) runs with no lock held;
-    /// only `commit_liveness` afterwards takes short scoped locks.
-    /// Staged: probe_loop (Task 8) is the production spawner and is not wired
-    /// in yet — only reachable through the Task 10 integration tests.
-    #[allow(dead_code)]
-    pub(crate) async fn run_outbound_liveness_probe(
-        &self,
-        peer_id: &str,
-        generation: u64,
-    ) {
+    /// only `commit_liveness` afterwards takes short scoped locks.  Spawned
+    /// (not awaited) by the probe_loop ScatterExtended 0-ACK trigger.
+    pub(crate) async fn run_outbound_liveness_probe(&self, peer_id: &str, generation: u64) {
         // Stale-generation guard: a generation advance makes the probe moot.
         if self.current_network_generation().await != generation {
             return;
@@ -117,8 +109,7 @@ impl PeerManager {
         // A bind failure is a SocketError for that target.  Each call builds
         // owned data inside the async block so the returned future is 'static.
         let outcome = p2pnet_nat::outbound_liveness::probe(&probe_cfg, |_round, target| {
-            let data =
-                p2pnet_nat::outbound_liveness::build_dns_a_query(0xdead, "a"); // owned per call
+            let data = p2pnet_nat::outbound_liveness::build_dns_a_query(0xdead, "a"); // owned per call
             async move {
                 let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
                     return p2pnet_nat::outbound_liveness::TargetProbeResult::SocketError;
@@ -156,11 +147,9 @@ impl PeerManager {
 
     /// Write cache + `PathHealth.last_liveness` + record a diagnostic event.
     /// Does NOT touch the recovery stage — that is consumed at the next
-    /// admission tick (Task 7, P1/P3), keeping the probe task free of the
-    /// recovery-epoch write lock.  Staged: its only caller
-    /// (`run_outbound_liveness_probe`) is itself not yet wired into
-    /// production, so this is dead code in the current build.
-    #[allow(dead_code)]
+    /// admission tick (P1/P3), keeping the probe task free of the
+    /// recovery-epoch write lock.  Called by the probe task
+    /// (`run_outbound_liveness_probe`).
     pub(crate) async fn commit_liveness(
         &self,
         peer_id: &str,
@@ -190,8 +179,15 @@ impl PeerManager {
             }
         }
         let detail = format_liveness_detail(&per_target, verdict, total_elapsed_ms);
-        self.record_direct_event(peer_id, "outbound_liveness", None, None, None, detail.clone())
-            .await;
+        self.record_direct_event(
+            peer_id,
+            "outbound_liveness",
+            None,
+            None,
+            None,
+            detail.clone(),
+        )
+        .await;
         info!(
             event = "outbound_liveness",
             peer_id = %peer_id,
@@ -250,7 +246,9 @@ impl PeerManager {
         if !should_apply {
             return;
         }
-        let detail = "outbound UDP liveness Blocked; stopping wide scatter, accelerating to relay fallback".to_string();
+        let detail =
+            "outbound UDP liveness Blocked; stopping wide scatter, accelerating to relay fallback"
+                .to_string();
         {
             let mut conns = self.connections.write().await;
             if let Some(conn) = conns.get_mut(peer_id) {
@@ -281,16 +279,11 @@ impl PeerManager {
     /// miss or an expired verdict it returns false (proceed with the punch).
     /// The TTL is what lets a transient "blocked" self-heal instead of
     /// permanently stopping punching.
-    pub(crate) async fn pre_flight_liveness_blocked(
-        &self,
-        peer_id: &str,
-        generation: u64,
-    ) -> bool {
+    pub(crate) async fn pre_flight_liveness_blocked(&self, peer_id: &str, generation: u64) -> bool {
         if !self.config.network.udp_liveness_pre_flight {
             return false; // default OFF
         }
-        self.evaluate_outbound_liveness(peer_id, generation)
-            .await
+        self.evaluate_outbound_liveness(peer_id, generation).await
             == Some(p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked)
     }
 
@@ -323,12 +316,12 @@ impl PeerManager {
     }
 
     /// Test-only: read the current direct-path failure reason code, if any.
-    /// Staged: its first consumer is the Task 10 integration tests.
+    /// Consumed by the part15 integration tests.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) async fn direct_health_error_code(&self, peer_id: &str) -> Option<String> {
         let conns = self.connections.read().await;
-        conns.get(peer_id)
+        conns
+            .get(peer_id)
             .and_then(|c| c.direct_health.last_error_code.clone())
     }
 
@@ -337,7 +330,8 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) async fn direct_liveness_event_count(&self, peer_id: &str) -> usize {
         let conns = self.connections.read().await;
-        conns.get(peer_id)
+        conns
+            .get(peer_id)
             .map(|c| {
                 c.direct_events
                     .iter()
@@ -350,8 +344,7 @@ impl PeerManager {
 
 /// Render the per-target liveness detail string for observability:
 /// `ip:port responded=<bool> ms=<opt>` per target + total + verdict.
-/// Staged: only reachable through `commit_liveness` (itself staged above).
-#[allow(dead_code)]
+/// Used by `commit_liveness` for the diagnostic event + log line.
 fn format_liveness_detail(
     per_target: &[p2pnet_nat::outbound_liveness::LivenessTargetResult],
     verdict: p2pnet_nat::outbound_liveness::LivenessVerdict,
@@ -364,7 +357,8 @@ fn format_liveness_detail(
                 "{} responded={} ms={}",
                 t.target,
                 t.responded,
-                t.elapsed_ms.map_or_else(|| "-".to_string(), |m| m.to_string())
+                t.elapsed_ms
+                    .map_or_else(|| "-".to_string(), |m| m.to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -377,10 +371,7 @@ fn format_liveness_detail(
     )
 }
 
-#[allow(dead_code)]
-fn verdict_str(
-    v: p2pnet_nat::outbound_liveness::LivenessVerdict,
-) -> &'static str {
+fn verdict_str(v: p2pnet_nat::outbound_liveness::LivenessVerdict) -> &'static str {
     match v {
         p2pnet_nat::outbound_liveness::LivenessVerdict::Ok => "ok",
         p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked => "blocked",
