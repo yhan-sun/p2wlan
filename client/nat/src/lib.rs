@@ -18,6 +18,7 @@ pub mod detection;
 pub mod error;
 pub mod ice;
 pub mod mapping;
+pub mod outbound_liveness;
 pub mod punch;
 pub mod stun;
 
