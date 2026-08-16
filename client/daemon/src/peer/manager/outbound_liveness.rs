@@ -130,7 +130,13 @@ impl PeerManager {
                     Ok(Ok(_)) => p2pnet_nat::outbound_liveness::TargetProbeResult::Responded {
                         elapsed: send_start.elapsed(),
                     },
-                    _ => p2pnet_nat::outbound_liveness::TargetProbeResult::NoResponse,
+                    Ok(Err(_)) => {
+                        // A recv_from I/O error is a system fault (Unknown),
+                        // not silence: only a clean timeout certifies a
+                        // target as unresponsive (Blocked contributor).
+                        p2pnet_nat::outbound_liveness::TargetProbeResult::SocketError
+                    }
+                    Err(_elapsed) => p2pnet_nat::outbound_liveness::TargetProbeResult::NoResponse,
                 }
                 // socket dropped here → isolation restored
             }
@@ -165,7 +171,7 @@ impl PeerManager {
         {
             let mut cache = self.outbound_liveness_cache.write().await;
             cache.insert(
-                key.clone(),
+                key,
                 LivenessCacheEntry {
                     verdict,
                     per_target: per_target.clone(),
