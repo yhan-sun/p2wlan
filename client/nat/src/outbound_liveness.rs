@@ -87,10 +87,7 @@ pub fn build_dns_a_query(id: u16, name: &str) -> Vec<u8> {
 /// outcomes without real sockets.  It is invoked once per target per round,
 /// concurrently within a round; the current round index is passed in as the
 /// first argument (so a stub can index a `[round][target]` script table).
-pub async fn probe<R, Fut>(
-    cfg: &LivenessConfig,
-    mut run_target: R,
-) -> LivenessOutcome
+pub async fn probe<R, Fut>(cfg: &LivenessConfig, mut run_target: R) -> LivenessOutcome
 where
     R: FnMut(usize, SocketAddr) -> Fut,
     Fut: std::future::Future<Output = TargetProbeResult> + Send + 'static,
@@ -170,7 +167,10 @@ mod tests {
     }
 
     fn two_targets() -> [SocketAddr; 2] {
-        ["10.0.0.1:53".parse().unwrap(), "10.0.0.2:53".parse().unwrap()]
+        [
+            "10.0.0.1:53".parse().unwrap(),
+            "10.0.0.2:53".parse().unwrap(),
+        ]
     }
 
     /// Map a probe target back to its script index (test-only; full-string match).
@@ -201,11 +201,12 @@ mod tests {
     /// borrow of the script table, not the futures it returns.
     fn stub<'a>(
         cells: &'a [Script],
-    ) -> impl FnMut(usize, SocketAddr)
-           -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = TargetProbeResult> + Send + 'static>,
-            >
-           + 'a {
+    ) -> impl FnMut(
+        usize,
+        SocketAddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = TargetProbeResult> + Send + 'static>,
+    > + 'a {
         |round, target| {
             let s = cell(cells, round, target_idx(target));
             Box::pin(async move {
@@ -231,7 +232,11 @@ mod tests {
         assert_eq!(q[2], 0x01, "RD bit");
         assert_eq!(q[3], 0x00, "flags high byte zero");
         assert_eq!(&q[4..6], &[0x00, 0x01], "QDCOUNT == 1");
-        assert_eq!(&q[6..12], &[0, 0, 0, 0, 0, 0], "ANCOUNT/NSCOUNT/ARCOUNT zero");
+        assert_eq!(
+            &q[6..12],
+            &[0, 0, 0, 0, 0, 0],
+            "ANCOUNT/NSCOUNT/ARCOUNT zero"
+        );
         // question
         assert_eq!(q[12], 1, "single label length 1");
         assert_eq!(q[13], b'a', "label byte 'a'");
@@ -246,8 +251,10 @@ mod tests {
         // To PROVE round 1 never ran: cells[1][0] is Respond (it WOULD mark t0
         // responded if round 1 executed). Assert t0 stayed un-responded.
         let cells = [
-            Script::Timeout, Script::Respond, // round 0
-            Script::Respond, Script::Timeout, // round 1 (must NOT run)
+            Script::Timeout,
+            Script::Respond, // round 0
+            Script::Respond,
+            Script::Timeout, // round 1 (must NOT run)
         ];
         let outcome = probe(&cfg_2(&cells), stub(&cells)).await;
         assert_eq!(outcome.verdict, LivenessVerdict::Ok);
@@ -277,7 +284,12 @@ mod tests {
     #[tokio::test]
     async fn nxdomain_style_response_still_counts_as_reachable() {
         // A single Responded cell (mock does not parse the answer body) -> Ok.
-        let cells = [Script::Timeout, Script::Respond, Script::Timeout, Script::Timeout];
+        let cells = [
+            Script::Timeout,
+            Script::Respond,
+            Script::Timeout,
+            Script::Timeout,
+        ];
         let outcome = probe(&cfg_2(&cells), stub(&cells)).await;
         assert_eq!(outcome.verdict, LivenessVerdict::Ok);
     }
@@ -287,8 +299,11 @@ mod tests {
         // A run_target whose future panics must be classified Unknown (socket/system
         // fault), never Blocked (firewall proof).  Use a fresh socket per target so
         // no real network is touched; the panic is injected at await time.
-        let targets: Vec<SocketAddr> =
-            ["10.9.9.1:53".parse().unwrap(), "10.9.9.2:53".parse().unwrap()].to_vec();
+        let targets: Vec<SocketAddr> = [
+            "10.9.9.1:53".parse().unwrap(),
+            "10.9.9.2:53".parse().unwrap(),
+        ]
+        .to_vec();
         let cfg = LivenessConfig {
             targets,
             timeout: Duration::from_millis(10),

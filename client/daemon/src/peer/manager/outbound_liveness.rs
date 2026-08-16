@@ -9,22 +9,13 @@
 /// One cached outbound-UDP liveness verdict for a `(peer, generation)` pair.
 /// Written by the spawned probe task; the `verdict`/`consumed`/`probed_at`
 /// fields are read by `apply_cached_liveness_block` and the read-only
-/// evaluation paths at the next admission tick.  `per_target`/`total_elapsed_ms`
-/// are stored for per-target observability but are write-only in the current
-/// build (no reader reads them back from the cache yet), hence the targeted
-/// `#[allow(dead_code)]` below.
+/// evaluation paths at the next admission tick.  Per-target detail is surfaced
+/// via the `outbound_liveness` diagnostic event at probe time (see
+/// `commit_liveness`), so it is not duplicated in this cache entry.
 #[derive(Debug)]
 struct LivenessCacheEntry {
     /// The 3-state verdict (Ok / Blocked / Unknown).
     verdict: p2pnet_nat::outbound_liveness::LivenessVerdict,
-    /// Per-target detail (ip:port, responded, elapsed) for observability.
-    /// Written-only for now: kept in the cache but not yet read back.
-    #[allow(dead_code)]
-    per_target: Vec<p2pnet_nat::outbound_liveness::LivenessTargetResult>,
-    /// Total wall time of the probe in milliseconds.  Written-only for now:
-    /// kept in the cache but not yet read back.
-    #[allow(dead_code)]
-    total_elapsed_ms: u64,
     /// When this verdict was produced; TTL-bounded before re-probing.
     probed_at: Instant,
     /// Whether a `Blocked` verdict has already been consumed (applied) by a
@@ -165,8 +156,6 @@ impl PeerManager {
                 key,
                 LivenessCacheEntry {
                     verdict,
-                    per_target: per_target.clone(),
-                    total_elapsed_ms,
                     probed_at: Instant::now(),
                     consumed: false,
                 },
@@ -307,8 +296,6 @@ impl PeerManager {
             key,
             LivenessCacheEntry {
                 verdict,
-                per_target: Vec::new(),
-                total_elapsed_ms: 0,
                 probed_at,
                 consumed: false,
             },
