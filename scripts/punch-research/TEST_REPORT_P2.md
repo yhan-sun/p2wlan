@@ -141,3 +141,54 @@
 - 因此：**当前双 CGNAT 环境下直连打洞不可达属环境特征，非引擎缺陷**；引擎按配置正确转入 TURN 中继回退（stats.mode 实测 `ConePunchToLinearSymmeric`→fail→relay）。
 - 达标线（成功率≥95%、P50≤1.5s）在本环境不可观测；需在"至少一侧为锥形/端口可预测"的真实网络（自建 STUN+软路由、或公网 VPS 直连形态）复核。
 - 生产影响：与现有 p2wlan 架构一致——直连打洞为尽力而为，TCP 中继（139 通道）为保底路径；本报告不改变生产依赖。
+
+## 10. Gate3 实测报告：Rust daemon 双端 REAL_TUN（Mini↔Air，10 轮）
+
+> 执行于 2026-08-16。A=Air（M3 arm64，出口 220.163.6.190） / B=Mini（M4 arm64，出口 222.221.188.223），
+> 双端均为运营商 CGNAT（Air 映射 AddressOrPortDependent、Mini 映射 EndpointIndependent）。
+> 工具：`scripts/dual-end/mini-air-smoke.sh`（`ACCEPTANCE_MODE=availability STRICT_PHASE=acceptance`、
+> `REAL_TUN=1 PRIVILEGED_SUPERVISOR=1`，每轮全新注册账号 + `default` 网络 + 每轮实时 isolation proof），
+> daemon v0.1.117（debug 本机构建，SHA-256 审计上传 Air 后双端同二进制）。control/relay 为阿里 47.109.40.237
+> 生产实例（HTTP 明文白名单模式，非 TLS）；Air 侧授权经 its GUI 会话弹窗完成，Mini 侧本机弹窗完成。
+
+### 10.1 结果总览（10/10 PASS，TUN ICMP 双向全通；9/10 轮直连建链）
+
+| 轮 | first_usable_ms | 路径 A/B | direct A/B | 探测命中 t(ms) | Promote t(ms) | RTT(ms) |
+|---|---|---|---|---|---|---|
+| 1 | 337 | relay/relay | 1/1 | 2628 | 2636 | 7 |
+| 2 | 130 | relay/**direct** | 1/1 | 1841 | 1948 | 6 |
+| 3 | 82 | relay/relay | 1/1 | 1734 | 1742 | 6 |
+| 4 | 118 | relay/**direct** | 1/1 | 2282 | 2300 | 15 |
+| 5 | 97 | relay/relay | 1/1 | 1297 | 1310 | 6 |
+| 6 | 172 | **direct**/relay | 1/1 | 1340 | 1348 | 6 |
+| 7 | 105 | relay/relay | 1/1 | 4142 | 4153 | 7 |
+| 8 | 131 | **direct**/relay | 1/1 | 1407 | 1415 | 7 |
+| 9 | 136 | relay/relay | **0/0** | —（未命中）| — | — |
+| 10 | 101 | relay/relay | 1/1 | 2929 | 2938 | 5 |
+
+- 直连建立耗时：**1.30–4.15s，中位 ≈1.9s**（daemon 启动起算）。
+- 直连延迟：**RTT 5–16ms，中位 7ms**（双向 encrypted validation，ack_endpoint_authenticated=true，无 endpoint drift）。
+- 过程还原：STUN 9/9 出网 → NAT profile → relay TCP 兜底（首包 82–337ms 可用）→ fresh-mapping 预测窗口
+  （R1/R7 noisy_linear、R9 Linear step=2）→ PeerReflexive 候选探测 → 加密 validation ACK → `direct_path_promoted`。
+- R2/R4/R6/R8 轮另一端**首次可用即 direct**（first_usable_path=direct，relay 同时确认），共 4/10 轮直连先行。
+- 崩溃/panic：0/10；relay peer confirmed 80–126/轮，overlay 往返 8/8 全轮。
+
+### 10.2 R9 失败分析（1/10 未直连）
+
+- 现象：`direct_validation` 无任何匹配 ACK；Mini 侧 two 次 `retry_ack_timeout`（candidate_count=3、sent_probes=54），
+  Air 侧一次（candidate_count=64、sent_probes=192）；轮内 246 发探测零命中，relay 兜底保持 PASS。
+- 根因：Air 端 CGNAT 为 **AddressOrPortDependent 映射**——对 STUN observer 的出口映射端口序列
+  [20736,20737,20740,20742]（deltas=[1,3,2]，Linear step=2）预测出窗口 20744–20768，但**对 Mini 出口 IP 的实际映射端口
+  （220.163.6.190:20592）偏离预测窗口约 150 端口**；候选集未覆盖目标端口，且 APD 过滤拒绝未知源，双方所有探测被吞。
+- 判定：属 CGNAT 目标相关端口分配的窗口外 miss（APD 映射固有随机性），非协议/引擎崩溃；relay 保底可用性未受影响，
+  成功覆盖 9/10（90%），与 Gate2 的"映射依赖目标、端口不可预测"环境结论一致。
+
+### 10.3 关键证据
+
+- 隔离证明：`isolated_exactly_two_active_nodes`（LIVE roster 恰为两节点；清理了 139 服务器残留旧版
+  p2pnet-daemon 0.1.110 后通过，DeviceOnlineTTL=90s 历史行转 inert）。
+- promote：`direct_validation_promoted ... ack_endpoint_authenticated=true validation_rtt_ms=6 ... affinity_adopted=true`；
+  `candidate_pair_selected ... reason="encrypted data path confirmed Direct UDP with authoritative RTT"`。
+- 约束声明：本 Gate3 为 availability-acceptance 数据面验证（REAL_TUN=1、真实 UDP/TCP 网络），relay 为明文 TCP、
+  control 为 HTTP，故**不构成安全发布就绪证据**；strict 计分（compat-baseline 锁定 → strict-acceptance 10 轮）
+  需 TLS control/relay 环境另行执行。
