@@ -11,6 +11,11 @@ pub struct PathHealth {
     pub last_error: Option<String>,
     /// Stable machine-readable reason for the last failure.
     pub last_error_code: Option<String>,
+    /// Most recent outbound-UDP liveness verdict for this peer (punch-time
+    /// diagnostic; distinct from the STUN-phase `UdpBlocked`).  None until the
+    /// first probe; cleared on network-generation change so a stale egress
+    /// verdict never survives an IP change.
+    pub last_liveness: Option<p2pnet_nat::outbound_liveness::LivenessVerdict>,
     /// Most recent measured round-trip time for this path.
     pub latency_ms: Option<u64>,
     /// Smoothed RTT estimate for this path.
@@ -65,6 +70,7 @@ impl PathHealth {
         self.rtt_ewma_ms = None;
         self.jitter_ms = None;
         self.consecutive_failures = 0;
+        self.last_liveness = None;
         self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason);
     }
 

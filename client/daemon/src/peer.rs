@@ -246,6 +246,13 @@ pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed"
 pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
 /// Stable reason code for direct path send failure.
 pub const REASON_DIRECT_SEND_FAILED: &str = "direct_send_failed";
+/// Stable reason code: a ScatterExtended wide scan exhausted with 0 matched
+/// ACKs AND outbound-UDP liveness probed Blocked (every DNS target silent
+/// across every round) — outbound egress is firewalled, not a window miss /
+/// C=0.  Distinct from `REASON_DIRECT_PROBE_FAILED` (a silent scan alone,
+/// whose cause is still unknown) so the operator can tell a firewall apart
+/// from a plain NAT miss.
+pub const REASON_DIRECT_FIREWALL_BLOCKED: &str = "firewall_blocked";
 /// A direct probe ACK arrived, but its RTT was too slow to displace a
 /// same-generation confirmed relay.
 pub const REASON_DIRECT_PROBE_SLOW_RELAY_RETAINED: &str = "direct_probe_slow_relay_retained";
