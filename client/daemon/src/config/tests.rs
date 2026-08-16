@@ -23,6 +23,19 @@ mod tests {
     }
 
     #[test]
+    fn test_default_udp_liveness_config() {
+        let config = Config::generate_default("https://control.example.com", "net123").unwrap();
+        assert!(config.network.udp_liveness_enabled);
+        assert_eq!(config.network.udp_liveness_targets.len(), 4);
+        assert_eq!(config.network.udp_liveness_targets[0], "223.5.5.5:53");
+        assert_eq!(config.network.udp_liveness_targets[3], "8.8.8.8:53");
+        assert_eq!(config.network.udp_liveness_timeout_ms, 1500);
+        assert_eq!(config.network.udp_liveness_ttl_ms, 30_000);
+        assert_eq!(config.network.udp_liveness_retries, 2);
+        assert!(!config.network.udp_liveness_pre_flight);
+    }
+
+    #[test]
     fn test_config_serialization_roundtrip() {
         let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -36,6 +49,27 @@ mod tests {
         assert_eq!(
             decoded.network.stun_timeout_ms,
             config.network.stun_timeout_ms
+        );
+        assert_eq!(
+            decoded.network.udp_liveness_enabled,
+            config.network.udp_liveness_enabled
+        );
+        assert_eq!(
+            decoded.network.udp_liveness_targets,
+            config.network.udp_liveness_targets
+        );
+        assert_eq!(
+            decoded.network.udp_liveness_timeout_ms,
+            config.network.udp_liveness_timeout_ms
+        );
+        assert_eq!(decoded.network.udp_liveness_ttl_ms, config.network.udp_liveness_ttl_ms);
+        assert_eq!(
+            decoded.network.udp_liveness_retries,
+            config.network.udp_liveness_retries
+        );
+        assert_eq!(
+            decoded.network.udp_liveness_pre_flight,
+            config.network.udp_liveness_pre_flight
         );
         assert_eq!(
             decoded.network.punch_interval_ms,

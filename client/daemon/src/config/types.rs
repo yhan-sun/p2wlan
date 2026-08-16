@@ -129,6 +129,27 @@ pub struct NetworkConfig {
     /// Timeout for each STUN query in milliseconds.
     #[serde(default = "default_stun_timeout_ms")]
     pub stun_timeout_ms: u64,
+    /// Enable outbound-UDP liveness diagnostics (legal DNS A query probe) when a
+    /// ScatterExtended wide scan exhausts with zero matched ACKs.
+    #[serde(default = "default_true")]
+    pub udp_liveness_enabled: bool,
+    /// Public DNS resolvers probed for outbound UDP reachability (ip:port).
+    #[serde(default = "default_udp_liveness_targets")]
+    pub udp_liveness_targets: Vec<String>,
+    /// Per-target round timeout in milliseconds.
+    #[serde(default = "default_udp_liveness_timeout_ms")]
+    pub udp_liveness_timeout_ms: u32,
+    /// How long a (peer, generation) verdict is cached before re-probing, ms.
+    #[serde(default = "default_udp_liveness_ttl_ms")]
+    pub udp_liveness_ttl_ms: u32,
+    /// Number of parallel probe rounds (each fans out to all targets).
+    #[serde(default = "default_udp_liveness_retries")]
+    pub udp_liveness_retries: u32,
+    /// When true, run a pre-flight liveness check before a punch starts and skip
+    /// the punch if Blocked.  Default OFF: relay already carries the data plane,
+    /// and a pre-punch "skip" is harder to self-heal than post-scan attribution.
+    #[serde(default)]
+    pub udp_liveness_pre_flight: bool,
     /// Interval between active UDP hole-punch probes in milliseconds.
     #[serde(default = "default_punch_interval_ms")]
     pub punch_interval_ms: u64,
@@ -239,6 +260,23 @@ fn default_udp_bind() -> String {
 }
 fn default_stun_timeout_ms() -> u64 {
     1500
+}
+fn default_udp_liveness_targets() -> Vec<String> {
+    vec![
+        "223.5.5.5:53".into(),      // AliDNS (CN)
+        "119.29.29.29:53".into(),    // China Unicom (CN)
+        "114.114.114.114:53".into(), // 114DNS (CN)
+        "8.8.8.8:53".into(),         // Google (overseas / fallback)
+    ]
+}
+fn default_udp_liveness_timeout_ms() -> u32 {
+    1500
+}
+fn default_udp_liveness_ttl_ms() -> u32 {
+    30_000
+}
+fn default_udp_liveness_retries() -> u32 {
+    2
 }
 fn default_punch_interval_ms() -> u64 {
     200
