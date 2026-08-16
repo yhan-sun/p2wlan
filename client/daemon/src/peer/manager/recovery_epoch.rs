@@ -334,6 +334,14 @@ impl PeerManager {
             return RecoveryAdmission::Superseded;
         }
 
+        // DEADLOCK-SAFE SEAM: consume any fresh Blocked liveness verdict
+        // BEFORE taking the `recovery_epochs` write lock below —
+        // `mark_recovery_relay_backoff` (called inside) re-takes that same
+        // non-reentrant write lock, so it must not run nested under it.  This
+        // gap is also before the `BudgetExhausted` early-return, so a
+        // budget-frozen peer still consumes its verdict.
+        self.apply_cached_liveness_block(peer_id).await;
+
         let mut epochs = self.recovery_epochs.write().await;
         let entry = epochs.entry(peer_id.to_string()).or_insert_with(|| {
             RecoveryEpochState::new(1, generation, now)

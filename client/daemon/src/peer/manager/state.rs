@@ -101,9 +101,9 @@ pub struct PeerManager {
     /// TTL-bounded (`config.network.udp_liveness_ttl_ms`) and invalidated on
     /// generation change (a new egress IP makes the old verdict meaningless —
     /// same reset semantics as the adaptive port-learner cache).  Written by
-    /// the spawned probe task; consumed at the next tick's admission.  Until
-    /// the admission consumer lands, only the tests exercise it.
-    #[allow(dead_code)]
+    /// the spawned probe task; consumed at the next tick's admission
+    /// (`apply_cached_liveness_block`, called from `recovery_epoch_admit`
+    /// before its `recovery_epochs` write lock).
     outbound_liveness_cache: Arc<RwLock<HashMap<(String, u64), LivenessCacheEntry>>>,
     /// Lock-free per-peer direct-commit sequence mirror.  Bumped inside the
     /// network-epoch critical section together with the Direct state

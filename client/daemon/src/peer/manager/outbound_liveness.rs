@@ -7,8 +7,10 @@
 // decision methods (evaluate / probe-due / probe / commit) live below.
 
 /// One cached outbound-UDP liveness verdict for a `(peer, generation)` pair.
-/// Staged with the decision methods: the admission consumer (Task 7) is not
-/// wired in yet, so not every field is read in the current build.
+/// Written by the spawned probe task; the `verdict`/`consumed`/`probed_at`
+/// fields are read by `apply_cached_liveness_block` at the next admission
+/// tick.  `per_target`/`total_elapsed_ms` are written-only in the current
+/// build (observability for the pre-flight gate, Task 9).
 #[derive(Debug)]
 #[allow(dead_code)]
 struct LivenessCacheEntry {
@@ -201,6 +203,74 @@ impl PeerManager {
         );
     }
 
+    /// Consume a fresh `Blocked` liveness verdict for `peer_id` at the next
+    /// admission tick.  Applied EXACTLY ONCE per `(peer, generation)` (the
+    /// `consumed` flag): stamps the `firewall_blocked` attribution on the
+    /// direct-path health and moves the recovery stage into the bounded
+    /// `RelayBackoff` regime — which is what stops the wide scatter for the
+    /// epoch (P1: the probe task itself never did this; it only wrote the
+    /// cache, so the probe stays off the recovery-epoch write lock).
+    ///
+    /// `Ok`/`Unknown` verdicts are recorded (Task 6) but never applied here:
+    /// only `Blocked` may accelerate the path (conservative invariant).
+    ///
+    /// Called from `recovery_epoch_admit` BEFORE that function takes the
+    /// `recovery_epochs` write lock — `mark_recovery_relay_backoff` below
+    /// re-takes that lock, so nesting the call after the lock would deadlock
+    /// (tokio RwLock is not reentrant).
+    pub(crate) async fn apply_cached_liveness_block(&self, peer_id: &str) {
+        // Only act once the recovery epoch already exists.  In production the
+        // probe fires at ScatterExtended (epoch long-established), so this is a
+        // no-op guard; it prevents the very first admit from consuming the
+        // verdict before any stage exists to move (or_insert happens after
+        // this call in recovery_epoch_admit).  Read-only, dropped before the
+        // cache write below — no lock held across mark_recovery_relay_backoff.
+        if !self.recovery_epochs.read().await.contains_key(peer_id) {
+            return;
+        }
+        let generation = self.current_network_generation().await;
+        let key = (peer_id.to_string(), generation);
+        let should_apply = {
+            let mut cache = self.outbound_liveness_cache.write().await;
+            match cache.get_mut(&key) {
+                Some(e)
+                    if e.verdict == p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked
+                        && !e.consumed
+                        && e.probed_at.elapsed()
+                            < Duration::from_millis(
+                                self.config.network.udp_liveness_ttl_ms as u64,
+                            ) =>
+                {
+                    e.consumed = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !should_apply {
+            return;
+        }
+        let detail = "outbound UDP liveness Blocked; stopping wide scatter, accelerating to relay fallback".to_string();
+        {
+            let mut conns = self.connections.write().await;
+            if let Some(conn) = conns.get_mut(peer_id) {
+                conn.direct_health
+                    .record_failure(REASON_DIRECT_FIREWALL_BLOCKED, detail.clone());
+            }
+        }
+        self.mark_recovery_relay_backoff(peer_id, "outbound_liveness_blocked")
+            .await;
+        self.record_direct_event(
+            peer_id,
+            "outbound_liveness_applied",
+            None,
+            None,
+            None,
+            detail,
+        )
+        .await;
+    }
+
     /// Test-only: seed a cached liveness verdict for `(peer, generation)` with
     /// a back-dated `probed_at` (age_ms).  Lets the TTL / generation tests
     /// drive the cache without opening real sockets.
@@ -237,6 +307,21 @@ impl PeerManager {
         let conns = self.connections.read().await;
         conns.get(peer_id)
             .and_then(|c| c.direct_health.last_error_code.clone())
+    }
+
+    /// Test-only: count `outbound_liveness_applied` diagnostic events for a
+    /// peer, so the exactly-once guarantee is directly observable.
+    #[cfg(test)]
+    pub(crate) async fn direct_liveness_event_count(&self, peer_id: &str) -> usize {
+        let conns = self.connections.read().await;
+        conns.get(peer_id)
+            .map(|c| {
+                c.direct_events
+                    .iter()
+                    .filter(|e| e.stage == "outbound_liveness_applied")
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }
 
