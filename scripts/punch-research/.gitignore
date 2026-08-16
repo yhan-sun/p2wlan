@@ -1,0 +1,7 @@
+# Reinstate key artifact data that the global `artifacts/` ignore rule
+# would otherwise exclude; the bulky per-round work/ tree stays ignored.
+!artifacts/
+!artifacts/nat_matrix.tsv
+!artifacts/logs/
+!artifacts/logs/*.log
+artifacts/work/

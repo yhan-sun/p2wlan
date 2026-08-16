@@ -1,0 +1,19 @@
+[A] NAT profile: mapping=endpoint_independent allocation=stable step=0 public=127.0.0.1:33480 confidence=1.00 filtering=endpoint_independent reuse=False legacy=1 degraded=False
+[A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
+[A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
+[A]   obs diff_port    target=203.0.113.1:33002    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
+[A]   obs diff_ip      target=203.0.113.3:33003    socket=127.0.0.1:30000 mapped=127.0.0.1:33480
+[A]   obs new_socket   target=203.0.113.1:33001    socket=127.0.0.1:30001 mapped=127.0.0.1:33598
+[A] peer: B nat=1 profile=(endpoint_independent/stable) addr=('127.0.0.1', 34795)
+[A] Enhanced Hole Punching 1  mode=DirectConePunch  local_port=30000
+[A] start nat traversal analysis  local=m=endpoint_independent/a=stable/s=0/f=endpoint_independent  remote=m=endpoint_independent/a=stable/s=0/f=endpoint_independent
+[A] execute: DirectConePunch  (epoch 1)
+[A] retry in 0.8s (epoch 1)
+[A] learned candidate 127.0.0.1:34795 (upgrade)
+[A] saved pair cache (127.0.0.1)
+[A] ★ P2P ESTABLISHED via 127.0.0.1:34795 (bidirectional confirm, recv=2)
+[A] P2P established, holding 4s for keepalive validation
+[A] keepalive to 127.0.0.1:34795
+[A] keepalive to 127.0.0.1:34795
+[A] result: p2p
+[A] stats: {"cache_hits": 0, "cache_saves": 1, "epoch": 1, "establish_ms": 800, "keptalive": 2, "learn_events": 1, "mode": "DirectConePunch", "predicted_hits": 0, "punches_recv": 2, "punches_sent": 7, "step_history": []}

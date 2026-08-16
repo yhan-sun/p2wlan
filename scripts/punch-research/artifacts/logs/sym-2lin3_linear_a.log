@@ -1,0 +1,23 @@
+[A] NAT profile: mapping=address_port_dependent allocation=linear step=3 public=127.0.0.1:33100 confidence=1.00 filtering=endpoint_independent reuse=False legacy=2 degraded=False
+[A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33100
+[A]   obs same_target  target=203.0.113.1:33001    socket=127.0.0.1:30000 mapped=127.0.0.1:33100
+[A]   obs diff_port    target=203.0.113.1:33002    socket=127.0.0.1:30000 mapped=127.0.0.1:33106
+[A]   obs diff_ip      target=203.0.113.3:33003    socket=127.0.0.1:30000 mapped=127.0.0.1:33109
+[A]   obs new_socket   target=203.0.113.1:33001    socket=127.0.0.1:30001 mapped=127.0.0.1:33103
+[A] peer: B nat=2 profile=(address_port_dependent/linear) addr=('127.0.0.1', 34100)
+[A] Enhanced Hole Punching 1  mode=BothLinearSymmericPunch  local_port=30000
+[A] start nat traversal analysis  local=m=address_port_dependent/a=linear/s=3/f=endpoint_independent  remote=m=address_port_dependent/a=linear/s=3/f=endpoint_independent
+[A] execute: BothLinearSymmericPunch  (epoch 1)
+[A] predict punch address: base=34100 step=3 N=16 first=[34052, 34055, 34058, 34061, 34064, 34067, 34070, 34073]
+[A] retry in 0.8s (epoch 1)
+[A] learned candidate 127.0.0.1:34100 (upgrade)
+[A] learned candidate 127.0.0.1:34118 (upgrade)
+[A] learned candidate 127.0.0.1:34121 (upgrade)
+[A] learned candidate 127.0.0.1:34124 (upgrade)
+[A] saved pair cache (127.0.0.1)
+[A] ★ P2P ESTABLISHED via 127.0.0.1:34121 (bidirectional confirm, recv=3)
+[A] P2P established, holding 4s for keepalive validation
+[A] keepalive to 127.0.0.1:34121
+[A] keepalive to 127.0.0.1:34121
+[A] result: p2p
+[A] stats: {"cache_hits": 0, "cache_saves": 1, "epoch": 1, "establish_ms": 810, "keptalive": 2, "learn_events": 4, "mode": "BothLinearSymmericPunch", "predicted_hits": 3, "punches_recv": 3, "punches_sent": 42, "step_history": []}
