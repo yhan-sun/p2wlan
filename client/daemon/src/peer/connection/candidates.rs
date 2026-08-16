@@ -710,12 +710,13 @@ impl PeerConnection {
     }
 
     pub(crate) fn remote_nat_requires_port_scatter(&self) -> bool {
-        let nat_type = self.nat_type.trim().to_ascii_lowercase();
-        nat_type.contains("address_or_port_dependent")
-            || nat_type.contains("symmetric")
-            || nat_type.contains("a=linear")
-            || nat_type.contains("a=random")
-            || nat_type.contains("a=blocked")
+        // R1: the peer's `nat_type` carries a structured NAT fingerprint hint
+        // (`p2v2:` label).  `scatter_decision` parses it and applies the
+        // m=/a=/f= predicate, falling back to the byte-for-byte legacy
+        // classifier for any input that does not parse (bare "symmetric",
+        // empty, corrupted) — so behavior is unchanged for old labels.  The
+        // six call sites (candidates.rs + probe_targets.rs) all funnel here.
+        scatter_decision(&self.nat_type)
     }
 
     fn explicit_predicted_window_failed(&self, local_generation: u64) -> bool {

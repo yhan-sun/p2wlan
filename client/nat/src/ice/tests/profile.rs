@@ -99,7 +99,7 @@ fn test_build_nat_profile_endpoint_independent_mapping() {
     assert_eq!(profile.confidence, 70);
     assert_eq!(
         profile.control_label(),
-        "p2:m=endpoint_independent;a=stable;d=0;c=70"
+        "p2v2:m=endpoint_independent;a=stable;d=0;c=70;f=unknown;h=unknown"
     );
 }
 
@@ -132,7 +132,9 @@ fn test_control_label_exposes_linear_prediction_hint_without_long_payload() {
     assert!(label.contains("m=address_or_port_dependent"));
     assert!(label.contains("a=linear"));
     assert!(label.contains("d=32"));
-    assert!(label.len() <= 64, "control nat_type must stay within server cap");
+    // The length ceiling is asserted exhaustively (all enum combos) in
+    // `test_control_label_all_enum_combos_within_128`; the old ad-hoc
+    // `<= 64` bound is subsumed by that single, harder-to-miss test.
 }
 
 #[test]

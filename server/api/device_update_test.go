@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -219,5 +220,67 @@ func TestUpdateDeviceEndpointStoresRelayRTT(t *testing.T) {
 	}
 	if len(response.Nodes) != 1 || response.Nodes[0].RelayRTTMS == nil || *response.Nodes[0].RelayRTTMS != 42 {
 		t.Fatalf("expected listed relay RTT 42, got %+v", response.Nodes)
+	}
+}
+
+// newEndpointUpdateTestServer sets up a server, user, and device owned by that
+// user, ready to exercise UpdateDeviceEndpoint.
+func newEndpointUpdateTestServer(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	user, err := db.CreateUser("endpoint-cap@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "endpoint-cap-key", "endpoint-cap-device", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	return NewServer(nil, nil, db), device.ID, user.ID
+}
+
+// patchEndpoint sends an endpoint update with the given nat_type and returns
+// the recorded response.
+func patchEndpoint(t *testing.T, server *Server, deviceID string, userID string, natType string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := fmt.Sprintf(`{"endpoint":"198.51.100.10:52100","nat_type":%q}`, natType)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/devices/"+deviceID+"/endpoint", strings.NewReader(body))
+	req.SetPathValue("id", deviceID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: userID}))
+	recorder := httptest.NewRecorder()
+	server.UpdateDeviceEndpoint(recorder, req)
+	return recorder
+}
+
+// R1 widens the nat_type cap from 64 to 128: a full-width `p2v2:` fingerprint
+// label (worst case ~97 bytes) must now be accepted.
+func TestUpdateEndpointAcceptsNatTypeWithin128(t *testing.T) {
+	server, deviceID, userID := newEndpointUpdateTestServer(t)
+	// A label shaped like the R1 control label, padded to exactly 128 bytes.
+	prefix := "p2v2:m=address_or_port_dependent;a=random;d=32;c=90;f=likely_endpoint_independent;h=not_applicable"
+	natType := prefix + strings.Repeat("x", 128-len(prefix))
+	if len(natType) != 128 {
+		t.Fatalf("test bug: nat_type must be 128 bytes, got %d", len(natType))
+	}
+	recorder := patchEndpoint(t, server, deviceID, userID, natType)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 128-byte nat_type, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// A nat_type over the new 128-byte cap must still be rejected with 400.
+func TestUpdateEndpointRejectsNatTypeOver128(t *testing.T) {
+	server, deviceID, userID := newEndpointUpdateTestServer(t)
+	natType := strings.Repeat("y", 129)
+	if len(natType) != 129 {
+		t.Fatalf("test bug: nat_type must be 129 bytes, got %d", len(natType))
+	}
+	recorder := patchEndpoint(t, server, deviceID, userID, natType)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for 129-byte nat_type, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }

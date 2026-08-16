@@ -14,17 +14,31 @@
 | 端口预测 | `client/nat/src/mapping.rs`：PortModelKind{FixedStep,Linear,NoisyLinear,MonotonicWindow,Periodic,Stable}，predict_ports 窗口 24/96 | predict.py：双向窗口 predict_ports、StepLearner（EWMA 0.6/0.4）、ReverseDetector（forward/reverse/mixed）、BirthdayPool（cap 128）、BudgetScanner 四段预算 | 已有主体，缺：反向/漂移检测、双窗口双向、池化散射调度、预算拆分回退链 |
 | 打洞 | `direct_runtime/hole_punch.rs` + `udp/outbound.rs`：PUNCH/ACK 14B、同步 punch_at、fresh-mapping 预测并发、PunchSocketPolicy 散射 | 7 策略表 + 三层预算回退（exact→window→random→sweep）、三态防火墙判定、hairpin 探测、drift 重预测 | 缺：预测失败逐级回退预算、防火墙三态接入散射决策 |
 | 生命周期 | candidate_refresh 15s 周期、3s 快重试、volatile 防抖 500ms、keepalive 25s 建议 | 参数化 keepalive、漂移检测+重预测、pair 缓存热启动（ttl+pattern）、事件时间线 | 缺：漂移检测接入 refresh 循环、缓存热启动协议化 |
-| 信令 | nat_type ≤64B 字符串 hint（`p2:m=..;a=..;d=..;c=..`）；server 纯存储透传 | 无（研究仅客户端视角） | 缺：结构化字段（mapping/allocation/filtering/hairpin/置信度）、指纹版本号、预测窗口向量下发 |
+| 信令 | nat_type ≤128B 字符串 hint（R1a 起 `p2v2:m=..;a=..;d=..;c=..;f=..;h=..`）；server 纯存储透传（dumb pipe，不解析） | 无（研究仅客户端视角） | 缺：预测窗口向量下发（f=/h= 已结构化，R1a；active filtering 探测 R1b） |
 | 环境 | netenv.rs 仅代理/TUN 捕获 | 无新增（检测链路在 nat 探测中） | 无 |
 | 验证 | mock/ 仅有 Rust harness 冒烟 | nat_sim.py 双 NAT 全谱模拟（4×3×3 注入）+ 36 组回归 + 324 格网格校准 | 迁移后需同一测试向量回放 |
 
 ## 2. 迁移范围与落点（Phase R1-R4）
 
-### R1 检测链路升级（低风险，独立）
-- `client/nat/src/detection.rs`：启用/扩展现有 active probes（`apply_active_behavior_probes`）为**三态 filtering**（allow/deny/no-response）+ **hairpin**（supported/unknown）+ **mapping lifetime** 探测；输出与 `NatProfile` 合并。
-- 新增 `NatFingerprint`（mapping/allocation/filtering/hairpin/mapping_confidence + observations 摘要），`control_label()` 扩展为 `p2:m=..;a=..;f=..;h=..;c=..`（向后兼容：旧客户端忽略未知字段）。
-- 落点：`client/nat/src/ice.rs`（NatProfile）、`active_probes.rs`。
-- 验收：nat_sim 注入矩阵 36 组回放，detection 与注入一致率 ≥95%。
+### R1 信令 schema 升级 + 散射决策结构化消费（低风险，独立）
+
+**R1a（本次已完成 ✅）**：把对端 NAT 行为指纹**结构化下发**给 peer，让散射决策从「看 `a=`」升级为「看 `m=`/`a=`/`f=`」；服务端仍纯透传（dumb pipe 是特性，非缺陷）。
+
+- [x] `control_label()`（`client/nat/src/ice.rs`）升级 `p2:` → `p2v2:m=..;a=..;d=..;c=..;f=..;h=..`。`m=/a=/d=/c=` 逐字节不变（旧 client `.contains()` 零回归），`f=/h=` 用 serde 名新增。
+- [x] 收端解析器 `parse_nat_hint` + `NatFingerprintHint` + `NatAllocation`（同 `ice.rs`，re-export 于 `lib.rs`）。纯函数、前缀无关（`p2:`/`p2v2:`）、损坏/裸词 → `parsed=false`。
+- [x] 散射决策 `scatter_decision` + `legacy_nat_classifier`（`client/daemon/src/peer/connection/nat_hint.rs`）：`remote_nat_requires_port_scatter` 瘦身为薄委托，6 个消费点（candidates.rs:153/594/826 + probe_targets.rs:131/615/914）全部经单一函数。`parsed=false` 时逐字节回退 legacy 5-pattern。
+- [x] Go 服务端 `UpdateDeviceEndpoint` cap `64 → 128`（`server/api/device_handlers.go`，**仅 1 常量**）；仍不解析、纯透传。2 条长度测试。
+- [x] CLI 对端诊断结构化展示（`peer_nat_hint_summary`，`formatting/peer/utils.rs`）：`nat= m/.. a/.. f/.. h/.. scatter=yes|no`，scatter 判定复用 `p2pnet_daemon::peer::scatter_decision`（单一事实源，不复制逻辑）。
+- [x] 兼容矩阵 + 结构证明测试（ice `tests/fingerprint.rs` + daemon `nat_hint.rs`）：穷举长度 ≤128、`m/a/d/c` 字节一致、往返、裸词/损坏 `parsed=false`、`f==apd ⟹ m==apd`（静态推断下 f 轴 provably 零贡献）、全组合 `scatter_decision == legacy`。
+- 落点：`client/nat/src/ice.rs`、`client/daemon/src/peer/connection/nat_hint.rs`、`server/api/device_handlers.go`、`client/cli/src/formatting/peer/utils.rs`。
+- **设计说明（f 轴 R1 零行为变化，是结构保证）**：R1 静态推断 `infer_filtering_behavior` 下 `f==apd ⟹ m==apd ⟹` base 已真，故 `|| (f==apd)` 项结构性不可达；`f==EIM ⟹ m==open ⟹ a==stable ⟹` base 假，f 轴整条 no-op。零回归由「全组合 == legacy」测试证明，非仅快照。首个可触发的新行为落在 R1b。
+
+**R1b（后续阶段，本次不做）**：让 `f=` 变准 —— 接入 active RFC 5780 CHANGE-REQUEST 三态过滤探测。
+
+- 范围：在生产 gather（`client/nat/src/ice/active_probes.rs::probe_filtering_behavior`，原型已存在但未接生产）里跑 CHANGE-REQUEST 探测，使 `filtering_behavior` **独立于 `m=`** 取值——尤其能在 `m==EndpointIndependent`（稳定映射）上探出 `f==apd`（EIM+APDF，家网关/CGNAT 常见）。
+- 触发新行为：R1b 后 `m==EIM + f==apd + a==stable` 首次使 `|| (f==apd)` 项可达 → 新 client 散射、旧 `.contains` 也命中（`address_or_port_dependent` token）→ 一致。后续可进一步按轴细化（如 `f==apd` 且入站 deny 的 C=0 协调），属独立范围。
+- 为何不并入 R1：active probe 要在生产 socket gather 里跑三态探测，是更大、独立可回归的活；混入会把 R1 从「低风险（管道+兼容）」变「中风险（行为变化）」。R1 先把 `f=` 决策的口子留对（`f==apd` 触发、unknown 不放大），R1b 只填数据即生效，无需再改决策代码。
+- 原 R1「detection 三态」与 R4「服务端结构化解析」拆分归属：detection 三态 → R1b（本段）；**服务端不解析**（原 R4 假设被推翻，dumb pipe 更优）→ 永久保持透传，服务端改动止于 cap=128。
 
 ### R2 预测引擎升级（中风险，核心收益）
 - `client/nat/src/mapping.rs`：
@@ -41,10 +55,10 @@
 - keepalive 参数化（默认 25s，配置可调），与 relay-backoff heartbeat 共存；
 - 落点：`client/daemon/src/candidate_refresh/runtime.rs`、`hole_punch.rs`。
 
-### R4 信令与对端散射（中风险，需服务端小改）
-- 服务端（Go）`UpdateDeviceEndpoint` 校验改为结构化解析（mapping/allocation/filtering/hairpin 枚举 + confidence），仍存 TEXT 兼容旧格式；
-- `remote_nat_requires_port_scatter` 扩展：使用 filtering 字段（apd → 散射 + 预测窗口全量），hairpin 字段（本地 hairpin=no 时对端直连不可用 → 快速回落中继）；
-- 落点：`server/api/device_handlers.go`、`client/daemon/src/peer/connection/candidates.rs`。
+### R4 服务端信令 cap 放宽 + hairpin 消费（低风险，服务端小改）
+- 服务端（Go）`UpdateDeviceEndpoint`：`nat_type` cap `64 → 128`（R1a 已完成 ✅）。**不引入结构化解析**——dumb pipe 透传更优（原 R4「服务端解析枚举」假设被 R1a 推翻），所有结构化在 Rust 收端。
+- `remote_nat_requires_port_scatter` 已结构化消费 `f=`（R1a）；hairpin 字段消费（本地 hairpin=no 时对端直连不可用 → 快速回落中继）留本阶段，待 `h=` 在生产有真实填充后接入（R1 只信令 + 记录 + CLI 展示，不接散射决策）。
+- 落点：`server/api/device_handlers.go`（R1a 已改）、`client/daemon/src/peer/connection/nat_hint.rs`（hairpin 消费待加）。
 - 注：信令仅 hint，Direct 提升仍以加密验证 ACK 为准（不改变现有安全模型）。
 
 ## 3. 明确不迁移项
@@ -66,8 +80,9 @@
 3. 双 linear 场景真实网络 P50 建立 ≤1.5s、成功率 ≥95%（Gate2 实测）。
 
 ## 6. 里程碑
-- R1: 检测三态 + 指纹信令（1 周）
+- R1a: 指纹信令 schema（`p2v2:`）+ 散射决策结构化消费 + 兼容层 + 服务端 cap（✅ 已完成）
+- R1b: active RFC 5780 filtering 探测，使 `f=` 独立于 `m=` 变准（后续，1 周）
 - R2: 预测升级 + 预算分层（2 周）
 - R3: 生命周期接入（1 周）
-- R4: 服务端结构化 + 散射决策（1 周）
+- R4: 服务端 cap（R1a 已完成）+ hairpin 消费（待 `h=` 生产填充，1 周）
 - 回归：nat_sim 向量库回放 + 真实网络 A/B（1 周）

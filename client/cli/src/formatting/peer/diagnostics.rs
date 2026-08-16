@@ -57,6 +57,9 @@ pub(crate) fn print_peer_diagnostics(snapshot: &Value) {
             direct_generation,
             pair_summary
         );
+        if let Some(nat) = peer_nat_hint_summary(peer) {
+            println!("  {nat}");
+        }
         if let Some(stage) = direct_failure_stage(peer) {
             println!("  direct-stage={stage}");
         }

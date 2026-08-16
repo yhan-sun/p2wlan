@@ -70,3 +70,4 @@ include!("tests/interfaces.rs");
 include!("tests/profile.rs");
 include!("tests/probes.rs");
 include!("tests/gather.rs");
+include!("tests/fingerprint.rs");

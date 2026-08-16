@@ -249,8 +249,32 @@ impl NatProfile {
             .port_delta
             .map(|delta| delta.to_string())
             .unwrap_or_else(|| "?".to_string());
+        // `f=`/`h=` use the serde names (not the display tokens `m=` uses) so
+        // the receiver can reverse-map them straight to the behavioral enums.
+        // They are purely additive: `m=`/`a=`/`d=`/`c=` are byte-for-byte
+        // unchanged from the historical `p2:` label, and `p2:` remains a
+        // substring of `p2v2:` — so an older daemon's `.contains("a=linear")`
+        // / `.contains("address_or_port_dependent")` heuristics still match
+        // exactly as before. `f=`/`h=` carry no legacy `a=`/`m=` token except
+        // `f=address_or_port_dependent`, which the wide `.contains` would have
+        // matched anyway. This is what makes the prefix upgrade + additive
+        // fields free of backward-compat regressions.
+        let filtering = match self.filtering_behavior {
+            FilteringBehavior::Unknown => "unknown",
+            FilteringBehavior::EndpointIndependent => "endpoint_independent",
+            FilteringBehavior::LikelyEndpointIndependent => "likely_endpoint_independent",
+            FilteringBehavior::AddressDependent => "address_dependent",
+            FilteringBehavior::AddressOrPortDependent => "address_or_port_dependent",
+            FilteringBehavior::UdpBlocked => "udp_blocked",
+        };
+        let hairpin = match self.hairpin_behavior {
+            HairpinBehavior::Unknown => "unknown",
+            HairpinBehavior::Supported => "supported",
+            HairpinBehavior::Unsupported => "unsupported",
+            HairpinBehavior::NotApplicable => "not_applicable",
+        };
         format!(
-            "p2:m={mapping};a={allocation};d={delta};c={}",
+            "p2v2:m={mapping};a={allocation};d={delta};c={};f={filtering};h={hairpin}",
             self.confidence
         )
     }
@@ -275,6 +299,239 @@ impl NatProfile {
             birthday_candidate: false,
             confidence: 0,
         }
+    }
+}
+
+/// Parsed value of the `a=` (allocation) token in a [`control_label`].
+///
+/// `allocation` is DERIVED in `NatProfile::control_label` (it is not stored as
+/// its own enum), so the receiver parses it back into this enum rather than
+/// serde. `Stable`/`Linear` correspond to the RFC 5780 names endpoint/linear
+/// `port dependent`; `Random` is the symmetric case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NatAllocation {
+    #[default]
+    Unknown,
+    Linear,
+    Stable,
+    Random,
+    Blocked,
+}
+
+/// Structured view of a peer `nat_type` control label
+/// (`p2:`/`p2v2:m=..;a=..;d=..;c=..;f=..;h=..`).
+///
+/// Receiver-side counterpart to [`NatProfile::control_label`]: the daemon
+/// advertises the label through the relay and the peer parses it back into
+/// these fields to drive the bounded port-scatter decision. `parsed` is the
+/// gate for that decision — when it is `false` (bare `"symmetric"`, empty, or
+/// a corrupted label from any client) the consumer MUST fall back to the
+/// legacy `.contains` classifier so behavior is byte-identical to pre-R1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatFingerprintHint {
+    /// Parsed `m=` (mapping behavior), `Unknown` if absent/unrecognized.
+    pub mapping: MappingBehavior,
+    /// Parsed `a=` (allocation), `Unknown` if absent/unrecognized.
+    pub allocation: NatAllocation,
+    /// Parsed `d=` port delta, `None` if absent, `?`, or non-numeric.
+    pub port_delta: Option<i32>,
+    /// Parsed `c=` confidence, `None` if absent or non-numeric.
+    pub confidence: Option<u8>,
+    /// Parsed `f=` (filtering behavior); `Unknown` for old `p2:` labels.
+    pub filtering: FilteringBehavior,
+    /// Parsed `h=` (hairpin behavior); `Unknown` for old `p2:` labels.
+    pub hairpin: HairpinBehavior,
+    /// `true` only when a well-formed `p2:`/`p2v2:` label was recognized.
+    pub parsed: bool,
+    /// The trimmed, lower-cased input, retained for the legacy fallback.
+    pub raw: String,
+}
+
+/// Reverse-map a `m=` token to its [`MappingBehavior`].
+///
+/// Accepts both the display tokens `control_label` emits AND the serde names,
+/// so a future emitter that switches `m=` to serde (or that R1b-era probe
+/// fills) still round-trips. The serde aliases must stay in lockstep with
+/// `#[serde(rename_all = "snake_case")]`.  Returns `None` for an unrecognized
+/// value: a *present* token whose value we don't know means the label is
+/// corrupted, and the caller MUST fall back to the legacy classifier — it must
+/// not silently read as `Unknown`, which could under-scatter relative to the
+/// legacy wide-substring match (e.g. truncated `m=address_or_port_dependentX`).
+fn mapping_behavior_from_token(token: &str) -> Option<MappingBehavior> {
+    match token {
+        "unknown" => Some(MappingBehavior::Unknown),
+        "blocked" | "udp_blocked" => Some(MappingBehavior::UdpBlocked),
+        "open" | "open_internet" => Some(MappingBehavior::OpenInternet),
+        "endpoint_independent" => Some(MappingBehavior::EndpointIndependent),
+        "address_or_port_dependent" => Some(MappingBehavior::AddressOrPortDependent),
+        _ => None,
+    }
+}
+
+/// Reverse-map an `a=` token to its [`NatAllocation`].
+///
+/// Returns `None` for an unrecognized value (see `mapping_behavior_from_token`
+/// for why a bad value must fall back to legacy rather than read as Unknown).
+fn allocation_from_token(token: &str) -> Option<NatAllocation> {
+    match token {
+        "unknown" => Some(NatAllocation::Unknown),
+        "linear" => Some(NatAllocation::Linear),
+        "stable" => Some(NatAllocation::Stable),
+        "random" => Some(NatAllocation::Random),
+        "blocked" => Some(NatAllocation::Blocked),
+        _ => None,
+    }
+}
+
+/// Reverse-map an `f=` token to its [`FilteringBehavior`].
+///
+/// `f=` uses serde names end-to-end (no separate display token), so accept the
+/// six serde variants and return `None` for anything else.
+fn filtering_behavior_from_token(token: &str) -> Option<FilteringBehavior> {
+    match token {
+        "unknown" => Some(FilteringBehavior::Unknown),
+        "endpoint_independent" => Some(FilteringBehavior::EndpointIndependent),
+        "likely_endpoint_independent" => Some(FilteringBehavior::LikelyEndpointIndependent),
+        "address_dependent" => Some(FilteringBehavior::AddressDependent),
+        "address_or_port_dependent" => Some(FilteringBehavior::AddressOrPortDependent),
+        "udp_blocked" => Some(FilteringBehavior::UdpBlocked),
+        _ => None,
+    }
+}
+
+/// Reverse-map an `h=` token to its [`HairpinBehavior`].
+fn hairpin_behavior_from_token(token: &str) -> Option<HairpinBehavior> {
+    match token {
+        "unknown" => Some(HairpinBehavior::Unknown),
+        "supported" => Some(HairpinBehavior::Supported),
+        "unsupported" => Some(HairpinBehavior::Unsupported),
+        "not_applicable" => Some(HairpinBehavior::NotApplicable),
+        _ => None,
+    }
+}
+
+/// Parse a peer `nat_type` control label into a [`NatFingerprintHint`].
+///
+/// Prefix-agnostic: both legacy `p2:` and the R1 `p2v2:` label parse. Missing
+/// `f=`/`h=` tokens (i.e. any `p2:` label) become `Unknown`, so a new client
+/// consuming an old label reproduces the pre-R1 decision exactly. Any input
+/// that does not start with `p2:`/`p2v2:` (bare words, empty, corrupted)
+/// yields `parsed == false` and the caller falls back to the legacy
+/// classifier. Pure: no I/O, no panic on malformed input.
+pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
+    let raw = input.trim().to_ascii_lowercase();
+    let Some(payload) = raw
+        .strip_prefix("p2v2:")
+        .or_else(|| raw.strip_prefix("p2:"))
+    else {
+        return unparsed_hint(&raw);
+    };
+    // A well-formed label is one or more `key=value` fields joined by `;`,
+    // each with a recognized key (m/a/d/c/f/h) AND a recognized value
+    // (d/c numeric where applicable).  Being strict here is the conservative
+    // direction: any malformed segment (no `=`), unrecognized key, or bad
+    // value yields `parsed == false` and the caller falls back to the legacy
+    // `.contains` classifier — which is always a safe superset.  The failure
+    // mode of over-strictness is merely "under-use the structured path",
+    // never a behavior change from legacy.  (A present-but-unrecognized
+    // `m=`/`f=` value in particular must NOT read as `Unknown`: that could
+    // under-scatter relative to the legacy wide-substring match on a
+    // truncated token.)
+    let mut mapping = MappingBehavior::Unknown;
+    let mut allocation = NatAllocation::Unknown;
+    let mut port_delta: Option<i32> = None;
+    let mut confidence: Option<u8> = None;
+    let mut filtering = FilteringBehavior::Unknown;
+    let mut hairpin = HairpinBehavior::Unknown;
+    let mut fields = 0u8;
+    for field in payload.split(';') {
+        if field.is_empty() {
+            continue; // tolerate stray/leading/trailing `;`
+        }
+        let Some((key, value)) = field.split_once('=') else {
+            return unparsed_hint(&raw);
+        };
+        match key {
+            "m" => {
+                mapping = match mapping_behavior_from_token(value) {
+                    Some(mb) => mb,
+                    None => return unparsed_hint(&raw),
+                };
+                fields += 1;
+            }
+            "a" => {
+                allocation = match allocation_from_token(value) {
+                    Some(a) => a,
+                    None => return unparsed_hint(&raw),
+                };
+                fields += 1;
+            }
+            "d" => {
+                // `control_label` emits `d=?` when there is no port delta, and
+                // a non-negative integer otherwise.  Reject anything else.
+                port_delta = if value == "?" {
+                    None
+                } else {
+                    match value.parse::<i32>() {
+                        Ok(d) if d >= 0 => Some(d),
+                        _ => return unparsed_hint(&raw),
+                    }
+                };
+                fields += 1;
+            }
+            "c" => {
+                // `confidence` is 0-100; out-of-range or non-numeric is
+                // treated as corruption → legacy fallback.
+                match value.parse::<u8>() {
+                    Ok(c) => confidence = Some(c),
+                    _ => return unparsed_hint(&raw),
+                }
+                fields += 1;
+            }
+            "f" => {
+                filtering = match filtering_behavior_from_token(value) {
+                    Some(fb) => fb,
+                    None => return unparsed_hint(&raw),
+                };
+                fields += 1;
+            }
+            "h" => {
+                hairpin = match hairpin_behavior_from_token(value) {
+                    Some(h) => h,
+                    None => return unparsed_hint(&raw),
+                };
+                fields += 1;
+            }
+            _ => return unparsed_hint(&raw), // unrecognized key → corrupted
+        }
+    }
+    if fields == 0 {
+        return unparsed_hint(&raw);
+    }
+    NatFingerprintHint {
+        mapping,
+        allocation,
+        port_delta,
+        confidence,
+        filtering,
+        hairpin,
+        parsed: true,
+        raw,
+    }
+}
+
+/// Build a `parsed == false` hint: no structured fields were recovered, so the
+/// consumer falls back to the legacy classifier on `raw`.
+fn unparsed_hint(raw: &str) -> NatFingerprintHint {
+    NatFingerprintHint {
+        mapping: MappingBehavior::Unknown,
+        allocation: NatAllocation::Unknown,
+        port_delta: None,
+        confidence: None,
+        filtering: FilteringBehavior::Unknown,
+        hairpin: HairpinBehavior::Unknown,
+        parsed: false,
+        raw: raw.to_string(),
     }
 }
 

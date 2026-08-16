@@ -29,9 +29,9 @@ pub use detection::{DetectionConfig, NatDetector};
 pub use error::{NatError, Result};
 pub use ice::{
     candidate_report_from_observations, candidates_to_addrs, compute_priority,
-    gather_candidate_report, gather_candidates, gather_local_addresses, CandidateGatherReport,
-    FilteringBehavior, HairpinBehavior, IceConfig, MappingBehavior, MappingLifetime, NatProfile,
-    StunObservation,
+    gather_candidate_report, gather_candidates, gather_local_addresses, parse_nat_hint,
+    CandidateGatherReport, FilteringBehavior, HairpinBehavior, IceConfig, MappingBehavior,
+    MappingLifetime, NatAllocation, NatFingerprintHint, NatProfile, StunObservation,
 };
 pub use mapping::{
     build_model, build_model_for_batch, model_is_fresh, modular_add, modular_difference,

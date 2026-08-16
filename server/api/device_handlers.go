@@ -252,7 +252,7 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 	if req.NATType == "" {
 		req.NATType = "unknown"
 	}
-	if len(req.NATType) > 64 {
+	if len(req.NATType) > 128 {
 		http.Error(w, `{"error":"nat_type too long"}`, http.StatusBadRequest)
 		return
 	}
