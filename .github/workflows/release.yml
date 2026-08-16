@@ -54,18 +54,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get may re-resolve transitive SDK-pinned dependencies
-      # (e.g. matcher/meta/test_api under a newer Flutter SDK) and rewrite the
-      # committed pubspec.lock, and newer SDKs may also upgrade
-      # analysis_options.yaml, both of which would dirty the checkout for the
-      # release identity gate.  Neither diff carries release-relevant content,
-      # so restore them immediately.
-      - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-
       - name: Build Android arm64 release APK
         working-directory: apps/flutter_client
         run: >
@@ -109,18 +97,6 @@ jobs:
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
-
-      # flutter pub get may re-resolve transitive SDK-pinned dependencies
-      # (e.g. matcher/meta/test_api under a newer Flutter SDK) and rewrite the
-      # committed pubspec.lock, and newer SDKs may also upgrade
-      # analysis_options.yaml, both of which would dirty the checkout for the
-      # release identity gate.  Neither diff carries release-relevant content,
-      # so restore them immediately.
-      - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
 
       - name: Build unsigned iOS release app
         working-directory: apps/flutter_client
@@ -188,18 +164,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get may re-resolve transitive SDK-pinned dependencies
-      # (e.g. matcher/meta/test_api under a newer Flutter SDK) and rewrite the
-      # committed pubspec.lock, and newer SDKs may also upgrade
-      # analysis_options.yaml, both of which would dirty the checkout for the
-      # release identity gate.  Neither diff carries release-relevant content,
-      # so restore them immediately.
-      - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-
       - name: Build macOS release app
         working-directory: apps/flutter_client
         run: >
@@ -209,6 +173,12 @@ jobs:
 
       - name: Build macOS daemon for ${{ matrix.arch }}
         run: cargo build -p p2wlan-daemon --release --target ${{ matrix.rust_target }}
+      - name: Restore SDK-migrated files
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+
 
       - name: Create architecture-specific DMG
         run: |
@@ -302,18 +272,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get may re-resolve transitive SDK-pinned dependencies
-      # (e.g. matcher/meta/test_api under a newer Flutter SDK) and rewrite the
-      # committed pubspec.lock, and newer SDKs may also upgrade
-      # analysis_options.yaml, both of which would dirty the checkout for the
-      # release identity gate.  Neither diff carries release-relevant content,
-      # so restore them immediately.
-      - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-
       - name: Build Linux daemon
         run: cargo build -p p2wlan-daemon --release
 
@@ -324,6 +282,12 @@ jobs:
           --release
           --target-platform ${{ matrix.target_platform }}
           --split-debug-info build/symbols/linux-${{ matrix.arch }}
+      - name: Restore SDK-migrated files
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+
 
       - name: Assemble Linux Flutter artifact
         run: |
@@ -388,18 +352,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get may re-resolve transitive SDK-pinned dependencies
-      # (e.g. matcher/meta/test_api under a newer Flutter SDK) and rewrite the
-      # committed pubspec.lock, and newer SDKs may also upgrade
-      # analysis_options.yaml, both of which would dirty the checkout for the
-      # release identity gate.  Neither diff carries release-relevant content,
-      # so restore them immediately.
-      - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-
       - name: Build Windows daemon
         run: cargo build -p p2wlan-daemon --release
 
@@ -413,6 +365,12 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
+      - name: Restore SDK-migrated files
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+
 
       - name: Build Windows installer
         shell: pwsh
