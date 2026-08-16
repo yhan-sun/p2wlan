@@ -204,6 +204,14 @@ jobs:
           --release
           --split-debug-info build/symbols/macos
 
+      - name: Restore SDK-migrated files (pre-daemon-build)
+        run: >
+          git checkout --
+          apps/flutter_client/pubspec.lock
+          apps/flutter_client/analysis_options.yaml
+          apps/flutter_client/.metadata
+          apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj
+
       - name: Build macOS daemon for ${{ matrix.arch }}
         run: cargo build -p p2wlan-daemon --release --target ${{ matrix.rust_target }}
       - name: Restore SDK-migrated files
