@@ -116,3 +116,28 @@
 - artifacts/nat_matrix_p2.tsv、grid_results.tsv、grid_work/、work_p2/、summary.tsv
 - RECOMMENDED_PARAMS.md、MIGRATION_RFC.md（本文档）
 - 进度日志：TEST_REPORT.md（F1）+ 本文档（P2）
+## 9. Gate2 实测报告（追加节）
+
+> 执行于 2026-08-16，A=Air(Mini 同环境公网出口候选集) / B=Mini。按 LIVE_PROTOCOL.md §2 步骤。
+
+### 9.1 环境
+
+- Mini / Air 双端通过 STUN 探测均获真实公网映射（非 loopback），UDP 出站正常。
+- 信号隧道：TCP 信令经 SSH 隧道（139.199.55.169:2300 → Air）交付，两端可正常交换 profile 并进入打洞阶段。
+- 引擎运行：N=8 W=2 M=32 pool=1 budget=2s，每轮 epoch 20，双方各发 1300-1320 发，全部 `punches_recv=0`，结果 fail（转 TURN 兜底路径，符合预期回退）。
+
+### 9.2 密码学级对照实验（人工最小化，隔离引擎逻辑）
+
+| # | 实验 | 配置 | 结果 |
+|---|---|---|---|
+| E1 | 双端并发互发（同一 socket 双向+30s）| Mini→{1.115.179.253, 1.114.147.253, 220.163.6.190}，Air→{1.122.x, 222.221.188.223} 各候选 40 发/秒 | 0 收 |
+| E2 | Mini 880 发跨 5 IP × 10 端口回扫 Air | 含探测端口 45474 及其邻域 | Air 监听 socket 0 收（n=0）|
+| E3 | 对照：STUN 出站+映射 | 双端 stun.l.google.com:19302 / stun.cloudflare.com:3478 | 均成功返回映射（出站 UDP 正常）|
+
+### 9.3 结论
+
+- 双端 NAT 均为运营商级 CGNAT 且 **映射地址持续漂移**（Mini 出口在 222.221.188.223 ↔ 1.122.x 间轮换；Air 出口在 220.163.6.190 ↔ 1.115.x 间轮换）——每次新 socket 探测所得映射不同，端口预测（StepLearner/BudgetScanner）无法抵消出口-IP 级变化。
+- filtering 为 `*_dependent + state=deny`（LIVE_PROTOCOL §4 已登记的"全封闭"类别），入站一律拒绝，锥形假设失败。
+- 因此：**当前双 CGNAT 环境下直连打洞不可达属环境特征，非引擎缺陷**；引擎按配置正确转入 TURN 中继回退（stats.mode 实测 `ConePunchToLinearSymmeric`→fail→relay）。
+- 达标线（成功率≥95%、P50≤1.5s）在本环境不可观测；需在"至少一侧为锥形/端口可预测"的真实网络（自建 STUN+软路由、或公网 VPS 直连形态）复核。
+- 生产影响：与现有 p2wlan 架构一致——直连打洞为尽力而为，TCP 中继（139 通道）为保底路径；本报告不改变生产依赖。
