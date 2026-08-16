@@ -139,6 +139,15 @@ fn birthday_probe_endpoint(base: SocketAddr, delta: i32) -> Option<SocketAddr> {
     Some(SocketAddr::new(base.ip(), port))
 }
 
+/// Wrapped port neighbor of an advertised base for the fast-prefix
+/// neighborhood merge.  Deduplicated by the caller.
+pub(super) fn advertised_neighborhood_endpoint(
+    base: SocketAddr,
+    delta: i32,
+) -> Option<SocketAddr> {
+    birthday_probe_endpoint(base, delta)
+}
+
 fn permuted_port_from_origin(origin: u16, rank: usize) -> u16 {
     let zero_based_origin = usize::from(origin.saturating_sub(1));
     let offset = rank

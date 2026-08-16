@@ -71,7 +71,26 @@ impl PeerConnection {
     /// receive the larger bounded fast-probe prefix.  The caller still owns
     /// the full candidate FIFO; this is only a latency hint for authenticated
     /// predictions and on-wire learned endpoints.
+    ///
+    /// When the peer advertised NO fresh prediction window this generation,
+    /// the exact advertised/learned ports are the best base but not the whole
+    /// trigger surface: a black-hole-recovering peer often answers on a
+    /// neighboring port of its advertised base first.  Merge the bounded ±8
+    /// neighborhood of every advertised authoritative public endpoint into
+    /// the preferred prefix so the very first bounded fast window can hit a
+    /// post-hole neighbor instead of waiting for the slow birthday sweep.
     pub(crate) fn preferred_fast_candidates(
+        &self,
+        candidates: &[SocketAddr],
+    ) -> Vec<SocketAddr> {
+        let mut preferred = self.preferred_fast_candidates_from_sources(candidates);
+        if !self.has_explicit_predicted_window() {
+            self.merge_advertised_neighborhood_into(&mut preferred, candidates);
+        }
+        preferred
+    }
+
+    fn preferred_fast_candidates_from_sources(
         &self,
         candidates: &[SocketAddr],
     ) -> Vec<SocketAddr> {
@@ -87,6 +106,42 @@ impl PeerConnection {
                 )
             })
             .collect()
+    }
+
+    /// Merge the bounded ±8 neighborhood of every advertised authoritative
+    /// public base into the preferred fast-prefix list (deduplicated, and
+    /// still bounded by the caller's `DIRECT_FAST_PROBE_MAX_CANDIDATES`
+    /// truncation downstream).
+    fn merge_advertised_neighborhood_into(
+        &self,
+        preferred: &mut Vec<SocketAddr>,
+        candidates: &[SocketAddr],
+    ) {
+        let bases = candidates
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::Signaled | CandidatePairSource::Upnp
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut emitted: HashSet<SocketAddr> = preferred.iter().copied().collect();
+        for base in bases {
+            for delta in 1..=FAST_PREFIX_ADVERTISED_NEAR_DELTA {
+                for sign in [1, -1] {
+                    let Some(endpoint) = advertised_neighborhood_endpoint(base, sign * delta)
+                    else {
+                        continue;
+                    };
+                    if emitted.insert(endpoint) {
+                        preferred.push(endpoint);
+                    }
+                }
+            }
+        }
     }
 
     fn candidate_targets_need_remote_scatter_pool(&self, endpoints: &[SocketAddr]) -> bool {

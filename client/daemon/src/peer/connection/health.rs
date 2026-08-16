@@ -582,6 +582,14 @@ impl PeerConnection {
         self.direct_health.retry_due(base)
     }
 
+    /// Relay-flat retry cadence: when the relay already carries the data
+    /// plane, a background scatter retry must not grow an exponential
+    /// backoff across consecutive misses — the special interval keeps the
+    /// window warm so a post-black-hole probe hits immediately.
+    fn direct_retry_due_relay_flat(&self, base: Duration) -> bool {
+        self.direct_health.retry_due_relay_flat(base)
+    }
+
     fn direct_reclaim_active(&self) -> bool {
         self.direct_reclaim_until
             .is_some_and(|until| Instant::now() < until)

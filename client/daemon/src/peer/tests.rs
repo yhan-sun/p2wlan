@@ -17,3 +17,4 @@ include!("tests/part10.rs");
 include!("tests/part11.rs");
 include!("tests/part12.rs");
 include!("tests/part13.rs");
+include!("tests/part14.rs");

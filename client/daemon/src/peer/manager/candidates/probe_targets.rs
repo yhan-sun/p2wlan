@@ -515,8 +515,20 @@ impl PeerManager {
                     continue;
                 }
                 let reclaim_active = conn.direct_reclaim_active();
-                if !reclaim_active && !conn.direct_retry_due(base_retry_after) {
-                    continue;
+                if !reclaim_active {
+                    // A relay-backed peer in the wide scatter stage keeps the
+                    // retry cadence flat (no exponential growth) so the scan
+                    // window stays warm during a transient black hole; only
+                    // peers without a relay safety net retain the classic
+                    // failure backoff.  See `PathHealth::retry_due_relay_flat`.
+                    let retry_due = if self.has_relay_safety_net(&peer_id).await {
+                        conn.direct_retry_due_relay_flat(base_retry_after)
+                    } else {
+                        conn.direct_retry_due(base_retry_after)
+                    };
+                    if !retry_due {
+                        continue;
+                    }
                 }
                 if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
                     let needs_record = conn

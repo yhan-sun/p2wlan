@@ -74,6 +74,18 @@ const BIRTHDAY_PROBE_COOLDOWN_BUDGET_PER_CYCLE: usize = 192;
 pub(crate) const BIRTHDAY_PROBE_FAILURE_BUDGET_PER_CYCLE: usize = 192;
 const BIRTHDAY_PROBE_MAX_BASES_PER_CYCLE: usize = 4;
 const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
+/// Advertised-endpoint neighborhood merged into the latency-sensitive fast
+/// prefix when NO fresh prediction window exists.
+///
+/// Field evidence (dual-CGNAT, 2026-08-16): the stable side's fast prefix
+/// carried only the exact advertised/learned ports, and after a UDP black
+/// hole cleared the first probe that matched was a neighboring port of an
+/// advertised base — the dt-precise trigger window was the neighborhood, not
+/// the exact port.  Merging ±8 around advertised authoritative bases into
+/// the bounded fast prefix (still capped by DIRECT_FAST_PROBE_MAX_CANDIDATES)
+/// makes the first post-hole probe land the hit instead of waiting for the
+/// slow birthday wide sweep.
+const FAST_PREFIX_ADVERTISED_NEAR_DELTA: i32 = 8;
 const BIRTHDAY_PROBE_PORT_SPACE: usize = u16::MAX as usize;
 const BIRTHDAY_PROBE_WIDE_STRIDE: usize = 251;
 /// Stable/easy peers should spend the remote-scatter session cap on distinct
@@ -301,8 +313,9 @@ mod endpoint;
 mod probe_budget;
 mod types;
 use birthday::{
-    birthday_probe_endpoint_plan_for_bases_from_rank, birthday_probe_wide_rank_count,
-    peer_candidates_need_port_scatter, stable_public_ip_probe_plan_from_rank,
+    advertised_neighborhood_endpoint, birthday_probe_endpoint_plan_for_bases_from_rank,
+    birthday_probe_wide_rank_count, peer_candidates_need_port_scatter,
+    stable_public_ip_probe_plan_from_rank,
 };
 #[cfg(test)]
 use birthday::{

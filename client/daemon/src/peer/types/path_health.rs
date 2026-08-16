@@ -116,4 +116,22 @@ impl PathHealth {
     pub(super) fn retry_due(&self, base: Duration) -> bool {
         self.retry_remaining(base).is_zero()
     }
+
+    /// Whether the next retry is due using a fixed short cadence, ignoring
+    /// the exponential backoff growth.
+    ///
+    /// Used only for a peer whose relay path already carries the data plane
+    /// during a background Direct retry.  There the retry interval is a
+    /// scan-density choice, not a failure-avoidance backoff: the wide scatter
+    /// window must stay warm so the first probe after a transient UDP black
+    /// hole clears lands immediately (field evidence: a dual-CGNAT cold-start
+    /// round sat at the 7-8s exponential cap for the whole window and then
+    /// matched exactly on the first post-hole retry probe).  An exponential
+    /// ramp in that state only delays the eventual hit.
+    pub(super) fn retry_due_relay_flat(&self, base: Duration) -> bool {
+        match self.failure_age() {
+            Some(age) => age >= base,
+            None => true,
+        }
+    }
 }
