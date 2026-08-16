@@ -143,3 +143,53 @@ async fn liveness_ok_verdict_is_recorded_but_never_applied() {
         "Ok must not force the stage into relay-backoff"
     );
 }
+
+#[tokio::test]
+async fn liveness_pre_flight_off_never_blocks() {
+    let manager = PeerManager::new(test_config()); // pre_flight defaults false
+    let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
+    manager.add_peer(&flood_peer_112("peer-pf", "10.20.0.3", endpoint)).await;
+    let gen = manager.current_network_generation().await;
+    // Even with a fresh Blocked verdict, default-OFF pre-flight never skips.
+    manager
+        .test_seed_liveness("peer-pf", gen, LivenessVerdict::Blocked, 0)
+        .await;
+    assert!(
+        !manager.pre_flight_liveness_blocked("peer-pf", gen).await,
+        "default-OFF pre-flight must never skip a punch"
+    );
+}
+
+#[tokio::test]
+async fn liveness_pre_flight_on_blocks_only_on_fresh_blocked() {
+    let mut config = test_config();
+    config.network.udp_liveness_pre_flight = true;
+    let ttl_ms = config.network.udp_liveness_ttl_ms as u64;
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
+    manager.add_peer(&flood_peer_112("peer-pf2", "10.20.0.3", endpoint)).await;
+    let gen = manager.current_network_generation().await;
+
+    // No cache → false (read-only: proceed with punch, do NOT spawn).
+    assert!(!manager.pre_flight_liveness_blocked("peer-pf2", gen).await);
+
+    // Fresh Ok → false (reachable, don't skip).
+    manager.test_seed_liveness("peer-pf2", gen, LivenessVerdict::Ok, 0).await;
+    assert!(!manager.pre_flight_liveness_blocked("peer-pf2", gen).await);
+
+    // Fresh Blocked → true (skip).
+    manager
+        .test_seed_liveness("peer-pf2", gen, LivenessVerdict::Blocked, 0)
+        .await;
+    assert!(manager.pre_flight_liveness_blocked("peer-pf2", gen).await);
+
+    // Expired Blocked → false: the TTL self-heals a transient block instead of
+    // skipping forever.
+    manager
+        .test_seed_liveness("peer-pf2", gen, LivenessVerdict::Blocked, ttl_ms + 1000)
+        .await;
+    assert!(
+        !manager.pre_flight_liveness_blocked("peer-pf2", gen).await,
+        "an expired Blocked must not keep skipping — the TTL self-heals"
+    );
+}

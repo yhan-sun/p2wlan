@@ -165,6 +165,24 @@ async fn run_direct_probe_loop(
                             .await;
                         return;
                     }
+                    // Pre-flight liveness gate (default OFF).  If a fresh Blocked verdict is
+                    // already cached, skip this punch round: outbound UDP is firewalled and relay
+                    // carries the data plane, so re-scattering into it only burns budget.  This is
+                    // READ-ONLY — it neither spawns a probe (the 0-ACK trigger is the sole spawn
+                    // path) nor takes the recovery_epochs lock.
+                    if peers.pre_flight_liveness_blocked(&peer_id, generation).await {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "outbound_liveness_pre_flight_skip",
+                                candidates.first().copied(),
+                                Some(candidates.len()),
+                                None,
+                                "pre-flight liveness Blocked; skipping this punch round (relay is the data plane)",
+                            )
+                            .await;
+                        return;
+                    }
                     let punch_started_stage = if reclaim_active {
                         "direct_reclaim_punch_started"
                     } else {

@@ -271,6 +271,29 @@ impl PeerManager {
         .await;
     }
 
+    /// Pre-flight gate (default OFF).  Returns true ONLY when
+    /// `udp_liveness_pre_flight` is enabled AND a FRESH (within-TTL) `Blocked`
+    /// liveness verdict already exists for `(peer, gen)` — meaning the punch
+    /// should be skipped because relay carries the data plane.
+    ///
+    /// READ-ONLY: never spawns a probe (the sole spawn path is the 0-ACK
+    /// trigger, Task 8) and never takes the recovery_epochs lock.  On a cache
+    /// miss or an expired verdict it returns false (proceed with the punch).
+    /// The TTL is what lets a transient "blocked" self-heal instead of
+    /// permanently stopping punching.
+    pub(crate) async fn pre_flight_liveness_blocked(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) -> bool {
+        if !self.config.network.udp_liveness_pre_flight {
+            return false; // default OFF
+        }
+        self.evaluate_outbound_liveness(peer_id, generation)
+            .await
+            == Some(p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked)
+    }
+
     /// Test-only: seed a cached liveness verdict for `(peer, generation)` with
     /// a back-dated `probed_at` (age_ms).  Lets the TTL / generation tests
     /// drive the cache without opening real sockets.
