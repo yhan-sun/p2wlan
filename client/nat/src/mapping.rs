@@ -557,6 +557,117 @@ pub fn predict_ports_for_elapsed(
     measurement_span_ms: u64,
     gap_ms: u64,
 ) -> Vec<PredictionCandidate> {
+    generate_candidates(model, last, measurement_span_ms, gap_ms, None, false)
+}
+
+/// Extra candidate ports covering the mappings a shared CGNAT will consume
+/// between the last STUN response and the peer's probes.
+///
+/// The observed sequence already contains the externality: every delta that
+/// overshoots the model step is one unrelated mapping consumed between two of
+/// our requests.  `excess / span` is the observed port consumption rate of
+/// unrelated traffic; multiplying by the expected gap yields the extra ports
+/// the peer-facing mapping may drift by.
+fn extra_window_ports(model: &PortModel, measurement_span_ms: u64, gap_ms: u64) -> usize {
+    if measurement_span_ms == 0 || gap_ms == 0 {
+        return 0;
+    }
+    let step = match model.kind {
+        PortModelKind::FixedStep { step }
+        | PortModelKind::Linear { step }
+        | PortModelKind::NoisyLinear { step } => step,
+        PortModelKind::MonotonicWindow { .. } => return 0,
+        _ => return 0,
+    };
+    let mut excess_ports = 0u64;
+    let step_direction = i64::from(step.signum());
+    for delta in &model.deltas {
+        // Measure the overshoot along the model's direction: with step +1 a
+        // delta of +3 consumed two extra ports; with step -1 a delta of -3
+        // consumed two extra ports as well.
+        let beyond = (i64::from(*delta) - i64::from(step)) * step_direction;
+        if beyond > 0 {
+            excess_ports += beyond as u64;
+        }
+    }
+    if excess_ports == 0 {
+        return 0;
+    }
+    let rate = excess_ports as f64 / measurement_span_ms.max(1) as f64;
+    let extra = (rate * gap_ms as f64).ceil() as usize;
+    extra.min(MAX_PREDICTED_PORTS)
+}
+
+/// Whether the model's samples are still within their trusted age.
+pub fn model_is_fresh(model: &PortModel, max_age: Duration, now_ms: u64) -> bool {
+    now_ms >= model.sampled_at_ms && (now_ms - model.sampled_at_ms) <= max_age.as_millis() as u64
+}
+
+/// The confidence tier of the linear candidate window, in the order the
+/// predictor walks them.  `reverse_window` widens the base tier by one step
+/// (to cover backwards allocation drift) and the sum is still capped at
+/// `MAX_PREDICTED_PORTS`.
+fn reverse_window_size(base_window: usize, reverse_window: bool) -> usize {
+    let base = if reverse_window {
+        match base_window {
+            6 => 12,
+            12 => MAX_PREDICTED_PORTS,
+            _ => base_window,
+        }
+    } else {
+        base_window
+    };
+    base.min(MAX_PREDICTED_PORTS)
+}
+
+/// Same as [`predict_ports_for_elapsed`], but with the adaptive-prediction
+/// refinements folded in from the [`crate::adaptive`] learner state:
+///
+/// - `step_estimate`: when `Some`, it **overrides** the model's stride for the
+///   `FixedStep` / `Linear` / `NoisyLinear` branches (the cross-batch EWMA
+///   estimate is more current than this one batch's median).  The caller is
+///   responsible for bounding the estimate (`FRESH_MAPPING_MAX_ABS_STEP`).
+/// - `reverse_window`: when `true` (the peer's mappings are walking backwards),
+///   the base confidence window is widened by one tier (`6 -> 12 -> 24`,
+///   already-capped tiers stay capped), still bounded by
+///   `MAX_PREDICTED_PORTS`.
+///
+/// With `step_estimate = None` and `reverse_window = false` the output is
+/// byte-for-byte identical to [`predict_ports_for_elapsed`].
+pub fn predict_ports_with_learning(
+    model: &PortModel,
+    last: u16,
+    measurement_span_ms: u64,
+    gap_ms: u64,
+    step_estimate: Option<i16>,
+    reverse_window: bool,
+) -> Vec<PredictionCandidate> {
+    generate_candidates(
+        model,
+        last,
+        measurement_span_ms,
+        gap_ms,
+        step_estimate,
+        reverse_window,
+    )
+}
+
+/// Shared candidate generation for [`predict_ports_for_elapsed`] and
+/// [`predict_ports_with_learning`].
+///
+/// `effective_step` (the learned estimate) overrides the model stride for the
+/// linear branches, and `reverse_window` widens the base confidence window by
+/// one tier.  Both flags are inert for the non-linear shapes (Stable,
+/// Periodic, MonotonicWindow, Unpredictable), so passing the "plain" defaults
+/// reproduces the historical predictor exactly.
+fn generate_candidates(
+    model: &PortModel,
+    last: u16,
+    measurement_span_ms: u64,
+    gap_ms: u64,
+    step_estimate: Option<i16>,
+    reverse_window: bool,
+) -> Vec<PredictionCandidate> {
     let mut candidates = Vec::with_capacity(MAX_PREDICTED_PORTS);
 
     match model.kind {
@@ -591,19 +702,23 @@ pub fn predict_ports_for_elapsed(
         PortModelKind::FixedStep { step }
         | PortModelKind::Linear { step }
         | PortModelKind::NoisyLinear { step } => {
+            // The learned cross-batch stride, when present, is more current
+            // than this single batch's median and replaces it.
+            let effective_step = step_estimate.unwrap_or(step);
             let base_window = match model.confidence {
                 90..=100 => 6,
                 75..=89 => 12,
                 60..=74 => MAX_PREDICTED_PORTS,
                 _ => 0,
             };
+            let base_window = reverse_window_size(base_window, reverse_window);
             let extra_window = extra_window_ports(model, measurement_span_ms, gap_ms);
             let window_size = base_window
                 .saturating_add(extra_window)
                 .min(MAX_PREDICTED_PORTS);
             let low_confidence = model.confidence < 75;
             for distance in 0..window_size {
-                let port = modular_add(last, step.saturating_mul((distance + 1) as i16));
+                let port = modular_add(last, effective_step.saturating_mul((distance + 1) as i16));
                 candidates.push(PredictionCandidate {
                     port,
                     rank: distance as u8,
@@ -656,49 +771,6 @@ pub fn predict_ports_for_elapsed(
     };
     candidates.truncate(window_cap);
     candidates
-}
-
-/// Extra candidate ports covering the mappings a shared CGNAT will consume
-/// between the last STUN response and the peer's probes.
-///
-/// The observed sequence already contains the externality: every delta that
-/// overshoots the model step is one unrelated mapping consumed between two of
-/// our requests.  `excess / span` is the observed port consumption rate of
-/// unrelated traffic; multiplying by the expected gap yields the extra ports
-/// the peer-facing mapping may drift by.
-fn extra_window_ports(model: &PortModel, measurement_span_ms: u64, gap_ms: u64) -> usize {
-    if measurement_span_ms == 0 || gap_ms == 0 {
-        return 0;
-    }
-    let step = match model.kind {
-        PortModelKind::FixedStep { step }
-        | PortModelKind::Linear { step }
-        | PortModelKind::NoisyLinear { step } => step,
-        PortModelKind::MonotonicWindow { .. } => return 0,
-        _ => return 0,
-    };
-    let mut excess_ports = 0u64;
-    let step_direction = i64::from(step.signum());
-    for delta in &model.deltas {
-        // Measure the overshoot along the model's direction: with step +1 a
-        // delta of +3 consumed two extra ports; with step -1 a delta of -3
-        // consumed two extra ports as well.
-        let beyond = (i64::from(*delta) - i64::from(step)) * step_direction;
-        if beyond > 0 {
-            excess_ports += beyond as u64;
-        }
-    }
-    if excess_ports == 0 {
-        return 0;
-    }
-    let rate = excess_ports as f64 / measurement_span_ms.max(1) as f64;
-    let extra = (rate * gap_ms as f64).ceil() as usize;
-    extra.min(MAX_PREDICTED_PORTS)
-}
-
-/// Whether the model's samples are still within their trusted age.
-pub fn model_is_fresh(model: &PortModel, max_age: Duration, now_ms: u64) -> bool {
-    now_ms >= model.sampled_at_ms && (now_ms - model.sampled_at_ms) <= max_age.as_millis() as u64
 }
 
 #[cfg(test)]
@@ -1166,4 +1238,123 @@ mod tests {
         assert!(model_is_fresh(&model, Duration::from_secs(5), 3000));
         assert!(!model_is_fresh(&model, Duration::from_millis(500), 3000));
     }
+
+    // ---- predict_ports_with_learning (adaptive step + reverse window) ----
+
+    #[test]
+    fn learning_step_estimate_overrides_fixed_step_top_prediction() {
+        // A fixed step-1 model, but the cross-batch learner now believes the
+        // peer walks step 7: the top-1 candidate must be last + 7, not + 1.
+        let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
+        assert!(matches!(model.kind, PortModelKind::FixedStep { step: 1 }));
+        let predicted = predict_ports_with_learning(&model, 45392, 0, 0, Some(7), false);
+        assert_eq!(predicted[0].port, 45399, "the learned estimate must override the model step");
+        assert_eq!(predicted[0].reason, PredictionReason::TopPrediction);
+        assert_eq!(predicted[0].rank, 0);
+    }
+
+    #[test]
+    fn learning_none_estimate_matches_plain_predictor() {
+        // No learned estimate and no reverse window: identical output to the
+        // existing predictor across every linear + periodic + stable shape.
+        let cases = [
+            (build_model(&[45390, 45391, 45392], Some(ip()), 1000), 45392),
+            (build_model(&[1000, 1001, 1000, 1001, 1000, 1001], Some(ip()), 1000), 1001),
+            (build_model(&[4483, 4483, 4483], Some(ip()), 1000), 4483),
+            (build_model(&[45390, 45391, 45393], Some(ip()), 1000), 45393),
+        ];
+        for (model, last) in cases {
+            let plain = predict_ports_for_elapsed(&model, last, 100, 500);
+            let learned = predict_ports_with_learning(&model, last, 100, 500, None, false);
+            assert_eq!(
+                plain, learned,
+                "no-estimate learner output must equal predict_ports_for_elapsed for {:?}",
+                model.kind
+            );
+        }
+    }
+
+    #[test]
+    fn learning_reverse_window_widens_base_tier() {
+        // 95-confidence fixed step -> base 6; reverse widens it one tier to 12.
+        let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
+        assert_eq!(model.confidence, 95);
+        let plain = predict_ports_with_learning(&model, 45392, 0, 0, None, false);
+        let widened = predict_ports_with_learning(&model, 45392, 0, 0, None, true);
+        assert_eq!(plain.len(), 6, "95-confidence fixed step has a 6-wide base window");
+        assert_eq!(
+            widened.len(),
+            12,
+            "reverse must widen the 6 tier to 12"
+        );
+        // The widened window is a strict superset: the first six stay identical.
+        assert_eq!(
+            plain.iter().map(|c| c.port).collect::<Vec<_>>(),
+            widened.iter().take(6).map(|c| c.port).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn learning_reverse_window_caps_at_max() {
+        // Construct a linear model in the 60..=74 tier (base window already at
+        // the cap).  `build_model` never emits a linear kind at this tier, so
+        // the model is built directly: this isolates the cap invariant from
+        // the model classifier's confidence assignment.
+        let model = PortModel {
+            kind: PortModelKind::FixedStep { step: 1 },
+            confidence: 70,
+            public_ip: Some(ip()),
+            sequence: vec![45390, 45391, 45392],
+            deltas: vec![1, 1],
+            sampled_at_ms: 1000,
+        };
+        let plain = predict_ports_with_learning(&model, 45392, 0, 0, None, false);
+        let widened = predict_ports_with_learning(&model, 45392, 0, 0, None, true);
+        assert_eq!(
+            plain.len(),
+            MAX_PREDICTED_PORTS,
+            "70-confidence linear is already at the cap"
+        );
+        assert_eq!(
+            widened.len(),
+            MAX_PREDICTED_PORTS,
+            "reverse must never exceed MAX_PREDICTED_PORTS"
+        );
+    }
+
+    #[test]
+    fn learning_reverse_window_handles_12_tier() {
+        // 86-confidence Linear (same direction, spread 1) -> base 12; reverse -> 24.
+        let model = build_model(&[1000, 1001, 1003], Some(ip()), 1000);
+        assert!(
+            matches!(model.kind, PortModelKind::Linear { step: 2 }),
+            "{:?}",
+            model.kind
+        );
+        assert_eq!(model.confidence, 86, "a spread-1 same-direction linear is the 12 tier");
+        let plain = predict_ports_with_learning(&model, 1003, 0, 0, None, false);
+        let widened = predict_ports_with_learning(&model, 1003, 0, 0, None, true);
+        assert_eq!(plain.len(), 12, "86-confidence linear has a 12-wide base window");
+        assert_eq!(widened.len(), MAX_PREDICTED_PORTS, "reverse must widen 12 to the 24 cap");
+    }
+
+    #[test]
+    fn learning_estimate_wrap_is_modular() {
+        // last 65534, learned step +3 -> top candidate wraps to port 1.
+        let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
+        let predicted = predict_ports_with_learning(&model, 65534, 0, 0, Some(3), false);
+        assert_eq!(predicted[0].port, 1, "the learned-step top candidate must wrap mod 65536");
+    }
+
+    #[test]
+    fn learning_unpredictable_model_is_empty() {
+        let model = build_model(&[1000, 1005, 1001, 1009, 1002], Some(ip()), 1000);
+        assert!(!model.kind.clone().is_predictable());
+        let predicted = predict_ports_with_learning(&model, 1002, 0, 0, Some(7), true);
+        assert!(
+            predicted.is_empty(),
+            "an unpredictable model must yield no candidates even with learning"
+        );
+    }
 }
+

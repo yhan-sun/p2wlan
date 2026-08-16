@@ -12,6 +12,7 @@
 //!
 //! Phase 3 module.
 
+pub mod adaptive;
 pub mod client;
 pub mod detection;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod punch;
 pub mod stun;
 
 // Re-export key types
+pub use adaptive::{DirectionPattern, ReverseDetector, StepLearner};
 pub use client::{BindingResponse, StunClient, DEFAULT_TIMEOUT};
 pub use detection::{DetectionConfig, NatDetector};
 pub use error::{NatError, Result};
@@ -32,8 +34,9 @@ pub use ice::{
 };
 pub use mapping::{
     build_model, build_model_for_batch, model_is_fresh, modular_add, modular_difference,
-    predict_ports, MappingBatch, MappingObservation, ModelRejection, PortModel, PortModelKind,
-    PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
+    predict_ports, predict_ports_for_elapsed, predict_ports_with_learning, MappingBatch,
+    MappingObservation, ModelRejection, PortModel, PortModelKind, PredictionCandidate,
+    PredictionReason, MAX_PREDICTED_PORTS,
 };
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,

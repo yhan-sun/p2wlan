@@ -8,3 +8,4 @@ include!("tests/part05.rs");
 include!("tests/part06.rs");
 include!("tests/part07.rs");
 include!("tests/part08.rs");
+include!("tests/part09.rs");

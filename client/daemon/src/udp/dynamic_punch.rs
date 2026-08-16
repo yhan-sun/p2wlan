@@ -1,9 +1,61 @@
+use p2pnet_nat::adaptive::{DirectionPattern, ReverseDetector, StepLearner};
 use p2pnet_nat::mapping::{
-    build_model_for_batch, predict_ports_for_elapsed, MappingBatch, MappingObservation,
-    ModelRejection, PortModelKind,
+    build_model_for_batch, predict_ports_with_learning, MappingBatch, MappingObservation,
+    ModelRejection, PortModel, PortModelKind,
 };
 
 const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
+
+/// Adaptive-prediction learner state for one network generation, shared across
+/// every peer on the same egress public IP (they draw from the same NAT
+/// allocator).
+#[derive(Debug)]
+struct LearningCache {
+    /// The network generation this cache was last synced to; any other value
+    /// forces a full reset (a new allocator invalidates every learned stride
+    /// and direction).
+    network_generation: u64,
+    /// public IP -> (cross-batch step learner, allocation-direction detector).
+    entries: HashMap<IpAddr, (StepLearner, ReverseDetector)>,
+}
+
+impl LearningCache {
+    /// An empty cache that resets on first use (its generation starts out of
+    /// sync with any real one).
+    fn new() -> Self {
+        Self {
+            network_generation: u64::MAX,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Drop all learned state when the network generation moved on.
+    fn reset_if_generation_changed(&mut self, generation: u64) {
+        if generation != self.network_generation {
+            self.entries.clear();
+            self.network_generation = generation;
+        }
+    }
+
+    fn entry(&mut self, ip: IpAddr) -> &mut (StepLearner, ReverseDetector) {
+        self.entries
+            .entry(ip)
+            .or_insert_with(|| (StepLearner::new(), ReverseDetector::new()))
+    }
+}
+
+/// A point-in-time read of the adaptive learner for one public IP, used both as
+/// the predictor input and as the fields logged/recorded for diagnostics.
+#[derive(Debug, Clone, Copy)]
+struct LearningSnapshot {
+    /// Cross-batch EWMA stride estimate (always >= 1) when the learner has a
+    /// valid reading, else `None`.
+    step_estimate: Option<i16>,
+    /// How many times the estimate changed (learning trajectory).
+    revision_count: u32,
+    /// Detected allocation direction of the peer's fresh mappings.
+    direction: DirectionPattern,
+}
 
 impl UdpTransport {
     /// Bind a brand-new dedicated punch socket for one fresh-mapping generation.
@@ -562,6 +614,57 @@ impl UdpTransport {
         observations
     }
 
+    /// Fold one fresh-mapping batch into the shared adaptive learner for its
+    /// egress public IP and return a point-in-time snapshot to feed the
+    /// predictor.
+    ///
+    /// The observed ports are streamed into the direction detector and the
+    /// model's positive deltas into the step learner (negative deltas carry no
+    /// forward-stride information; the detector already captures the direction
+    /// from the ports themselves).  A network-generation change clears every
+    /// learned stride and direction first, so a stale reading is never applied
+    /// to a new allocator.
+    async fn observe_learning(
+        &self,
+        public_ip: IpAddr,
+        ports: &[u16],
+        model: &PortModel,
+        network_generation: u64,
+    ) -> LearningSnapshot {
+        let mut cache = self.learning_cache.lock().await;
+        cache.reset_if_generation_changed(network_generation);
+        let (step_learner, detector) = cache.entry(public_ip);
+        for port in ports {
+            detector.observe_port(*port);
+        }
+        for delta in &model.deltas {
+            step_learner.observe_diff(*delta);
+        }
+        let step_estimate = step_learner.estimate();
+        let direction = detector.pattern();
+        LearningSnapshot {
+            step_estimate,
+            revision_count: step_learner.revision_count(),
+            direction,
+        }
+    }
+
+    /// Test-only presence check for the adaptive learner on one public IP,
+    /// syncing the cache to `network_generation` first (the same lazy reset the
+    /// production path performs).  Returns `false` when that public IP has no
+    /// learned state for the requested generation — i.e. the cache was reset or
+    /// never fed.
+    #[cfg(test)]
+    pub(crate) async fn has_learning_for(
+        &self,
+        ip: IpAddr,
+        network_generation: u64,
+    ) -> bool {
+        let mut cache = self.learning_cache.lock().await;
+        cache.reset_if_generation_changed(network_generation);
+        cache.entries.contains_key(&ip)
+    }
+
     /// Run one atomic fresh-mapping punch generation for a peer.
     ///
     /// 1. Bind a fresh dedicated socket (never used before).
@@ -891,9 +994,36 @@ impl UdpTransport {
             .unwrap_or(batch.finished_at_ms);
         let measurement_span_ms = last_sent_at_ms.saturating_sub(first_sent_at_ms);
         let probe_gap_ms = now_ms.saturating_sub(last_sent_at_ms);
-        let predicted = predict_ports_for_elapsed(&model, last, measurement_span_ms, probe_gap_ms);
-        let predicted_ports = predicted.iter().map(|candidate| candidate.port).collect::<Vec<_>>();
         let public_ip = batch.public_ip();
+        // Fold this batch into the shared adaptive learner (keyed by egress
+        // public IP) and read back its stride estimate + allocation direction.
+        // The detector is fed the raw observed ports; the step learner is fed
+        // the model's deltas. A network-generation change resets both first, so
+        // a reading from a superseded allocator is never applied here.
+        let learner_ip = public_ip
+            .expect("a valid batch was checked for a single public IP above");
+        let learning = self
+            .observe_learning(learner_ip, &ports, &model, network_generation)
+            .await;
+        let learner_used = learning
+            .step_estimate
+            .is_some_and(|estimate| {
+                u32::from(estimate.unsigned_abs()) <= FRESH_MAPPING_MAX_ABS_STEP as u32
+            });
+        let effective_step = if learner_used {
+            learning.step_estimate
+        } else {
+            None
+        };
+        let predicted = predict_ports_with_learning(
+            &model,
+            last,
+            measurement_span_ms,
+            probe_gap_ms,
+            effective_step,
+            learning.direction == DirectionPattern::Reverse,
+        );
+        let predicted_ports = predicted.iter().map(|candidate| candidate.port).collect::<Vec<_>>();
 
         let sequence_label = format!("{:?}", ports);
         let deltas_label = format!("{:?}", model.deltas);
@@ -908,14 +1038,22 @@ impl UdpTransport {
             sequence = %sequence_label,
             deltas = %deltas_label,
             sample_age_ms = now_ms.saturating_sub(batch.started_at_ms),
+            step_estimate = ?learning.step_estimate,
+            learner_revision_count = learning.revision_count,
+            direction_pattern = learning.direction.as_str(),
+            learner_used = learner_used,
             predicted = ?predicted_ports,
-            "fresh_mapping_model peer_id={} punch_generation={} model={:?} confidence={} sequence={} deltas={} predicted={:?}",
+            "fresh_mapping_model peer_id={} punch_generation={} model={:?} confidence={} sequence={} deltas={} step_estimate={:?} learner_revision_count={} direction_pattern={} learner_used={} predicted={:?}",
             peer_id,
             punch_generation,
             model.kind,
             model.confidence,
             sequence_label,
             deltas_label,
+            learning.step_estimate,
+            learning.revision_count,
+            learning.direction.as_str(),
+            learner_used,
             predicted_ports
         );
         // The fresh-mapping model is only recorded after ownership, network
@@ -1126,6 +1264,27 @@ impl UdpTransport {
 
         // Record the fresh mapping only now that ownership, network and
         // direct-path validations passed and the socket is committed.
+        self.peers
+            .record_direct_event(
+                peer_id,
+                "fresh_mapping_model",
+                stable_targets.first().copied(),
+                Some(predicted_ports.len()),
+                None,
+                format!(
+                    "punch_generation={punch_generation} model={:?} confidence={} sequence={} deltas={} step_estimate={:?} learner_revision_count={} direction_pattern={} learner_used={} predicted={:?}",
+                    model.kind,
+                    model.confidence,
+                    sequence_label,
+                    deltas_label,
+                    learning.step_estimate,
+                    learning.revision_count,
+                    learning.direction.as_str(),
+                    learner_used,
+                    predicted_ports
+                ),
+            )
+            .await;
         self.peers
             .record_fresh_mapping(
                 peer_id,

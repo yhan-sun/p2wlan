@@ -115,6 +115,17 @@ pub struct UdpTransport {
     /// clone so a network-generation transition cancels old ownership while
     /// it is still inside the shared epoch gate.
     direct_validation: DirectValidationRegistry,
+    /// Adaptive-prediction learner state for the current network generation.
+    ///
+    /// The fresh-mapping generator feeds each batch's observed ports into a
+    /// shared [`StepLearner`] (cross-batch EWMA stride) and [`ReverseDetector`]
+    /// (allocation direction) so the predictor can use a stride newer than
+    /// this one batch's median and widen its window on reverse allocation.  All
+    /// peers on one egress share the allocator, so the cache is keyed by
+    /// public IP (not peer).  The whole cache resets when the network
+    /// generation changes, since a new allocator invalidates every learned
+    /// stride and direction.
+    learning_cache: Arc<Mutex<LearningCache>>,
 }
 
 impl UdpTransport {
@@ -173,6 +184,7 @@ impl UdpTransport {
             local_node_id: None,
             wireguard_transport: None,
             direct_validation,
+            learning_cache: Arc::new(Mutex::new(LearningCache::new())),
         })
     }
 
