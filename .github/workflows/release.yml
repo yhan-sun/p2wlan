@@ -212,6 +212,7 @@ jobs:
           apps/flutter_client/pubspec.lock
           apps/flutter_client/analysis_options.yaml
           apps/flutter_client/.metadata
+          apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj
 
 
       - name: Diagnose checkout dirt
