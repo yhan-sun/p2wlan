@@ -193,3 +193,134 @@ async fn liveness_pre_flight_on_blocks_only_on_fresh_blocked() {
         "an expired Blocked must not keep skipping — the TTL self-heals"
     );
 }
+
+// ============================================================
+// v0.1.119: full decision-path integration — 0-ACK transition + liveness verdict
+// ============================================================
+
+#[tokio::test]
+async fn scatter_extended_0ack_blocked_overwrites_reason_and_stops_scatter() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-fw", "10.20.0.3", endpoint))
+        .await;
+    let gen = manager.current_network_generation().await;
+
+    // (1) Establish the epoch and drive recovery to the wide-scan stage.
+    let _ = manager.recovery_epoch_admit("peer-fw").await; // creates epoch (Initial)
+    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-1").await;
+    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-2").await;
+    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-3").await;
+    assert_eq!(
+        manager.recovery_stage_for("peer-fw").await,
+        RecoveryStage::ScatterExtended,
+        "test precondition: the peer is at the wide-scan boundary"
+    );
+
+    // (2) The EXISTING 0-ACK path: relay backstop + generic (UNKNOWN) attribution.
+    manager
+        .record_direct_probe_batch_failure_for_generation("peer-fw", gen, "wide scan 0 ACK")
+        .await;
+    assert_eq!(
+        manager.get_connection("peer-fw").await.unwrap().state,
+        ConnectionState::FallbackToRelay,
+        "relay always backstops on a 0-ACK wide scan (unchanged behavior)"
+    );
+    assert_eq!(
+        manager.direct_health_error_code("peer-fw").await.as_deref(),
+        Some("direct_probe_failed"),
+        "before liveness applies, the root cause is still the generic UNKNOWN"
+    );
+
+    // (3) The liveness probe finished and cached a fresh Blocked verdict.
+    manager
+        .test_seed_liveness("peer-fw", gen, LivenessVerdict::Blocked, 0)
+        .await;
+
+    // (4) The NEXT admission tick consumes it (Task 7 apply).
+    let _ = manager.recovery_epoch_admit("peer-fw").await;
+
+    // (5) The feature's effect:
+    assert_eq!(
+        manager.direct_health_error_code("peer-fw").await.as_deref(),
+        Some("firewall_blocked"),
+        "Blocked must overwrite the generic reason with the accurate firewall attribution"
+    );
+    assert_eq!(
+        manager.recovery_stage_for("peer-fw").await,
+        RecoveryStage::RelayBackoff,
+        "Blocked must stop the wide scatter: stage moves ScatterExtended -> RelayBackoff"
+    );
+    assert_eq!(
+        manager.get_connection("peer-fw").await.unwrap().state,
+        ConnectionState::FallbackToRelay,
+        "relay backstop is preserved (never resurrected to Direct by liveness)"
+    );
+}
+
+#[tokio::test]
+async fn scatter_extended_0ack_ok_does_not_overwrite_or_stop_scatter() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-ok", "10.20.0.3", endpoint))
+        .await;
+    let gen = manager.current_network_generation().await;
+
+    let _ = manager.recovery_epoch_admit("peer-ok").await;
+    manager.advance_recovery_stage_after_no_ack("peer-ok", "n1").await;
+    manager.advance_recovery_stage_after_no_ack("peer-ok", "n2").await;
+    manager.advance_recovery_stage_after_no_ack("peer-ok", "n3").await;
+    manager
+        .record_direct_probe_batch_failure_for_generation("peer-ok", gen, "wide scan 0 ACK")
+        .await;
+    // Outbound UDP is reachable -> the 0-ACK is a NAT miss / C=0, NOT a firewall.
+    manager.test_seed_liveness("peer-ok", gen, LivenessVerdict::Ok, 0).await;
+    let _ = manager.recovery_epoch_admit("peer-ok").await;
+
+    assert_eq!(
+        manager.direct_health_error_code("peer-ok").await.as_deref(),
+        Some("direct_probe_failed"),
+        "Ok must NOT overwrite the generic reason (the cause is a NAT miss, not a firewall)"
+    );
+    assert_eq!(
+        manager.recovery_stage_for("peer-ok").await,
+        RecoveryStage::ScatterExtended,
+        "Ok must NOT stop the scan — the peer stays at ScatterExtended to keep retrying"
+    );
+}
+
+#[tokio::test]
+async fn scatter_extended_0ack_unknown_does_not_overwrite_or_stop_scatter() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-unk", "10.20.0.3", endpoint))
+        .await;
+    let gen = manager.current_network_generation().await;
+
+    let _ = manager.recovery_epoch_admit("peer-unk").await;
+    manager.advance_recovery_stage_after_no_ack("peer-unk", "n1").await;
+    manager.advance_recovery_stage_after_no_ack("peer-unk", "n2").await;
+    manager.advance_recovery_stage_after_no_ack("peer-unk", "n3").await;
+    manager
+        .record_direct_probe_batch_failure_for_generation("peer-unk", gen, "wide scan 0 ACK")
+        .await;
+    // Socket/system error -> Unknown: recorded but must NOT drive a decision.
+    manager
+        .test_seed_liveness("peer-unk", gen, LivenessVerdict::Unknown, 0)
+        .await;
+    let _ = manager.recovery_epoch_admit("peer-unk").await;
+
+    assert_eq!(
+        manager.direct_health_error_code("peer-unk").await.as_deref(),
+        Some("direct_probe_failed"),
+        "Unknown must NOT be treated as a firewall (a socket fault says nothing about egress)"
+    );
+    assert_eq!(
+        manager.recovery_stage_for("peer-unk").await,
+        RecoveryStage::ScatterExtended,
+        "Unknown must NOT stop the scan"
+    );
+}
