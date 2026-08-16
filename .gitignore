@@ -86,7 +86,7 @@ scripts/tun-ping-smoke.sh
 *.sha256
 *.sig
 artifacts/
-release/
+/release/
 releases/
 
 # Logs/env
