@@ -253,9 +253,22 @@ impl PeerManager {
             None,
             None,
             None,
-            detail,
+            detail.clone(),
         )
         .await;
+        // Symmetric stdout marker for the *applied* step.  The event above lives
+        // only in the in-memory `direct_events` ledger, which has no stdout or
+        // `/status` egress — so without this line the "next admission tick
+        // consumed a fresh Blocked" signal was unobservable to live_check.sh
+        // (it greps stdout).  Pairs with `commit_liveness`'s `outbound_liveness`
+        // probe marker: probe = verdict recorded, applied = decision consumed.
+        info!(
+            event = "outbound_liveness_applied",
+            peer_id = %peer_id,
+            generation,
+            detail = %detail,
+            "outbound UDP liveness Blocked applied: wide scatter stopped, relay fallback accelerated",
+        );
     }
 
     /// Pre-flight gate (default OFF).  Returns true ONLY when
