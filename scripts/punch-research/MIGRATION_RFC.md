@@ -33,12 +33,15 @@
 - 落点：`client/nat/src/ice.rs`、`client/daemon/src/peer/connection/nat_hint.rs`、`server/api/device_handlers.go`、`client/cli/src/formatting/peer/utils.rs`。
 - **设计说明（f 轴 R1 零行为变化，是结构保证）**：R1 静态推断 `infer_filtering_behavior` 下 `f==apd ⟹ m==apd ⟹` base 已真，故 `|| (f==apd)` 项结构性不可达；`f==EIM ⟹ m==open ⟹ a==stable ⟹` base 假，f 轴整条 no-op。零回归由「全组合 == legacy」测试证明，非仅快照。首个可触发的新行为落在 R1b。
 
-**R1b（后续阶段，本次不做）**：让 `f=` 变准 —— 接入 active RFC 5780 CHANGE-REQUEST 三态过滤探测。
+**R1b（BLOCKED — 2026-08-17 §4 前置探测判定）**：让 `f=` 变准 —— 接入 active RFC 5780 CHANGE-REQUEST 三态过滤探测。
 
-- 范围：在生产 gather（`client/nat/src/ice/active_probes.rs::probe_filtering_behavior`，原型已存在但未接生产）里跑 CHANGE-REQUEST 探测，使 `filtering_behavior` **独立于 `m=`** 取值——尤其能在 `m==EndpointIndependent`（稳定映射）上探出 `f==apd`（EIM+APDF，家网关/CGNAT 常见）。
-- 触发新行为：R1b 后 `m==EIM + f==apd + a==stable` 首次使 `|| (f==apd)` 项可达 → 新 client 散射、旧 `.contains` 也命中（`address_or_port_dependent` token）→ 一致。后续可进一步按轴细化（如 `f==apd` 且入站 deny 的 C=0 协调），属独立范围。
-- 为何不并入 R1：active probe 要在生产 socket gather 里跑三态探测，是更大、独立可回归的活；混入会把 R1 从「低风险（管道+兼容）」变「中风险（行为变化）」。R1 先把 `f=` 决策的口子留对（`f==apd` 触发、unknown 不放大），R1b 只填数据即生效，无需再改决策代码。
-- 原 R1「detection 三态」与 R4「服务端结构化解析」拆分归属：detection 三态 → R1b（本段）；**服务端不解析**（原 R4 假设被推翻，dumb pipe 更优）→ 永久保持透传，服务端改动止于 cap=128。
+- **状态：BLOCKED，不硬做。** 前置生死探测（`scripts/p2wlan-r1b/`，3 生产 STUN × 6 迭代 = 18 样本）证实：**cloudflare / google 的 change-port 均返回 SAME（服务器把 CHANGE-REQUEST 当普通请求从原址回），miwifi NO_RESP**——18 次迭代 **changed-source 响应出现 0 次**。在不支持 CHANGE-REQUEST 的 STUN 上，RFC 5780 filtering 测试逻辑本身歧义（「changed 响应收不到」分不清「我 NAT 过滤」还是「服务器没发」），active 探测无料可喂 → live-safe 探测写出来是永远走 fallback 的死代码。
+- **范围（解锁后）**：在生产稳态 gather 里跑**复用 `stun_waiters` 派发机制**的 live-safe CHANGE-REQUEST 探测（命门已核实可解：`query_stun_live_on_socket` + `inbound.rs:219` source-agnostic 派发），使 `filtering_behavior` 独立于 `m=` 取值——尤其能在 `m==EndpointIndependent`（稳定映射）上探出 `f==apd`（EIM+APDF，家网关常见）。
+- **触发新行为**：R1b 后 `m==EIM + f==apd + a==stable` 首次使 `|| (f==apd)` 项可达 → 新 client 散射、旧 `.contains` 也命中（`address_or_port_dependent` token）→ 一致，不破坏 R1a 的 provably==legacy。
+- **解锁条件**：一台 **honor CHANGE-REQUEST 的 STUN**（本项目全自托管——自托管一台即彻底绕开第三方忽略 change 问题）。届时 `selftest.py` 先证正例可检测、`probe2.py` 指向自托管 STUN 复跑，再启动 R1b 本体。
+- **ROI 提示**：R1b 主要收益在 EIM+APDF（家用网关）；**双 CGNAT 主场景（m=APD）无增量**——commit `4e3312f` 已用 `base=(m==apd)` 无条件散射，f 对其无关。故 R1b 非当前最痛点，与 field Gate 排序时 field 优先。
+- 原 R1「detection 三态」与 R4「服务端结构化解析」拆分归属：detection 三态 → R1b（本段，BLOCKED）；**服务端不解析**（原 R4 假设被推翻，dumb pipe 更优）→ 永久保持透传，服务端改动止于 cap=128。
+- 探测工具与完整证据：`scripts/p2wlan-r1b/README.md`。
 
 ### R2 预测引擎升级（中风险，核心收益）
 - `client/nat/src/mapping.rs`：
@@ -81,7 +84,7 @@
 
 ## 6. 里程碑
 - R1a: 指纹信令 schema（`p2v2:`）+ 散射决策结构化消费 + 兼容层 + 服务端 cap（✅ 已完成）
-- R1b: active RFC 5780 filtering 探测，使 `f=` 独立于 `m=` 变准（后续，1 周）
+- R1b: active RFC 5780 filtering 探测，使 `f=` 独立于 `m=` 变准（**BLOCKED**，2026-08-17 §4 探测：生产 STUN 不 honor CHANGE-REQUEST，解锁需自托管 CHANGE-REQUEST STUN，见 §2 R1b 段）
 - R2: 预测升级 + 预算分层（2 周）
 - R3: 生命周期接入（1 周）
 - R4: 服务端 cap（R1a 已完成）+ hairpin 消费（待 `h=` 生产填充，1 周）
