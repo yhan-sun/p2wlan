@@ -48,8 +48,10 @@ impl LearningCache {
 /// the predictor input and as the fields logged/recorded for diagnostics.
 #[derive(Debug, Clone, Copy)]
 struct LearningSnapshot {
-    /// Cross-batch EWMA stride estimate (always >= 1) when the learner has a
-    /// valid reading, else `None`.
+    /// Cross-batch EWMA stride estimate (signed — a reverse allocator learns a
+    /// negative stride) when the learner has a valid reading, else `None`.  A
+    /// `Some(0)` reading is a no-consensus placeholder the predictor treats as
+    /// "no useful stride".
     step_estimate: Option<i16>,
     /// How many times the estimate changed (learning trajectory).
     revision_count: u32,
