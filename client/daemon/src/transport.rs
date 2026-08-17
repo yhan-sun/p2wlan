@@ -659,6 +659,17 @@ struct RelayProbeIngress<'a> {
     token: crate::relay_probe::RelayProbeToken,
 }
 
+/// An inbound synthetic path-commit packet (request or ack) that arrived over
+/// the relay transport.  Mirrors [`RelayProbeIngress`]; see
+/// [`UdpTransport::handle_path_commit_packet`].
+struct PathCommitIngress<'a> {
+    peer_id: &'a str,
+    packet: &'a [u8],
+    relay_endpoint: &'a str,
+    relay_connection_id: Option<u64>,
+    token: crate::path_commit::PathCommitToken,
+}
+
 /// Whether a decrypted IP packet looks like an overlay business payload (UDP
 /// with the overlay magic right after the UDP header).  The overlay validation
 /// loop re-verifies fully (magic, checksum, nonce/seq, sender); this is only a
@@ -2728,6 +2739,7 @@ impl WireGuardTransport {
                     let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
                     let direct_validation = parse_direct_validation_token(&inbound.packet);
                     let relay_probe = crate::relay_probe::parse_relay_probe_token(&inbound.packet);
+                    let path_commit = crate::path_commit::parse_path_commit_token(&inbound.packet);
                     if session_evidence_eligible {
                         if let Some(peers) = peers.as_ref() {
                             // Forced-relay path-probe / path-ack: consumed here and
@@ -2805,6 +2817,62 @@ impl WireGuardTransport {
                                         } else {
                                             "request"
                                         }
+                                    );
+                                }
+                            }
+                            // Synthetic path-commit probe/ack: a business-shaped
+                            // authenticated packet round-tripped over the confirmed
+                            // relay.  A matching ack closes the relay-first
+                            // business gate for one-directional traffic (P0-4);
+                            // a request is answered idempotently, exactly like the
+                            // relay path-probe.
+                            if let Some(path_token) = path_commit {
+                                if relay_endpoint.is_some() {
+                                    let path_kind = path_token.kind;
+                                    let path_session_guard = if path_kind
+                                        == crate::path_commit::PathCommitKind::Ack
+                                    {
+                                        self.acquire_current_session_evidence_guard(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    };
+                                    let path_session_current = if inbound.session_instance.is_none()
+                                    {
+                                        true
+                                    } else if path_kind == crate::path_commit::PathCommitKind::Ack {
+                                        path_session_guard.is_some()
+                                    } else {
+                                        self.session_instance_is_current(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await
+                                    };
+                                    if path_session_current {
+                                        self.handle_path_commit_packet(
+                                            peers,
+                                            evidence.as_ref().map(|feed| &feed.relay_transport),
+                                            PathCommitIngress {
+                                                peer_id: &inbound.peer_id,
+                                                packet: &inbound.packet,
+                                                relay_endpoint: relay_endpoint
+                                                    .as_deref()
+                                                    .unwrap_or("unknown"),
+                                                relay_connection_id,
+                                                token: path_token,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                    drop(path_session_guard);
+                                } else {
+                                    debug!(
+                                        peer_id = %inbound.peer_id,
+                                        "ignored path-commit packet that arrived without relay ingress"
                                     );
                                 }
                             }
@@ -4154,6 +4222,132 @@ impl WireGuardTransport {
                     debug!(
                         peer_id = %peer_id,
                         "relay probe ACK from {peer_id} did not match a fresh outstanding expectation, or arrived over a different relay (or was already consumed)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle one inbound synthetic path-commit packet (request or ack).
+    ///
+    /// Mirrors [`Self::handle_relay_probe_packet`]: a request is answered
+    /// idempotently over the same relay, and an ack is verified against the
+    /// outstanding expectation before it commits the relay-first business gate
+    /// for one-directional traffic.  A relay renewal rejects this reader the
+    /// same way, so a stale transport can neither answer nor consume.
+    async fn handle_path_commit_packet(
+        &self,
+        peers: &Arc<PeerManager>,
+        relay_transport: Option<&Arc<RwLock<Option<RelayTransport>>>>,
+        probe: PathCommitIngress<'_>,
+    ) {
+        let PathCommitIngress {
+            peer_id,
+            packet,
+            relay_endpoint,
+            relay_connection_id,
+            token,
+        } = probe;
+        if let Some(relay_transport) = relay_transport {
+            let current_connection_id = relay_transport
+                .read()
+                .await
+                .as_ref()
+                .map(RelayTransport::connection_id);
+            if relay_connection_id != current_connection_id {
+                peers.emit_timeline(
+                    "path_commit_packet_stale",
+                    Some("relay"),
+                    Some("relay_transport_replaced"),
+                    Some(format!(
+                        "peer={peer_id} relay_endpoint={relay_endpoint} packet_connection_id={relay_connection_id:?} current_connection_id={current_connection_id:?}"
+                    )),
+                );
+                return;
+            }
+        }
+        match token.kind {
+            crate::path_commit::PathCommitKind::Request => {
+                let Some(relay_transport) = relay_transport else {
+                    debug!(
+                        peer_id = %peer_id,
+                        "ignored path-commit request from {peer_id}: no relay transport to answer on"
+                    );
+                    return;
+                };
+                let Some(relay) = relay_transport.read().await.clone() else {
+                    debug!(
+                        peer_id = %peer_id,
+                        "ignored path-commit request from {peer_id}: relay slot is empty"
+                    );
+                    return;
+                };
+                let Ok(ip) = Ipv4Packet::new(packet) else {
+                    return;
+                };
+                let ack_payload = crate::path_commit::build_path_commit_payload(
+                    crate::path_commit::PathCommitKind::Ack,
+                    token.generation,
+                    token.request_id,
+                    token.owner_token,
+                );
+                let ack_packet = Ipv4Packet::build_icmp_echo_request(
+                    ip.dst_addr(),
+                    ip.src_addr(),
+                    token.request_id,
+                    1,
+                    &ack_payload,
+                );
+                let relay_send = relay.clone();
+                match self
+                    .encrypt_and_emit_outbound(
+                        OutboundPacket {
+                            peer_id: peer_id.to_string(),
+                            dst_ip: ip.src_addr().to_string(),
+                            packet: ack_packet,
+                        },
+                        move |encrypted| async move {
+                            relay_send.send_packet(&encrypted).await.map(|_| ())
+                        },
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            event = "path_commit_ack_sent",
+                            peer_id = %peer_id,
+                            relay_endpoint = %relay_endpoint,
+                            request_id = token.request_id,
+                            "path_commit_ack_sent peer_id={peer_id} relay_endpoint={relay_endpoint} request_id={}",
+                            token.request_id,
+                        );
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "Could not answer path-commit from {peer_id}: WireGuard session is no longer ready"
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to answer path-commit from {peer_id} over {relay_endpoint}: {err}"
+                        );
+                    }
+                }
+            }
+            crate::path_commit::PathCommitKind::Ack => {
+                // The caller guaranteed the ACK's real ingress was relay.  The
+                // peer manager verifies the token against the outstanding
+                // expectation (request id + generation + owner, within TTL)
+                // AND that the ACK arrived over the SAME relay the request was
+                // sent on; only then does it commit the relay-first business
+                // path-commit marker (P0-4 one-way liveness).
+                let confirmed = peers
+                    .consume_path_commit_ack(peer_id, token, relay_endpoint)
+                    .await;
+                if !confirmed {
+                    debug!(
+                        peer_id = %peer_id,
+                        "path-commit ACK from {peer_id} did not match a fresh outstanding expectation, or arrived over a different relay (or was already consumed)"
                     );
                 }
             }

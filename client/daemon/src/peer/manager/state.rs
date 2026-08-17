@@ -133,6 +133,12 @@ pub struct PeerManager {
     /// is verified before RelayPeerConfirmed is set.
     relay_probe_expectations:
         Arc<std::sync::Mutex<HashMap<String, crate::relay_probe::RelayProbeExpectation>>>,
+    /// Bounded per-peer path-commit expectations: the token the local daemon
+    /// sent in a synthetic path-commit request, against which a relay-ingress
+    /// ACK is verified before the relay-first business gate is closed for
+    /// one-directional traffic (audit P0-4).
+    path_commit_expectations:
+        Arc<std::sync::Mutex<HashMap<String, crate::path_commit::PathCommitExpectation>>>,
     /// Authoritative stale-peer quarantine state (relay 404 isolation).
     quarantined_peers: Arc<tokio::sync::Mutex<HashMap<String, PeerQuarantineState>>>,
     /// Short-lived relay registration grace state. A relay `peer_not_found`

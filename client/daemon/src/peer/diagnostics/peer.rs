@@ -404,6 +404,7 @@ impl PeerDiagnostics {
                             model: result.model_label.clone(),
                             confidence: result.confidence,
                             hit_window: result.hit_window,
+                            hit_rank: result.hit_rank,
                         })
                         .collect()
                 })

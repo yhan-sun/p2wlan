@@ -842,4 +842,9 @@ pub struct FreshMappingDiag {
     pub model: String,
     pub confidence: u8,
     pub hit_window: bool,
+    /// 0-indexed position of `actual_port` in the rank-ordered prediction
+    /// window (`None` on a miss).  The per-hit calibration signal: lets CLI/UI
+    /// expose top-K accuracy, which window sizing and confidence calibration
+    /// are tuned against.
+    pub hit_rank: Option<u8>,
 }

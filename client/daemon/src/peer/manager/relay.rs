@@ -1078,6 +1078,50 @@ impl PeerManager {
         targets
     }
 
+    /// Peers whose relay-first business gate is pending on the confirmed relay
+    /// while Direct is already encrypted-confirmed.  For these peers a synthetic
+    /// path-commit request closes the gate (one-way traffic has no natural
+    /// inbound business to release it — audit P0-4).  The predicate is exactly
+    /// the business-pending condition: relay confirmed for the current
+    /// generation, Direct confirmed, natural exchange not done, path-commit not
+    /// yet done, not quarantined.
+    pub async fn path_commit_targets(&self) -> Vec<(String, String, u64)> {
+        let generation = self.current_network_generation().await;
+        let candidates: Vec<_> = self
+            .connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| {
+                conn.online
+                    && conn.state == ConnectionState::Direct
+                    && conn.relay_confirmed_generation == Some(generation)
+                    && conn
+                        .relay_confirmed_endpoint
+                        .as_deref()
+                        .is_some_and(|endpoint| !endpoint.is_empty())
+                    && conn.relay_first_business_exchange_generation != Some(generation)
+                    && conn.relay_first_business_pathcommit_generation != Some(generation)
+            })
+            .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone(), generation))
+            .collect();
+        let mut targets = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !self.peer_quarantined(&candidate.0).await {
+                targets.push(candidate);
+            }
+        }
+        targets
+    }
+
+    /// Whether a path-commit expectation is currently installed for the peer.
+    pub(crate) fn path_commit_expectation_present(&self, node_id: &str) -> bool {
+        self.path_commit_expectations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(node_id)
+    }
+
     /// Whether the current forced-relay probe expectation is still installed.
     ///
     /// A relay `peer_not_found` removes the expectation immediately. The
@@ -1422,6 +1466,74 @@ impl PeerManager {
             );
         }
         changed
+    }
+
+    /// Register the expectation for one outstanding path-commit request.  The
+    /// initiator sends a synthetic path-commit request over the confirmed relay
+    /// and records its token here so only a matching, same-relay, fresh ACK can
+    /// close the relay-first business gate.
+    pub(crate) fn register_path_commit_expectation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        request_id: u16,
+        owner_token: u64,
+        relay_endpoint: &str,
+    ) {
+        let mut expectations = self
+            .path_commit_expectations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        expectations.insert(
+            node_id.to_string(),
+            crate::path_commit::PathCommitExpectation {
+                generation,
+                request_id,
+                owner_token,
+                relay_endpoint: relay_endpoint.to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Consume a path-commit ACK.  It closes the relay-first business gate only
+    /// when its token mirrors the outstanding expectation, the expectation is
+    /// still fresh, and the ACK ACTUALLY arrived over the same relay the request
+    /// was sent on.  A late ACK from an old relay must never release the current
+    /// generation's gate.  Returns whether the ACK matched and committed the
+    /// path-commit marker.
+    pub(crate) async fn consume_path_commit_ack(
+        &self,
+        node_id: &str,
+        token: crate::path_commit::PathCommitToken,
+        ack_ingress: &str,
+    ) -> bool {
+        let now = Instant::now();
+        let expectation = {
+            let mut expectations = self
+                .path_commit_expectations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let expectation = expectations.get(node_id).cloned();
+            if expectation.as_ref().is_some_and(|e| {
+                e.accepts(&token, now, ack_ingress)
+            }) {
+                expectations.remove(node_id);
+            }
+            expectation
+        };
+        let Some(expectation) = expectation else {
+            return false;
+        };
+        if !expectation.accepts(&token, now, ack_ingress) {
+            return false;
+        }
+        self.mark_relay_first_business_pathcommit_for_generation(
+            node_id,
+            token.generation,
+            ack_ingress,
+        )
+        .await
     }
 
     /// Whether a peer is inside the network-generation window that the first

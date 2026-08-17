@@ -46,6 +46,7 @@ impl PeerManager {
             relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_notify: Arc::new(Notify::new()),
             relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            path_commit_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             quarantined_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             relay_not_found_grace: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),

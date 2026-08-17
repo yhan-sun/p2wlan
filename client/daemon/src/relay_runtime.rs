@@ -1416,6 +1416,85 @@ pub(super) async fn run_relay_peer_probe_loop(
         last_sent.retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
         attempt_counts
             .retain(|peer_id, _| targets.iter().any(|(target_id, _, _)| target_id == peer_id));
+
+        // Synthetic path-commit probes: peers stuck on the relay-first business
+        // gate (relay confirmed + Direct confirmed + no natural two-way
+        // business) get a bounded path-commit request.  Its ack proves the
+        // bidirectional relay-data invariant and releases the gate for
+        // one-directional traffic (audit P0-4).  A fresh token is used per
+        // request and the expectation is registered before the send, so a
+        // late ack can only match the outstanding request.
+        let path_targets = peers.path_commit_targets().await;
+        if !path_targets.is_empty() {
+            let mut path_sends = Vec::new();
+            for (peer_id, peer_virtual_ip, target_generation) in &path_targets {
+                let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
+                    continue;
+                };
+                let session_status = transport.session_status(peer_id).await;
+                if !session_status.has_active {
+                    continue;
+                }
+                if peers.path_commit_expectation_present(peer_id) {
+                    // An outstanding request is still in flight (within TTL);
+                    // do not pile up duplicate probes.
+                    continue;
+                }
+                next_request_id = next_request_id.wrapping_add(1);
+                let request_id = next_request_id;
+                let owner_token = unix_time_millis();
+                peers.register_path_commit_expectation(
+                    peer_id,
+                    *target_generation,
+                    request_id,
+                    owner_token,
+                    &relay_endpoint,
+                );
+                let payload = crate::path_commit::build_path_commit_payload(
+                    crate::path_commit::PathCommitKind::Request,
+                    *target_generation,
+                    request_id,
+                    owner_token,
+                );
+                let packet = Ipv4Packet::build_icmp_echo_request(local_ip, peer_ip, request_id, 1, &payload);
+                let send_transport = transport.clone();
+                let send_relay = relay.clone();
+                let send_peer_id = peer_id.clone();
+                let send_peer_virtual_ip = peer_virtual_ip.clone();
+                path_sends.push(async move {
+                    let result = tokio::time::timeout(
+                        RELAY_CONTROL_SEND_TIMEOUT,
+                        send_transport.encrypt_and_emit_outbound(
+                            OutboundPacket {
+                                peer_id: send_peer_id.clone(),
+                                dst_ip: send_peer_virtual_ip,
+                                packet,
+                            },
+                            |encrypted| async move { send_relay.send_packet(&encrypted).await },
+                        ),
+                    )
+                    .await;
+                    (send_peer_id, request_id, result)
+                });
+            }
+            for (peer_id, request_id, result) in join_all(path_sends).await {
+                match result {
+                    Ok(Ok(true)) => debug!(
+                        event = "path_commit_sent",
+                        peer_id = %peer_id,
+                        relay_endpoint = %relay_endpoint,
+                        request_id = request_id,
+                        "path_commit_sent peer_id={peer_id} relay_endpoint={relay_endpoint} request_id={request_id}"
+                    ),
+                    Ok(_) => debug!(
+                        "path-commit request to {peer_id} was not sent (WireGuard session not ready)"
+                    ),
+                    Err(err) => debug!(
+                        "path-commit request to {peer_id} over {relay_endpoint} failed: {err}"
+                    ),
+                }
+            }
+        }
     }
 }
 
