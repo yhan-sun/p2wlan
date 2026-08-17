@@ -4,6 +4,7 @@ import 'dart:io';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
+import '../security/secure_token_repository.dart';
 
 part 'daemon_controller/process_control.dart';
 part 'daemon_controller/elevation.dart';
@@ -69,6 +70,21 @@ class DaemonController {
     final useManualMode = settings.manualMode || authToken.isEmpty;
     final udpAdvertise = settings.udpAdvertise.trim();
     final relayServers = settings.relayServers.trim();
+
+    // Keep the credential out of the process command line: write it to a
+    // 0600 owner-only file and hand the daemon `--token-file` (the daemon
+    // already supports this and reads it permission-checked). The file is
+    // removed after the daemon has started.
+    File? tokenFile;
+    if (!useManualMode) {
+      tokenFile = File(
+        '${logDir.path}${Platform.pathSeparator}p2wlan-daemon.token',
+      );
+      await logDir.create(recursive: true);
+      await tokenFile.writeAsString(authToken, flush: true);
+      await tryRestrictOwnerOnly(tokenFile);
+    }
+
     final args = [
       '--config',
       configPath.path,
@@ -101,7 +117,17 @@ class DaemonController {
         settings.socketPool.trim(),
       ],
       if (relayServers.isNotEmpty) ...['--relay', relayServers],
-      if (useManualMode) '--manual' else ...['--managed', '--token', authToken],
+      if (useManualMode)
+        '--manual'
+      else if (tokenFile != null) ...[
+        '--managed',
+        '--token-file',
+        tokenFile.path,
+      ] else ...[
+        '--managed',
+        '--token',
+        authToken,
+      ],
     ];
 
     await configPath.parent.create(recursive: true);
@@ -144,6 +170,10 @@ class DaemonController {
       );
     }
 
+    // The token file (0600) is kept for the daemon's lifetime and removed on
+    // `stop()`. It must NOT be deleted here: the daemon reads it asynchronously
+    // at startup, and an early delete would race the launch. Keeping it also
+    // lets the daemon survive app restarts while still running.
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
     final ready = await _waitForHealth(
       settings.diagnosticsUrl,
@@ -175,6 +205,23 @@ class DaemonController {
           ? 'p2wlan-daemon started in manual/offline mode. Add a control token in Settings to join the managed P2WLAN network.'
           : 'p2wlan-daemon started.',
     );
+  }
+
+  /// Best-effort removal of the launch token file (deterministic path). The
+  /// daemon keeps it for its lifetime; `stop()` deletes it so no long-lived
+  /// credential remains after shutdown. Never throws.
+  Future<void> _deleteLaunchTokenFile() async {
+    final logDir = _defaultLogDir();
+    final file = File(
+      '${logDir.path}${Platform.pathSeparator}p2wlan-daemon.token',
+    );
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Ignore cleanup failure; the file is user-scoped and short-lived.
+    }
   }
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {

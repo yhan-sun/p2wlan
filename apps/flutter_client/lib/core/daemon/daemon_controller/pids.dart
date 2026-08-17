@@ -199,6 +199,9 @@ extension DaemonControllerPids on DaemonController {
       // Best effort cleanup; a root-owned marker must not turn a stopped
       // daemon into a reported failure.
     }
+    // The launch token file is also removed once the daemon is stopped, so no
+    // credential remains on disk after shutdown.
+    await _deleteLaunchTokenFile();
   }
 
   bool _isRootUser() {

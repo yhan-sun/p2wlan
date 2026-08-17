@@ -60,10 +60,12 @@ class _RawJsonState extends State<_RawJson> {
 
   String _rawJson() {
     final snapshot = widget.snapshot;
-    if (snapshot == null) return _readableErrorJson();
+    if (snapshot == null) return redactSensitive(_readableErrorJson());
     if (!identical(snapshot, _cachedSnapshot)) {
       _cachedSnapshot = snapshot;
-      _cachedPrettyJson = snapshot.prettyJson;
+      // Redact so the raw view (and the copy action) can never carry a live
+      // token/ticket even if the daemon snapshot includes one.
+      _cachedPrettyJson = redactSensitive(snapshot.prettyJson);
     }
     return _cachedPrettyJson!;
   }

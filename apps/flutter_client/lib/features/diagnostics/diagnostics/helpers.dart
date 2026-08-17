@@ -214,9 +214,11 @@ Future<_LogPreview> _loadLogPreview() async {
     final lines = await file.readAsLines();
     final start = lines.length > 120 ? lines.length - 120 : 0;
     final shown = lines.sublist(start);
+    // Redact any credential material so a log preview cannot leak tokens or
+    // tickets even if the daemon logged them (defense in depth).
     return _LogPreview(
       path: path,
-      content: shown.join('\n'),
+      content: redactLines(shown),
       lineCount: lines.length,
       shownLineCount: shown.length,
     );

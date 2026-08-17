@@ -5,11 +5,18 @@ import 'package:flutter/foundation.dart';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
+import '../security/secure_token_repository.dart';
 
 class SettingsStore extends ChangeNotifier {
-  SettingsStore({File? settingsFile}) : _settingsFileOverride = settingsFile;
+  SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
+    : _settingsFileOverride = settingsFile {
+    _tokenRepository =
+        tokenRepository ??
+        FileSecureTokenRepository(File('${_settingsFile().path}.token'));
+  }
 
   final File? _settingsFileOverride;
+  late final SecureTokenRepository _tokenRepository;
 
   AppSettings _settings = const AppSettings();
   var _loaded = false;
@@ -31,16 +38,30 @@ class SettingsStore extends ChangeNotifier {
         final decoded = jsonDecode(raw);
         if (decoded is Map<String, dynamic>) {
           final loadedSettings = AppSettings.fromJson(decoded);
-          _settings = await _migrateSettings(loadedSettings);
+          // One-time secure-token migration: a legacy settings file may carry
+          // the token in JSON. Move it into the secure store (verifying by
+          // re-read) before we persist, and keep the effective value in memory.
+          final legacyToken = loadedSettings.authToken.trim();
+          if (legacyToken.isNotEmpty) {
+            await _tokenRepository.write(legacyToken);
+          }
+          final effectiveToken = legacyToken.isNotEmpty
+              ? legacyToken
+              : (await _tokenRepository.read()) ?? '';
+          _settings = (await _migrateSettings(
+            loadedSettings,
+          )).copyWith(authToken: effectiveToken);
           final migrated =
-              jsonEncode(loadedSettings.toJson()) !=
-              jsonEncode(_settings.toJson());
+              jsonEncode(_persistedSettings().toJson()) !=
+              jsonEncode(_stripToken(loadedSettings.toJson()));
           if (sourceFile.path != file.path || migrated) {
             await _writeSettingsFile(file);
           }
         }
       } else {
-        _settings = await _migrateSettings(_settings);
+        _settings = (await _migrateSettings(
+          _settings,
+        )).copyWith(authToken: (await _tokenRepository.read()) ?? '');
       }
       _lastError = null;
     } catch (error) {
@@ -85,10 +106,19 @@ class SettingsStore extends ChangeNotifier {
     final normalizedDeviceName = deviceName.trim().isEmpty
         ? await resolveDefaultDeviceName()
         : deviceName.trim();
+    final enteredToken = authToken.trim();
+    final resolvedAuthToken = enteredToken.isNotEmpty
+        ? enteredToken
+        : (manualMode
+              ? '' // manual/offline mode intentionally has no control token
+              : _settings.authToken); // managed: empty means "keep stored"
     final nextSettings = _settings.copyWith(
       diagnosticsUrl: normalizedDiagnosticsUrl,
       controlServer: normalizedControlServer,
-      authToken: authToken.trim(),
+      // The token field is never prefilled with the stored value, so an empty
+      // entry in managed mode preserves it; explicit clearing happens via
+      // logout or manual mode.
+      authToken: resolvedAuthToken,
       networkId: normalizedNetworkId,
       virtualIp: virtualIp.trim(),
       deviceName: normalizedDeviceName,
@@ -169,6 +199,9 @@ class SettingsStore extends ChangeNotifier {
     try {
       final file = _settingsFile();
       _configPath = file.path;
+      // Keep the credential in the secure store in lockstep with the
+      // in-memory value. A blank token clears the secure store.
+      await _tokenRepository.write(_settings.authToken);
       await _writeSettingsFile(file);
       _lastError = null;
     } catch (error) {
@@ -194,9 +227,23 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> _writeSettingsFile(File file) async {
     await file.parent.create(recursive: true);
+    // Persist non-credential settings only. The auth token lives in the secure
+    // repository, never in this JSON (it can be backed up or shipped in support
+    // bundles), so it is always written blank.
     await file.writeAsString(
-      const JsonEncoder.withIndent('  ').convert(_settings.toJson()),
+      const JsonEncoder.withIndent('  ').convert(_persistedSettings().toJson()),
     );
+  }
+
+  /// Settings as they should be written to disk: identical to the in-memory
+  /// settings except the auth token is blanked (it is stored separately).
+  AppSettings _persistedSettings() => _settings.copyWith(authToken: '');
+
+  /// The token field in [json] blanked, for comparing persisted content.
+  Map<String, dynamic> _stripToken(Map<String, dynamic> json) {
+    final copy = Map<String, dynamic>.from(json);
+    copy['authToken'] = '';
+    return copy;
   }
 
   File? _legacySettingsFile() {

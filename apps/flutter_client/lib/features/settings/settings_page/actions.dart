@@ -51,7 +51,12 @@ extension _SettingsPageActions on _SettingsPageState {
           );
       await widget.statusStore.refresh();
       if (mounted) {
-        _updateState(() => _restartRequired = restartRequired);
+        _updateState(() {
+          _restartRequired = restartRequired;
+          // Re-derive the credential status without ever reading the token
+          // back into a text field.
+          _credentialState = _describeCredential(widget.settingsStore.settings);
+        });
       }
       _showSnackBar(
         restartRequired
