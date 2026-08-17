@@ -151,7 +151,7 @@ flowchart LR
 
 | 层级 | 实现 | 主要职责 |
 | --- | --- | --- |
-| 客户端界面 | Flutter 原生客户端 / React 网页控制台 | 设备状态、诊断和控制面操作 |
+| 客户端界面 | Flutter 原生客户端（唯一 GUI） | 设备状态、诊断和控制面操作。React 网页控制台已冻结、待移除，见 `docs/adr/0004`。 |
 | 本地守护进程 | Rust | 虚拟网卡、加密会话、Peer 状态、NAT 探测、中继回退 |
 | 控制面 | Go, SQLite | 账号、设备注册、虚拟 IP 分配、凭据状态、中继票据、信令 |
 | 中继服务 | Go | 密文转发、票据校验、撤销信息同步 |
@@ -326,8 +326,8 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```text
 client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、CLI
 server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
-src/          React 网页控制台
-apps/flutter_client/ Flutter 诊断客户端：Android、iOS、macOS、Windows、Linux
+src/          React 网页控制台（已冻结，仅保留待移除；新能力一律进 Flutter，见 docs/adr/0004）
+apps/flutter_client/ Flutter 原生客户端（唯一 GUI）：Android、iOS、macOS、Windows、Linux
 scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
 fuzz/         协议与解析器模糊测试
 proto/        Protobuf 协议草案

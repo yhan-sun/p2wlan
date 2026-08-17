@@ -150,7 +150,7 @@ flowchart LR
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Client UI | Flutter native client / React web console | Device status, diagnostics, and control-plane actions |
+| Client UI | Flutter native client (sole GUI) | Device status, diagnostics, and control-plane actions. The React web console is frozen pending removal; see `docs/adr/0004`. |
 | Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
 | Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
 | Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
@@ -313,8 +313,8 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ```text
 client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon, CLI
 server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
-src/          React web console
-apps/flutter_client/ Flutter diagnostics client for Android, iOS, macOS, Windows, and Linux
+src/          React web console (frozen, retained only for removal; new work goes to Flutter, see docs/adr/0004)
+apps/flutter_client/ Flutter native client (sole GUI) for Android, iOS, macOS, Windows, and Linux
 scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
 fuzz/         Protocol and parser fuzzing
 proto/        Protobuf protocol draft
