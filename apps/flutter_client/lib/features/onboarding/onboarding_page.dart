@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -37,9 +38,23 @@ class _OnboardingPageState extends State<OnboardingPage> {
   late final OnboardingModel _model = OnboardingModel(
     capabilities: widget.capabilities ?? PlatformCapabilities.current(),
   );
-  bool _permissionGranted = false;
+  PermissionPreflight? _preflight;
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshPreflight();
+  }
+
+  /// Re-run the live permission preflight. The result (not an in-memory
+  /// boolean) is what drives the permission step.
+  Future<void> _refreshPreflight() async {
+    final preflight = await runPermissionPreflight();
+    if (!mounted) return;
+    setState(() => _preflight = preflight);
+  }
 
   OnboardingFacts _facts() {
     final settings = widget.settingsStore.settings;
@@ -49,7 +64,11 @@ class _OnboardingPageState extends State<OnboardingPage> {
     return OnboardingFacts(
       hasCredential: settings.authToken.trim().isNotEmpty,
       manualMode: settings.manualMode,
-      permissionGranted: _permissionGranted,
+      // Real permission: the static preflight says TUN/route work is possible
+      // right now, OR the daemon is already running (the authoritative runtime
+      // proof that elevation was granted).
+      permissionGranted:
+          (_preflight?.satisfied ?? false) || widget.statusStore.daemonReachable,
       daemonReachable: widget.statusStore.daemonReachable,
       virtualIp: snapshot?.virtualIp ?? '',
       onlinePeerCount: onlinePeers,
@@ -70,21 +89,28 @@ class _OnboardingPageState extends State<OnboardingPage> {
     widget.onCompleted?.call();
   }
 
+  /// Start the daemon. The permission step and the daemon step both land here:
+  /// granting permission IS the real elevation that happens when the daemon
+  /// is launched (osascript/UAC/pkexec), and once the daemon is reachable the
+  /// permission fact is true by definition.
+  Future<void> _startDaemon() async {
+    setState(() => _busy = true);
+    try {
+      final result = await widget.statusStore.startDaemon();
+      await widget.statusStore.refresh();
+      await _refreshPreflight();
+      if (!result.ok && mounted) setState(() => _error = result.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   Future<void> _onPrimaryAction(OnboardingStep step) async {
     _error = null;
     switch (step) {
       case OnboardingStep.permission:
-        setState(() => _permissionGranted = true);
-        break;
       case OnboardingStep.daemon:
-        setState(() => _busy = true);
-        try {
-          final result = await widget.statusStore.startDaemon();
-          await widget.statusStore.refresh();
-          if (!result.ok && mounted) setState(() => _error = result.message);
-        } finally {
-          if (mounted) setState(() => _busy = false);
-        }
+        await _startDaemon();
         break;
       case OnboardingStep.virtualIp:
       case OnboardingStep.discover:
@@ -143,10 +169,10 @@ class _OnboardingPageState extends State<OnboardingPage> {
                         step: step,
                         visible: _visibleSteps,
                         facts: facts,
-                        permissionGranted: _permissionGranted,
+                        permissionGranted: facts.permissionGranted,
                       ),
                       const SizedBox(height: 28),
-                      _StepBody(step: step, isZh: isZh, busy: _busy),
+                      _StepBody(step: step, isZh: isZh, busy: _busy, preflight: _preflight),
                       if (_error != null) ...[
                         const SizedBox(height: 16),
                         Text(
@@ -295,11 +321,17 @@ class _StepDot extends StatelessWidget {
 }
 
 class _StepBody extends StatelessWidget {
-  const _StepBody({required this.step, required this.isZh, required this.busy});
+  const _StepBody({
+    required this.step,
+    required this.isZh,
+    required this.busy,
+    this.preflight,
+  });
 
   final OnboardingStep step;
   final bool isZh;
   final bool busy;
+  final PermissionPreflight? preflight;
 
   @override
   Widget build(BuildContext context) {
@@ -358,7 +390,65 @@ class _StepBody extends StatelessWidget {
                 color: AppTokens.colorTextMuted,
               ),
         ),
+        if (step == OnboardingStep.permission && preflight != null) ...[
+          const SizedBox(height: 12),
+          _PermissionSummary(preflight: preflight!),
+        ],
       ],
+    );
+  }
+}
+
+/// Real preflight summary for the permission step: shows what the live
+/// platform check found, so the user grants permission from evidence rather
+/// than a blind click.
+class _PermissionSummary extends StatelessWidget {
+  const _PermissionSummary({required this.preflight});
+
+  final PermissionPreflight preflight;
+
+  @override
+  Widget build(BuildContext context) {
+    final tone = preflight.bad
+        ? Colors.redAccent
+        : preflight.warn
+        ? Colors.orange
+        : AppTokens.colorAccent;
+    final label = preflight.satisfied
+        ? '权限已满足'
+        : '需要授权';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTokens.colorSurfaceSubtle,
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+        border: Border.all(color: AppTokens.colorBorderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.security_rounded, size: 16, color: tone),
+              const SizedBox(width: 6),
+              Text(
+                '$label · ${preflight.canCreateTun == 'true' ? '可创建 TUN' : 'TUN: ${preflight.canCreateTun}'} · ${preflight.canModifyRoutes == 'true' ? '可修改路由' : '路由: ${preflight.canModifyRoutes}'}',
+                style: TextStyle(fontSize: 12, color: tone),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            preflight.recommendedAction,
+            style: const TextStyle(
+              fontSize: 12,
+              height: 1.4,
+              color: AppTokens.colorTextSecondary,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

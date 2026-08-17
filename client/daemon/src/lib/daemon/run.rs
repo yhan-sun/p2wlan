@@ -392,6 +392,7 @@ impl Daemon {
                 self.timeline.clone(),
                 self.status_events.clone(),
                 self.config.diagnostics.log_path.clone(),
+                self.config.diagnostics.auth_token.clone(),
             );
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager

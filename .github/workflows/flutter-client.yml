@@ -13,6 +13,9 @@ on:
       - "client/daemon/src/diagnostics/**"
       - "client/daemon/src/route/**"
       - "client/daemon/src/connection_timeline.rs"
+      # Shared daemon <-> client contract fixtures (single source of truth for
+      # the wire format; both sides must stay in lockstep).
+      - "contracts/**"
       - ".github/workflows/flutter-client.yml"
   pull_request:
     branches: [ main ]
@@ -21,6 +24,7 @@ on:
       - "client/daemon/src/diagnostics/**"
       - "client/daemon/src/route/**"
       - "client/daemon/src/connection_timeline.rs"
+      - "contracts/**"
       - ".github/workflows/flutter-client.yml"
   workflow_dispatch:
 

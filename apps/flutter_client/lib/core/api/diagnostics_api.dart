@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../daemon/diagnostics_auth.dart';
 import '../models/diagnostics_models.dart';
 
 class DiagnosticsApi {
@@ -48,6 +49,7 @@ class DiagnosticsApi {
           .postUrl(_endpoint(diagnosticsUrl, '/shutdown'))
           .timeout(_requestTimeout);
       request.headers.set(HttpHeaders.acceptHeader, 'text/plain');
+      await _authorize(request);
       request.headers.contentLength = 0;
       final response = await request.close().timeout(_requestTimeout);
       await response.drain<void>().timeout(_requestTimeout);
@@ -75,6 +77,7 @@ class DiagnosticsApi {
         )
         .timeout(_requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    await _authorize(request);
     request.headers.contentLength = 0;
     final response = await request.close().timeout(_speedTestTimeout);
     final body = await utf8.decodeStream(response).timeout(_speedTestTimeout);
@@ -179,6 +182,7 @@ class DiagnosticsApi {
         .postUrl(_endpoint(diagnosticsUrl, '/routes/verify'))
         .timeout(_requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    await _authorize(request);
     request.headers.contentLength = 0;
     final response = await request.close().timeout(_requestTimeout);
     final body = await utf8.decodeStream(response).timeout(_requestTimeout);
@@ -203,6 +207,7 @@ class DiagnosticsApi {
         .postUrl(_endpoint(diagnosticsUrl, '/routes/repair'))
         .timeout(_requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    await _authorize(request);
     request.headers.contentLength = 0;
     final response = await request.close().timeout(_requestTimeout);
     final body = await utf8.decodeStream(response).timeout(_requestTimeout);
@@ -222,6 +227,16 @@ class DiagnosticsApi {
 
   Future<String> _getText(Uri uri, String accept) async {
     return _getTextWithTimeout(uri, accept, _requestTimeout);
+  }
+
+  /// Attach the per-process diagnostics mutation token when the daemon has
+  /// published one. Read fresh on every call: after a daemon restart the token
+  /// is regenerated, and a stale cached value would be rejected with 403.
+  Future<void> _authorize(HttpClientRequest request) async {
+    final token = await readDiagnosticsAuthToken();
+    if (token != null && token.isNotEmpty) {
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    }
   }
 
   Future<String> _getTextWithTimeout(

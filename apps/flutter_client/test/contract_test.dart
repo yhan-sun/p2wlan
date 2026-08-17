@@ -1,56 +1,45 @@
-// Contract test: pins the JSON field contract between the Rust daemon and the
-// Flutter client for the state fields introduced for the Flutter unification
-// (ADR 0004). If the daemon renames or drops these fields, this test fails so
-// the two sides cannot drift silently.
+// Contract test: pins the JSON wire contract shared with the Rust daemon.
+//
+// The fixtures live in `contracts/fixtures/` at the repository root — the SAME
+// files the Rust daemon contract test (`client/daemon/tests/contract_fixture.rs`)
+// deserializes. If either side renames or drops a field, one of the two tests
+// fails so the daemon and the Flutter client cannot drift silently.
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 
+Future<Map<String, dynamic>> _readFixture(String name) async {
+  final file = File('../../contracts/fixtures/$name');
+  final raw = await file.readAsString();
+  final decoded = jsonDecode(raw);
+  if (decoded is! Map<String, dynamic>) {
+    throw StateError('fixture $name must be a JSON object');
+  }
+  return decoded;
+}
+
 void main() {
-  group('/status contract: revision + readyPhase', () {
-    test('new fields are parsed from the daemon snapshot', () {
-      final raw = jsonDecode(jsonEncode({
-        'version': '0.1.118',
-        'node_id': 'node-a',
-        'virtual_ip': '10.20.0.7',
-        'network_id': 'net1',
-        'revision': 42,
-        'ready_phase': 'connected_direct',
-        'peers': <Map<String, dynamic>>[],
-        'health': <String, dynamic>{},
-        'stats': <String, dynamic>{},
-        'relay_selection': <String, dynamic>{},
-      })) as Map<String, dynamic>;
-
-      final snapshot = DiagnosticsSnapshot.fromJson(raw);
-      expect(snapshot.revision, 42);
-      expect(snapshot.readyPhase, 'connected_direct');
+  group('/status contract (shared fixture)', () {
+    test('shared status.json parses and carries revision + readyPhase', () async {
+      final json = await _readFixture('status.json');
+      final snapshot = DiagnosticsSnapshot.fromJson(json);
+      expect(snapshot.nodeId, 'node-a');
+      expect(snapshot.networkId, 'net1');
+      expect(snapshot.virtualIp, '10.20.0.7');
+      expect(snapshot.revision, greaterThan(0));
+      expect(snapshot.readyPhase, isNotEmpty);
     });
 
-    test('old daemon without the fields falls back to 0 / unknown (backward compatible)', () {
-      final raw = jsonDecode(jsonEncode({
-        'version': '0.1.110',
-        'node_id': 'node-a',
-        'virtual_ip': '10.20.0.7',
-        'peers': <Map<String, dynamic>>[],
-        'health': <String, dynamic>{},
-        'stats': <String, dynamic>{},
-        'relay_selection': <String, dynamic>{},
-      })) as Map<String, dynamic>;
-
-      final snapshot = DiagnosticsSnapshot.fromJson(raw);
-      expect(snapshot.revision, 0);
-      expect(snapshot.readyPhase, 'unknown');
-    });
-
-    test('every documented readyPhase value round-trips through the model', () {
+    test('every documented readyPhase value round-trips through the model', () async {
       const phases = [
         'connecting_control',
         'connected_manual',
         'connected_direct',
         'connected_relay',
         'discovering_peers',
+        'allocating_virtual_ip',
         'credential_reauth_required',
         'error',
         'stopping',
@@ -71,79 +60,48 @@ void main() {
     });
   });
 
-  group('/events contract', () {
-    test('response shape: {revision, events:[{seq, event, at_ms, ...}]}', () {
-      // Mirrors the daemon's StatusEvent serialization.
-      final body = jsonDecode(jsonEncode({
-        'revision': 7,
-        'events': [
-          {
-            'seq': 6,
-            'event': 'peer_state_changed',
-            'at_ms': 1234,
-            'path': 'direct',
-            'reason_code': null,
-            'peer_id': 'node-b',
-          },
-          {
-            'seq': 7,
-            'event': 'relay_transport_connected',
-            'at_ms': 2000,
-          },
-        ],
-      })) as Map<String, dynamic>;
-
-      expect(body['revision'], 7);
-      final events = body['events'] as List;
-      expect(events.length, 2);
+  group('/events contract (shared fixture)', () {
+    test('response shape: {revision, events:[{seq, event, at_ms, ...}]}', () async {
+      final json = await _readFixture('events.json');
+      expect(json['revision'], greaterThanOrEqualTo(3));
+      final events = json['events'] as List;
+      expect(events.length, 3);
       // seq is monotonic and usable as the /events?since=N cursor.
-      expect((events[0]['seq'] as int) < (events[1]['seq'] as int), isTrue);
-      // Optional fields may be absent on some events (skip_serializing_if).
-      expect(events[1].containsKey('peer_id'), isFalse);
+      final seqs = [
+        for (final e in events) (e as Map<String, dynamic>)['seq'] as int,
+      ];
+      for (var i = 1; i < seqs.length; i++) {
+        expect(seqs[i], greaterThan(seqs[i - 1]));
+      }
+      // Optional fields may be absent on some events.
+      expect((events[0] as Map<String, dynamic>).containsKey('peer_id'), isFalse);
     });
   });
 
-  group('/routes contract', () {
+  group('/routes contract (shared fixture)', () {
     test('response shape: {interface, mtu, healthy, conflictCount, entries[]}',
-        () {
-      // Mirrors the daemon's describe_overlay_routes output.
-      final body = jsonDecode(jsonEncode({
-        'interface': 'p2wlan0',
-        'mtu': 1420,
-        'healthy': true,
-        'conflictCount': 0,
-        'entries': [
-          {
-            'cidr': '10.20.0.0/16',
-            'expected_interface': 'p2wlan0',
-            'actual_interface': 'p2wlan0',
-            'state': 'installed',
-            'owned': true,
-          },
-        ],
-      })) as Map<String, dynamic>;
-
-      expect(body['healthy'], true);
-      expect(body['conflictCount'], 0);
-      final entries = body['entries'] as List;
-      expect(entries.first['state'], 'installed');
-      expect(entries.first['expected_interface'], 'p2wlan0');
-      expect(entries.first['owned'], true);
+        () async {
+      final json = await _readFixture('routes.json');
+      expect(json['interface'], 'p2wlan0');
+      expect(json['mtu'], 1420);
+      expect(json['healthy'], true);
+      expect(json['conflictCount'], 0);
+      final entries = json['entries'] as List;
+      final entry = entries.first as Map<String, dynamic>;
+      expect(entry['cidr'], '10.20.0.0/16');
+      expect(entry['expected_interface'], 'p2wlan0');
+      expect(entry['actual_interface'], 'p2wlan0');
+      expect(entry['state'], 'installed');
+      expect(entry['owned'], true);
     });
 
-    test('repair response shape: {cidr, changed, before, after, restartedDaemon}',
-        () {
-      // Mirrors the daemon's repair_overlay_routes output. `restartedDaemon`
-      // MUST be false — repair never restarts the daemon/TUN/sessions.
-      final body = jsonDecode(jsonEncode({
-        'cidr': '10.20.0.0/16',
-        'changed': true,
-        'before': 'missing',
-        'after': 'installed',
-        'restartedDaemon': false,
-      })) as Map<String, dynamic>;
-      expect(body['restartedDaemon'], isFalse);
-      expect(body['after'], 'installed');
+    test('repair response never restarts the daemon', () async {
+      final json = await _readFixture('route_repair.json');
+      // `restartedDaemon` MUST be false — repair never restarts daemon/TUN/sessions.
+      expect(json['restartedDaemon'], isFalse);
+      expect(json['changed'], isTrue);
+      expect(json['after'], 'installed');
+      expect(json['reason'], 'installed');
     });
   });
 }

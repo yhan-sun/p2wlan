@@ -9,7 +9,6 @@ use super::*;
             control: control.map(ToString::to_string),
             network: network.map(ToString::to_string),
             status: false,
-            token: None,
             token_file: None,
             interface: None,
             address: None,
@@ -120,7 +119,6 @@ use super::*;
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: None,
             token_file: None,
             interface: None,
             address: None,
@@ -189,7 +187,6 @@ use super::*;
             control: Some("https://control.p2wlan.io".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: None,
             token_file: None,
             interface: None,
             address: None,
@@ -325,7 +322,6 @@ use super::*;
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: Some("test-token".to_string()),
             token_file: None,
             interface: None,
             address: None,
@@ -370,7 +366,6 @@ use super::*;
         apply_cli_overrides(&mut config, &cli);
 
         assert!(!config.network.manual);
-        assert_eq!(config.control.auth_token, "test-token");
     }
 
     #[test]

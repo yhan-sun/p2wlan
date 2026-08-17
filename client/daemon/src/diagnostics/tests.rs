@@ -7,23 +7,105 @@ mod tests {
     use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_UNAVAILABLE};
 
     #[test]
-    fn cors_origin_is_restricted_to_local_dev_server() {
+    fn no_browser_cors_is_never_emitted_for_any_origin() {
+        // The React/Vite web console is deleted; no browser origin is trusted.
         assert_eq!(
-            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: http://localhost:14327\r\n\r\n"),
-            Some("http://localhost:14327")
-        );
-        assert_eq!(
-            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
-            Some("http://localhost:1420")
-        );
-        assert_eq!(
-            allowed_cors_origin("GET /status HTTP/1.1\r\norigin: http://127.0.0.1:1420\r\n\r\n"),
-            Some("http://127.0.0.1:1420")
-        );
-        assert_eq!(
-            allowed_cors_origin("GET /status HTTP/1.1\r\nOrigin: https://example.com\r\n\r\n"),
+            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://localhost:14327\r\n\r\n"),
             None
         );
+        assert_eq!(
+            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            no_browser_cors("GET /status HTTP/1.1\r\norigin: http://127.0.0.1:1420\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: https://example.com\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn bearer_token_extracts_authorization_header_value() {
+        assert_eq!(
+            bearer_token("GET /status HTTP/1.1\r\nAuthorization: Bearer abc123\r\n\r\n"),
+            Some("abc123")
+        );
+        assert_eq!(
+            bearer_token("GET /status HTTP/1.1\r\nauthorization: bearer xyz\r\n\r\n"),
+            Some("xyz")
+        );
+        assert_eq!(bearer_token("GET /status HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(
+            bearer_token("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_repair_report_never_reports_false_success() {
+        use crate::route::RouteObservation;
+        use crate::route::RouteState;
+
+        let obs = |state: RouteState| RouteObservation {
+            cidr: "10.20.0.0/16".to_string(),
+            expected_interface: "p2wlan0".to_string(),
+            actual_interface: None,
+            state,
+            owned: true,
+        };
+
+        // Missing -> Installed is the only "changed" outcome.
+        let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Installed));
+        assert_eq!(status, 200);
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["attempted"], true);
+        assert_eq!(body["after"], "installed");
+
+        // Conflict -> Installed is a real change too.
+        let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Installed));
+        assert_eq!(status, 200);
+        assert_eq!(body["changed"], true);
+
+        // Repair that leaves the route Missing (add failed) is NOT a success.
+        let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Missing));
+        assert_eq!(status, 409);
+        assert_eq!(body["changed"], false);
+        assert_eq!(body["reason"], "add_failed");
+
+        // A third-party conflict that is not removed is NOT a success, and the
+        // caller must not be told the route is repaired.
+        let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Conflict));
+        assert_eq!(status, 409);
+        assert_eq!(body["changed"], false);
+        assert_eq!(body["reason"], "conflict_remains");
+
+        // Unknown stays a failure, never a success.
+        let (status, body) = route_repair_report(obs(RouteState::Unknown), obs(RouteState::Unknown));
+        assert_eq!(status, 503);
+        assert_eq!(body["changed"], false);
+
+        // Already Installed -> no-op, success, not "changed".
+        let (status, body) =
+            route_repair_report(obs(RouteState::Installed), obs(RouteState::Installed));
+        assert_eq!(status, 200);
+        assert_eq!(body["changed"], false);
+        assert_eq!(body["attempted"], false);
+
+        // Every report must state that the daemon/TUN/sessions were not
+        // restarted — repair is in-place only.
+        for (state, after) in [
+            (RouteState::Missing, RouteState::Installed),
+            (RouteState::Conflict, RouteState::Installed),
+            (RouteState::Missing, RouteState::Missing),
+            (RouteState::Conflict, RouteState::Conflict),
+            (RouteState::Unknown, RouteState::Unknown),
+        ] {
+            let (_, body) = route_repair_report(obs(state), obs(after));
+            assert_eq!(body["restartedDaemon"], false);
+        }
     }
 
     #[test]
@@ -148,6 +230,7 @@ mod tests {
             ConnectionTimeline::new("node-a", 0),
             status_events,
             None,
+            Some("diag-test-token".to_string()),
         );
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 
@@ -163,7 +246,10 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"gateway_mapping\""));
-        assert!(response.contains("Access-Control-Allow-Origin: http://127.0.0.1:1420\r\n"));
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "no browser origin may be allowed after the React console was deleted"
+        );
         let body = response.split("\r\n\r\n").nth(1).unwrap();
         let snapshot: DiagnosticsSnapshot = serde_json::from_str(body).unwrap();
         assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
@@ -259,8 +345,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(shutdown_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(shutdown_response.contains("shutting down"));
+        // A mutation without the per-process token is rejected, never executed.
+        assert!(shutdown_response.starts_with("HTTP/1.1 403"));
+        assert!(shutdown_response.contains("forbidden"));
+        assert!(shutdown_response.contains("shutting down") == false);
+
+        // The same request with the correct Bearer token succeeds.
+        let mut authed_shutdown_stream = TcpStream::connect(addr).await.unwrap();
+        authed_shutdown_stream
+            .write_all(
+                b"POST /shutdown HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut authed_shutdown_response = String::new();
+        authed_shutdown_stream
+            .read_to_string(&mut authed_shutdown_response)
+            .await
+            .unwrap();
+
+        assert!(authed_shutdown_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(authed_shutdown_response.contains("shutting down"));
 
         worker.await.unwrap().unwrap();
     }

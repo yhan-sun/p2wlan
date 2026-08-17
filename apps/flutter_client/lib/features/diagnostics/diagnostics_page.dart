@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/capabilities/permission_preflight.dart';
+import '../../core/daemon/diagnostics_auth.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/security/redactor.dart';
 import '../../core/state/status_store.dart';

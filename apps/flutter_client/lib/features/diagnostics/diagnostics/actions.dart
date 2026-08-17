@@ -48,7 +48,7 @@ class _DiagnosticsActions extends StatelessWidget {
     final stats = snapshot?.stats;
     final lines = [
       'P2WLAN diagnostics',
-      'platform=${_platformName()}',
+      'platform=${Platform.operatingSystem}',
       'health_endpoint=${statusStore.healthReachable}',
       'status_endpoint=${statusStore.statusReachable}',
       'service_health=${health?.status ?? "n/a"}',
@@ -73,7 +73,7 @@ class _DiagnosticsActions extends StatelessWidget {
 
   Future<void> _openLogs(BuildContext context) async {
     final strings = AppStringsScope.of(context);
-    final dir = _defaultLogDir();
+    final dir = defaultP2WlanLogDir();
     await dir.create(recursive: true);
     if (Platform.isMacOS) {
       await Process.start('open', [dir.path]);

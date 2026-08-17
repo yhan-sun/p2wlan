@@ -194,6 +194,11 @@ pub struct DiagnosticsContext {
     /// used by the bounded `GET /logs/tail` endpoint. `None` when logging to
     /// stdout.
     log_path: Option<std::path::PathBuf>,
+    /// Per-process random token required to authorize diagnostics **mutation**
+    /// endpoints (`POST /speedtest`, `POST /routes/repair`, `POST /shutdown`).
+    /// `None` when the diagnostics endpoint is disabled; mutations then fail
+    /// closed with 403.
+    auth_token: Option<String>,
 }
 
 impl DiagnosticsContext {
@@ -214,6 +219,7 @@ impl DiagnosticsContext {
         timeline: Arc<ConnectionTimeline>,
         status_events: Arc<StatusEventBus>,
         log_path: Option<std::path::PathBuf>,
+        auth_token: Option<String>,
     ) -> Self {
         Self {
             config,
@@ -231,7 +237,38 @@ impl DiagnosticsContext {
             timeline,
             status_events,
             log_path,
+            auth_token,
         }
+    }
+}
+
+/// Compare a bearer token against the daemon's per-process diagnostics auth
+/// token in constant time. `None` token (diagnostics disabled) never matches.
+fn auth_matches(expect: Option<&str>, provided: Option<&str>) -> bool {
+    match (expect, provided) {
+        (Some(expected), Some(given)) => expected.len() == given.len()
+            && expected
+                .as_bytes()
+                .iter()
+                .zip(given.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod auth_matches_tests {
+    use super::*;
+
+    #[test]
+    fn bearer_matches_only_the_exact_token() {
+        assert!(auth_matches(Some("abc123"), Some("abc123")));
+        assert!(!auth_matches(Some("abc123"), Some("abc124")));
+        assert!(!auth_matches(Some("abc123"), Some("abc12")));
+        assert!(!auth_matches(Some("abc123"), None));
+        assert!(!auth_matches(None, Some("abc123")));
+        assert!(!auth_matches(None, None));
     }
 }
 
@@ -239,8 +276,8 @@ impl DiagnosticsContext {
 ///
 /// The phase is a coarse, UI-safe ladder. Clients render this instead of
 /// inferring "connected" from `virtual_ip` presence alone. Priority (top wins):
-/// shutdown > reauth required > unhealthy > control not connected > connecting >
-/// connected (relayed or direct).
+/// shutdown > reauth required > unhealthy > control not connected > VIP still
+/// being allocated > connected (relayed or direct) > still discovering peers.
 pub fn derive_ready_phase(
     health: &crate::tasks::HealthSnapshot,
     relay_connected: bool,
@@ -258,12 +295,20 @@ pub fn derive_ready_phase(
     if health.status == HealthStatus::Unhealthy {
         return "error";
     }
-    if !health.control_connected && virtual_ip.trim().is_empty() {
-        return "connecting_control";
-    }
     if !health.control_connected {
+        if virtual_ip.trim().is_empty() {
+            // No control plane yet and no VIP: the control connection is the
+            // first thing that must come up.
+            return "connecting_control";
+        }
         // Local-only/manual mode: no control plane, but we have a VIP.
         return "connected_manual";
+    }
+    if virtual_ip.trim().is_empty() {
+        // Connected to control but the VIP has not been assigned yet. This is
+        // a distinct state from "no peers found": the daemon is still waiting
+        // on the control plane to allocate 10.20.x.x.
+        return "allocating_virtual_ip";
     }
     let has_direct = peers
         .iter()

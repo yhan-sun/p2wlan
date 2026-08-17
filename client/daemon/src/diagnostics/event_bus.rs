@@ -24,7 +24,7 @@ pub const STATUS_EVENT_MAX_EVENTS: usize = 1024;
 /// One status event exposed over `/events`. Kept intentionally small and
 /// credential-free: it mirrors the timeline event identity but never carries
 /// tickets, tokens, keys, or endpoint credentials.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusEvent {
     pub seq: u64,
     pub event: String,

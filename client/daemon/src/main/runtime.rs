@@ -9,9 +9,10 @@ async fn main() -> p2pnet_daemon::Result<()> {
         std::process::exit(1);
     }
 
-    // Resolve this before any generated config is saved.  A token-file keeps
+    // Resolve this before any generated config is saved.  The token file keeps
     // credentials out of `ps`, shell history, and the audited daemon command
-    // while preserving the existing --token behavior for interactive use.
+    // line. It is the only supported way to supply a control-plane token (the
+    // old `--token` flag was removed).
     let token_file_value = cli
         .token_file
         .as_ref()
@@ -149,6 +150,12 @@ async fn main() -> p2pnet_daemon::Result<()> {
         return Ok(());
     }
 
+    // Generate the per-process diagnostics mutation token and write it to a
+    // 0600 file for local callers (Flutter / tray). It never appears on the
+    // command line or in the persisted config, and it is removed on graceful
+    // shutdown below.
+    let diagnostics_auth_path = prepare_diagnostics_auth(&mut config, config_path);
+
     // Keep one owner for the TUN, control session, and UDP socket set associated
     // with this device identity. A duplicate daemon can consume the other
     // process's offer/answer signals and invalidate authenticated probe MACs.
@@ -248,7 +255,79 @@ async fn main() -> p2pnet_daemon::Result<()> {
     }
 
     info!("Shutdown complete.");
+    if let Some(path) = diagnostics_auth_path {
+        remove_diagnostics_auth(&path);
+    }
     Ok(())
+}
+
+/// Generate a fresh random per-process diagnostics mutation token and write it
+/// to a 0600 file next to the daemon's log file (falling back to the config
+/// directory). Returns the file path for shutdown cleanup, or `None` when the
+/// diagnostics endpoint is disabled.
+fn prepare_diagnostics_auth(config: &mut Config, config_path: &Path) -> Option<PathBuf> {
+    if !config.diagnostics.enabled {
+        return None;
+    }
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+    config.diagnostics.auth_token = Some(token.clone());
+
+    let dir = config
+        .diagnostics
+        .log_path
+        .as_ref()
+        .and_then(|log| log.parent().map(Path::to_path_buf))
+        .or_else(|| config_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = dir.join("p2wlan-daemon.diag-auth");
+
+    let result = std::fs::create_dir_all(&dir)
+        .and_then(|_| {
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(token.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = file.metadata()?.permissions();
+                perms.set_mode(0o600);
+                file.set_permissions(perms)?;
+            }
+            Ok(())
+        });
+    match result {
+        Ok(()) => {
+            config.diagnostics.auth_token_path = Some(path.clone());
+            info!(
+                "Diagnostics mutation auth token written to {}",
+                path.display()
+            );
+            Some(path)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to write diagnostics auth token to {}: {e}; mutations will fail closed",
+                path.display()
+            );
+            // Fail closed: no token file means the server rejects all POSTs.
+            config.diagnostics.auth_token = None;
+            None
+        }
+    }
+}
+
+/// Best-effort removal of the per-process diagnostics auth token file.
+fn remove_diagnostics_auth(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => info!("Removed diagnostics auth token file {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            "Failed to remove diagnostics auth token file {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 async fn print_status(config: &Config, cli: &Cli) -> p2pnet_daemon::Result<()> {

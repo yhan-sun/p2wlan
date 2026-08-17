@@ -5,9 +5,6 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if let Some(ref network) = cli.network {
         config.network.network_id = network.clone();
     }
-    if let Some(ref token) = cli.token {
-        config.control.auth_token = token.clone();
-    }
     if let Some(ref interface) = cli.interface {
         config.network.interface = interface.clone();
     }

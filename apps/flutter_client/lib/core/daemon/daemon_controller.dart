@@ -163,6 +163,9 @@ class DaemonController {
         await _writePidMarker(pidPath, process.pid);
       }
     } catch (error) {
+      // The launch itself failed: never leave the temporary credential file
+      // behind.
+      await _deleteLaunchTokenFile();
       return DaemonCommandResult(
         ok: false,
         message: _startFailureMessage(error),
@@ -170,16 +173,18 @@ class DaemonController {
       );
     }
 
-    // The token file (0600) is kept for the daemon's lifetime and removed on
-    // `stop()`. It must NOT be deleted here: the daemon reads it asynchronously
-    // at startup, and an early delete would race the launch. Keeping it also
-    // lets the daemon survive app restarts while still running.
+    // The daemon reads the token synchronously at startup, so once the
+    // diagnostics endpoint is up (or the launch has failed/timed out) the
+    // temporary credential file is no longer needed. Delete it now so no
+    // long-lived plaintext token file persists, and always clean it up on
+    // failure/timeout below.
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
     final ready = await _waitForHealth(
       settings.diagnosticsUrl,
       timeout,
       logPath,
     );
+    await _deleteLaunchTokenFile();
     if (!ready) {
       // A daemon that exited right after an elevated launch usually failed
       // for a definitive, actionable reason.  Detect a permanent control
@@ -208,8 +213,10 @@ class DaemonController {
   }
 
   /// Best-effort removal of the launch token file (deterministic path). The
-  /// daemon keeps it for its lifetime; `stop()` deletes it so no long-lived
-  /// credential remains after shutdown. Never throws.
+  /// daemon reads the token synchronously at startup, so the temporary file is
+  /// deleted as soon as the daemon is up (or the launch failed/timed out) —
+  /// a long-lived plaintext credential file must never persist. Also called by
+  /// `stop()` as a safety net. Never throws.
   Future<void> _deleteLaunchTokenFile() async {
     final logDir = _defaultLogDir();
     final file = File(

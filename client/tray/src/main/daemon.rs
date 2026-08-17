@@ -1,16 +1,42 @@
 fn stop_daemon() -> Result<(), Box<dyn Error>> {
     let shutdown_url = shutdown_url()?;
-    let response = reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(3))
-        .build()?
-        .post(shutdown_url)
-        .send()?;
+        .build()?;
+    let mut request = client.post(shutdown_url);
+    // The diagnostics mutation endpoint requires the daemon's per-process
+    // auth token (written by the daemon next to its log file at startup).
+    if let Some(token) = read_diagnostics_auth_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send()?;
     if response.status().is_success() {
         Ok(())
     } else {
         Err(format!("daemon returned HTTP {}", response.status()).into())
     }
+}
+
+/// Read the daemon's per-process diagnostics auth token from the file the
+/// daemon writes at startup next to its log file. `None` when the daemon is
+/// not running or has not published one yet. Checks both the tray's log dir
+/// and the Flutter client's log dir (they differ on Linux).
+fn read_diagnostics_auth_token() -> Option<String> {
+    let mut candidates = vec![p2wlan_desktop_host::default_log_dir()];
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local/state/p2wlan"));
+    }
+    for log_dir in candidates {
+        let path = log_dir.join("p2wlan-daemon.diag-auth");
+        if let Ok(value) = fs::read_to_string(&path) {
+            let token = value.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn shutdown_url() -> Result<String, Box<dyn Error>> {

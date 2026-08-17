@@ -96,7 +96,10 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .map_err(|e| DaemonError::Network(format!("diagnostics read failed: {e}")))?;
 
     let request = String::from_utf8_lossy(&buffer[..n]);
-    let cors_origin = allowed_cors_origin(&request);
+    // Native clients only (Flutter / tray / CLI): no browser origin is ever
+    // allowed. The deleted React/Vite web console no longer exists, and no
+    // other web origin is trusted, so CORS headers are never emitted.
+    let cors_origin = no_browser_cors(&request);
     let (method, target) = request
         .lines()
         .next()
@@ -109,6 +112,16 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         })
         .unwrap_or(("GET", "/"));
     let (path, query) = split_request_target(target);
+
+    // Every POST endpoint mutates local system state (speedtest traffic,
+    // route changes, shutdown) or verifies the live routing table. A local
+    // process without the per-process diagnostics token must not be able to
+    // trigger any of them, so all POST requests are authenticated. Read-only
+    // GET endpoints (status/logs/events/peers) stay open to the UI.
+    if method == "POST" && !auth_matches(context.auth_token.as_deref(), bearer_token(&request)) {
+        write_response(&mut stream, 403, "text/plain", "forbidden\n", cors_origin).await?;
+        return Ok(());
+    }
 
     if method == "GET" {
         if let Some(peer_id) = path.strip_prefix("/status/peer/") {
@@ -203,10 +216,16 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         }
         ("POST", "/routes/repair") => {
             // Repairs missing/conflicting routes only; never restarts the daemon,
-            // the TUN, or peer sessions.
-            let result = repair_overlay_routes(&context);
-            let body = serde_json::to_string_pretty(&result)?;
-            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+            // the TUN, or peer sessions. `changed` is true only when the route
+            // actually transitioned to `Installed`; a repair that ends in
+            // Missing/Conflict/Unknown returns a non-2xx status so the caller
+            // never sees a false success.
+            let cidr = context.config.network.cidr.clone();
+            let before = context.route_manager.describe_overlay_route(&cidr);
+            let after = context.route_manager.repair_overlay_route(&cidr);
+            let (status, body) = route_repair_report(before, after);
+            let body = serde_json::to_string_pretty(&body)?;
+            write_response(&mut stream, status, "application/json", &body, cors_origin).await?;
         }
         ("GET", "/events") => {
             let since = query_param(query, "since")
@@ -316,22 +335,60 @@ fn describe_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
     })
 }
 
-/// `/routes/repair` result: repairs the overlay route in place (no daemon/TUN/
-/// session restart), then reports the fresh authoritative state.
-fn repair_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
-    let cidr = context.config.network.cidr.clone();
-    let before = context.route_manager.describe_overlay_route(&cidr);
-    let changed = matches!(
-        before.state,
-        crate::route::RouteState::Missing | crate::route::RouteState::Conflict
-    );
-    let after = context.route_manager.repair_overlay_route(&cidr);
-    serde_json::json!({
-        "cidr": after.cidr,
-        "changed": changed,
-        "before": before.state.as_str(),
-        "after": after.state.as_str(),
-        "restartedDaemon": false,
+/// Compute the `/routes/repair` report and HTTP status from the before/after
+/// route observations. `changed` is only true when the route actually
+/// transitioned to `Installed`; any repair that ends in `Missing`, `Conflict`,
+/// or `Unknown` is a failure and maps to a non-2xx status so the UI can never
+/// present a false success. `attempted` records whether a change was attempted.
+fn route_repair_report(
+    before: crate::route::RouteObservation,
+    after: crate::route::RouteObservation,
+) -> (u16, serde_json::Value) {
+    use crate::route::RouteState;
+    let attempted = matches!(before.state, RouteState::Missing | RouteState::Conflict);
+    let changed = before.state != RouteState::Installed && after.state == RouteState::Installed;
+    let (status, reason) = match after.state {
+        RouteState::Installed => (200, "installed"),
+        RouteState::Missing => (409, "add_failed"),
+        RouteState::Conflict => (409, "conflict_remains"),
+        RouteState::Unknown => (503, "state_unknown"),
+    };
+    (
+        status,
+        serde_json::json!({
+            "cidr": after.cidr,
+            "changed": changed,
+            "attempted": attempted,
+            "before": before.state.as_str(),
+            "after": after.state.as_str(),
+            "reason": reason,
+            "restartedDaemon": false,
+        }),
+    )
+}
+
+/// The diagnostics endpoint is loopback-bound and consumed exclusively by
+/// native clients (Flutter / tray / CLI), which do not send an `Origin` header.
+/// The deleted React/Vite web console was the only browser client, so no
+/// origin is ever allowed and no `Access-Control-Allow-Origin` header is ever
+/// emitted.
+fn no_browser_cors(_request: &str) -> Option<&str> {
+    None
+}
+
+/// Extract a `Bearer <token>` value from the request's `Authorization` header,
+/// if present.
+fn bearer_token(request: &str) -> Option<&str> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("authorization") {
+            return None;
+        }
+        let value = value.trim();
+        value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(str::trim)
     })
 }
 
@@ -383,22 +440,4 @@ fn speedtest_error_status(message: &str) -> u16 {
     } else {
         503
     }
-}
-
-fn allowed_cors_origin(request: &str) -> Option<&str> {
-    request.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.eq_ignore_ascii_case("origin") {
-            return None;
-        }
-        let origin = value.trim();
-        matches!(
-            origin,
-            "http://localhost:14327"
-                | "http://127.0.0.1:14327"
-                | "http://localhost:1420"
-                | "http://127.0.0.1:1420"
-        )
-        .then_some(origin)
-    })
 }

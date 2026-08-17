@@ -1,0 +1,9 @@
+{
+  "cidr": "10.20.0.0/16",
+  "changed": true,
+  "attempted": true,
+  "before": "missing",
+  "after": "installed",
+  "reason": "installed",
+  "restartedDaemon": false
+}

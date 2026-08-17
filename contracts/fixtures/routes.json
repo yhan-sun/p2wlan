@@ -1,0 +1,15 @@
+{
+  "interface": "p2wlan0",
+  "mtu": 1420,
+  "healthy": true,
+  "conflictCount": 0,
+  "entries": [
+    {
+      "cidr": "10.20.0.0/16",
+      "expected_interface": "p2wlan0",
+      "actual_interface": "p2wlan0",
+      "state": "installed",
+      "owned": true
+    }
+  ]
+}
