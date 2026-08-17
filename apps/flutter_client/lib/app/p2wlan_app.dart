@@ -7,10 +7,12 @@ import '../app/app_strings.dart';
 import '../app/app_theme.dart';
 import '../app/app_tokens.dart';
 import '../core/api/diagnostics_api.dart';
+import '../core/capabilities/platform_capabilities.dart';
 import '../core/daemon/daemon_controller.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/auth/login_page.dart';
+import '../features/onboarding/onboarding_page.dart';
 import 'app_constants.dart';
 import 'navigation.dart';
 
@@ -131,11 +133,20 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
             child: !_ready
                 ? const _BootScreen()
                 : _authenticated
-                ? P2WlanShell(
-                    settingsStore: _settingsStore,
-                    statusStore: _statusStore,
-                    onLogout: _logout,
-                  )
+                ? _needsOnboarding
+                    ? OnboardingPage(
+                        settingsStore: _settingsStore,
+                        statusStore: _statusStore,
+                        capabilities: _capabilities,
+                        onCompleted: () {
+                          if (mounted) setState(() {});
+                        },
+                      )
+                    : P2WlanShell(
+                        settingsStore: _settingsStore,
+                        statusStore: _statusStore,
+                        onLogout: _logout,
+                      )
                 : LoginPage(
                     settingsStore: _settingsStore,
                     statusStore: _statusStore,
@@ -150,6 +161,18 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       },
     );
   }
+
+  /// Platform capability, decided once. Pages read this rather than branching
+  /// on Platform.isX.
+  late final PlatformCapabilities _capabilities =
+      PlatformCapabilities.current();
+
+  /// Local-node first-run flow is required when the platform can act as a VPN
+  /// node and the device has not finished onboarding yet. Remote-only
+  /// platforms (mobile/web) skip straight to the shell.
+  bool get _needsOnboarding =>
+      _capabilities.canActAsLocalVpnNode &&
+      !_settingsStore.settings.onboardingCompleted;
 }
 
 class _BootScreen extends StatelessWidget {

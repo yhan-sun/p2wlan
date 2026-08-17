@@ -189,6 +189,14 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Persist that the local-node onboarding flow is complete. Idempotent.
+  Future<void> markOnboardingCompleted() async {
+    if (_settings.onboardingCompleted) return;
+    _settings = _settings.copyWith(onboardingCompleted: true);
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> resetDiagnosticsUrl() async {
     _settings = _settings.copyWith(diagnosticsUrl: defaultDiagnosticsUrl);
     await _save();
