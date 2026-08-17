@@ -33,6 +33,11 @@ pub(crate) struct FreshMappingPredictionResult {
     pub confidence: u8,
     pub window_ports: Vec<u16>,
     pub hit_window: bool,
+    /// 0-indexed position of the actually-learned port within the rank-ordered
+    /// prediction window, or `None` when it fell outside the window.  This is
+    /// the per-hit calibration signal: `hit_window` only says in/out, while the
+    /// rank tells how well-ordered the window was (top-1 vs. deep-in-window).
+    pub hit_rank: Option<u8>,
 }
 
 const FRESH_MAPPING_STATE_MAX_AGE: Duration = Duration::from_secs(30);
@@ -626,6 +631,14 @@ impl PeerManager {
             None => 0,
         };
         let hit_window = state.predicted_ports.contains(&actual_port);
+        // 0-indexed position of the actual port in the rank-ordered window;
+        // `None` when it fell outside (a miss).  Distinct from hit_window,
+        // which is only a boolean in/out: the rank is the calibration signal.
+        let hit_rank = state
+            .predicted_ports
+            .iter()
+            .position(|predicted| *predicted == actual_port)
+            .map(|index| index as u8);
         let result = FreshMappingPredictionResult {
             punch_generation: state.punch_generation,
             predicted_top_port: predicted_top,
@@ -635,6 +648,7 @@ impl PeerManager {
             confidence: state.model.confidence,
             window_ports: state.predicted_ports.clone(),
             hit_window,
+            hit_rank,
         };
         // The peer-reflexive notification can arrive many times for the same
         // peer-facing mapping (retransmissions, triggered checks), and the
@@ -676,8 +690,9 @@ impl PeerManager {
             model = %result.model_label,
             confidence = result.confidence,
             hit_window = hit_window,
+            hit_rank = hit_rank.map(|rank| rank.to_string()).unwrap_or_else(|| "none".to_string()),
             window = ?result.window_ports,
-            "fresh_mapping_prediction_result peer_id={} punch_generation={} socket_local={} public_ip={} predicted_top={:?} actual_port={} error={} model={} confidence={} hit_window={}",
+            "fresh_mapping_prediction_result peer_id={} punch_generation={} socket_local={} public_ip={} predicted_top={:?} actual_port={} error={} model={} confidence={} hit_window={} hit_rank={:?}",
             peer_id,
             state.punch_generation,
             state.socket_local_endpoint,
@@ -687,7 +702,8 @@ impl PeerManager {
             error,
             result.model_label,
             result.confidence,
-            hit_window
+            hit_window,
+            hit_rank
         );
         self.record_direct_event(
                 peer_id,

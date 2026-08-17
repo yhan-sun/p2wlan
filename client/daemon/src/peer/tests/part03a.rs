@@ -80,6 +80,57 @@ async fn fresh_mapping_prediction_result_is_deduplicated_per_generation_and_port
 }
 
 #[tokio::test]
+async fn fresh_mapping_prediction_result_records_hit_rank() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51843".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let model = p2pnet_nat::mapping::build_model(
+        &[45390, 45391, 45392],
+        Some("203.0.113.10".parse().unwrap()),
+        1_000,
+    );
+    // Rank-ordered prediction window: rank0=45393, rank1=45394, rank2=45395,
+    // rank3=45396.  Recording the actually-learned peer port must capture WHICH
+    // position it hit (the calibration metric), not just in-window/miss.
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            model,
+            vec![45393, 45394, 45395, 45396],
+            "0.0.0.0:58980".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            41,
+            0,
+        )
+        .await;
+
+    // A hit at rank 2.
+    manager
+        .record_fresh_mapping_prediction_result("peer1", "203.0.113.10:45395".parse().unwrap())
+        .await;
+    // A miss: port 45398 is outside the predicted window.
+    manager
+        .record_fresh_mapping_prediction_result("peer1", "203.0.113.10:45398".parse().unwrap())
+        .await;
+
+    let history = manager
+        .fresh_mapping_history
+        .lock()
+        .unwrap()
+        .get("peer1")
+        .cloned()
+        .unwrap();
+    let hit = history.iter().find(|r| r.actual_port == 45395).unwrap();
+    assert!(hit.hit_window);
+    assert_eq!(hit.hit_rank, Some(2), "45395 is the 3rd (rank 2) prediction");
+
+    let miss = history.iter().find(|r| r.actual_port == 45398).unwrap();
+    assert!(!miss.hit_window);
+    assert_eq!(miss.hit_rank, None, "an out-of-window port has no hit rank");
+}
+
+#[tokio::test]
 async fn fresh_prediction_label_classifies_as_predicted_with_rank() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "127.0.0.1:51842".parse().unwrap();
