@@ -4,6 +4,7 @@ class _DashboardActions extends StatelessWidget {
   const _DashboardActions({
     required this.daemonAvailable,
     required this.daemonBusy,
+    required this.canControlLocalDaemon,
     required this.refreshing,
     required this.onStartDaemon,
     required this.onStopDaemon,
@@ -12,6 +13,7 @@ class _DashboardActions extends StatelessWidget {
 
   final bool daemonAvailable;
   final bool daemonBusy;
+  final bool canControlLocalDaemon;
   final bool refreshing;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
@@ -43,7 +45,13 @@ class _DashboardActions extends StatelessWidget {
         if (constraints.maxWidth < 520) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [primaryAction, const SizedBox(height: 8), refreshAction],
+            children: [
+              if (canControlLocalDaemon) ...[
+                primaryAction,
+                const SizedBox(height: 8),
+              ],
+              refreshAction,
+            ],
           );
         }
 
@@ -51,7 +59,7 @@ class _DashboardActions extends StatelessWidget {
           spacing: 10,
           runSpacing: 8,
           crossAxisAlignment: WrapCrossAlignment.center,
-          children: [primaryAction, refreshAction],
+          children: [if (canControlLocalDaemon) primaryAction, refreshAction],
         );
       },
     );

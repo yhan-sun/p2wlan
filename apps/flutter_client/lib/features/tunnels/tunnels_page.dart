@@ -28,6 +28,67 @@ class TunnelsPage extends StatefulWidget {
 class _TunnelsPageState extends State<TunnelsPage> {
   String? _message;
   var _rebuilding = false;
+  // Authoritative overlay-route state, fetched from the daemon (never inferred
+  // from "daemon running + virtual IP"). `null` = not yet verified.
+  Map<String, dynamic>? _routeState;
+  var _verifying = false;
+  var _repairing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _verifyRoutes();
+  }
+
+  /// Read-only authoritative check of the live system routing table.
+  Future<void> _verifyRoutes() async {
+    final url = widget.settingsStore.settings.diagnosticsUrl;
+    if (!widget.statusStore.daemonReachable) return;
+    setState(() {
+      _verifying = true;
+    });
+    try {
+      final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
+      if (!mounted) return;
+      setState(() => _routeState = result);
+    } catch (_) {
+      // Daemon may not expose /routes/verify yet; leave state unknown.
+    } finally {
+      if (mounted) setState(() => _verifying = false);
+    }
+  }
+
+  /// Repair the overlay route in place — no daemon/TUN/session restart.
+  Future<void> _repairRoutes() async {
+    final strings = AppStringsScope.of(context);
+    final url = widget.settingsStore.settings.diagnosticsUrl;
+    setState(() {
+      _repairing = true;
+      _message = null;
+    });
+    try {
+      final result = await widget.statusStore.diagnosticsApi.repairRoutes(url);
+      final changed = result['changed'] == true;
+      final after = result['after']?.toString() ?? '';
+      if (!mounted) return;
+      setState(() {
+        _routeState = result;
+        _message = changed
+            ? (strings.isZh
+                  ? '路由已就地修复（状态：$after），未重启 daemon。'
+                  : 'Route repaired in place (state: $after) without restarting the daemon.')
+            : (strings.isZh
+                  ? '路由已正确安装，无需修复。'
+                  : 'Route was already correctly installed; no change needed.');
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _message = '路由修复失败：$error');
+      }
+    } finally {
+      if (mounted) setState(() => _repairing = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -66,7 +127,12 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   snapshot: snapshot,
                   settings: settings,
                   running: running,
+                  routeState: _routeState,
+                  verifying: _verifying,
+                  repairing: _repairing,
                   rebuilding: _rebuilding,
+                  onVerify: _verifyRoutes,
+                  onRepair: _repairRoutes,
                   onRebuild: _rebuildRoutes,
                 );
                 if (constraints.maxWidth < 760) {
@@ -213,65 +279,141 @@ class _RoutePanel extends StatelessWidget {
     required this.snapshot,
     required this.settings,
     required this.running,
+    required this.routeState,
+    required this.verifying,
+    required this.repairing,
     required this.rebuilding,
+    required this.onVerify,
+    required this.onRepair,
     required this.onRebuild,
   });
 
   final DiagnosticsSnapshot? snapshot;
   final AppSettings settings;
   final bool running;
+  final Map<String, dynamic>? routeState;
+  final bool verifying;
+  final bool repairing;
   final bool rebuilding;
+  final Future<void> Function() onVerify;
+  final Future<void> Function() onRepair;
   final Future<void> Function() onRebuild;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final daemonManagingRoutes =
-        running && snapshot?.virtualIp.trim().isNotEmpty == true;
+    final isZh = strings.isZh;
+
+    // Authoritative state comes from the daemon when available; otherwise we
+    // report "unknown" rather than guessing from daemon-running + virtual IP.
+    final state =
+        routeState?['entries'] is List &&
+            (routeState?['entries'] as List).isNotEmpty
+        ? ((routeState?['entries']) as List).first as Map<String, dynamic>
+        : null;
+    final routeOk = state?['state'] == 'installed';
+    final routeConflict = state?['state'] == 'conflict';
+    final actual = state?['actual_interface']?.toString();
+    final expected = state?['expected_interface']?.toString();
+
+    String badgeLabel;
+    StatusTone badgeTone;
+    if (!running) {
+      badgeLabel = isZh ? '离线' : 'Offline';
+      badgeTone = StatusTone.neutral;
+    } else if (state == null) {
+      badgeLabel = isZh ? '未知（未校验）' : 'Unknown (unverified)';
+      badgeTone = StatusTone.warn;
+    } else if (routeOk) {
+      badgeLabel = isZh ? '已安装' : 'Installed';
+      badgeTone = StatusTone.good;
+    } else if (routeConflict) {
+      badgeLabel = isZh ? '冲突' : 'Conflict';
+      badgeTone = StatusTone.bad;
+    } else {
+      badgeLabel = isZh ? '缺失' : 'Missing';
+      badgeTone = StatusTone.bad;
+    }
+
     return AppPanel(
       title: strings.route,
-      trailing: StatusBadge(
-        label: daemonManagingRoutes
-            ? (strings.isZh ? '由 daemon 管理' : 'Daemon managed')
-            : (strings.isZh ? '未知' : 'Unknown'),
-        tone: daemonManagingRoutes ? StatusTone.good : StatusTone.neutral,
-      ),
+      trailing: StatusBadge(label: badgeLabel, tone: badgeTone),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _Kv(
-            label: strings.isZh ? '目标网段' : 'Destination',
+            label: isZh ? '目标网段' : 'Destination',
             value: settings.overlayCidr,
           ),
           _Kv(
-            label: strings.isZh ? '目标网卡' : 'Interface',
-            value: settings.effectiveTunInterface,
+            label: isZh ? '期望网卡' : 'Expected interface',
+            value: expected ?? settings.effectiveTunInterface,
           ),
+          if (actual != null)
+            _Kv(
+              label: isZh ? '系统实际网卡' : 'Actual (system table)',
+              value: actual,
+            ),
           _Kv(
-            label: strings.isZh ? '状态说明' : 'Detail',
-            value: daemonManagingRoutes
-                ? (strings.isZh
-                      ? '守护进程在线；路由由 daemon 维护，当前版本不会直接读取系统路由表。'
-                      : 'Daemon is online and manages routes; this client does not read the system route table directly.')
-                : (strings.isZh
-                      ? '守护进程离线或尚未分配虚拟 IP。'
-                      : 'Daemon is offline or virtual IP is not assigned.'),
+            label: isZh ? '状态说明' : 'Detail',
+            value: state == null
+                ? (isZh
+                      ? '尚未从 daemon 读取系统路由表；点击"检查路由"。'
+                      : 'Not yet read from the daemon; tap "Check routes".')
+                : (isZh
+                      ? '权威状态：${routeState?['state'] ?? state['state']}。'
+                      : 'Authoritative state: ${routeState?['state'] ?? state['state']}.'),
           ),
           const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: rebuilding ? null : onRebuild,
+          // Check (read-only, safe anytime) + Repair (in place, no restart).
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: running && !verifying ? onVerify : null,
+                  icon: verifying
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.check_circle_outline_rounded),
+                  label: Text(isZh ? '检查路由' : 'Check routes'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: running && !repairing ? onRepair : null,
+                  icon: repairing
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.build_rounded),
+                  label: Text(isZh ? '修复路由' : 'Repair routes'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // Restarting the daemon is a heavier, distinct action — keep it
+          // available but clearly secondary (it interrupts the connection).
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: running && !(verifying || repairing)
+                  ? onRebuild
+                  : null,
               icon: rebuilding
                   ? const SizedBox.square(
                       dimension: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.restart_alt_rounded),
+                  : const Icon(Icons.restart_alt_rounded, size: 16),
               label: Text(
-                strings.isZh
-                    ? '重启 daemon 重装路由'
-                    : 'Restart daemon to rebuild routes',
+                isZh
+                    ? '重启网络服务（会短暂断开）'
+                    : 'Restart network service (brief disconnect)',
               ),
             ),
           ),
