@@ -264,6 +264,24 @@ impl NatDiscoveryResult {
     }
 
     /// Check if direct P2P is likely possible.
+    ///
+    /// # Deprecated
+    ///
+    /// This collapses NAT behavior into the legacy 5-way [`NatType`] enum and
+    /// reports `false` for anything labelled `Symmetric`.  p2wlan actively
+    /// traverses address-or-port-dependent (and partial symmetric) NATs via
+    /// fresh-mapping prediction, so `false` here is a **false negative** — the
+    /// peer is often directly reachable even when this returns `false`.
+    ///
+    /// Do not gate new path decisions on it.  Use the structured
+    /// [`ice::MappingBehavior`] / [`ice::FilteringBehavior`] from
+    /// [`ice::NatProfile`] (and the peer's `p2v2:` fingerprint), which
+    /// distinguishes endpoint-dependent mapping from true symmetric behavior.
+    /// Retained only for wire compatibility with older discovery payloads.
+    #[deprecated(
+        since = "0.1.118",
+        note = "legacy NatType enum under-reports traversability; use ice::MappingBehavior / NatProfile instead"
+    )]
     pub fn can_p2p(&self) -> bool {
         !matches!(self.nat_type, NatType::Symmetric)
     }
@@ -315,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // wire-compat: the legacy enum value must stay stable
     fn test_nat_discovery() {
         let mut result = NatDiscoveryResult::new(NatType::FullCone);
         result.add_candidate(IceCandidate::host("192.168.1.1", 5000));
@@ -326,8 +345,34 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // wire-compat: the legacy enum value must stay stable
     fn test_symmetric_cannot_p2p() {
         let result = NatDiscoveryResult::new(NatType::Symmetric);
         assert!(!result.can_p2p());
+    }
+
+    // The legacy `can_p2p` value is intentionally frozen for wire
+    // compatibility (older discovery payloads still carry it).  The structured
+    // profile, not this enum, is what p2wlan gates traversal on today — see the
+    // deprecation note on `can_p2p`.  This test pins that the frozen legacy
+    // mapping has not drifted while the structured path is the authority.
+    #[test]
+    #[allow(deprecated)]
+    fn can_p2p_legacy_value_is_frozen_for_wire_compat() {
+        let symmetric = NatDiscoveryResult::new(NatType::Symmetric);
+        assert!(!symmetric.can_p2p(), "Symmetric historically reports false");
+        for nat_type in [
+            NatType::Open,
+            NatType::FullCone,
+            NatType::RestrictedCone,
+            NatType::PortRestrictedCone,
+            NatType::Unknown,
+        ] {
+            let result = NatDiscoveryResult::new(nat_type);
+            assert!(
+                result.can_p2p(),
+                "{nat_type:?} must still report true (unchanged legacy value)"
+            );
+        }
     }
 }

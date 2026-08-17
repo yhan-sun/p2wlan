@@ -391,6 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // wire-compat: legacy can_p2p value, not a live gate
     async fn test_detect_symmetric_nat() {
         // Two mock servers with different port overrides
         let (server1, _h1) = spawn_mock_stun_server(Some(12345)).await;
@@ -411,6 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // wire-compat: legacy can_p2p value, not a live gate
     async fn test_detect_with_consistent_ports() {
         // Two mock servers with the same port override
         let (server1, _h1) = spawn_mock_stun_server(Some(9999)).await;
