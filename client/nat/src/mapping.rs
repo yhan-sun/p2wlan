@@ -499,11 +499,112 @@ pub fn build_model_for_batch(
     }
     let public_ip = batch.public_ip();
     let sequence = batch.ordered_ports();
-    let model = build_model(&sequence, public_ip, batch.started_at_ms);
+
+    // A sequence gap means a timed-out observer whose request was already sent
+    // (and whose NAT mapping was very likely already consumed) but whose port we
+    // never observed.  Differencing across that gap would teach the model a
+    // false, inflated step (e.g. a +1 allocator looks like +2).  Only a
+    // gap-free batch may be modeled directly from its successful ports.
+    //
+    // The gap is detected over the *successful* observations only, so it is
+    // robust to however the collector represents a timeout: either omitting the
+    // failed entry entirely, or keeping it with `responded_at_ms == 0`.
+    let successful_sequences: Vec<u16> = batch
+        .observations
+        .iter()
+        .filter(|observation| observation.responded_at_ms > 0)
+        .map(|observation| observation.sequence)
+        .collect();
+    let has_gap = successful_sequences
+        .windows(2)
+        .any(|window| window[1].saturating_sub(window[0]) > 1);
+
+    let model = if has_gap {
+        build_model_from_gapped(batch, public_ip, sequence)
+    } else {
+        build_model(&sequence, public_ip, batch.started_at_ms)
+    };
+
     if matches!(model.kind, PortModelKind::Unpredictable { .. }) {
         return Err(ModelRejection::NoConsistentStep);
     }
     Ok(model)
+}
+
+/// Model a batch whose successful observations contain sequence gaps.
+///
+/// Only a maximal gap-free run (consecutive send sequences) may pin an exact
+/// step, because within such a run every delta is a real single-request
+/// allocation.  A single gap is never folded into the step.  When no run is
+/// long enough to be trustworthy, downgrade to a direction-only
+/// [`PortModelKind::MonotonicWindow`] over the full successful sequence so the
+/// true next allocation stays inside a bounded window instead of being missed
+/// by an inflated stride.  A mixed-direction sequence with no long run is
+/// rejected rather than fabricating a direction.
+fn build_model_from_gapped(
+    batch: &MappingBatch,
+    public_ip: Option<std::net::IpAddr>,
+    successful: Vec<u16>,
+) -> PortModel {
+    // Split the successful observations into maximal gap-free runs.
+    let successful_obs: Vec<&MappingObservation> = batch
+        .observations
+        .iter()
+        .filter(|observation| observation.responded_at_ms > 0)
+        .collect();
+    let mut runs: Vec<Vec<u16>> = Vec::new();
+    let mut previous_sequence: Option<u16> = None;
+    for observation in &successful_obs {
+        match previous_sequence {
+            Some(previous) if observation.sequence.saturating_sub(previous) == 1 => {
+                runs.last_mut().expect("a run always exists after the first push").push(
+                    observation.observed.port(),
+                );
+            }
+            _ => runs.push(vec![observation.observed.port()]),
+        }
+        previous_sequence = Some(observation.sequence);
+    }
+
+    // Prefer the longest gap-free run; trust it only when it is single-direction.
+    if let Some(run) = runs.iter().filter(|run| run.len() >= 3).max_by_key(|run| run.len()) {
+        let model = build_model(run, public_ip, batch.started_at_ms);
+        let forward = model.deltas.iter().filter(|delta| **delta > 0).count();
+        let backward = model.deltas.iter().filter(|delta| **delta < 0).count();
+        if !(forward > 0 && backward > 0) {
+            return model;
+        }
+    }
+
+    // Downgrade: the full successful sequence's direction decides the window;
+    // a gap may still be direction evidence even though it is not step evidence.
+    let full_deltas: Vec<i16> = successful
+        .windows(2)
+        .map(|pair| modular_difference(pair[0], pair[1]))
+        .collect();
+    let forward = full_deltas.iter().filter(|delta| **delta > 0).count();
+    let backward = full_deltas.iter().filter(|delta| **delta < 0).count();
+    let kind = if forward > 0 && backward > 0 {
+        PortModelKind::Unpredictable {
+            reason: ModelRejection::NoConsistentStep,
+        }
+    } else {
+        PortModelKind::MonotonicWindow {
+            direction: if backward > 0 { -1 } else { 1 },
+        }
+    };
+    let confidence = match kind {
+        PortModelKind::MonotonicWindow { .. } => 60,
+        _ => 0,
+    };
+    PortModel {
+        kind,
+        confidence,
+        public_ip,
+        sequence: successful,
+        deltas: full_deltas,
+        sampled_at_ms: batch.started_at_ms,
+    }
 }
 
 /// Maximum total predicted candidates emitted by `predict_ports`.
@@ -807,6 +908,19 @@ mod tests {
             observed: SocketAddr::new(ip(), observed),
             sent_at_ms: 1000,
             responded_at_ms: 1050,
+            local_endpoint: ("0.0.0.0:58980").parse().unwrap(),
+        }
+    }
+
+    /// An observation at an explicit send `sequence`, with `responded_at_ms`
+    /// controllable so a timed-out observer can be modeled (`responded_at_ms == 0`).
+    fn observation_at(sequence: u16, observed: u16, responded_at_ms: u64) -> MappingObservation {
+        MappingObservation {
+            sequence,
+            observer: ("1.2.3.4:3478").parse().unwrap(),
+            observed: SocketAddr::new(ip(), observed),
+            sent_at_ms: 1000,
+            responded_at_ms,
             local_endpoint: ("0.0.0.0:58980").parse().unwrap(),
         }
     }
@@ -1467,6 +1581,75 @@ mod tests {
             predicted.is_empty(),
             "an unpredictable model must yield no candidates even with learning"
         );
+    }
+
+    // ---- P0-2: a timed-out observer must not fabricate a wrong step ----
+
+    #[test]
+    fn single_gap_timeout_does_not_fabricate_double_step() {
+        // A strict +1 allocator, four observers in send order, but observer
+        // at sequence 1 timed out: the real collector keeps only successful
+        // observations, so the batch is [seq0, seq2, seq3] with ports
+        // 1000, 1002, 1003.  The seq1 request was already sent and its NAT
+        // mapping very likely already consumed — naively differencing the
+        // survivors yields [+2, +1] and the old upper-median logic learned
+        // Linear{step:2}, so `last + 2 = 1005` — which misses the real next
+        // allocation 1004.  A gap must never be folded into the exact step.
+        let batch = MappingBatch {
+            generation: 7,
+            network_generation: 3,
+            socket_identity: ("0.0.0.0:58980").parse().unwrap(),
+            observations: vec![
+                observation_at(0, 1000, 1050),
+                observation_at(2, 1002, 1060),
+                observation_at(3, 1003, 1070),
+            ],
+            started_at_ms: 1000,
+            finished_at_ms: 1100,
+        };
+        assert!(
+            batch.is_consistent(),
+            "a gap alone must not make the batch inconsistent"
+        );
+        let model = build_model_for_batch(&batch, Duration::from_secs(5), 2000).unwrap();
+        // The survivors 1000,1002,1003 are strictly increasing, so the
+        // allocator order is intact — we must NOT reject the batch.
+        assert!(model.kind.clone().is_predictable(), "{:?}", model.kind);
+        let predicted = predict_ports(&model, 1003);
+        let ports: Vec<u16> = predicted.iter().map(|c| c.port).collect();
+        assert!(
+            ports.contains(&1004),
+            "the real next allocation 1004 must be in the window, got {:?}",
+            ports
+        );
+        assert!(
+            !matches!(
+                model.kind,
+                PortModelKind::Linear { step: 2 }
+                    | PortModelKind::FixedStep { step: 2 }
+                    | PortModelKind::NoisyLinear { step: 2 }
+            ),
+            "a single gap must not be learned as step 2, got {:?}",
+            model.kind
+        );
+    }
+
+    #[test]
+    fn no_gap_batch_is_unchanged_by_gap_logic() {
+        // Backward-compat guard: a gap-free +1 batch must keep its exact
+        // FixedStep model and predictor output identical to before the
+        // sequence-gap-aware path was introduced.
+        let batch = consistent_batch(&[45390, 45391, 45392]);
+        let model = build_model_for_batch(&batch, Duration::from_secs(5), 2000).unwrap();
+        assert!(
+            matches!(model.kind, PortModelKind::FixedStep { step: 1 }),
+            "{:?}",
+            model.kind
+        );
+        assert_eq!(model.confidence, 95);
+        let predicted = predict_ports(&model, 45392);
+        assert_eq!(predicted[0].port, 45393);
+        assert_eq!(predicted.len(), 6);
     }
 }
 
