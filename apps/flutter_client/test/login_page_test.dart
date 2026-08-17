@@ -106,5 +106,32 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
+  Future<({int revision, List<Map<String, dynamic>> events})> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    Duration timeout = const Duration(seconds: 30),
+  }) => throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<({List<Map<String, dynamic>> peers, int total, String? nextCursor})>
+  fetchPeers(String diagnosticsUrl, {String? cursor, int limit = 100}) =>
+      throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<String> fetchLogTail(
+    String diagnosticsUrl, {
+    int lines = 120,
+    int maxBytes = 262144,
+  }) => throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<Map<String, dynamic>> verifyRoutes(String diagnosticsUrl) =>
+      throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<Map<String, dynamic>> repairRoutes(String diagnosticsUrl) =>
+      throw const DiagnosticsApiException('offline');
+
+  @override
   void close() {}
 }

@@ -132,5 +132,32 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
+  Future<({int revision, List<Map<String, dynamic>> events})> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    Duration timeout = const Duration(seconds: 30),
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<({List<Map<String, dynamic>> peers, int total, String? nextCursor})>
+  fetchPeers(String diagnosticsUrl, {String? cursor, int limit = 100}) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<String> fetchLogTail(
+    String diagnosticsUrl, {
+    int lines = 120,
+    int maxBytes = 262144,
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<Map<String, dynamic>> verifyRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<Map<String, dynamic>> repairRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
+
+  @override
   void close() {}
 }

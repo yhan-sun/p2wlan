@@ -19,6 +19,8 @@ class DiagnosticsSnapshot {
     required this.peers,
     required this.stats,
     required this.health,
+    this.revision = 0,
+    this.readyPhase = 'unknown',
   });
 
   final JsonMap raw;
@@ -27,6 +29,15 @@ class DiagnosticsSnapshot {
   final String nodeId;
   final String virtualIp;
   final String networkId;
+
+  /// Monotonic daemon status revision. Clients compare to their last-seen
+  /// value to decide whether a full snapshot refetch is needed.
+  final int revision;
+
+  /// Authoritative daemon readiness phase (e.g. `connected_direct`,
+  /// `connected_relay`, `discovering_peers`, `error`). Render this instead of
+  /// inferring connectivity from `virtualIp` presence.
+  final String readyPhase;
   final String? udpLocalAddr;
   final int udpSocketCount;
   final bool udpSocketPoolActive;
@@ -63,6 +74,8 @@ class DiagnosticsSnapshot {
       ],
       stats: PeerManagerStatsSnapshot.fromJson(_map(json['stats'])),
       health: HealthSnapshot.fromJson(_map(json['health'])),
+      revision: _int(json['revision'], 0),
+      readyPhase: _string(json['ready_phase'], 'unknown'),
     );
   }
 
