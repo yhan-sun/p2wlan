@@ -360,7 +360,9 @@ class AppStrings {
   /// but the DATA path is NOT verified — never displayed as a connection.
   String probingWithProbeRtt(int? probeRttMs) {
     if (probeRttMs == null) return probing;
-    return isZh ? '探测中 · 候选 RTT ${probeRttMs}ms（未直连）' : 'probing · candidate RTT ${probeRttMs}ms (no direct)';
+    return isZh
+        ? '探测中 · 候选 RTT ${probeRttMs}ms（未直连）'
+        : 'probing · candidate RTT ${probeRttMs}ms (no direct)';
   }
 
   String routeLabel(String path, bool isRelay) {

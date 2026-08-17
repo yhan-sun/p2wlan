@@ -52,6 +52,7 @@ class PeerSnapshot {
   /// encrypted relay probe ACK — never from a TCP/TLS connect, a queued
   /// registration, or a candidate RTT.
   final String? relayConfirmedEndpoint;
+
   /// Network generation of the relay probe ACK confirmation.
   final int? relayConfirmedGeneration;
 
@@ -142,8 +143,12 @@ class PeerSnapshot {
     // probe's RTT (e.g. the 8ms UDP punch) proves nothing about the data
     // path: it must never be displayed or counted as the connection latency.
     if (!online) return null;
-    if (path == 'direct') return isDirectVerified ? direct.displayLatencyMs : null;
-    if (path == 'relay') return isRelayVerified ? relay.displayLatencyMs : null;
+    if (path == 'direct') {
+      return isDirectVerified ? direct.displayLatencyMs : null;
+    }
+    if (path == 'relay') {
+      return isRelayVerified ? relay.displayLatencyMs : null;
+    }
     return null;
   }
 
@@ -165,8 +170,7 @@ class PeerSnapshot {
   /// relay probe ACK (`relay_confirmed_endpoint` — daemon authority).  A
   /// transport connect, a queued registration, or a candidate RTT never sets
   /// this.
-  bool get isRelayVerified =>
-      path == 'relay' && _hasRelayConfirmation;
+  bool get isRelayVerified => path == 'relay' && _hasRelayConfirmation;
 
   /// Whether the direct path to this peer is VERIFIED by a matching encrypted
   /// direct validation exchange (daemon `active_path == direct` requires the

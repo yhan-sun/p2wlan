@@ -19,11 +19,13 @@ class DiagnosticsSnapshot {
     required this.peers,
     required this.stats,
     required this.health,
+    this.contractVersion = 0,
     this.revision = 0,
     this.readyPhase = 'unknown',
   });
 
   final JsonMap raw;
+  final int contractVersion;
   final String version;
   final int? processId;
   final String nodeId;
@@ -53,6 +55,7 @@ class DiagnosticsSnapshot {
   factory DiagnosticsSnapshot.fromJson(JsonMap json) {
     return DiagnosticsSnapshot(
       raw: json,
+      contractVersion: _contractVersion(json),
       version: _string(json['version']),
       processId: _intOrNull(json['process_id']),
       nodeId: _string(json['node_id']),

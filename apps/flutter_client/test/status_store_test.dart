@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 
@@ -72,6 +73,7 @@ Future<_Stores> _makeStores(
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_status_store_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await settingsStore.load();
   final statusStore = StatusStore(
@@ -132,16 +134,18 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
-  Future<({int revision, List<Map<String, dynamic>> events})> fetchEvents(
+  Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
     Duration timeout = const Duration(seconds: 30),
   }) async => throw UnimplementedError();
 
   @override
-  Future<({List<Map<String, dynamic>> peers, int total, String? nextCursor})>
-  fetchPeers(String diagnosticsUrl, {String? cursor, int limit = 100}) async =>
-      throw UnimplementedError();
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) async => throw UnimplementedError();
 
   @override
   Future<String> fetchLogTail(
@@ -151,11 +155,11 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   }) async => throw UnimplementedError();
 
   @override
-  Future<Map<String, dynamic>> verifyRoutes(String diagnosticsUrl) async =>
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
       throw UnimplementedError();
 
   @override
-  Future<Map<String, dynamic>> repairRoutes(String diagnosticsUrl) async =>
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
       throw UnimplementedError();
 
   @override

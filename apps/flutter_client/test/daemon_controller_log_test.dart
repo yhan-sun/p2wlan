@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 
 void main() {
@@ -62,6 +63,51 @@ void main() {
       isFalse,
     );
   });
+
+  test('launch token uses a random name and is deleted explicitly', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+    final runtime = Directory('${tempDir.path}/runtime');
+    final file = await controller.createEphemeralLaunchTokenFile(
+      runtime,
+      'launch-secret',
+    );
+
+    expect(file.uri.pathSegments.last, startsWith('p2wlan-launch-'));
+    expect(file.uri.pathSegments.last, endsWith('.token'));
+    expect(await file.readAsString(), 'launch-secret');
+    if (!Platform.isWindows) {
+      expect((await file.stat()).mode & 0x1ff, 0x180);
+      expect((await runtime.stat()).mode & 0x1ff, 0x1c0);
+    }
+
+    await controller.deleteEphemeralLaunchTokenFile(file);
+    expect(await file.exists(), isFalse);
+  });
+
+  test(
+    'stale launch token cleanup is limited to the controlled name',
+    () async {
+      final api = DiagnosticsApi(authTokenReader: () async => null);
+      addTearDown(api.close);
+      final controller = DaemonController(diagnosticsApi: api);
+      final runtime = Directory('${tempDir.path}/stale-runtime');
+      await runtime.create(recursive: true);
+      final stale = File('${runtime.path}/p2wlan-launch-abcdef.token');
+      await stale.writeAsString('old');
+      await stale.setLastModified(
+        DateTime.now().subtract(const Duration(minutes: 11)),
+      );
+      final unrelated = File('${runtime.path}/keep.txt');
+      await unrelated.writeAsString('keep');
+
+      await controller.cleanupStaleLaunchTokenFiles(runtime);
+
+      expect(await stale.exists(), isFalse);
+      expect(await unrelated.exists(), isTrue);
+    },
+  );
 
   test('an unrelated relay 404 log is not an auth failure', () async {
     final log = await writeLog(

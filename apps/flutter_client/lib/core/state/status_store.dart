@@ -51,6 +51,7 @@ class StatusStore extends ChangeNotifier {
   Timer? _staleTimer;
   DiagnosticsSnapshot? _snapshot;
   var _healthReachable = false;
+  var _routeHealthy = false;
   var _refreshing = false;
   var _daemonBusy = false;
   var _autoRefreshEnabled = false;
@@ -77,6 +78,7 @@ class StatusStore extends ChangeNotifier {
   DiagnosticsSnapshot? get snapshot => _snapshot;
   bool get healthReachable => _healthReachable;
   bool get daemonReachable => _healthReachable || _snapshot != null;
+  bool get routeHealthy => _routeHealthy;
   bool get online => _healthReachable && _snapshot != null;
   bool get statusReachable => _snapshot != null;
   bool get refreshing => _refreshing;
@@ -188,6 +190,7 @@ class StatusStore extends ChangeNotifier {
       _healthReachable = health;
       if (!health) {
         _clearSnapshot();
+        _routeHealthy = false;
         _lastHealthError = 'GET /health is offline or unreadable';
         _lastStatusError = 'GET /status skipped because /health is offline';
         _lastError = _lastHealthError;
@@ -202,6 +205,11 @@ class StatusStore extends ChangeNotifier {
           return;
         }
         _snapshot = snapshot;
+        try {
+          _routeHealthy = (await diagnosticsApi.verifyRoutes(url)).healthy;
+        } catch (_) {
+          _routeHealthy = false;
+        }
         _lastError = null;
         _lastFetchedAt = DateTime.now();
         _lastSuccessfulStatusAt = _lastFetchedAt;

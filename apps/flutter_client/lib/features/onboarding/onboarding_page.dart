@@ -40,6 +40,8 @@ class _OnboardingPageState extends State<OnboardingPage> {
   );
   PermissionPreflight? _preflight;
   bool _busy = false;
+  bool _completing = false;
+  bool _completionNotified = false;
   String? _error;
 
   @override
@@ -59,16 +61,19 @@ class _OnboardingPageState extends State<OnboardingPage> {
   OnboardingFacts _facts() {
     final settings = widget.settingsStore.settings;
     final snapshot = widget.statusStore.snapshot;
-    final onlinePeers =
-        snapshot?.peers.where((p) => p.online).length ?? 0;
+    final onlinePeers = snapshot?.peers.where((p) => p.online).length ?? 0;
     return OnboardingFacts(
       hasCredential: settings.authToken.trim().isNotEmpty,
       manualMode: settings.manualMode,
-      // Real permission: the static preflight says TUN/route work is possible
-      // right now, OR the daemon is already running (the authoritative runtime
-      // proof that elevation was granted).
+      // Runtime proof must include a healthy daemon snapshot and an actual
+      // route verification. Health alone is not evidence that TUN/route setup
+      // succeeded.
       permissionGranted:
-          (_preflight?.satisfied ?? false) || widget.statusStore.daemonReachable,
+          (_preflight?.satisfied ?? false) ||
+          (widget.statusStore.daemonReachable &&
+              widget.statusStore.routeHealthy &&
+              snapshot?.virtualIp.trim().isNotEmpty == true &&
+              snapshot?.health.status == 'healthy'),
       daemonReachable: widget.statusStore.daemonReachable,
       virtualIp: snapshot?.virtualIp ?? '',
       onlinePeerCount: onlinePeers,
@@ -84,9 +89,37 @@ class _OnboardingPageState extends State<OnboardingPage> {
     OnboardingStep.discover,
   ];
 
-  Future<void> _complete() async {
-    await widget.settingsStore.markOnboardingCompleted();
-    widget.onCompleted?.call();
+  Future<void> _completeOnce() async {
+    if (_completing || _completionNotified) return;
+
+    if (widget.settingsStore.settings.onboardingCompleted) {
+      _completionNotified = true;
+      widget.onCompleted?.call();
+      return;
+    }
+
+    _completing = true;
+    if (mounted) {
+      setState(() {
+        _busy = true;
+        _error = null;
+      });
+    }
+    try {
+      await widget.settingsStore.markOnboardingCompleted();
+      if (!mounted) return;
+      _completionNotified = true;
+      widget.onCompleted?.call();
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error = '无法完成本机设置：$error');
+      }
+    } finally {
+      _completing = false;
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
   }
 
   /// Start the daemon. The permission step and the daemon step both land here:
@@ -114,10 +147,10 @@ class _OnboardingPageState extends State<OnboardingPage> {
         break;
       case OnboardingStep.virtualIp:
       case OnboardingStep.discover:
-        await _complete();
+      case OnboardingStep.done:
+        await _completeOnce();
         break;
       case OnboardingStep.auth:
-      case OnboardingStep.done:
         break;
     }
   }
@@ -125,9 +158,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: Listenable.merge(
-        [widget.settingsStore, widget.statusStore],
-      ),
+      animation: Listenable.merge([widget.settingsStore, widget.statusStore]),
       builder: (context, _) {
         final facts = _facts();
         final step = _model.step(facts);
@@ -151,7 +182,9 @@ class _OnboardingPageState extends State<OnboardingPage> {
                       ),
                       const SizedBox(height: 16),
                       Text(
-                        isZh ? '把这台设备接入 P2WLAN' : 'Connect this device to P2WLAN',
+                        isZh
+                            ? '把这台设备接入 P2WLAN'
+                            : 'Connect this device to P2WLAN',
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       const SizedBox(height: 8),
@@ -160,8 +193,8 @@ class _OnboardingPageState extends State<OnboardingPage> {
                             ? '几步完成本地节点设置；中途退出可随时从这里继续。'
                             : 'A few steps to set up your local node; you can resume here anytime.',
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: AppTokens.colorTextMuted,
-                            ),
+                          color: AppTokens.colorTextMuted,
+                        ),
                       ),
                       const SizedBox(height: 28),
                       _OnboardingStepper(
@@ -172,7 +205,12 @@ class _OnboardingPageState extends State<OnboardingPage> {
                         permissionGranted: facts.permissionGranted,
                       ),
                       const SizedBox(height: 28),
-                      _StepBody(step: step, isZh: isZh, busy: _busy, preflight: _preflight),
+                      _StepBody(
+                        step: step,
+                        isZh: isZh,
+                        busy: _busy,
+                        preflight: _preflight,
+                      ),
                       if (_error != null) ...[
                         const SizedBox(height: 16),
                         Text(
@@ -192,7 +230,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
                             // A VIP may take a moment; virtual IP step is not
                             // skippable but we allow "keep waiting" (no-op).
                           } else if (_model.canSkip(step)) {
-                            _complete();
+                            _completeOnce();
                           }
                         },
                       ),
@@ -248,17 +286,16 @@ class _OnboardingStepper extends StatelessWidget {
     final isZh = AppStringsScope.of(context).isZh;
     return Row(
       children: [
-        for (var i = 0; i < visible.length; i++)
-          ...[
-            if (i > 0)
-              Expanded(
-                child: Container(height: 2, color: AppTokens.colorBorderSubtle),
-              ),
-            _StepDot(
-              label: _label(visible[i], isZh),
-              state: _dotState(visible[i], current, isZh),
+        for (var i = 0; i < visible.length; i++) ...[
+          if (i > 0)
+            Expanded(
+              child: Container(height: 2, color: AppTokens.colorBorderSubtle),
             ),
-          ],
+          _StepDot(
+            label: _label(visible[i], isZh),
+            state: _dotState(visible[i], current, isZh),
+          ),
+        ],
       ],
     );
   }
@@ -337,39 +374,37 @@ class _StepBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final (title, subtitle) = switch (step) {
       OnboardingStep.auth => (
-          isZh ? '登录控制面' : 'Sign in to the control plane',
-          isZh
-              ? '使用账号登录以加入你的网络。'
-              : 'Use your account to join your network.',
-        ),
+        isZh ? '登录控制面' : 'Sign in to the control plane',
+        isZh ? '使用账号登录以加入你的网络。' : 'Use your account to join your network.',
+      ),
       OnboardingStep.permission => (
-          isZh ? '授予本机权限' : 'Grant local permissions',
-          isZh
-              ? 'P2WLAN 需要创建虚拟网卡并安装路由，可能需要管理员权限。'
-              : 'P2WLAN creates a virtual adapter and installs routes; this may need admin rights.',
-        ),
+        isZh ? '授予本机权限' : 'Grant local permissions',
+        isZh
+            ? 'P2WLAN 需要创建虚拟网卡并安装路由，可能需要管理员权限。'
+            : 'P2WLAN creates a virtual adapter and installs routes; this may need admin rights.',
+      ),
       OnboardingStep.daemon => (
-          isZh ? '启动本地守护进程' : 'Start the local daemon',
-          isZh
-              ? '启动 p2wlan-daemon 以建立虚拟网卡与加密会话。'
-              : 'Start p2wlan-daemon to create the virtual adapter and secure sessions.',
-        ),
+        isZh ? '启动本地守护进程' : 'Start the local daemon',
+        isZh
+            ? '启动 p2wlan-daemon 以建立虚拟网卡与加密会话。'
+            : 'Start p2wlan-daemon to create the virtual adapter and secure sessions.',
+      ),
       OnboardingStep.virtualIp => (
-          isZh ? '等待分配虚拟 IP' : 'Waiting for a virtual IP',
-          isZh
-              ? '正在加入网络并获取 10.20.x.x 地址…'
-              : 'Joining the network and getting a 10.20.x.x address…',
-        ),
+        isZh ? '等待分配虚拟 IP' : 'Waiting for a virtual IP',
+        isZh
+            ? '正在加入网络并获取 10.20.x.x 地址…'
+            : 'Joining the network and getting a 10.20.x.x address…',
+      ),
       OnboardingStep.discover => (
-          isZh ? '发现其他设备' : 'Discover other devices',
-          isZh
-              ? '正在同步节点目录。可以现在完成，之后在"设备"页继续查看。'
-              : 'Syncing the node catalog. You can finish now and check "Devices" later.',
-        ),
+        isZh ? '发现其他设备' : 'Discover other devices',
+        isZh
+            ? '正在同步节点目录。可以现在完成，之后在"设备"页继续查看。'
+            : 'Syncing the node catalog. You can finish now and check "Devices" later.',
+      ),
       OnboardingStep.done => (
-          isZh ? '准备就绪' : 'Ready',
-          isZh ? '本地节点已配置完成。' : 'Your local node is set up.',
-        ),
+        isZh ? '准备就绪' : 'Ready',
+        isZh ? '本地节点已配置完成。' : 'Your local node is set up.',
+      ),
     };
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -377,7 +412,10 @@ class _StepBody extends StatelessWidget {
         Row(
           children: [
             if (busy) ...[
-              const SizedBox.square(dimension: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox.square(
+                dimension: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
               const SizedBox(width: 10),
             ],
             Text(title, style: Theme.of(context).textTheme.titleMedium),
@@ -386,9 +424,9 @@ class _StepBody extends StatelessWidget {
         const SizedBox(height: 6),
         Text(
           subtitle,
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: AppTokens.colorTextMuted,
-              ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: AppTokens.colorTextMuted),
         ),
         if (step == OnboardingStep.permission && preflight != null) ...[
           const SizedBox(height: 12),
@@ -414,9 +452,7 @@ class _PermissionSummary extends StatelessWidget {
         : preflight.warn
         ? Colors.orange
         : AppTokens.colorAccent;
-    final label = preflight.satisfied
-        ? '权限已满足'
-        : '需要授权';
+    final label = preflight.satisfied ? '权限已满足' : '需要授权';
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(12),
@@ -433,7 +469,15 @@ class _PermissionSummary extends StatelessWidget {
               Icon(Icons.security_rounded, size: 16, color: tone),
               const SizedBox(width: 6),
               Text(
-                '$label · ${preflight.canCreateTun == 'true' ? '可创建 TUN' : 'TUN: ${preflight.canCreateTun}'} · ${preflight.canModifyRoutes == 'true' ? '可修改路由' : '路由: ${preflight.canModifyRoutes}'}',
+                '$label · ${preflight.canCreateTun == true
+                    ? '可创建 TUN'
+                    : preflight.canCreateTun == null
+                    ? 'TUN: 运行时验证'
+                    : 'TUN: 不可用'} · ${preflight.canModifyRoutes == true
+                    ? '可修改路由'
+                    : preflight.canModifyRoutes == null
+                    ? '路由: 运行时验证'
+                    : '路由: 不可用'}',
                 style: TextStyle(fontSize: 12, color: tone),
               ),
             ],
@@ -471,12 +515,13 @@ class _PrimaryAction extends StatelessWidget {
   final VoidCallback onSkip;
 
   String get _label => switch (step) {
-        OnboardingStep.permission => isZh ? '授予并继续' : 'Grant & continue',
-        OnboardingStep.daemon => isZh ? '启动 P2WLAN' : 'Start P2WLAN',
-        OnboardingStep.virtualIp => isZh ? '继续' : 'Continue',
-        OnboardingStep.discover => isZh ? '完成' : 'Finish',
-        _ => isZh ? '继续' : 'Continue',
-      };
+    OnboardingStep.permission => isZh ? '授予并继续' : 'Grant & continue',
+    OnboardingStep.daemon => isZh ? '启动 P2WLAN' : 'Start P2WLAN',
+    OnboardingStep.virtualIp => isZh ? '继续' : 'Continue',
+    OnboardingStep.discover => isZh ? '完成' : 'Finish',
+    OnboardingStep.done => isZh ? '完成' : 'Finish',
+    _ => isZh ? '继续' : 'Continue',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -496,7 +541,10 @@ class _PrimaryAction extends StatelessWidget {
           const Spacer(),
         ] else ...[
           if (skippable)
-            TextButton(onPressed: busy ? null : onSkip, child: Text(isZh ? '跳过' : 'Skip')),
+            TextButton(
+              onPressed: busy ? null : onSkip,
+              child: Text(isZh ? '跳过' : 'Skip'),
+            ),
           const Spacer(),
           FilledButton(
             onPressed: busy ? null : onPrimary,

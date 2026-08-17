@@ -134,19 +134,19 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                 ? const _BootScreen()
                 : _authenticated
                 ? _needsOnboarding
-                    ? OnboardingPage(
-                        settingsStore: _settingsStore,
-                        statusStore: _statusStore,
-                        capabilities: _capabilities,
-                        onCompleted: () {
-                          if (mounted) setState(() {});
-                        },
-                      )
-                    : P2WlanShell(
-                        settingsStore: _settingsStore,
-                        statusStore: _statusStore,
-                        onLogout: _logout,
-                      )
+                      ? OnboardingPage(
+                          settingsStore: _settingsStore,
+                          statusStore: _statusStore,
+                          capabilities: _capabilities,
+                          onCompleted: () {
+                            if (mounted) setState(() {});
+                          },
+                        )
+                      : P2WlanShell(
+                          settingsStore: _settingsStore,
+                          statusStore: _statusStore,
+                          onLogout: _logout,
+                        )
                 : LoginPage(
                     settingsStore: _settingsStore,
                     statusStore: _statusStore,

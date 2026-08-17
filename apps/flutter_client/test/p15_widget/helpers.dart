@@ -25,6 +25,7 @@ Future<_Stores> _makeStores({
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await settingsStore.load();
   await settingsStore.updateSettings(
@@ -119,16 +120,18 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
-  Future<({int revision, List<Map<String, dynamic>> events})> fetchEvents(
+  Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
     Duration timeout = const Duration(seconds: 30),
   }) async => throw UnimplementedError();
 
   @override
-  Future<({List<Map<String, dynamic>> peers, int total, String? nextCursor})>
-  fetchPeers(String diagnosticsUrl, {String? cursor, int limit = 100}) async =>
-      throw UnimplementedError();
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) async => throw UnimplementedError();
 
   @override
   Future<String> fetchLogTail(
@@ -138,11 +141,11 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   }) async => throw UnimplementedError();
 
   @override
-  Future<Map<String, dynamic>> verifyRoutes(String diagnosticsUrl) async =>
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
       throw UnimplementedError();
 
   @override
-  Future<Map<String, dynamic>> repairRoutes(String diagnosticsUrl) async =>
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
       throw UnimplementedError();
 
   @override

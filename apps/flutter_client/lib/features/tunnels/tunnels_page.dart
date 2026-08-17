@@ -50,7 +50,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
     try {
       final result = await widget.statusStore.diagnosticsApi.verifyRoutes(url);
       if (!mounted) return;
-      setState(() => _routeState = result);
+      setState(() => _routeState = result.toJson());
     } catch (_) {
       // Daemon may not expose /routes/verify yet; leave state unknown.
     } finally {
@@ -68,11 +68,11 @@ class _TunnelsPageState extends State<TunnelsPage> {
     });
     try {
       final result = await widget.statusStore.diagnosticsApi.repairRoutes(url);
-      final changed = result['changed'] == true;
-      final after = result['after']?.toString() ?? '';
+      final changed = result.changed;
+      final after = result.after;
       if (!mounted) return;
       setState(() {
-        _routeState = result;
+        _routeState = result.toJson();
         _message = changed
             ? (strings.isZh
                   ? '路由已就地修复（状态：$after），未重启 daemon。'

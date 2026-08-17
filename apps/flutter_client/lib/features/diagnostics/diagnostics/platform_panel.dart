@@ -71,11 +71,11 @@ class _PlatformPanelState extends State<_PlatformPanel> {
                         ),
                         MetricTile(
                           label: strings.isZh ? '创建 TUN' : 'Create TUN',
-                          value: permission.canCreateTun,
+                          value: permission.canCreateTunLabel,
                         ),
                         MetricTile(
                           label: strings.isZh ? '修改路由' : 'Modify routes',
-                          value: permission.canModifyRoutes,
+                          value: permission.canModifyRoutesLabel,
                         ),
                       ],
                     ),

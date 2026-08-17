@@ -21,46 +21,72 @@ class PermissionCheck {
   final String detail;
 }
 
+enum PermissionPreflightState {
+  satisfied,
+  elevationRequired,
+  runtimeVerificationRequired,
+  unsupported,
+  failed,
+}
+
 /// Result of the live permission preflight.
 class PermissionPreflight {
   const PermissionPreflight({
     required this.platform,
+    required this.state,
     required this.canCreateTun,
     required this.canModifyRoutes,
-    required this.needsElevation,
-    required this.recommendedAction,
+    required this.elevationSupported,
+    required this.reasonCode,
+    required this.message,
     required this.checks,
     this.sudoCommand,
   });
 
   final String platform;
+  final PermissionPreflightState state;
 
-  /// 'true' | 'false' | 'unknown' — whether the TUN device can be created.
-  final String canCreateTun;
+  /// A fact, not a final state: null means the platform needs runtime proof.
+  final bool? canCreateTun;
 
-  /// 'true' | 'false' | 'unknown' — whether overlay routes can be modified.
-  final String canModifyRoutes;
+  /// A fact, not a final state: null means the platform needs runtime proof.
+  final bool? canModifyRoutes;
 
-  /// Whether further elevation is required before TUN/route work is possible.
-  final bool needsElevation;
+  final bool elevationSupported;
+  final String reasonCode;
+  final String message;
 
-  final String recommendedAction;
   final List<PermissionCheck> checks;
   final String? sudoCommand;
 
   bool get bad =>
-      needsElevation || checks.any((check) => check.status == 'fail');
+      state == PermissionPreflightState.elevationRequired ||
+      state == PermissionPreflightState.failed ||
+      state == PermissionPreflightState.unsupported ||
+      checks.any((check) => check.status == 'fail');
 
   bool get warn =>
+      state == PermissionPreflightState.runtimeVerificationRequired ||
       checks.any((check) => check.status == 'warn') ||
-      canCreateTun == 'unknown' ||
-      canModifyRoutes == 'unknown';
+      (canCreateTun == null && state != PermissionPreflightState.failed) ||
+      (canModifyRoutes == null && state != PermissionPreflightState.failed);
 
-  /// Whether the local node can act as a VPN node right now without further
-  /// elevation. This is the authoritative "permission granted" signal for
-  /// onboarding; the daemon reachability check is the runtime complement.
-  bool get satisfied =>
-      !needsElevation && canCreateTun == 'true' && canModifyRoutes == 'true';
+  bool get needsElevation =>
+      state == PermissionPreflightState.elevationRequired;
+
+  bool get satisfied => state == PermissionPreflightState.satisfied;
+
+  String get recommendedAction => message;
+
+  String get canCreateTunLabel => _factLabel(canCreateTun);
+
+  String get canModifyRoutesLabel => _factLabel(canModifyRoutes);
+
+  String _factLabel(bool? value) => switch (value) {
+    true => 'true',
+    false => 'false',
+    null => 'unknown',
+  };
 }
 
 /// Run the live permission preflight for the current platform.
@@ -70,10 +96,12 @@ Future<PermissionPreflight> runPermissionPreflight() async {
   if (Platform.isMacOS) return _checkMacosPermissions();
   return const PermissionPreflight(
     platform: 'other',
-    canCreateTun: 'unknown',
-    canModifyRoutes: 'unknown',
-    needsElevation: true,
-    recommendedAction:
+    state: PermissionPreflightState.unsupported,
+    canCreateTun: null,
+    canModifyRoutes: null,
+    elevationSupported: false,
+    reasonCode: 'platform_unsupported',
+    message:
         'Local daemon process control is not supported on this platform yet.',
     checks: [
       PermissionCheck(
@@ -92,11 +120,15 @@ PermissionPreflight _checkMacosPermissions() {
       File('/dev/net/tun').existsSync() || File('/dev/tun').existsSync();
   return PermissionPreflight(
     platform: 'macOS',
-    canCreateTun: isRoot ? 'unknown' : 'false',
-    canModifyRoutes: isRoot ? 'true' : 'false',
-    needsElevation: !isRoot,
-    recommendedAction: isRoot
-        ? '权限已满足；macOS utun 创建仍会在 daemon 启动时做运行时验证。'
+    state: isRoot
+        ? PermissionPreflightState.runtimeVerificationRequired
+        : PermissionPreflightState.elevationRequired,
+    canCreateTun: isRoot ? null : false,
+    canModifyRoutes: isRoot ? true : false,
+    elevationSupported: true,
+    reasonCode: isRoot ? 'tun_runtime_verification' : 'elevation_required',
+    message: isRoot
+        ? '已获得 root 权限；macOS utun 创建需要 daemon 运行时验证。'
         : '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。',
     sudoCommand: isRoot ? null : _suggestedSudoCommand(),
     checks: [
@@ -128,15 +160,27 @@ PermissionPreflight _checkLinuxPermissions() {
   final privileged = isRoot || hasCapNetAdmin;
   return PermissionPreflight(
     platform: 'Linux',
+    state: !privileged
+        ? PermissionPreflightState.elevationRequired
+        : !hasDevTun
+        ? PermissionPreflightState.failed
+        : PermissionPreflightState.satisfied,
     canCreateTun: hasDevTun && privileged
-        ? 'true'
+        ? true
         : hasDevTun
-        ? 'unknown'
-        : 'false',
-    canModifyRoutes: privileged ? 'true' : 'unknown',
-    needsElevation: !privileged,
-    recommendedAction: privileged && hasDevTun
+        ? null
+        : false,
+    canModifyRoutes: privileged ? true : null,
+    elevationSupported: true,
+    reasonCode: !privileged
+        ? 'elevation_required'
+        : !hasDevTun
+        ? 'tun_device_missing'
+        : 'ready',
+    message: privileged && hasDevTun
         ? '权限已满足，daemon 可以创建 TUN 并维护路由。'
+        : privileged
+        ? '当前权限已满足，但缺少 /dev/net/tun，无法创建 Linux TUN。'
         : '请使用 pkexec/sudo 启动 daemon，或对 p2wlan-daemon 设置 CAP_NET_ADMIN。',
     sudoCommand: privileged ? null : _suggestedSudoCommand(),
     checks: [
@@ -178,10 +222,20 @@ PermissionPreflight _checkWindowsPermissions() {
   final wintun = _findWintunDll();
   return PermissionPreflight(
     platform: 'Windows',
-    canCreateTun: isAdmin && wintun != null ? 'true' : 'false',
-    canModifyRoutes: isAdmin ? 'true' : 'false',
-    needsElevation: !isAdmin,
-    recommendedAction: isAdmin && wintun != null
+    state: !isAdmin
+        ? PermissionPreflightState.elevationRequired
+        : wintun == null
+        ? PermissionPreflightState.failed
+        : PermissionPreflightState.satisfied,
+    canCreateTun: isAdmin && wintun != null ? true : false,
+    canModifyRoutes: isAdmin ? true : false,
+    elevationSupported: true,
+    reasonCode: !isAdmin
+        ? 'elevation_required'
+        : wintun == null
+        ? 'wintun_missing'
+        : 'ready',
+    message: isAdmin && wintun != null
         ? 'Windows 管理员权限和 Wintun 运行库均已就绪。'
         : !isAdmin
         ? '启动 TUN 时请确认 Windows UAC 授权，并确保 wintun.dll 与客户端/daemon 同级或在 PATH 中。'
@@ -190,9 +244,7 @@ PermissionPreflight _checkWindowsPermissions() {
       PermissionCheck(
         label: 'Windows 管理员权限',
         status: isAdmin ? 'pass' : 'fail',
-        detail: isAdmin
-            ? '当前已具备管理员权限。'
-            : '安装 Wintun 虚拟网卡和更新路由需要管理员权限。',
+        detail: isAdmin ? '当前已具备管理员权限。' : '安装 Wintun 虚拟网卡和更新路由需要管理员权限。',
       ),
       PermissionCheck(
         label: 'Wintun 运行库',

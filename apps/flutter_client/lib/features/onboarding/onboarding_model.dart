@@ -17,14 +17,7 @@
 import '../../core/capabilities/platform_capabilities.dart';
 
 /// The discrete steps of the local-node onboarding flow, in order.
-enum OnboardingStep {
-  auth,
-  permission,
-  daemon,
-  virtualIp,
-  discover,
-  done,
-}
+enum OnboardingStep { auth, permission, daemon, virtualIp, discover, done }
 
 /// Observable facts that drive the onboarding model. All fields are plain
 /// values a caller (the app) can assemble from the existing stores; no

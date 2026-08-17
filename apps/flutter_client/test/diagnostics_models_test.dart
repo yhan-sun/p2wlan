@@ -301,8 +301,11 @@ void main() {
     expect(peer.path, 'direct_trial');
     expect(peer.connectionType, 'probing');
     expect(peer.isDirectVerified, isFalse);
-    expect(peer.latencyMs, isNull,
-        reason: 'a candidate probe RTT must never be shown as connection latency');
+    expect(
+      peer.latencyMs,
+      isNull,
+      reason: 'a candidate probe RTT must never be shown as connection latency',
+    );
     expect(peer.probeLatencyMs, 8);
   });
 
@@ -324,10 +327,17 @@ void main() {
     expect(notVerified.path, 'probing');
     expect(notVerified.relayConfirmedEndpoint, isNull);
     expect(notVerified.isRelayVerified, isFalse);
-    expect(notVerified.latencyMs, isNull,
-        reason: 'relay RTT without encrypted relay confirmation is not usable latency');
-    expect(notVerified.probeLatencyMs, isNull,
-        reason: 'relay health RTT is not a candidate probe RTT');
+    expect(
+      notVerified.latencyMs,
+      isNull,
+      reason:
+          'relay RTT without encrypted relay confirmation is not usable latency',
+    );
+    expect(
+      notVerified.probeLatencyMs,
+      isNull,
+      reason: 'relay health RTT is not a candidate probe RTT',
+    );
 
     // A matching encrypted relay probe ACK sets relay_confirmed_endpoint; only
     // then is the peer "中继已验证".

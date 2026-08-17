@@ -10,14 +10,33 @@ void main() {
     String canCreateTun = 'true',
     String canModifyRoutes = 'true',
     bool needsElevation = false,
+    PermissionPreflightState? state,
+    bool elevationSupported = true,
     List<PermissionCheck> checks = const [],
   }) {
+    bool? fact(String value) => switch (value) {
+      'true' => true,
+      'false' => false,
+      _ => null,
+    };
+    final tun = fact(canCreateTun);
+    final routes = fact(canModifyRoutes);
     return PermissionPreflight(
       platform: 'test',
-      canCreateTun: canCreateTun,
-      canModifyRoutes: canModifyRoutes,
-      needsElevation: needsElevation,
-      recommendedAction: '',
+      state:
+          state ??
+          (needsElevation
+              ? PermissionPreflightState.elevationRequired
+              : tun == true && routes == true
+              ? PermissionPreflightState.satisfied
+              : tun == null || routes == null
+              ? PermissionPreflightState.runtimeVerificationRequired
+              : PermissionPreflightState.failed),
+      canCreateTun: tun,
+      canModifyRoutes: routes,
+      elevationSupported: elevationSupported,
+      reasonCode: 'test',
+      message: '',
       checks: checks,
     );
   }
@@ -76,5 +95,33 @@ void main() {
         isTrue,
       );
     });
+
+    test(
+      'runtime verification is distinct from satisfied and elevation required',
+      () {
+        final runtime = preflight(
+          canCreateTun: 'unknown',
+          state: PermissionPreflightState.runtimeVerificationRequired,
+        );
+        expect(runtime.needsElevation, isFalse);
+        expect(runtime.satisfied, isFalse);
+        expect(runtime.warn, isTrue);
+
+        expect(
+          preflight(
+            state: PermissionPreflightState.elevationRequired,
+          ).needsElevation,
+          isTrue,
+        );
+        expect(preflight(state: PermissionPreflightState.failed).bad, isTrue);
+        expect(
+          preflight(
+            state: PermissionPreflightState.unsupported,
+            elevationSupported: false,
+          ).elevationSupported,
+          isFalse,
+        );
+      },
+    );
   });
 }

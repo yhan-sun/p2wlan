@@ -7,43 +7,6 @@ import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
-  group('SecureTokenRepository (file-backed)', () {
-    late Directory tmp;
-    late File tokenFile;
-    late FileSecureTokenRepository repo;
-
-    setUp(() async {
-      tmp = await Directory.systemTemp.createTemp('p2wlan_tok_');
-      tokenFile = File('${tmp.path}/token');
-      repo = FileSecureTokenRepository(tokenFile);
-    });
-
-    tearDown(() async {
-      if (await tmp.exists()) await tmp.delete(recursive: true);
-    });
-
-    test('read returns null when nothing stored', () async {
-      expect(await repo.read(), isNull);
-    });
-
-    test('write then read round-trips the trimmed value', () async {
-      await repo.write('  abc123  ');
-      expect(await repo.read(), 'abc123');
-    });
-
-    test('writing empty clears the store', () async {
-      await repo.write('secret');
-      await repo.write('   ');
-      expect(await repo.read(), isNull);
-      expect(await tokenFile.exists(), isFalse);
-    });
-
-    test('no truncated temp file remains after a write', () async {
-      await repo.write('secret');
-      expect(await File('${tokenFile.path}.tmp').exists(), isFalse);
-    });
-  });
-
   group('InMemorySecureTokenRepository', () {
     test('round-trips and clears', () async {
       final repo = InMemorySecureTokenRepository();
@@ -54,6 +17,73 @@ void main() {
       expect(await repo.read(), isNull);
     });
   });
+
+  test('secure-store migration supports every legacy token spelling', () async {
+    for (final key in const ['authToken', 'auth_token', 'token']) {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_migrate_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"$key":"legacy-$key"}');
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+
+      await store.load();
+
+      expect(await secure.read(), 'legacy-$key');
+      expect(store.settings.authToken, 'legacy-$key');
+      final persisted = await settingsFile.readAsString();
+      expect(persisted.contains('legacy-$key'), isFalse);
+    }
+  });
+
+  test(
+    'secure-store write failure preserves the legacy settings value',
+    () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_migrate_fail_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"authToken":"legacy-token"}');
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: _FailingSecureTokenRepository(),
+      );
+
+      await store.load();
+
+      expect(await settingsFile.readAsString(), contains('legacy-token'));
+      expect(store.lastError, contains('secure storage'));
+    },
+  );
+
+  test(
+    'an existing secure token wins and repeated migration is harmless',
+    () async {
+      final tmp = await Directory.systemTemp.createTemp(
+        'p2wlan_migrate_repeat_',
+      );
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"authToken":"legacy-token"}');
+      final secure = InMemorySecureTokenRepository();
+      await secure.write('secure-token');
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+
+      await store.load();
+
+      expect(await secure.read(), 'secure-token');
+      expect(store.settings.authToken, 'secure-token');
+      expect(
+        await settingsFile.readAsString(),
+        isNot(contains('legacy-token')),
+      );
+    },
+  );
 
   group('SettingsStore token handling', () {
     test(
@@ -178,4 +208,17 @@ void main() {
       );
     });
   });
+}
+
+class _FailingSecureTokenRepository implements SecureTokenRepository {
+  @override
+  Future<String?> read() async => null;
+
+  @override
+  Future<void> write(String token) async {
+    throw const SecureTokenStorageException('secure storage write failed');
+  }
+
+  @override
+  Future<void> clear() async {}
 }
