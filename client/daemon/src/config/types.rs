@@ -425,6 +425,11 @@ pub struct DiagnosticsConfig {
     /// Local bind address for diagnostics. Keep this on loopback.
     #[serde(default = "default_diagnostics_bind")]
     pub bind: String,
+    /// Path to the daemon's own log file (set from `--log-file`). Populated
+    /// only in-process; not part of the persisted config. Backs `GET
+    /// /logs/tail`. Ignored when the operator did not configure a log file.
+    #[serde(default, skip_serializing)]
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 fn default_diagnostics_bind() -> String {
@@ -436,6 +441,7 @@ impl Default for DiagnosticsConfig {
         Self {
             enabled: false,
             bind: default_diagnostics_bind(),
+            log_path: None,
         }
     }
 }

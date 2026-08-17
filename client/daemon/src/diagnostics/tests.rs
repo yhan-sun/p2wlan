@@ -130,6 +130,8 @@ mod tests {
         let health = HealthState::new();
         let task_manager = TaskManager::new(health.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let route_manager = Arc::new(crate::route::RouteManager::new("p2wlan0".to_string()));
+        let status_events = StatusEventBus::new();
         let context = DiagnosticsContext::new(
             config,
             peers,
@@ -141,8 +143,11 @@ mod tests {
             Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
             health,
             task_manager,
+            route_manager,
             shutdown_tx,
             ConnectionTimeline::new("node-a", 0),
+            status_events,
+            None,
         );
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 

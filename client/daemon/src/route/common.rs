@@ -62,6 +62,30 @@ impl RouteManager {
         }
     }
 
+    /// The interface the overlay route should be (and, once installed, is) on.
+    /// On macOS this is the kernel-assigned `utunN`; on Linux/Windows it is the
+    /// configured name.
+    pub fn current_interface(&self) -> String {
+        self.interface()
+    }
+
+    /// Routes this process recorded as having installed itself. `None`-safe:
+    /// returns a clone.
+    pub fn owned_routes(&self) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+        self.routes_added
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Whether this process recorded itself as having installed `cidr`.
+    fn owns_cidr(&self, cidr: &str) -> bool {
+        match parse_cidr_to_ip_mask(cidr) {
+            Some(pair) => self.owned_routes().contains(&pair),
+            None => false,
+        }
+    }
+
     pub fn set_interface(&self, interface: String) {
         if let Ok(mut current) = self.interface.lock() {
             *current = interface;
@@ -107,4 +131,69 @@ fn ip_mask_to_prefix(mask: Ipv4Addr) -> u32 {
         | ((octets[2] as u32) << 8)
         | (octets[3] as u32);
     mask_u32.count_ones()
+}
+
+/// Authoritative install state for one overlay route, derived from the live
+/// system routing table (never inferred from "daemon running + virtual IP").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteState {
+    /// Present on the expected interface.
+    Installed,
+    /// Not present in the system routing table at all.
+    Missing,
+    /// Present, but on a different interface than expected.
+    Conflict,
+    /// Could not be determined (platform unsupported, or the query failed).
+    Unknown,
+}
+
+impl RouteState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteState::Installed => "installed",
+            RouteState::Missing => "missing",
+            RouteState::Conflict => "conflict",
+            RouteState::Unknown => "unknown",
+        }
+    }
+}
+
+/// One authoritative route observation returned by `GET /routes` and
+/// `POST /routes/verify`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RouteObservation {
+    pub cidr: String,
+    /// Interface the overlay route is expected to live on (the TUN name).
+    pub expected_interface: String,
+    /// Interface the system routing table actually reports, if any.
+    pub actual_interface: Option<String>,
+    pub state: RouteState,
+    /// Whether this process installed (owns) this route.
+    pub owned: bool,
+}
+
+impl RouteManager {
+    /// Repair the single overlay route for `cidr` **without** touching the TUN,
+    /// the encrypted sessions, or peer state:
+    ///   - `Installed` -> no-op;
+    ///   - `Missing`   -> add it;
+    ///   - `Conflict`  -> remove then re-add (best effort);
+    ///   - `Unknown`   -> no-op (cannot safely decide).
+    /// Returns the post-repair observation.
+    pub fn repair_overlay_route(&self, cidr: &str) -> RouteObservation {
+        let initial = self.describe_overlay_route(cidr);
+        match initial.state {
+            RouteState::Installed => return initial,
+            RouteState::Missing => {
+                let _ = self.add_cidr_route(cidr);
+            }
+            RouteState::Conflict => {
+                self.remove_cidr_route(cidr);
+                let _ = self.add_cidr_route(cidr);
+            }
+            RouteState::Unknown => return initial,
+        }
+        self.describe_overlay_route(cidr)
+    }
 }

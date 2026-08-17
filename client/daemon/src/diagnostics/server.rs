@@ -192,6 +192,82 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             .await?;
             let _ = context.shutdown_tx.send(true);
         }
+        ("GET", "/routes") => {
+            let body = describe_overlay_routes(&context).to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("POST", "/routes/verify") => {
+            // Read-only: observe the live system routing table without changing it.
+            let body = describe_overlay_routes(&context).to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("POST", "/routes/repair") => {
+            // Repairs missing/conflicting routes only; never restarts the daemon,
+            // the TUN, or peer sessions.
+            let result = repair_overlay_routes(&context);
+            let body = serde_json::to_string_pretty(&result)?;
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("GET", "/events") => {
+            let since = query_param(query, "since")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let events = context
+                .status_events
+                .wait_or_poll(since, Duration::from_secs(25))
+                .await;
+            let body = serde_json::json!({
+                "revision": context.status_events.current_seq(),
+                "events": events,
+            })
+            .to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("GET", "/peers") => {
+            let cursor = query_param(query, "cursor");
+            let limit = query_param(query, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 1000);
+            let all = context.peers.diagnostics().await;
+            let total = all.len();
+            let start = match cursor.as_ref() {
+                Some(cursor) => all
+                    .iter()
+                    .position(|p| p.node_id > *cursor)
+                    .unwrap_or(all.len()),
+                None => 0,
+            };
+            let page: Vec<_> = all.iter().skip(start).take(limit).cloned().collect();
+            let next_cursor = page.last().map(|p| p.node_id.clone());
+            let body = serde_json::json!({
+                "peers": page,
+                "total": total,
+                "cursor": cursor,
+                "next_cursor": next_cursor,
+            })
+            .to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
+        ("GET", "/logs/tail") => {
+            let lines = query_param(query, "lines")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120)
+                .clamp(1, 1000);
+            let max_bytes = query_param(query, "max_bytes")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(262144)
+                .clamp(4096, 2 * 1024 * 1024);
+            let body = bounded_log_tail(&context.log_path, lines, max_bytes).await;
+            let (status, text) = match body {
+                Ok(text) => (200, text),
+                Err(reason) if reason.contains("no log file") => {
+                    (404, format!("error: {reason}\n"))
+                }
+                Err(reason) => (500, format!("error: {reason}\n")),
+            };
+            write_response(&mut stream, status, "text/plain", &text, cors_origin).await?;
+        }
         _ => {
             warn!("Unknown diagnostics path requested: {path}");
             write_response(&mut stream, 404, "text/plain", "not found\n", cors_origin).await?;
@@ -214,6 +290,86 @@ fn split_request_target(target: &str) -> (&str, Option<&str>) {
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
     }
+}
+
+/// Authoritative overlay-route state for `/routes` and `/routes/verify`.
+/// Reports the TUN interface, configured MTU, and the live system-route state
+/// for the overlay CIDR — computed from the routing table, never inferred.
+fn describe_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
+    let cidr = context.config.network.cidr.clone();
+    let obs = context.route_manager.describe_overlay_route(&cidr);
+    let healthy = obs.state == crate::route::RouteState::Installed;
+    let conflict_count = usize::from(obs.state == crate::route::RouteState::Conflict);
+    let entries = vec![serde_json::json!({
+        "cidr": obs.cidr,
+        "expected_interface": obs.expected_interface,
+        "actual_interface": obs.actual_interface,
+        "state": obs.state.as_str(),
+        "owned": obs.owned,
+    })];
+    serde_json::json!({
+        "interface": obs.expected_interface,
+        "mtu": context.config.network.mtu,
+        "healthy": healthy,
+        "conflictCount": conflict_count,
+        "entries": entries,
+    })
+}
+
+/// `/routes/repair` result: repairs the overlay route in place (no daemon/TUN/
+/// session restart), then reports the fresh authoritative state.
+fn repair_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
+    let cidr = context.config.network.cidr.clone();
+    let before = context.route_manager.describe_overlay_route(&cidr);
+    let changed = matches!(
+        before.state,
+        crate::route::RouteState::Missing | crate::route::RouteState::Conflict
+    );
+    let after = context.route_manager.repair_overlay_route(&cidr);
+    serde_json::json!({
+        "cidr": after.cidr,
+        "changed": changed,
+        "before": before.state.as_str(),
+        "after": after.state.as_str(),
+        "restartedDaemon": false,
+    })
+}
+
+/// Bounded tail of the daemon's own log file: read at most `max_bytes` from the
+/// end and return the last `lines` complete lines. Returns `Err("no log file
+/// configured")` when the operator did not set `--log-file`.
+async fn bounded_log_tail(
+    log_path: &Option<std::path::PathBuf>,
+    lines: usize,
+    max_bytes: u64,
+) -> std::result::Result<String, String> {
+    let path = log_path
+        .as_ref()
+        .ok_or_else(|| "no log file configured".to_string())?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("failed to stat log file: {e}"))?;
+    let len = metadata.len();
+    if len == 0 {
+        return Ok(String::new());
+    }
+    let start = len.saturating_sub(max_bytes);
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("failed to open log file: {e}"))?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| format!("failed to seek log file: {e}"))?;
+    }
+    file.read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("failed to read log file: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    let tail: Vec<&str> = text.lines().rev().take(lines).collect();
+    Ok(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 fn speedtest_error_status(message: &str) -> u16 {

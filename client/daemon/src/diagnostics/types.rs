@@ -94,6 +94,15 @@ pub struct DiagnosticsSnapshot {
     /// Monotonic milliseconds since this daemon process started (matches the
     /// timeline events' `at_ms` clock).
     pub uptime_ms: u64,
+    /// Monotonic status revision. Bumped by every recorded status event; a
+    /// client compares this to its last-seen revision to decide whether a full
+    /// snapshot refetch is needed (see `GET /events?since=N`).
+    #[serde(default)]
+    pub revision: u64,
+    /// Authoritative daemon readiness phase (see `derive_ready_phase`). Clients
+    /// must render this instead of inferring readiness from `virtual_ip` alone.
+    #[serde(default)]
+    pub ready_phase: String,
     pub protocol: ProtocolDiagnostics,
     pub mtu: MtuDiagnostics,
     pub udp_local_addr: Option<String>,
@@ -172,9 +181,19 @@ pub struct DiagnosticsContext {
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     health: Arc<HealthState>,
     task_manager: Arc<TaskManager>,
+    /// Shared route manager: source of the authoritative overlay-route state
+    /// for `GET /routes` and `POST /routes/verify` / `/routes/repair`.
+    route_manager: Arc<crate::route::RouteManager>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Per-process connection timeline (correlation id + bounded events).
     timeline: Arc<ConnectionTimeline>,
+    /// Bounded monotonic status event log backing `/events` and the
+    /// `/status.revision` counter.
+    status_events: Arc<StatusEventBus>,
+    /// Path to the daemon's own log file (when the operator set `--log-file`),
+    /// used by the bounded `GET /logs/tail` endpoint. `None` when logging to
+    /// stdout.
+    log_path: Option<std::path::PathBuf>,
 }
 
 impl DiagnosticsContext {
@@ -190,8 +209,11 @@ impl DiagnosticsContext {
         relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
         health: Arc<HealthState>,
         task_manager: Arc<TaskManager>,
+        route_manager: Arc<crate::route::RouteManager>,
         shutdown_tx: tokio::sync::watch::Sender<bool>,
         timeline: Arc<ConnectionTimeline>,
+        status_events: Arc<StatusEventBus>,
+        log_path: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             config,
@@ -204,8 +226,58 @@ impl DiagnosticsContext {
             relay_selection,
             health,
             task_manager,
+            route_manager,
             shutdown_tx,
             timeline,
+            status_events,
+            log_path,
         }
+    }
+}
+
+/// Derive the authoritative readiness phase from daemon-side signals only.
+///
+/// The phase is a coarse, UI-safe ladder. Clients render this instead of
+/// inferring "connected" from `virtual_ip` presence alone. Priority (top wins):
+/// shutdown > reauth required > unhealthy > control not connected > connecting >
+/// connected (relayed or direct).
+pub fn derive_ready_phase(
+    health: &crate::tasks::HealthSnapshot,
+    relay_connected: bool,
+    peers: &[PeerDiagnostics],
+    virtual_ip: &str,
+) -> &'static str {
+    use crate::tasks::HealthStatus;
+    match health.status {
+        HealthStatus::ShuttingDown => return "stopping",
+        _ => {}
+    }
+    if health.reauth_required {
+        return "credential_reauth_required";
+    }
+    if health.status == HealthStatus::Unhealthy {
+        return "error";
+    }
+    if !health.control_connected && virtual_ip.trim().is_empty() {
+        return "connecting_control";
+    }
+    if !health.control_connected {
+        // Local-only/manual mode: no control plane, but we have a VIP.
+        return "connected_manual";
+    }
+    let has_direct = peers
+        .iter()
+        .any(|p| p.active_path.as_ref() == Some(&NetworkPath::Direct));
+    let has_relay = relay_connected
+        || peers
+            .iter()
+            .any(|p| p.active_path.as_ref() == Some(&NetworkPath::Relay));
+    if has_direct {
+        "connected_direct"
+    } else if has_relay {
+        "connected_relay"
+    } else {
+        // Connected to control, VIP allocated, but no peer path yet.
+        "discovering_peers"
     }
 }

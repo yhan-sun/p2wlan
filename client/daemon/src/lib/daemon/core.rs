@@ -84,6 +84,10 @@ pub struct Daemon {
     boot_epoch_ms: u64,
     /// Per-process connection timeline (correlation id + bounded event ring).
     timeline: Arc<ConnectionTimeline>,
+    /// Bounded monotonic status event log backing the diagnostics `/events`
+    /// endpoint and the `/status.revision` counter. The timeline mirrors every
+    /// record into it.
+    status_events: Arc<crate::diagnostics::StatusEventBus>,
     /// Watch for relay transport availability.  The relay supervisor flips this
     /// whenever the shared `relay_transport` slot is set or cleared, so the
     /// outbound path can wait event-driven for a relay to come up instead of
@@ -140,6 +144,12 @@ impl Daemon {
         let health = tasks::HealthState::new();
         let task_manager = tasks::TaskManager::new(health.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Status event bus: bounded monotonic log backing `/events` and the
+        // `/status.revision` counter. Attach it to the shared timeline so every
+        // existing timeline emit is mirrored without touching each call site.
+        let status_events = crate::diagnostics::StatusEventBus::new();
+        timeline.set_status_event_bus(status_events.clone());
 
         let udp_transport = Arc::new(RwLock::new(None));
         let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
@@ -209,6 +219,7 @@ impl Daemon {
             shutdown_rx,
             boot_epoch_ms,
             timeline,
+            status_events,
             relay_available_tx,
         }
     }

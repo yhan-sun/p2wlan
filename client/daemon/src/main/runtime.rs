@@ -139,6 +139,10 @@ async fn main() -> p2pnet_daemon::Result<()> {
     if let Some(ref token) = token_file_value {
         config.control.auth_token = token.clone();
     }
+    // Expose the operator-configured log file to the diagnostics server so
+    // `GET /logs/tail` can read it with a bounded tail. In-process only; never
+    // persisted to the config file.
+    config.diagnostics.log_path = cli.log_file.clone();
 
     if cli.status {
         print_status(&config, &cli).await?;

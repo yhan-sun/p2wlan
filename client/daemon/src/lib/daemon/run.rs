@@ -387,8 +387,11 @@ impl Daemon {
                 self.relay_selection.clone(),
                 self.health.clone(),
                 self.task_manager.clone(),
+                self.route_manager.clone(),
                 self.shutdown_tx.clone(),
                 self.timeline.clone(),
+                self.status_events.clone(),
+                self.config.diagnostics.log_path.clone(),
             );
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager

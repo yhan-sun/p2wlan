@@ -11,4 +11,16 @@ impl RouteManager {
     }
 
     pub fn cleanup(&self) {}
+
+    pub fn describe_overlay_route(&self, cidr: &str) -> RouteObservation {
+        RouteObservation {
+            cidr: cidr.to_string(),
+            expected_interface: self.interface(),
+            actual_interface: None,
+            state: RouteState::Unknown,
+            owned: self.owns_cidr(cidr),
+        }
+    }
+
+    pub fn remove_cidr_route(&self, _cidr: &str) {}
 }

@@ -167,6 +167,81 @@ impl RouteManager {
             ), WINDOWS_ROUTE_QUERY_TIMEOUT);
         }
     }
+
+    /// Read the live system routing table for `cidr` and report its state.
+    pub fn describe_overlay_route(&self, cidr: &str) -> RouteObservation {
+        let expected = self.interface();
+        let Some((network, mask)) = parse_cidr_to_ip_mask(cidr) else {
+            return RouteObservation {
+                cidr: cidr.to_string(),
+                expected_interface: expected,
+                actual_interface: None,
+                state: RouteState::Unknown,
+                owned: self.owns_cidr(cidr),
+            };
+        };
+        let destination_prefix = format!("{network}/{}", ip_mask_to_prefix(mask));
+        let aliases = match windows_get_route_aliases(&destination_prefix) {
+            Ok(aliases) => aliases,
+            Err(_) => {
+                return RouteObservation {
+                    cidr: cidr.to_string(),
+                    expected_interface: expected,
+                    actual_interface: None,
+                    state: RouteState::Unknown,
+                    owned: self.owns_cidr(cidr),
+                };
+            }
+        };
+        if aliases.is_empty() {
+            return RouteObservation {
+                cidr: cidr.to_string(),
+                expected_interface: expected,
+                actual_interface: None,
+                state: RouteState::Missing,
+                owned: self.owns_cidr(cidr),
+            };
+        }
+        let on_expected = aliases
+            .iter()
+            .any(|alias| windows_interface_alias_eq(alias, &expected));
+        let (state, actual) = if on_expected {
+            (RouteState::Installed, aliases.into_iter().next())
+        } else {
+            (RouteState::Conflict, aliases.into_iter().next())
+        };
+        RouteObservation {
+            cidr: cidr.to_string(),
+            expected_interface: expected,
+            actual_interface: actual,
+            state,
+            owned: self.owns_cidr(cidr),
+        }
+    }
+
+    /// Remove only this process's owned route for `cidr`.
+    pub fn remove_cidr_route(&self, cidr: &str) {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return;
+        }
+        if !self.owns_cidr(cidr) {
+            return;
+        }
+        let Some((network, mask)) = parse_cidr_to_ip_mask(cidr) else {
+            return;
+        };
+        let destination_prefix = format!("{network}/{}", ip_mask_to_prefix(mask));
+        let interface = self.interface();
+        info!("Removing owned Windows route for {destination_prefix} via {interface}");
+        let _ = windows_powershell_output(&format!(
+            "$ErrorActionPreference = 'SilentlyContinue'; Get-NetRoute -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue 2>$null | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; exit 0",
+            ps_quote(&destination_prefix),
+            ps_quote(&interface)
+        ), WINDOWS_ROUTE_QUERY_TIMEOUT);
+        if let Ok(mut added) = self.routes_added.lock() {
+            added.retain(|(ip, m)| *ip != network || *m != mask);
+        }
+    }
 }
 
 include!("windows/helpers.rs");
