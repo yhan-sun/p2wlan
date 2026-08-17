@@ -235,6 +235,7 @@ impl PeerManager {
                     conn.relay_first_business_sent_generation = None;
                     conn.relay_first_business_received_generation = None;
                     conn.relay_first_business_exchange_generation = None;
+                    conn.relay_first_business_pathcommit_generation = None;
                     conn.relay_preconfirmation_business = None;
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     if conn.state == ConnectionState::Relay {
@@ -263,6 +264,7 @@ impl PeerManager {
                 conn.relay_first_business_sent_generation = None;
                 conn.relay_first_business_received_generation = None;
                 conn.relay_first_business_exchange_generation = None;
+                conn.relay_first_business_pathcommit_generation = None;
                 conn.relay_preconfirmation_business = None;
                 debug!(
                     event = "relay_transport_ready_peer",
@@ -502,6 +504,7 @@ impl PeerManager {
                 conn.relay_first_business_sent_generation = None;
                 conn.relay_first_business_received_generation = None;
                 conn.relay_first_business_exchange_generation = None;
+                conn.relay_first_business_pathcommit_generation = None;
                 conn.relay_preconfirmation_business = None;
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
@@ -530,6 +533,7 @@ impl PeerManager {
                 // peer ACK authorizes the business marker for this generation.
                 conn.relay_first_business_received_generation = None;
                 conn.relay_first_business_exchange_generation = None;
+                conn.relay_first_business_pathcommit_generation = None;
                 conn.relay_preconfirmation_business = None;
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
@@ -1361,6 +1365,65 @@ impl PeerManager {
             .and_then(|conn| conn.first_usable_at)
     }
 
+    /// Commit a synthetic path-commit proof for one generation.
+    ///
+    /// Called when a matching forced-relay path-commit ACK arrives (a
+    /// business-shaped authenticated packet round-tripped over the confirmed
+    /// relay).  This closes the relay-first business gate as an *alternative*
+    /// to natural two-way business: it proves the same bidirectional relay-data
+    /// invariant without depending on traffic that may never flow one way
+    /// (audit P0-4).  It does not itself make Direct active — Direct promotion
+    /// still requires its own generation-bound encrypted validation.
+    ///
+    /// Returns `true` when the marker was newly committed for this generation.
+    pub(crate) async fn mark_relay_first_business_pathcommit_for_generation(
+        &self,
+        node_id: &str,
+        generation: u64,
+        relay_endpoint: &str,
+    ) -> bool {
+        let (changed, endpoint) = {
+            let epoch_gate = self.network_epoch_gate();
+            let _epoch_guard = epoch_gate.lock().await;
+            if generation != self.current_network_generation_sync() {
+                return false;
+            }
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            let confirmed = conn.relay_confirmed_at.is_some()
+                && conn.relay_confirmed_generation == Some(generation)
+                && conn
+                    .relay_confirmed_endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| !endpoint.is_empty());
+            if !confirmed
+                || conn.relay_first_business_pathcommit_generation == Some(generation)
+            {
+                return false;
+            }
+            conn.relay_first_business_pathcommit_generation = Some(generation);
+            (
+                true,
+                conn.relay_confirmed_endpoint.clone().unwrap_or_else(|| {
+                    relay_endpoint.to_string()
+                }),
+            )
+        };
+        if changed {
+            self.emit_timeline(
+                "relay_first_business_pathcommit",
+                Some("relay"),
+                None,
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={endpoint}"
+                )),
+            );
+        }
+        changed
+    }
+
     /// Whether a peer is inside the network-generation window that the first
     /// business packet may wait in (used by the outbound actor to restart a
     /// shared deadline when the generation advances mid-wait).
@@ -1459,6 +1522,7 @@ impl PeerManager {
                     conn.relay_first_business_sent_generation = None;
                     conn.relay_first_business_received_generation = None;
                     conn.relay_first_business_exchange_generation = None;
+                    conn.relay_first_business_pathcommit_generation = None;
                     conn.relay_preconfirmation_business = None;
                     let had_ready = conn.relay_ready_at.is_some();
                     conn.relay_ready_generation = None;
@@ -1664,6 +1728,7 @@ impl PeerManager {
                 conn.relay_first_business_sent_generation = None;
                 conn.relay_first_business_received_generation = None;
                 conn.relay_first_business_exchange_generation = None;
+                conn.relay_first_business_pathcommit_generation = None;
                 conn.relay_preconfirmation_business = None;
                 if had_confirmed {
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);

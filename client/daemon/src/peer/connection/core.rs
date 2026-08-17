@@ -164,6 +164,8 @@ pub struct PeerConnection {
     /// Direct data-plane promotion may win.  The two component markers may
     /// arrive in either order.
     pub relay_first_business_exchange_generation: Option<u64>,
+    /// Generation for which a synthetic path-commit probe round-tripped over the confirmed relay, proving bidirectional relay data without natural traffic (audit P0-4). An alternative to `..._exchange_generation` for closing the relay-first business gate; it does not itself activate Direct.
+    pub relay_first_business_pathcommit_generation: Option<u64>,
     /// Real relay business ingress observed before local RelayPeerConfirmed.
     /// It is promoted only when the later confirmation matches generation,
     /// endpoint and transport incarnation; any lifecycle reset clears it.
@@ -246,6 +248,7 @@ impl PeerConnection {
             relay_first_business_sent_generation: None,
             relay_first_business_received_generation: None,
             relay_first_business_exchange_generation: None,
+            relay_first_business_pathcommit_generation: None,
             relay_preconfirmation_business: None,
             first_usable_generation: None,
             first_usable_at: None,
@@ -292,6 +295,7 @@ impl PeerConnection {
         self.relay_first_business_sent_generation = None;
         self.relay_first_business_received_generation = None;
         self.relay_first_business_exchange_generation = None;
+        self.relay_first_business_pathcommit_generation = None;
         self.relay_preconfirmation_business = None;
         self.first_usable_generation = None;
         self.first_usable_at = None;

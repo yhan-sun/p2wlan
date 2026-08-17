@@ -45,6 +45,7 @@ mod network_outbound;
 pub mod netenv;
 pub mod peer;
 pub mod port_mapping;
+pub(crate) mod path_commit;
 pub mod relay;
 pub(crate) mod relay_probe;
 pub(crate) mod relay_runtime;

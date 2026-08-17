@@ -384,6 +384,7 @@ impl PeerConnection {
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
             self.relay_first_business_exchange_generation = None;
+            self.relay_first_business_pathcommit_generation = None;
             self.relay_preconfirmation_business = None;
         }
         if self.relay_first_gate_generation != Some(local_generation) {
@@ -398,6 +399,7 @@ impl PeerConnection {
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
             self.relay_first_business_exchange_generation = None;
+            self.relay_first_business_pathcommit_generation = None;
             self.relay_preconfirmation_business = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
             if self.state == ConnectionState::Relay {
@@ -472,6 +474,7 @@ impl PeerConnection {
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
             self.relay_first_business_exchange_generation = None;
+            self.relay_first_business_pathcommit_generation = None;
             self.relay_preconfirmation_business = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;
@@ -483,6 +486,7 @@ impl PeerConnection {
             self.relay_first_business_sent_generation = None;
             self.relay_first_business_received_generation = None;
             self.relay_first_business_exchange_generation = None;
+            self.relay_first_business_pathcommit_generation = None;
             self.relay_preconfirmation_business = None;
             self.relay_first_gate_generation = None;
             self.relay_first_gate_started_at = None;

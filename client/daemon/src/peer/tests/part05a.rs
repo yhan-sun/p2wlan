@@ -97,6 +97,92 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
 }
 
 #[tokio::test]
+async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_proves_relay() {
+    // P0-4 (audit): one-directional traffic (telemetry, video push, heartbeat
+    // only) never produces a natural *received* business direction, so the
+    // old relay-first business gate stranded the peer on relay forever despite
+    // a confirmed, encrypted Direct path.  A synthetic path-commit proof — a
+    // business-shaped authenticated packet round-tripped over the confirmed
+    // relay — closes the gate as an alternative, restoring liveness while
+    // preserving the counter-commit invariant (the relay was proven for both
+    // directions before Direct may win).
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.61:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18082";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .record_relay_observation("peer1", relay_endpoint, None)
+        .await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+
+    // Outbound business has crossed the relay (local send direction)...
+    assert!(manager
+        .mark_relay_first_business_sent_for_generation("peer1", generation)
+        .await);
+    // ...but the peer sends nothing back, so the *received* direction never
+    // happens.  Without a path-commit proof the gate must still hold relay.
+    let stuck = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(stuck.path, Some(NetworkPath::Relay));
+    assert_eq!(stuck.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
+
+    // A path-commit probe round-trips over the confirmed relay and proves the
+    // missing direction.  The gate now releases to Direct even though no
+    // natural inbound business ever arrived.
+    assert!(manager
+        .mark_relay_first_business_pathcommit_for_generation("peer1", generation, relay_endpoint)
+        .await);
+    let promoted = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(promoted.path, Some(NetworkPath::Direct));
+    assert!(manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+}
+
+#[tokio::test]
+async fn pathcommit_proof_does_not_relie_on_natural_business_and_resets_on_generation() {
+    // A path-commit marker committed for a stale generation must not release the
+    // gate for the current generation, and a generation change must clear it —
+    // so an old proof can never promote Direct for a new allocator epoch.
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.62:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18083";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .record_relay_observation("peer1", relay_endpoint, None)
+        .await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+
+    // A path-commit marked for a generation that is NOT the current one is
+    // refused (stale) and does not release the gate.
+    assert!(!manager
+        .mark_relay_first_business_pathcommit_for_generation("peer1", generation + 1, relay_endpoint)
+        .await);
+    let still = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(still.path, Some(NetworkPath::Relay));
+}
+
+#[tokio::test]
 async fn relay_transport_replacement_revokes_old_confirmation_and_rejects_old_ack() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.52:51831".parse().unwrap();

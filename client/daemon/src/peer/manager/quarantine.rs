@@ -169,6 +169,7 @@ impl PeerManager {
                     conn.relay_first_business_sent_generation = None;
                     conn.relay_first_business_received_generation = None;
                     conn.relay_first_business_exchange_generation = None;
+                    conn.relay_first_business_pathcommit_generation = None;
                     conn.relay_preconfirmation_business = None;
                     conn.relay_ready_generation = None;
                     conn.relay_ready_at = None;

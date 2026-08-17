@@ -284,6 +284,7 @@ impl PeerConnection {
             || self.relay_ready_generation != Some(local_generation)
             || !self.relay_peer_confirmed_for_generation(local_generation)
             || self.relay_first_business_exchange_generation == Some(local_generation)
+            || self.relay_first_business_pathcommit_generation == Some(local_generation)
         {
             return false;
         }
