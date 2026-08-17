@@ -9,11 +9,35 @@ fn test_priority_ordering() {
     assert!(prflx_pri > srflx_pri);
     assert!(srflx_pri > relay_pri);
 
-    // Check exact values
-    assert_eq!(host_pri, (1 << 24) * PREF_HOST + (1 << 8) * LOCAL_PREF + 1);
+    // Check exact values (RFC 8445 §6.1.2.3: the last term is 256 - component_id,
+    // not component_id).
+    assert_eq!(
+        host_pri,
+        (1 << 24) * PREF_HOST + (1 << 8) * LOCAL_PREF + (256 - COMPONENT_ID)
+    );
     assert_eq!(
         srflx_pri,
-        (1 << 24) * PREF_SERVER_REFLEXIVE + (1 << 8) * LOCAL_PREF + 1
+        (1 << 24) * PREF_SERVER_REFLEXIVE + (1 << 8) * LOCAL_PREF + (256 - COMPONENT_ID)
+    );
+}
+
+#[test]
+fn priority_uses_rfc_component_term_not_bare_component_id() {
+    // The RFC 8445 priority formula's final term is (256 - component_id).  The
+    // historical code used component_id directly, which inverted the term.  With
+    // component_id = 1 the correct term is 255, so every priority is offset by
+    // (255 - 1) = 254 above the bare-component-id value — a fixed offset that
+    // preserves relative ordering (higher component_id must still rank LOWER).
+    let host = compute_priority(CandidateType::Host);
+    assert_eq!(
+        host,
+        (1u32 << 24) * PREF_HOST + (1u32 << 8) * LOCAL_PREF + (256 - COMPONENT_ID),
+        "component term must be (256 - COMPONENT_ID), got {host}"
+    );
+    assert_eq!(
+        (host - (1u32 << 24) * PREF_HOST - (1u32 << 8) * LOCAL_PREF),
+        256 - COMPONENT_ID,
+        "the low-order component term must be 255 (256 - 1)"
     );
 }
 

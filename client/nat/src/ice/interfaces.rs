@@ -1,4 +1,10 @@
 /// Compute the ICE priority for a candidate.
+///
+/// RFC 8445 §6.1.2.3: `PRIORITY = 2^24 * G + 2^8 * local_preference +
+/// (256 - component_id)`, where `G` is the type preference.  The final term is
+/// `256 - component_id` (not `component_id`): for a single component (id 1)
+/// this is 255, and a higher component_id must rank *lower*, which the bare
+/// `+ component_id` term got backwards.
 pub fn compute_priority(candidate_type: CandidateType) -> u32 {
     let type_pref = match candidate_type {
         CandidateType::Host => PREF_HOST,
@@ -6,7 +12,7 @@ pub fn compute_priority(candidate_type: CandidateType) -> u32 {
         CandidateType::ServerReflexive => PREF_SERVER_REFLEXIVE,
         CandidateType::Relay => PREF_RELAY,
     };
-    (1u32 << 24) * type_pref + (1u32 << 8) * LOCAL_PREF + COMPONENT_ID
+    (1u32 << 24) * type_pref + (1u32 << 8) * LOCAL_PREF + (256 - COMPONENT_ID)
 }
 
 /// Gather local network interface addresses.
