@@ -361,9 +361,17 @@ impl Daemon {
                     &offer.from_node_id,
                     offer.punch_at_ms,
                     Some(id),
-                    Some(frozen_targets),
+                    Some(frozen_targets.clone()),
                 )
                 .await;
+                // C=0 (mutual-APD): when we also hold a fresh local mapping,
+                // knock back from OUR fresh source at the SAME canonical
+                // deadline toward the peer's fresh predicted ports.  This is
+                // the fresh-fresh synchronized pair that breaks the
+                // no-mutually-admitted-endpoint deadlock; bounded by the
+                // per-(peer, generation) budget.
+                self.coordinate_c0_fresh_fresh_pair(offer, &frozen_targets, id)
+                    .await;
             }
             FreshPunchDecision::Degraded => {
                 if !offer.handshake_init.is_empty() {
@@ -380,6 +388,136 @@ impl Daemon {
                         .await;
                 }
             }
+        }
+    }
+
+    /// Coordinate the C=0 fresh-fresh synchronized pair on the receiver side
+    /// of a fresh offer.
+    ///
+    /// The peer advertised its FRESH predicted ports (`frozen_targets`) with a
+    /// canonical `punch_at_ms`.  We already punch at that deadline through the
+    /// ordinary path (`start_hole_punch_at`); when we ALSO hold a fresh local
+    /// mapping for this peer, we additionally knock from OUR fresh source at
+    /// the SAME canonical instant toward the peer's fresh ports — the
+    /// mutual-APD deadlock breaker.
+    ///
+    /// Fully bounded: the per-(peer, generation) C=0 ledger caps the number of
+    /// distinct fresh-fresh pairs ever attempted, and the C=0 rendezvous
+    /// window itself reuses the micro-window target cap and attempt count.
+    /// When the budget is exhausted, no further fresh-fresh pairs are
+    /// scheduled and the relay keeps carrying the data plane.
+    ///
+    /// A miss is attributed to the ledger immediately (the pair was
+    /// attempted); a hit is decided by the existing encrypted-validation path
+    /// and stops further attempts via the ledger.
+    async fn coordinate_c0_fresh_fresh_pair(
+        &self,
+        offer: &PendingPeerOffer,
+        frozen_targets: &[SocketAddr],
+        id: crate::FreshPredictionId,
+    ) {
+        let peer_id = &offer.from_node_id;
+        let generation = self.peers.current_network_generation().await;
+        // Budget gate first: exhausted means we stop scheduling C=0 pairs.
+        if !self.peers.c0_pair_admission(peer_id, generation).await {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "c0_skipped_budget_exhausted",
+                    None,
+                    None,
+                    None,
+                    "C=0 fresh-fresh pair not scheduled: per-(peer, generation) budget exhausted",
+                )
+                .await;
+            return;
+        }
+        // We must hold a fresh local mapping (the SOURCE the peer must learn)
+        // for this pair to be meaningful.
+        let Some(local_fresh) = self.peers.fresh_mapping_for_peer(peer_id).await else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "c0_skipped_no_local_fresh",
+                    None,
+                    None,
+                    None,
+                    "C=0 fresh-fresh pair not scheduled: no fresh local mapping available",
+                )
+                .await;
+            return;
+        };
+        // Remote targets = the peer's OWN fresh predicted ports (frozen by
+        // the offer's committed snapshot), NOT historical stable_targets.
+        let Some(plan) = C0FreshPairPlan::new(
+            local_fresh.socket_local_endpoint,
+            frozen_targets,
+            offer.punch_at_ms,
+        ) else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "c0_skipped_no_remote_fresh",
+                    None,
+                    None,
+                    None,
+                    "C=0 fresh-fresh pair not scheduled: no remote fresh predicted ports in the offer",
+                )
+                .await;
+            return;
+        };
+        let Some(udp) = self.udp_transport.read().await.clone() else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "c0_skipped_no_udp",
+                    None,
+                    None,
+                    None,
+                    "C=0 fresh-fresh pair not scheduled: UDP transport not ready",
+                )
+                .await;
+            return;
+        };
+        let scheduled = spawn_c0_synchronized_fresh_pair(
+            udp,
+            self.peers.clone(),
+            self.punch_attempts.clone(),
+            peer_id.clone(),
+            plan.local_fresh_endpoint,
+            plan.bounded_targets.clone(),
+            Some(plan.canonical_punch_at_ms),
+            Some(id),
+        )
+        .await;
+        // Attribution: the pair was (or was not) attempted; the ledger
+        // counts the attempt regardless of the wire outcome, and a hit is
+        // decided by encrypted validation independently.
+        self.peers
+            .c0_pair_attempt(
+                peer_id,
+                generation,
+                self.peers.recovery_epoch_for(peer_id).await,
+                &plan.local_fresh_endpoint.to_string(),
+                &plan.bounded_targets
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                Some(plan.canonical_punch_at_ms),
+                crate::peer::C0PairOutcome::Miss,
+            )
+            .await;
+        if !scheduled {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "c0_rendezvous_not_scheduled",
+                    None,
+                    None,
+                    None,
+                    "C=0 fresh-fresh pair could not be scheduled (budget/admission/udp/deferred); attributed as attempted miss",
+                )
+                .await;
         }
     }
 

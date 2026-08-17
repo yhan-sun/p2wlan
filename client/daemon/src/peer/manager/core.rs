@@ -40,6 +40,7 @@ impl PeerManager {
             relay_first_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
             outbound_liveness_cache: Arc::new(RwLock::new(HashMap::new())),
+            c0_pair_ledgers: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
             relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),

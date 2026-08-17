@@ -105,6 +105,13 @@ pub struct PeerManager {
     /// (`apply_cached_liveness_block`, called from `recovery_epoch_admit`
     /// before its `recovery_epochs` write lock).
     outbound_liveness_cache: Arc<RwLock<HashMap<(String, u64), LivenessCacheEntry>>>,
+    /// Bounded C=0 (mutual-APD, no mutually-admitted endpoint pair)
+    /// fresh-fresh attempt ledger, keyed by `(peer_id, generation)`.  Written
+    /// by `c0_pair_attempt`; read by `c0_pair_admission` before scheduling a
+    /// fresh-fresh synchronized pair.  Reset on generation change (a new
+    /// egress IP invalidates every old pair — same reset semantics as the
+    /// adaptive port-learner and liveness caches).
+    c0_pair_ledgers: Arc<RwLock<HashMap<(String, u64), C0PairLedger>>>,
     /// Lock-free per-peer direct-commit sequence mirror.  Bumped inside the
     /// network-epoch critical section together with the Direct state
     /// transition, so outbound punch loops can gate every actual UDP send on
