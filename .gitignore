@@ -61,9 +61,11 @@ deploy/staging/*.env.example
 # Test scripts that hardcode real infra/device IPs (kept on disk, never published)
 scripts/mac-remote-smoke.sh
 scripts/windows-remote-smoke.ps1
-scripts/dual-end/run-ab-sequence.sh
-scripts/dual-end/link-health-check.sh
 scripts/tun-ping-smoke.sh
+
+# Local-only dual-end shell helpers; keep their Markdown runbooks publishable.
+# Existing tracked scripts remain tracked until explicitly removed from Git.
+scripts/dual-end/*.sh
 
 # Release packages and archives
 *.pdf
