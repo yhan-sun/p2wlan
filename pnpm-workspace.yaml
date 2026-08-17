@@ -1,6 +1,0 @@
-overrides:
-  nanoid: ">=3.3.17 <4"
-allowBuilds:
-  esbuild: true
-onlyBuiltDependencies:
-  - esbuild
