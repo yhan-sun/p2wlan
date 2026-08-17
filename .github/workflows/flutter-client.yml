@@ -7,11 +7,20 @@ on:
       - codex/**
     paths:
       - "apps/flutter_client/**"
+      # The daemon owns the authoritative status/route/event contract the
+      # Flutter client consumes; changes must re-run client tests + contract
+      # test (ADR 0004, P2-04).
+      - "client/daemon/src/diagnostics/**"
+      - "client/daemon/src/route/**"
+      - "client/daemon/src/connection_timeline.rs"
       - ".github/workflows/flutter-client.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "apps/flutter_client/**"
+      - "client/daemon/src/diagnostics/**"
+      - "client/daemon/src/route/**"
+      - "client/daemon/src/connection_timeline.rs"
       - ".github/workflows/flutter-client.yml"
   workflow_dispatch:
 
