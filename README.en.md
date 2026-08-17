@@ -150,7 +150,7 @@ flowchart LR
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Client UI | Flutter native client (sole GUI) | Device status, diagnostics, and control-plane actions. The React web console is frozen pending removal; see `docs/adr/0004`. |
+| Client UI | Flutter native client (sole GUI) | Device status, diagnostics, and control-plane actions. The React web console has been removed; see `docs/adr/0004`. |
 | Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
 | Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
 | Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
@@ -265,15 +265,13 @@ Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files,
 
 ## Build from Source
 
-Install Rust stable, Go 1.22+, Node.js 20+, pnpm 10+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies.
+Install Rust stable, Go 1.22+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies.
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
 cd p2wlan
-pnpm install --frozen-lockfile
 
 cargo build -p p2wlan-daemon
-pnpm run dev
 
 cd apps/flutter_client
 flutter pub get
@@ -296,8 +294,12 @@ go vet ./...
 go test ./... -count=1
 cd ..
 
-pnpm audit --audit-level high
-pnpm run build
+cd apps/flutter_client
+dart format --set-exit-if-changed .
+flutter analyze
+flutter test
+cd ..
+
 ./scripts/control-smoke.sh
 ```
 
@@ -311,9 +313,8 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ## Repository Map
 
 ```text
-client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon, CLI
+client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon, CLI, tray
 server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
-src/          React web console (frozen, retained only for removal; new work goes to Flutter, see docs/adr/0004)
 apps/flutter_client/ Flutter native client (sole GUI) for Android, iOS, macOS, Windows, and Linux
 scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
 fuzz/         Protocol and parser fuzzing
