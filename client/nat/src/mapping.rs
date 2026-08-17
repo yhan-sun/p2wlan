@@ -803,9 +803,21 @@ fn generate_candidates(
         PortModelKind::FixedStep { step }
         | PortModelKind::Linear { step }
         | PortModelKind::NoisyLinear { step } => {
-            // The learned cross-batch stride, when present, is more current
-            // than this single batch's median and replaces it.
-            let effective_step = step_estimate.unwrap_or(step);
+            // The learned cross-batch stride, when present and pointing the
+            // SAME way as this batch, is more current than the batch's own
+            // median and replaces it.  But a learned estimate that conflicts in
+            // direction (or is a zero-consensus placeholder) must never override
+            // the batch's signed step: the batch is the freshest evidence, and a
+            // stale opposite-sign reading would walk the candidate window the
+            // wrong way (e.g. a reverse FixedStep{-3} batch overridden by a
+            // forward +3 estimate lands candidates at +30003 instead of the real
+            // next mapping 29991).  The batch step itself is signed and
+            // guaranteed non-zero for these kinds, so defaulting to it is always
+            // safe.
+            let effective_step = match step_estimate {
+                Some(estimate) if estimate != 0 && estimate.signum() == step.signum() => estimate,
+                _ => step,
+            };
             let base_window = match model.confidence {
                 90..=100 => 6,
                 75..=89 => 12,
@@ -1476,6 +1488,44 @@ mod tests {
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         let predicted = predict_ports_with_learning(&model, 65534, 0, 0, Some(3), false);
         assert_eq!(predicted[0].port, 1, "the learned-step top candidate must wrap mod 65536");
+    }
+
+    // ---- P0-1: the learned estimate must not override the batch's direction ----
+
+    #[test]
+    fn learning_estimate_direction_conflict_keeps_model_step() {
+        // P0-1: the current batch's allocator is walking backwards
+        // (30000, 29997, 29994 -> FixedStep{-3}) but a stale cross-batch
+        // learner still holds a positive estimate of +3 (it was taught +3 back
+        // when the allocator ran forward).  The learned estimate must NOT
+        // override the model's signed step on a sign conflict, or the top
+        // candidate walks up to 30003 and misses the real next mapping 29991.
+        let model = build_model(&[30000, 29997, 29994], Some(ip()), 1000);
+        assert!(matches!(model.kind, PortModelKind::FixedStep { step: -3 }), "{:?}", model.kind);
+        let predicted = predict_ports_with_learning(&model, 29994, 0, 0, Some(3), true);
+        assert_eq!(
+            predicted.first().map(|c| c.port),
+            Some(29991),
+            "a sign-conflicting estimate must not flip the walk direction, got {:?}",
+            predicted
+        );
+    }
+
+    #[test]
+    fn learning_matching_negative_estimate_still_overrides() {
+        // Counterpart guard: when the learned estimate shares the model's
+        // direction it must still override the step (the cross-batch reading is
+        // more current).  Model step -3, learned -7 -> the top candidate is
+        // last - 7, not last - 3.
+        let model = build_model(&[30000, 29997, 29994], Some(ip()), 1000);
+        assert!(matches!(model.kind, PortModelKind::FixedStep { step: -3 }));
+        let predicted = predict_ports_with_learning(&model, 29994, 0, 0, Some(-7), true);
+        assert_eq!(
+            predicted.first().map(|c| c.port),
+            Some(29987),
+            "a same-direction negative estimate must still override the model step, got {:?}",
+            predicted
+        );
     }
 
     // ---- P0-3: port 0 is never a candidate ----

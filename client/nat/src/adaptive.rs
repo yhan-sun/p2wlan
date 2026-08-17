@@ -63,17 +63,20 @@ impl DirectionPattern {
 ///   lower weight.
 ///
 /// `estimate = ALPHA_ADVERT * A + ALPHA_DIFF * B`, or the single known channel
-/// when only one has observations.  The rounded value is clamped to at least 1
-/// and only counts a revision when it actually changes.
+/// when only one has observations.  The estimate is signed — the observed-diff
+/// channel learns a reverse (negative) allocator as well as a forward one — and
+/// only a zero consensus is suppressed.  It counts a revision when the value
+/// actually changes.
 #[derive(Debug)]
 pub struct StepLearner {
     /// Channel A smoothed value (peer-advertised stride).
     advert_est: Option<f64>,
     /// Channel B smoothed value (observed-diff mode).
     diff_est: Option<f64>,
-    /// Bounded ring of raw positive observed diffs (the noise source for B).
+    /// Bounded ring of raw observed diffs (the noise source for B); zero diffs
+    /// are filtered out at the source, both positive and negative are kept.
     diffs: VecDeque<i16>,
-    /// Current fused estimate, clamped to >= 1.
+    /// Current fused estimate (signed), or `None` before any observation.
     estimate: Option<i16>,
     /// Running maximum of the diff-channel mode coverage (0.0..=1.0).
     confidence: f64,
@@ -110,15 +113,17 @@ impl StepLearner {
         *self = Self::new();
     }
 
-    /// Fold one observed positive port delta (the step the peer's allocator
-    /// advanced by between two consecutive fresh mappings).
+    /// Fold one observed signed port delta (the step the peer's allocator moved
+    /// by between two consecutive fresh mappings).
     ///
-    /// Non-positive deltas carry no forward-stride information and are
-    /// ignored.  The raw diff is buffered, then the last `DIFF_MODE_WINDOW`
-    /// diffs are reduced to their (noise-resistant) mode, which EWMA-smooths
-    /// the diff channel before the two channels are fused.
+    /// A zero delta carries no stride information (an unchanged port) and is
+    /// ignored; positive and negative deltas are both kept so the learner tracks
+    /// a reverse (downward) allocator as well as a forward one.  The raw diff is
+    /// buffered, then the last `DIFF_MODE_WINDOW` diffs are reduced to their
+    /// (noise-resistant) mode, which EWMA-smooths the diff channel before the
+    /// two channels are fused.
     pub fn observe_diff(&mut self, diff: i16) {
-        if diff <= 0 {
+        if diff == 0 {
             return;
         }
         self.diffs.push_back(diff);
@@ -153,7 +158,9 @@ impl StepLearner {
         self.recompute(None);
     }
 
-    /// The current fused stride estimate, or `None` before any observation.
+    /// The current fused stride estimate (signed), or `None` before any
+    /// observation.  `Some(0)` means the recent diffs carried no direction
+    /// consensus; callers treat that as "no useful stride".
     pub fn estimate(&self) -> Option<i16> {
         self.estimate
     }
@@ -187,7 +194,9 @@ impl StepLearner {
     }
 
     /// Recompute the fused estimate from the two channel values and advance
-    /// the revision counter + confidence.
+    /// the revision counter + confidence.  The estimate is signed (a reverse
+    /// allocator learns a negative stride); a near-zero fused value is rounded
+    /// to 0 rather than clamped up to a stray positive stride.
     fn recompute(&mut self, diff_cov: Option<f64>) {
         let (a, b) = (self.advert_est, self.diff_est);
         let est = match (a, b) {
@@ -199,7 +208,7 @@ impl StepLearner {
         let Some(est) = est else {
             return;
         };
-        let new = (est.round()).max(1.0) as i16;
+        let new = est.round() as i16;
         if self.estimate != Some(new) {
             self.revision_count += 1;
         }
@@ -377,11 +386,47 @@ mod tests {
         learner.observe_diff(3);
         let before = (learner.estimate(), learner.revision_count());
         learner.observe_diff(0);
-        learner.observe_diff(-2);
         assert_eq!(
             (learner.estimate(), learner.revision_count()),
             before,
-            "zero/negative diffs must not touch the estimate"
+            "zero diffs carry no stride information and must not touch the estimate"
+        );
+    }
+
+    #[test]
+    fn learner_learns_negative_stride() {
+        // P0-1: the learner must track a reverse allocator.  Three identical
+        // -1 diffs pin a signed stride of -1 (the old positive-only learner
+        // dropped these and never learned the reversal).
+        let mut learner = StepLearner::new();
+        for _ in 0..3 {
+            learner.observe_diff(-1);
+        }
+        assert_eq!(
+            learner.estimate(),
+            Some(-1),
+            "identical negative diffs must pin a negative stride"
+        );
+    }
+
+    #[test]
+    fn learner_sign_conflict_does_not_advertise_a_stray_step() {
+        // P0-1: if the recent diffs oscillate around zero (the allocator just
+        // reversed direction within the mode window), the fused estimate must
+        // not advertise a confidently-wrong single sign.  A near-zero / no-
+        // consensus estimate is acceptable; what is not acceptable is a stale
+        // one-sign stride overriding the current batch — but that guard lives
+        // in the predictor.  Here we only assert the learner stops forcing >= 1.
+        let mut learner = StepLearner::new();
+        for diff in [1, 1, 1, -1, -1, -1, -1] {
+            learner.observe_diff(diff);
+        }
+        // The dominant mode is -1, so the estimate must land negative or at
+        // least not be clamped up to a positive stride.
+        assert!(
+            learner.estimate().map_or(true, |e| e <= 0),
+            "a reversing batch must not yield a positive clamped stride, got {:?}",
+            learner.estimate()
         );
     }
 
