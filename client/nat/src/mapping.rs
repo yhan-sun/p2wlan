@@ -762,6 +762,24 @@ fn generate_candidates(
         PortModelKind::Unpredictable { .. } => {}
     }
 
+    // A modular wrap can push `last + step*k` to port 0 (e.g. 65535 + 1) and
+    // fold two distances onto the same valid port (0 and 1 both normalize to 1).
+    // Port 0 is not a usable UDP port and a duplicate wastes probe budget, so
+    // drop both and re-rank the survivors sequentially.  Clean (non-wrapping)
+    // distributions have no 0 and no duplicates, so this pass leaves them
+    // byte-for-byte unchanged — including the rank sequence and the final cap.
+    let mut survivors: Vec<PredictionCandidate> = Vec::with_capacity(candidates.len());
+    let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for candidate in candidates {
+        if candidate.port != 0 && seen_ports.insert(candidate.port) {
+            survivors.push(PredictionCandidate {
+                rank: survivors.len() as u8,
+                ..candidate
+            });
+        }
+    }
+    candidates = survivors;
+
     let window_cap = if matches!(model.kind, PortModelKind::MonotonicWindow { .. })
         && is_wide_monotonic_window(&model.deltas)
     {
@@ -1344,6 +1362,100 @@ mod tests {
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         let predicted = predict_ports_with_learning(&model, 65534, 0, 0, Some(3), false);
         assert_eq!(predicted[0].port, 1, "the learned-step top candidate must wrap mod 65536");
+    }
+
+    // ---- P0-3: port 0 is never a candidate ----
+
+    #[test]
+    fn fixed_step_wrap_does_not_emit_port_zero() {
+        // A strict +1 allocator sitting at the very top of the 16-bit space:
+        // 65533, 65534, 65535.  The model step is +1, so `last + step` is
+        // 65536 mod 65536 = 0, which is not a valid UDP port.  The predictor
+        // must wrap to 1 instead of advertising port 0 as the top candidate.
+        let ports = [65533u16, 65534, 65535];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(model.kind, PortModelKind::FixedStep { step: 1 }));
+        let predicted = predict_ports(&model, 65535);
+        assert!(
+            !predicted.iter().any(|candidate| candidate.port == 0),
+            "port 0 must never be a candidate, got {:?}",
+            predicted
+        );
+        assert_eq!(
+            predicted.first().map(|candidate| candidate.port),
+            Some(1),
+            "the top candidate must wrap 65535+1 to port 1"
+        );
+        assert_eq!(predicted[0].rank, 0);
+        // Ranks stay contiguous after dropping the invalid port.
+        let ranks: Vec<u8> = predicted.iter().map(|candidate| candidate.rank).collect();
+        assert_eq!(ranks, (0..predicted.len() as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn learned_step_wrap_does_not_emit_port_zero() {
+        // The cross-batch learner drives the top candidate the same way the
+        // model step does: a learned step of +1 from last 65535 must not yield
+        // port 0.
+        let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
+        let predicted = predict_ports_with_learning(&model, 65535, 0, 0, Some(1), false);
+        assert!(
+            !predicted.iter().any(|candidate| candidate.port == 0),
+            "a learned-step candidate must never be port 0, got {:?}",
+            predicted
+        );
+        assert_eq!(predicted.first().map(|candidate| candidate.port), Some(1));
+    }
+
+    #[test]
+    fn monotonic_window_wrap_does_not_emit_port_zero() {
+        // A busy CGNAT near the top of the space with same-direction but
+        // non-uniform jumps (+2 then +5): spread 3 is not a Linear step and the
+        // jumps are not multiples of each other, so this is a MonotonicWindow.
+        // The window walks `last + 1`, which from 65535 is port 0.
+        let ports = [65528u16, 65530, 65535];
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(
+            matches!(model.kind, PortModelKind::MonotonicWindow { direction: 1 }),
+            "{:?}",
+            model.kind
+        );
+        let predicted = predict_ports(&model, 65535);
+        assert!(
+            !predicted.iter().any(|candidate| candidate.port == 0),
+            "a monotonic-window candidate must never be port 0, got {:?}",
+            predicted
+        );
+    }
+
+    #[test]
+    fn candidates_are_unique_when_the_window_wraps() {
+        // A large fixed step near the 16-bit boundary folds two window
+        // distances onto the same port once the modular arithmetic wraps
+        // (e.g. step 16384: k=1 and k=5 both land on the same port).  The
+        // survivor pass must de-duplicate so the peer is never told to probe
+        // the same port twice — and never port 0.
+        let ports = [1000u16, 17384, 33768]; // +16384 each -> FixedStep{16384}
+        let model = build_model(&ports, Some(ip()), 1000);
+        assert!(matches!(model.kind, PortModelKind::FixedStep { step: 16384 }));
+        for last in [33768u16, 50152, 65000] {
+            let predicted = predict_ports(&model, last);
+            let mut seen = std::collections::HashSet::new();
+            for candidate in &predicted {
+                assert!(
+                    seen.insert(candidate.port),
+                    "duplicate candidate port {} for last={}: {:?}",
+                    candidate.port,
+                    last,
+                    predicted
+                );
+                assert!(
+                    candidate.port != 0,
+                    "port 0 must not survive for last={}",
+                    last
+                );
+            }
+        }
     }
 
     #[test]
