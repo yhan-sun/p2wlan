@@ -341,6 +341,45 @@ async fn test_local_hole_punch() {
 }
 
 #[tokio::test]
+async fn hole_punch_rejects_ack_with_wrong_nonce() {
+    // Legacy PNCH v1 is unauthenticated (no MAC), so the ONLY correlation an
+    // attacker cannot trivially guess is our per-run random punch nonce.  A
+    // forged / stale ACK whose nonce does not echo the current punch must NOT
+    // establish the connection, or an on-path attacker could force
+    // `connected: true` with an attacker-chosen `peer_addr`.
+    let socket_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket_attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = socket_a.local_addr().unwrap();
+
+    let config = PunchConfig {
+        timeout: Duration::from_millis(700),
+        interval: Duration::from_millis(30),
+        max_attempts: 50,
+    };
+
+    // A punches toward the attacker's (bogus) candidate; the attacker replies
+    // with a well-formed legacy ACK whose nonce does NOT echo A's random punch
+    // nonce.  A must ignore it and time out rather than "connect".
+    let candidates_a = [socket_attacker.local_addr().unwrap()];
+    let punch_a = tokio::spawn(async move { hole_punch(&socket_a, &candidates_a, &config).await });
+
+    // Wait for A to enter the loop, then feed the forged ACK to A.  A new punch
+    // each run uses a fresh random nonce, so a fixed wrong nonce never matches.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let forged_ack = PunchPacket::new_ack([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]);
+    socket_attacker
+        .send_to(&forged_ack.encode(), addr_a)
+        .await
+        .unwrap();
+
+    let result = punch_a.await.unwrap().unwrap();
+    assert!(
+        !result.connected,
+        "an ACK whose nonce does not echo our punch must not establish the connection"
+    );
+}
+
+#[tokio::test]
 async fn test_hole_punch_no_candidates() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = PunchConfig::default();

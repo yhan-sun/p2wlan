@@ -103,14 +103,23 @@ pub async fn hole_punch(
                             debug!("Sent ACK to {}", from_addr);
                         }
                     } else if packet.is_ack() {
-                        // Received an ACK — connection established!
-                        info!("Received ACK from {} — connection established!", from_addr);
-                        return Ok(PunchResult {
-                            connected: true,
-                            peer_addr: Some(from_addr),
-                            elapsed: start.elapsed(),
-                            packets_sent,
-                        });
+                        // Only an ACK that echoes *this* run's random punch
+                        // nonce establishes the connection.  PNCH v1 is
+                        // unauthenticated (no MAC), so the nonce is the only
+                        // per-run correlation: accepting any well-formed ACK
+                        // would let an on-path attacker forge one and force
+                        // `connected: true` with an attacker-chosen `peer_addr`.
+                        if packet.nonce == my_punch.nonce {
+                            info!("Received ACK from {} — connection established!", from_addr);
+                            return Ok(PunchResult {
+                                connected: true,
+                                peer_addr: Some(from_addr),
+                                elapsed: start.elapsed(),
+                                packets_sent,
+                            });
+                        } else {
+                            debug!("Ignoring ACK with non-matching nonce from {}", from_addr);
+                        }
                     }
                 } else {
                     // Not a punch packet — might be WireGuard traffic, ignore
