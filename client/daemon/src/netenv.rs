@@ -13,6 +13,7 @@
 //! interface name.  Everything here is a fast, synchronous probe that is safe
 //! to run on the control-plane path; nothing opens a network connection.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 /// Proxy / TUN-capture environment verdict.
@@ -76,7 +77,16 @@ const PROXY_ENV_NAMES: &[&str] = &[
 /// Interface name patterns that indicate a virtual capture device.  The
 /// daemon's own TUN is filtered by the caller via `excluded`.
 const VIRTUAL_CAPTURE_PREFIXES: &[&str] = &[
-    "utun", "tun", "tap", "wg", "ppp", "gpd", "clat", "tailscale", "ipsec", "tunl",
+    "utun",
+    "tun",
+    "tap",
+    "wg",
+    "ppp",
+    "gpd",
+    "clat",
+    "tailscale",
+    "ipsec",
+    "tunl",
 ];
 
 /// Read proxy URLs from the environment.
@@ -124,18 +134,16 @@ pub fn parse_scutil_proxy_output(output: &str) -> Option<String> {
                 if !proxy.is_empty()
                     && proxy != "0.0.0.0"
                     && proxy != "empty"
-                    && dictionary
-                        .iter()
-                        .any(|(enable_key, enable_value)| {
-                            let enable_key = enable_key.as_str();
-                            enable_value == "1"
-                                && matches!(
-                                    (enable_key, key.as_str()),
-                                    ("HTTPEnable", "HTTPProxy")
-                                        | ("HTTPSEnable", "HTTPSProxy")
-                                        | ("SOCKSEnable", "SOCKSServer")
-                                )
-                        }) =>
+                    && dictionary.iter().any(|(enable_key, enable_value)| {
+                        let enable_key = enable_key.as_str();
+                        enable_value == "1"
+                            && matches!(
+                                (enable_key, key.as_str()),
+                                ("HTTPEnable", "HTTPProxy")
+                                    | ("HTTPSEnable", "HTTPSProxy")
+                                    | ("SOCKSEnable", "SOCKSServer")
+                            )
+                    }) =>
             {
                 let port = dictionary
                     .iter()
@@ -213,7 +221,9 @@ pub fn parse_route_default_interface(output: &str) -> Option<String> {
 }
 
 fn is_candidate_route_iface_token(token: &str) -> bool {
-    token.starts_with("en") || token.starts_with("eth") || token.starts_with("wl")
+    token.starts_with("en")
+        || token.starts_with("eth")
+        || token.starts_with("wl")
         || is_virtual_capture_interface(token, &[])
 }
 
@@ -223,14 +233,22 @@ pub fn default_route_interface() -> Option<String> {
     // Prefer `route -n get default` (macOS/BSD) because it also works for
     // rootless users; fall back to `ip route show default`.
     if cfg!(target_os = "macos") {
-        if let Ok(output) = Command::new("route").args(["-n", "get", "default"]).output() {
-            if let Some(iface) = parse_route_get_interface(&String::from_utf8_lossy(&output.stdout)) {
+        if let Ok(output) = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+        {
+            if let Some(iface) = parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
+            {
                 return Some(iface);
             }
         }
     }
-    if let Ok(output) = Command::new("ip").args(["route", "show", "default"]).output() {
-        if let Some(iface) = parse_route_default_interface(&String::from_utf8_lossy(&output.stdout)) {
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+    {
+        if let Some(iface) = parse_route_default_interface(&String::from_utf8_lossy(&output.stdout))
+        {
             return Some(iface);
         }
     }
@@ -279,7 +297,7 @@ pub fn detect_proxy_environment(excluded: &[String]) -> ProxyEnvironment {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-use std::sync::MutexGuard;
+    use std::sync::MutexGuard;
 
     // Tests mutate process environment variables; serialize them so parallel
     // runs cannot observe each other's leftovers.
@@ -342,16 +360,16 @@ destination: default
     gateway: 192.168.1.1
   interface: utun4
 ";
-        assert_eq!(
-            parse_route_get_interface(output).as_deref(),
-            Some("utun4")
-        );
+        assert_eq!(parse_route_get_interface(output).as_deref(), Some("utun4"));
     }
 
     #[test]
     fn ip_route_default_parses_linux_output() {
         let output = "default via 192.168.1.1 dev en0 proto dhcp metric 100\n";
-        assert_eq!(parse_route_default_interface(output).as_deref(), Some("en0"));
+        assert_eq!(
+            parse_route_default_interface(output).as_deref(),
+            Some("en0")
+        );
         let tun_output = "default via 10.0.0.1 dev tun0 proto static\n";
         assert_eq!(
             parse_route_default_interface(tun_output).as_deref(),
@@ -368,15 +386,24 @@ Destination        Gateway            Flags        Netif Expire
 default            192.168.1.1        UGScg            en0
 default            10.0.0.1           UGScg           utun3
 ";
-        assert_eq!(parse_route_default_interface(output).as_deref(), Some("en0"));
+        assert_eq!(
+            parse_route_default_interface(output).as_deref(),
+            Some("en0")
+        );
     }
 
     #[test]
     fn virtual_capture_interface_excludes_self_tun() {
         let none: Vec<String> = vec![];
         assert!(is_virtual_capture_interface("utun4", &none));
-        assert!(is_virtual_capture_interface("tun0", &["p2wlan0".to_string()]));
-        assert!(!is_virtual_capture_interface("utun4", &["utun4".to_string()]));
+        assert!(is_virtual_capture_interface(
+            "tun0",
+            &["p2wlan0".to_string()]
+        ));
+        assert!(!is_virtual_capture_interface(
+            "utun4",
+            &["utun4".to_string()]
+        ));
         assert!(!is_virtual_capture_interface("en0", &none));
         assert!(!is_virtual_capture_interface("", &none));
     }

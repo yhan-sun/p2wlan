@@ -10,11 +10,11 @@ mod tests {
     fn no_browser_cors_is_never_emitted_for_any_origin() {
         // The React/Vite web console is deleted; no browser origin is trusted.
         assert_eq!(
-            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://localhost:14327\r\n\r\n"),
+            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://legacy.invalid\r\n\r\n"),
             None
         );
         assert_eq!(
-            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
+            no_browser_cors("GET /status HTTP/1.1\r\nOrigin: http://legacy.invalid\r\n\r\n"),
             None
         );
         assert_eq!(
@@ -39,7 +39,7 @@ mod tests {
         );
         assert_eq!(bearer_token("GET /status HTTP/1.1\r\n\r\n"), None);
         assert_eq!(
-            bearer_token("GET /status HTTP/1.1\r\nOrigin: http://localhost:1420\r\n\r\n"),
+            bearer_token("GET /status HTTP/1.1\r\nOrigin: http://legacy.invalid\r\n\r\n"),
             None
         );
     }
@@ -60,39 +60,39 @@ mod tests {
         // Missing -> Installed is the only "changed" outcome.
         let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Installed));
         assert_eq!(status, 200);
-        assert_eq!(body["changed"], true);
-        assert_eq!(body["attempted"], true);
-        assert_eq!(body["after"], "installed");
+        assert!(body.changed);
+        assert!(body.attempted);
+        assert_eq!(body.after, "installed");
 
         // Conflict -> Installed is a real change too.
         let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Installed));
         assert_eq!(status, 200);
-        assert_eq!(body["changed"], true);
+        assert!(body.changed);
 
         // Repair that leaves the route Missing (add failed) is NOT a success.
         let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Missing));
         assert_eq!(status, 409);
-        assert_eq!(body["changed"], false);
-        assert_eq!(body["reason"], "add_failed");
+        assert!(!body.changed);
+        assert_eq!(body.reason, "add_failed");
 
         // A third-party conflict that is not removed is NOT a success, and the
         // caller must not be told the route is repaired.
         let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Conflict));
         assert_eq!(status, 409);
-        assert_eq!(body["changed"], false);
-        assert_eq!(body["reason"], "conflict_remains");
+        assert!(!body.changed);
+        assert_eq!(body.reason, "conflict_remains");
 
         // Unknown stays a failure, never a success.
         let (status, body) = route_repair_report(obs(RouteState::Unknown), obs(RouteState::Unknown));
         assert_eq!(status, 503);
-        assert_eq!(body["changed"], false);
+        assert!(!body.changed);
 
         // Already Installed -> no-op, success, not "changed".
         let (status, body) =
             route_repair_report(obs(RouteState::Installed), obs(RouteState::Installed));
         assert_eq!(status, 200);
-        assert_eq!(body["changed"], false);
-        assert_eq!(body["attempted"], false);
+        assert!(!body.changed);
+        assert!(!body.attempted);
 
         // Every report must state that the daemon/TUN/sessions were not
         // restarted — repair is in-place only.
@@ -104,7 +104,7 @@ mod tests {
             (RouteState::Unknown, RouteState::Unknown),
         ] {
             let (_, body) = route_repair_report(obs(state), obs(after));
-            assert_eq!(body["restartedDaemon"], false);
+            assert!(!body.restarted_daemon);
         }
     }
 
@@ -234,10 +234,52 @@ mod tests {
         );
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 
+        let mut health_stream = TcpStream::connect(addr).await.unwrap();
+        health_stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut health_response = String::new();
+        health_stream.read_to_string(&mut health_response).await.unwrap();
+        assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+
+        let mut version_stream = TcpStream::connect(addr).await.unwrap();
+        version_stream
+            .write_all(b"GET /status.version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut version_response = String::new();
+        version_stream.read_to_string(&mut version_response).await.unwrap();
+        assert!(version_response.starts_with("HTTP/1.1 200 OK"));
+
+        let mut unauthenticated_status = TcpStream::connect(addr).await.unwrap();
+        unauthenticated_status
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut unauthenticated_status_response = String::new();
+        unauthenticated_status
+            .read_to_string(&mut unauthenticated_status_response)
+            .await
+            .unwrap();
+        assert!(unauthenticated_status_response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(unauthenticated_status_response.contains("WWW-Authenticate: Bearer"));
+
+        let mut wrong_status = TcpStream::connect(addr).await.unwrap();
+        wrong_status
+            .write_all(
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong-token\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut wrong_status_response = String::new();
+        wrong_status.read_to_string(&mut wrong_status_response).await.unwrap();
+        assert!(wrong_status_response.starts_with("HTTP/1.1 401 Unauthorized"));
+
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(
-                b"GET /status HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:1420\r\n\r\n",
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:1420\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
             )
             .await
             .unwrap();
@@ -299,7 +341,7 @@ mod tests {
         let mut scoped_stream = TcpStream::connect(addr).await.unwrap();
         scoped_stream
             .write_all(
-                b"GET /status/peer/node-b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                b"GET /status/peer/node-b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
             )
             .await
             .unwrap();
@@ -317,7 +359,9 @@ mod tests {
 
         let mut runtime_stream = TcpStream::connect(addr).await.unwrap();
         runtime_stream
-            .write_all(b"GET /status.runtime HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(
+                b"GET /status.runtime HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
+            )
             .await
             .unwrap();
         let mut runtime_response = String::new();
@@ -346,9 +390,44 @@ mod tests {
             .unwrap();
 
         // A mutation without the per-process token is rejected, never executed.
-        assert!(shutdown_response.starts_with("HTTP/1.1 403"));
-        assert!(shutdown_response.contains("forbidden"));
-        assert!(shutdown_response.contains("shutting down") == false);
+        assert!(shutdown_response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(shutdown_response.contains("WWW-Authenticate: Bearer"));
+        assert!(shutdown_response.contains("unauthorized"));
+        assert!(!shutdown_response.contains("shutting down"));
+
+        let mut logs_stream = TcpStream::connect(addr).await.unwrap();
+        logs_stream
+            .write_all(b"GET /logs/tail HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut logs_response = String::new();
+        logs_stream.read_to_string(&mut logs_response).await.unwrap();
+        assert!(logs_response.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let mut repair_stream = TcpStream::connect(addr).await.unwrap();
+        repair_stream
+            .write_all(
+                b"POST /routes/repair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut repair_response = String::new();
+        repair_stream.read_to_string(&mut repair_response).await.unwrap();
+        assert!(repair_response.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let mut disallowed_stream = TcpStream::connect(addr).await.unwrap();
+        disallowed_stream
+            .write_all(
+                b"POST /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut disallowed_response = String::new();
+        disallowed_stream
+            .read_to_string(&mut disallowed_response)
+            .await
+            .unwrap();
+        assert!(disallowed_response.starts_with("HTTP/1.1 403 Forbidden"));
 
         // The same request with the correct Bearer token succeeds.
         let mut authed_shutdown_stream = TcpStream::connect(addr).await.unwrap();

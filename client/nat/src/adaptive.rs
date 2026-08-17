@@ -175,14 +175,16 @@ impl StepLearner {
     /// diffs are pushed in send order, so the first value to reach the max
     /// count is kept, matching the reference `Counter.most_common(1)` order.
     fn mode(&self, values: &[i16]) -> Option<(i16, f64)> {
-        let (mode, count) = values.iter().fold(None, |best: Option<(i16, usize)>, &value| {
-            let count = values.iter().filter(|other| **other == value).count();
-            match best {
-                None => Some((value, count)),
-                Some((_, candidate_count)) if count > candidate_count => Some((value, count)),
-                _ => best,
-            }
-        })?;
+        let (mode, count) = values
+            .iter()
+            .fold(None, |best: Option<(i16, usize)>, &value| {
+                let count = values.iter().filter(|other| **other == value).count();
+                match best {
+                    None => Some((value, count)),
+                    Some((_, candidate_count)) if count > candidate_count => Some((value, count)),
+                    _ => best,
+                }
+            })?;
         Some((mode, count as f64 / values.len() as f64))
     }
 
@@ -316,16 +318,27 @@ mod tests {
         for _ in 0..3 {
             learner.observe_diff(3);
         }
-        assert_eq!(learner.estimate(), Some(3), "three identical diffs must pin the mode to 3");
+        assert_eq!(
+            learner.estimate(),
+            Some(3),
+            "three identical diffs must pin the mode to 3"
+        );
         assert!(learner.confidence() > 0.0 && learner.confidence() <= 1.0);
-        assert!(learner.revision_count() >= 1, "the first estimate change is a revision");
+        assert!(
+            learner.revision_count() >= 1,
+            "the first estimate change is a revision"
+        );
     }
 
     #[test]
     fn advertised_only() {
         let mut learner = StepLearner::new();
         learner.observe_advertised(5);
-        assert_eq!(learner.estimate(), Some(5), "a lone advertised channel sets the estimate");
+        assert_eq!(
+            learner.estimate(),
+            Some(5),
+            "a lone advertised channel sets the estimate"
+        );
     }
 
     #[test]
@@ -348,8 +361,16 @@ mod tests {
         learner.observe_advertised(8);
         // 0.6*8 + 0.4*2 = 5.6 -> 6, distinct from a naive last-write-wins (8)
         // and from ignoring the weight (2).
-        assert_eq!(learner.estimate(), Some(6), "EWMA must blend, not overwrite");
-        assert_eq!(learner.revision_count(), 2, "each distinct change is one revision");
+        assert_eq!(
+            learner.estimate(),
+            Some(6),
+            "EWMA must blend, not overwrite"
+        );
+        assert_eq!(
+            learner.revision_count(),
+            2,
+            "each distinct change is one revision"
+        );
     }
 
     #[test]
@@ -463,7 +484,11 @@ mod tests {
             detector.observe_port(port);
         }
         assert_eq!(detector.pattern(), DirectionPattern::Forward);
-        assert_eq!(detector.suggest_window(2), 2, "forward must not widen the window");
+        assert_eq!(
+            detector.suggest_window(2),
+            2,
+            "forward must not widen the window"
+        );
     }
 
     #[test]
@@ -473,7 +498,11 @@ mod tests {
             detector.observe_port(port);
         }
         assert_eq!(detector.pattern(), DirectionPattern::Reverse);
-        assert_eq!(detector.suggest_window(2), 3, "reverse must widen the window by one");
+        assert_eq!(
+            detector.suggest_window(2),
+            3,
+            "reverse must widen the window by one"
+        );
     }
 
     #[test]
@@ -483,7 +512,11 @@ mod tests {
             detector.observe_port(port);
         }
         assert_eq!(detector.pattern(), DirectionPattern::Mixed);
-        assert_eq!(detector.suggest_window(2), 2, "mixed must keep the window unchanged");
+        assert_eq!(
+            detector.suggest_window(2),
+            2,
+            "mixed must keep the window unchanged"
+        );
     }
 
     #[test]

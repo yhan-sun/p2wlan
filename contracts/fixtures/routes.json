@@ -1,4 +1,5 @@
 {
+  "contractVersion": 1,
   "interface": "p2wlan0",
   "mtu": 1420,
   "healthy": true,

@@ -1248,7 +1248,10 @@ mod tests {
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         assert!(matches!(model.kind, PortModelKind::FixedStep { step: 1 }));
         let predicted = predict_ports_with_learning(&model, 45392, 0, 0, Some(7), false);
-        assert_eq!(predicted[0].port, 45399, "the learned estimate must override the model step");
+        assert_eq!(
+            predicted[0].port, 45399,
+            "the learned estimate must override the model step"
+        );
         assert_eq!(predicted[0].reason, PredictionReason::TopPrediction);
         assert_eq!(predicted[0].rank, 0);
     }
@@ -1259,7 +1262,10 @@ mod tests {
         // existing predictor across every linear + periodic + stable shape.
         let cases = [
             (build_model(&[45390, 45391, 45392], Some(ip()), 1000), 45392),
-            (build_model(&[1000, 1001, 1000, 1001, 1000, 1001], Some(ip()), 1000), 1001),
+            (
+                build_model(&[1000, 1001, 1000, 1001, 1000, 1001], Some(ip()), 1000),
+                1001,
+            ),
             (build_model(&[4483, 4483, 4483], Some(ip()), 1000), 4483),
             (build_model(&[45390, 45391, 45393], Some(ip()), 1000), 45393),
         ];
@@ -1281,12 +1287,12 @@ mod tests {
         assert_eq!(model.confidence, 95);
         let plain = predict_ports_with_learning(&model, 45392, 0, 0, None, false);
         let widened = predict_ports_with_learning(&model, 45392, 0, 0, None, true);
-        assert_eq!(plain.len(), 6, "95-confidence fixed step has a 6-wide base window");
         assert_eq!(
-            widened.len(),
-            12,
-            "reverse must widen the 6 tier to 12"
+            plain.len(),
+            6,
+            "95-confidence fixed step has a 6-wide base window"
         );
+        assert_eq!(widened.len(), 12, "reverse must widen the 6 tier to 12");
         // The widened window is a strict superset: the first six stay identical.
         assert_eq!(
             plain.iter().map(|c| c.port).collect::<Vec<_>>(),
@@ -1331,11 +1337,22 @@ mod tests {
             "{:?}",
             model.kind
         );
-        assert_eq!(model.confidence, 86, "a spread-1 same-direction linear is the 12 tier");
+        assert_eq!(
+            model.confidence, 86,
+            "a spread-1 same-direction linear is the 12 tier"
+        );
         let plain = predict_ports_with_learning(&model, 1003, 0, 0, None, false);
         let widened = predict_ports_with_learning(&model, 1003, 0, 0, None, true);
-        assert_eq!(plain.len(), 12, "86-confidence linear has a 12-wide base window");
-        assert_eq!(widened.len(), MAX_PREDICTED_PORTS, "reverse must widen 12 to the 24 cap");
+        assert_eq!(
+            plain.len(),
+            12,
+            "86-confidence linear has a 12-wide base window"
+        );
+        assert_eq!(
+            widened.len(),
+            MAX_PREDICTED_PORTS,
+            "reverse must widen 12 to the 24 cap"
+        );
     }
 
     #[test]
@@ -1343,7 +1360,10 @@ mod tests {
         // last 65534, learned step +3 -> top candidate wraps to port 1.
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         let predicted = predict_ports_with_learning(&model, 65534, 0, 0, Some(3), false);
-        assert_eq!(predicted[0].port, 1, "the learned-step top candidate must wrap mod 65536");
+        assert_eq!(
+            predicted[0].port, 1,
+            "the learned-step top candidate must wrap mod 65536"
+        );
     }
 
     #[test]
@@ -1357,4 +1377,3 @@ mod tests {
         );
     }
 }
-

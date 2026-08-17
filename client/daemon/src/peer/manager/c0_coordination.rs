@@ -233,6 +233,17 @@ impl PeerManager {
             })
             .unwrap_or(0)
     }
+
+    /// Test-only: install a pre-built ledger for `(peer, generation)` so a
+    /// budget test can start from a seeded state without simulating N real
+    /// punch windows (paired with `C0PairLedger::seeded_exhausted`).
+    #[cfg(test)]
+    pub(crate) async fn c0_set_ledger(&self, peer_id: &str, generation: u64, ledger: C0PairLedger) {
+        self.c0_pair_ledgers
+            .write()
+            .await
+            .insert((peer_id.to_string(), generation), ledger);
+    }
 }
 
 impl C0PairLedger {

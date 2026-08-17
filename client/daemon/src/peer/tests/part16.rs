@@ -244,3 +244,56 @@ async fn c0_retry_after_hit_is_rejected_without_double_record() {
     assert_eq!(ledger.attempted_count(), 2, "no third pair recorded");
     assert_eq!(manager.c0_event_count("peer-retry", "c0_attempt").await, 2);
 }
+
+#[tokio::test]
+async fn c0_seeded_exhausted_ledger_blocks_admission() {
+    // A ledger seeded at the exact budget cap (no real punch windows) must
+    // block admission immediately and never record another pair.
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:51006".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-seeded", "10.20.0.3", endpoint))
+        .await;
+    let gen = manager.current_network_generation().await;
+
+    let attempts: Vec<C0PairAttempt> = (0..MAX_C0_PAIRS_PER_GENERATION)
+        .map(|i| C0PairAttempt {
+            pair_index: i as u32,
+            epoch: i as u64,
+            local_fresh_endpoint: format!("10.0.0.1:46{i:03}"),
+            remote_fresh_endpoint: format!("10.0.0.2:46{i:03}"),
+            punch_at_ms: None,
+            outcome: C0PairOutcome::Miss,
+        })
+        .collect();
+    manager
+        .c0_set_ledger("peer-seeded", gen, C0PairLedger::seeded_exhausted(attempts))
+        .await;
+
+    assert!(
+        !manager.c0_pair_admission("peer-seeded", gen).await,
+        "a seeded full ledger must deny admission"
+    );
+    let exhausted = manager
+        .c0_pair_attempt(
+            "peer-seeded",
+            gen,
+            MAX_C0_PAIRS_PER_GENERATION as u64,
+            "10.0.0.1:46999",
+            "10.0.0.2:46999",
+            None,
+            C0PairOutcome::Miss,
+        )
+        .await;
+    assert!(exhausted, "attempt on a seeded full ledger reports stop");
+    let ledger = manager
+        .c0_ledger_snapshot("peer-seeded", gen)
+        .await
+        .expect("ledger present");
+    assert_eq!(
+        ledger.attempted_count(),
+        MAX_C0_PAIRS_PER_GENERATION,
+        "seeded ledger must not grow beyond the cap"
+    );
+    assert!(ledger.is_exhausted(), "seeded ledger is exhausted");
+}

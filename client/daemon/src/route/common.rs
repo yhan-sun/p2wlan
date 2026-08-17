@@ -180,6 +180,7 @@ impl RouteManager {
     ///   - `Missing`   -> add it;
     ///   - `Conflict`  -> remove then re-add (best effort);
     ///   - `Unknown`   -> no-op (cannot safely decide).
+    ///
     /// Returns the post-repair observation.
     pub fn repair_overlay_route(&self, cidr: &str) -> RouteObservation {
         let initial = self.describe_overlay_route(cidr);

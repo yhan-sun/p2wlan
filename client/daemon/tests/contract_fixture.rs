@@ -5,26 +5,35 @@
 //! drops, or retypes a contract field, deserialization here fails so the two
 //! sides cannot drift silently.
 
-use p2pnet_daemon::diagnostics::{derive_ready_phase, DiagnosticsSnapshot, StatusEvent};
-use p2pnet_daemon::route::{RouteObservation, RouteState};
+use p2pnet_daemon::diagnostics::{
+    derive_ready_phase, EventsResponse, PeersPageResponse, PermissionPreflightResponse,
+    RouteRepairResponse, RoutesResponse, StatusResponse,
+};
+use p2pnet_daemon::route::RouteState;
 
 fn fixture_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/fixtures")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/fixtures")
 }
 
 fn read_fixture(name: &str) -> String {
     let path = fixture_dir().join(name);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("failed to read shared contract fixture {path:?}: {e}")
-    })
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read shared contract fixture {path:?}: {e}"))
 }
 
 #[test]
 fn status_fixture_deserializes_into_daemon_snapshot() {
     let raw = read_fixture("status.json");
-    let snapshot: DiagnosticsSnapshot = serde_json::from_str(&raw)
-        .expect("status.json must deserialize into the daemon DiagnosticsSnapshot");
+    let response: StatusResponse = serde_json::from_str(&raw)
+        .expect("status.json must deserialize into the production StatusResponse");
+    assert_eq!(response.contract_version, 1);
+    let snapshot = response.snapshot;
+    let expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let actual = serde_json::to_value(StatusResponse::from_snapshot(snapshot.clone())).unwrap();
+    assert_eq!(
+        actual, expected,
+        "status serializer must match the shared fixture"
+    );
 
     assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(snapshot.node_id, "node-a");
@@ -70,14 +79,21 @@ fn status_fixture_deserializes_into_daemon_snapshot() {
 #[test]
 fn events_fixture_deserializes_into_status_events() {
     let raw = read_fixture("events.json");
-    let body: serde_json::Value =
-        serde_json::from_str(&raw).expect("events.json must be valid JSON");
-    let revision = body["revision"]
-        .as_u64()
-        .expect("events.json must carry a revision");
-    assert!(revision >= 3);
-    let events: Vec<StatusEvent> = serde_json::from_value(body["events"].clone())
-        .expect("events[] must deserialize into the daemon StatusEvent struct");
+    let response: EventsResponse =
+        serde_json::from_str(&raw).expect("events.json must deserialize into EventsResponse");
+    assert_eq!(response.contract_version, 1);
+    let expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let actual = serde_json::to_value(EventsResponse::new(
+        response.revision,
+        response.events.clone(),
+    ))
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "events serializer must match the shared fixture"
+    );
+    assert!(response.revision >= 3);
+    let events = response.events;
     assert_eq!(events.len(), 3);
     let mut seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
     seqs.sort_unstable();
@@ -89,44 +105,60 @@ fn events_fixture_deserializes_into_status_events() {
 #[test]
 fn routes_fixture_deserializes_into_route_observations() {
     let raw = read_fixture("routes.json");
-    let body: serde_json::Value =
-        serde_json::from_str(&raw).expect("routes.json must be valid JSON");
-    assert_eq!(body["interface"], "p2wlan0");
-    assert_eq!(body["healthy"], true);
-    assert_eq!(body["conflictCount"], 0);
-
-    let entries: Vec<RouteObservation> = serde_json::from_value(body["entries"].clone())
-        .expect("entries[] must deserialize into the daemon RouteObservation struct");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].cidr, "10.20.0.0/16");
-    assert_eq!(entries[0].state, RouteState::Installed);
-    assert_eq!(entries[0].expected_interface, "p2wlan0");
-    assert!(entries[0].owned);
+    let response: RoutesResponse =
+        serde_json::from_str(&raw).expect("routes.json must deserialize into RoutesResponse");
+    assert_eq!(response.contract_version, 1);
+    let expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let actual = serde_json::to_value(response.clone()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "routes serializer must match the shared fixture"
+    );
+    assert_eq!(response.interface, "p2wlan0");
+    assert!(response.healthy);
+    assert_eq!(response.conflict_count, 0);
+    assert_eq!(response.entries.len(), 1);
+    assert_eq!(response.entries[0].cidr, "10.20.0.0/16");
+    assert_eq!(response.entries[0].state, RouteState::Installed);
+    assert_eq!(response.entries[0].expected_interface, "p2wlan0");
+    assert!(response.entries[0].owned);
 }
 
 #[test]
 fn route_repair_fixture_never_restarts_daemon() {
     let raw = read_fixture("route_repair.json");
-    let body: serde_json::Value =
-        serde_json::from_str(&raw).expect("route_repair.json must be valid JSON");
+    let response: RouteRepairResponse = serde_json::from_str(&raw)
+        .expect("route_repair.json must deserialize into RouteRepairResponse");
+    let expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let actual = serde_json::to_value(response.clone()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "route repair serializer must match the shared fixture"
+    );
     // Repair is in-place only; the contract MUST keep restartedDaemon false.
-    assert_eq!(body["restartedDaemon"], false);
-    assert_eq!(body["changed"], true);
-    assert_eq!(body["after"], "installed");
-    assert_eq!(body["reason"], "installed");
-    // All contract keys are present so a Rust-side rename is caught.
-    for key in [
-        "cidr",
-        "changed",
-        "attempted",
-        "before",
-        "after",
-        "reason",
-        "restartedDaemon",
-    ] {
-        assert!(
-            body.get(key).is_some(),
-            "route_repair fixture is missing contract key {key}"
-        );
-    }
+    assert!(!response.restarted_daemon);
+    assert!(response.changed);
+    assert_eq!(response.after, "installed");
+    assert_eq!(response.reason, "installed");
+}
+
+#[test]
+fn peers_page_fixture_deserializes_into_production_response() {
+    let raw = read_fixture("peers_page.json");
+    let response: PeersPageResponse =
+        serde_json::from_str(&raw).expect("peers_page.json must use PeersPageResponse");
+    assert_eq!(response.contract_version, 1);
+    assert_eq!(response.total, response.peers.len());
+    assert!(response.peers.is_empty());
+}
+
+#[test]
+fn permission_preflight_fixture_deserializes_into_production_response() {
+    let raw = read_fixture("permission_preflight.json");
+    let response: PermissionPreflightResponse = serde_json::from_str(&raw)
+        .expect("permission_preflight.json must use PermissionPreflightResponse");
+    assert_eq!(response.contract_version, 1);
+    assert_eq!(response.state, "runtimeVerificationRequired");
+    assert_eq!(response.can_create_tun, None);
+    assert_eq!(response.can_modify_routes, Some(true));
 }
