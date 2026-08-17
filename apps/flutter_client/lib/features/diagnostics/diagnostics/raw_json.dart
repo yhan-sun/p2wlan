@@ -17,6 +17,14 @@ class _RawJsonState extends State<_RawJson> {
   String? _cachedPrettyJson;
 
   @override
+  void dispose() {
+    // Release the raw payload cache when leaving the page (E-03).
+    _cachedSnapshot = null;
+    _cachedPrettyJson = null;
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
@@ -26,7 +34,17 @@ class _RawJsonState extends State<_RawJson> {
         runSpacing: 8,
         children: [
           OutlinedButton.icon(
-            onPressed: () => setState(() => _expanded = !_expanded),
+            onPressed: () {
+              setState(() {
+                _expanded = !_expanded;
+                // Release the (potentially large) redacted pretty string when
+                // collapsing so the collapsed panel holds no raw payload (E-03).
+                if (!_expanded) {
+                  _cachedSnapshot = null;
+                  _cachedPrettyJson = null;
+                }
+              });
+            },
             icon: Icon(
               _expanded
                   ? Icons.unfold_less_outlined
