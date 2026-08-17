@@ -13,25 +13,13 @@ async fn main() -> p2pnet_daemon::Result<()> {
     // credentials out of `ps`, shell history, and the audited daemon command
     // line. It is the only supported way to supply a control-plane token (the
     // old `--token` flag was removed).
-    let token_file_value = cli
-        .token_file
-        .as_ref()
-        .map(|path| {
-            std::fs::read_to_string(path)
-                .map_err(|e| DaemonError::Config(format!("failed to read token file {}: {e}", path.display())))
-                .and_then(|value| {
-                    let token = value.trim();
-                    if token.is_empty() {
-                        Err(DaemonError::Config(format!(
-                            "token file {} is empty",
-                            path.display()
-                        )))
-                    } else {
-                        Ok(token.to_string())
-                    }
-                })
-        })
-        .transpose()?;
+    let token_file_value = if let Some(path) = cli.token_file.as_ref() {
+        Some(read_launch_token_file(path)?)
+    } else if cli.token_stdin {
+        Some(read_launch_token_stdin()?)
+    } else {
+        None
+    };
 
     // --build-info must print PURE JSON on stdout before any logging is
     // initialized, so build scripts and CI can parse it verbatim.
@@ -98,7 +86,14 @@ async fn main() -> p2pnet_daemon::Result<()> {
         }
         let config_path = &cli.config;
         config.config_path = Some(config_path.clone());
-        config.save_to_file(config_path)?;
+        let mut persisted = config.clone();
+        if token_file_value.is_some() {
+            // A one-time launch credential is process input, never daemon
+            // configuration. Persist an empty field and keep the real value
+            // only in the in-memory runtime config.
+            persisted.control.auth_token.clear();
+        }
+        persisted.save_to_file(config_path)?;
         info!("Config saved to {}", config_path.display());
         info!("Node ID: {}", config.node.node_id);
         return Ok(());
@@ -130,7 +125,11 @@ async fn main() -> p2pnet_daemon::Result<()> {
             config.control.auth_token = token.clone();
         }
         config.config_path = Some(config_path.clone());
-        config.save_to_file(config_path)?;
+        let mut persisted = config.clone();
+        if token_file_value.is_some() {
+            persisted.control.auth_token.clear();
+        }
+        persisted.save_to_file(config_path)?;
         info!("Saved default config to {}", config_path.display());
         config
     };
@@ -146,15 +145,9 @@ async fn main() -> p2pnet_daemon::Result<()> {
     config.diagnostics.log_path = cli.log_file.clone();
 
     if cli.status {
-        print_status(&config, &cli).await?;
+        print_status(&config, &cli, config_path).await?;
         return Ok(());
     }
-
-    // Generate the per-process diagnostics mutation token and write it to a
-    // 0600 file for local callers (Flutter / tray). It never appears on the
-    // command line or in the persisted config, and it is removed on graceful
-    // shutdown below.
-    let diagnostics_auth_path = prepare_diagnostics_auth(&mut config, config_path);
 
     // Keep one owner for the TUN, control session, and UDP socket set associated
     // with this device identity. A duplicate daemon can consume the other
@@ -164,6 +157,11 @@ async fn main() -> p2pnet_daemon::Result<()> {
         "Acquired daemon instance lock at {}",
         instance_lock.path.display()
     );
+
+    // The instance lock must be held before a diagnostics session file is
+    // refreshed. A second daemon therefore cannot overwrite or remove the
+    // first daemon's active session secret.
+    let _diagnostics_auth = DiagnosticsAuthGuard::prepare(&mut config, config_path)?;
 
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);
@@ -255,107 +253,147 @@ async fn main() -> p2pnet_daemon::Result<()> {
     }
 
     info!("Shutdown complete.");
-    if let Some(path) = diagnostics_auth_path {
-        remove_diagnostics_auth(&path);
-    }
     Ok(())
 }
 
-/// Generate a fresh random per-process diagnostics mutation token and write it
-/// to a 0600 file next to the daemon's log file (falling back to the config
-/// directory). Returns the file path for shutdown cleanup, or `None` when the
-/// diagnostics endpoint is disabled.
-fn prepare_diagnostics_auth(config: &mut Config, config_path: &Path) -> Option<PathBuf> {
-    if !config.diagnostics.enabled {
-        return None;
-    }
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let token = hex::encode(bytes);
-    config.diagnostics.auth_token = Some(token.clone());
-
-    let dir = config
-        .diagnostics
-        .log_path
-        .as_ref()
-        .and_then(|log| log.parent().map(Path::to_path_buf))
-        .or_else(|| config_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let path = dir.join("p2wlan-daemon.diag-auth");
-
-    let result = std::fs::create_dir_all(&dir)
-        .and_then(|_| {
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(token.as_bytes())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = file.metadata()?.permissions();
-                perms.set_mode(0o600);
-                file.set_permissions(perms)?;
-            }
-            Ok(())
-        });
-    match result {
-        Ok(()) => {
-            config.diagnostics.auth_token_path = Some(path.clone());
-            info!(
-                "Diagnostics mutation auth token written to {}",
-                path.display()
-            );
-            Some(path)
-        }
-        Err(e) => {
-            warn!(
-                "Failed to write diagnostics auth token to {}: {e}; mutations will fail closed",
-                path.display()
-            );
-            // Fail closed: no token file means the server rejects all POSTs.
-            config.diagnostics.auth_token = None;
-            None
-        }
-    }
-}
-
-/// Best-effort removal of the per-process diagnostics auth token file.
-fn remove_diagnostics_auth(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => info!("Removed diagnostics auth token file {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!(
-            "Failed to remove diagnostics auth token file {}: {e}",
-            path.display()
-        ),
-    }
-}
-
-async fn print_status(config: &Config, cli: &Cli) -> p2pnet_daemon::Result<()> {
+async fn print_status(
+    config: &Config,
+    cli: &Cli,
+    config_path: &std::path::Path,
+) -> p2pnet_daemon::Result<()> {
     let url = cli
         .diagnostics_url
         .clone()
         .unwrap_or_else(|| format!("http://{}/status", config.diagnostics.bind));
 
-    let res = reqwest::get(&url)
-        .await
-        .map_err(|e| DaemonError::Network(format!("failed to query diagnostics at {url}: {e}")))?;
+    let auth_dir = cli
+        .log_file
+        .as_ref()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let auth_path = auth_dir.join("p2wlan-daemon.diag-auth");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|error| DaemonError::Network(format!("failed to create diagnostics client: {error}")))?;
 
-    let status = res.status();
-    let body = res.text().await.map_err(|e| {
-        DaemonError::Network(format!(
-            "failed to read diagnostics response from {url}: {e}"
-        ))
-    })?;
-
-    if !status.is_success() {
-        return Err(DaemonError::Network(format!(
-            "diagnostics endpoint {url} returned HTTP {status}: {body}"
-        )));
-    }
+    let body = 'request: {
+        for attempt in 0..2 {
+            let token = std::fs::read_to_string(&auth_path)
+                .map_err(|_| DaemonError::Network("diagnostics session token file is missing; daemon session may have changed".to_string()))?;
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(DaemonError::Network(
+                    "diagnostics session token file is empty; daemon session may have changed"
+                        .to_string(),
+                ));
+            }
+            let response = client
+                .get(&url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|error| {
+                    DaemonError::Network(format!("failed to query diagnostics at {url}: {error}"))
+                })?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                continue;
+            }
+            let status = response.status();
+            let body = response.text().await.map_err(|error| {
+                DaemonError::Network(format!(
+                    "failed to read diagnostics response from {url}: {error}"
+                ))
+            })?;
+            if !status.is_success() {
+                return Err(DaemonError::Network(format!(
+                    "diagnostics endpoint {url} returned HTTP {status}: {body}"
+                )));
+            }
+            break 'request body;
+        }
+        return Err(DaemonError::Network(
+            "diagnostics session changed; daemon returned HTTP 401 twice".to_string(),
+        ));
+    };
 
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
         Err(_) => println!("{body}"),
     }
     Ok(())
+}
+
+const MAX_LAUNCH_TOKEN_BYTES: usize = 16 * 1024;
+
+fn read_launch_token_file(path: &std::path::Path) -> p2pnet_daemon::Result<String> {
+    let result = (|| -> std::io::Result<String> {
+        restrict_auth_file(path)?;
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "launch token file is not owner-only",
+                ));
+            }
+        }
+        if metadata.len() > MAX_LAUNCH_TOKEN_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launch token file is too large",
+            ));
+        }
+        let value = std::fs::read_to_string(path)?;
+        let token = value.trim();
+        if token.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launch token file is empty",
+            ));
+        }
+        Ok(token.to_string())
+    })();
+    let remove_result = std::fs::remove_file(path);
+    if let Err(error) = remove_result {
+        return Err(DaemonError::Config(format!(
+            "failed to remove one-time launch token file {}: {error}",
+            path.display()
+        )));
+    }
+    result.map_err(|error| {
+        DaemonError::Config(format!(
+            "failed to read one-time launch token file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_launch_token_stdin() -> p2pnet_daemon::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(MAX_LAUNCH_TOKEN_BYTES + 1);
+    let read_result = std::io::stdin()
+        .take((MAX_LAUNCH_TOKEN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes);
+    let result = read_result
+        .map_err(|error| DaemonError::Config(format!("failed to read token from stdin: {error}")))
+        .and_then(|size| {
+            if size > MAX_LAUNCH_TOKEN_BYTES {
+                return Err(DaemonError::Config(
+                    "stdin launch token exceeds the 16 KiB limit".to_string(),
+                ));
+            }
+            let value = String::from_utf8(std::mem::take(&mut bytes))
+                .map_err(|_| DaemonError::Config("stdin launch token is not valid UTF-8".to_string()))?;
+            let token = value.trim();
+            if token.is_empty() {
+                return Err(DaemonError::Config("stdin launch token is empty".to_string()));
+            }
+            Ok(token.to_string())
+        });
+    bytes.fill(0);
+    result
 }

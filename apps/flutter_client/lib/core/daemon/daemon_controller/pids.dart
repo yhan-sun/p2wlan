@@ -176,7 +176,7 @@ extension DaemonControllerPids on DaemonController {
               'fi',
           'p2wlan 需要管理员权限停止后台 p2wlan-daemon。',
         );
-        return _waitForDaemonPidExit(pid, const Duration(seconds: 3));
+        return await _waitForDaemonPidExit(pid, const Duration(seconds: 3));
       } catch (_) {
         return false;
       }
@@ -201,7 +201,9 @@ extension DaemonControllerPids on DaemonController {
     }
     // The launch token file is also removed once the daemon is stopped, so no
     // credential remains on disk after shutdown.
-    await _deleteLaunchTokenFile();
+    try {
+      await cleanupStaleLaunchTokenFiles(_defaultLogDir());
+    } catch (_) {}
   }
 
   bool _isRootUser() {

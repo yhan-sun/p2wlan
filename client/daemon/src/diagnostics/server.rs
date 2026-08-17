@@ -97,8 +97,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
 
     let request = String::from_utf8_lossy(&buffer[..n]);
     // Native clients only (Flutter / tray / CLI): no browser origin is ever
-    // allowed. The deleted React/Vite web console no longer exists, and no
-    // other web origin is trusted, so CORS headers are never emitted.
+    // allowed. No web origin is trusted, so CORS headers are never emitted.
     let cors_origin = no_browser_cors(&request);
     let (method, target) = request
         .lines()
@@ -113,12 +112,17 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         .unwrap_or(("GET", "/"));
     let (path, query) = split_request_target(target);
 
-    // Every POST endpoint mutates local system state (speedtest traffic,
-    // route changes, shutdown) or verifies the live routing table. A local
-    // process without the per-process diagnostics token must not be able to
-    // trigger any of them, so all POST requests are authenticated. Read-only
-    // GET endpoints (status/logs/events/peers) stay open to the UI.
-    if method == "POST" && !auth_matches(context.auth_token.as_deref(), bearer_token(&request)) {
+    let public = is_public_endpoint(method, path);
+    let authenticated = auth_matches(context.auth_token.as_deref(), bearer_token(&request));
+    if !public && !authenticated {
+        write_unauthorized(&mut stream, cors_origin).await?;
+        return Ok(());
+    }
+
+    // A valid session secret does not turn an unsupported method/path pair
+    // into an operation. Keep that distinction explicit for callers: 401 is
+    // authentication failure, 403 is an authenticated but disallowed action.
+    if authenticated && !is_supported_endpoint(method, path) {
         write_response(&mut stream, 403, "text/plain", "forbidden\n", cors_origin).await?;
         return Ok(());
     }
@@ -168,7 +172,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         ("GET", "/status") => {
             match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_snapshot(context)).await {
                 Ok(snapshot) => {
-                    let body = serde_json::to_string_pretty(&snapshot)?;
+                    let body = serde_json::to_string_pretty(&StatusResponse::from_snapshot(snapshot))?;
                     write_response(&mut stream, 200, "application/json", &body, cors_origin)
                         .await?;
                 }
@@ -206,12 +210,12 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let _ = context.shutdown_tx.send(true);
         }
         ("GET", "/routes") => {
-            let body = describe_overlay_routes(&context).to_string();
+            let body = serde_json::to_string_pretty(&describe_overlay_routes(&context))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("POST", "/routes/verify") => {
             // Read-only: observe the live system routing table without changing it.
-            let body = describe_overlay_routes(&context).to_string();
+            let body = serde_json::to_string_pretty(&describe_overlay_routes(&context))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("POST", "/routes/repair") => {
@@ -235,11 +239,10 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
                 .status_events
                 .wait_or_poll(since, Duration::from_secs(25))
                 .await;
-            let body = serde_json::json!({
-                "revision": context.status_events.current_seq(),
-                "events": events,
-            })
-            .to_string();
+            let body = serde_json::to_string_pretty(&EventsResponse::new(
+                context.status_events.current_seq(),
+                events,
+            ))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("GET", "/peers") => {
@@ -259,13 +262,12 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             };
             let page: Vec<_> = all.iter().skip(start).take(limit).cloned().collect();
             let next_cursor = page.last().map(|p| p.node_id.clone());
-            let body = serde_json::json!({
-                "peers": page,
-                "total": total,
-                "cursor": cursor,
-                "next_cursor": next_cursor,
-            })
-            .to_string();
+            let body = serde_json::to_string_pretty(&PeersPageResponse::new(
+                page,
+                total,
+                cursor,
+                next_cursor,
+            ))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("GET", "/logs/tail") => {
@@ -314,25 +316,25 @@ fn split_request_target(target: &str) -> (&str, Option<&str>) {
 /// Authoritative overlay-route state for `/routes` and `/routes/verify`.
 /// Reports the TUN interface, configured MTU, and the live system-route state
 /// for the overlay CIDR — computed from the routing table, never inferred.
-fn describe_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
+fn describe_overlay_routes(context: &DiagnosticsContext) -> RoutesResponse {
     let cidr = context.config.network.cidr.clone();
     let obs = context.route_manager.describe_overlay_route(&cidr);
     let healthy = obs.state == crate::route::RouteState::Installed;
     let conflict_count = usize::from(obs.state == crate::route::RouteState::Conflict);
-    let entries = vec![serde_json::json!({
-        "cidr": obs.cidr,
-        "expected_interface": obs.expected_interface,
-        "actual_interface": obs.actual_interface,
-        "state": obs.state.as_str(),
-        "owned": obs.owned,
-    })];
-    serde_json::json!({
-        "interface": obs.expected_interface,
-        "mtu": context.config.network.mtu,
-        "healthy": healthy,
-        "conflictCount": conflict_count,
-        "entries": entries,
-    })
+    let entries = vec![RouteEntryResponse {
+        cidr: obs.cidr,
+        expected_interface: obs.expected_interface.clone(),
+        actual_interface: obs.actual_interface,
+        state: obs.state,
+        owned: obs.owned,
+    }];
+    RoutesResponse::new(
+        obs.expected_interface,
+        context.config.network.mtu,
+        healthy,
+        conflict_count,
+        entries,
+    )
 }
 
 /// Compute the `/routes/repair` report and HTTP status from the before/after
@@ -343,7 +345,7 @@ fn describe_overlay_routes(context: &DiagnosticsContext) -> serde_json::Value {
 fn route_repair_report(
     before: crate::route::RouteObservation,
     after: crate::route::RouteObservation,
-) -> (u16, serde_json::Value) {
+) -> (u16, RouteRepairResponse) {
     use crate::route::RouteState;
     let attempted = matches!(before.state, RouteState::Missing | RouteState::Conflict);
     let changed = before.state != RouteState::Installed && after.state == RouteState::Installed;
@@ -355,25 +357,51 @@ fn route_repair_report(
     };
     (
         status,
-        serde_json::json!({
-            "cidr": after.cidr,
-            "changed": changed,
-            "attempted": attempted,
-            "before": before.state.as_str(),
-            "after": after.state.as_str(),
-            "reason": reason,
-            "restartedDaemon": false,
-        }),
+        RouteRepairResponse::new(
+            after.cidr,
+            changed,
+            attempted,
+            before.state.as_str().to_string(),
+            after.state.as_str().to_string(),
+            reason.to_string(),
+        ),
     )
 }
 
 /// The diagnostics endpoint is loopback-bound and consumed exclusively by
 /// native clients (Flutter / tray / CLI), which do not send an `Origin` header.
-/// The deleted React/Vite web console was the only browser client, so no
-/// origin is ever allowed and no `Access-Control-Allow-Origin` header is ever
-/// emitted.
+/// No browser origin is trusted and no `Access-Control-Allow-Origin` header is
+/// ever emitted.
 fn no_browser_cors(_request: &str) -> Option<&str> {
     None
+}
+
+fn is_public_endpoint(method: &str, path: &str) -> bool {
+    method == "GET" && matches!(path, "/health" | "/status.version")
+}
+
+fn is_supported_endpoint(method: &str, path: &str) -> bool {
+    match (method, path) {
+        ("GET", "/health" | "/status.version" | "/status.runtime" | "/status")
+        | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail")
+        | ("POST", "/speedtest" | "/shutdown" | "/routes/verify" | "/routes/repair") => {
+            true
+        }
+        ("GET", path) if path.starts_with("/status/peer/") => true,
+        _ => false,
+    }
+}
+
+async fn write_unauthorized(stream: &mut TcpStream, cors_origin: Option<&str>) -> Result<()> {
+    write_response_with_headers(
+        stream,
+        401,
+        "text/plain",
+        "unauthorized\n",
+        cors_origin,
+        "WWW-Authenticate: Bearer\r\n",
+    )
+    .await
 }
 
 /// Extract a `Bearer <token>` value from the request's `Authorization` header,

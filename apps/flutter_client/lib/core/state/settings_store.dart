@@ -10,9 +10,7 @@ import '../security/secure_token_repository.dart';
 class SettingsStore extends ChangeNotifier {
   SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
     : _settingsFileOverride = settingsFile {
-    _tokenRepository =
-        tokenRepository ??
-        FileSecureTokenRepository(File('${_settingsFile().path}.token'));
+    _tokenRepository = tokenRepository ?? PlatformSecureTokenRepository();
   }
 
   final File? _settingsFileOverride;
@@ -29,6 +27,7 @@ class SettingsStore extends ChangeNotifier {
   String? get configPath => _configPath;
 
   Future<void> load() async {
+    AppSettings? parsedSettings;
     try {
       final file = _settingsFile();
       _configPath = file.path;
@@ -38,23 +37,30 @@ class SettingsStore extends ChangeNotifier {
         final decoded = jsonDecode(raw);
         if (decoded is Map<String, dynamic>) {
           final loadedSettings = AppSettings.fromJson(decoded);
-          // One-time secure-token migration: a legacy settings file may carry
-          // the token in JSON. Move it into the secure store (verifying by
-          // re-read) before we persist, and keep the effective value in memory.
-          final legacyToken = loadedSettings.authToken.trim();
-          if (legacyToken.isNotEmpty) {
+          parsedSettings = loadedSettings;
+
+          // Migrate every legacy spelling only after checking whether a secure
+          // value already exists. Never overwrite an established secure value.
+          final legacyToken = _legacyToken(decoded, loadedSettings);
+          final secureToken = (await _tokenRepository.read())?.trim() ?? '';
+          var effectiveToken = secureToken;
+          if (effectiveToken.isEmpty && legacyToken.isNotEmpty) {
             await _tokenRepository.write(legacyToken);
+            final verified = (await _tokenRepository.read())?.trim() ?? '';
+            if (verified != legacyToken) {
+              throw const SecureTokenStorageException('系统安全存储写入校验失败，旧配置保持不变。');
+            }
+            effectiveToken = legacyToken;
           }
-          final effectiveToken = legacyToken.isNotEmpty
-              ? legacyToken
-              : (await _tokenRepository.read()) ?? '';
           _settings = (await _migrateSettings(
             loadedSettings,
           )).copyWith(authToken: effectiveToken);
           final migrated =
               jsonEncode(_persistedSettings().toJson()) !=
               jsonEncode(_stripToken(loadedSettings.toJson()));
-          if (sourceFile.path != file.path || migrated) {
+          if (sourceFile.path != file.path ||
+              migrated ||
+              _hasLegacyFields(decoded)) {
             await _writeSettingsFile(file);
           }
         }
@@ -66,7 +72,9 @@ class SettingsStore extends ChangeNotifier {
       _lastError = null;
     } catch (error) {
       _lastError = 'Failed to load local settings: $error';
-      _settings = const AppSettings();
+      // Keep the parsed legacy value in memory when secure migration fails so
+      // the caller cannot mistake a failed migration for an empty credential.
+      _settings = parsedSettings ?? const AppSettings();
     } finally {
       _loaded = true;
       notifyListeners();
@@ -238,9 +246,28 @@ class SettingsStore extends ChangeNotifier {
     // Persist non-credential settings only. The auth token lives in the secure
     // repository, never in this JSON (it can be backed up or shipped in support
     // bundles), so it is always written blank.
-    await file.writeAsString(
-      const JsonEncoder.withIndent('  ').convert(_persistedSettings().toJson()),
+    final temp = File(
+      '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
     );
+    try {
+      await temp.writeAsString(
+        const JsonEncoder.withIndent(
+          '  ',
+        ).convert(_persistedSettings().toJson()),
+        flush: true,
+      );
+      try {
+        await temp.rename(file.path);
+      } on FileSystemException {
+        // Dart cannot replace an existing file with rename on every Windows
+        // filesystem. The temporary file is still fully flushed before this
+        // narrow fallback, and it never contains credentials.
+        if (await file.exists()) await file.delete();
+        await temp.rename(file.path);
+      }
+    } finally {
+      if (await temp.exists()) await temp.delete();
+    }
   }
 
   /// Settings as they should be written to disk: identical to the in-memory
@@ -252,6 +279,21 @@ class SettingsStore extends ChangeNotifier {
     final copy = Map<String, dynamic>.from(json);
     copy['authToken'] = '';
     return copy;
+  }
+
+  String _legacyToken(Map<String, dynamic> json, AppSettings loaded) {
+    for (final key in const ['authToken', 'auth_token', 'token']) {
+      final value = json[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+    }
+    return loaded.authToken.trim();
+  }
+
+  bool _hasLegacyFields(Map<String, dynamic> json) {
+    return json.containsKey('auth_token') ||
+        json.containsKey('token') ||
+        (json['authToken'] is String &&
+            (json['authToken'] as String).trim().isNotEmpty);
   }
 
   File? _legacySettingsFile() {

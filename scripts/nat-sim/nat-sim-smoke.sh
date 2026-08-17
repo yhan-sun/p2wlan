@@ -15,6 +15,7 @@
 #   sides complete the bidirectional encrypted overlay loopback over Relay.
 #   Direct results are reported separately as informational and must be 0.
 set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/diagnostics-auth.sh"
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # The standalone local control DB provisions only `default`; the real dual-end
@@ -238,7 +239,14 @@ fetch_required_json() {
     echo "[nat-sim] FAIL reason_code=metrics_http_500_injected url=$url" >&2
     return 1
   fi
-  if ! curl -fsS --max-time 5 "$url" -o "$output"; then
+  local curl_status=0
+  if [[ "$kind" == "status" ]]; then
+    DIAGNOSTICS_AUTH_TOKEN_FILE="$ROUND_DIR/p2wlan-daemon.diag-auth" \
+      p2wlan_diagnostics_curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+  else
+    curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+  fi
+  if [[ "$curl_status" -ne 0 ]]; then
     echo "[nat-sim] FAIL reason_code=${kind}_unavailable url=$url" >&2
     return 1
   fi
@@ -447,11 +455,11 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ -n "$SOCKET_POOL" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --socket-pool $SOCKET_POOL"; fi
   if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
 
-  P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-a.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
-    --token "$TOKEN" \
+    --token-stdin \
     --device-name node-a \
     --udp-bind 127.0.0.1:0 \
     --stun "$STUN_A" \
@@ -470,11 +478,11 @@ for round in $(seq 1 "$ROUNDS"); do
     sleep 0.25
   done
 
-  P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-b.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
-    --token "$TOKEN" \
+    --token-stdin \
     --device-name node-b \
     --udp-bind 127.0.0.1:0 \
     --stun "$STUN_B" \

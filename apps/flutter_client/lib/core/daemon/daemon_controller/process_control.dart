@@ -70,13 +70,23 @@ extension DaemonControllerProcessControl on DaemonController {
   Future<Process> _startDetached({
     required File binary,
     required List<String> args,
+    String? stdinToken,
   }) async {
-    return Process.start(
+    final process = await Process.start(
       binary.path,
       args,
-      mode: ProcessStartMode.detached,
+      mode: stdinToken == null
+          ? ProcessStartMode.detached
+          : ProcessStartMode.detachedWithStdio,
       environment: {'P2WLAN_DAEMON_BIN': binary.path},
     );
+    if (stdinToken != null) {
+      process.stdin.write('$stdinToken\n');
+      await process.stdin.close();
+      unawaited(process.stdout.drain<void>());
+      unawaited(process.stderr.drain<void>());
+    }
+    return process;
   }
 
   Future<void> _writePidMarker(String pidPath, int pid) async {

@@ -168,6 +168,165 @@ pub struct RuntimeDiagnosticsSnapshot {
     pub relay_connected: bool,
 }
 
+pub const DIAGNOSTICS_CONTRACT_VERSION: u32 = 1;
+
+/// Production serializer boundary for the status endpoint. Keeping the
+/// contract marker in a typed wrapper makes a field mutation visible to both
+/// Rust fixture tests and Flutter's production parser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    #[serde(flatten)]
+    pub snapshot: DiagnosticsSnapshot,
+}
+
+impl StatusResponse {
+    pub fn from_snapshot(snapshot: DiagnosticsSnapshot) -> Self {
+        Self {
+            contract_version: DIAGNOSTICS_CONTRACT_VERSION,
+            snapshot,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    pub revision: u64,
+    pub events: Vec<StatusEvent>,
+}
+
+impl EventsResponse {
+    pub fn new(revision: u64, events: Vec<StatusEvent>) -> Self {
+        Self {
+            contract_version: DIAGNOSTICS_CONTRACT_VERSION,
+            revision,
+            events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteEntryResponse {
+    pub cidr: String,
+    pub expected_interface: String,
+    pub actual_interface: Option<String>,
+    pub state: crate::route::RouteState,
+    pub owned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutesResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    pub interface: String,
+    pub mtu: u32,
+    pub healthy: bool,
+    #[serde(rename = "conflictCount")]
+    pub conflict_count: usize,
+    pub entries: Vec<RouteEntryResponse>,
+}
+
+impl RoutesResponse {
+    pub fn new(
+        interface: String,
+        mtu: u32,
+        healthy: bool,
+        conflict_count: usize,
+        entries: Vec<RouteEntryResponse>,
+    ) -> Self {
+        Self {
+            contract_version: DIAGNOSTICS_CONTRACT_VERSION,
+            interface,
+            mtu,
+            healthy,
+            conflict_count,
+            entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRepairResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    pub cidr: String,
+    pub changed: bool,
+    pub attempted: bool,
+    pub before: String,
+    pub after: String,
+    pub reason: String,
+    #[serde(rename = "restartedDaemon")]
+    pub restarted_daemon: bool,
+}
+
+impl RouteRepairResponse {
+    pub fn new(
+        cidr: String,
+        changed: bool,
+        attempted: bool,
+        before: String,
+        after: String,
+        reason: String,
+    ) -> Self {
+        Self {
+            contract_version: DIAGNOSTICS_CONTRACT_VERSION,
+            cidr,
+            changed,
+            attempted,
+            before,
+            after,
+            reason,
+            restarted_daemon: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeersPageResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    pub peers: Vec<PeerDiagnostics>,
+    pub total: usize,
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+}
+
+impl PeersPageResponse {
+    pub fn new(
+        peers: Vec<PeerDiagnostics>,
+        total: usize,
+        cursor: Option<String>,
+        next_cursor: Option<String>,
+    ) -> Self {
+        Self {
+            contract_version: DIAGNOSTICS_CONTRACT_VERSION,
+            peers,
+            total,
+            cursor,
+            next_cursor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionPreflightResponse {
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    pub state: String,
+    #[serde(rename = "canCreateTun")]
+    pub can_create_tun: Option<bool>,
+    #[serde(rename = "canModifyRoutes")]
+    pub can_modify_routes: Option<bool>,
+    #[serde(rename = "elevationSupported")]
+    pub elevation_supported: bool,
+    #[serde(rename = "reasonCode")]
+    pub reason_code: String,
+    pub message: String,
+}
+
 /// Shared state needed to build diagnostics responses.
 #[derive(Clone)]
 pub struct DiagnosticsContext {
@@ -245,14 +404,10 @@ impl DiagnosticsContext {
 /// Compare a bearer token against the daemon's per-process diagnostics auth
 /// token in constant time. `None` token (diagnostics disabled) never matches.
 fn auth_matches(expect: Option<&str>, provided: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
+
     match (expect, provided) {
-        (Some(expected), Some(given)) => expected.len() == given.len()
-            && expected
-                .as_bytes()
-                .iter()
-                .zip(given.as_bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0,
+        (Some(expected), Some(given)) => expected.as_bytes().ct_eq(given.as_bytes()).into(),
         _ => false,
     }
 }
@@ -285,9 +440,8 @@ pub fn derive_ready_phase(
     virtual_ip: &str,
 ) -> &'static str {
     use crate::tasks::HealthStatus;
-    match health.status {
-        HealthStatus::ShuttingDown => return "stopping",
-        _ => {}
+    if health.status == HealthStatus::ShuttingDown {
+        return "stopping";
     }
     if health.reauth_required {
         return "credential_reauth_required";

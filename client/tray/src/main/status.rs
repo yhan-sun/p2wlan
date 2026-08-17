@@ -21,11 +21,10 @@ fn query_daemon_state() -> DaemonState {
     if !health.status().is_success() {
         return DaemonState::offline();
     }
-    let status = client
-        .get(status_url)
-        .send()
-        .ok()
-        .and_then(|response| response.json::<serde_json::Value>().ok());
+    let status = match fetch_status_with_auth(&client, &status_url) {
+        Ok(status) => Some(status),
+        Err(message) => return DaemonState::session_error(message),
+    };
     let virtual_ip = status
         .as_ref()
         .and_then(|value| value.get("virtual_ip"))
@@ -65,6 +64,35 @@ fn query_daemon_state() -> DaemonState {
             None => format!("p2wlan：已连接 · {peer_count} 台设备"),
         },
     }
+}
+
+fn fetch_status_with_auth(
+    client: &reqwest::blocking::Client,
+    status_url: &str,
+) -> Result<serde_json::Value, String> {
+    for attempt in 0..2 {
+        let token = read_diagnostics_auth_token().ok_or_else(|| {
+            "诊断会话 Token 文件不存在，请重新启动 p2wlan-daemon。".to_string()
+        })?;
+        let response = client
+            .get(status_url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| "无法读取 p2wlan-daemon 状态。".to_string())?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            continue;
+        }
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("诊断会话已变化，请重新启动 p2wlan-daemon。".to_string());
+        }
+        if !response.status().is_success() {
+            return Err(format!("p2wlan-daemon 状态请求返回 HTTP {}。", response.status()));
+        }
+        return response
+            .json::<serde_json::Value>()
+            .map_err(|_| "p2wlan-daemon 状态响应无法解析。".to_string());
+    }
+    Err("诊断会话已变化，请重新启动 p2wlan-daemon。".to_string())
 }
 
 fn tray_device_menu(status: &serde_json::Value) -> TrayDeviceMenu {

@@ -35,6 +35,11 @@ struct Cli {
     #[arg(long, name = "token-file")]
     token_file: Option<PathBuf>,
 
+    /// Read one control-plane token from stdin, then close stdin. The token is
+    /// bounded, never appears in process arguments, and is not persisted.
+    #[arg(long, conflicts_with = "token-file")]
+    token_stdin: bool,
+
     /// Override interface name
     #[arg(long)]
     interface: Option<String>,

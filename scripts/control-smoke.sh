@@ -7,6 +7,7 @@ DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 101))}
 DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 102))}
 GO_BIN=${GO_BIN:-go}
 TMP_DIR=$(mktemp -d /tmp/p2wlan-smoke.XXXXXX)
+source "$ROOT_DIR/scripts/diagnostics-auth.sh"
 
 cleanup() {
   if [[ -n "${NODE_A_PID:-}" ]]; then
@@ -60,11 +61,11 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
-P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
   --config "$TMP_DIR/node-a.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
-  --token "$TOKEN" \
+  --token-stdin \
   --device-name node-a \
   --udp-bind 127.0.0.1:0 \
   --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
@@ -77,11 +78,11 @@ for _ in {1..40}; do
   sleep 0.25
 done
 
-P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
   --config "$TMP_DIR/node-b.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
-  --token "$TOKEN" \
+  --token-stdin \
   --device-name node-b \
   --udp-bind 127.0.0.1:0 \
   --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
@@ -98,8 +99,8 @@ for _ in {1..80}; do
      grep -Eq 'Prepared [1-9][0-9]* UDP candidate endpoints' "$TMP_DIR/node-b.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-a.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-b.log" 2>/dev/null; then
-    STATUS_A=$(curl -fsS "http://127.0.0.1:$DIAG_A_PORT/status" 2>/dev/null || true)
-    STATUS_B=$(curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
+     STATUS_A=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$TMP_DIR/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_A_PORT/status" 2>/dev/null || true)
+     STATUS_B=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$TMP_DIR/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
     if printf '%s' "$STATUS_A" | grep -q '"peers"' && \
        printf '%s' "$STATUS_A" | grep -q '"stats"' && \
        printf '%s' "$STATUS_A" | grep -q '"relay_selection"' && \

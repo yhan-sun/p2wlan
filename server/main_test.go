@@ -35,11 +35,11 @@ func TestWithCORSRejectsLocalDevAndUnknownOrigins(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// The deleted React/Vite dev server origins are no longer trusted, and
+	// Browser development origins are no longer trusted, and
 	// unknown origins are rejected the same way.
 	for _, origin := range []string{
-		"http://localhost:1420",
-		"http://127.0.0.1:1420",
+		"http://legacy.invalid",
+		"http://legacy-loopback.invalid",
 		"http://localhost:5173",
 		"https://example.invalid",
 	} {

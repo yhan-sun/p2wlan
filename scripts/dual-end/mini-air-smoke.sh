@@ -1191,7 +1191,7 @@ wait_for_target_relay_pair() {
 
     local mini_confirmed=0
     local air_confirmed=0
-    if curl -fsS --max-time 3 \
+    if local_diag_curl 3 \
       "http://127.0.0.1:$DIAG_A_PORT/status/peer/$AIR_NODE_ID" >"$mini_live" 2>/dev/null; then
       mini_confirmed=$(python3 - "$mini_live" "$AIR_NODE_ID" <<'PY'
 import json
@@ -1211,7 +1211,7 @@ except (OSError, ValueError, TypeError):
 PY
       )
     fi
-    if $AIR_SSH "curl --noproxy '*' -fsS --max-time 3 http://127.0.0.1:$DIAG_B_PORT/status/peer/$MINI_NODE_ID" \
+    if remote_diag_curl 3 "http://127.0.0.1:$DIAG_B_PORT/status/peer/$MINI_NODE_ID" \
       >"$air_live" 2>/dev/null; then
       air_confirmed=$(python3 - "$air_live" "$MINI_NODE_ID" <<'PY'
 import json
@@ -1260,10 +1260,26 @@ count_stage() {
 # The Direct state is authoritative in diagnostics. Log lines are retained as
 # evidence and for endpoint extraction, but an ambient filtering change must
 # never turn a real Direct path into a harness timeout.
+local_diag_curl() {
+  local max_time=$1
+  local url=$2
+  local token_file="$LOCAL_RUN_DIR/p2wlan-daemon.diag-auth"
+  local token
+  token=$(tr -d '\r\n' <"$token_file") || return 1
+  [[ -n "$token" ]] || return 1
+  curl -fsS --max-time "$max_time" -H "Authorization: Bearer $token" "$url"
+}
+
+remote_diag_curl() {
+  local max_time=$1
+  local url=$2
+  $AIR_SSH "token=\$(tr -d '\\r\\n' < '$REMOTE_RUN_DIR/p2wlan-daemon.diag-auth'); test -n \"\$token\"; curl --noproxy '*' -fsS --max-time $max_time -H \"Authorization: Bearer \$token\" '$url'"
+}
+
 status_reports_direct() {
   local status_url=$1
   local peer_id=$2
-  curl -fsS --max-time 5 "$status_url" | python3 -c '
+  local_diag_curl 5 "$status_url" | python3 -c '
 import json
 import sys
 
@@ -1421,9 +1437,9 @@ capture_status_pair() {
   # healthy. Never make a slow unrelated peer part of the target verdict.
   local mini_status_path="/status/peer/$AIR_NODE_ID"
   local air_status_path="/status/peer/$MINI_NODE_ID"
-  curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT$mini_status_path" >"$a_tmp" 2>"$a_err" &
+  local_diag_curl 5 "http://127.0.0.1:$DIAG_A_PORT$mini_status_path" >"$a_tmp" 2>"$a_err" &
   local mini_pid=$!
-  $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT$air_status_path" >"$b_tmp" 2>"$b_err" &
+  remote_diag_curl 5 "http://127.0.0.1:$DIAG_B_PORT$air_status_path" >"$b_tmp" 2>"$b_err" &
   local air_pid=$!
   local mini_rc=0
   local air_rc=0
@@ -1510,7 +1526,7 @@ collect_air_log() {
 
 remote_status_reports_direct() {
   local peer_id=$1
-  $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status/peer/$peer_id | python3 -c 'import json,sys; status=json.load(sys.stdin); peer=status.get(\"peer\") or {}; raise SystemExit(0 if peer.get(\"node_id\") == sys.argv[1] and peer.get(\"state\") == \"direct\" and peer.get(\"active_path\") == \"direct\" else 1)' '$peer_id'"
+  remote_diag_curl 5 "http://127.0.0.1:$DIAG_B_PORT/status/peer/$peer_id" | python3 -c 'import json,sys; status=json.load(sys.stdin); peer=status.get("peer") or {}; raise SystemExit(0 if peer.get("node_id") == sys.argv[1] and peer.get("state") == "direct" and peer.get("active_path") == "direct" else 1)' "$peer_id"
 }
 
 direct_endpoint_from_log() {
@@ -2130,7 +2146,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # used for traffic and verdicts.
   MINI_STATUS_BOOTSTRAP="$ROUND_DIR/mini-status-bootstrap.json"
   AIR_STATUS_BOOTSTRAP="$ROUND_DIR/air-status-bootstrap.json"
-  if ! curl -fsS --max-time 5 "http://127.0.0.1:$DIAG_A_PORT/status.runtime" >"$MINI_STATUS_BOOTSTRAP"; then
+  if ! local_diag_curl 5 "http://127.0.0.1:$DIAG_A_PORT/status.runtime" >"$MINI_STATUS_BOOTSTRAP"; then
     echo "[mini-air] ROUND $round: FAIL (Mini diagnostics disappeared before bootstrap)" >&2
     overall=1
     remote_daemon_cleanup || true
@@ -2139,7 +2155,7 @@ for round in $(seq 1 "$ROUNDS"); do
     if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
     continue
   fi
-  if ! $AIR_SSH "curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:$DIAG_B_PORT/status.runtime" >"$AIR_STATUS_BOOTSTRAP"; then
+  if ! remote_diag_curl 5 "http://127.0.0.1:$DIAG_B_PORT/status.runtime" >"$AIR_STATUS_BOOTSTRAP"; then
     echo "[mini-air] ROUND $round: FAIL (Air diagnostics disappeared before bootstrap)" >&2
     overall=1
     remote_daemon_cleanup || true

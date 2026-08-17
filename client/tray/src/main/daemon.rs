@@ -4,18 +4,22 @@ fn stop_daemon() -> Result<(), Box<dyn Error>> {
         .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()?;
-    let mut request = client.post(shutdown_url);
-    // The diagnostics mutation endpoint requires the daemon's per-process
-    // auth token (written by the daemon next to its log file at startup).
-    if let Some(token) = read_diagnostics_auth_token() {
-        request = request.bearer_auth(token);
+    for attempt in 0..2 {
+        let token = read_diagnostics_auth_token()
+            .ok_or("diagnostics session token file is missing; daemon session may have changed")?;
+        let response = client
+            .post(&shutdown_url)
+            .bearer_auth(token)
+            .send()?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            continue;
+        }
+        if response.status().is_success() {
+            return Ok(());
+        }
+        return Err(format!("daemon returned HTTP {}", response.status()).into());
     }
-    let response = request.send()?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("daemon returned HTTP {}", response.status()).into())
-    }
+    Err("daemon diagnostics session changed; retry after restarting the daemon".into())
 }
 
 /// Read the daemon's per-process diagnostics auth token from the file the
@@ -58,7 +62,7 @@ fn start_daemon() -> Result<(), Box<dyn Error>> {
     let log_path = log_dir.join("p2wlan-daemon.log");
     let pid_path = p2wlan_desktop_host::pid_path_from_log_dir(&log_dir);
     let bind = p2wlan_desktop_host::diagnostics_bind_from_url(STATUS_URL)?;
-    let managed = config_has_token(&config_path);
+    let control_token = config_token(&config_path);
 
     fs::create_dir_all(&log_dir)?;
     if let Some(parent) = config_path.parent() {
@@ -73,13 +77,26 @@ fn start_daemon() -> Result<(), Box<dyn Error>> {
         "--log-file".to_string(),
         log_path.display().to_string(),
     ];
-    if managed {
+    let launch_token_file = if let Some(token) = control_token.as_deref() {
+        let path = write_ephemeral_launch_token(&log_dir, token)?;
         args.push("--managed".to_string());
+        args.push("--token-file".to_string());
+        args.push(path.display().to_string());
+        Some(path)
     } else {
         args.push("--manual".to_string());
-    }
+        None
+    };
 
-    start_daemon_platform(&daemon, &args, &config_path, &log_dir, &log_path, &pid_path)
+    match start_daemon_platform(&daemon, &args, &config_path, &log_dir, &log_path, &pid_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(path) = launch_token_file {
+                let _ = fs::remove_file(path);
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -165,18 +182,63 @@ fn start_daemon_platform(
     Ok(())
 }
 
-fn config_has_token(path: &Path) -> bool {
+fn config_token(path: &Path) -> Option<String> {
     let Ok(raw) = fs::read_to_string(path) else {
-        return false;
+        return None;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
+        return None;
     };
     value
         .get("control")
         .and_then(|control| control.get("auth_token"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|token| !token.trim().is_empty())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+}
+
+fn write_ephemeral_launch_token(log_dir: &Path, token: &str) -> Result<PathBuf, Box<dyn Error>> {
+    use rand::RngCore;
+
+    fs::create_dir_all(log_dir)?;
+    #[cfg(unix)]
+    {
+        let status = Command::new("chmod").args(["700", &log_dir.display().to_string()]).status()?;
+        if !status.success() {
+            return Err("could not restrict tray runtime directory permissions".into());
+        }
+    }
+    let mut random = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut random);
+    let path = log_dir.join(format!("p2wlan-launch-{}.token", hex::encode(random)));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    std::io::Write::write_all(&mut file, token.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(windows)]
+    {
+        let username = env::var("USERNAME").map_err(|_| "USERNAME is unavailable")?;
+        let status = Command::new("icacls")
+            .args([
+                path.as_os_str(),
+                std::ffi::OsStr::new("/inheritance:r"),
+                std::ffi::OsStr::new("/grant:r"),
+                std::ffi::OsStr::new(&format!("{username}:F")),
+            ])
+            .status()?;
+        if !status.success() {
+            let _ = fs::remove_file(&path);
+            return Err("could not restrict tray launch token ACL".into());
+        }
+    }
+    Ok(path)
 }
 
 fn locate_daemon_binary() -> Option<PathBuf> {

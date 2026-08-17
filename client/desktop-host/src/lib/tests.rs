@@ -115,7 +115,7 @@ mod tests {
             "application/json",
         )
         .await;
-        let client = DesktopHostClient::with_timeout(Duration::from_millis(500)).unwrap();
+        let client = test_client();
 
         assert!(client.fetch_health(&url).await.unwrap());
     }
@@ -130,7 +130,7 @@ mod tests {
             "application/json",
         )
         .await;
-        let client = DesktopHostClient::with_timeout(Duration::from_millis(500)).unwrap();
+        let client = test_client();
 
         assert!(!client.fetch_health(&url).await.unwrap());
     }
@@ -159,7 +159,7 @@ mod tests {
             "application/json",
         )
         .await;
-        let client = DesktopHostClient::with_timeout(Duration::from_millis(500)).unwrap();
+        let client = test_client();
 
         let status = client.fetch_status(&url).await.unwrap();
 
@@ -170,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn client_fetch_status_non_2xx_maps_daemon_unavailable() {
         let url = diagnostics_server(200, "ok\n", 503, "busy\n", "text/plain").await;
-        let client = DesktopHostClient::with_timeout(Duration::from_millis(500)).unwrap();
+        let client = test_client();
 
         let error = client.fetch_status(&url).await.unwrap_err();
 
@@ -182,13 +182,20 @@ mod tests {
     #[tokio::test]
     async fn client_fetch_status_non_json_maps_decode_failed() {
         let url = diagnostics_server(200, "ok\n", 200, "not json\n", "text/plain").await;
-        let client = DesktopHostClient::with_timeout(Duration::from_millis(500)).unwrap();
+        let client = test_client();
 
         let error = client.fetch_status(&url).await.unwrap_err();
 
         assert_eq!(error.kind, DesktopHostErrorKind::DaemonStatusDecodeFailed);
         assert!(error.recoverable);
         assert!(error.message.contains("valid JSON"));
+    }
+
+    fn test_client() -> DesktopHostClient {
+        fn token() -> Result<String> {
+            Ok("test-diagnostics-token".to_string())
+        }
+        DesktopHostClient::with_timeout_and_auth_reader(Duration::from_millis(500), token).unwrap()
     }
 
     #[test]

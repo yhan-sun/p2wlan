@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
-import '../security/secure_token_repository.dart';
 
 part 'daemon_controller/process_control.dart';
 part 'daemon_controller/elevation.dart';
 part 'daemon_controller/diagnostics_paths.dart';
+part 'daemon_controller/launch_token.dart';
 part 'daemon_controller/pids.dart';
 
 class DaemonCommandResult {
@@ -71,18 +72,20 @@ class DaemonController {
     final udpAdvertise = settings.udpAdvertise.trim();
     final relayServers = settings.relayServers.trim();
 
-    // Keep the credential out of the process command line: write it to a
-    // 0600 owner-only file and hand the daemon `--token-file` (the daemon
-    // already supports this and reads it permission-checked). The file is
-    // removed after the daemon has started.
+    final requiresElevation =
+        Platform.isMacOS && !_isRootUser() ||
+        Platform.isWindows && !await _isWindowsAdministrator() ||
+        Platform.isLinux && !_isRootUser();
     File? tokenFile;
-    if (!useManualMode) {
-      tokenFile = File(
-        '${logDir.path}${Platform.pathSeparator}p2wlan-daemon.token',
-      );
-      await logDir.create(recursive: true);
-      await tokenFile.writeAsString(authToken, flush: true);
-      await tryRestrictOwnerOnly(tokenFile);
+    if (!useManualMode && requiresElevation) {
+      try {
+        tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+      } catch (error) {
+        return DaemonCommandResult(
+          ok: false,
+          message: _startFailureMessage(error),
+        );
+      }
     }
 
     final args = [
@@ -125,8 +128,7 @@ class DaemonController {
         tokenFile.path,
       ] else ...[
         '--managed',
-        '--token',
-        authToken,
+        '--token-stdin',
       ],
     ];
 
@@ -152,20 +154,26 @@ class DaemonController {
         : null;
 
     try {
-      if (Platform.isMacOS && !_isRootUser()) {
+      if (requiresElevation && Platform.isMacOS) {
         await _startMacosElevated(elevatedShell);
-      } else if (Platform.isWindows && !await _isWindowsAdministrator()) {
+      } else if (requiresElevation && Platform.isWindows) {
         await _startWindowsElevated(binary: binary, args: args);
-      } else if (Platform.isLinux && !_isRootUser()) {
+      } else if (requiresElevation && Platform.isLinux) {
         await _startLinuxElevated(binary: binary, args: args);
       } else {
-        final process = await _startDetached(binary: binary, args: args);
+        final process = await _startDetached(
+          binary: binary,
+          args: args,
+          stdinToken: useManualMode ? null : authToken,
+        );
         await _writePidMarker(pidPath, process.pid);
       }
     } catch (error) {
       // The launch itself failed: never leave the temporary credential file
       // behind.
-      await _deleteLaunchTokenFile();
+      try {
+        await deleteEphemeralLaunchTokenFile(tokenFile);
+      } catch (_) {}
       return DaemonCommandResult(
         ok: false,
         message: _startFailureMessage(error),
@@ -184,7 +192,9 @@ class DaemonController {
       timeout,
       logPath,
     );
-    await _deleteLaunchTokenFile();
+    try {
+      await deleteEphemeralLaunchTokenFile(tokenFile);
+    } catch (_) {}
     if (!ready) {
       // A daemon that exited right after an elevated launch usually failed
       // for a definitive, actionable reason.  Detect a permanent control
@@ -210,25 +220,6 @@ class DaemonController {
           ? 'p2wlan-daemon started in manual/offline mode. Add a control token in Settings to join the managed P2WLAN network.'
           : 'p2wlan-daemon started.',
     );
-  }
-
-  /// Best-effort removal of the launch token file (deterministic path). The
-  /// daemon reads the token synchronously at startup, so the temporary file is
-  /// deleted as soon as the daemon is up (or the launch failed/timed out) —
-  /// a long-lived plaintext credential file must never persist. Also called by
-  /// `stop()` as a safety net. Never throws.
-  Future<void> _deleteLaunchTokenFile() async {
-    final logDir = _defaultLogDir();
-    final file = File(
-      '${logDir.path}${Platform.pathSeparator}p2wlan-daemon.token',
-    );
-    try {
-      if (await file.exists()) {
-        await file.delete();
-      }
-    } catch (_) {
-      // Ignore cleanup failure; the file is user-scoped and short-lived.
-    }
   }
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {

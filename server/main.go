@@ -151,8 +151,8 @@ func main() {
 }
 
 // withCORS allows explicitly configured browser origins to call the control
-// API. The React/Vite web console was deleted and Flutter Web is out of scope,
-// so there is no default browser origin: only origins listed in
+// API. The browser console was deleted and Flutter Web is out of scope, so
+// there is no default browser origin: only origins listed in
 // CONTROL_ALLOWED_ORIGINS (a comma list) are honored. The daemon and the
 // Flutter/tray/CLI clients are native and never send an Origin header.
 func withCORS(next http.Handler) http.Handler {

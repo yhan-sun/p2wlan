@@ -194,6 +194,7 @@ if [[ -z "$PEER" ]]; then
 fi
 
 require_cmd ping
+source "$ROOT_DIR/scripts/diagnostics-auth.sh"
 mkdir -p "$OUT_DIR"
 
 P2WLAN_BIN=$(resolve_p2wlan_bin)
@@ -204,7 +205,7 @@ else
 fi
 
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS "$DIAGNOSTICS_URL" -o "$OUT_DIR/status.json" 2>"$OUT_DIR/status.err" || true
+  p2wlan_diagnostics_curl -fsS "$DIAGNOSTICS_URL" -o "$OUT_DIR/status.json" 2>"$OUT_DIR/status.err" || true
 fi
 MTU_STATUS_SUMMARY=""
 if [[ -s "$OUT_DIR/status.json" ]]; then

@@ -124,13 +124,27 @@ async fn stop(config_path: &Path) -> Result<(), String> {
         "http://{}/shutdown",
         normalized_diagnostics_bind(&config.diagnostics.bind)
     );
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
-        .map_err(|error| error.to_string())?
-        .post(url)
-        .send()
-        .await;
+        .map_err(|error| error.to_string())?;
+    let response = async {
+        for attempt in 0..2 {
+            let token = read_diagnostics_auth_token()?;
+            let response = client
+                .post(&url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                continue;
+            }
+            return Ok::<_, String>(response);
+        }
+        Err("diagnostics session changed; retry after restarting the daemon".to_string())
+    }
+    .await;
     match response {
         Ok(response) if response.status().is_success() => {
             println!("已发送停止请求。");

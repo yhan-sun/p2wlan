@@ -6,7 +6,11 @@ import '../daemon/diagnostics_auth.dart';
 import '../models/diagnostics_models.dart';
 
 class DiagnosticsApi {
-  DiagnosticsApi({HttpClient? client}) : _client = client ?? HttpClient() {
+  DiagnosticsApi({
+    HttpClient? client,
+    Future<String?> Function()? authTokenReader,
+  }) : _client = client ?? HttpClient(),
+       _authTokenReader = authTokenReader ?? readDiagnosticsAuthToken {
     _client.connectionTimeout = _requestTimeout;
   }
 
@@ -16,12 +20,14 @@ class DiagnosticsApi {
   static const _eventsTimeout = Duration(seconds: 30);
 
   final HttpClient _client;
+  final Future<String?> Function() _authTokenReader;
 
   Future<bool> fetchHealth(String diagnosticsUrl) async {
     try {
       final body = await _getText(
         _endpoint(diagnosticsUrl, '/health'),
         'text/plain',
+        authorize: false,
       );
       return body.trim().isNotEmpty;
     } catch (_) {
@@ -40,7 +46,7 @@ class DiagnosticsApi {
         'Diagnostics endpoint /status did not return a JSON object',
       );
     }
-    return DiagnosticsSnapshot.fromJson(decoded);
+    return StatusResponse.fromJson(decoded).snapshot;
   }
 
   Future<bool> requestShutdown(String diagnosticsUrl) async {
@@ -101,7 +107,7 @@ class DiagnosticsApi {
   /// Long-poll the status event stream. Returns the current `revision` and the
   /// events with `seq > since`. Blocks up to `timeout` when no new events are
   /// available, so callers treat an empty list as "no change yet".
-  Future<({int revision, List<Map<String, dynamic>> events})> fetchEvents(
+  Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
     Duration timeout = _eventsTimeout,
@@ -121,18 +127,16 @@ class DiagnosticsApi {
         'Diagnostics endpoint /events did not return a JSON object',
       );
     }
-    final events = [
-      for (final e in _listAs(decoded['events']))
-        if (e is Map<String, dynamic>) e,
-    ];
-    final revision = (decoded['revision'] as num?)?.toInt() ?? since;
-    return (revision: revision, events: events);
+    return EventsResponse.fromJson(decoded);
   }
 
   /// Paged peer list. `cursor` is the `node_id` to start after (omit for the
   /// first page). Returns the page plus `total` and the `next_cursor`.
-  Future<({List<Map<String, dynamic>> peers, int total, String? nextCursor})>
-  fetchPeers(String diagnosticsUrl, {String? cursor, int limit = 100}) async {
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) async {
     final params = <String, String>{'limit': limit.toString()};
     if (cursor != null) params['cursor'] = cursor;
     final body = await _getText(
@@ -145,14 +149,7 @@ class DiagnosticsApi {
         'Diagnostics endpoint /peers did not return a JSON object',
       );
     }
-    return (
-      peers: [
-        for (final p in _listAs(decoded['peers']))
-          if (p is Map<String, dynamic>) p,
-      ],
-      total: (decoded['total'] as num?)?.toInt() ?? 0,
-      nextCursor: _asStringOrNull(decoded['next_cursor']),
-    );
+    return PeersPageResponse.fromJson(decoded);
   }
 
   /// Bounded tail of the daemon's own log file (last `lines`, within
@@ -177,7 +174,7 @@ class DiagnosticsApi {
 
   /// Authoritative overlay-route state (read-only). Maps to the daemon's
   /// `POST /routes/verify`.
-  Future<Map<String, dynamic>> verifyRoutes(String diagnosticsUrl) async {
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
     final request = await _client
         .postUrl(_endpoint(diagnosticsUrl, '/routes/verify'))
         .timeout(_requestTimeout);
@@ -197,12 +194,12 @@ class DiagnosticsApi {
         'Diagnostics endpoint /routes/verify did not return a JSON object',
       );
     }
-    return decoded;
+    return RoutesResponse.fromJson(decoded);
   }
 
   /// Repair the overlay route in place (no daemon/TUN/session restart). Maps to
   /// the daemon's `POST /routes/repair`.
-  Future<Map<String, dynamic>> repairRoutes(String diagnosticsUrl) async {
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async {
     final request = await _client
         .postUrl(_endpoint(diagnosticsUrl, '/routes/repair'))
         .timeout(_requestTimeout);
@@ -222,18 +219,27 @@ class DiagnosticsApi {
         'Diagnostics endpoint /routes/repair did not return a JSON object',
       );
     }
-    return decoded;
+    return RouteRepairResponse.fromJson(decoded);
   }
 
-  Future<String> _getText(Uri uri, String accept) async {
-    return _getTextWithTimeout(uri, accept, _requestTimeout);
+  Future<String> _getText(
+    Uri uri,
+    String accept, {
+    bool authorize = true,
+  }) async {
+    return _getTextWithTimeout(
+      uri,
+      accept,
+      _requestTimeout,
+      authorize: authorize,
+    );
   }
 
   /// Attach the per-process diagnostics mutation token when the daemon has
   /// published one. Read fresh on every call: after a daemon restart the token
   /// is regenerated, and a stale cached value would be rejected with 403.
   Future<void> _authorize(HttpClientRequest request) async {
-    final token = await readDiagnosticsAuthToken();
+    final token = await _authTokenReader();
     if (token != null && token.isNotEmpty) {
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
     }
@@ -242,18 +248,30 @@ class DiagnosticsApi {
   Future<String> _getTextWithTimeout(
     Uri uri,
     String accept,
-    Duration timeout,
-  ) async {
-    final request = await _client.getUrl(uri).timeout(timeout);
-    request.headers.set(HttpHeaders.acceptHeader, accept);
-    final response = await request.close().timeout(timeout);
-    final body = await utf8.decodeStream(response).timeout(timeout);
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw DiagnosticsApiException(
-        'GET ${uri.path} returned HTTP ${response.statusCode}',
-      );
+    Duration timeout, {
+    bool authorize = true,
+  }) async {
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final request = await _client.getUrl(uri).timeout(timeout);
+      request.headers.set(HttpHeaders.acceptHeader, accept);
+      if (authorize) await _authorize(request);
+      final response = await request.close().timeout(timeout);
+      final body = await utf8.decodeStream(response).timeout(timeout);
+      if (authorize &&
+          response.statusCode == HttpStatus.unauthorized &&
+          attempt == 0) {
+        // A daemon restart rotates the local session token. Re-read the file
+        // once before surfacing the session-change error to the caller.
+        continue;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw DiagnosticsApiException(
+          'GET ${uri.path} returned HTTP ${response.statusCode}',
+        );
+      }
+      return body;
     }
-    return body;
+    throw DiagnosticsApiException('GET ${uri.path} returned HTTP 401');
   }
 
   Uri _endpoint(
@@ -281,15 +299,6 @@ Map<String, dynamic>? _tryJsonObject(String body) {
   } catch (_) {
     return null;
   }
-}
-
-List<dynamic> _listAs(dynamic value) {
-  return value is List ? value : const <dynamic>[];
-}
-
-String? _asStringOrNull(dynamic value) {
-  if (value == null) return null;
-  return value.toString();
 }
 
 class DiagnosticsApiException implements Exception {

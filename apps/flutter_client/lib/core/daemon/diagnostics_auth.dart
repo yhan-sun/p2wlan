@@ -1,9 +1,9 @@
-// Per-process diagnostics mutation token.
+// Per-process local diagnostics session token.
 //
 // The daemon generates a fresh random token at startup, writes it to a 0600
-// file next to its log file, and deletes it on graceful shutdown. Any caller
-// that triggers a diagnostics mutation (POST /speedtest, /routes/repair,
-// /routes/verify, /shutdown) must attach it as `Authorization: Bearer <token>`.
+// file next to its log file, and deletes it on shutdown. Native callers attach
+// it to every sensitive diagnostics request as `Authorization: Bearer <token>`;
+// only `/health` and `/status.version` are public.
 // The token never appears on the daemon command line or in the persisted
 // config, and it is per-process: after a daemon restart the file (and the
 // token) is regenerated, so callers always read it fresh.

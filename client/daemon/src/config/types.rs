@@ -430,10 +430,10 @@ pub struct DiagnosticsConfig {
     /// /logs/tail`. Ignored when the operator did not configure a log file.
     #[serde(default, skip_serializing)]
     pub log_path: Option<std::path::PathBuf>,
-    /// Per-process random token authorizing diagnostics **mutation** endpoints.
+    /// Per-process random token authorizing sensitive diagnostics endpoints.
     /// Generated at startup and never persisted to the config file or command
-    /// line; surfaced to local callers (Flutter / tray) through a 0600 file
-    /// whose path is `auth_token_path`. `None` means mutations fail closed.
+    /// line; surfaced to local callers (Flutter / tray) through a protected
+    /// file whose path is `auth_token_path`. `None` means access fails closed.
     #[serde(default, skip_serializing)]
     pub auth_token: Option<String>,
     /// Where the per-process diagnostics auth token is written at startup and
