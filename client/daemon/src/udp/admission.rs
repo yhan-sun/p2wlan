@@ -233,7 +233,7 @@ impl UdpTransport {
             .is_ok()
     }
 
-    fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
+    async fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
         // A converged Direct peer needs no outbound peer-reflexive signal: the
         // relayed HTTP signal and the fast punch would only re-create
         // speculative traversal work on a path that is already confirmed.
@@ -242,6 +242,13 @@ impl UdpTransport {
         if self.peers.is_direct_sync(peer_id) {
             return;
         }
+        // Feed the peer-scope adaptive learner: the observed source port is the
+        // peer's real public mapping toward us, which is the authoritative
+        // allocation-direction evidence for THAT peer (audit P1-B).  STUN-only
+        // learning can diverge from the real peer direction on a complex CGNAT.
+        let generation = self.peers.current_network_generation().await;
+        self.observe_peer_scope(peer_id, observed_endpoint.port(), generation)
+            .await;
         let Some(ingress) = self.peer_reflexive_ingress.as_ref() else {
             return;
         };

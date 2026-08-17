@@ -518,7 +518,7 @@ impl UdpTransport {
                             SocketEvidence::Fresh,
                         )
                         .await;
-                        self.notify_peer_reflexive_observation(&identity.source_node_id, source);
+                        self.notify_peer_reflexive_observation(&identity.source_node_id, source).await;
 
                         if ack_sent {
                             debug!(
@@ -748,7 +748,8 @@ impl UdpTransport {
                                 self.notify_peer_reflexive_observation(
                                     &identity.source_node_id,
                                     source,
-                                );
+                                )
+                                .await;
                                 // A matched ACK is the most reliable proof that
                                 // the peer's mapping works RIGHT NOW: fire the
                                 // daemon-internal encrypted validation toward
@@ -895,7 +896,7 @@ impl UdpTransport {
                                         SocketEvidence::Fresh,
                                     )
                                     .await;
-                                    self.notify_peer_reflexive_observation(&peer_id, source);
+                                    self.notify_peer_reflexive_observation(&peer_id, source).await;
                                     self.trigger_peer_reflexive_check(
                                         socket_index,
                                         &peer_id,
@@ -1078,7 +1079,7 @@ impl UdpTransport {
                                     )
                                     .await;
                                 if accepted {
-                                    self.notify_peer_reflexive_observation(&peer_id, source);
+                                    self.notify_peer_reflexive_observation(&peer_id, source).await;
                                     // Legacy peers still need the same
                                     // per-pending-probe attribution. The ACK
                                     // remains only an ingress signal for the

@@ -6,17 +6,33 @@ use p2pnet_nat::mapping::{
 
 const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 
-/// Adaptive-prediction learner state for one network generation, shared across
-/// every peer on the same egress public IP (they draw from the same NAT
-/// allocator).
+/// Adaptive-prediction learner state for one network generation, scoped by
+/// destination so a stride learned toward STUN observers is not blindly applied
+/// to a real peer (audit P1-B: complex CGNAT may bucket allocation by target;
+/// Mini-Air observed the peer-facing mapping diverge from the STUN direction).
 #[derive(Debug)]
 struct LearningCache {
     /// The network generation this cache was last synced to; any other value
     /// forces a full reset (a new allocator invalidates every learned stride
     /// and direction).
     network_generation: u64,
-    /// public IP -> (cross-batch step learner, allocation-direction detector).
-    entries: HashMap<IpAddr, (StepLearner, ReverseDetector)>,
+    /// (destination scope) -> (cross-batch step learner, direction detector).
+    /// The scope separates STUN-observer allocation from per-peer allocation so
+    /// a peer whose real direction differs from the STUN direction is not
+    /// dragged toward the STUN-learned stride.
+    entries: HashMap<DestinationScope, (StepLearner, ReverseDetector)>,
+}
+
+/// The destination an allocation-sequence measurement was taken toward.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DestinationScope {
+    /// The measurement was a batch of STUN-observer requests on a fresh socket.
+    /// This is the shared prior used when no peer-scope evidence exists.
+    Stun,
+    /// The measurement/observation was toward one specific peer (its actual
+    /// mapping port observed on the wire).  Peer-scope evidence, when present,
+    /// is authoritative for that peer over the STUN prior.
+    Peer(String),
 }
 
 impl LearningCache {
@@ -37,10 +53,16 @@ impl LearningCache {
         }
     }
 
-    fn entry(&mut self, ip: IpAddr) -> &mut (StepLearner, ReverseDetector) {
+    fn entry(&mut self, scope: DestinationScope) -> &mut (StepLearner, ReverseDetector) {
         self.entries
-            .entry(ip)
+            .entry(scope)
             .or_insert_with(|| (StepLearner::new(), ReverseDetector::new()))
+    }
+
+    /// The peer-scope learner for `peer_id`, or `None` when no peer-scope
+    /// evidence was ever observed for it.
+    fn peer_scope(&self, peer_id: &str) -> Option<&(StepLearner, ReverseDetector)> {
+        self.entries.get(&DestinationScope::Peer(peer_id.to_string()))
     }
 }
 
@@ -626,16 +648,25 @@ impl UdpTransport {
     /// from the ports themselves).  A network-generation change clears every
     /// learned stride and direction first, so a stale reading is never applied
     /// to a new allocator.
+    /// Fold a STUN measurement batch into the adaptive learner and return a
+    /// point-in-time snapshot to feed the predictor.
+    ///
+    /// The observed ports are streamed into the direction detector and the
+    /// model's deltas into the step learner.  This is the STUN-observer scope:
+    /// it is the shared prior.  A peer whose real allocation direction was
+    /// observed on the wire (see [`Self::observe_peer_scope`]) gets its own
+    /// peer scope and the predictor prefers that evidence (audit P1-B).
+    /// A network-generation change clears every learned state first, so a
+    /// stale reading is never applied to a new allocator.
     async fn observe_learning(
         &self,
-        public_ip: IpAddr,
         ports: &[u16],
         model: &PortModel,
         network_generation: u64,
     ) -> LearningSnapshot {
         let mut cache = self.learning_cache.lock().await;
         cache.reset_if_generation_changed(network_generation);
-        let (step_learner, detector) = cache.entry(public_ip);
+        let (step_learner, detector) = cache.entry(DestinationScope::Stun);
         for port in ports {
             detector.observe_port(*port);
         }
@@ -651,9 +682,53 @@ impl UdpTransport {
         }
     }
 
-    /// Test-only presence check for the adaptive learner on one public IP,
-    /// syncing the cache to `network_generation` first (the same lazy reset the
-    /// production path performs).  Returns `false` when that public IP has no
+    /// Fold one real peer-scope allocation observation (the peer's actual
+    /// public mapping port, learned from the wire) into a per-peer direction
+    /// detector.
+    ///
+    /// The peer scope is authoritative for that peer over the STUN prior: a
+    /// complex CGNAT can allocate toward STUN observers differently than toward
+    /// the real peer, so once a peer's true direction is observed it must not
+    /// be dragged back toward the STUN-learned stride (audit P1-B).
+    async fn observe_peer_scope(
+        &self,
+        peer_id: &str,
+        observed_port: u16,
+        network_generation: u64,
+    ) {
+        let mut cache = self.learning_cache.lock().await;
+        cache.reset_if_generation_changed(network_generation);
+        let (_, detector) = cache.entry(DestinationScope::Peer(peer_id.to_string()));
+        // The peer's observed ports, in observation order, feed the direction
+        // detector.  The stride learner is deliberately not fed here: a single
+        // wire observation cannot pin a stride, and the predictor already
+        // guards the direction conflict at P0-1 (current batch wins).  The
+        // peer-scope *direction* is the new, authoritative signal.
+        detector.observe_port(observed_port);
+    }
+
+    /// Read the peer-scope learning snapshot for `peer_id`, or fall back to the
+    /// STUN prior when no peer-scope evidence exists.
+    async fn peer_learning_snapshot(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+    ) -> Option<LearningSnapshot> {
+        let cache = self.learning_cache.lock().await;
+        if cache.network_generation != network_generation {
+            return None;
+        }
+        let (_, detector) = cache.peer_scope(peer_id)?;
+        Some(LearningSnapshot {
+            step_estimate: None,
+            revision_count: 0,
+            direction: detector.pattern(),
+        })
+    }
+
+    /// Test-only presence check for the STUN-scope adaptive learner, syncing
+    /// the cache to `network_generation` first (the same lazy reset the
+    /// production path performs).  Returns `false` when the STUN scope has no
     /// learned state for the requested generation — i.e. the cache was reset or
     /// never fed.
     #[cfg(test)]
@@ -662,9 +737,10 @@ impl UdpTransport {
         ip: IpAddr,
         network_generation: u64,
     ) -> bool {
+        let _ = ip;
         let mut cache = self.learning_cache.lock().await;
         cache.reset_if_generation_changed(network_generation);
-        cache.entries.contains_key(&ip)
+        cache.entries.contains_key(&DestinationScope::Stun)
     }
 
     /// Run one atomic fresh-mapping punch generation for a peer.
@@ -997,15 +1073,16 @@ impl UdpTransport {
         let measurement_span_ms = last_sent_at_ms.saturating_sub(first_sent_at_ms);
         let probe_gap_ms = now_ms.saturating_sub(last_sent_at_ms);
         let public_ip = batch.public_ip();
-        // Fold this batch into the shared adaptive learner (keyed by egress
-        // public IP) and read back its stride estimate + allocation direction.
-        // The detector is fed the raw observed ports; the step learner is fed
-        // the model's deltas. A network-generation change resets both first, so
-        // a reading from a superseded allocator is never applied here.
-        let learner_ip = public_ip
+        // Fold this batch into the adaptive learner (scoped by destination:
+        // STUN prior + per-peer direction) and read back its stride estimate +
+        // allocation direction.  The detector is fed the raw observed ports; the
+        // step learner is fed the model's deltas.  A network-generation change
+        // resets both first, so a reading from a superseded allocator is never
+        // applied here.
+        let _learner_ip = public_ip
             .expect("a valid batch was checked for a single public IP above");
         let learning = self
-            .observe_learning(learner_ip, &ports, &model, network_generation)
+            .observe_learning(&ports, &model, network_generation)
             .await;
         let learner_used = learning
             .step_estimate
@@ -1017,13 +1094,24 @@ impl UdpTransport {
         } else {
             None
         };
+        // Prefer the peer-scope allocation direction over the STUN prior: once
+        // this peer's real mapping direction was observed on the wire, a
+        // complex CGNAT that allocates toward STUN differently than toward the
+        // peer must not drag this peer's window back toward the STUN direction
+        // (audit P1-B).  With no peer-scope evidence the STUN direction is the
+        // prior.
+        let peer_direction = self
+            .peer_learning_snapshot(peer_id, network_generation)
+            .await
+            .map(|snapshot| snapshot.direction);
+        let direction = peer_direction.unwrap_or(learning.direction);
         let predicted = predict_ports_with_learning(
             &model,
             last,
             measurement_span_ms,
             probe_gap_ms,
             effective_step,
-            learning.direction == DirectionPattern::Reverse,
+            direction == DirectionPattern::Reverse,
         );
         let predicted_ports = predicted.iter().map(|candidate| candidate.port).collect::<Vec<_>>();
 

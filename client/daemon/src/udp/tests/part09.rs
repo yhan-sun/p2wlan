@@ -198,3 +198,48 @@ async fn network_generation_change_resets_learning_cache() {
         "a generation change must clear the learned stride/direction"
     );
 }
+
+#[tokio::test]
+async fn peer_scope_direction_overrides_stun_prior_and_is_isolated() {
+    // P1-B: STUN-only learning observes the +step allocator direction.  Once
+    // the REAL peer's mapping is observed on the wire walking the other way, the
+    // peer-scope direction must become authoritative for that peer — and it must
+    // not contaminate the shared STUN scope (other peers still use the prior).
+    let (peers, transport, nat) = learning_env(3).await;
+    let generation = peers.current_network_generation().await;
+    // Feed the STUN scope once (learns forward / +3 from the simulated NAT).
+    let _ = run_one(&transport, &nat).await;
+
+    // Observe the peer's real mapping walking DOWN: reverse direction, unique
+    // to this peer.  The peer scope must classify it Reverse while the STUN
+    // scope stays Forward.
+    transport
+        .observe_peer_scope("peer-b", 5000, generation)
+        .await;
+    transport
+        .observe_peer_scope("peer-b", 4990, generation)
+        .await;
+    transport
+        .observe_peer_scope("peer-b", 4980, generation)
+        .await;
+
+    let peer_snapshot = transport
+        .peer_learning_snapshot("peer-b", generation)
+        .await
+        .expect("peer scope must have learned evidence");
+    assert_eq!(
+        peer_snapshot.direction,
+        DirectionPattern::Reverse,
+        "the observed peer direction must override the STUN prior for that peer"
+    );
+
+    // Isolation: a different peer has no peer-scope evidence, so its snapshot
+    // is None (falls back to the STUN prior, which stays Forward).
+    assert!(
+        transport
+            .peer_learning_snapshot("peer-c", generation)
+            .await
+            .is_none(),
+        "a peer with no observed mapping must have no peer-scope evidence"
+    );
+}
