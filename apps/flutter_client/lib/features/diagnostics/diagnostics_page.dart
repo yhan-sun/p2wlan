@@ -10,6 +10,7 @@ import '../../core/models/diagnostics_models.dart';
 import '../../core/security/redactor.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
+import '../../shared/log_tail.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';

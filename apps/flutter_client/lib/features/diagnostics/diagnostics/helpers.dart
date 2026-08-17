@@ -4,14 +4,12 @@ class _LogPreview {
   const _LogPreview({
     required this.path,
     required this.content,
-    required this.lineCount,
     required this.shownLineCount,
     this.error,
   });
 
   final String path;
   final String content;
-  final int lineCount;
   final int shownLineCount;
   final String? error;
 }
@@ -199,34 +197,30 @@ _PermissionSnapshot _checkWindowsPermissions() {
 }
 
 Future<_LogPreview> _loadLogPreview() async {
+  const previewLines = 120;
   final path =
       '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
   final file = File(path);
   try {
     if (!await file.exists()) {
-      return _LogPreview(
-        path: path,
-        content: '',
-        lineCount: 0,
-        shownLineCount: 0,
-      );
+      return _LogPreview(path: path, content: '', shownLineCount: 0);
     }
-    final lines = await file.readAsLines();
-    final start = lines.length > 120 ? lines.length - 120 : 0;
-    final shown = lines.sublist(start);
-    // Redact any credential material so a log preview cannot leak tokens or
-    // tickets even if the daemon logged them (defense in depth).
+    // Bounded tail read: memory cost is O(preview window), never O(file size).
+    // A 100 MB log previews identically cheaply to a small one.
+    final content = await tailLines(file, lines: previewLines);
+    // We only read a bounded window, so we do not (and cannot, without an
+    // O(size) scan) report the total file line count. The shown count is
+    // bounded by the window; the UI labels it accordingly.
+    final shownLines = content.isEmpty ? 0 : content.split('\n').length;
     return _LogPreview(
       path: path,
-      content: redactLines(shown),
-      lineCount: lines.length,
-      shownLineCount: shown.length,
+      content: redactLines(content.split('\n')),
+      shownLineCount: shownLines,
     );
   } catch (error) {
     return _LogPreview(
       path: path,
       content: '',
-      lineCount: 0,
       shownLineCount: 0,
       error: 'Failed to read $path: $error',
     );
