@@ -405,6 +405,10 @@ impl PeerDiagnostics {
                             confidence: result.confidence,
                             hit_window: result.hit_window,
                             hit_rank: result.hit_rank,
+                            hit_top1: result.hit_top1,
+                            hit_top6: result.hit_top6,
+                            hit_top24: result.hit_top24,
+                            hit_top96: result.hit_top96,
                         })
                         .collect()
                 })

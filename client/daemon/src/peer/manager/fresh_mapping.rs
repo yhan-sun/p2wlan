@@ -38,6 +38,11 @@ pub(crate) struct FreshMappingPredictionResult {
     /// the per-hit calibration signal: `hit_window` only says in/out, while the
     /// rank tells how well-ordered the window was (top-1 vs. deep-in-window).
     pub hit_rank: Option<u8>,
+    /// Whether this observation landed in each calibration prefix.
+    pub hit_top1: bool,
+    pub hit_top6: bool,
+    pub hit_top24: bool,
+    pub hit_top96: bool,
 }
 
 const FRESH_MAPPING_STATE_MAX_AGE: Duration = Duration::from_secs(30);
@@ -649,6 +654,10 @@ impl PeerManager {
             window_ports: state.predicted_ports.clone(),
             hit_window,
             hit_rank,
+            hit_top1: hit_rank.is_some_and(|rank| rank < 1),
+            hit_top6: hit_rank.is_some_and(|rank| rank < 6),
+            hit_top24: hit_rank.is_some_and(|rank| rank < 24),
+            hit_top96: hit_rank.is_some_and(|rank| rank < 96),
         };
         // The peer-reflexive notification can arrive many times for the same
         // peer-facing mapping (retransmissions, triggered checks), and the
@@ -847,4 +856,9 @@ pub struct FreshMappingDiag {
     /// expose top-K accuracy, which window sizing and confidence calibration
     /// are tuned against.
     pub hit_rank: Option<u8>,
+    /// Whether this observation landed in each calibration prefix.
+    pub hit_top1: bool,
+    pub hit_top6: bool,
+    pub hit_top24: bool,
+    pub hit_top96: bool,
 }

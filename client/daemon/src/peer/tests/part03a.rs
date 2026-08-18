@@ -124,10 +124,61 @@ async fn fresh_mapping_prediction_result_records_hit_rank() {
     let hit = history.iter().find(|r| r.actual_port == 45395).unwrap();
     assert!(hit.hit_window);
     assert_eq!(hit.hit_rank, Some(2), "45395 is the 3rd (rank 2) prediction");
+    // Top-K calibration (P1-C): rank 2 is inside top-6/top-24/top-96 but not
+    // top-1.
+    assert!(!hit.hit_top1, "rank 2 is not a top-1 hit");
+    assert!(hit.hit_top6, "rank 2 is within top-6");
+    assert!(hit.hit_top24, "rank 2 is within top-24");
+    assert!(hit.hit_top96, "rank 2 is within top-96");
 
     let miss = history.iter().find(|r| r.actual_port == 45398).unwrap();
     assert!(!miss.hit_window);
     assert_eq!(miss.hit_rank, None, "an out-of-window port has no hit rank");
+    assert!(!miss.hit_top1 && !miss.hit_top6 && !miss.hit_top24 && !miss.hit_top96,
+        "a miss hits no calibration prefix");
+}
+
+#[tokio::test]
+async fn fresh_mapping_prediction_result_records_top1_hit() {
+    // P1-C: a top-1 hit (rank 0) must be flagged in every prefix, so the
+    // calibration consumer can distinguish a clean top-1 from a deep window hit.
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "127.0.0.1:51844".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    let model = p2pnet_nat::mapping::build_model(
+        &[45390, 45391, 45392],
+        Some("203.0.113.10".parse().unwrap()),
+        1_000,
+    );
+    manager
+        .record_fresh_mapping(
+            "peer1",
+            model,
+            vec![45393, 45394, 45395, 45396],
+            "0.0.0.0:58980".parse().unwrap(),
+            Some("203.0.113.10".parse().unwrap()),
+            42,
+            0,
+        )
+        .await;
+
+    // A hit at rank 0 (the top prediction).
+    manager
+        .record_fresh_mapping_prediction_result("peer1", "203.0.113.10:45393".parse().unwrap())
+        .await;
+
+    let history = manager
+        .fresh_mapping_history
+        .lock()
+        .unwrap()
+        .get("peer1")
+        .cloned()
+        .unwrap();
+    let hit = history.iter().find(|r| r.actual_port == 45393).unwrap();
+    assert_eq!(hit.hit_rank, Some(0), "45393 is the top (rank 0) prediction");
+    assert!(hit.hit_top1, "rank 0 is a top-1 hit");
+    assert!(hit.hit_top6 && hit.hit_top24 && hit.hit_top96);
 }
 
 #[tokio::test]
