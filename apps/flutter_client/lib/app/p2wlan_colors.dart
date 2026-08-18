@@ -167,8 +167,16 @@ class P2WlanColors extends ThemeExtension<P2WlanColors> {
     consoleText: Color(0xFFE5ECE8),
   );
 
+  /// Resolves the palette for [context]. The official `AppTheme` themes always
+  /// register the extension explicitly; this fallback only guards against a
+  /// theme that lacks it, choosing the palette that matches the effective
+  /// brightness so a dark theme never silently falls back to light colors.
   static P2WlanColors of(BuildContext context) {
-    return Theme.of(context).extension<P2WlanColors>() ?? light;
+    final theme = Theme.of(context);
+    return theme.extension<P2WlanColors>() ??
+        (theme.brightness == Brightness.dark
+            ? P2WlanColors.dark
+            : P2WlanColors.light);
   }
 
   @override

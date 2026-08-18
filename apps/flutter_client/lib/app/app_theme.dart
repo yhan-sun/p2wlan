@@ -454,6 +454,7 @@ abstract final class AppTheme {
 final _lightChipTheme = ChipThemeData(
   backgroundColor: P2WlanColors.light.surfaceMuted,
   selectedColor: P2WlanColors.light.selectedSurface,
+  secondarySelectedColor: P2WlanColors.light.selectedSurface,
   side: BorderSide(color: P2WlanColors.light.border),
   shape: RoundedRectangleBorder(
     borderRadius: BorderRadius.circular(AppTokens.radiusMd),
@@ -475,6 +476,7 @@ final _lightChipTheme = ChipThemeData(
 final _darkChipTheme = ChipThemeData(
   backgroundColor: P2WlanColors.dark.surfaceMuted,
   selectedColor: P2WlanColors.dark.selectedSurface,
+  secondarySelectedColor: P2WlanColors.dark.selectedSurface,
   side: BorderSide(color: P2WlanColors.dark.border),
   shape: RoundedRectangleBorder(
     borderRadius: BorderRadius.circular(AppTokens.radiusMd),

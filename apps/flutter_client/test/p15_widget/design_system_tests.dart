@@ -3,6 +3,61 @@ part of '../p15_widget_test.dart';
 void _registerDesignSystemTests() {
   for (final dark in [false, true]) {
     testWidgets(
+      'selected ChoiceChip uses selectedSurface in ${dark ? 'dark' : 'light'}',
+      (tester) async {
+        await tester.pumpWidget(
+          _DesignSystemHost(
+            dark: dark,
+            child: const ChoiceChip(label: Text('filter'), selected: true),
+          ),
+        );
+
+        final c = dark ? P2WlanColors.dark : P2WlanColors.light;
+        // ChoiceChip builds a RawChip whose resolved selected background comes
+        // from the chip theme's secondarySelectedColor; assert the real
+        // rendered contract (chips paint via their own decoration, so RawChip
+        // is the stable surface to inspect).
+        final raw = tester.widget<RawChip>(find.byType(RawChip));
+        expect(raw.selected, isTrue);
+        expect(raw.selectedColor, c.selectedSurface);
+        // Selected label/checkmark stay on the brand accent family.
+        expect(
+          AppTheme.lightTheme.chipTheme.secondarySelectedColor,
+          P2WlanColors.light.selectedSurface,
+        );
+        expect(
+          AppTheme.darkTheme.chipTheme.secondarySelectedColor,
+          P2WlanColors.dark.selectedSurface,
+        );
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final dark in [false, true]) {
+    testWidgets(
+      'P2WlanColors.of falls back by brightness ${dark ? 'dark' : 'light'}',
+      (tester) async {
+        P2WlanColors? resolved;
+        await tester.pumpWidget(
+          Theme(
+            data: dark ? ThemeData.dark() : ThemeData.light(),
+            child: Builder(
+              builder: (context) {
+                resolved = P2WlanColors.of(context);
+                return const SizedBox.shrink();
+              },
+            ),
+          ),
+        );
+        expect(resolved, dark ? P2WlanColors.dark : P2WlanColors.light);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final dark in [false, true]) {
+    testWidgets(
       'StatusBadge tones resolve in ${dark ? 'dark' : 'light'} theme',
       (tester) async {
         await tester.pumpWidget(

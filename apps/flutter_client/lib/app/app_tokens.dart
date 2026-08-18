@@ -44,17 +44,17 @@ abstract final class AppTokens {
   static const colorGoodBorder = Color(0xFFB9DFC9);
   static const colorGoodText = Color(0xFF276044);
 
-  // Warning / Degraded / Relay
+  // Warning / Degraded / Probing
   static const colorWarnBg = Color(0xFFFCF7EA);
   static const colorWarnBorder = Color(0xFFE6CD8F);
   static const colorWarnText = Color(0xFF755622);
 
-  // Bad / Offline / Unhealthy
+  // Bad / Unhealthy / Actual failures
   static const colorBadBg = Color(0xFFFCF3F1);
   static const colorBadBorder = Color(0xFFE7B8AE);
   static const colorBadText = Color(0xFF8B372D);
 
-  // Neutral / Skipped / Idle
+  // Neutral / Offline / Skipped / Idle
   static const colorNeutralBg = Color(0xFFF1F4F3);
   static const colorNeutralBorder = Color(0xFFD3DCDA);
   static const colorNeutralText = Color(0xFF4C585D);
