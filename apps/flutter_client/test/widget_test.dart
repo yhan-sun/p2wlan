@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -114,6 +116,72 @@ void main() {
     await tester.pump();
 
     expect(find.text('守护进程控制'), findsOneWidget);
+  });
+
+  testWidgets(
+    'More hub resolves when the viewport grows to a rail breakpoint',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await _pumpTestApp(tester);
+
+      // Compact: open the More hub.
+      await tester.tap(find.text('更多'));
+      await tester.pump();
+      expect(find.text('诊断'), findsOneWidget);
+      expect(find.text('设置'), findsOneWidget);
+
+      // Grow to Medium: the rail replaces the bottom bar and the More hub must
+      // resolve back to the current business section (dashboard).
+      tester.view.physicalSize = const Size(700, 1000);
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.byType(NavigationRail), findsOneWidget);
+      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.text('更多'), findsNothing);
+      expect(find.byType(ListTile), findsNothing);
+      expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+      expect(find.text('仪表盘'), findsWidgets);
+
+      // Shrink back to Compact: the bottom bar returns with the More hub
+      // selected — never an illegal navigation state.
+      tester.view.physicalSize = const Size(390, 844);
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.byType(NavigationBar), findsOneWidget);
+      expect(find.byType(NavigationRail), findsNothing);
+      expect(find.byType(ListTile), findsNWidgets(2));
+      expect(find.text('诊断'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('compact desktop keeps a rail instead of the phone bottom bar', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    tester.view.physicalSize = const Size(500, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+
+    expect(find.byType(NavigationRail), findsOneWidget);
+    expect(find.byType(NavigationBar), findsNothing);
+    // Icon-only rail: labels are hidden (kept invisible for semantics only).
+    final rail = tester.widget<NavigationRail>(find.byType(NavigationRail));
+    expect(rail.labelType, NavigationRailLabelType.none);
+    expect(find.text('更多'), findsNothing);
+
+    // Must be restored inside the test body: the framework asserts that
+    // foundation debug variables are unset before it runs tear-downs.
+    debugDefaultTargetPlatformOverride = null;
   });
 }
 

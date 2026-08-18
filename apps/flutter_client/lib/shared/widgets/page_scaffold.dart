@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../layout/app_breakpoints.dart';
+
 class PageScaffold extends StatelessWidget {
   const PageScaffold({
     super.key,
@@ -24,7 +26,10 @@ class PageScaffold extends StatelessWidget {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final isNarrow = constraints.maxWidth < 640;
+          // Content density follows the shell's compact breakpoint: below it
+          // (phones / very narrow windows) the page uses tighter padding.
+          final isNarrow =
+              constraints.maxWidth < AppBreakpoints.compactMaxWidth;
           final horizontalPadding = isNarrow ? 14.0 : 22.0;
           final verticalPadding = isNarrow ? 14.0 : 20.0;
 

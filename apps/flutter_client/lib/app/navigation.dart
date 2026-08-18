@@ -87,7 +87,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
         // never suddenly morphs into a phone layout.
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
-        final body = _buildBody();
+        // The More hub is meaningful only while the bottom bar is actually
+        // shown. If the viewport grows to a rail layout, derive it away so
+        // the current business section renders instead — no setState needed
+        // on viewport change.
+        final showMoreHub = useBottomNav && _showMoreHub;
+        final body = _buildBody(showMoreHub);
         final dragWindowFromAppBar = _canDragWindowFromAppBar;
         final macosChrome = _usesMacosChrome;
         final windowsChrome = _usesWindowsChrome;
@@ -96,7 +101,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
           appBar: AppBar(
             leading: macosChrome ? const SizedBox.shrink() : null,
             leadingWidth: macosChrome ? 76 : null,
-            title: Text(_appBarTitle(strings)),
+            title: Text(_appBarTitle(strings, showMoreHub)),
             centerTitle: true,
             flexibleSpace: dragWindowFromAppBar
                 ? const DragToMoveArea(child: SizedBox.expand())
@@ -116,7 +121,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
                     Expanded(child: body),
                   ],
                 ),
-          bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
+          bottomNavigationBar: useBottomNav
+              ? _buildBottomNav(strings, showMoreHub)
+              : null,
         );
       },
     );
@@ -128,8 +135,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
     }
   }
 
-  Widget _buildBody() {
-    if (_showMoreHub) {
+  Widget _buildBody(bool showMoreHub) {
+    if (showMoreHub) {
       return _MoreHub(onOpenSection: _openFromMoreHub);
     }
     return switch (_section) {
@@ -161,8 +168,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
     };
   }
 
-  String _appBarTitle(AppStrings strings) {
-    if (_showMoreHub) return strings.more;
+  String _appBarTitle(AppStrings strings, bool showMoreHub) {
+    if (showMoreHub) return strings.more;
     return strings.sectionLabel(_section.name);
   }
 
@@ -182,8 +189,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
     });
   }
 
-  int get _bottomNavIndex {
-    if (_showMoreHub) return 3;
+  int _bottomNavIndex(bool showMoreHub) {
+    if (showMoreHub) return 3;
     return switch (_section) {
       P2WlanSection.dashboard => 0,
       P2WlanSection.nodes => 1,
@@ -233,9 +240,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
   }
 
-  Widget _buildBottomNav(AppStrings strings) {
+  Widget _buildBottomNav(AppStrings strings, bool showMoreHub) {
     return NavigationBar(
-      selectedIndex: _bottomNavIndex,
+      selectedIndex: _bottomNavIndex(showMoreHub),
       onDestinationSelected: _onBottomNavSelected,
       destinations: [
         _bottomDestination(strings.dashboard, P2WlanSection.dashboard.icon),
