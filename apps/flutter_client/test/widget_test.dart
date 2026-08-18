@@ -53,10 +53,9 @@ void main() {
     expect(find.text('Daemon control'), findsOneWidget);
   });
 
-  testWidgets('uses compact navigation below the desktop rail breakpoint', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(700, 1000);
+  testWidgets('uses three-tier responsive navigation', (tester) async {
+    // Compact phone: four-item bottom bar, no rail.
+    tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
@@ -65,6 +64,56 @@ void main() {
 
     expect(find.byType(NavigationBar), findsOneWidget);
     expect(find.byType(NavigationRail), findsNothing);
+    expect(
+      find.descendant(
+        of: find.byType(NavigationBar),
+        matching: find.byType(NavigationDestination),
+      ),
+      findsNWidgets(4),
+    );
+    expect(find.text('更多'), findsOneWidget);
+
+    // Medium tablet / small window: a plain rail with all five labels.
+    tester.view.physicalSize = const Size(700, 1000);
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byType(NavigationRail), findsOneWidget);
+    expect(find.byType(NavigationBar), findsNothing);
+    expect(find.text('设置'), findsOneWidget);
+
+    // Expanded desktop: grouped rail with brand header.
+    tester.view.physicalSize = const Size(1280, 900);
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byType(NavigationRail), findsNothing);
+    expect(find.text('P2WLAN'), findsWidgets);
+    expect(find.text('概览'), findsOneWidget);
+    expect(find.text('网络'), findsOneWidget);
+    expect(find.text('工具'), findsOneWidget);
+  });
+
+  testWidgets('compact navigation routes diagnostics and settings via More', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+
+    await tester.tap(find.text('更多'));
+    await tester.pump();
+
+    expect(find.text('诊断'), findsOneWidget);
+    expect(find.text('设置'), findsOneWidget);
+
+    await tester.tap(find.text('设置'));
+    await tester.pump();
+
+    expect(find.text('守护进程控制'), findsOneWidget);
   });
 }
 

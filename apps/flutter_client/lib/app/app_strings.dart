@@ -40,6 +40,13 @@ class AppStrings {
   String get tunnels => isZh ? '隧道' : 'Tunnels';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
+  String get more => isZh ? '更多' : 'More';
+  String get navGroupOverview => isZh ? '概览' : 'Overview';
+  String get navGroupNetwork => isZh ? '网络' : 'Network';
+  String get navGroupTools => isZh ? '工具' : 'Tools';
+  String get moreDescription => isZh
+      ? '诊断与设置等低频功能。'
+      : 'Diagnostics, settings, and other less frequent features.';
   String get restartRequired =>
       isZh ? '需要重启 P2WLAN' : 'P2WLAN restart required';
   String get restartRequiredDetail => isZh

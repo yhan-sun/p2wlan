@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/api/control_api.dart';
@@ -93,6 +94,7 @@ class _NodesPageState extends State<NodesPage> {
           title: strings.nodes,
           subtitle: strings.nodesSubtitle,
           showHeader: widget.showHeader,
+          maxWidth: nodesPageMaxWidth,
           children: [
             _LocalNodePanel(
               snapshot: snapshot,

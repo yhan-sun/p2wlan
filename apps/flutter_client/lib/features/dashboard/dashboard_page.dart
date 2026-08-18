@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/capabilities/platform_capabilities.dart';
@@ -42,6 +43,7 @@ class DashboardPage extends StatelessWidget {
           title: strings.dashboard,
           subtitle: strings.dashboardSubtitle,
           showHeader: showHeader,
+          maxWidth: dashboardPageMaxWidth,
           children: [
             _ConnectionBanner(
               snapshot: snapshot,

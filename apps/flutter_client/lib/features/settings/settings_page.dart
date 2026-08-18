@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/api/diagnostics_api.dart';
@@ -130,6 +131,7 @@ class _SettingsPageState extends State<SettingsPage> {
           title: strings.settings,
           subtitle: strings.settingsSubtitle,
           showHeader: widget.showHeader,
+          maxWidth: settingsPageMaxWidth,
           children: [
             if (_formError != null) ...[
               _ErrorBanner(message: _formError!),

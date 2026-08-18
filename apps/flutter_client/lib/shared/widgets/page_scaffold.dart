@@ -7,12 +7,16 @@ class PageScaffold extends StatelessWidget {
     required this.subtitle,
     required this.children,
     this.showHeader = true,
+    this.maxWidth = defaultPageMaxWidth,
   });
+
+  static const defaultPageMaxWidth = 980.0;
 
   final String title;
   final String subtitle;
   final List<Widget> children;
   final bool showHeader;
+  final double maxWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -34,7 +38,7 @@ class PageScaffold extends StatelessWidget {
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 980),
+                  constraints: BoxConstraints(maxWidth: maxWidth),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [

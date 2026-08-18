@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/capabilities/permission_preflight.dart';
@@ -46,6 +47,7 @@ class DiagnosticsPage extends StatelessWidget {
           title: strings.diagnostics,
           subtitle: strings.diagnosticsSubtitle,
           showHeader: showHeader,
+          maxWidth: diagnosticsPageMaxWidth,
           children: [
             _DiagnosticsActions(statusStore: statusStore, snapshot: snapshot),
             const SizedBox(height: 14),

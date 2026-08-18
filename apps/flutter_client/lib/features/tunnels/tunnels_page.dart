@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../core/models/diagnostics_models.dart';
@@ -105,6 +106,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
               ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
               : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.',
           showHeader: widget.showHeader,
+          maxWidth: tunnelsPageMaxWidth,
           children: [
             if (_message != null) ...[
               _InfoBanner(message: _message!),
