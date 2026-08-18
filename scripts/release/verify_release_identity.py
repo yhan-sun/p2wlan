@@ -191,11 +191,32 @@ def main() -> None:
     parser.add_argument("--daemon")
     parser.add_argument("--build-info-file")
     parser.add_argument("--manifest")
+    parser.add_argument("--emit-manifest")
     parser.add_argument("--app-info")
     parser.add_argument("--expected-commit")
     parser.add_argument("--release", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(verify(args), sort_keys=True))
+    result = verify(args)
+    if args.emit_manifest:
+        info = daemon_info(args)
+        manifest = {
+            "app_version": result["app_version"],
+            "git_commit": result["git_commit"],
+            "build_id": result["build_id"],
+            "daemon_sha256": result["daemon_sha256"],
+            "daemon_build_info": dict(info),
+            "toolchain": {
+                "cargo": cargo_version(),
+                "flutter": flutter_version(),
+            },
+        }
+        out_path = Path(args.emit_manifest)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"manifest written to {out_path}", flush=True, file=sys.stderr)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
