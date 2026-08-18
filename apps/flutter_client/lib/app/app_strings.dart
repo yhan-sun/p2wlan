@@ -377,6 +377,95 @@ class AppStrings {
   String get failedToSaveLocalSettings =>
       isZh ? '保存本地设置失败' : 'Failed to save local settings';
 
+  // --- Settings information architecture (Phase 4) ---
+  String get settingsSectionGeneral => isZh ? '常规' : 'General';
+  String get settingsSectionAccountNetwork =>
+      isZh ? '账号与网络' : 'Account & Network';
+  String get settingsSectionAdvancedNetwork =>
+      isZh ? '高级网络' : 'Advanced Network';
+  String get settingsSectionDeveloperDiagnostics =>
+      isZh ? '开发与诊断' : 'Developer & Diagnostics';
+
+  String get saveChanges => isZh ? '保存更改' : 'Save changes';
+  String get saveChangesRestartRequired =>
+      isZh ? '保存更改并应用（需重启）' : 'Save changes (restart needed)';
+  String get disclosureExpand => isZh ? '展开' : 'Expand';
+  String get disclosureCollapse => isZh ? '收起' : 'Collapse';
+
+  // General
+  String get deviceNameHelper =>
+      isZh ? '留空保存时会使用当前主机名。' : 'If left empty, the current hostname is used.';
+  String get closeBehavior => isZh ? '关闭窗口行为' : 'Close window behavior';
+  String get closeBehaviorHelper => isZh
+      ? '关闭主窗口后，P2WLAN 是否继续保持后台运行。'
+      : 'Whether P2WLAN keeps running in the background after the main window closes.';
+  String get closeBehaviorKeepRunning =>
+      isZh ? '继续在后台运行' : 'Keep running in background';
+  String get closeBehaviorStopAndQuit => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
+
+  // Credential / account
+  String get credentialSectionTitle => isZh ? '认证凭据' : 'Authentication';
+  String get credentialSaved => isZh ? '已安全保存' : 'Securely saved';
+  String get credentialNotSaved => isZh ? '未保存凭据' : 'No credential saved';
+  String get credentialManualMode =>
+      isZh ? '手动模式无需凭据' : 'Manual mode, no credential needed';
+  String get changeCredential => isZh ? '更换凭据' : 'Change credential';
+  String get hideCredential => isZh ? '收起' : 'Hide';
+  String get credentialChangeHelper => isZh
+      ? '输入新的认证 Token 以替换当前凭据；留空保存将保留现有凭据。'
+      : 'Enter a new auth token to replace the current credential. Leaving it blank on save keeps the existing credential.';
+  String get signOut => isZh ? '退出登录' : 'Sign out';
+
+  // Advanced network
+  String get advancedNetworkSubtitle => isZh
+      ? 'TUN、MTU、UDP、NAT 穿透与 Relay 参数。'
+      : 'TUN, MTU, UDP, NAT traversal, and relay parameters.';
+  String get interfaceName => isZh ? '网卡设备名称' : 'Interface name';
+  String get interfaceNameHelper =>
+      isZh ? defaultTunInterface : defaultTunInterface;
+  String get mtu => 'MTU';
+  String get mtuHelper => isZh
+      ? '建议 1420；Relay 路径异常时可尝试 1280。'
+      : '1420 is recommended; try 1280 for relay path issues.';
+  String get overlayCidr => 'Overlay CIDR';
+  String get overlayCidrHelper =>
+      isZh ? defaultOverlayCidr : defaultOverlayCidr;
+  String get udpBind => isZh ? 'UDP 监听地址' : 'UDP bind';
+  String get udpBindHelper => '0.0.0.0:0';
+  String get udpAdvertise => isZh ? '公网 UDP 地址' : 'UDP advertise';
+  String get udpAdvertiseHelper => isZh
+      ? '云主机固定入口，例如 203.0.113.10:60207。'
+      : 'Fixed cloud endpoint such as 203.0.113.10:60207.';
+  String get socketPool => isZh ? '增强打洞 socket pool' : 'Socket pool';
+  String get socketPoolHelper => isZh
+      ? '困难 NAT 下增加受控 UDP 映射，推荐 3。'
+      : 'Adds bounded UDP mappings for hard NATs; 3 is recommended.';
+  String get socketPoolOff => 'off';
+  String get socketPool2 => '2 sockets';
+  String get socketPool3 => '3 sockets';
+  String get socketPool4 => '4 sockets';
+  String get relayCandidates => isZh ? 'Relay 候选' : 'Relay candidates';
+  String get relayCandidatesHelper => isZh
+      ? '可选，逗号分隔，格式 region@ip:port 或 ip:port。'
+      : 'Optional comma-separated region@ip:port or ip:port entries.';
+  String get advancedNetworkInactiveHint => isZh
+      ? '当前平台未启用本地节点，以下参数暂不适用。'
+      : 'This platform does not run a local node; these parameters do not apply.';
+
+  // Developer & diagnostics
+  String get developerSectionSubtitle =>
+      isZh ? '本地服务与诊断参数。' : 'Local service and diagnostic parameters.';
+  String get localService => isZh ? '本地服务' : 'Local service';
+  String get daemonRunning => isZh ? '运行中' : 'Running';
+  String get daemonStopped => isZh ? '未运行' : 'Not running';
+  String get localSettingsFileLabel => isZh ? '配置文件位置' : 'Config file location';
+  String get restartWillApplyLater => isZh
+      ? '这些设置将在相关节点下次启动时生效。'
+      : 'These settings take effect the next time the relevant node starts.';
+  String get settingsSubtitleAccountNetwork => isZh
+      ? '登录凭据、控制面与网络标识。'
+      : 'Credentials, control plane, and network identity.';
+
   String sectionLabel(String sectionName) {
     return switch (sectionName) {
       'dashboard' => dashboard,

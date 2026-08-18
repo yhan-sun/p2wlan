@@ -26,8 +26,15 @@ void main() {
     await tester.tap(find.text('设置').last);
     await tester.pump();
 
-    expect(find.text('诊断端点'), findsWidgets);
-    expect(find.text('守护进程控制'), findsOneWidget);
+    // Diagnostics lives in the collapsed Developer section (progressive
+    // disclosure), so it is revealed before asserting on the URL field.
+    expect(find.text('开发与诊断'), findsOneWidget);
+    await tester.ensureVisible(find.text('开发与诊断'));
+    await tester.pump();
+    await tester.tap(find.text('开发与诊断'));
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.text('诊断 URL'), findsWidgets);
   });
 
   testWidgets('switches the shell language from Chinese to English', (
@@ -51,8 +58,12 @@ void main() {
     await tester.pump();
 
     expect(find.text('Settings'), findsWidgets);
-    expect(find.text('Diagnostics endpoint'), findsWidgets);
-    expect(find.text('Daemon control'), findsOneWidget);
+    expect(find.text('Developer & Diagnostics'), findsOneWidget);
+    await tester.ensureVisible(find.text('Developer & Diagnostics'));
+    await tester.pump();
+    await tester.tap(find.text('Developer & Diagnostics'));
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.text('Diagnostics URL'), findsWidgets);
   });
 
   testWidgets('uses three-tier responsive navigation', (tester) async {
@@ -115,7 +126,7 @@ void main() {
     await tester.tap(find.text('设置'));
     await tester.pump();
 
-    expect(find.text('守护进程控制'), findsOneWidget);
+    expect(find.text('开发与诊断'), findsOneWidget);
   });
 
   testWidgets(

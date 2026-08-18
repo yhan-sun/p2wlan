@@ -41,7 +41,7 @@ extension _SettingsPageActions on _SettingsPageState {
         udpAdvertise: _udpAdvertiseController.text,
         socketPool: _socketPool,
         relayServers: _relayServersController.text,
-        closeBehavior: currentSettings.closeBehavior,
+        closeBehavior: _closeBehavior,
       );
       final restartRequired =
           daemonWasRunning &&
@@ -55,7 +55,10 @@ extension _SettingsPageActions on _SettingsPageState {
           _restartRequired = restartRequired;
           // Re-derive the credential status without ever reading the token
           // back into a text field.
-          _credentialState = _describeCredential(widget.settingsStore.settings);
+          _credentialState = _describeCredential(
+            widget.settingsStore.settings,
+            strings,
+          );
         });
       }
       _showSnackBar(
