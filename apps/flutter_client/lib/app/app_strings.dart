@@ -236,8 +236,96 @@ class AppStrings {
       isZh ? '测速失败：$message' : 'Speed test failed: $message';
 
   String get diagnosticsSubtitle => isZh
-      ? 'GET /status 的摘要和原始 JSON。'
-      : 'Summary plus raw JSON from GET /status.';
+      ? '检查 P2WLAN 服务状态，并查看需要处理的问题。'
+      : 'Check P2WLAN service status and see what needs attention.';
+  String get diagnosticsOverview => isZh ? '诊断概览' : 'Diagnostics overview';
+  String get healthChecks => isZh ? '状态检查' : 'Health checks';
+  String get p2wlanService => isZh ? 'P2WLAN 服务' : 'P2WLAN service';
+  String get controlService => isZh ? '控制服务' : 'Control service';
+  String get deviceConnections => isZh ? '设备连接' : 'Device connections';
+  String get runningNormally => isZh ? '正常运行' : 'Running normally';
+  String get needsAction => isZh ? '需要处理' : 'Needs attention';
+  String get advancedDiagnostics => isZh ? '高级诊断' : 'Advanced diagnostics';
+  String get advancedDiagnosticsSubtitle => isZh
+      ? '端点、权限、协议、日志和原始状态'
+      : 'Endpoints, permissions, protocol, logs, and raw status';
+  String get runtimeDetails => isZh ? '运行详情' : 'Runtime details';
+  String get healthEndpoint => isZh ? '健康端点' : 'Health endpoint';
+  String get statusEndpoint => isZh ? '状态端点' : 'Status endpoint';
+  String get healthEndpointReachable =>
+      isZh ? '健康端点可达' : 'Health endpoint reachable';
+  String get healthEndpointOffline =>
+      isZh ? '健康端点不可达' : 'Health endpoint offline';
+  String get overviewHealthyTitle =>
+      isZh ? 'P2WLAN 运行正常' : 'P2WLAN is running normally';
+  String get overviewHealthyDetail =>
+      isZh ? '当前没有发现需要处理的问题。' : 'No issues found that need your attention.';
+  String get overviewAttentionTitle =>
+      isZh ? 'P2WLAN 需要检查' : 'P2WLAN needs attention';
+  String get overviewAttentionDetail =>
+      isZh ? '部分网络功能当前可能受影响。' : 'Some network features may be affected.';
+  String get overviewUnavailableTitle =>
+      isZh ? '暂时无法获取诊断状态' : 'Diagnostics unavailable';
+  String get overviewUnavailableDetail => isZh
+      ? '无法读取 P2WLAN 当前运行状态，请稍后重试。'
+      : 'Unable to read the current P2WLAN status. Please try again.';
+  String get overviewStaleTitle =>
+      isZh ? '诊断数据已过期' : 'Diagnostics data is stale';
+  String get overviewStaleDetail => isZh
+      ? '当前显示的是上一次成功获取的数据。'
+      : 'Showing data from the last successful refresh.';
+  String devicesOnlineOk(int online) =>
+      isZh ? '$online 台在线，无路径异常' : '$online online, no path anomalies';
+  String devicesOnlineNeedsCheck(int online, int count) =>
+      isZh ? '$online 台在线，$count 台需检查' : '$online online, $count need review';
+  String get issueCannotReachService =>
+      isZh ? '无法连接 P2WLAN 服务' : 'Cannot reach the P2WLAN service';
+  String get issueCannotReachServiceDetail => isZh
+      ? '请稍后重试，或检查 P2WLAN 服务是否已启动。'
+      : 'Please try again, or check whether the P2WLAN service is running.';
+  String get issueStatusUnavailableTitle =>
+      isZh ? '运行状态暂时不可用' : 'Runtime status temporarily unavailable';
+  String get issueStatusUnavailableDetail => isZh
+      ? '服务可达，但运行状态暂时不可用。'
+      : 'The service is reachable, but runtime status is temporarily unavailable.';
+  String get issueReauthTitle => isZh ? '需要重新登录' : 'Re-authentication required';
+  String get issueReauthDetail => isZh
+      ? '当前认证已失效，请重新登录后再试。'
+      : 'Your authentication has expired. Please sign in again.';
+  String get issueControlServerTitle =>
+      isZh ? '控制服务器连接异常' : 'Control server connection issue';
+  String get issueControlServerDetail => isZh
+      ? '设备目录和配置同步可能暂时不可用。请检查网络或控制服务器设置后刷新。'
+      : 'Device catalog and config sync may be temporarily unavailable. Check your network or control server settings, then refresh.';
+  String get issueCriticalTaskTitle =>
+      isZh ? '关键网络任务需要处理' : 'Critical network tasks need attention';
+  String get issueCriticalTaskDetail =>
+      isZh ? '后台网络任务出现异常。' : 'A background network task is failing.';
+  String get issueServiceStatusTitle =>
+      isZh ? '运行状态异常' : 'Runtime status degraded';
+  String get issueServiceStatusDetail => isZh
+      ? 'P2WLAN 服务上报了异常状态。'
+      : 'The P2WLAN service reported an abnormal status.';
+  String get issueStaleDetail =>
+      isZh ? '建议刷新状态。' : 'Try refreshing the status.';
+  String get issueRelayTitle =>
+      isZh ? '中继路径需要检查' : 'Relay path needs attention';
+  String get issueRelayDetail => isZh
+      ? '中继路径出现异常，部分跨 NAT 连接可能受影响。'
+      : 'The relay path is failing; some cross-NAT connections may be affected.';
+  String devicesNeedPathReview(int count) =>
+      isZh ? '$count 台设备的连接路径需要检查' : '$count device(s) need path review';
+  String get issuePeerPathsDetail =>
+      isZh ? '具体设备请到「设备」页查看。' : 'See the Devices page for specific devices.';
+  String get copyDiagnosticsSummary =>
+      isZh ? '复制诊断摘要' : 'Copy diagnostics summary';
+  String get diagnosticsSummaryCopied =>
+      isZh ? '诊断摘要已复制' : 'Diagnostics summary copied';
+  String get cannotReadLogs => isZh ? '无法读取日志' : 'Unable to read logs';
+  String get cannotOpenLogsTitle => isZh ? '无法打开日志目录' : 'Could not open logs';
+  String get cannotOpenLogsDetail =>
+      isZh ? '请确认系统文件管理器可用。' : 'Make sure a file manager is available.';
+  String get logsOpened => isZh ? '日志目录已打开' : 'Log directory opened';
   String get summary => isZh ? '摘要' : 'Summary';
   String get statusLoaded => isZh ? '状态已加载' : 'Status loaded';
   String get noSnapshot => isZh ? '无快照' : 'No snapshot';

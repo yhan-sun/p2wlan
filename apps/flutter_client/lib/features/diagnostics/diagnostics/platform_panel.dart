@@ -1,7 +1,10 @@
 part of '../diagnostics_page.dart';
 
 class _PlatformPanel extends StatefulWidget {
-  const _PlatformPanel();
+  const _PlatformPanel({this.permissionCheck});
+
+  /// Test seam: replaces the real platform permission preflight.
+  final Future<PermissionPreflight> Function()? permissionCheck;
 
   @override
   State<_PlatformPanel> createState() => _PlatformPanelState();
@@ -13,7 +16,7 @@ class _PlatformPanelState extends State<_PlatformPanel> {
   @override
   void initState() {
     super.initState();
-    _permissionFuture = _checkPermissions();
+    _permissionFuture = (widget.permissionCheck ?? _checkPermissions)();
   }
 
   @override
@@ -104,7 +107,7 @@ class _PlatformPanelState extends State<_PlatformPanel> {
 
   void _refresh() {
     setState(() {
-      _permissionFuture = _checkPermissions();
+      _permissionFuture = (widget.permissionCheck ?? _checkPermissions)();
     });
   }
 }

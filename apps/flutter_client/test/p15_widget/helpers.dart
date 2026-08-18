@@ -21,6 +21,8 @@ Future<_Stores> _makeStores({
       StatusStore.defaultStartupCatalogRefreshInterval,
   Duration startupCatalogRefreshTimeout =
       StatusStore.defaultStartupCatalogRefreshTimeout,
+  bool enableFreshnessTimer = false,
+  Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
@@ -38,6 +40,8 @@ Future<_Stores> _makeStores({
     autoRefreshInterval: const Duration(minutes: 5),
     startupCatalogRefreshInterval: startupCatalogRefreshInterval,
     startupCatalogRefreshTimeout: startupCatalogRefreshTimeout,
+    enableFreshnessTimer: enableFreshnessTimer,
+    maxSnapshotAge: maxSnapshotAge,
   );
   return _Stores(tempDir, settingsStore, statusStore);
 }

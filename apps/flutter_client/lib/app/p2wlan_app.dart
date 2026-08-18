@@ -145,6 +145,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                       : P2WlanShell(
                           settingsStore: _settingsStore,
                           statusStore: _statusStore,
+                          capabilities: _capabilities,
                           onLogout: _logout,
                         )
                 : LoginPage(

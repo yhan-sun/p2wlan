@@ -1,7 +1,7 @@
 part of '../diagnostics_page.dart';
 
-class _BoundaryPanel extends StatelessWidget {
-  const _BoundaryPanel({required this.snapshot});
+class _ProtocolMtuPanel extends StatelessWidget {
+  const _ProtocolMtuPanel({required this.snapshot});
 
   final DiagnosticsSnapshot? snapshot;
 
@@ -116,7 +116,9 @@ class _TaskRow extends StatelessWidget {
             task.name,
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
           );
-          final error = task.error;
+          final error = task.error == null
+              ? null
+              : redactSensitive(task.error!);
           if (constraints.maxWidth < 380 && error != null) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,

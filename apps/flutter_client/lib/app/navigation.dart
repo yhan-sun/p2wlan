@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import '../app/app_constants.dart';
 import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
+import '../core/capabilities/platform_capabilities.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/dashboard/dashboard_page.dart';
@@ -36,11 +37,16 @@ class P2WlanShell extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.onLogout,
+    this.capabilities,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final VoidCallback? onLogout;
+
+  /// Platform capability override (primarily for tests); defaults to the
+  /// current runtime platform.
+  final PlatformCapabilities? capabilities;
 
   @override
   State<P2WlanShell> createState() => _P2WlanShellState();
@@ -157,6 +163,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       ),
       P2WlanSection.diagnostics => DiagnosticsPage(
         statusStore: widget.statusStore,
+        capabilities: widget.capabilities,
         showHeader: false,
       ),
       P2WlanSection.settings => SettingsPage(
