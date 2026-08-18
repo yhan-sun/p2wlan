@@ -224,14 +224,13 @@ class _ConnectionMapPainter extends CustomPainter {
       ..strokeWidth = 1.2
       ..strokeCap = StrokeCap.round;
     final midX = size.width / 2;
-    final localY = size.height / 2;
-    final localRow = rows ~/ 2;
 
-    // Central trunk plus this-device row always exist.
+    // Central vertical trunk always exists; the local device node sits on it
+    // via Center in the widget tree. Peers branch off the trunk only where a
+    // real peer occupies that row — no synthetic local row, no dangling
+    // branches for empty rows.
     canvas.drawLine(Offset(midX, 0), Offset(midX, size.height), paint);
-    canvas.drawLine(Offset(0, localY), Offset(size.width, localY), paint);
     for (var index = 0; index < rows; index++) {
-      if (index == localRow) continue;
       final y = index * rowHeight + rowHeight / 2;
       if (index < leftCount) {
         canvas.drawLine(Offset(0, y), Offset(midX, y), paint);

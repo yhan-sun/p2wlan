@@ -337,7 +337,7 @@ void _registerDashboardTests() {
     tester.view.resetDevicePixelRatio();
   });
 
-  testWidgets('Connection map draws single peer with no dangling branches', (
+  testWidgets('Connection map draws one branch per real peer (1..6)', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -346,74 +346,55 @@ void _registerDashboardTests() {
     addTearDown(tester.view.resetDevicePixelRatio);
 
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, [_fourPeerFixtures().first]);
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
+    for (var count = 1; count <= 6; count++) {
+      final snapshot = _snapshotWithPeers(base, _peerFixturesForCount(count));
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
         ),
-      ),
-    );
-    await tester.pump();
+      ))!;
+      addTearDown(stores.dispose);
 
-    // One peer on the left, none on the right: only the central trunk and the
-    // local row are drawn — no right-side branch for a missing peer.
-    final lines = _mapLinePairs(tester, const Size(120, 80));
-    expect(lines, {
-      (const Offset(60, 0), const Offset(60, 80)),
-      (const Offset(0, 40), const Offset(120, 40)),
-    });
-    expect(tester.takeException(), isNull);
-  });
-
-  testWidgets('Connection map matches branches to existing peers', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(1280, 900);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, _fivePeerFixtures());
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
         ),
-      ),
-    );
-    await tester.pump();
+      );
+      await tester.pump();
 
-    // 5 peers -> 3 left rows + 2 right rows, local row in the middle. Row 2
-    // has a left peer but no right peer, so no right branch is drawn for it.
-    final lines = _mapLinePairs(tester, const Size(120, 240));
-    expect(lines, {
-      (const Offset(60, 0), const Offset(60, 240)),
-      (const Offset(0, 120), const Offset(120, 120)),
-      (const Offset(0, 40), const Offset(60, 40)),
-      (const Offset(60, 40), const Offset(120, 40)),
-      (const Offset(0, 200), const Offset(60, 200)),
-    });
-    expect(tester.takeException(), isNull);
+      final lines = _mapLinePairs(
+        tester,
+        Size(120, _mapRowCount(count) * 80.0),
+      );
+      // One vertical trunk plus exactly one branch per real peer: no missing
+      // branches and no dangling branches for empty rows.
+      expect(
+        lines.length,
+        1 + count,
+        reason: 'peers=$count (${_mapRowCount(count)} rows)',
+      );
+      final verticals = lines.where((line) => line.$1.dx == line.$2.dx);
+      expect(verticals, hasLength(1), reason: 'peers=$count');
+      final horizontals = lines.where((line) => line.$1.dy == line.$2.dy);
+      expect(horizontals, hasLength(count), reason: 'peers=$count');
+      for (final (a, b) in horizontals) {
+        final touchesEdge =
+            a.dx == 0 || a.dx == 120 || b.dx == 0 || b.dx == 120;
+        final touchesTrunk = a.dx == 60 || b.dx == 60;
+        expect(
+          touchesEdge && touchesTrunk,
+          isTrue,
+          reason: 'peers=$count branch $a -> $b',
+        );
+      }
+      expect(tester.takeException(), isNull, reason: 'peers=$count');
+    }
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
   });
 }
 
@@ -600,6 +581,49 @@ List<Map<String, dynamic>> _fivePeerFixtures() {
     ),
   ];
 }
+
+/// A pool of distinct peers used to build snapshots with any 1..6 peer count.
+/// First four come from [_fourPeerFixtures]; the rest are distinct verified
+/// paths (direct / relay) matching the real model rules.
+List<Map<String, dynamic>> _peerFixturesForCount(int count) {
+  assert(count >= 1 && count <= 6);
+  final pool = <Map<String, dynamic>>[
+    ..._fourPeerFixtures(),
+    ..._fivePeerFixtures().skip(4),
+    _peerJson(
+      nodeId: 'node-relay2',
+      deviceName: 'relay-server2',
+      virtualIp: '10.20.0.16',
+      online: true,
+      state: 'relay',
+      activePath: 'relay',
+      relayConfirmedEndpoint: '203.0.113.11:18082',
+      relayConfirmedGeneration: 7,
+      direct: _emptyPathHealth(),
+      relay: {
+        'last_success_age_ms': 250,
+        'last_failure_age_ms': null,
+        'consecutive_failures': 0,
+        'last_error': null,
+        'last_error_code': null,
+        'latency_ms': 55,
+        'rtt_ewma_ms': null,
+      },
+      currentPathSelection: {
+        'path': 'relay',
+        'direct_endpoint': null,
+        'reason_code': 'path_relay_fallback',
+        'reason': 'direct path unavailable; relay confirmed',
+        'direct_confirmed': false,
+        'relay_hedged': false,
+      },
+    ),
+  ];
+  return pool.take(count).toList();
+}
+
+/// Number of map rows for a peer count (peers are split left / right).
+int _mapRowCount(int peerCount) => (peerCount + 1) ~/ 2;
 
 String _heroCount(WidgetTester tester, String key) {
   final text = tester.widget<Text>(
