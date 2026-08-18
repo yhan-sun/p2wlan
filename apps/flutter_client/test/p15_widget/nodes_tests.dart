@@ -33,9 +33,12 @@ void _registerNodesTests() {
 
     expect(find.text('This device'), findsOneWidget);
     expect(find.text('studio-mac'), findsOneWidget);
-    expect(find.text('Device summary'), findsOneWidget);
-    expect(find.text('Other devices'), findsOneWidget);
+    expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-filter-all')), findsOneWidget);
     expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.byKey(const Key('node-row-peer-direct-001')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-peer-relay-002')), findsOneWidget);
     expect(find.text('Peer 数'), findsNothing);
   });
 
@@ -70,9 +73,9 @@ void _registerNodesTests() {
       ),
     );
 
-    expect(find.text('Other devices'), findsOneWidget);
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
+    expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -209,10 +212,13 @@ void _registerNodesTests() {
       tester.getTopLeft(plainOffline).dy,
       greaterThan(tester.getTopLeft(offlineGroupHeader).dy),
     );
+    // Raw lastError is not dumped into the list; a warning indicator is shown
+    // instead. The full error lives in the detail pane.
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
-      findsOneWidget,
+      findsNothing,
     );
+    expect(find.byIcon(Icons.warning_amber_rounded), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 
@@ -401,4 +407,413 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(api.speedTestCount, 2);
   });
+
+  testWidgets('Nodes searches by name, IP, and node ID', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _searchPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    final search = find.byKey(const Key('nodes-search-field'));
+    await tester.enterText(search, 'nas');
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-nas')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-laptop')), findsNothing);
+    expect(find.byKey(const Key('node-row-node-office')), findsNothing);
+
+    await tester.enterText(search, '10.20.0.32');
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-office')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-nas')), findsNothing);
+
+    await tester.enterText(search, 'node-laptop');
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-office')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('nodes-search-clear')));
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-nas')), findsOneWidget);
+    expect(find.byKey(const Key('node-row-node-office')), findsOneWidget);
+  });
+
+  testWidgets('Nodes filter chips narrow the device set', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    Future<void> tapFilter(String name) async {
+      final finder = find.byKey(Key('nodes-filter-$name'));
+      await tester.ensureVisible(finder);
+      await tester.pump();
+      await tester.tap(finder);
+      await tester.pump();
+    }
+
+    int rowCount() => tester
+        .widgetList(find.byWidgetPredicate((widget) => widget is InkWell))
+        .where((widget) => widget.key?.toString().contains('node-row-') == true)
+        .length;
+
+    expect(rowCount(), 4); // All
+    await tapFilter('online');
+    expect(rowCount(), 3);
+    await tapFilter('direct');
+    expect(rowCount(), 1);
+    await tapFilter('relay');
+    expect(rowCount(), 1);
+    await tapFilter('attention');
+    expect(rowCount(), 1);
+    await tapFilter('offline');
+    expect(rowCount(), 1);
+    await tapFilter('all');
+    expect(rowCount(), 4);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Nodes sort by name and by verified latency', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    double rowTop(String nodeId) =>
+        tester.getTopLeft(find.byKey(Key('node-row-$nodeId'))).dy;
+
+    // Name sort: direct-laptop, offline-printer, probing-phone, relay-nas.
+    await tester.tap(find.byKey(const Key('nodes-sort-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Name').last);
+    await tester.pumpAndSettle();
+    expect(rowTop('node-direct'), lessThan(rowTop('node-offline')));
+    expect(rowTop('node-offline'), lessThan(rowTop('node-probing')));
+    expect(rowTop('node-probing'), lessThan(rowTop('node-relay')));
+
+    // Latency sort: direct (12 ms) before relay (43 ms); probing and offline
+    // have no verified latency and sort after them by name. Probe RTT (8 ms)
+    // is not a latency and must not place probing-phone first.
+    await tester.tap(find.byKey(const Key('nodes-sort-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Latency').last);
+    await tester.pumpAndSettle();
+    expect(rowTop('node-direct'), lessThan(rowTop('node-relay')));
+    expect(rowTop('node-relay'), lessThan(rowTop('node-offline')));
+    expect(rowTop('node-offline'), lessThan(rowTop('node-probing')));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Nodes expanded layout keeps selection across refresh', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    // Detail pane exists and shows the recommended-first peer.
+    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(find.text('direct-laptop'), findsWidgets);
+
+    // Clicking the second row updates the detail pane.
+    await tester.tap(find.byKey(const Key('node-row-node-relay')));
+    await tester.pump();
+    expect(find.text('relay-nas'), findsWidgets);
+    expect(find.byType(Dialog), findsNothing);
+
+    // StatusStore refresh keeps the selection.
+    await stores.statusStore.refresh();
+    await tester.pump();
+    expect(find.text('relay-nas'), findsWidgets);
+
+    // Removing the selected peer hides it and falls back to the first visible
+    // peer instead of showing stale details.
+    final api = stores.statusStore;
+    // Simulate the peer disappearing from the snapshot.
+    final pruned = _snapshotWithPeers(
+      base,
+      _fourPeerFixtures().where((p) => p['node_id'] != 'node-relay').toList(),
+    );
+    (api.diagnosticsApi as _FakeDiagnosticsApi).snapshot = pruned;
+    await api.refresh();
+    await tester.pump();
+    expect(find.text('relay-nas'), findsNothing);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Nodes responsive detail flows across breakpoints', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+
+    // Compact: mobile full-screen detail, no master-detail.
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    expect(tester.takeException(), isNull);
+
+    await tester.tap(find.byKey(const Key('node-row-node-direct')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+    expect(find.text('10.20.0.11'), findsWidgets);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.byType(CloseButton));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsNothing);
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+
+    // Medium: no master-detail, row opens the dialog.
+    tester.view.physicalSize = const Size(700, 1000);
+    tester.view.devicePixelRatio = 1;
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    await tester.tap(find.byKey(const Key('node-row-node-direct')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('Connection type'), findsOneWidget);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+
+    // Expanded: master-detail, no dialog on row tap.
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('node-row-node-relay')));
+    await tester.pump();
+    expect(find.byType(Dialog), findsNothing);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
+
+  testWidgets('Nodes distinguishes empty states', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(api: _FakeDiagnosticsApi(health: true, snapshot: base)),
+    ))!;
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+
+    // No peers at all.
+    final noPeersSnapshot = _snapshotWithPeers(base, []);
+    (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi).snapshot =
+        noPeersSnapshot;
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.text('No other devices yet'), findsOneWidget);
+    expect(find.text('No matching devices'), findsNothing);
+
+    // Search with no matches.
+    final searchSnapshot = _snapshotWithPeers(base, _searchPeerFixtures());
+    (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi).snapshot =
+        searchSnapshot;
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.enterText(find.byKey(const Key('nodes-search-field')), 'zzz');
+    await tester.pump();
+    expect(find.text('No matching devices'), findsOneWidget);
+    await tester.tap(find.text('Clear search'));
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
+
+    // Filter with no matches.
+    final attentionChip = find.byKey(const Key('nodes-filter-attention'));
+    await tester.ensureVisible(attentionChip);
+    await tester.pump();
+    await tester.tap(attentionChip);
+    await tester.pump();
+    expect(find.text('No matching devices'), findsOneWidget);
+    await tester.tap(find.text('Clear filters'));
+    await tester.pump();
+    expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
+
+/// Three peers for search coverage: Laptop / NAS / Office PC with distinct
+/// names, IPs, and node IDs.
+List<Map<String, dynamic>> _searchPeerFixtures() {
+  return [
+    _peerJson(
+      nodeId: 'node-laptop',
+      deviceName: 'Laptop',
+      virtualIp: '10.20.0.31',
+      online: true,
+      state: 'direct',
+      activePath: 'direct',
+      relayConfirmedEndpoint: null,
+      direct: _latencyPathHealth(21),
+      relay: _emptyPathHealth(),
+      currentPathSelection: _directSelection(),
+    ),
+    _peerJson(
+      nodeId: 'node-nas',
+      deviceName: 'NAS',
+      virtualIp: '10.20.0.33',
+      online: true,
+      state: 'relay',
+      activePath: 'relay',
+      relayConfirmedEndpoint: '203.0.113.10:18081',
+      relayConfirmedGeneration: 5,
+      direct: _emptyPathHealth(),
+      relay: _latencyPathHealth(33),
+      currentPathSelection: _relaySelection(),
+    ),
+    _peerJson(
+      nodeId: 'node-office',
+      deviceName: 'Office PC',
+      virtualIp: '10.20.0.32',
+      online: true,
+      state: 'direct',
+      activePath: 'direct',
+      relayConfirmedEndpoint: null,
+      direct: _latencyPathHealth(18),
+      relay: _emptyPathHealth(),
+      currentPathSelection: _directSelection(),
+    ),
+  ];
+}
+
+Map<String, dynamic> _latencyPathHealth(int latencyMs) => {
+  'last_success_age_ms': 100,
+  'last_failure_age_ms': null,
+  'consecutive_failures': 0,
+  'last_error': null,
+  'last_error_code': null,
+  'latency_ms': latencyMs,
+  'rtt_ewma_ms': null,
+};
+
+Map<String, dynamic> _directSelection() => {
+  'path': 'direct',
+  'direct_endpoint': '198.51.100.30:60000',
+  'reason_code': 'path_direct_confirmed',
+  'reason': 'public UDP pair confirmed',
+  'direct_confirmed': true,
+  'relay_hedged': false,
+};
+
+Map<String, dynamic> _relaySelection() => {
+  'path': 'relay',
+  'direct_endpoint': null,
+  'reason_code': 'path_relay_fallback',
+  'reason': 'direct path unavailable; relay confirmed',
+  'direct_confirmed': false,
+  'relay_hedged': false,
+};

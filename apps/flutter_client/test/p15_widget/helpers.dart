@@ -67,7 +67,7 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   });
 
   final bool health;
-  final DiagnosticsSnapshot? snapshot;
+  DiagnosticsSnapshot? snapshot;
   final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
   final SpeedTestResult? speedTestResult;

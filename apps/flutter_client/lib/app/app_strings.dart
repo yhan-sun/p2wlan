@@ -292,6 +292,46 @@ class AppStrings {
   String get relayDevices => isZh ? '中继设备' : 'Relay devices';
   String get offlineDevices => isZh ? '离线设备' : 'Offline devices';
 
+  String get searchDevicesPlaceholder => isZh
+      ? '搜索设备名称、虚拟 IP 或 Node ID'
+      : 'Search device name, virtual IP, or Node ID';
+  String get filterAll => isZh ? '全部' : 'All';
+  String get sortRecommended => isZh ? '推荐' : 'Recommended';
+  String get sortByName => isZh ? '名称' : 'Name';
+  String get sortByLatency => isZh ? '延迟' : 'Latency';
+  String deviceCountSummary(int total, int online) =>
+      isZh ? '$total 台设备 · $online 在线' : '$total devices · $online online';
+  String get clearSearch => isZh ? '清除搜索' : 'Clear search';
+  String get clearFilter => isZh ? '清除筛选' : 'Clear filters';
+  String get noPeersTitle => isZh ? '还没有其他设备' : 'No other devices yet';
+  String get noPeersBody => isZh
+      ? '登录另一台设备后，它会显示在这里。'
+      : 'Sign in on another device and it will appear here.';
+  String get noSearchResultsTitle => isZh ? '没有找到匹配设备' : 'No matching devices';
+  String get noSearchResultsBody => isZh
+      ? '换个关键词，或清除搜索查看全部设备。'
+      : 'Try a different query, or clear the search to see all devices.';
+  String get noFilterResultsTitle => isZh ? '没有匹配的设备' : 'No matching devices';
+  String get noFilterResultsBody => isZh
+      ? '当前筛选条件下没有设备，清除筛选查看全部。'
+      : 'No devices match this filter. Clear it to see everything.';
+  String get sectionConnection => isZh ? '连接' : 'Connection';
+  String get sectionNetwork => isZh ? '网络' : 'Network';
+  String get sectionDevice => isZh ? '设备' : 'Device';
+  String get sectionIssues => isZh ? '问题' : 'Issues';
+  String get sectionActions => isZh ? '操作' : 'Actions';
+  String get onlineState => isZh ? '在线状态' : 'Online state';
+  String get lastSeen => isZh ? '最后在线' : 'Last seen';
+  String get pathDecision => isZh ? '路径判定' : 'Path decision';
+  String get deviceActions => isZh ? '设备操作' : 'Device actions';
+  String get viewDetails => isZh ? '查看详情' : 'View details';
+  String get removeDevice => isZh ? '移除设备' : 'Remove device';
+  String get copyVirtualIp => isZh ? '复制虚拟 IP' : 'Copy virtual IP';
+  String get copyPingCommand => isZh ? '复制 ping 命令' : 'Copy ping command';
+  String get renameDevice => isZh ? '修改名称' : 'Rename';
+  String get noSelectionHint =>
+      isZh ? '选择一台设备查看详情' : 'Select a device to view its details';
+
   String get settingsSubtitle =>
       isZh ? '本地 P2WLAN 客户端配置。' : 'Local P2WLAN client configuration.';
   String get connectionSettings => isZh ? '连接设置' : 'Connection settings';

@@ -1,8 +1,5 @@
 part of '../nodes_page.dart';
 
-String _routeLabel(AppStrings strings, PeerSnapshot peer) =>
-    strings.routeLabel(peer.path, peer.isRelay);
-
 List<_PeerGroup> _buildPeerGroups(
   List<PeerSnapshot> peers,
   AppStrings strings,
@@ -134,3 +131,77 @@ String _formatLastSeen(PeerSnapshot peer) {
   String two(int n) => n.toString().padLeft(2, '0');
   return '${local.year}-${two(local.month)}-${two(local.day)} ${two(local.hour)}:${two(local.minute)}';
 }
+
+enum _NodeFilter { all, online, direct, relay, attention, offline }
+
+enum _NodeSort { recommended, name, latency }
+
+bool _filterMatches(_NodeFilter filter, PeerSnapshot peer) {
+  return switch (filter) {
+    _NodeFilter.all => true,
+    _NodeFilter.online => peer.online && !_peerIsOffline(peer),
+    _NodeFilter.direct => peer.path == 'direct',
+    _NodeFilter.relay => peer.path == 'relay',
+    _NodeFilter.attention => _peerNeedsAttention(peer),
+    _NodeFilter.offline => _peerIsOffline(peer),
+  };
+}
+
+List<PeerSnapshot> _applySearch(List<PeerSnapshot> peers, String query) {
+  final trimmed = query.trim().toLowerCase();
+  if (trimmed.isEmpty) return peers;
+  return peers
+      .where(
+        (peer) =>
+            peer.displayName.toLowerCase().contains(trimmed) ||
+            peer.virtualIp.toLowerCase().contains(trimmed) ||
+            peer.nodeId.toLowerCase().contains(trimmed),
+      )
+      .toList(growable: false);
+}
+
+List<PeerSnapshot> _applySort(List<PeerSnapshot> peers, _NodeSort sort) {
+  final sorted = [...peers];
+  switch (sort) {
+    case _NodeSort.recommended:
+      sorted.sort(_comparePeers);
+    case _NodeSort.name:
+      sorted.sort(_compareByName);
+    case _NodeSort.latency:
+      sorted.sort(_compareByLatency);
+  }
+  return sorted;
+}
+
+int _compareByName(PeerSnapshot left, PeerSnapshot right) {
+  return left.displayName.toLowerCase().compareTo(
+    right.displayName.toLowerCase(),
+  );
+}
+
+/// Verified latency ascending; peers without a verified latency sort last.
+/// Probe RTT is never treated as a latency for sorting.
+int _compareByLatency(PeerSnapshot left, PeerSnapshot right) {
+  final leftLatency = left.latencyMs;
+  final rightLatency = right.latencyMs;
+  if (leftLatency == null && rightLatency == null) {
+    return _compareByName(left, right);
+  }
+  if (leftLatency == null) return 1;
+  if (rightLatency == null) return -1;
+  final byLatency = leftLatency.compareTo(rightLatency);
+  if (byLatency != 0) return byLatency;
+  return _compareByName(left, right);
+}
+
+int _filterCount(List<PeerSnapshot> peers, _NodeFilter filter) {
+  var count = 0;
+  for (final peer in peers) {
+    if (_filterMatches(filter, peer)) count += 1;
+  }
+  return count;
+}
+
+/// True when the list should render smart group headers. Only the "all" filter
+/// groups; specific filters already narrow the set and would repeat the header.
+bool _showGroupsForFilter(_NodeFilter filter) => filter == _NodeFilter.all;

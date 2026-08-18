@@ -12,17 +12,20 @@ import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
+import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
 part 'nodes/local_node.dart';
-part 'nodes/peer_dialogs.dart';
-part 'nodes/peer_table.dart';
+part 'nodes/toolbar.dart';
 part 'nodes/peer_list.dart';
-part 'nodes/peer_details_widgets.dart';
+part 'nodes/peer_detail.dart';
+part 'nodes/peer_dialogs.dart';
 part 'nodes/helpers.dart';
 part 'nodes/speed_test.dart';
+
+enum _NodesLayout { compact, medium, expanded }
 
 class NodesPage extends StatefulWidget {
   const NodesPage({
@@ -43,6 +46,11 @@ class NodesPage extends StatefulWidget {
 class _NodesPageState extends State<NodesPage> {
   final _controlApi = ControlApi();
   final _hiddenPeerIds = <String>{};
+  final _searchController = TextEditingController();
+  final _searchFocusNode = FocusNode();
+  var _filter = _NodeFilter.all;
+  var _sort = _NodeSort.recommended;
+  String? _selectedPeerId;
   String? _copiedKey;
   String? _busyPeerId;
 
@@ -64,72 +72,206 @@ class _NodesPageState extends State<NodesPage> {
   @override
   void dispose() {
     widget.statusStore.removeListener(_pruneHiddenPeers);
+    _searchController.dispose();
+    _searchFocusNode.dispose();
     _controlApi.close();
     super.dispose();
   }
 
   void _pruneHiddenPeers() {
     final snapshot = widget.statusStore.snapshot;
-    if (!mounted || snapshot == null || _hiddenPeerIds.isEmpty) return;
+    if (!mounted || snapshot == null) return;
     final currentPeerIds = snapshot.peers.map((peer) => peer.nodeId).toSet();
     final before = _hiddenPeerIds.length;
     _hiddenPeerIds.removeWhere((nodeId) => !currentPeerIds.contains(nodeId));
-    if (_hiddenPeerIds.length != before) {
-      setState(() {});
+    var changed = _hiddenPeerIds.length != before;
+    if (_selectedPeerId != null && !currentPeerIds.contains(_selectedPeerId)) {
+      _selectedPeerId = null;
+      changed = true;
     }
+    if (changed) setState(() {});
+  }
+
+  void _focusSearch() {
+    _searchFocusNode.requestFocus();
   }
 
   @override
   Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    return AnimatedBuilder(
-      animation: Listenable.merge([widget.statusStore, widget.settingsStore]),
-      builder: (context, _) {
-        final snapshot = widget.statusStore.snapshot;
-        final peers = _dedupeAndSortPeers(
-          snapshot?.peers ?? const <PeerSnapshot>[],
-        ).where((peer) => !_hiddenPeerIds.contains(peer.nodeId)).toList();
-        final settings = widget.settingsStore.settings;
-        return PageScaffold(
-          title: strings.nodes,
-          subtitle: strings.nodesSubtitle,
-          showHeader: widget.showHeader,
-          maxWidth: nodesPageMaxWidth,
-          children: [
-            _LocalNodePanel(
-              snapshot: snapshot,
-              settings: settings,
-              onEdit: () => _editLocalNode(snapshot),
-            ),
-            const SizedBox(height: 14),
-            _PeerSummary(peers: peers),
-            const SizedBox(height: 14),
-            if (peers.isEmpty)
-              AppPanel(
-                title: strings.isZh ? '其他设备' : 'Other devices',
-                child: Text(
-                  strings.noPeers,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: AppTokens.colorTextSecondary,
-                  ),
-                ),
-              )
-            else
-              _PeerList(
-                peers: peers,
-                copiedKey: _copiedKey,
-                busyPeerId: _busyPeerId,
-                onCopy: _copy,
-                onDetails: _showPeerDetails,
-                onEdit: _editPeer,
-                onDelete: _deletePeer,
-                onSpeedTest: _showSpeedTest,
-              ),
-          ],
-        );
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+            _focusSearch,
+        const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+            _focusSearch,
       },
+      child: Focus(
+        autofocus: true,
+        child: AnimatedBuilder(
+          animation: Listenable.merge([
+            widget.statusStore,
+            widget.settingsStore,
+          ]),
+          builder: (context, _) {
+            final snapshot = widget.statusStore.snapshot;
+            final allPeers = _dedupeAndSortPeers(
+              snapshot?.peers ?? const <PeerSnapshot>[],
+            ).where((peer) => !_hiddenPeerIds.contains(peer.nodeId)).toList();
+            final query = _searchController.text;
+            final visiblePeers = _applySort(
+              _applySearch(allPeers, query),
+              _sort,
+            ).where((peer) => _filterMatches(_filter, peer)).toList();
+            final selectedPeer = _resolveSelectedPeer(allPeers, visiblePeers);
+            final settings = widget.settingsStore.settings;
+            return PageScaffold(
+              title: stringsOf(context).nodes,
+              subtitle: stringsOf(context).nodesSubtitle,
+              showHeader: widget.showHeader,
+              maxWidth: nodesPageMaxWidth,
+              children: [
+                _LocalNodePanel(
+                  snapshot: snapshot,
+                  settings: settings,
+                  daemonReachable: widget.statusStore.daemonReachable,
+                  onEdit: () => _editLocalNode(snapshot),
+                ),
+                const SizedBox(height: 14),
+                _NodeToolbar(
+                  searchController: _searchController,
+                  searchFocusNode: _searchFocusNode,
+                  filter: _filter,
+                  sort: _sort,
+                  allPeers: allPeers,
+                  onFilterChanged: (filter) => setState(() => _filter = filter),
+                  onSortChanged: (sort) => setState(() => _sort = sort),
+                  onQueryChanged: () => setState(() {}),
+                  onClearSearch: () => setState(_searchController.clear),
+                ),
+                const SizedBox(height: 12),
+                if (allPeers.isEmpty)
+                  _NodesEmptyState(
+                    icon: Icons.devices_other_rounded,
+                    title: stringsOf(context).noPeersTitle,
+                    body: stringsOf(context).noPeersBody,
+                  )
+                else if (visiblePeers.isEmpty)
+                  _NodesEmptyState(
+                    icon: query.trim().isNotEmpty
+                        ? Icons.search_off_rounded
+                        : Icons.filter_alt_off_rounded,
+                    title: query.trim().isNotEmpty
+                        ? stringsOf(context).noSearchResultsTitle
+                        : stringsOf(context).noFilterResultsTitle,
+                    body: query.trim().isNotEmpty
+                        ? stringsOf(context).noSearchResultsBody
+                        : stringsOf(context).noFilterResultsBody,
+                    actionLabel: query.trim().isNotEmpty
+                        ? stringsOf(context).clearSearch
+                        : stringsOf(context).clearFilter,
+                    onAction: query.trim().isNotEmpty
+                        ? () => setState(_searchController.clear)
+                        : () => setState(() => _filter = _NodeFilter.all),
+                  )
+                else
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final layout =
+                          constraints.maxWidth >=
+                              AppBreakpoints.expandedMinWidth
+                          ? _NodesLayout.expanded
+                          : constraints.maxWidth <
+                                AppBreakpoints.compactMaxWidth
+                          ? _NodesLayout.compact
+                          : _NodesLayout.medium;
+                      if (layout == _NodesLayout.expanded) {
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              flex: 6,
+                              child: _PeerList(
+                                peers: visiblePeers,
+                                showGroups:
+                                    _showGroupsForFilter(_filter) &&
+                                    _sort == _NodeSort.recommended,
+                                selectedPeerId: selectedPeer?.nodeId,
+                                copiedKey: _copiedKey,
+                                busyPeerId: _busyPeerId,
+                                compact: false,
+                                onCopy: _copy,
+                                onEdit: _editPeer,
+                                onDelete: _deletePeer,
+                                onSpeedTest: _showSpeedTest,
+                                onTap: (peer) => _openPeer(peer, layout),
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              flex: 4,
+                              child: _PeerDetailPane(
+                                key: const Key('nodes-detail-pane'),
+                                peer: selectedPeer,
+                                strings: stringsOf(context),
+                                copiedKey: _copiedKey,
+                                busyPeerId: _busyPeerId,
+                                onCopy: _copy,
+                                onEdit: _editPeer,
+                                onDelete: _deletePeer,
+                                onSpeedTest: _showSpeedTest,
+                              ),
+                            ),
+                          ],
+                        );
+                      }
+                      return _PeerList(
+                        peers: visiblePeers,
+                        showGroups:
+                            _showGroupsForFilter(_filter) &&
+                            _sort == _NodeSort.recommended,
+                        selectedPeerId: null,
+                        copiedKey: _copiedKey,
+                        busyPeerId: _busyPeerId,
+                        compact: layout == _NodesLayout.compact,
+                        onCopy: _copy,
+                        onEdit: _editPeer,
+                        onDelete: _deletePeer,
+                        onSpeedTest: _showSpeedTest,
+                        onTap: (peer) => _openPeer(peer, layout),
+                      );
+                    },
+                  ),
+              ],
+            );
+          },
+        ),
+      ),
     );
+  }
+
+  PeerSnapshot? _resolveSelectedPeer(
+    List<PeerSnapshot> allPeers,
+    List<PeerSnapshot> visiblePeers,
+  ) {
+    final id = _selectedPeerId;
+    if (id != null) {
+      for (final peer in allPeers) {
+        if (peer.nodeId == id) return peer;
+      }
+    }
+    return visiblePeers.isEmpty ? null : visiblePeers.first;
+  }
+
+  void _openPeer(PeerSnapshot peer, _NodesLayout layout) {
+    setState(() => _selectedPeerId = peer.nodeId);
+    switch (layout) {
+      case _NodesLayout.expanded:
+        break;
+      case _NodesLayout.medium:
+        _showPeerDetails(peer, mobile: false);
+      case _NodesLayout.compact:
+        _showPeerDetails(peer, mobile: true);
+    }
   }
 
   Future<void> _copy(String value, String key) async {
@@ -150,7 +292,7 @@ class _NodesPageState extends State<NodesPage> {
   }
 
   Future<void> _editLocalNode(DiagnosticsSnapshot? snapshot) async {
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final settings = widget.settingsStore.settings;
     final initialName = settings.deviceName.trim().isEmpty
         ? await resolveDefaultDeviceName()
@@ -210,10 +352,10 @@ class _NodesPageState extends State<NodesPage> {
 
   Future<void> _editPeer(PeerSnapshot peer) async {
     if (_busyPeerId != null) return;
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final result = await _promptDeviceName(
       initialName: peer.displayName,
-      title: strings.isZh ? '编辑设备名称' : 'Edit device name',
+      title: strings.renameDevice,
     );
     if (result == null) return;
     final settings = widget.settingsStore.settings;
@@ -242,11 +384,11 @@ class _NodesPageState extends State<NodesPage> {
 
   Future<void> _deletePeer(PeerSnapshot peer) async {
     if (_busyPeerId != null) return;
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(strings.isZh ? '移除设备' : 'Remove device'),
+        title: Text(strings.removeDevice),
         content: _RemoveDeviceDialogContent(peer: peer, strings: strings),
         actions: [
           TextButton(
@@ -260,7 +402,7 @@ class _NodesPageState extends State<NodesPage> {
             ),
             onPressed: () => Navigator.of(dialogContext).pop(true),
             icon: const Icon(Icons.delete_outline_rounded, size: 17),
-            label: Text(strings.isZh ? '移除设备' : 'Remove device'),
+            label: Text(strings.removeDevice),
           ),
         ],
       ),
@@ -292,23 +434,47 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 
-  Future<void> _showPeerDetails(PeerSnapshot peer) async {
-    final strings = AppStringsScope.of(context);
+  Future<void> _showPeerDetails(
+    PeerSnapshot peer, {
+    required bool mobile,
+  }) async {
+    if (mobile) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          fullscreenDialog: true,
+          builder: (_) => _MobilePeerDetails(
+            peer: peer,
+            onCopy: _copy,
+            onEdit: _editPeer,
+            onDelete: _deletePeer,
+            onSpeedTest: _showSpeedTest,
+          ),
+        ),
+      );
+      return;
+    }
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) =>
-          _PeerDetailsDialog(peer: peer, strings: strings),
+      builder: (dialogContext) => _PeerDetailsDialog(
+        peer: peer,
+        strings: stringsOf(context),
+        copiedKey: _copiedKey,
+        busyPeerId: _busyPeerId,
+        onCopy: _copy,
+        onEdit: _editPeer,
+        onDelete: _deletePeer,
+        onSpeedTest: _showSpeedTest,
+      ),
     );
   }
 
   Future<void> _showSpeedTest(PeerSnapshot peer) async {
-    final strings = AppStringsScope.of(context);
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => _SpeedTestDialog(
         peer: peer,
         statusStore: widget.statusStore,
-        strings: strings,
+        strings: stringsOf(context),
       ),
     );
   }
@@ -317,7 +483,7 @@ class _NodesPageState extends State<NodesPage> {
     required String initialName,
     required String title,
   }) async {
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final controller = TextEditingController(text: initialName);
     String? error;
     try {
@@ -378,7 +544,7 @@ class _NodesPageState extends State<NodesPage> {
     required String initialName,
     required String initialVirtualIp,
   }) async {
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final nameController = TextEditingController(text: initialName);
     final ipController = TextEditingController(text: initialVirtualIp);
     String? error;
@@ -472,3 +638,5 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 }
+
+AppStrings stringsOf(BuildContext context) => AppStringsScope.of(context);
