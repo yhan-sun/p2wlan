@@ -111,7 +111,7 @@ pub fn is_virtual_capture_interface(name: &str, excluded: &[String]) -> bool {
 
 /// macOS `scutil --proxy` dictionary output → enabled proxy description.
 ///
-/// ```
+/// ```text
 /// <dictionary> {
 ///   HTTPEnable : 1
 ///   HTTPPort : 7890
@@ -171,7 +171,7 @@ pub fn parse_scutil_proxy_output(output: &str) -> Option<String> {
 
 /// macOS `route -n get default` output → egress interface name.
 ///
-/// ```
+/// ```text
 ///    route to: default
 /// destination: default
 ///        mask: default
@@ -306,26 +306,47 @@ mod tests {
         ENV_LOCK.lock().unwrap()
     }
 
+    fn clear_proxy_environment() -> Vec<(&'static str, Option<String>)> {
+        let previous = PROXY_ENV_NAMES
+            .iter()
+            .copied()
+            .map(|name| (name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in PROXY_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        previous
+    }
+
+    fn restore_proxy_environment(previous: Vec<(&'static str, Option<String>)>) {
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
     #[test]
     fn env_proxies_collects_configured_variables() {
         let _guard = env_guard();
+        let previous = clear_proxy_environment();
         std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7890");
         std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:7891");
         std::env::set_var("HTTPS_PROXY", "");
         let proxies = env_proxies();
         assert!(proxies.contains(&"http://127.0.0.1:7890".to_string()));
         assert!(proxies.contains(&"socks5://127.0.0.1:7891".to_string()));
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("ALL_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
+        restore_proxy_environment(previous);
     }
 
     #[test]
     fn env_proxies_ignores_none_sentinel() {
         let _guard = env_guard();
+        let previous = clear_proxy_environment();
         std::env::set_var("HTTPS_PROXY", "none");
         assert!(env_proxies().is_empty());
-        std::env::remove_var("HTTPS_PROXY");
+        restore_proxy_environment(previous);
     }
 
     #[test]

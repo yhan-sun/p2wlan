@@ -98,7 +98,7 @@ impl RouteManager {
                 split.get(idx + 1).map(|value| (*value).to_string())
             });
         let state = match actual.as_deref() {
-            Some(iface) if iface == &expected => RouteState::Installed,
+            Some(iface) if iface == expected => RouteState::Installed,
             Some(_) => RouteState::Conflict,
             None => RouteState::Missing,
         };

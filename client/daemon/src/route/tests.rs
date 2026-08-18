@@ -44,15 +44,9 @@ mod tests {
             // actor having moved/replaced the route after we added it.
             if self.conflicting.lock().unwrap().iter().any(|p| p == cidr) {
                 Some(format!("{cidr} dev p2pnet1 scope link"))
-            } else if self
-                .owned_added
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|p| p == cidr)
+            } else if self.owned_added.lock().unwrap().iter().any(|p| p == cidr)
+                || self.preexisting.lock().unwrap().iter().any(|p| p == cidr)
             {
-                Some(format!("{cidr} dev p2pnet0 scope link"))
-            } else if self.preexisting.lock().unwrap().iter().any(|p| p == cidr) {
                 Some(format!("{cidr} dev p2pnet0 scope link"))
             } else {
                 None

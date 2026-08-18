@@ -117,7 +117,7 @@ async fn diagnostics_does_not_report_overlay_endpoint_as_active_direct() {
 
 #[test]
 fn shared_cgn_and_ula_endpoints_are_overlay_direct() {
-    for endpoint in ["tailscale.example.com:63169", "[fd7a:115c:a1e0::b936:4102]:63167"] {
+    for endpoint in ["100.64.0.10:63169", "[fd7a:115c:a1e0::b936:4102]:63167"] {
         let endpoint: SocketAddr = endpoint.parse().unwrap();
         assert!(is_overlay_endpoint(endpoint));
         assert_eq!(
