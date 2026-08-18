@@ -442,6 +442,89 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('invalid custom control server is rejected before authenticate', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    final fake = _FakeControlApi();
+
+    await _pumpLogin(tester, stores, controlApi: fake);
+    await _enterInvalidServerAndSubmit(tester, 'abc.com');
+    expect(find.text('Invalid control server address'), findsOneWidget);
+    expect(
+      find.text(
+        'Enter a complete HTTP or HTTPS URL, for example https://example.com',
+      ),
+      findsOneWidget,
+    );
+    expect(fake.authenticateCalls, 0);
+
+    await tester.tap(find.text('Advanced options'));
+    await tester.pumpAndSettle();
+    await _enterInvalidServerAndSubmit(tester, 'ftp://example.com');
+    expect(find.text('Invalid control server address'), findsOneWidget);
+    expect(fake.authenticateCalls, 0);
+  });
+
+  testWidgets('manual mode settings failure shows localized error', (
+    tester,
+  ) async {
+    final tempDir = await tester.runAsync(
+      () => Directory.systemTemp.createTemp('p2wlan_login_test_'),
+    );
+    addTearDown(() {
+      tempDir?.deleteSync(recursive: true);
+    });
+    final settingsStore = SettingsStore(
+      settingsFile: File('${tempDir!.path}/settings.json'),
+      tokenRepository: _ThrowingTokenRepository(),
+    );
+    await tester.runAsync(settingsStore.load);
+    final statusStore = StatusStore(
+      settingsStore: settingsStore,
+      diagnosticsApi: _OfflineDiagnosticsApi(),
+    );
+    addTearDown(() {
+      statusStore.dispose();
+      settingsStore.dispose();
+    });
+    var authenticated = 0;
+
+    await _pumpLogin(
+      tester,
+      _Stores(tempDir, settingsStore, statusStore),
+      onAuthenticated: () {
+        authenticated += 1;
+      },
+    );
+    await tester.tap(find.text('Advanced options'));
+    await tester.pumpAndSettle();
+    final offlineButton = find.text('Continue in manual / offline mode');
+    await tester.ensureVisible(offlineButton);
+    await tester.pump();
+    await tester.tap(offlineButton);
+    await _waitFor(
+      tester,
+      () => find.text('Could not enter manual mode').evaluate().isNotEmpty,
+    );
+    await tester.pump();
+
+    expect(authenticated, 0);
+    expect(find.text('Could not enter manual mode'), findsOneWidget);
+    expect(
+      find.text('Local settings could not be saved. Please try again.'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('SecureTokenStorageException'), findsNothing);
+    expect(find.textContaining('FileSystemException'), findsNothing);
+    expect(tester.takeException(), isNull);
+    final button = tester.widget<OutlinedButton>(
+      find.ancestor(of: offlineButton, matching: find.byType(OutlinedButton)),
+    );
+    expect(button.onPressed, isNotNull);
+  });
+
   for (final size in const [Size(390, 844), Size(700, 1000), Size(1280, 900)]) {
     testWidgets('layout fits ${size.width.toInt()}x${size.height.toInt()}', (
       tester,
@@ -493,6 +576,27 @@ Future<void> _pumpLogin(
   );
 }
 
+Future<void> _enterInvalidServerAndSubmit(
+  WidgetTester tester,
+  String server,
+) async {
+  if (find.text('Self-hosted server').evaluate().isEmpty) {
+    await tester.tap(find.text('Advanced options'));
+    await tester.pumpAndSettle();
+  }
+  final serverField = find.widgetWithText(TextField, 'Self-hosted server');
+  await tester.ensureVisible(serverField);
+  await tester.pump();
+  await tester.enterText(serverField, server);
+  await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
+  await tester.enterText(find.byType(TextField).at(1), 'secret123');
+  final signIn = find.text('Sign in');
+  await tester.ensureVisible(signIn);
+  await tester.pumpAndSettle();
+  await tester.tap(signIn);
+  await tester.pumpAndSettle();
+}
+
 Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
   for (var i = 0; i < 100; i++) {
     if (condition()) return;
@@ -533,6 +637,19 @@ class _FakeControlApi extends ControlApi {
     if (error != null) throw error!;
     return session ?? AuthSession(token: 'token', controlServer: controlServer);
   }
+}
+
+class _ThrowingTokenRepository implements SecureTokenRepository {
+  @override
+  Future<String?> read() async => null;
+
+  @override
+  Future<void> write(String token) async {
+    throw const SecureTokenStorageException('token write failed');
+  }
+
+  @override
+  Future<void> clear() async {}
 }
 
 Future<_Stores> _makeStores() async {

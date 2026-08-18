@@ -371,6 +371,17 @@ class _LoginPageState extends State<LoginPage> {
       });
       return;
     }
+    try {
+      normalizeControlServer(_controlServerController.text);
+    } on FormatException {
+      setState(() {
+        _error = _LoginError(
+          title: strings.loginErrorInvalidServerTitle,
+          body: strings.loginErrorInvalidServerBody,
+        );
+      });
+      return;
+    }
     setState(() {
       _submitting = true;
       _error = null;
@@ -409,6 +420,7 @@ class _LoginPageState extends State<LoginPage> {
 
   Future<void> _continueOffline() async {
     if (_submitting) return;
+    final strings = AppStringsScope.of(context);
     setState(() => _submitting = true);
     try {
       final settings = widget.settingsStore.settings;
@@ -423,6 +435,15 @@ class _LoginPageState extends State<LoginPage> {
       );
       await widget.statusStore.refresh();
       widget.onAuthenticated();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _error = _LoginError(
+            title: strings.loginErrorManualModeTitle,
+            body: strings.loginErrorManualModeBody,
+          );
+        });
+      }
     } finally {
       if (mounted) {
         setState(() => _submitting = false);

@@ -500,6 +500,16 @@ class AppStrings {
   String get loginErrorEmailRequired => isZh ? '请输入邮箱' : 'Enter your email';
   String get loginErrorPasswordTooShort =>
       isZh ? '密码至少需要 6 个字符' : 'Password must be at least 6 characters';
+  String get loginErrorInvalidServerTitle =>
+      isZh ? '控制服务器地址无效' : 'Invalid control server address';
+  String get loginErrorInvalidServerBody => isZh
+      ? '请输入完整的 HTTP 或 HTTPS 地址，例如 https://example.com'
+      : 'Enter a complete HTTP or HTTPS URL, for example https://example.com';
+  String get loginErrorManualModeTitle =>
+      isZh ? '无法进入手动模式' : 'Could not enter manual mode';
+  String get loginErrorManualModeBody => isZh
+      ? '无法保存本地配置，请重试。'
+      : 'Local settings could not be saved. Please try again.';
   String get loginFailedTitle => isZh ? '无法登录' : 'Sign in failed';
   String get loginErrorAuthenticationBody =>
       isZh ? '邮箱或密码不正确。' : 'Incorrect email or password.';
