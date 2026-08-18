@@ -95,7 +95,7 @@ impl RouteManager {
             .position(|tok| tok == "dev")
             .and_then(|idx| {
                 let split: Vec<&str> = line.split_whitespace().collect();
-                split.get(idx + 1).map(str::to_string)
+                split.get(idx + 1).map(|value| (*value).to_string())
             });
         let state = match actual.as_deref() {
             Some(iface) if iface == &expected => RouteState::Installed,

@@ -6,6 +6,7 @@
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// A mock runner that simulates route table state.
     #[derive(Debug, Default)]
@@ -13,7 +14,7 @@ mod tests {
         preexisting: Mutex<Vec<String>>,
         /// Routes present on an unexpected interface (simulates a third-party
         /// or stale route the daemon does not own).
-        conflicting: Mutex<Vec<String>>,
+        conflicting: Arc<Mutex<Vec<String>>>,
         owned_added: Mutex<Vec<String>>,
         add_fail: Mutex<Vec<String>>,
         last_show: Mutex<Option<String>>,
@@ -34,7 +35,7 @@ mod tests {
         }
         fn with_conflict(cidr: &str) -> Self {
             Self {
-                conflicting: Mutex::new(vec![cidr.to_string()]),
+                conflicting: Arc::new(Mutex::new(vec![cidr.to_string()])),
                 ..Default::default()
             }
         }
@@ -188,6 +189,7 @@ mod tests {
         // A route WE added, then externally moved to another interface, is
         // repairable: remove (owned) then re-add on the expected interface.
         let runner = Box::new(MockRunner::default());
+        let conflicting = Arc::clone(&runner.conflicting);
         let rm = RouteManager::new_with_runner("p2pnet0".into(), runner);
 
         // We own it on p2pnet0 first.
@@ -195,8 +197,7 @@ mod tests {
         assert_eq!(rm.owned_routes().len(), 1);
 
         // External actor moves it to p2pnet1 (simulate conflict, still owned).
-        runner
-            .conflicting
+        conflicting
             .lock()
             .unwrap()
             .push("10.20.0.0/16".to_string());
