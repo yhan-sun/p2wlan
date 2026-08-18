@@ -232,11 +232,11 @@ impl PeerManager {
                     conn.relay_confirmed_generation = None;
                     conn.relay_confirmed_endpoint = None;
                     conn.relay_confirmed_connection_id = None;
-                    conn.relay_first_business_sent_generation = None;
-                    conn.relay_first_business_received_generation = None;
-                    conn.relay_first_business_exchange_generation = None;
-                    conn.relay_first_business_pathcommit_generation = None;
-                    conn.relay_preconfirmation_business = None;
+                    conn.relay_first.business_sent_generation = None;
+                    conn.relay_first.business_received_generation = None;
+                    conn.relay_first.business_exchange_generation = None;
+                    conn.relay_first.business_pathcommit_generation = None;
+                    conn.relay_first.preconfirmation = None;
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     if conn.state == ConnectionState::Relay {
                         conn.transition(ConnectionState::FallbackToRelay);
@@ -255,17 +255,17 @@ impl PeerManager {
                 // race and also makes the startup deadline depend on relay
                 // supervisor scheduling. For a dynamically discovered peer,
                 // arm it at the transport-ready boundary.
-                if conn.relay_first_gate_generation != Some(generation) {
-                    conn.relay_first_gate_generation = Some(generation);
-                    conn.relay_first_gate_started_at = Some(now);
+                if conn.relay_first.gate_generation != Some(generation) {
+                    conn.relay_first.gate_generation = Some(generation);
+                    conn.relay_first.gate_started_at = Some(now);
                 } else {
-                    conn.relay_first_gate_started_at.get_or_insert(now);
+                    conn.relay_first.gate_started_at.get_or_insert(now);
                 }
-                conn.relay_first_business_sent_generation = None;
-                conn.relay_first_business_received_generation = None;
-                conn.relay_first_business_exchange_generation = None;
-                conn.relay_first_business_pathcommit_generation = None;
-                conn.relay_preconfirmation_business = None;
+                conn.relay_first.business_sent_generation = None;
+                conn.relay_first.business_received_generation = None;
+                conn.relay_first.business_exchange_generation = None;
+                conn.relay_first.business_pathcommit_generation = None;
+                conn.relay_first.preconfirmation = None;
                 debug!(
                     event = "relay_transport_ready_peer",
                     peer_id = %node_id,
@@ -466,7 +466,7 @@ impl PeerManager {
             // already crossed WireGuard's replay window, so it cannot be
             // replayed after confirmation to reconstruct the evidence.
             let preconfirmation_business_received = conn
-                .relay_preconfirmation_business
+                .relay_first.preconfirmation
                 .take()
                 .filter(|pending| {
                     pending.generation == generation
@@ -499,13 +499,13 @@ impl PeerManager {
                     conn.relay_ready_connection_id = relay_connection_id;
                 }
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                conn.relay_first_gate_generation = None;
-                conn.relay_first_gate_started_at = None;
-                conn.relay_first_business_sent_generation = None;
-                conn.relay_first_business_received_generation = None;
-                conn.relay_first_business_exchange_generation = None;
-                conn.relay_first_business_pathcommit_generation = None;
-                conn.relay_preconfirmation_business = None;
+                conn.relay_first.gate_generation = None;
+                conn.relay_first.gate_started_at = None;
+                conn.relay_first.business_sent_generation = None;
+                conn.relay_first.business_received_generation = None;
+                conn.relay_first.business_exchange_generation = None;
+                conn.relay_first.business_pathcommit_generation = None;
+                conn.relay_first.preconfirmation = None;
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
                 }
@@ -525,25 +525,25 @@ impl PeerManager {
                     conn.relay_ready_connection_id = relay_connection_id;
                 }
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                conn.relay_first_gate_generation = None;
-                conn.relay_first_gate_started_at = None;
-                conn.relay_first_business_sent_generation = None;
+                conn.relay_first.gate_generation = None;
+                conn.relay_first.gate_started_at = None;
+                conn.relay_first.business_sent_generation = None;
                 // A packet received while the transport was merely READY is
                 // not relay delivery evidence.  Only a matching encrypted
                 // peer ACK authorizes the business marker for this generation.
-                conn.relay_first_business_received_generation = None;
-                conn.relay_first_business_exchange_generation = None;
-                conn.relay_first_business_pathcommit_generation = None;
-                conn.relay_preconfirmation_business = None;
+                conn.relay_first.business_received_generation = None;
+                conn.relay_first.business_exchange_generation = None;
+                conn.relay_first.business_pathcommit_generation = None;
+                conn.relay_first.preconfirmation = None;
                 if conn.state != ConnectionState::Direct {
                     conn.transition(ConnectionState::Relay);
                 }
                 (true, preconfirmation_business_received)
             };
             if preconfirmation_business_received {
-                conn.relay_first_business_received_generation = Some(generation);
-                if conn.relay_first_business_sent_generation == Some(generation) {
-                    conn.relay_first_business_exchange_generation = Some(generation);
+                conn.relay_first.business_received_generation = Some(generation);
+                if conn.relay_first.business_sent_generation == Some(generation) {
+                    conn.relay_first.business_exchange_generation = Some(generation);
                 }
             }
             if result.0 {
@@ -698,7 +698,7 @@ impl PeerManager {
                     } else if path == NetworkPath::Direct
                         && (conn.relay_confirmed_generation == Some(generation)
                             && conn.relay_confirmed_endpoint.is_some())
-                        && conn.relay_first_business_exchange_generation != Some(generation)
+                        && conn.relay_first.business_exchange_generation != Some(generation)
                     {
                         // A confirmed relay remains the business safety path
                         // until both same-generation relay business
@@ -709,7 +709,7 @@ impl PeerManager {
                         (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
                     } else if path == NetworkPath::Direct
                         && (conn.relay_ready_generation == Some(generation)
-                            || conn.relay_first_gate_generation == Some(generation))
+                            || conn.relay_first.gate_generation == Some(generation))
                         && conn.relay_confirmed_generation != Some(generation)
                     {
                         // If relay peer confirmation itself is still pending,
@@ -719,7 +719,7 @@ impl PeerManager {
                         // delivery proof exists for this generation.
                         let gate_expired = conn
                             .relay_ready_at
-                            .or(conn.relay_first_gate_started_at)
+                            .or(conn.relay_first.gate_started_at)
                             .is_some_and(|started_at| {
                                 started_at.elapsed() >= RELAY_FIRST_CONFIRMATION_GRACE
                             });
@@ -1100,8 +1100,8 @@ impl PeerManager {
                         .relay_confirmed_endpoint
                         .as_deref()
                         .is_some_and(|endpoint| !endpoint.is_empty())
-                    && conn.relay_first_business_exchange_generation != Some(generation)
-                    && conn.relay_first_business_pathcommit_generation != Some(generation)
+                    && conn.relay_first.business_exchange_generation != Some(generation)
+                    && conn.relay_first.business_pathcommit_generation != Some(generation)
             })
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone(), generation))
             .collect();
@@ -1207,14 +1207,14 @@ impl PeerManager {
                     .relay_confirmed_endpoint
                     .as_deref()
                     .is_some_and(|endpoint| !endpoint.is_empty());
-            if !confirmed || conn.relay_first_business_sent_generation == Some(generation) {
+            if !confirmed || conn.relay_first.business_sent_generation == Some(generation) {
                 return false;
             }
-            conn.relay_first_business_sent_generation = Some(generation);
-            let exchange_confirmed = conn.relay_first_business_received_generation == Some(generation)
-                && conn.relay_first_business_exchange_generation != Some(generation);
+            conn.relay_first.business_sent_generation = Some(generation);
+            let exchange_confirmed = conn.relay_first.business_received_generation == Some(generation)
+                && conn.relay_first.business_exchange_generation != Some(generation);
             if exchange_confirmed {
-                conn.relay_first_business_exchange_generation = Some(generation);
+                conn.relay_first.business_exchange_generation = Some(generation);
             }
             (
                 true,
@@ -1314,7 +1314,7 @@ impl PeerManager {
                     && conn.relay_ready_endpoint.as_deref() == Some(relay_endpoint);
                 let pending = if ready_session_matches {
                     let should_replace = conn
-                        .relay_preconfirmation_business
+                        .relay_first.preconfirmation
                         .as_ref()
                         .is_none_or(|existing| {
                             existing.generation != generation
@@ -1324,7 +1324,7 @@ impl PeerManager {
                                     > RELAY_FIRST_CONFIRMATION_GRACE
                         });
                     if should_replace {
-                        conn.relay_preconfirmation_business =
+                        conn.relay_first.preconfirmation =
                             Some(PendingRelayBusinessEvidence {
                                 generation,
                                 relay_endpoint: relay_endpoint.to_string(),
@@ -1339,15 +1339,15 @@ impl PeerManager {
                 (false, false, None, pending)
             } else {
                 let first_receive =
-                    conn.relay_first_business_received_generation != Some(generation);
+                    conn.relay_first.business_received_generation != Some(generation);
                 if first_receive {
-                    conn.relay_first_business_received_generation = Some(generation);
+                    conn.relay_first.business_received_generation = Some(generation);
                 }
                 let exchange_confirmed =
-                    conn.relay_first_business_sent_generation == Some(generation)
-                        && conn.relay_first_business_exchange_generation != Some(generation);
+                    conn.relay_first.business_sent_generation == Some(generation)
+                        && conn.relay_first.business_exchange_generation != Some(generation);
                 if exchange_confirmed {
-                    conn.relay_first_business_exchange_generation = Some(generation);
+                    conn.relay_first.business_exchange_generation = Some(generation);
                 }
                 if !first_receive && !exchange_confirmed {
                     (false, false, None, false)
@@ -1443,11 +1443,11 @@ impl PeerManager {
                     .as_deref()
                     .is_some_and(|endpoint| !endpoint.is_empty());
             if !confirmed
-                || conn.relay_first_business_pathcommit_generation == Some(generation)
+                || conn.relay_first.business_pathcommit_generation == Some(generation)
             {
                 return false;
             }
-            conn.relay_first_business_pathcommit_generation = Some(generation);
+            conn.relay_first.business_pathcommit_generation = Some(generation);
             (
                 true,
                 conn.relay_confirmed_endpoint.clone().unwrap_or_else(|| {
@@ -1629,13 +1629,13 @@ impl PeerManager {
                     conn.relay_confirmed_generation = None;
                     conn.relay_confirmed_endpoint = None;
                     conn.relay_confirmed_connection_id = None;
-                    conn.relay_first_gate_generation = None;
-                    conn.relay_first_gate_started_at = None;
-                    conn.relay_first_business_sent_generation = None;
-                    conn.relay_first_business_received_generation = None;
-                    conn.relay_first_business_exchange_generation = None;
-                    conn.relay_first_business_pathcommit_generation = None;
-                    conn.relay_preconfirmation_business = None;
+                    conn.relay_first.gate_generation = None;
+                    conn.relay_first.gate_started_at = None;
+                    conn.relay_first.business_sent_generation = None;
+                    conn.relay_first.business_received_generation = None;
+                    conn.relay_first.business_exchange_generation = None;
+                    conn.relay_first.business_pathcommit_generation = None;
+                    conn.relay_first.preconfirmation = None;
                     let had_ready = conn.relay_ready_at.is_some();
                     conn.relay_ready_generation = None;
                     conn.relay_ready_at = None;
@@ -1835,13 +1835,13 @@ impl PeerManager {
                 conn.relay_confirmed_generation = None;
                 conn.relay_confirmed_endpoint = None;
                 conn.relay_confirmed_connection_id = None;
-                conn.relay_first_gate_generation = None;
-                conn.relay_first_gate_started_at = None;
-                conn.relay_first_business_sent_generation = None;
-                conn.relay_first_business_received_generation = None;
-                conn.relay_first_business_exchange_generation = None;
-                conn.relay_first_business_pathcommit_generation = None;
-                conn.relay_preconfirmation_business = None;
+                conn.relay_first.gate_generation = None;
+                conn.relay_first.gate_started_at = None;
+                conn.relay_first.business_sent_generation = None;
+                conn.relay_first.business_received_generation = None;
+                conn.relay_first.business_exchange_generation = None;
+                conn.relay_first.business_pathcommit_generation = None;
+                conn.relay_first.preconfirmation = None;
                 if had_confirmed {
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     self.bump_relay_confirm_seq(&conn.node_id);

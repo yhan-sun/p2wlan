@@ -161,9 +161,9 @@ impl PeerDiagnostics {
         // rendering a Direct probe as a usable connection or latency sample.
         let relay_first_pending = conn.relay_first_confirmation_pending(local_generation, true);
         let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
-            || conn.relay_first_gate_generation == Some(local_generation))
+            || conn.relay_first.gate_generation == Some(local_generation))
             && relay_peer_confirmed
-            && conn.relay_first_business_exchange_generation != Some(local_generation);
+            && conn.relay_first.business_exchange_generation != Some(local_generation);
         let confirmed_direct_active =
             confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
         let mut active_path = match current_selection {
@@ -333,15 +333,15 @@ impl PeerDiagnostics {
             relay_ready_endpoint: conn.relay_ready_endpoint.clone(),
             relay_ready_generation: conn.relay_ready_generation,
             relay_ready_connection_id: conn.relay_ready_connection_id,
-            relay_first_gate_generation: conn.relay_first_gate_generation,
+            relay_first_gate_generation: conn.relay_first.gate_generation,
             relay_first_gate_age_ms: conn
-                .relay_first_gate_started_at
+                .relay_first.gate_started_at
                 .map(|started_at| duration_millis(started_at.elapsed())),
             relay_first_confirmation_pending: relay_first_pending,
             relay_first_business_pending,
-            relay_first_business_sent_generation: conn.relay_first_business_sent_generation,
-            relay_first_business_received_generation: conn.relay_first_business_received_generation,
-            relay_first_business_exchange_generation: conn.relay_first_business_exchange_generation,
+            relay_first_business_sent_generation: conn.relay_first.business_sent_generation,
+            relay_first_business_received_generation: conn.relay_first.business_received_generation,
+            relay_first_business_exchange_generation: conn.relay_first.business_exchange_generation,
             first_usable_path: conn.first_usable_path,
             first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(

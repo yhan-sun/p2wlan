@@ -227,9 +227,9 @@ async fn relay_confirmation_and_business_markers_reject_retired_generation() {
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_ready_generation, None);
     assert_eq!(connection.relay_confirmed_generation, None);
-    assert_eq!(connection.relay_first_business_sent_generation, None);
-    assert_eq!(connection.relay_first_business_received_generation, None);
-    assert_eq!(connection.relay_first_business_exchange_generation, None);
+    assert_eq!(connection.relay_first.business_sent_generation, None);
+    assert_eq!(connection.relay_first.business_received_generation, None);
+    assert_eq!(connection.relay_first.business_exchange_generation, None);
 }
 
 #[tokio::test]

@@ -132,10 +132,10 @@ impl PeerManager {
             .get_mut(node_id)
             .map(|conn| {
                 if (relay_available || self.relay_first_required())
-                    && conn.relay_first_gate_generation != Some(generation)
+                    && conn.relay_first.gate_generation != Some(generation)
                 {
-                    conn.relay_first_gate_generation = Some(generation);
-                    conn.relay_first_gate_started_at = Some(Instant::now());
+                    conn.relay_first.gate_generation = Some(generation);
+                    conn.relay_first.gate_started_at = Some(Instant::now());
                 }
                 if !conn.online || conn.state == ConnectionState::Closed {
                     return false;

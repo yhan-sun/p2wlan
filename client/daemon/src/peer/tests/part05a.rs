@@ -469,7 +469,7 @@ async fn relay_first_receive_before_ack_is_promoted_on_confirmation() {
         .await);
 
     let connection = manager.get_connection("peer1").await.unwrap();
-    assert_eq!(connection.relay_first_business_received_generation, Some(generation));
+    assert_eq!(connection.relay_first.business_received_generation, Some(generation));
     assert_eq!(connection.first_usable_generation, Some(generation));
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
@@ -518,7 +518,7 @@ async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_confirmed_generation, Some(generation));
     assert_eq!(connection.relay_confirmed_connection_id, Some(17));
-    assert_eq!(connection.relay_first_business_received_generation, Some(generation));
+    assert_eq!(connection.relay_first.business_received_generation, Some(generation));
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
 
@@ -553,7 +553,7 @@ async fn preconfirmation_business_from_replaced_relay_transport_is_rejected() {
         )
         .await);
     let connection = manager.get_connection("peer1").await.unwrap();
-    assert_eq!(connection.relay_first_business_received_generation, None);
+    assert_eq!(connection.relay_first.business_received_generation, None);
     assert_eq!(connection.first_usable_generation, None);
 
     assert!(manager
@@ -660,7 +660,7 @@ async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
         connections
             .get_mut("peer1")
             .expect("peer exists")
-            .relay_first_gate_started_at = Some(
+            .relay_first.gate_started_at = Some(
                 Instant::now()
                     .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
                     .expect("test instant is representable"),
@@ -699,7 +699,7 @@ async fn relay_catalog_gate_blocks_direct_ack_before_any_business_ingress() {
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.state, ConnectionState::Direct);
-    assert_eq!(connection.relay_first_gate_generation, Some(generation));
+    assert_eq!(connection.relay_first.gate_generation, Some(generation));
 }
 
 #[tokio::test]
