@@ -75,9 +75,6 @@ class _SettingsPageState extends State<SettingsPage> {
   var _showAdvancedNetwork = false;
   var _showDeveloper = false;
   var _showTokenField = false;
-  // Human-readable credential status (e.g. "valid" / "missing"). The raw token
-  // is never shown; this only describes whether one is stored.
-  late String _credentialState;
 
   void _updateState(VoidCallback fn) => setState(fn);
 
@@ -97,10 +94,6 @@ class _SettingsPageState extends State<SettingsPage> {
     // empty on save (managed mode) preserves the current token, while
     // re-entering a value updates it. Clearing is a separate logout action.
     _authTokenController = TextEditingController();
-    _credentialState = _describeCredential(
-      settings,
-      AppStrings.fromCode(settings.languageCode),
-    );
     _networkIdController = TextEditingController(text: settings.networkId);
     _virtualIpController = TextEditingController(text: settings.virtualIp);
     _deviceNameController = TextEditingController(text: settings.deviceName);
@@ -149,6 +142,13 @@ class _SettingsPageState extends State<SettingsPage> {
         final languageCode = widget.settingsStore.settings.languageCode;
         final themeCode = widget.settingsStore.settings.themeMode;
         final theme = Theme.of(context);
+        // Derived from the live store + current strings so a language switch
+        // (or any other store update) re-renders the status correctly. The raw
+        // token is never read back into a text field.
+        final credentialState = _describeCredential(
+          widget.settingsStore.settings,
+          strings,
+        );
         return PageScaffold(
           title: strings.settings,
           subtitle: strings.settingsSubtitle,
@@ -266,7 +266,7 @@ class _SettingsPageState extends State<SettingsPage> {
               children: [
                 _SettingsRow(
                   label: strings.credentialSectionTitle,
-                  subtitle: _credentialState,
+                  subtitle: credentialState,
                   control: TextButton.icon(
                     onPressed: _saving
                         ? null

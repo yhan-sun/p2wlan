@@ -402,4 +402,120 @@ void _registerSettingsTests() {
       tester.view.resetDevicePixelRatio();
     },
   );
+
+  testWidgets('Credential status follows the active language', (tester) async {
+    tester.view.physicalSize = const Size(800, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final stores = (await tester.runAsync(() async {
+      final s = await _makeStores(api: _FakeDiagnosticsApi(health: false));
+      await s.settingsStore.updateSettings(
+        s.settingsStore.settings.copyWith(authToken: 'secret-token'),
+      );
+      return s;
+    }))!;
+    addTearDown(stores.dispose);
+
+    await tester.pumpWidget(
+      _TestApp(
+        child: SettingsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('Securely saved'), findsOneWidget);
+
+    // Switch the language without touching Save; the credential status must
+    // re-derive from the live store in the new locale.
+    await tester.runAsync(
+      () => stores.settingsStore.updateLanguageCode('zh-Hans'),
+    );
+    await tester.pump();
+
+    expect(find.text('已安全保存'), findsOneWidget);
+    expect(find.text('Securely saved'), findsNothing);
+
+    // Manual mode is reported from the saved settings, not the draft toggle.
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(manualMode: true),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('手动模式无需凭据'), findsOneWidget);
+    expect(find.text('已安全保存'), findsNothing);
+  });
+
+  testWidgets('Pending restart survives unrelated saves until applied', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = await _pumpSettings(
+      tester,
+      api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+    );
+    await stores.statusStore.refresh();
+    expect(stores.statusStore.daemonReachable, isTrue);
+
+    // First save: a real daemon-launch change (MTU) while the daemon runs.
+    await tester.tap(_disclosure('Advanced Network'));
+    await tester.pumpAndSettle();
+    await tester.enterText(_settingsTextField('MTU'), '1280');
+    await tester.tap(find.byKey(const Key('settings-save-button')));
+    await tester.pump();
+    await _waitFor(tester, () => stores.settingsStore.settings.mtu == 1280);
+    await _waitFor(
+      tester,
+      () => find.text('P2WLAN restart required').evaluate().isNotEmpty,
+    );
+    expect(find.text('P2WLAN restart required'), findsOneWidget);
+    expect(find.text('Restart and apply'), findsOneWidget);
+
+    // Second save with no daemon-launch change (close behavior only). The
+    // pending restart must NOT be cleared by this unrelated save.
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('close-behavior-keep-running')),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('close-behavior-keep-running')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Stop P2WLAN').last);
+    await tester.pump();
+    await _waitFor(
+      tester,
+      () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
+    );
+    await tester.tap(find.byKey(const Key('settings-save-button')));
+    await tester.pump();
+    await _waitFor(
+      tester,
+      () => stores.settingsStore.settings.closeBehavior == 'stop-and-quit',
+    );
+
+    expect(find.text('P2WLAN restart required'), findsOneWidget);
+    expect(find.text('Restart and apply'), findsOneWidget);
+    expect(stores.settingsStore.settings.closeBehavior, 'stop-and-quit');
+    // Wait for the second save (including its refresh) to finish so the
+    // restart action is enabled again.
+    await _waitFor(
+      tester,
+      () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
+    );
+
+    // Applying the pending restart clears the notice.
+    await tester.ensureVisible(find.text('Restart and apply'));
+    await tester.pump();
+    await tester.tap(find.text('Restart and apply'));
+    await tester.pump();
+    await _waitFor(
+      tester,
+      () => find.text('P2WLAN restart required').evaluate().isEmpty,
+    );
+    expect(find.text('P2WLAN restart required'), findsNothing);
+    expect(find.text('Restart and apply'), findsNothing);
+  });
 }
