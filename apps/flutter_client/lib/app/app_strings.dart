@@ -118,6 +118,28 @@ class AppStrings {
   String get virtualNetworkStoppedDetail => isZh
       ? '启动后会显示虚拟 IP、控制面和设备路径状态。'
       : 'Start P2WLAN to see virtual IP, control-plane, and device path status.';
+  String get networkTitle => isZh ? 'P2WLAN 网络' : 'P2WLAN network';
+  String get connectionOverview => isZh ? '连接概览' : 'Connection overview';
+  String get networkEnvironment => isZh ? '网络环境' : 'Network environment';
+  String get localNode => isZh ? '本机' : 'This device';
+  String get udp => isZh ? 'UDP' : 'UDP';
+  String get udpAvailable => isZh ? 'UDP 可用' : 'UDP available';
+  String get udpUnavailable => isZh ? 'UDP 不可用' : 'UDP unavailable';
+  String get dashboardStoppedTitle =>
+      isZh ? 'P2WLAN 尚未运行' : 'P2WLAN is not running';
+  String get dashboardStoppedDetail => isZh
+      ? '启动 P2WLAN 后，这里会显示你的设备和连接状态。'
+      : 'Start P2WLAN to see your devices and connection status here.';
+  String get dashboardUnavailableTitle =>
+      isZh ? '暂时无法获取网络状态' : 'Network status unavailable';
+  String get dashboardUnavailableDetail => isZh
+      ? '连接控制服务器后，这里会显示你的设备和连接状态。'
+      : 'Connect to the control server to see your devices and connection status here.';
+  String probeRtt(int probeRttMs) =>
+      isZh ? '探测 RTT $probeRttMs ms' : 'probe RTT $probeRttMs ms';
+  String moreDevices(int count) => isZh
+      ? '还有 $count 台设备，可在「设备」页查看。'
+      : '$count more devices — see the Devices page.';
   String get daemonStatus => isZh ? '守护进程' : 'Daemon';
   String get controlPlane => isZh ? '控制面' : 'Control plane';
   String get onlineDevices => isZh ? '在线设备' : 'Online devices';

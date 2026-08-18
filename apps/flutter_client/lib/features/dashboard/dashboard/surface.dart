@@ -21,33 +21,6 @@ class _DashboardSurface extends StatelessWidget {
   }
 }
 
-class _DashboardSurfaceHeader extends StatelessWidget {
-  const _DashboardSurfaceHeader();
-
-  @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    return Row(
-      children: [
-        Expanded(
-          child: Text(
-            strings.virtualNetwork,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurface,
-              fontSize: 15,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
 class _ManualDaemonCommand extends StatelessWidget {
   const _ManualDaemonCommand({required this.command});
 
