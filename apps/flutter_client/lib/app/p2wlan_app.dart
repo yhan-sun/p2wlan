@@ -150,6 +150,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                 : LoginPage(
                     settingsStore: _settingsStore,
                     statusStore: _statusStore,
+                    capabilities: _capabilities,
                     onAuthenticated: () {
                       if (mounted) {
                         setState(() => _authenticated = true);

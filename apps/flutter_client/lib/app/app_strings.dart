@@ -466,6 +466,64 @@ class AppStrings {
       ? '登录凭据、控制面与网络标识。'
       : 'Credentials, control plane, and network identity.';
 
+  // --- Login / authentication (Phase 5) ---
+  String get loginSubtitleDesktop => isZh
+      ? '登录后连接这台设备到你的 P2WLAN 网络。'
+      : 'Sign in to connect this device to your P2WLAN network.';
+  String get loginSubtitleMobile => isZh
+      ? '登录后查看和管理你的 P2WLAN 网络与设备。'
+      : 'Sign in to view and manage your P2WLAN network and devices.';
+  String get email => isZh ? '邮箱' : 'Email';
+  String get password => isZh ? '密码' : 'Password';
+  String get signIn => isZh ? '登录' : 'Sign in';
+  String get signingIn => isZh ? '登录中...' : 'Signing in...';
+  String get createAccount => isZh ? '创建账号' : 'Create account';
+  String get creatingAccount => isZh ? '创建账号中...' : 'Creating account...';
+  String get noAccountYet =>
+      isZh ? '没有账号？创建账号' : "Don't have an account? Create one";
+  String get alreadyHaveAccount =>
+      isZh ? '已有账号？登录' : 'Already have an account? Sign in';
+  String get advancedOptions => isZh ? '高级选项' : 'Advanced options';
+  String get advancedOptionsSubtitle =>
+      isZh ? '自托管服务器、手动 / 离线模式' : 'Self-hosted server, manual / offline mode';
+  String get selfHostedServer => isZh ? '自托管服务器' : 'Self-hosted server';
+  String get usingCustomServer =>
+      isZh ? '正在使用自托管服务器' : 'Using a self-hosted server';
+  String get manualOfflineMode => isZh ? '手动 / 离线模式' : 'Manual / offline mode';
+  String get manualOfflineModeHelper => isZh
+      ? '不连接控制服务器，仅用于本地网络测试和诊断。'
+      : 'Does not connect to a control server; for local network testing and diagnostics only.';
+  String get continueOffline =>
+      isZh ? '继续使用手动 / 离线模式' : 'Continue in manual / offline mode';
+  String get showPassword => isZh ? '显示密码' : 'Show password';
+  String get hidePassword => isZh ? '隐藏密码' : 'Hide password';
+  String get loginErrorEmailRequired => isZh ? '请输入邮箱' : 'Enter your email';
+  String get loginErrorPasswordTooShort =>
+      isZh ? '密码至少需要 6 个字符' : 'Password must be at least 6 characters';
+  String get loginFailedTitle => isZh ? '无法登录' : 'Sign in failed';
+  String get loginErrorAuthenticationBody =>
+      isZh ? '邮箱或密码不正确。' : 'Incorrect email or password.';
+  String get loginErrorAccountExistsBody => isZh
+      ? '该邮箱已注册，请直接登录。'
+      : 'This email is already registered. Sign in instead.';
+  String get loginErrorRegistrationFailedBody =>
+      isZh ? '注册失败，请稍后重试。' : 'Registration failed. Please try again.';
+  String get loginErrorRateLimitedBody =>
+      isZh ? '请求过于频繁，请稍后再试。' : 'Too many attempts. Please try again later.';
+  String get loginErrorNetworkTitle =>
+      isZh ? '无法连接控制服务器' : 'Cannot reach control server';
+  String get loginErrorNetworkBody => isZh
+      ? '请检查网络或自托管服务器地址。'
+      : 'Check your network or the self-hosted server address.';
+  String get loginErrorTimeoutBody => isZh
+      ? '连接控制服务器超时，请稍后重试。'
+      : 'Connection to the control server timed out. Try again.';
+  String get loginErrorServerBody => isZh
+      ? '控制服务器返回了错误，请稍后再试或检查服务端。'
+      : 'The control server returned an error. Try again later or check the server.';
+  String get loginErrorUnknownTitle =>
+      isZh ? '登录失败，请重试。' : 'Sign in failed. Please try again.';
+
   String sectionLabel(String sectionName) {
     return switch (sectionName) {
       'dashboard' => dashboard,
