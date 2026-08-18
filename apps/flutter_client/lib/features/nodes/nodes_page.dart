@@ -345,16 +345,12 @@ class _NodesPageState extends State<NodesPage> {
       if (!mounted) return;
       _showSnack(
         canSync
-            ? (strings.isZh
-                  ? '本机节点已同步：$savedName / ${dash(savedVirtualIp)}。重启 P2WLAN 后 IP 生效。'
-                  : 'This device synced: $savedName / ${dash(savedVirtualIp)}. Restart P2WLAN to apply IP changes.')
-            : (strings.isZh
-                  ? '本机节点已保存：$savedName / ${dash(savedVirtualIp)}。启动后生效。'
-                  : 'This device saved: $savedName / ${dash(savedVirtualIp)}. Applies on next start.'),
+            ? strings.nodeSynced(savedName, dash(savedVirtualIp))
+            : strings.nodeSaved(savedName, dash(savedVirtualIp)),
       );
     } catch (error) {
       if (!mounted) return;
-      _showSnack(error.toString());
+      _showSnack(strings.deviceSaveFailed);
     }
   }
 
@@ -376,13 +372,11 @@ class _NodesPageState extends State<NodesPage> {
         deviceName: result,
       );
       if (!mounted) return;
-      _showSnack(
-        strings.isZh ? '设备名称已同步：$savedName' : 'Device name synced: $savedName',
-      );
+      _showSnack(strings.deviceNameSynced(savedName));
       await widget.statusStore.refresh();
     } catch (error) {
       if (!mounted) return;
-      _showSnack(error.toString());
+      _showSnack(strings.deviceRenameFailed);
     } finally {
       if (mounted && _busyPeerId == peer.nodeId) {
         setState(() => _busyPeerId = null);
@@ -430,15 +424,11 @@ class _NodesPageState extends State<NodesPage> {
       if (mounted) setState(() => _hiddenPeerIds.add(peer.nodeId));
       await widget.statusStore.refresh();
       if (!mounted) return true;
-      _showSnack(
-        strings.isZh
-            ? '设备已移除：${peer.displayName}'
-            : 'Device removed: ${peer.displayName}',
-      );
+      _showSnack(strings.deviceRemoved(peer.displayName));
       return true;
     } catch (error) {
       if (!mounted) return false;
-      _showSnack(error.toString());
+      _showSnack(strings.deviceRemoveFailed);
       return false;
     } finally {
       if (mounted && _busyPeerId == peer.nodeId) {
@@ -528,9 +518,7 @@ class _NodesPageState extends State<NodesPage> {
                       final name = controller.text.trim();
                       if (name.isEmpty) {
                         setDialogState(() {
-                          error = strings.isZh
-                              ? '设备名称不能为空'
-                              : 'Device name is required';
+                          error = strings.deviceNameRequired;
                         });
                         return;
                       }
@@ -569,7 +557,7 @@ class _NodesPageState extends State<NodesPage> {
           return StatefulBuilder(
             builder: (context, setDialogState) {
               return AlertDialog(
-                title: Text(strings.isZh ? '编辑本机节点' : 'Edit this device'),
+                title: Text(strings.editThisDevice),
                 content: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 420),
                   child: Column(
@@ -586,12 +574,8 @@ class _NodesPageState extends State<NodesPage> {
                       TextField(
                         controller: ipController,
                         decoration: InputDecoration(
-                          labelText: strings.isZh
-                              ? '期望虚拟 IP'
-                              : 'Requested virtual IP',
-                          helperText: strings.isZh
-                              ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
-                              : 'Leave blank for automatic assignment; restart P2WLAN after changing it.',
+                          labelText: strings.requestedVirtualIp,
+                          helperText: strings.requestedVirtualIpHelper,
                           errorText: error,
                         ),
                         keyboardType: TextInputType.number,
@@ -610,9 +594,7 @@ class _NodesPageState extends State<NodesPage> {
                       final virtualIp = ipController.text.trim();
                       if (name.isEmpty) {
                         setDialogState(() {
-                          error = strings.isZh
-                              ? '设备名称不能为空'
-                              : 'Device name is required';
+                          error = strings.deviceNameRequired;
                         });
                         return;
                       }
@@ -622,9 +604,7 @@ class _NodesPageState extends State<NodesPage> {
                       if (virtualIp.isNotEmpty &&
                           parsedIp?.type != InternetAddressType.IPv4) {
                         setDialogState(() {
-                          error = strings.isZh
-                              ? '虚拟 IP 格式不正确，例如 10.20.0.42'
-                              : 'Virtual IP must look like 10.20.0.42';
+                          error = strings.virtualIpFormatHint;
                         });
                         return;
                       }

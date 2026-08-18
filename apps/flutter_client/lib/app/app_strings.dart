@@ -139,6 +139,8 @@ class AppStrings {
       isZh ? '探测 RTT $probeRttMs ms' : 'probe RTT $probeRttMs ms';
   String moreDevices(int count) => isZh
       ? '还有 $count 台设备，可在「设备」页查看。'
+      : count == 1
+      ? '1 more device — see the Devices page.'
       : '$count more devices — see the Devices page.';
   String get daemonStatus => isZh ? '守护进程' : 'Daemon';
   String get controlPlane => isZh ? '控制面' : 'Control plane';
@@ -313,8 +315,11 @@ class AppStrings {
   String get issueRelayDetail => isZh
       ? '中继路径出现异常，部分跨 NAT 连接可能受影响。'
       : 'The relay path is failing; some cross-NAT connections may be affected.';
-  String devicesNeedPathReview(int count) =>
-      isZh ? '$count 台设备的连接路径需要检查' : '$count device(s) need path review';
+  String devicesNeedPathReview(int count) => isZh
+      ? '$count 台设备的连接路径需要检查'
+      : count == 1
+      ? '1 device needs path review'
+      : '$count devices need path review';
   String get issuePeerPathsDetail =>
       isZh ? '具体设备请到「设备」页查看。' : 'See the Devices page for specific devices.';
   String get copyDiagnosticsSummary =>
@@ -387,8 +392,11 @@ class AppStrings {
   String get sortRecommended => isZh ? '推荐' : 'Recommended';
   String get sortByName => isZh ? '名称' : 'Name';
   String get sortByLatency => isZh ? '延迟' : 'Latency';
-  String deviceCountSummary(int total, int online) =>
-      isZh ? '$total 台设备 · $online 在线' : '$total devices · $online online';
+  String deviceCountSummary(int total, int online) => isZh
+      ? '$total 台设备 · $online 在线'
+      : total == 1
+      ? '1 device · $online online'
+      : '$total devices · $online online';
   String get clearSearch => isZh ? '清除搜索' : 'Clear search';
   String get clearFilter => isZh ? '清除筛选' : 'Clear filters';
   String get noPeersTitle => isZh ? '还没有其他设备' : 'No other devices yet';
@@ -621,6 +629,160 @@ class AppStrings {
       : 'The control server returned an error. Try again later or check the server.';
   String get loginErrorUnknownTitle =>
       isZh ? '登录失败，请重试。' : 'Sign in failed. Please try again.';
+
+  // --- Onboarding (Phase 8 localization) ---
+  String get onboardingTitle =>
+      isZh ? '把这台设备接入 P2WLAN' : 'Connect this device to P2WLAN';
+  String get onboardingSubtitle => isZh
+      ? '几步完成本地节点设置；中途退出可随时从这里继续。'
+      : 'A few steps to set up your local node; you can resume here anytime.';
+  String get onboardingStepPermission => isZh ? '权限' : 'Permission';
+  String get onboardingStepStart => isZh ? '启动' : 'Start';
+  String get onboardingStepVirtualIp => isZh ? '虚拟 IP' : 'Virtual IP';
+  String get onboardingStepDiscover => isZh ? '发现设备' : 'Discover';
+  String get onboardingStepDone => isZh ? '完成' : 'Done';
+  String get onboardingAuthTitle =>
+      isZh ? '登录控制面' : 'Sign in to the control plane';
+  String get onboardingAuthSubtitle =>
+      isZh ? '使用账号登录以加入你的网络。' : 'Use your account to join your network.';
+  String get onboardingPermissionTitle =>
+      isZh ? '授予本机权限' : 'Grant local permissions';
+  String get onboardingPermissionSubtitle => isZh
+      ? 'P2WLAN 需要创建虚拟网卡并安装路由，可能需要管理员权限。'
+      : 'P2WLAN creates a virtual adapter and installs routes; this may need admin rights.';
+  String get onboardingDaemonTitle =>
+      isZh ? '启动本地守护进程' : 'Start the local daemon';
+  String get onboardingDaemonSubtitle => isZh
+      ? '启动 p2wlan-daemon 以建立虚拟网卡与加密会话。'
+      : 'Start p2wlan-daemon to create the virtual adapter and secure sessions.';
+  String get onboardingVirtualIpTitle =>
+      isZh ? '等待分配虚拟 IP' : 'Waiting for a virtual IP';
+  String get onboardingVirtualIpSubtitle => isZh
+      ? '正在加入网络并获取 10.20.x.x 地址…'
+      : 'Joining the network and getting a 10.20.x.x address…';
+  String get onboardingDiscoverTitle =>
+      isZh ? '发现其他设备' : 'Discover other devices';
+  String get onboardingDiscoverSubtitle => isZh
+      ? '正在同步节点目录。可以现在完成，之后在"设备"页继续查看。'
+      : 'Syncing the node catalog. You can finish now and check "Devices" later.';
+  String get onboardingReadyTitle => isZh ? '准备就绪' : 'Ready';
+  String get onboardingReadySubtitle =>
+      isZh ? '本地节点已配置完成。' : 'Your local node is set up.';
+  String get onboardingPermissionSatisfied =>
+      isZh ? '权限已满足' : 'Permissions satisfied';
+  String get onboardingPermissionNeeded =>
+      isZh ? '需要授权' : 'Authorization needed';
+  String get onboardingTunAvailable => isZh ? '可创建 TUN' : 'Can create TUN';
+  String get onboardingTunRuntimeVerify =>
+      isZh ? 'TUN: 运行时验证' : 'TUN: runtime verification';
+  String get onboardingTunUnavailable => isZh ? 'TUN: 不可用' : 'TUN: unavailable';
+  String get onboardingRoutesAvailable => isZh ? '可修改路由' : 'Can modify routes';
+  String get onboardingRoutesRuntimeVerify =>
+      isZh ? '路由: 运行时验证' : 'Routes: runtime verification';
+  String get onboardingRoutesUnavailable =>
+      isZh ? '路由: 不可用' : 'Routes: unavailable';
+  String get onboardingGrantContinue => isZh ? '授予并继续' : 'Grant & continue';
+  String get onboardingFinish => isZh ? '完成' : 'Finish';
+  String get onboardingConnecting => isZh ? '正在连接…' : 'Connecting…';
+  String get onboardingSkip => isZh ? '跳过' : 'Skip';
+  String onboardingCompleteFailed(String error) =>
+      isZh ? '无法完成本机设置：$error' : 'Could not finish local setup: $error';
+
+  // --- Tunnels (Phase 8 localization) ---
+  String get tunnelsSubtitle => isZh
+      ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
+      : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.';
+  String get tunnelSummary => isZh ? '隧道摘要' : 'Tunnel summary';
+  String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
+  String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
+  String get virtualAdapter => isZh ? '虚拟网卡' : 'Virtual Adapter';
+  String get routeUnknown => isZh ? '未知（未校验）' : 'Unknown (unverified)';
+  String get routeInstalled => isZh ? '已安装' : 'Installed';
+  String get routeConflict => isZh ? '冲突' : 'Conflict';
+  String get routeMissing => isZh ? '缺失' : 'Missing';
+  String get routeDestination => isZh ? '目标网段' : 'Destination';
+  String get routeExpectedInterface => isZh ? '期望网卡' : 'Expected interface';
+  String get routeActualInterface => isZh ? '系统实际网卡' : 'Actual (system table)';
+  String get routeDetail => isZh ? '状态说明' : 'Detail';
+  String get routeNotRead => isZh
+      ? '尚未从 daemon 读取系统路由表；点击"检查路由"。'
+      : 'Not yet read from the daemon; tap "Check routes".';
+  String routeAuthoritative(String state) =>
+      isZh ? '权威状态：$state。' : 'Authoritative state: $state.';
+  String get checkRoutes => isZh ? '检查路由' : 'Check routes';
+  String get repairRoutes => isZh ? '修复路由' : 'Repair routes';
+  String get restartNetworkService =>
+      isZh ? '重启网络服务（会短暂断开）' : 'Restart network service (brief disconnect)';
+  String tunnelRouteRepaired(String after) => isZh
+      ? '路由已就地修复（状态：$after），未重启 daemon。'
+      : 'Route repaired in place (state: $after) without restarting the daemon.';
+  String get tunnelRouteAlreadyInstalled => isZh
+      ? '路由已正确安装，无需修复。'
+      : 'Route was already correctly installed; no change needed.';
+  String tunnelRouteRepairFailed(String error) =>
+      isZh ? '路由修复失败：$error' : 'Route repair failed: $error';
+  String get daemonRestartedReinstall => isZh
+      ? '已通过重启 daemon 触发 Overlay 路由重装。'
+      : 'Daemon restarted to reinstall overlay routes.';
+
+  // --- Nodes (Phase 8 localization) ---
+  String nodeSynced(String name, String virtualIp) => isZh
+      ? '本机节点已同步：$name / $virtualIp。重启 P2WLAN 后 IP 生效。'
+      : 'This device synced: $name / $virtualIp. Restart P2WLAN to apply IP changes.';
+  String nodeSaved(String name, String virtualIp) => isZh
+      ? '本机节点已保存：$name / $virtualIp。启动后生效。'
+      : 'This device saved: $name / $virtualIp. Applies on next start.';
+  String deviceRemoved(String name) =>
+      isZh ? '设备已移除：$name' : 'Device removed: $name';
+  String deviceNameSynced(String name) =>
+      isZh ? '设备名称已同步：$name' : 'Device name synced: $name';
+  String get removeDeviceConfirmation => isZh
+      ? '该设备会从控制面移除，之后需要重新登录/注册才能加入网络。'
+      : 'This removes the device from the control plane. It must sign in or register again to rejoin.';
+  String get deviceNameRequired =>
+      isZh ? '设备名称不能为空' : 'Device name is required';
+  String get editThisDevice => isZh ? '编辑本机节点' : 'Edit this device';
+  String get requestedVirtualIp => isZh ? '期望虚拟 IP' : 'Requested virtual IP';
+  String get requestedVirtualIpHelper => isZh
+      ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
+      : 'Leave blank for automatic assignment; restart P2WLAN after changing it.';
+  String get virtualIpFormatHint => isZh
+      ? '虚拟 IP 格式不正确，例如 10.20.0.42'
+      : 'Virtual IP must look like 10.20.0.42';
+  String get version => isZh ? '版本' : 'Version';
+  String get thisDeviceTitle => isZh ? '本机节点' : 'This device';
+  String get controlSyncReady => isZh ? '控制面同步就绪' : 'Control sync ready';
+  String get savedLocally => isZh ? '本地保存' : 'Saved locally';
+  String get directTypePublic => isZh ? '公网直连' : 'Public direct';
+  String get directTypeLan => isZh ? '局域网直连' : 'LAN direct';
+  String get directTypeOverlay => isZh ? 'Overlay 直连' : 'Overlay direct';
+  String get removeDeviceOfflineHint => isZh
+      ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
+      : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.';
+
+  // --- Settings (Phase 8 localization) ---
+  String get controlServerHelper => isZh
+      ? '用户注册、设备认证和节点目录同步地址。'
+      : 'Used for account auth, device registration, and peer catalog sync.';
+  String get networkIdHelper =>
+      isZh ? '加入的专用虚拟内网标识。' : 'Virtual network identifier to join.';
+  String get requestedVirtualIpHelperSettings => isZh
+      ? '可选；留空由控制面自动分配，例如 10.20.0.42。保存后重启 P2WLAN 生效。'
+      : 'Optional; leave blank for control-plane assignment, e.g. 10.20.0.42. Restart P2WLAN after saving.';
+  String get localServiceSubtitle => isZh
+      ? '诊断端点对应的本地 daemon。'
+      : 'Local daemon behind the diagnostics endpoint.';
+  String get settingsSaveFailed =>
+      isZh ? '无法保存配置，请重试。' : 'Could not save settings. Please try again.';
+  String get deviceSaveFailed =>
+      isZh ? '无法保存本机节点，请重试。' : 'Could not save this device. Please try again.';
+  String get deviceRenameFailed =>
+      isZh ? '无法重命名设备，请重试。' : 'Could not rename the device. Please try again.';
+  String get deviceRemoveFailed =>
+      isZh ? '无法移除设备，请重试。' : 'Could not remove the device. Please try again.';
+
+  // --- Diagnostics (Phase 8 localization) ---
+  String get logExcerptCopied => isZh ? '日志片段已复制' : 'Log excerpt copied';
 
   String sectionLabel(String sectionName) {
     return switch (sectionName) {

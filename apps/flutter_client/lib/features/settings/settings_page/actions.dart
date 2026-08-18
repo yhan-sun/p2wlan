@@ -78,7 +78,7 @@ extension _SettingsPageActions on _SettingsPageState {
             : strings.failedToSaveLocalSettings,
       );
     } catch (error) {
-      _updateState(() => _formError = error.toString());
+      _updateState(() => _formError = strings.settingsSaveFailed);
       _showSnackBar(strings.failedToSaveLocalSettings);
     } finally {
       if (mounted) {

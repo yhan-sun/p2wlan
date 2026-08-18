@@ -297,26 +297,20 @@ class _SettingsPageState extends State<SettingsPage> {
                 _SettingsTextField(
                   controller: _controlServerController,
                   label: strings.controlServer,
-                  helper: strings.isZh
-                      ? '用户注册、设备认证和节点目录同步地址。'
-                      : 'Used for account auth, device registration, and peer catalog sync.',
+                  helper: strings.controlServerHelper,
                   keyboardType: TextInputType.url,
                 ),
                 _gap,
                 _SettingsTextField(
                   controller: _networkIdController,
                   label: strings.networkId,
-                  helper: strings.isZh
-                      ? '加入的专用虚拟内网标识。'
-                      : 'Virtual network identifier to join.',
+                  helper: strings.networkIdHelper,
                 ),
                 _gap,
                 _SettingsTextField(
                   controller: _virtualIpController,
-                  label: strings.isZh ? '期望虚拟 IP' : 'Requested virtual IP',
-                  helper: strings.isZh
-                      ? '可选；留空由控制面自动分配，例如 10.20.0.42。保存后重启 P2WLAN 生效。'
-                      : 'Optional; leave blank for control-plane assignment, e.g. 10.20.0.42. Restart P2WLAN after saving.',
+                  label: strings.requestedVirtualIp,
+                  helper: strings.requestedVirtualIpHelperSettings,
                 ),
                 if (widget.onLogout != null) ...[
                   _gap,
@@ -460,9 +454,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   const Divider(height: 24),
                   _SettingsRow(
                     label: strings.localService,
-                    subtitle: strings.isZh
-                        ? '诊断端点对应的本地 daemon。'
-                        : 'Local daemon behind the diagnostics endpoint.',
+                    subtitle: strings.localServiceSubtitle,
                     control: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [

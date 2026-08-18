@@ -31,6 +31,7 @@ part 'p15_widget/nodes_tests.dart';
 part 'p15_widget/tunnels_tests.dart';
 part 'p15_widget/diagnostics_tests.dart';
 part 'p15_widget/design_system_tests.dart';
+part 'p15_widget/localization_tests.dart';
 part 'p15_widget/helpers.dart';
 
 void main() {
@@ -40,4 +41,5 @@ void main() {
   _registerTunnelsTests();
   _registerDiagnosticsTests();
   _registerDesignSystemTests();
+  _registerLocalizationTests();
 }

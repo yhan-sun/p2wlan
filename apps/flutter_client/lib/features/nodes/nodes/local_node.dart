@@ -34,9 +34,7 @@ class _LocalNodePanel extends StatelessWidget {
         !settings.manualMode &&
         settings.authToken.trim().isNotEmpty &&
         nodeId.isNotEmpty;
-    final syncText = canSync
-        ? (strings.isZh ? '控制面同步就绪' : 'Control sync ready')
-        : (strings.isZh ? '本地保存' : 'Saved locally');
+    final syncText = canSync ? strings.controlSyncReady : strings.savedLocally;
     // Real daemon reachability signals only; never claim "offline" when the
     // daemon is actually reachable but the snapshot is unavailable.
     final statusLabel = snapshot != null
@@ -47,7 +45,7 @@ class _LocalNodePanel extends StatelessWidget {
     final statusTone = snapshot != null ? StatusTone.good : StatusTone.neutral;
 
     return AppPanel(
-      title: strings.isZh ? '本机节点' : 'This device',
+      title: strings.thisDeviceTitle,
       trailing: OutlinedButton.icon(
         onPressed: onEdit,
         icon: const Icon(Icons.edit_outlined, size: 16),

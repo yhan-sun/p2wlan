@@ -115,9 +115,9 @@ String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
     // "直连已验证" requires the daemon's encrypted direct validation ACK.
     if (!peer.isDirectVerified) return strings.probing;
     return switch (peer.connectionType) {
-      'public_udp' => strings.isZh ? '公网直连' : 'Public direct',
-      'lan' => strings.isZh ? '局域网直连' : 'LAN direct',
-      'overlay' => strings.isZh ? 'Overlay 直连' : 'Overlay direct',
+      'public_udp' => strings.directTypePublic,
+      'lan' => strings.directTypeLan,
+      'overlay' => strings.directTypeOverlay,
       _ => strings.direct,
     };
   }

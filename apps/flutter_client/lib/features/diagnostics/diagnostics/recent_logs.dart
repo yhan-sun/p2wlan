@@ -181,9 +181,9 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
     final strings = AppStringsScope.of(context);
     await Clipboard.setData(ClipboardData(text: content));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(strings.isZh ? '日志片段已复制' : 'Log excerpt copied')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(strings.logExcerptCopied)));
   }
 }
 

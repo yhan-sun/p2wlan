@@ -35,9 +35,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
                   const SizedBox(width: AppTokens.space10),
                   Expanded(
                     child: Text(
-                      strings.isZh
-                          ? '该设备会从控制面移除，之后需要重新登录/注册才能加入网络。'
-                          : 'This removes the device from the control plane. It must sign in or register again to rejoin.',
+                      strings.removeDeviceConfirmation,
                       style: TextStyle(
                         color: c.dangerText,
                         fontSize: 13,
@@ -62,9 +60,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
           ),
           const SizedBox(height: AppTokens.space4),
           Text(
-            strings.isZh
-                ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
-                : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.',
+            strings.removeDeviceOfflineHint,
             style: TextStyle(
               color: theme.colorScheme.onSurfaceVariant,
               fontSize: 12,

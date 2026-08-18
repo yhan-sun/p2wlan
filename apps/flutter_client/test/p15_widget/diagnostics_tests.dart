@@ -358,7 +358,7 @@ void _registerDiagnosticsTests() {
       _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
     );
 
-    expect(find.text('1 device(s) need path review'), findsOneWidget);
+    expect(find.text('1 device needs path review'), findsOneWidget);
     expect(
       find.text('See the Devices page for specific devices.'),
       findsOneWidget,

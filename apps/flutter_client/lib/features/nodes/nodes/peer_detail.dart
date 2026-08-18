@@ -137,10 +137,7 @@ class _PeerDetailsContent extends StatelessWidget {
           title: strings.sectionDevice,
           rows: [
             _DetailLine(label: strings.nodeId, value: peer.nodeId),
-            _DetailLine(
-              label: strings.isZh ? '版本' : 'Version',
-              value: dash(peer.appVersion),
-            ),
+            _DetailLine(label: strings.version, value: dash(peer.appVersion)),
             _DetailLine(label: strings.state, value: dash(peer.state)),
           ],
         ),

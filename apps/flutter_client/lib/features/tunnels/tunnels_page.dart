@@ -76,16 +76,12 @@ class _TunnelsPageState extends State<TunnelsPage> {
       setState(() {
         _routeState = result.toJson();
         _message = changed
-            ? (strings.isZh
-                  ? '路由已就地修复（状态：$after），未重启 daemon。'
-                  : 'Route repaired in place (state: $after) without restarting the daemon.')
-            : (strings.isZh
-                  ? '路由已正确安装，无需修复。'
-                  : 'Route was already correctly installed; no change needed.');
+            ? strings.tunnelRouteRepaired(after)
+            : strings.tunnelRouteAlreadyInstalled;
       });
     } catch (error) {
       if (mounted) {
-        setState(() => _message = '路由修复失败：$error');
+        setState(() => _message = strings.tunnelRouteRepairFailed('$error'));
       }
     } finally {
       if (mounted) setState(() => _repairing = false);
@@ -103,9 +99,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
         final running = widget.statusStore.daemonReachable && snapshot != null;
         return PageScaffold(
           title: strings.tunnels,
-          subtitle: strings.isZh
-              ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
-              : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.',
+          subtitle: strings.tunnelsSubtitle,
           showHeader: widget.showHeader,
           maxWidth: tunnelsPageMaxWidth,
           children: [
@@ -177,11 +171,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
       }
       final start = await widget.statusStore.startDaemon();
       setState(() {
-        _message = start.ok
-            ? (strings.isZh
-                  ? '已通过重启 daemon 触发 Overlay 路由重装。'
-                  : 'Daemon restarted to reinstall overlay routes.')
-            : start.message;
+        _message = start.ok ? strings.daemonRestartedReinstall : start.message;
       });
     } finally {
       if (mounted) setState(() => _rebuilding = false);
@@ -204,25 +194,22 @@ class _SummaryStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: strings.isZh ? '隧道摘要' : 'Tunnel summary',
+      title: strings.tunnelSummary,
       child: Wrap(
         spacing: 24,
         runSpacing: 10,
         children: [
           MetricTile(
-            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
+            label: strings.startupInterface,
             value: settings.effectiveTunInterface,
           ),
           MetricTile(
             label: strings.virtualIp,
             value: _dash(snapshot?.virtualIp),
           ),
+          MetricTile(label: strings.startupMtu, value: settings.mtu.toString()),
           MetricTile(
-            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
-            value: settings.mtu.toString(),
-          ),
-          MetricTile(
-            label: strings.isZh ? '状态' : 'State',
+            label: strings.state,
             value: running ? strings.connected : strings.offline,
           ),
         ],
@@ -246,7 +233,7 @@ class _TunnelPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: strings.isZh ? '虚拟网卡' : 'Virtual Adapter',
+      title: strings.virtualAdapter,
       trailing: StatusBadge(
         label: running ? 'UP' : 'DOWN',
         tone: running ? StatusTone.good : StatusTone.bad,
@@ -254,21 +241,18 @@ class _TunnelPanel extends StatelessWidget {
       child: Column(
         children: [
           _Kv(
-            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
+            label: strings.startupInterface,
             value: settings.effectiveTunInterface,
           ),
           _Kv(label: 'Overlay CIDR', value: settings.overlayCidr),
           _Kv(label: strings.virtualIp, value: _dash(snapshot?.virtualIp)),
-          _Kv(
-            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
-            value: settings.mtu.toString(),
-          ),
+          _Kv(label: strings.startupMtu, value: settings.mtu.toString()),
           _Kv(
             label: strings.udpLocalAddr,
             value: _dash(snapshot?.udpLocalAddr ?? settings.udpBind),
           ),
           _Kv(
-            label: strings.isZh ? 'UDP sockets' : 'UDP sockets',
+            label: 'UDP sockets',
             value: (snapshot?.udpSocketCount ?? 0).toString(),
           ),
         ],
@@ -305,7 +289,6 @@ class _RoutePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final isZh = strings.isZh;
 
     // Authoritative state comes from the daemon when available; otherwise we
     // report "unknown" rather than guessing from daemon-running + virtual IP.
@@ -322,19 +305,19 @@ class _RoutePanel extends StatelessWidget {
     String badgeLabel;
     StatusTone badgeTone;
     if (!running) {
-      badgeLabel = isZh ? '离线' : 'Offline';
+      badgeLabel = strings.offline;
       badgeTone = StatusTone.neutral;
     } else if (state == null) {
-      badgeLabel = isZh ? '未知（未校验）' : 'Unknown (unverified)';
+      badgeLabel = strings.routeUnknown;
       badgeTone = StatusTone.warn;
     } else if (routeOk) {
-      badgeLabel = isZh ? '已安装' : 'Installed';
+      badgeLabel = strings.routeInstalled;
       badgeTone = StatusTone.good;
     } else if (routeConflict) {
-      badgeLabel = isZh ? '冲突' : 'Conflict';
+      badgeLabel = strings.routeConflict;
       badgeTone = StatusTone.bad;
     } else {
-      badgeLabel = isZh ? '缺失' : 'Missing';
+      badgeLabel = strings.routeMissing;
       badgeTone = StatusTone.bad;
     }
 
@@ -344,28 +327,20 @@ class _RoutePanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _Kv(label: strings.routeDestination, value: settings.overlayCidr),
           _Kv(
-            label: isZh ? '目标网段' : 'Destination',
-            value: settings.overlayCidr,
-          ),
-          _Kv(
-            label: isZh ? '期望网卡' : 'Expected interface',
+            label: strings.routeExpectedInterface,
             value: expected ?? settings.effectiveTunInterface,
           ),
           if (actual != null)
-            _Kv(
-              label: isZh ? '系统实际网卡' : 'Actual (system table)',
-              value: actual,
-            ),
+            _Kv(label: strings.routeActualInterface, value: actual),
           _Kv(
-            label: isZh ? '状态说明' : 'Detail',
+            label: strings.routeDetail,
             value: state == null
-                ? (isZh
-                      ? '尚未从 daemon 读取系统路由表；点击"检查路由"。'
-                      : 'Not yet read from the daemon; tap "Check routes".')
-                : (isZh
-                      ? '权威状态：${routeState?['state'] ?? state['state']}。'
-                      : 'Authoritative state: ${routeState?['state'] ?? state['state']}.'),
+                ? strings.routeNotRead
+                : strings.routeAuthoritative(
+                    routeState?['state'] ?? state['state'],
+                  ),
           ),
           const SizedBox(height: AppTokens.space12),
           // Check (read-only, safe anytime) + Repair (in place, no restart).
@@ -380,7 +355,7 @@ class _RoutePanel extends StatelessWidget {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.check_circle_outline_rounded),
-                  label: Text(isZh ? '检查路由' : 'Check routes'),
+                  label: Text(strings.checkRoutes),
                 ),
               ),
               const SizedBox(width: AppTokens.space10),
@@ -393,7 +368,7 @@ class _RoutePanel extends StatelessWidget {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.build_rounded),
-                  label: Text(isZh ? '修复路由' : 'Repair routes'),
+                  label: Text(strings.repairRoutes),
                 ),
               ),
             ],
@@ -413,11 +388,7 @@ class _RoutePanel extends StatelessWidget {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(Icons.restart_alt_rounded, size: 16),
-              label: Text(
-                isZh
-                    ? '重启网络服务（会短暂断开）'
-                    : 'Restart network service (brief disconnect)',
-              ),
+              label: Text(strings.restartNetworkService),
             ),
           ),
         ],
