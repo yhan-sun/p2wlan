@@ -425,6 +425,21 @@ pub struct DiagnosticsConfig {
     /// Local bind address for diagnostics. Keep this on loopback.
     #[serde(default = "default_diagnostics_bind")]
     pub bind: String,
+    /// Path to the daemon's own log file (set from `--log-file`). Populated
+    /// only in-process; not part of the persisted config. Backs `GET
+    /// /logs/tail`. Ignored when the operator did not configure a log file.
+    #[serde(default, skip_serializing)]
+    pub log_path: Option<std::path::PathBuf>,
+    /// Per-process random token authorizing sensitive diagnostics endpoints.
+    /// Generated at startup and never persisted to the config file or command
+    /// line; surfaced to local callers (Flutter / tray) through a protected
+    /// file whose path is `auth_token_path`. `None` means access fails closed.
+    #[serde(default, skip_serializing)]
+    pub auth_token: Option<String>,
+    /// Where the per-process diagnostics auth token is written at startup and
+    /// deleted on graceful shutdown. In-process only; never persisted.
+    #[serde(default, skip_serializing)]
+    pub auth_token_path: Option<std::path::PathBuf>,
 }
 
 fn default_diagnostics_bind() -> String {
@@ -436,6 +451,9 @@ impl Default for DiagnosticsConfig {
         Self {
             enabled: false,
             bind: default_diagnostics_bind(),
+            log_path: None,
+            auth_token: None,
+            auth_token_path: None,
         }
     }
 }

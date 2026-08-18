@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
@@ -8,6 +9,7 @@ import '../models/diagnostics_models.dart';
 part 'daemon_controller/process_control.dart';
 part 'daemon_controller/elevation.dart';
 part 'daemon_controller/diagnostics_paths.dart';
+part 'daemon_controller/launch_token.dart';
 part 'daemon_controller/pids.dart';
 
 class DaemonCommandResult {
@@ -69,6 +71,23 @@ class DaemonController {
     final useManualMode = settings.manualMode || authToken.isEmpty;
     final udpAdvertise = settings.udpAdvertise.trim();
     final relayServers = settings.relayServers.trim();
+
+    final requiresElevation =
+        Platform.isMacOS && !_isRootUser() ||
+        Platform.isWindows && !await _isWindowsAdministrator() ||
+        Platform.isLinux && !_isRootUser();
+    File? tokenFile;
+    if (!useManualMode && requiresElevation) {
+      try {
+        tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+      } catch (error) {
+        return DaemonCommandResult(
+          ok: false,
+          message: _startFailureMessage(error),
+        );
+      }
+    }
+
     final args = [
       '--config',
       configPath.path,
@@ -101,7 +120,16 @@ class DaemonController {
         settings.socketPool.trim(),
       ],
       if (relayServers.isNotEmpty) ...['--relay', relayServers],
-      if (useManualMode) '--manual' else ...['--managed', '--token', authToken],
+      if (useManualMode)
+        '--manual'
+      else if (tokenFile != null) ...[
+        '--managed',
+        '--token-file',
+        tokenFile.path,
+      ] else ...[
+        '--managed',
+        '--token-stdin',
+      ],
     ];
 
     await configPath.parent.create(recursive: true);
@@ -126,17 +154,26 @@ class DaemonController {
         : null;
 
     try {
-      if (Platform.isMacOS && !_isRootUser()) {
+      if (requiresElevation && Platform.isMacOS) {
         await _startMacosElevated(elevatedShell);
-      } else if (Platform.isWindows && !await _isWindowsAdministrator()) {
+      } else if (requiresElevation && Platform.isWindows) {
         await _startWindowsElevated(binary: binary, args: args);
-      } else if (Platform.isLinux && !_isRootUser()) {
+      } else if (requiresElevation && Platform.isLinux) {
         await _startLinuxElevated(binary: binary, args: args);
       } else {
-        final process = await _startDetached(binary: binary, args: args);
+        final process = await _startDetached(
+          binary: binary,
+          args: args,
+          stdinToken: useManualMode ? null : authToken,
+        );
         await _writePidMarker(pidPath, process.pid);
       }
     } catch (error) {
+      // The launch itself failed: never leave the temporary credential file
+      // behind.
+      try {
+        await deleteEphemeralLaunchTokenFile(tokenFile);
+      } catch (_) {}
       return DaemonCommandResult(
         ok: false,
         message: _startFailureMessage(error),
@@ -144,12 +181,20 @@ class DaemonController {
       );
     }
 
+    // The daemon reads the token synchronously at startup, so once the
+    // diagnostics endpoint is up (or the launch has failed/timed out) the
+    // temporary credential file is no longer needed. Delete it now so no
+    // long-lived plaintext token file persists, and always clean it up on
+    // failure/timeout below.
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
     final ready = await _waitForHealth(
       settings.diagnosticsUrl,
       timeout,
       logPath,
     );
+    try {
+      await deleteEphemeralLaunchTokenFile(tokenFile);
+    } catch (_) {}
     if (!ready) {
       // A daemon that exited right after an elevated launch usually failed
       // for a definitive, actionable reason.  Detect a permanent control

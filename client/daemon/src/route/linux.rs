@@ -65,4 +65,67 @@ impl RouteManager {
             self.runner.route_del(&cidr, &interface);
         }
     }
+
+    /// Read the live system routing table for `cidr` and report its state.
+    pub fn describe_overlay_route(&self, cidr: &str) -> RouteObservation {
+        let expected = self.interface();
+        let line = match self.runner.route_show(cidr) {
+            Ok(line) => line,
+            Err(_) => {
+                return RouteObservation {
+                    cidr: cidr.to_string(),
+                    expected_interface: expected,
+                    actual_interface: None,
+                    state: RouteState::Unknown,
+                    owned: self.owns_cidr(cidr),
+                };
+            }
+        };
+        if line.is_empty() {
+            return RouteObservation {
+                cidr: cidr.to_string(),
+                expected_interface: expected,
+                actual_interface: None,
+                state: RouteState::Missing,
+                owned: self.owns_cidr(cidr),
+            };
+        }
+        let actual = line
+            .split_whitespace()
+            .position(|tok| tok == "dev")
+            .and_then(|idx| {
+                let split: Vec<&str> = line.split_whitespace().collect();
+                split.get(idx + 1).map(|value| (*value).to_string())
+            });
+        let state = match actual.as_deref() {
+            Some(iface) if iface == expected => RouteState::Installed,
+            Some(_) => RouteState::Conflict,
+            None => RouteState::Missing,
+        };
+        RouteObservation {
+            cidr: cidr.to_string(),
+            expected_interface: expected,
+            actual_interface: actual,
+            state,
+            owned: self.owns_cidr(cidr),
+        }
+    }
+
+    /// Remove only this process's owned route for `cidr`.
+    pub fn remove_cidr_route(&self, cidr: &str) {
+        if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return;
+        }
+        if !self.owns_cidr(cidr) {
+            return;
+        }
+        let interface = self.interface();
+        info!("Removing owned route for {cidr} via {interface}");
+        self.runner.route_del(cidr, &interface);
+        if let Some((ip, mask)) = parse_cidr_to_ip_mask(cidr) {
+            if let Ok(mut added) = self.routes_added.lock() {
+                added.retain(|(a, m)| *a != ip || *m != mask);
+            }
+        }
+    }
 }

@@ -61,11 +61,11 @@ for round in $(seq 1 "$ROUNDS"); do
 
   START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-a.json" \
     --control "http://127.0.0.1:$PORT" \
     --network default \
-    --token "$TOKEN" \
+    --token-stdin \
     --device-name node-a \
     --udp-bind 127.0.0.1:0 \
     --stun "127.0.0.1:$STUN_PORT" \
@@ -80,11 +80,11 @@ for round in $(seq 1 "$ROUNDS"); do
     sleep 0.25
   done
 
-  P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$ROUND_DIR/node-b.json" \
     --control "http://127.0.0.1:$PORT" \
     --network default \
-    --token "$TOKEN" \
+    --token-stdin \
     --device-name node-b \
     --udp-bind 127.0.0.1:0 \
     --stun "127.0.0.1:$STUN_PORT" \

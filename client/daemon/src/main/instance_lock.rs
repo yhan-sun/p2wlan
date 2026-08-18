@@ -44,6 +44,18 @@ impl DaemonInstanceLock {
                     config_path.display()
                 )));
             }
+            #[cfg(windows)]
+            Err(error) => {
+                // Windows maps LockFileEx contention and some sharing
+                // violations to platform-specific errors instead of
+                // WouldBlock. The safe interpretation is still "an owner is
+                // present": fail closed before any session file is touched.
+                return Err(DaemonError::Config(format!(
+                    "another P2WLAN daemon is already running for config {} ({error})",
+                    config_path.display()
+                )));
+            }
+            #[cfg(not(windows))]
             Err(error) => {
                 return Err(DaemonError::Config(format!(
                     "failed to lock daemon instance file {}: {error}",

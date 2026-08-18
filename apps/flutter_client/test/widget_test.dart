@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 import 'package:p2wlan_flutter_client/app/p2wlan_app.dart';
@@ -73,10 +74,15 @@ Future<void> _pumpTestApp(WidgetTester tester) async {
   );
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir!.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await tester.runAsync(() async {
     await settingsStore.load();
-    await settingsStore.updateSettings(const AppSettings(manualMode: true));
+    // Complete onboarding so these shell tests reach the main UI (the
+    // onboarding flow is covered by onboarding_page_test.dart).
+    await settingsStore.updateSettings(
+      const AppSettings(manualMode: true, onboardingCompleted: true),
+    );
   });
   addTearDown(() {
     if (tempDir.existsSync()) {

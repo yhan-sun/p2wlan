@@ -19,15 +19,13 @@ coverage.out
 server/bin/
 server/vendor/
 
-# Node
+# Build artifacts
+# (The React/Vite frontend was removed; `dist/` is still used by the macOS
+#  tray app build, and `node_modules/`/`build/`/`.cache/` are kept defensively.)
 node_modules/
 dist/
 build/
-.vite/
 .cache/
-.turbo/
-desktop/node_modules/
-desktop/dist/
 
 # Coverage/test output
 coverage/

@@ -83,6 +83,11 @@ pub struct ConnectionTimeline {
     /// for per-peer + generation milestones), so a first-milestone can never be
     /// deduplicated across different peers or generations of the same peer.
     first_events: Mutex<HashSet<(String, String)>>,
+    /// Optional forwarder to the diagnostics status event bus. When present,
+    /// every recorded timeline event is also mirrored to `/events`, giving a
+    /// single choke point that covers all timeline emits without touching each
+    /// call site. Absent in tests that do not need the diagnostics surface.
+    status_events: Mutex<Option<Arc<crate::diagnostics::StatusEventBus>>>,
 }
 
 impl ConnectionTimeline {
@@ -106,7 +111,16 @@ impl ConnectionTimeline {
             started_at: Instant::now(),
             events: Mutex::new(VecDeque::new()),
             first_events: Mutex::new(HashSet::new()),
+            status_events: Mutex::new(None),
         })
+    }
+
+    /// Attach the diagnostics status event bus so every timeline record is
+    /// mirrored to `/events`. Called once by the daemon after constructing the
+    /// shared timeline (construction precedes run(), so before any emit).
+    pub fn set_status_event_bus(&self, bus: Arc<crate::diagnostics::StatusEventBus>) {
+        let mut guard = self.status_events.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(bus);
     }
 
     pub fn run_id(&self) -> Option<&str> {
@@ -137,6 +151,9 @@ impl ConnectionTimeline {
             .as_deref()
             .map(parse_detail_fields)
             .unwrap_or_default();
+        // Captured before `fields.peer_id` is moved into the timeline event, so
+        // the diagnostics mirror below can use it without a use-after-move.
+        let mirror_peer_id = fields.peer_id.clone();
         {
             let mut events = self
                 .events
@@ -158,6 +175,17 @@ impl ConnectionTimeline {
             while events.len() > TIMELINE_MAX_EVENTS {
                 events.pop_front();
             }
+        }
+        // Mirror to the diagnostics status event bus (single choke point that
+        // covers all timeline emits). Best-effort: a detached timeline (no bus)
+        // or a transient lock failure must never break the dataplane.
+        if let Some(bus) = self
+            .status_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            bus.record(event, at_ms, path, reason_code, mirror_peer_id.as_deref());
         }
         at_ms
     }

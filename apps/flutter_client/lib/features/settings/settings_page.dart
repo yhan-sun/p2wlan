@@ -12,6 +12,16 @@ import '../../shared/widgets/page_scaffold.dart';
 part 'settings_page/widgets.dart';
 part 'settings_page/actions.dart';
 
+/// Describes credential state for display without ever revealing the token.
+String _describeCredential(AppSettings settings) {
+  if (settings.manualMode) {
+    return 'Manual / offline mode (no control token needed)';
+  }
+  return settings.authToken.trim().isEmpty
+      ? 'No control token stored — sign in to authenticate'
+      : 'Control token stored';
+}
+
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
     super.key,
@@ -50,6 +60,9 @@ class _SettingsPageState extends State<SettingsPage> {
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
   var _restartRequired = false;
+  // Human-readable credential status (e.g. "valid" / "missing"). The raw token
+  // is never shown; this only describes whether one is stored.
+  late String _credentialState;
 
   void _updateState(VoidCallback fn) => setState(fn);
 
@@ -63,7 +76,12 @@ class _SettingsPageState extends State<SettingsPage> {
     _controlServerController = TextEditingController(
       text: settings.controlServer,
     );
-    _authTokenController = TextEditingController(text: settings.authToken);
+    // The token field is intentionally NOT prefilled with the stored token: the
+    // settings UI must not display the credential. It starts empty; leaving it
+    // empty on save (managed mode) preserves the current token, while
+    // re-entering a value updates it. Clearing is a separate logout action.
+    _authTokenController = TextEditingController();
+    _credentialState = _describeCredential(settings);
     _networkIdController = TextEditingController(text: settings.networkId);
     _virtualIpController = TextEditingController(text: settings.virtualIp);
     _deviceNameController = TextEditingController(text: settings.deviceName);
@@ -179,7 +197,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   _SettingsTextField(
                     controller: _authTokenController,
                     label: strings.authToken,
-                    helper: strings.authTokenHelper,
+                    helper: '${strings.authTokenHelper} · $_credentialState',
                     obscureText: true,
                   ),
                   _gap,

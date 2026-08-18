@@ -13,6 +13,7 @@
 //! interface name.  Everything here is a fast, synchronous probe that is safe
 //! to run on the control-plane path; nothing opens a network connection.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 /// Proxy / TUN-capture environment verdict.
@@ -76,7 +77,16 @@ const PROXY_ENV_NAMES: &[&str] = &[
 /// Interface name patterns that indicate a virtual capture device.  The
 /// daemon's own TUN is filtered by the caller via `excluded`.
 const VIRTUAL_CAPTURE_PREFIXES: &[&str] = &[
-    "utun", "tun", "tap", "wg", "ppp", "gpd", "clat", "tailscale", "ipsec", "tunl",
+    "utun",
+    "tun",
+    "tap",
+    "wg",
+    "ppp",
+    "gpd",
+    "clat",
+    "tailscale",
+    "ipsec",
+    "tunl",
 ];
 
 /// Read proxy URLs from the environment.
@@ -101,7 +111,7 @@ pub fn is_virtual_capture_interface(name: &str, excluded: &[String]) -> bool {
 
 /// macOS `scutil --proxy` dictionary output → enabled proxy description.
 ///
-/// ```
+/// ```text
 /// <dictionary> {
 ///   HTTPEnable : 1
 ///   HTTPPort : 7890
@@ -124,18 +134,16 @@ pub fn parse_scutil_proxy_output(output: &str) -> Option<String> {
                 if !proxy.is_empty()
                     && proxy != "0.0.0.0"
                     && proxy != "empty"
-                    && dictionary
-                        .iter()
-                        .any(|(enable_key, enable_value)| {
-                            let enable_key = enable_key.as_str();
-                            enable_value == "1"
-                                && matches!(
-                                    (enable_key, key.as_str()),
-                                    ("HTTPEnable", "HTTPProxy")
-                                        | ("HTTPSEnable", "HTTPSProxy")
-                                        | ("SOCKSEnable", "SOCKSServer")
-                                )
-                        }) =>
+                    && dictionary.iter().any(|(enable_key, enable_value)| {
+                        let enable_key = enable_key.as_str();
+                        enable_value == "1"
+                            && matches!(
+                                (enable_key, key.as_str()),
+                                ("HTTPEnable", "HTTPProxy")
+                                    | ("HTTPSEnable", "HTTPSProxy")
+                                    | ("SOCKSEnable", "SOCKSServer")
+                            )
+                    }) =>
             {
                 let port = dictionary
                     .iter()
@@ -163,7 +171,7 @@ pub fn parse_scutil_proxy_output(output: &str) -> Option<String> {
 
 /// macOS `route -n get default` output → egress interface name.
 ///
-/// ```
+/// ```text
 ///    route to: default
 /// destination: default
 ///        mask: default
@@ -213,7 +221,9 @@ pub fn parse_route_default_interface(output: &str) -> Option<String> {
 }
 
 fn is_candidate_route_iface_token(token: &str) -> bool {
-    token.starts_with("en") || token.starts_with("eth") || token.starts_with("wl")
+    token.starts_with("en")
+        || token.starts_with("eth")
+        || token.starts_with("wl")
         || is_virtual_capture_interface(token, &[])
 }
 
@@ -223,14 +233,22 @@ pub fn default_route_interface() -> Option<String> {
     // Prefer `route -n get default` (macOS/BSD) because it also works for
     // rootless users; fall back to `ip route show default`.
     if cfg!(target_os = "macos") {
-        if let Ok(output) = Command::new("route").args(["-n", "get", "default"]).output() {
-            if let Some(iface) = parse_route_get_interface(&String::from_utf8_lossy(&output.stdout)) {
+        if let Ok(output) = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+        {
+            if let Some(iface) = parse_route_get_interface(&String::from_utf8_lossy(&output.stdout))
+            {
                 return Some(iface);
             }
         }
     }
-    if let Ok(output) = Command::new("ip").args(["route", "show", "default"]).output() {
-        if let Some(iface) = parse_route_default_interface(&String::from_utf8_lossy(&output.stdout)) {
+    if let Ok(output) = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+    {
+        if let Some(iface) = parse_route_default_interface(&String::from_utf8_lossy(&output.stdout))
+        {
             return Some(iface);
         }
     }
@@ -279,7 +297,7 @@ pub fn detect_proxy_environment(excluded: &[String]) -> ProxyEnvironment {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-use std::sync::MutexGuard;
+    use std::sync::MutexGuard;
 
     // Tests mutate process environment variables; serialize them so parallel
     // runs cannot observe each other's leftovers.
@@ -288,26 +306,47 @@ use std::sync::MutexGuard;
         ENV_LOCK.lock().unwrap()
     }
 
+    fn clear_proxy_environment() -> Vec<(&'static str, Option<String>)> {
+        let previous = PROXY_ENV_NAMES
+            .iter()
+            .copied()
+            .map(|name| (name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in PROXY_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        previous
+    }
+
+    fn restore_proxy_environment(previous: Vec<(&'static str, Option<String>)>) {
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
     #[test]
     fn env_proxies_collects_configured_variables() {
         let _guard = env_guard();
+        let previous = clear_proxy_environment();
         std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7890");
         std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:7891");
         std::env::set_var("HTTPS_PROXY", "");
         let proxies = env_proxies();
         assert!(proxies.contains(&"http://127.0.0.1:7890".to_string()));
         assert!(proxies.contains(&"socks5://127.0.0.1:7891".to_string()));
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("ALL_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
+        restore_proxy_environment(previous);
     }
 
     #[test]
     fn env_proxies_ignores_none_sentinel() {
         let _guard = env_guard();
+        let previous = clear_proxy_environment();
         std::env::set_var("HTTPS_PROXY", "none");
         assert!(env_proxies().is_empty());
-        std::env::remove_var("HTTPS_PROXY");
+        restore_proxy_environment(previous);
     }
 
     #[test]
@@ -342,16 +381,16 @@ destination: default
     gateway: 192.168.1.1
   interface: utun4
 ";
-        assert_eq!(
-            parse_route_get_interface(output).as_deref(),
-            Some("utun4")
-        );
+        assert_eq!(parse_route_get_interface(output).as_deref(), Some("utun4"));
     }
 
     #[test]
     fn ip_route_default_parses_linux_output() {
         let output = "default via 192.168.1.1 dev en0 proto dhcp metric 100\n";
-        assert_eq!(parse_route_default_interface(output).as_deref(), Some("en0"));
+        assert_eq!(
+            parse_route_default_interface(output).as_deref(),
+            Some("en0")
+        );
         let tun_output = "default via 10.0.0.1 dev tun0 proto static\n";
         assert_eq!(
             parse_route_default_interface(tun_output).as_deref(),
@@ -368,15 +407,24 @@ Destination        Gateway            Flags        Netif Expire
 default            192.168.1.1        UGScg            en0
 default            10.0.0.1           UGScg           utun3
 ";
-        assert_eq!(parse_route_default_interface(output).as_deref(), Some("en0"));
+        assert_eq!(
+            parse_route_default_interface(output).as_deref(),
+            Some("en0")
+        );
     }
 
     #[test]
     fn virtual_capture_interface_excludes_self_tun() {
         let none: Vec<String> = vec![];
         assert!(is_virtual_capture_interface("utun4", &none));
-        assert!(is_virtual_capture_interface("tun0", &["p2wlan0".to_string()]));
-        assert!(!is_virtual_capture_interface("utun4", &["utun4".to_string()]));
+        assert!(is_virtual_capture_interface(
+            "tun0",
+            &["p2wlan0".to_string()]
+        ));
+        assert!(!is_virtual_capture_interface(
+            "utun4",
+            &["utun4".to_string()]
+        ));
         assert!(!is_virtual_capture_interface("en0", &none));
         assert!(!is_virtual_capture_interface("", &none));
     }

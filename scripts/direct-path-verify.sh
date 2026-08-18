@@ -42,8 +42,9 @@ echo "[direct-verify] output: $OUT_DIR"
 
 mkdir -p "$OUT_DIR"
 require_cmd curl
+source "$ROOT_DIR/scripts/diagnostics-auth.sh"
 
-curl -fsS "$DIAGNOSTICS_URL" -o "$OUT_DIR/status.json"
+p2wlan_diagnostics_curl -fsS "$DIAGNOSTICS_URL" -o "$OUT_DIR/status.json"
 
 P2WLAN_BIN=$(resolve_p2wlan_bin)
 if [[ -n "$P2WLAN_BIN" && -x "$P2WLAN_BIN" ]]; then

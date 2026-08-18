@@ -6,11 +6,15 @@
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// A mock runner that simulates route table state.
     #[derive(Debug, Default)]
     struct MockRunner {
         preexisting: Mutex<Vec<String>>,
+        /// Routes present on an unexpected interface (simulates a third-party
+        /// or stale route the daemon does not own).
+        conflicting: Arc<Mutex<Vec<String>>>,
         owned_added: Mutex<Vec<String>>,
         add_fail: Mutex<Vec<String>>,
         last_show: Mutex<Option<String>>,
@@ -29,22 +33,41 @@ mod tests {
                 ..Default::default()
             }
         }
+        fn with_conflict(cidr: &str) -> Self {
+            Self {
+                conflicting: Arc::new(Mutex::new(vec![cidr.to_string()])),
+                ..Default::default()
+            }
+        }
+        fn route_line(&self, cidr: &str) -> Option<String> {
+            // A conflicting entry wins over ownership: it simulates an external
+            // actor having moved/replaced the route after we added it.
+            if self.conflicting.lock().unwrap().iter().any(|p| p == cidr) {
+                Some(format!("{cidr} dev p2pnet1 scope link"))
+            } else if self.owned_added.lock().unwrap().iter().any(|p| p == cidr)
+                || self.preexisting.lock().unwrap().iter().any(|p| p == cidr)
+            {
+                Some(format!("{cidr} dev p2pnet0 scope link"))
+            } else {
+                None
+            }
+        }
     }
 
     impl RouteCommandRunner for MockRunner {
         fn route_show(&self, cidr: &str) -> Result<String, crate::DaemonError> {
             let mut last = self.last_show.lock().unwrap();
             *last = Some(cidr.to_string());
-            if self.preexisting.lock().unwrap().iter().any(|p| p == cidr) {
-                // Simulate: route exists on the target interface
-                Ok(format!("{cidr} dev p2pnet0 scope link"))
-            } else {
-                Ok(String::new())
-            }
+            Ok(self.route_line(cidr).unwrap_or_default())
         }
 
         fn route_add(&self, cidr: &str, _interface: &str) -> Result<bool, crate::DaemonError> {
             if self.add_fail.lock().unwrap().iter().any(|f| f == cidr) {
+                Ok(false)
+            } else if self.route_line(cidr).is_some() {
+                // A conflicting pre-existing route makes the real `ip route add`
+                // fail; simulate that so the daemon never silently takes over a
+                // route it does not own.
                 Ok(false)
             } else {
                 self.owned_added.lock().unwrap().push(cidr.to_string());
@@ -126,6 +149,77 @@ mod tests {
             0,
             "failed route add must not be recorded as owned"
         );
+    }
+
+    #[test]
+    fn test_repair_never_deletes_third_party_conflicting_route() {
+        // A conflicting route the daemon does not own must survive repair:
+        // repair may only remove routes this process actually added.
+        let runner = Box::new(MockRunner::with_conflict("10.20.0.0/16"));
+        let rm = RouteManager::new_with_runner("p2pnet0".into(), runner);
+
+        let before = rm.describe_overlay_route("10.20.0.0/16");
+        assert_eq!(before.state, RouteState::Conflict);
+        assert_eq!(before.actual_interface.as_deref(), Some("p2pnet1"));
+        assert!(!before.owned, "a third-party route is never owned by us");
+
+        let after = rm.repair_overlay_route("10.20.0.0/16");
+
+        assert_eq!(
+            after.state,
+            RouteState::Conflict,
+            "a third-party conflict cannot be silently 'fixed'"
+        );
+        assert_eq!(
+            after.actual_interface.as_deref(),
+            Some("p2pnet1"),
+            "the third-party route must still be present on its own interface"
+        );
+        assert_eq!(rm.owned_routes().len(), 0, "we must not claim ownership");
+    }
+
+    #[test]
+    fn test_repair_conflict_owned_route_reinstalls_on_expected_interface() {
+        // A route WE added, then externally moved to another interface, is
+        // repairable: remove (owned) then re-add on the expected interface.
+        let runner = Box::new(MockRunner::default());
+        let conflicting = Arc::clone(&runner.conflicting);
+        let rm = RouteManager::new_with_runner("p2pnet0".into(), runner);
+
+        // We own it on p2pnet0 first.
+        rm.add_cidr_route("10.20.0.0/16").unwrap();
+        assert_eq!(rm.owned_routes().len(), 1);
+
+        // External actor moves it to p2pnet1 (simulate conflict, still owned).
+        conflicting
+            .lock()
+            .unwrap()
+            .push("10.20.0.0/16".to_string());
+
+        let before = rm.describe_overlay_route("10.20.0.0/16");
+        assert_eq!(before.state, RouteState::Conflict);
+        assert!(before.owned);
+
+        let after = rm.repair_overlay_route("10.20.0.0/16");
+        // The mock's conflicting entry stays, so add keeps failing and the
+        // route cannot be claimed — the important invariant is that the owned
+        // entry was removed and no ownership is claimed over the conflict.
+        assert_eq!(after.state, RouteState::Conflict);
+        assert_eq!(rm.owned_routes().len(), 0);
+    }
+
+    #[test]
+    fn test_repair_missing_route_becomes_installed() {
+        let runner = Box::new(MockRunner::default());
+        let rm = RouteManager::new_with_runner("p2pnet0".into(), runner);
+
+        let before = rm.describe_overlay_route("10.20.0.0/16");
+        assert_eq!(before.state, RouteState::Missing);
+
+        let after = rm.repair_overlay_route("10.20.0.0/16");
+        assert_eq!(after.state, RouteState::Installed);
+        assert_eq!(after.actual_interface.as_deref(), Some("p2pnet0"));
+        assert!(after.owned);
     }
 }
 

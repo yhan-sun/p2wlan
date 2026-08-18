@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/control_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
@@ -29,7 +30,10 @@ void main() {
 }
 ''');
 
-    final store = SettingsStore(settingsFile: settingsFile);
+    final store = SettingsStore(
+      settingsFile: settingsFile,
+      tokenRepository: InMemorySecureTokenRepository(),
+    );
     await store.load();
     addTearDown(store.dispose);
 
@@ -55,7 +59,10 @@ void main() {
 }
 ''');
 
-    final store = SettingsStore(settingsFile: settingsFile);
+    final store = SettingsStore(
+      settingsFile: settingsFile,
+      tokenRepository: InMemorySecureTokenRepository(),
+    );
     await store.load();
     addTearDown(store.dispose);
 

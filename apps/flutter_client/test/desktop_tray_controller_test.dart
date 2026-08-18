@@ -7,6 +7,7 @@ import 'package:p2wlan_flutter_client/app/desktop_tray_controller.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 
@@ -275,6 +276,7 @@ Future<_Stores> _makeStores({
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_tray_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await settingsStore.load();
   final statusStore = StatusStore(
@@ -336,6 +338,35 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
       uploadBytes: 0,
     );
   }
+
+  @override
+  Future<EventsResponse> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    Duration timeout = const Duration(seconds: 30),
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<String> fetchLogTail(
+    String diagnosticsUrl, {
+    int lines = 120,
+    int maxBytes = 262144,
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
 
   @override
   void close() {}

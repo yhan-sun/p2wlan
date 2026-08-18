@@ -9,8 +9,8 @@ use super::*;
             control: control.map(ToString::to_string),
             network: network.map(ToString::to_string),
             status: false,
-            token: None,
             token_file: None,
+            token_stdin: false,
             interface: None,
             address: None,
             manual: false,
@@ -120,8 +120,8 @@ use super::*;
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: None,
             token_file: None,
+            token_stdin: false,
             interface: None,
             address: None,
             manual: false,
@@ -189,8 +189,8 @@ use super::*;
             control: Some("https://control.p2wlan.io".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: None,
             token_file: None,
+            token_stdin: false,
             interface: None,
             address: None,
             manual: false,
@@ -325,8 +325,8 @@ use super::*;
             control: Some("http://127.0.0.1".to_string()),
             network: Some("default".to_string()),
             status: false,
-            token: Some("test-token".to_string()),
             token_file: None,
+            token_stdin: false,
             interface: None,
             address: None,
             manual: false,
@@ -370,7 +370,6 @@ use super::*;
         apply_cli_overrides(&mut config, &cli);
 
         assert!(!config.network.manual);
-        assert_eq!(config.control.auth_token, "test-token");
     }
 
     #[test]
@@ -446,4 +445,159 @@ use super::*;
         drop(first);
         assert!(DaemonInstanceLock::acquire(&config_path).is_ok());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn diagnostics_test_config(directory: &std::path::Path) -> Config {
+        let mut config = Config::generate_default("http://127.0.0.1:8080", "test")
+            .expect("default config");
+        config.diagnostics.enabled = true;
+        config.diagnostics.log_path = Some(directory.join("p2wlan-daemon.log"));
+        config
+    }
+
+    #[test]
+    fn diagnostics_auth_is_not_touched_when_second_instance_loses_lock() {
+        let directory = tempfile_directory("diagnostics-race");
+        let config_path = directory.join("p2wlan-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+
+        let first_lock = DaemonInstanceLock::acquire(&config_path).unwrap();
+        let mut first_config = diagnostics_test_config(&directory);
+        let first_guard = DiagnosticsAuthGuard::prepare(&mut first_config, &config_path)
+            .unwrap()
+            .expect("diagnostics enabled");
+        let auth_path = first_guard.path.clone();
+        let token_a = std::fs::read_to_string(&auth_path).unwrap();
+
+        let second_lock = DaemonInstanceLock::acquire(&config_path);
+        assert!(second_lock.is_err(), "the second daemon must lose the lock");
+        assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), token_a);
+
+        drop(first_guard);
+        assert!(!auth_path.exists(), "the owner guard removes its session file");
+        drop(first_lock);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn diagnostics_auth_guard_cleans_up_after_normal_error_and_unwind_paths() {
+        let directory = tempfile_directory("diagnostics-cleanup");
+        let config_path = directory.join("p2wlan-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let lock = DaemonInstanceLock::acquire(&config_path).unwrap();
+
+        let mut config = diagnostics_test_config(&directory);
+        let path = {
+            let guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path)
+                .unwrap()
+                .expect("diagnostics enabled");
+            let path = guard.path.clone();
+            drop(guard);
+            path
+        };
+        assert!(!path.exists(), "normal return must remove the auth file");
+
+        let mut config = diagnostics_test_config(&directory);
+        let (error_result, path) = diagnostics_scope_returns_error(&mut config, &config_path);
+        assert!(error_result.is_err());
+        assert!(!path.exists(), "error-path guard drop must remove the auth file");
+
+        let mut config = diagnostics_test_config(&directory);
+        let path = directory.join("p2wlan-daemon.diag-auth");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path)
+                .unwrap()
+                .expect("diagnostics enabled");
+            assert!(path.exists());
+            panic!("controlled diagnostics panic");
+        }));
+        assert!(unwind.is_err());
+        assert!(!path.exists(), "unwind must drop the auth guard");
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn diagnostics_auth_creation_fails_closed_when_runtime_directory_is_invalid() {
+        let directory = tempfile_directory("diagnostics-fail-closed");
+        let invalid_parent = directory.join("not-a-directory");
+        std::fs::write(&invalid_parent, b"file").unwrap();
+        let config_path = directory.join("p2wlan-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+
+        let mut config = diagnostics_test_config(&invalid_parent);
+        let result = DiagnosticsAuthGuard::prepare(&mut config, &config_path);
+        assert!(result.is_err());
+        assert!(config.diagnostics.auth_token.is_none());
+        assert!(config.diagnostics.auth_token_path.is_none());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn one_time_launch_token_file_is_read_once_and_deleted() {
+        let directory = tempfile_directory("launch-token");
+        let path = directory.join("p2wlan-launch-test.token");
+        std::fs::write(&path, b"launch-token\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        let token = read_launch_token_file(&path).unwrap();
+        assert_eq!(token, "launch-token");
+        assert!(!path.exists(), "daemon must not retain the launch token file");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn token_transport_cli_has_no_plaintext_token_argument() {
+        let parsed = Cli::try_parse_from([
+            "p2wlan-daemon",
+            "--managed",
+            "--token-stdin",
+        ])
+        .expect("--token-stdin should be accepted");
+        assert!(parsed.token_stdin);
+        assert!(
+            Cli::try_parse_from([
+                "p2wlan-daemon",
+                "--managed",
+                "--token-stdin",
+                "--token-file",
+                "launch.token",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["p2wlan-daemon", "--managed", "--token", "secret"]).is_err());
+    }
+
+    fn tempfile_directory(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "p2wlan-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn diagnostics_scope_returns_error(
+        config: &mut Config,
+        config_path: &std::path::Path,
+    ) -> (p2pnet_daemon::Result<()>, std::path::PathBuf) {
+        let guard = DiagnosticsAuthGuard::prepare(config, config_path)
+            .unwrap()
+            .expect("diagnostics enabled");
+        let path = guard.path.clone();
+        let result = Err(DaemonError::Config("controlled runtime error".to_string()));
+        (result, path)
     }

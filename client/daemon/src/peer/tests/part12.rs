@@ -94,9 +94,9 @@ async fn easy_nat_activates_socket_pool_for_multi_socket_hard_peer() {
     manager.update_nat_profile(stable_profile.clone()).await;
 
     let air_pool = [
-        "air.example.com:10001".parse::<SocketAddr>().unwrap(),
-        "air.example.com:10002".parse::<SocketAddr>().unwrap(),
-        "air.example.com:10003".parse::<SocketAddr>().unwrap(),
+        "8.8.8.8:10001".parse::<SocketAddr>().unwrap(),
+        "8.8.8.8:10002".parse::<SocketAddr>().unwrap(),
+        "8.8.8.8:10003".parse::<SocketAddr>().unwrap(),
     ];
     let candidates = air_pool
         .iter()

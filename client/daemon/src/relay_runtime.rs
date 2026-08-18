@@ -791,7 +791,7 @@ impl RelaySupervisor {
                         relay.connect_latency_ms()
                     )),
                 );
-retry_delay = Duration::from_millis(100);
+                retry_delay = Duration::from_millis(100);
 
                 let endpoint = relay.endpoint().to_string();
                 // The proactive ticket renewal runs make-before-break: a

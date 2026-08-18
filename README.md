@@ -151,7 +151,7 @@ flowchart LR
 
 | 层级 | 实现 | 主要职责 |
 | --- | --- | --- |
-| 客户端界面 | Flutter 原生客户端 / React 网页控制台 | 设备状态、诊断和控制面操作 |
+| 客户端界面 | Flutter 原生客户端（唯一 GUI） | 设备状态、诊断和控制面操作。React 网页控制台已移除，见 `docs/adr/0004`。 |
 | 本地守护进程 | Rust | 虚拟网卡、加密会话、Peer 状态、NAT 探测、中继回退 |
 | 控制面 | Go, SQLite | 账号、设备注册、虚拟 IP 分配、凭据状态、中继票据、信令 |
 | 中继服务 | Go | 密文转发、票据校验、撤销信息同步 |
@@ -278,15 +278,13 @@ RELAY_AUTH_FAILURE_WINDOW="1m" \
 
 ## 从源码构建
 
-需要 Rust stable、Go 1.22+、Node.js 20+、pnpm 10+ 和 Flutter stable。Linux Flutter 桌面构建还需要 GTK 开发依赖。
+需要 Rust stable、Go 1.22+ 和 Flutter stable。Linux Flutter 桌面构建还需要 GTK 开发依赖。
 
 ```bash
 git clone https://github.com/yhan-sun/p2wlan.git
 cd p2wlan
-pnpm install --frozen-lockfile
 
 cargo build -p p2wlan-daemon
-pnpm run dev
 
 cd apps/flutter_client
 flutter pub get
@@ -309,8 +307,12 @@ go vet ./...
 go test ./... -count=1
 cd ..
 
-pnpm audit --audit-level high
-pnpm run build
+cd apps/flutter_client
+dart format --set-exit-if-changed .
+flutter analyze
+flutter test
+cd ..
+
 ./scripts/control-smoke.sh
 ```
 
@@ -324,10 +326,9 @@ sudo -E ./scripts/mac-remote-smoke.sh --tun
 ## 仓库结构
 
 ```text
-client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、CLI
+client/       Rust 网络核心：TUN、加密会话、NAT、中继、daemon、CLI、tray
 server/       Go 控制面、认证、SQLite、信令、中继服务、撤销源
-src/          React 网页控制台
-apps/flutter_client/ Flutter 诊断客户端：Android、iOS、macOS、Windows、Linux
+apps/flutter_client/ Flutter 原生客户端（唯一 GUI）：Android、iOS、macOS、Windows、Linux
 scripts/      构建、安装、打包、直连验证和跨平台 smoke 脚本
 fuzz/         协议与解析器模糊测试
 proto/        Protobuf 协议草案

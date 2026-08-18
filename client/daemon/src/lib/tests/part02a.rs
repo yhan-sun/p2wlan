@@ -64,7 +64,7 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
 #[test]
 fn canonical_network_identity_is_computed_before_air_sized_signal_cap() {
     let physical_host = "192.168.0.239:56255".to_string();
-    let shared_lan_host = "tailscale.example.com:56255".to_string();
+    let shared_lan_host = "100.64.0.10:56255".to_string();
     let ten_twenty_lan_host = "10.20.0.13:56255".to_string();
     let mut candidates = vec![
         physical_host.clone(),
@@ -100,7 +100,7 @@ fn canonical_network_identity_is_computed_before_air_sized_signal_cap() {
     assert!(candidates.contains(&shared_lan_host));
     assert!(candidates.contains(&ten_twenty_lan_host));
     assert!(identity.contains(&"physical-host-ip:192.168.0.239".to_string()));
-    assert!(identity.contains(&"physical-host-ip:tailscale.example.com".to_string()));
+    assert!(identity.contains(&"physical-host-ip:100.64.0.10".to_string()));
     assert!(identity.contains(&"physical-host-ip:10.20.0.13".to_string()));
     assert!(identity.contains(&"public-ip:93.184.216.34".to_string()));
     assert_eq!(sources.len(), candidates.len());

@@ -1,0 +1,9 @@
+{
+  "contractVersion": 1,
+  "state": "runtimeVerificationRequired",
+  "canCreateTun": null,
+  "canModifyRoutes": true,
+  "elevationSupported": true,
+  "reasonCode": "tun_runtime_verification",
+  "message": "TUN creation requires runtime verification."
+}

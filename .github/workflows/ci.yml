@@ -33,6 +33,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Rust Tests
         run: cargo test --workspace --all-targets
+      - name: Linux route gate tests
+        run: "cargo test -p p2wlan-daemon --lib route::tests::"
       - name: Rust Linux Target Cross-Compile Check
         run: |
           rustup target add x86_64-unknown-linux-gnu
@@ -73,16 +75,10 @@ jobs:
           components: rustfmt, clippy
       - name: Rust Clippy (Windows)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust Fmt Check (Windows)
+        run: cargo fmt --all -- --check
       - name: Rust Tests (Windows)
-        # The daemon lib tests cover the platform-specific directory-fsync
-        # path (incarnation persistence) and the full signal/lease flow on
-        # Windows; desktop/TUN crates are excluded because Windows builds of
-        # the TUN dataplane need admin privileges for packet tests.
-        run: |
-          cargo test -p p2wlan-daemon --lib
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p p2pnet-nat --lib
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: cargo test --workspace
 
   go:
     name: Go Check
@@ -102,23 +98,31 @@ jobs:
           cd server
           go test ./... -count=1
 
-  frontend:
-    name: Frontend Check
+  repository-policy:
+    name: React absence and security scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 11.15.1
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: 'pnpm'
-      - name: Install Dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Audit
-        run: pnpm audit --audit-level high
-      - name: Build
-        run: pnpm run build
+      - name: Assert web GUI dependencies are absent
+        run: |
+          test ! -e package.json
+          test ! -e pnpm-lock.yaml
+          test ! -e pnpm-workspace.yaml
+          test ! -e vite.config.ts
+      - name: Scan for deleted React/Vite origins
+        run: |
+          legacy_port=327
+          if git grep -nE "react-dom|from [\"']react[\"']|@vitejs|vite/client|pnpm run|localhost:14${legacy_port}" -- . ':!docs/**' ':!*.md' ':!.github/workflows/**'; then
+            echo "deleted React/Vite/legacy-origin reference found" >&2
+            exit 1
+          fi
+      - name: Scan production credential transport
+        run: |
+          if git grep -nE 'localStorage|sessionStorage|--token([ =]|$)|p2wlan-daemon\.token' -- \
+            'apps/flutter_client/lib/**' \
+            'client/**' \
+            'scripts/**' \
+            ':!scripts/dual-end/mini-air-smoke.sh'; then
+            echo "unsafe production credential transport found" >&2
+            exit 1
+          fi

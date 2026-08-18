@@ -1,0 +1,25 @@
+{
+  "contractVersion": 1,
+  "revision": 3,
+  "events": [
+    {
+      "seq": 1,
+      "event": "control_connected",
+      "at_ms": 1500
+    },
+    {
+      "seq": 2,
+      "event": "peer_state_changed",
+      "at_ms": 2000,
+      "path": "direct",
+      "reason_code": "path_confirmed",
+      "peer_id": "node-b"
+    },
+    {
+      "seq": 3,
+      "event": "relay_transport_connected",
+      "at_ms": 2500,
+      "path": "relay"
+    }
+  ]
+}

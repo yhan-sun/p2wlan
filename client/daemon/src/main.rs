@@ -15,6 +15,7 @@ const DEFAULT_NETWORK_ID: &str = "default";
 include!("main/cli.rs");
 include!("main/validation.rs");
 include!("main/instance_lock.rs");
+include!("main/diagnostics_auth.rs");
 include!("main/runtime.rs");
 include!("main/overrides.rs");
 

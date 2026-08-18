@@ -28,15 +28,17 @@ struct Cli {
     #[arg(long)]
     status: bool,
 
-    /// Override auth token
-    #[arg(long, conflicts_with = "token-file")]
-    token: Option<String>,
-
     /// Read the auth token from a permission-protected file instead of
     /// exposing it in the daemon command line.  Intended for service
-    /// managers and the audited dual-end harness.
-    #[arg(long, name = "token-file", conflicts_with = "token")]
+    /// managers, the Flutter client, and the audited dual-end harness.
+    /// This is the ONLY supported way to supply a control-plane token.
+    #[arg(long, name = "token-file")]
     token_file: Option<PathBuf>,
+
+    /// Read one control-plane token from stdin, then close stdin. The token is
+    /// bounded, never appears in process arguments, and is not persisted.
+    #[arg(long, conflicts_with = "token-file")]
+    token_stdin: bool,
 
     /// Override interface name
     #[arg(long)]

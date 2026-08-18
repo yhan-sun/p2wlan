@@ -10,6 +10,8 @@ arboard = { version = "3.6.1", default-features = false }
 p2wlan-desktop-host = { path = "../desktop-host" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 tao = "0.35.3"
 tray-icon = { version = "0.24.1", default-features = false }
 

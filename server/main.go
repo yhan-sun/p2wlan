@@ -150,8 +150,11 @@ func main() {
 	log.Println("Server stopped")
 }
 
-// withCORS allows the local development UI to call the control API.
-// Extra origins can be supplied with CONTROL_ALLOWED_ORIGINS as a comma list.
+// withCORS allows explicitly configured browser origins to call the control
+// API. The browser console was deleted and Flutter Web is out of scope, so
+// there is no default browser origin: only origins listed in
+// CONTROL_ALLOWED_ORIGINS (a comma list) are honored. The daemon and the
+// Flutter/tray/CLI clients are native and never send an Origin header.
 func withCORS(next http.Handler) http.Handler {
 	allowed := parseAllowedOrigins(getEnv("CONTROL_ALLOWED_ORIGINS", ""))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -184,11 +187,6 @@ func parseAllowedOrigins(raw string) map[string]struct{} {
 
 func isAllowedOrigin(origin string, extra map[string]struct{}) bool {
 	if _, ok := extra[origin]; ok {
-		return true
-	}
-	if strings.HasPrefix(origin, "http://localhost:") ||
-		strings.HasPrefix(origin, "http://127.0.0.1:") ||
-		strings.HasPrefix(origin, "http://[::1]:") {
 		return true
 	}
 	return false

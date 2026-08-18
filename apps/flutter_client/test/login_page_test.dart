@@ -7,6 +7,7 @@ import 'package:p2wlan_flutter_client/app/app_theme.dart';
 import 'package:p2wlan_flutter_client/app/app_tokens.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
@@ -58,6 +59,7 @@ Future<_Stores> _makeStores() async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_login_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await settingsStore.load();
   final api = _OfflineDiagnosticsApi();
@@ -104,6 +106,35 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
   }) {
     throw const DiagnosticsApiException('offline');
   }
+
+  @override
+  Future<EventsResponse> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    Duration timeout = const Duration(seconds: 30),
+  }) => throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) => throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<String> fetchLogTail(
+    String diagnosticsUrl, {
+    int lines = 120,
+    int maxBytes = 262144,
+  }) => throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) =>
+      throw const DiagnosticsApiException('offline');
+
+  @override
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) =>
+      throw const DiagnosticsApiException('offline');
 
   @override
   void close() {}

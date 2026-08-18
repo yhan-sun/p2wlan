@@ -1,0 +1,119 @@
+{
+  "contractVersion": 1,
+  "version": "0.1.118",
+  "process_id": 44413,
+  "node_id": "node-a",
+  "virtual_ip": "10.20.0.7",
+  "network_id": "net1",
+  "network_generation": 0,
+  "uptime_ms": 2,
+  "revision": 1,
+  "ready_phase": "connected_manual",
+  "protocol": {
+    "data_plane": "wireguard_like_noise",
+    "handshake": "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s",
+    "key_exchange": "X25519",
+    "aead": "ChaCha20-Poly1305",
+    "hash_kdf": "BLAKE2s/HKDF-BLAKE2s",
+    "device_identity": "Ed25519 challenge-response",
+    "relay_transport": "DERP-like TCP/TLS ciphertext forwarding",
+    "wireguard_interop": false,
+    "turn_compatible": false,
+    "security_audit": "not_completed"
+  },
+  "mtu": {
+    "configured_mtu": 1420,
+    "profile": "default",
+    "ipv6_safe_min_mtu": 1280,
+    "relay_safe_mtu": 1380,
+    "wireguard_style_mtu": 1420,
+    "common_ethernet_mtu": 1500,
+    "automatic_pmtu": false,
+    "relay_path_observed": false,
+    "suggested_safe_mtu": null,
+    "risks": []
+  },
+  "udp_local_addr": null,
+  "udp_socket_count": 0,
+  "udp_socket_pool_active": false,
+  "udp_socket_pool": [],
+  "local_candidates": [],
+  "candidate_snapshot_version": null,
+  "candidate_snapshot_hash": null,
+  "nat_profile": null,
+  "gateway_mapping": {
+    "enabled": true,
+    "local_endpoint": null,
+    "candidate_endpoint": null,
+    "candidate_source": null,
+    "lease_seconds": 0,
+    "renewal_remaining_ms": null,
+    "next_discovery_remaining_ms": null,
+    "upnp": {
+      "status": "idle",
+      "last_error": null,
+      "attempts": 0,
+      "last_attempt_age_ms": null,
+      "last_success_age_ms": null
+    },
+    "pcp": {
+      "status": "idle",
+      "last_error": null,
+      "attempts": 0,
+      "last_attempt_age_ms": null,
+      "last_success_age_ms": null
+    },
+    "nat_pmp": {
+      "status": "idle",
+      "last_error": null,
+      "attempts": 0,
+      "last_attempt_age_ms": null,
+      "last_success_age_ms": null
+    }
+  },
+  "relay_servers": [],
+  "relay_connected": false,
+  "relay_selection": {
+    "selected_region": null,
+    "selected_endpoint": null,
+    "selected_connect_latency_ms": null,
+    "selected_last_pong_at_unix_ms": null,
+    "selected_last_pong_age_ms": null,
+    "selected_last_pong_rtt_ms": null,
+    "selected_rtt_ewma_ms": null,
+    "selected_jitter_ms": null,
+    "selected_pong_count": 0,
+    "selected_error_count": 0,
+    "candidates": [],
+    "last_error": null,
+    "last_error_code": null
+  },
+  "control_proxy_mode": "direct",
+  "control_proxy_consults_env": false,
+  "connection_timeline": {
+    "correlation_id": "node-a-boot0",
+    "events": []
+  },
+  "traversal_history": {
+    "sources": []
+  },
+  "peers": [],
+  "stats": {
+    "total_peers": 0,
+    "direct_connections": 0,
+    "relay_connections": 0,
+    "total_bytes_sent": 0,
+    "total_bytes_received": 0,
+    "outbound_drops": {},
+    "outbound_send_failures": {},
+    "outbound_loss_events": []
+  },
+  "health": {
+    "status": "healthy",
+    "reason": null,
+    "critical_tasks": [],
+    "control_connected": false,
+    "last_control_success_secs_ago": null,
+    "reauth_required": false
+  }
+}

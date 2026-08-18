@@ -141,10 +141,7 @@ fn birthday_probe_endpoint(base: SocketAddr, delta: i32) -> Option<SocketAddr> {
 
 /// Wrapped port neighbor of an advertised base for the fast-prefix
 /// neighborhood merge.  Deduplicated by the caller.
-pub(super) fn advertised_neighborhood_endpoint(
-    base: SocketAddr,
-    delta: i32,
-) -> Option<SocketAddr> {
+pub(super) fn advertised_neighborhood_endpoint(base: SocketAddr, delta: i32) -> Option<SocketAddr> {
     birthday_probe_endpoint(base, delta)
 }
 

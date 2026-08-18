@@ -3,6 +3,7 @@ part of '../dashboard_page.dart';
 class _ConnectionBanner extends StatelessWidget {
   const _ConnectionBanner({
     required this.snapshot,
+    required this.canControlLocalDaemon,
     required this.daemonReachable,
     required this.healthReachable,
     required this.statusReachable,
@@ -21,6 +22,11 @@ class _ConnectionBanner extends StatelessWidget {
   });
 
   final DiagnosticsSnapshot? snapshot;
+
+  /// Whether this platform may start/stop the local daemon. When false
+  /// (mobile/web), the daemon controls are hidden entirely instead of shown
+  /// and failing — the concrete P0-07 capability gate.
+  final bool canControlLocalDaemon;
   final bool daemonReachable;
   final bool healthReachable;
   final bool statusReachable;
@@ -63,6 +69,7 @@ class _ConnectionBanner extends StatelessWidget {
           _DashboardActions(
             daemonAvailable: daemonAvailable,
             daemonBusy: daemonBusy,
+            canControlLocalDaemon: canControlLocalDaemon,
             refreshing: refreshing,
             onStartDaemon: () => _handleStart(context),
             onStopDaemon: onStopDaemon,

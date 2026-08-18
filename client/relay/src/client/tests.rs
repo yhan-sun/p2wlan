@@ -420,6 +420,10 @@ async fn relay_disconnect_reason_is_classified() {
             .await
             .unwrap();
         stream.flush().await.unwrap();
+        // Windows can otherwise deliver the reset before the client has
+        // consumed the registration frame, making the setup itself fail
+        // instead of exercising disconnect classification.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         force_rst(&stream);
         drop(stream);
     })

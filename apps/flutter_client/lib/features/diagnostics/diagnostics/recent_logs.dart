@@ -63,8 +63,8 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                 children: [
                   Text(
                     strings.isZh
-                        ? '显示最后 ${preview.shownLineCount}/${preview.lineCount} 行'
-                        : 'Showing last ${preview.shownLineCount}/${preview.lineCount} lines',
+                        ? '显示最后 ${preview.shownLineCount} 行（有界尾读，内存与文件大小无关）'
+                        : 'Showing last ${preview.shownLineCount} lines (bounded tail; memory independent of file size)',
                     style: const TextStyle(
                       fontSize: 12,
                       color: AppTokens.colorTextSecondary,

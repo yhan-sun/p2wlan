@@ -27,6 +27,7 @@ use crate::udp::{UdpSocketPoolMemberDiagnostics, UdpTransport};
 
 include!("diagnostics/types.rs");
 include!("diagnostics/mtu.rs");
+include!("diagnostics/event_bus.rs");
 include!("diagnostics/speedtest.rs");
 include!("diagnostics/server.rs");
 include!("diagnostics/snapshot.rs");

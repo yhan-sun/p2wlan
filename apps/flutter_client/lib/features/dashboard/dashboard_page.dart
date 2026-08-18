@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -44,6 +45,8 @@ class DashboardPage extends StatelessWidget {
           children: [
             _ConnectionBanner(
               snapshot: snapshot,
+              canControlLocalDaemon:
+                  PlatformCapabilities.current().canControlLocalDaemon,
               daemonReachable: statusStore.daemonReachable,
               healthReachable: statusStore.healthReachable,
               statusReachable: statusStore.statusReachable,

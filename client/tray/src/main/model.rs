@@ -123,4 +123,16 @@ impl DaemonState {
             tooltip: "p2wlan：未启动".to_string(),
         }
     }
+
+    fn session_error(message: String) -> Self {
+        Self {
+            running: true,
+            busy: false,
+            status_label: "诊断会话不可用".to_string(),
+            virtual_ip: "—".to_string(),
+            online: None,
+            devices: TrayDeviceMenu::default(),
+            tooltip: format!("p2wlan：{message}"),
+        }
+    }
 }

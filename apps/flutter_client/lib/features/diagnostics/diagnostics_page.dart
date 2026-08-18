@@ -6,9 +6,13 @@ import 'package:flutter/services.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../core/capabilities/permission_preflight.dart';
+import '../../core/daemon/diagnostics_auth.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/security/redactor.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
+import '../../shared/log_tail.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';

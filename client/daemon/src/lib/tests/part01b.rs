@@ -16,11 +16,11 @@ fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
             None,
             &[
                 "192.168.1.10:51820".to_string(),
-                "stun.example.com:43000".to_string()
+                "8.8.8.8:43000".to_string()
             ],
             false,
         ),
-        Some("stun.example.com:43000".to_string())
+        Some("8.8.8.8:43000".to_string())
     );
 }
 

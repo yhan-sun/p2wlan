@@ -231,15 +231,13 @@ class ControlApi {
       throw ControlApiException('控制服务器 TLS 握手失败：${uri.origin}');
     } on FormatException {
       throw const ControlApiException('控制服务器返回了无法解析的数据');
-    } on HttpException catch (error) {
+    } on HttpException {
       // `HttpClient` reports a refused/closed socket as HttpException on
       // some platforms and SocketException on others.  At this point no HTTP
       // response exists, so exposing a generic request failure is not useful
       // to the user; classify every transport-level HttpException as an
       // unreachable control endpoint.
-      throw ControlApiException(
-        '无法连接控制服务器：${uri.origin}。请确认服务端已启动且地址/端口正确。',
-      );
+      throw ControlApiException('无法连接控制服务器：${uri.origin}。请确认服务端已启动且地址/端口正确。');
     }
   }
 

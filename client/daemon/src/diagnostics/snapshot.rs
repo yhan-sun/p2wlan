@@ -43,6 +43,14 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         network_id: context.config.network.network_id.clone(),
         network_generation: context.peers.current_network_generation_sync(),
         uptime_ms: context.timeline.uptime_ms(),
+        revision: context.status_events.current_seq(),
+        ready_phase: derive_ready_phase(
+            &health_snap,
+            relay_connected,
+            &peers,
+            &context.config.network.virtual_ip,
+        )
+        .to_string(),
         protocol: ProtocolDiagnostics::current(),
         mtu: MtuDiagnostics::from_runtime(
             context.config.network.mtu,

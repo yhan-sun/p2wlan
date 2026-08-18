@@ -25,6 +25,7 @@ Future<_Stores> _makeStores({
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
+    tokenRepository: InMemorySecureTokenRepository(),
   );
   await settingsStore.load();
   await settingsStore.updateSettings(
@@ -117,6 +118,35 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     }
     return value;
   }
+
+  @override
+  Future<EventsResponse> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    Duration timeout = const Duration(seconds: 30),
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<PeersPageResponse> fetchPeers(
+    String diagnosticsUrl, {
+    String? cursor,
+    int limit = 100,
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<String> fetchLogTail(
+    String diagnosticsUrl, {
+    int lines = 120,
+    int maxBytes = 262144,
+  }) async => throw UnimplementedError();
+
+  @override
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
+      throw UnimplementedError();
 
   @override
   void close() {}

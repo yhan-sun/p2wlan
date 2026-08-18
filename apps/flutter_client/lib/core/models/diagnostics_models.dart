@@ -6,3 +6,4 @@ part 'diagnostics_models/snapshot.dart';
 part 'diagnostics_models/peer.dart';
 part 'diagnostics_models/speed_test.dart';
 part 'diagnostics_models/json_helpers.dart';
+part 'diagnostics_models/responses.dart';

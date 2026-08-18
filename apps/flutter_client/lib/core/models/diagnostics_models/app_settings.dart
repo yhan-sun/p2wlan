@@ -76,6 +76,7 @@ class AppSettings {
     this.closeBehavior = defaultCloseBehavior,
     this.languageCode = defaultLanguageCode,
     this.themeMode = 'system',
+    this.onboardingCompleted = false,
   });
 
   final String diagnosticsUrl;
@@ -95,6 +96,11 @@ class AppSettings {
   final String closeBehavior;
   final String languageCode;
   final String themeMode;
+
+  /// Whether the local-node onboarding flow has been completed on this device.
+  /// Persisted so a restart resumes at the shell rather than re-running
+  /// first-run. Managed-mode users who have never signed in see it as false.
+  final bool onboardingCompleted;
 
   String get effectiveTunInterface {
     final trimmed = tunInterface.trim();
@@ -119,6 +125,7 @@ class AppSettings {
     String? closeBehavior,
     String? languageCode,
     String? themeMode,
+    bool? onboardingCompleted,
   }) {
     return AppSettings(
       diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl,
@@ -144,6 +151,7 @@ class AppSettings {
       themeMode: themeMode == null
           ? this.themeMode
           : AppThemeMode.fromCode(themeMode).code,
+      onboardingCompleted: onboardingCompleted ?? this.onboardingCompleted,
     );
   }
 
@@ -172,6 +180,7 @@ class AppSettings {
         json.containsKey('languageCode') ? _string(json['languageCode']) : null,
       ).code,
       themeMode: AppThemeMode.fromCode(_string(json['themeMode'])).code,
+      onboardingCompleted: _bool(json['onboardingCompleted']),
     );
   }
 
@@ -193,6 +202,7 @@ class AppSettings {
     'closeBehavior': _normalizeCloseBehavior(closeBehavior),
     'languageCode': languageCode,
     'themeMode': themeMode,
+    'onboardingCompleted': onboardingCompleted,
   };
 }
 

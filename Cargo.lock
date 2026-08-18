@@ -2166,11 +2166,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2191,7 +2193,9 @@ name = "p2wlan-tray"
 version = "0.1.118"
 dependencies = [
  "arboard",
+ "hex",
  "p2wlan-desktop-host",
+ "rand 0.8.7",
  "reqwest",
  "serde_json",
  "tao",

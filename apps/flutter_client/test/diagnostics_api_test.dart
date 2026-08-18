@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -62,4 +64,57 @@ void main() {
       );
     });
   });
+
+  test(
+    'authorizes sensitive GETs, leaves health public, and retries one 401',
+    () async {
+      final fixture = await File(
+        '../../contracts/fixtures/status.json',
+      ).readAsString();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      var statusRequests = 0;
+      final headers = <String?>[];
+      server.listen((request) async {
+        if (request.uri.path == '/health') {
+          expect(
+            request.headers.value(HttpHeaders.authorizationHeader),
+            isNull,
+          );
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.text
+            ..write('ok\n');
+          await request.response.close();
+          return;
+        }
+        if (request.uri.path == '/status') {
+          statusRequests++;
+          headers.add(request.headers.value(HttpHeaders.authorizationHeader));
+          if (statusRequests == 1) {
+            request.response.statusCode = HttpStatus.unauthorized;
+            await request.response.close();
+            return;
+          }
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(fixture);
+          await request.response.close();
+        }
+      });
+
+      final api = DiagnosticsApi(
+        authTokenReader: () async => 'diag-test-token',
+      );
+      addTearDown(api.close);
+      final url = 'http://127.0.0.1:${server.port}/status';
+
+      expect(await api.fetchHealth(url), isTrue);
+      final status = await api.fetchStatus(url);
+      expect(status.nodeId, 'node-a');
+      expect(statusRequests, 2, reason: 'one daemon-session retry is allowed');
+      expect(headers, ['Bearer diag-test-token', 'Bearer diag-test-token']);
+    },
+  );
 }
