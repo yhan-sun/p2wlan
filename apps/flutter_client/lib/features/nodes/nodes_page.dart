@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/api/control_api.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
@@ -142,7 +143,7 @@ class _NodesPageState extends State<NodesPage> {
                   daemonReachable: widget.statusStore.daemonReachable,
                   onEdit: () => _editLocalNode(snapshot),
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: AppTokens.space14),
                 _NodeToolbar(
                   searchController: _searchController,
                   searchFocusNode: _searchFocusNode,
@@ -154,7 +155,7 @@ class _NodesPageState extends State<NodesPage> {
                   onQueryChanged: () => setState(() {}),
                   onClearSearch: () => setState(_searchController.clear),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: AppTokens.space12),
                 if (allPeers.isEmpty)
                   _NodesEmptyState(
                     icon: Icons.devices_other_rounded,
@@ -212,7 +213,7 @@ class _NodesPageState extends State<NodesPage> {
                                 onTap: (peer) => _openPeer(peer, layout),
                               ),
                             ),
-                            const SizedBox(width: 16),
+                            const SizedBox(width: AppTokens.space16),
                             Expanded(
                               flex: 4,
                               child: _PeerDetailPane(
@@ -407,8 +408,8 @@ class _NodesPageState extends State<NodesPage> {
           ),
           FilledButton.icon(
             style: FilledButton.styleFrom(
-              backgroundColor: AppTokens.colorBadText,
-              foregroundColor: AppTokens.colorSurface,
+              backgroundColor: P2WlanColors.of(context).dangerText,
+              foregroundColor: P2WlanColors.of(context).dangerSurface,
             ),
             onPressed: () => Navigator.of(dialogContext).pop(true),
             icon: const Icon(Icons.delete_outline_rounded, size: 17),
@@ -581,7 +582,7 @@ class _NodesPageState extends State<NodesPage> {
                           labelText: strings.deviceName,
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: AppTokens.space12),
                       TextField(
                         controller: ipController,
                         decoration: InputDecoration(

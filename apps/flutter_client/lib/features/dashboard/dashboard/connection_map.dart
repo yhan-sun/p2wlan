@@ -18,15 +18,13 @@ class _ConnectionMap extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
+    final c = P2WlanColors.of(context);
     final leftCount = (peers.length + 1) ~/ 2;
     final rightCount = peers.length - leftCount;
     final rows = leftCount > rightCount ? leftCount : rightCount;
     if (rows < 1) return const SizedBox.shrink();
 
-    final lineColor = theme.brightness == Brightness.dark
-        ? AppTokens.colorDarkBorder
-        : AppTokens.colorBorderSubtle;
+    final lineColor = c.border;
 
     Widget cellAt(int index, bool left) {
       final peer = left
@@ -115,7 +113,7 @@ class _MapPeerCell extends StatelessWidget {
                 height: 8,
                 decoration: BoxDecoration(color: color, shape: BoxShape.circle),
               ),
-              const SizedBox(width: 6),
+              const SizedBox(width: AppTokens.space6),
               Flexible(
                 child: Text(
                   statusText,
@@ -172,8 +170,7 @@ class _MapLocalCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-    final accent = isDark ? AppTokens.colorDarkAccent : AppTokens.colorAccent;
+    final accent = P2WlanColors.of(context).relay;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [

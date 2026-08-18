@@ -50,7 +50,7 @@ class _NetworkHero extends StatelessWidget {
             ),
           ),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: AppTokens.space12),
         StatusBadge(
           label: _networkStatusLabel(strings, status, canControlLocalDaemon),
           tone: _networkStatusTone(status),
@@ -68,7 +68,7 @@ class _NetworkHero extends StatelessWidget {
       children: [
         if (hasSnapshot) ...[
           _HeroLabel(strings.virtualIp),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppTokens.space4),
           Text(
             dash(snapshot!.virtualIp),
             maxLines: 1,
@@ -82,7 +82,7 @@ class _NetworkHero extends StatelessWidget {
             ),
           ),
           if (counts.total > 0) ...[
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             _HeroCounts(counts: counts),
           ],
         ] else ...[
@@ -97,7 +97,7 @@ class _NetworkHero extends StatelessWidget {
               height: 1.15,
             ),
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: AppTokens.space6),
           Text(
             showStartGuide
                 ? strings.dashboardStoppedDetail
@@ -129,11 +129,11 @@ class _NetworkHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           header,
-          const SizedBox(height: 14),
+          const SizedBox(height: AppTokens.space14),
           infoBlock,
-          const SizedBox(height: 16),
+          const SizedBox(height: AppTokens.space16),
           const Divider(height: 1),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppTokens.space16),
           LayoutBuilder(
             builder: (context, constraints) {
               if (constraints.maxWidth < 560) {
@@ -141,7 +141,7 @@ class _NetworkHero extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     _NetworkIdLine(snapshot: snapshot),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: AppTokens.space12),
                     actions,
                   ],
                 );
@@ -150,7 +150,7 @@ class _NetworkHero extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   Expanded(child: _NetworkIdLine(snapshot: snapshot)),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: AppTokens.space16),
                   actions,
                 ],
               );
@@ -197,14 +197,13 @@ class _HeroCounts extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-    final good = isDark ? AppTokens.colorDarkGoodText : AppTokens.colorGoodText;
-    final warn = isDark ? AppTokens.colorDarkWarnText : AppTokens.colorWarnText;
-    final relay = isDark ? AppTokens.colorDarkAccent : AppTokens.colorAccent;
+    final c = P2WlanColors.of(context);
+    final good = c.direct;
+    final warn = c.probing;
+    final relay = c.relay;
     return Wrap(
-      spacing: 20,
-      runSpacing: 10,
+      spacing: AppTokens.space20,
+      runSpacing: AppTokens.space10,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         _HeroCount(

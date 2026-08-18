@@ -9,6 +9,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final c = P2WlanColors.of(context);
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 420),
       child: Column(
@@ -17,28 +18,28 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
         children: [
           DecoratedBox(
             decoration: BoxDecoration(
-              color: AppTokens.colorBadBg,
+              color: c.dangerSurface,
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              border: Border.all(color: AppTokens.colorBadBorder),
+              border: Border.all(color: c.dangerBorder),
             ),
             child: Padding(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(AppTokens.space12),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Icon(
+                  Icon(
                     Icons.warning_amber_rounded,
                     size: 20,
-                    color: AppTokens.colorBadText,
+                    color: c.dangerText,
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: AppTokens.space10),
                   Expanded(
                     child: Text(
                       strings.isZh
                           ? '该设备会从控制面移除，之后需要重新登录/注册才能加入网络。'
                           : 'This removes the device from the control plane. It must sign in or register again to rejoin.',
-                      style: const TextStyle(
-                        color: AppTokens.colorBadText,
+                      style: TextStyle(
+                        color: c.dangerText,
                         fontSize: 13,
                         height: 1.35,
                         fontWeight: FontWeight.w600,
@@ -49,7 +50,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: AppTokens.space14),
           _RemoveDeviceMetaRow(label: strings.device, value: peer.displayName),
           _RemoveDeviceMetaRow(
             label: strings.virtualIp,
@@ -59,7 +60,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
             label: strings.nodeId,
             value: shortId(peer.nodeId),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppTokens.space4),
           Text(
             strings.isZh
                 ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
@@ -101,7 +102,7 @@ class _RemoveDeviceMetaRow extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppTokens.space8),
           Expanded(
             child: Text(
               value,

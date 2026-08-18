@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/daemon/diagnostics_auth.dart';
@@ -101,15 +102,15 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
           maxWidth: diagnosticsPageMaxWidth,
           children: [
             _DiagnosticsActions(statusStore: statusStore),
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             _OverviewCard(model: model),
             if (model.checks.isNotEmpty) ...[
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
               _ChecksPanel(checks: model.checks),
             ],
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             _IssuesPanel(issues: model.issues),
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             _AdvancedDisclosure(
               open: _advancedExpanded,
               onToggle: () =>
@@ -138,23 +139,23 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     return [
       _RuntimeDetailsPanel(statusStore: statusStore, snapshot: snapshot),
       if (canLocal) ...[
-        const SizedBox(height: 14),
+        const SizedBox(height: AppTokens.space14),
         _PlatformPanel(permissionCheck: widget.permissionCheck),
       ],
       if (snapshot != null) ...[
-        const SizedBox(height: 14),
+        const SizedBox(height: AppTokens.space14),
         _ProtocolMtuPanel(snapshot: snapshot),
-        const SizedBox(height: 14),
+        const SizedBox(height: AppTokens.space14),
         _TaskPanel(snapshot: snapshot),
       ],
       if (_capabilities.canOpenLocalLogs) ...[
-        const SizedBox(height: 14),
+        const SizedBox(height: AppTokens.space14),
         _RecentLogsPanel(
           logPreviewLoader: widget.logPreviewLoader,
           openLogs: widget.openLogs,
         ),
       ],
-      const SizedBox(height: 14),
+      const SizedBox(height: AppTokens.space14),
       _RawJson(statusStore: statusStore, snapshot: snapshot),
     ];
   }

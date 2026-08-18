@@ -29,7 +29,7 @@ class _PeerOverview extends StatelessWidget {
             letterSpacing: 0,
           ),
         ),
-        const SizedBox(height: 14),
+        const SizedBox(height: AppTokens.space14),
         if (showMap) ...[
           _ConnectionMap(peers: peers),
           const SizedBox(height: 18),
@@ -93,7 +93,7 @@ class _PeerRow extends StatelessWidget {
               shape: BoxShape.circle,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -114,15 +114,13 @@ class _PeerRow extends StatelessWidget {
                       ),
                     ),
                     if (peer.lastError != null) ...[
-                      const SizedBox(width: 6),
+                      const SizedBox(width: AppTokens.space6),
                       Tooltip(
                         message: peer.lastError!,
                         child: Icon(
                           Icons.warning_amber_rounded,
                           size: 14,
-                          color: theme.brightness == Brightness.dark
-                              ? AppTokens.colorDarkWarnText
-                              : AppTokens.colorWarnText,
+                          color: P2WlanColors.of(context).probing,
                         ),
                       ),
                     ],
@@ -144,9 +142,9 @@ class _PeerRow extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppTokens.space12),
           _PeerStatusBadge(label: statusLabel, color: statusColor),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Text(
             _peerLatencyLabel(strings, peer),
             maxLines: 1,

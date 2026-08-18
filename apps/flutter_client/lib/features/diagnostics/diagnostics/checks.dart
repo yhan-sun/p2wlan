@@ -52,7 +52,7 @@ class _CheckRow extends StatelessWidget {
               color: colors.text,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Expanded(
             child: Text(
               check.title,
@@ -63,7 +63,7 @@ class _CheckRow extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppTokens.space12),
           Flexible(
             child: Text(
               check.value,

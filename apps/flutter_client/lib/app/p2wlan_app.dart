@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import '../app/desktop_tray_controller.dart';
 import '../app/app_strings.dart';
 import '../app/app_theme.dart';
-import '../app/app_tokens.dart';
+import '../app/p2wlan_colors.dart';
 import '../core/api/diagnostics_api.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/daemon/daemon_controller.dart';
@@ -182,13 +182,15 @@ class _BootScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
+    return Scaffold(
       body: Center(
         child: SizedBox.square(
           dimension: 24,
           child: CircularProgressIndicator(
             strokeWidth: 2,
-            valueColor: AlwaysStoppedAnimation<Color>(AppTokens.colorTextMuted),
+            valueColor: AlwaysStoppedAnimation<Color>(
+              P2WlanColors.of(context).textMuted,
+            ),
           ),
         ),
       ),

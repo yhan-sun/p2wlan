@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/p2wlan_colors.dart';
 import '../../app/app_tokens.dart';
 
 /// Clean native surface panel (replaces generic bloated Cards).
@@ -9,8 +10,13 @@ class AppPanel extends StatelessWidget {
     required this.title,
     required this.child,
     this.trailing,
-    this.headerPadding = const EdgeInsets.fromLTRB(16, 16, 16, 0),
-    this.contentPadding = const EdgeInsets.all(16),
+    this.headerPadding = const EdgeInsets.fromLTRB(
+      AppTokens.space16,
+      AppTokens.space16,
+      AppTokens.space16,
+      0,
+    ),
+    this.contentPadding = const EdgeInsets.all(AppTokens.space16),
     this.flushContent = false,
   });
 
@@ -29,12 +35,13 @@ class AppPanel extends StatelessWidget {
 
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    final c = P2WlanColors.of(context);
 
     return Container(
       decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
+        color: c.surface,
         borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: theme.colorScheme.outline, width: 1),
+        border: Border.all(color: c.border, width: 1),
         boxShadow: isDark ? const [] : AppTokens.shadowBorder,
       ),
       child: Column(
@@ -44,7 +51,7 @@ class AppPanel extends StatelessWidget {
             padding: headerPadding,
             child: _PanelHeader(title: title, trailing: trailing),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppTokens.space12),
           Padding(padding: effectiveContentPadding, child: child),
         ],
       ),
@@ -82,7 +89,7 @@ class _PanelHeader extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               titleWidget,
-              const SizedBox(height: 8),
+              const SizedBox(height: AppTokens.space8),
               Align(alignment: Alignment.centerLeft, child: trailingWidget),
             ],
           );
@@ -91,7 +98,7 @@ class _PanelHeader extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Expanded(child: titleWidget),
-            const SizedBox(width: 12),
+            const SizedBox(width: AppTokens.space12),
             trailingWidget,
           ],
         );

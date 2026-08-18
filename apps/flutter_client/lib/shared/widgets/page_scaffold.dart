@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
 import '../layout/app_breakpoints.dart';
 
 class PageScaffold extends StatelessWidget {
@@ -30,15 +31,19 @@ class PageScaffold extends StatelessWidget {
           // (phones / very narrow windows) the page uses tighter padding.
           final isNarrow =
               constraints.maxWidth < AppBreakpoints.compactMaxWidth;
-          final horizontalPadding = isNarrow ? 14.0 : 22.0;
-          final verticalPadding = isNarrow ? 14.0 : 20.0;
+          final horizontalPadding = isNarrow
+              ? AppTokens.space14
+              : AppTokens.space24;
+          final verticalPadding = isNarrow
+              ? AppTokens.space14
+              : AppTokens.space20;
 
           return ListView(
             padding: EdgeInsets.fromLTRB(
               horizontalPadding,
               verticalPadding,
               horizontalPadding,
-              verticalPadding + 8,
+              verticalPadding + AppTokens.space8,
             ),
             children: [
               Center(
@@ -83,7 +88,7 @@ class PageScaffold extends StatelessWidget {
                             ],
                           ),
                         ),
-                        const SizedBox(height: 16),
+                        const SizedBox(height: AppTokens.space16),
                       ],
                       ...children,
                     ],

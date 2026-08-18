@@ -17,10 +17,7 @@ class _ProtocolMtuPanel extends StatelessWidget {
           strings.isZh
               ? '当前快照未上报协议边界或 MTU 策略。'
               : 'The current snapshot has no protocol boundary or MTU policy data.',
-          style: const TextStyle(
-            fontSize: 13,
-            color: AppTokens.colorTextSecondary,
-          ),
+          style: TextStyle(fontSize: 13, color: themeTextSecondary(context)),
         ),
       );
     }
@@ -86,9 +83,9 @@ class _TaskPanel extends StatelessWidget {
               strings.isZh
                   ? '当前快照没有关键任务明细。'
                   : 'No critical task details in the current snapshot.',
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 13,
-                color: AppTokens.colorTextSecondary,
+                color: themeTextSecondary(context),
               ),
             )
           : Column(children: [for (final task in tasks) _TaskRow(task: task)]),
@@ -126,16 +123,16 @@ class _TaskRow extends StatelessWidget {
                 Row(
                   children: [
                     Expanded(child: name),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: AppTokens.space10),
                     badge,
                   ],
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: AppTokens.space4),
                 Text(
                   error,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 12,
-                    color: AppTokens.colorBadText,
+                    color: P2WlanColors.of(context).dangerText,
                   ),
                 ),
               ],
@@ -150,9 +147,9 @@ class _TaskRow extends StatelessWidget {
                     error,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 12,
-                      color: AppTokens.colorBadText,
+                      color: P2WlanColors.of(context).dangerText,
                     ),
                   ),
                 ),

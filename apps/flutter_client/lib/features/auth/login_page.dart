@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/api/control_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
@@ -102,7 +103,7 @@ class _LoginPageState extends State<LoginPage> {
             ),
           Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(AppTokens.space24),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 460),
                 child: Column(
@@ -128,7 +129,7 @@ class _LoginPageState extends State<LoginPage> {
                             fit: BoxFit.contain,
                           ),
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: AppTokens.space14),
                         Expanded(
                           child: Text(
                             p2wlanAppName,
@@ -152,7 +153,7 @@ class _LoginPageState extends State<LoginPage> {
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppTokens.space20),
                     DecoratedBox(
                       decoration: BoxDecoration(
                         color: theme.colorScheme.surface,
@@ -182,7 +183,7 @@ class _LoginPageState extends State<LoginPage> {
                                 onSubmitted: (_) =>
                                     _submitting ? null : _submit(),
                               ),
-                              const SizedBox(height: 12),
+                              const SizedBox(height: AppTokens.space12),
                               TextField(
                                 controller: _passwordController,
                                 decoration: InputDecoration(
@@ -216,10 +217,10 @@ class _LoginPageState extends State<LoginPage> {
                                     _submitting ? null : _submit(),
                               ),
                               if (_error != null) ...[
-                                const SizedBox(height: 12),
+                                const SizedBox(height: AppTokens.space12),
                                 _LoginErrorBanner(error: _error!),
                               ],
-                              const SizedBox(height: 16),
+                              const SizedBox(height: AppTokens.space16),
                               FilledButton.icon(
                                 onPressed: _submitting ? null : _submit,
                                 icon: _submitting
@@ -282,7 +283,7 @@ class _LoginPageState extends State<LoginPage> {
                                       onSubmitted: (_) =>
                                           _submitting ? null : _submit(),
                                     ),
-                                    const SizedBox(height: 12),
+                                    const SizedBox(height: AppTokens.space12),
                                     Row(
                                       crossAxisAlignment:
                                           CrossAxisAlignment.start,
@@ -294,7 +295,7 @@ class _LoginPageState extends State<LoginPage> {
                                               .colorScheme
                                               .onSurfaceVariant,
                                         ),
-                                        const SizedBox(width: 8),
+                                        const SizedBox(width: AppTokens.space8),
                                         Expanded(
                                           child: Text(
                                             strings.manualOfflineModeHelper,
@@ -309,7 +310,7 @@ class _LoginPageState extends State<LoginPage> {
                                         ),
                                       ],
                                     ),
-                                    const SizedBox(height: 12),
+                                    const SizedBox(height: AppTokens.space12),
                                     OutlinedButton.icon(
                                       onPressed: _submitting
                                           ? null
@@ -542,12 +543,10 @@ class _LoginErrorBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final bg = isDark ? AppTokens.colorDarkBadBg : AppTokens.colorBadBg;
-    final border = isDark
-        ? AppTokens.colorDarkBadBorder
-        : AppTokens.colorBadBorder;
-    final text = isDark ? AppTokens.colorDarkBadText : AppTokens.colorBadText;
+    final c = P2WlanColors.of(context);
+    final bg = c.dangerSurface;
+    final border = c.dangerBorder;
+    final text = c.dangerText;
     return DecoratedBox(
       decoration: BoxDecoration(
         color: bg,
@@ -648,7 +647,7 @@ class _AdvancedDisclosure extends StatelessWidget {
                     ],
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: AppTokens.space8),
                 Icon(
                   open ? Icons.expand_less_rounded : Icons.expand_more_rounded,
                   color: theme.colorScheme.onSurfaceVariant,
@@ -657,8 +656,8 @@ class _AdvancedDisclosure extends StatelessWidget {
             ),
           ),
         ),
-        if (open) ...[const SizedBox(height: 4), child],
-        const SizedBox(height: 4),
+        if (open) ...[const SizedBox(height: AppTokens.space4), child],
+        const SizedBox(height: AppTokens.space4),
         TextButton(
           onPressed: onToggle,
           child: Text(

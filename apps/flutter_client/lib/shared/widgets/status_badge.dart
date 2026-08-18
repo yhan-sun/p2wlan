@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/p2wlan_colors.dart';
 import '../../app/app_tokens.dart';
 
 enum StatusTone { good, warn, bad, neutral }
@@ -19,7 +20,10 @@ class StatusBadge extends StatelessWidget {
     final (bg, border, text, dot) = _colors(context);
     return Container(
       constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppTokens.space8,
+        vertical: AppTokens.space4,
+      ),
       decoration: BoxDecoration(
         color: bg,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),
@@ -33,7 +37,7 @@ class StatusBadge extends StatelessWidget {
             height: 6,
             decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
           ),
-          const SizedBox(width: 6),
+          const SizedBox(width: AppTokens.space6),
           Flexible(
             child: Text(
               label,
@@ -54,60 +58,31 @@ class StatusBadge extends StatelessWidget {
   }
 
   (Color, Color, Color, Color) _colors(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    if (isDark) {
-      return switch (tone) {
-        StatusTone.good => (
-          AppTokens.colorDarkGoodBg,
-          AppTokens.colorDarkGoodBorder,
-          AppTokens.colorDarkGoodText,
-          AppTokens.colorDarkGoodDot,
-        ),
-        StatusTone.warn => (
-          AppTokens.colorDarkWarnBg,
-          AppTokens.colorDarkWarnBorder,
-          AppTokens.colorDarkWarnText,
-          AppTokens.colorDarkWarnDot,
-        ),
-        StatusTone.bad => (
-          AppTokens.colorDarkBadBg,
-          AppTokens.colorDarkBadBorder,
-          AppTokens.colorDarkBadText,
-          AppTokens.colorDarkBadDot,
-        ),
-        StatusTone.neutral => (
-          AppTokens.colorDarkNeutralBg,
-          AppTokens.colorDarkNeutralBorder,
-          AppTokens.colorDarkNeutralText,
-          AppTokens.colorDarkNeutralDot,
-        ),
-      };
-    }
-
+    final c = P2WlanColors.of(context);
     return switch (tone) {
       StatusTone.good => (
-        AppTokens.colorGoodBg,
-        AppTokens.colorGoodBorder,
-        AppTokens.colorGoodText,
-        AppTokens.colorGoodText,
+        c.successSurface,
+        c.successBorder,
+        c.successText,
+        c.successDot,
       ),
       StatusTone.warn => (
-        AppTokens.colorWarnBg,
-        AppTokens.colorWarnBorder,
-        AppTokens.colorWarnText,
-        AppTokens.colorWarnText,
+        c.warningSurface,
+        c.warningBorder,
+        c.warningText,
+        c.warningDot,
       ),
       StatusTone.bad => (
-        AppTokens.colorBadBg,
-        AppTokens.colorBadBorder,
-        AppTokens.colorBadText,
-        AppTokens.colorBadText,
+        c.dangerSurface,
+        c.dangerBorder,
+        c.dangerText,
+        c.dangerDot,
       ),
       StatusTone.neutral => (
-        AppTokens.colorNeutralBg,
-        AppTokens.colorNeutralBorder,
-        AppTokens.colorNeutralText,
-        AppTokens.colorNeutralText,
+        c.neutralSurface,
+        c.neutralBorder,
+        c.neutralText,
+        c.neutralDot,
       ),
     };
   }

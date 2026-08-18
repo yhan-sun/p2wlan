@@ -99,9 +99,9 @@ class _PeerDetailsContent extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _DetailHeader(peer: peer, strings: strings),
-        const SizedBox(height: 12),
+        const SizedBox(height: AppTokens.space12),
         const Divider(height: 1),
-        const SizedBox(height: 12),
+        const SizedBox(height: AppTokens.space12),
         _DetailSection(
           title: strings.sectionConnection,
           rows: [
@@ -150,9 +150,9 @@ class _PeerDetailsContent extends StatelessWidget {
             rows: [_DetailIssueNote(message: error, strings: strings)],
           ),
         ],
-        const SizedBox(height: 4),
+        const SizedBox(height: AppTokens.space4),
         const Divider(height: 1),
-        const SizedBox(height: 12),
+        const SizedBox(height: AppTokens.space12),
         _DetailActions(
           peer: peer,
           strings: strings,
@@ -177,9 +177,7 @@ class _DetailHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final onlineColor = theme.brightness == Brightness.dark
-        ? AppTokens.colorDarkGoodText
-        : AppTokens.colorGoodText;
+    final onlineColor = P2WlanColors.of(context).direct;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -201,7 +199,7 @@ class _DetailHeader extends StatelessWidget {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: AppTokens.space8),
                   Text(
                     peer.online ? strings.online : strings.offline,
                     style: TextStyle(
@@ -214,7 +212,7 @@ class _DetailHeader extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: AppTokens.space4),
               Text(
                 dash(peer.virtualIp),
                 maxLines: 1,
@@ -229,7 +227,7 @@ class _DetailHeader extends StatelessWidget {
             ],
           ),
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: AppTokens.space10),
         _PathBadge(peer: peer, strings: strings),
       ],
     );
@@ -259,7 +257,7 @@ class _DetailSection extends StatelessWidget {
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppTokens.space4),
           ...rows,
         ],
       ),
@@ -275,40 +273,27 @@ class _DetailIssueNote extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
+    final c = P2WlanColors.of(context);
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(AppTokens.space10),
       decoration: BoxDecoration(
-        color: isDark ? AppTokens.colorDarkWarnBg : AppTokens.colorWarnBg,
+        color: c.warningSurface,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(
-          color: isDark
-              ? AppTokens.colorDarkWarnBorder
-              : AppTokens.colorWarnBorder,
-        ),
+        border: Border.all(color: c.warningBorder),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(
-            Icons.warning_amber_rounded,
-            size: 17,
-            color: isDark
-                ? AppTokens.colorDarkWarnText
-                : AppTokens.colorWarnText,
-          ),
-          const SizedBox(width: 8),
+          Icon(Icons.warning_amber_rounded, size: 17, color: c.warningText),
+          const SizedBox(width: AppTokens.space8),
           Expanded(
             child: SelectableText(
               message,
               style: TextStyle(
                 fontSize: 12,
                 height: 1.35,
-                color: isDark
-                    ? AppTokens.colorDarkWarnText
-                    : AppTokens.colorWarnText,
+                color: c.warningText,
               ),
             ),
           ),
@@ -406,7 +391,10 @@ class _DetailActions extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         primaryActions,
-        if (remove != null) ...[const SizedBox(height: 6), remove],
+        if (remove != null) ...[
+          const SizedBox(height: AppTokens.space6),
+          remove,
+        ],
       ],
     );
   }
@@ -442,7 +430,7 @@ class _PeerDetailPane extends StatelessWidget {
     if (current == null) {
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(AppTokens.space24),
           child: Text(
             strings.noSelectionHint,
             textAlign: TextAlign.center,
@@ -500,7 +488,10 @@ class _PeerDetailsDialog extends StatelessWidget {
     final maxDialogHeight = usableHeight < 620 ? usableHeight : 620.0;
 
     return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      insetPadding: const EdgeInsets.symmetric(
+        horizontal: AppTokens.space16,
+        vertical: AppTokens.space24,
+      ),
       backgroundColor: Colors.transparent,
       surfaceTintColor: Colors.transparent,
       child: ConstrainedBox(

@@ -78,58 +78,33 @@ String _value(dynamic value) {
   return text.isEmpty ? '—' : text;
 }
 
-/// Tone surface colors for overview/issue surfaces. Reuses the existing
-/// semantic status tokens (same mapping as StatusBadge / dashboard).
+/// Tone surface colors for overview/issue surfaces. Reuses the same semantic
+/// status palette as StatusBadge / dashboard via [P2WlanColors].
 ({Color bg, Color border, Color text}) _tonePanelColors(
   BuildContext context,
   StatusTone tone,
 ) {
-  final theme = Theme.of(context);
-  final isDark = theme.brightness == Brightness.dark;
-  if (isDark) {
-    return switch (tone) {
-      StatusTone.good => (
-        bg: AppTokens.colorDarkGoodBg,
-        border: AppTokens.colorDarkGoodBorder,
-        text: AppTokens.colorDarkGoodText,
-      ),
-      StatusTone.warn => (
-        bg: AppTokens.colorDarkWarnBg,
-        border: AppTokens.colorDarkWarnBorder,
-        text: AppTokens.colorDarkWarnText,
-      ),
-      StatusTone.bad => (
-        bg: AppTokens.colorDarkBadBg,
-        border: AppTokens.colorDarkBadBorder,
-        text: AppTokens.colorDarkBadText,
-      ),
-      StatusTone.neutral => (
-        bg: theme.colorScheme.surfaceContainerHighest,
-        border: theme.colorScheme.outline,
-        text: theme.colorScheme.onSurfaceVariant,
-      ),
-    };
-  }
+  final c = P2WlanColors.of(context);
   return switch (tone) {
     StatusTone.good => (
-      bg: AppTokens.colorGoodBg,
-      border: AppTokens.colorGoodBorder,
-      text: AppTokens.colorGoodText,
+      bg: c.successSurface,
+      border: c.successBorder,
+      text: c.successText,
     ),
     StatusTone.warn => (
-      bg: AppTokens.colorWarnBg,
-      border: AppTokens.colorWarnBorder,
-      text: AppTokens.colorWarnText,
+      bg: c.warningSurface,
+      border: c.warningBorder,
+      text: c.warningText,
     ),
     StatusTone.bad => (
-      bg: AppTokens.colorBadBg,
-      border: AppTokens.colorBadBorder,
-      text: AppTokens.colorBadText,
+      bg: c.dangerSurface,
+      border: c.dangerBorder,
+      text: c.dangerText,
     ),
     StatusTone.neutral => (
-      bg: theme.colorScheme.surfaceContainerHighest,
-      border: theme.colorScheme.outline,
-      text: theme.colorScheme.onSurfaceVariant,
+      bg: c.neutralSurface,
+      border: c.neutralBorder,
+      text: c.neutralText,
     ),
   };
 }

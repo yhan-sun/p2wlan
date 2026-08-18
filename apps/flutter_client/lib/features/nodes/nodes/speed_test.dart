@@ -84,7 +84,10 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
 
     return Dialog(
       key: const Key('node-speedtest-dialog'),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      insetPadding: const EdgeInsets.symmetric(
+        horizontal: AppTokens.space16,
+        vertical: AppTokens.space24,
+      ),
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: 560),
         child: Padding(
@@ -107,7 +110,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                             fontWeight: FontWeight.w700,
                           ),
                         ),
-                        const SizedBox(height: 4),
+                        const SizedBox(height: AppTokens.space4),
                         Text(
                           strings.speedTestPeer(widget.peer.displayName),
                           maxLines: 1,
@@ -121,7 +124,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: AppTokens.space12),
                   _PathBadge(peer: widget.peer, strings: widget.strings),
                   IconButton(
                     tooltip: strings.close,
@@ -130,7 +133,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: AppTokens.space16),
               _SpeedTestDetailRow(
                 label: strings.virtualIp,
                 value: dash(widget.peer.virtualIp),
@@ -156,7 +159,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                 )
               else if (_runningForPeer) ...[
                 LinearProgressIndicator(value: progress),
-                const SizedBox(height: 10),
+                const SizedBox(height: AppTokens.space10),
                 Row(
                   children: [
                     const SizedBox.square(
@@ -198,7 +201,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                   message: strings.speedTestDuration,
                   color: colorScheme.onSurfaceVariant,
                 ),
-              const SizedBox(height: 20),
+              const SizedBox(height: AppTokens.space20),
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
@@ -206,7 +209,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                     onPressed: () => Navigator.of(context).pop(),
                     child: Text(strings.close),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: AppTokens.space8),
                   FilledButton.icon(
                     key: const Key('node-speedtest-start'),
                     onPressed: eligible && !widget.statusStore.speedTestRunning

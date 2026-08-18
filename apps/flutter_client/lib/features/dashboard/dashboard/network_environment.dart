@@ -16,8 +16,7 @@ class _NetworkEnvironment extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
+    final c = P2WlanColors.of(context);
     final rows = <Widget>[
       _natRow(context, strings),
       _relayRow(context, strings),
@@ -30,9 +29,7 @@ class _NetworkEnvironment extends StatelessWidget {
         _EnvRow(
           label: strings.udp,
           value: strings.udpUnavailable,
-          dotColor: isDark
-              ? AppTokens.colorDarkBadText
-              : AppTokens.colorBadText,
+          dotColor: c.dangerText,
         ),
       );
     } else if (udpCount > 0) {
@@ -40,9 +37,7 @@ class _NetworkEnvironment extends StatelessWidget {
         _EnvRow(
           label: strings.udp,
           value: strings.udpAvailable,
-          dotColor: isDark
-              ? AppTokens.colorDarkGoodText
-              : AppTokens.colorGoodText,
+          dotColor: c.successText,
         ),
       );
     } else {
@@ -84,9 +79,8 @@ class _NetworkEnvironment extends StatelessWidget {
   Widget _relayRow(BuildContext context, AppStrings strings) {
     final relay = snapshot?.relaySelection;
     final relayValue = _relayValue(strings, relay);
-    final isDark = Theme.of(context).brightness == Brightness.dark;
     final color = snapshot?.relayConnected == true
-        ? (isDark ? AppTokens.colorDarkAccent : AppTokens.colorAccent)
+        ? P2WlanColors.of(context).relay
         : null;
     return _EnvRow(label: strings.relay, value: relayValue, dotColor: color);
   }
@@ -142,7 +136,7 @@ class _EnvRow extends StatelessWidget {
             ),
           ),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: AppTokens.space12),
         if (dotColor != null) ...[
           Container(
             width: 7,

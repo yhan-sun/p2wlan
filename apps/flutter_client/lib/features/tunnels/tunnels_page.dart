@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -110,14 +111,14 @@ class _TunnelsPageState extends State<TunnelsPage> {
           children: [
             if (_message != null) ...[
               _InfoBanner(message: _message!),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
             _SummaryStrip(
               running: running,
               snapshot: snapshot,
               settings: settings,
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             LayoutBuilder(
               builder: (context, constraints) {
                 final tunnelPanel = _TunnelPanel(
@@ -141,7 +142,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   return Column(
                     children: [
                       tunnelPanel,
-                      const SizedBox(height: 14),
+                      const SizedBox(height: AppTokens.space14),
                       routePanel,
                     ],
                   );
@@ -150,7 +151,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Expanded(child: tunnelPanel),
-                    const SizedBox(width: 14),
+                    const SizedBox(width: AppTokens.space14),
                     Expanded(child: routePanel),
                   ],
                 );
@@ -366,7 +367,7 @@ class _RoutePanel extends StatelessWidget {
                       ? '权威状态：${routeState?['state'] ?? state['state']}。'
                       : 'Authoritative state: ${routeState?['state'] ?? state['state']}.'),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppTokens.space12),
           // Check (read-only, safe anytime) + Repair (in place, no restart).
           Row(
             children: [
@@ -382,7 +383,7 @@ class _RoutePanel extends StatelessWidget {
                   label: Text(isZh ? '检查路由' : 'Check routes'),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: AppTokens.space10),
               Expanded(
                 child: OutlinedButton.icon(
                   onPressed: running && !repairing ? onRepair : null,
@@ -397,7 +398,7 @@ class _RoutePanel extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppTokens.space8),
           // Restarting the daemon is a heavier, distinct action — keep it
           // available but clearly secondary (it interrupts the connection).
           Align(
@@ -433,23 +434,24 @@ class _Kv extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final labelText = Text(
             label,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12,
-              color: AppTokens.colorTextSecondary,
+              color: c.textSecondary,
               fontWeight: FontWeight.w600,
             ),
           );
           final valueText = Text(
             value,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 13,
-              color: AppTokens.colorTextPrimary,
+              color: c.textPrimary,
               fontFeatures: AppTokens.tabularFontFeatures,
             ),
           );
@@ -480,21 +482,18 @@ class _InfoBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: AppTokens.colorWarnBg,
+        color: c.warningSurface,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: AppTokens.colorWarnBorder),
+        border: Border.all(color: c.warningBorder),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(AppTokens.space12),
         child: Text(
           message,
-          style: const TextStyle(
-            color: AppTokens.colorWarnText,
-            fontSize: 13,
-            height: 1.35,
-          ),
+          style: TextStyle(color: c.warningText, fontSize: 13, height: 1.35),
         ),
       ),
     );

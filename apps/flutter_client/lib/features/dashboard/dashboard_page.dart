@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
@@ -92,7 +93,7 @@ class DashboardPage extends StatelessWidget {
               onRefresh: statusStore.refresh,
             ),
             if (snapshot != null) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: AppTokens.space16),
               LayoutBuilder(
                 builder: (context, constraints) {
                   if (constraints.maxWidth >= AppBreakpoints.expandedMinWidth) {
@@ -108,7 +109,7 @@ class DashboardPage extends StatelessWidget {
                                 daemonAvailable && overviewPeers.isNotEmpty,
                           ),
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: AppTokens.space14),
                         Expanded(
                           flex: 1,
                           child: _NetworkEnvironment(
@@ -129,7 +130,7 @@ class DashboardPage extends StatelessWidget {
                         totalPeers: peers.length,
                         showMap: false,
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: AppTokens.space16),
                       _NetworkEnvironment(
                         snapshot: snapshot,
                         lastFetchedAt: statusStore.lastSuccessfulStatusAt,
@@ -142,7 +143,7 @@ class DashboardPage extends StatelessWidget {
               ),
             ],
             if (issueMessage != null && daemonAvailable) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: AppTokens.space16),
               _DashboardIssues(
                 message: issueMessage,
                 tone:
@@ -153,7 +154,7 @@ class DashboardPage extends StatelessWidget {
               ),
             ],
             if (manualCommand != null) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: AppTokens.space16),
               _ManualDaemonCommand(command: manualCommand),
             ],
           ],

@@ -70,7 +70,7 @@ class _LocalNodePanel extends StatelessWidget {
               color: theme.colorScheme.primary,
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppTokens.space12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -103,7 +103,7 @@ class _LocalNodePanel extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppTokens.space12),
           StatusBadge(label: statusLabel, tone: statusTone),
         ],
       ),

@@ -65,7 +65,7 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
               children: [
                 _LogMessage(message: strings.cannotReadLogs),
                 if (preview.error != null) ...[
-                  const SizedBox(height: 4),
+                  const SizedBox(height: AppTokens.space4),
                   _LogMessage(
                     message: redactSensitive(preview.error!),
                     muted: true,
@@ -107,11 +107,11 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                   ),
                 ],
               ),
-              const SizedBox(height: 10),
+              const SizedBox(height: AppTokens.space10),
               Container(
                 width: double.infinity,
                 constraints: const BoxConstraints(maxHeight: 280),
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppTokens.space12),
                 decoration: BoxDecoration(
                   color: AppTokens.colorConsoleBg,
                   borderRadius: BorderRadius.circular(AppTokens.radiusSm),
@@ -133,7 +133,7 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                   ),
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: AppTokens.space8),
               Text(
                 preview.path,
                 maxLines: 1,
@@ -207,13 +207,9 @@ class _LogMessage extends StatelessWidget {
 }
 
 Color themeTextSecondary(BuildContext context) {
-  final isDark = Theme.of(context).brightness == Brightness.dark;
-  return isDark
-      ? AppTokens.colorDarkTextSecondary
-      : AppTokens.colorTextSecondary;
+  return P2WlanColors.of(context).textSecondary;
 }
 
 Color themeTextMuted(BuildContext context) {
-  final isDark = Theme.of(context).brightness == Brightness.dark;
-  return isDark ? AppTokens.colorDarkTextMuted : AppTokens.colorTextMuted;
+  return P2WlanColors.of(context).textMuted;
 }

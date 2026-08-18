@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/api/diagnostics_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
@@ -157,7 +158,7 @@ class _SettingsPageState extends State<SettingsPage> {
           children: [
             if (_formError != null) ...[
               _ErrorBanner(message: _formError!),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
             if (_restartRequired) ...[
               _PendingRestartNotice(
@@ -165,7 +166,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 canRestart: _capabilities.canControlLocalDaemon,
                 onRestart: _restartDaemonToApply,
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
             _SettingsSection(
               title: strings.settingsSectionGeneral,
@@ -436,7 +437,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     keyboardType: TextInputType.url,
                     onSubmitted: (_) => _saveAll(),
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: AppTokens.space10),
                   Wrap(
                     spacing: 12,
                     runSpacing: 8,
@@ -455,7 +456,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: AppTokens.space4),
                   const Divider(height: 24),
                   _SettingsRow(
                     label: strings.localService,
@@ -475,7 +476,7 @@ class _SettingsPageState extends State<SettingsPage> {
                             shape: BoxShape.circle,
                           ),
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: AppTokens.space6),
                         Text(
                           widget.statusStore.daemonReachable
                               ? strings.daemonRunning
@@ -505,16 +506,16 @@ class _SettingsPageState extends State<SettingsPage> {
                   if (widget.settingsStore.lastError != null) ...[
                     Text(
                       widget.settingsStore.lastError!,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
-                        color: AppTokens.colorBadText,
+                        color: P2WlanColors.of(context).dangerText,
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: AppTokens.space8),
                   ],
                 ],
               ),
-            const SizedBox(height: 16),
+            const SizedBox(height: AppTokens.space16),
             LayoutBuilder(
               builder: (context, constraints) {
                 final narrow = constraints.maxWidth < 520;
@@ -547,5 +548,5 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  static const _gap = SizedBox(height: 12);
+  static const _gap = SizedBox(height: AppTokens.space12);
 }

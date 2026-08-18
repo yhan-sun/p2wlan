@@ -16,7 +16,10 @@ class _DashboardSurface extends StatelessWidget {
         border: Border.all(color: theme.colorScheme.outline, width: 1),
         boxShadow: isDark ? const [] : AppTokens.shadowBorder,
       ),
-      child: Padding(padding: const EdgeInsets.all(16), child: child),
+      child: Padding(
+        padding: const EdgeInsets.all(AppTokens.space16),
+        child: child,
+      ),
     );
   }
 }
@@ -36,7 +39,7 @@ class _ManualDaemonCommand extends StatelessWidget {
         border: Border.all(color: AppTokens.colorConsoleBorder),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(AppTokens.space12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -59,7 +62,7 @@ class _ManualDaemonCommand extends StatelessWidget {
                 ),
               ],
             ),
-            const SizedBox(height: 6),
+            const SizedBox(height: AppTokens.space6),
             Text(
               strings.manualLaunchCommandBody,
               style: const TextStyle(
@@ -68,7 +71,7 @@ class _ManualDaemonCommand extends StatelessWidget {
                 height: 1.35,
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: AppTokens.space10),
             SelectableText(
               command,
               style: const TextStyle(

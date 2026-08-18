@@ -100,7 +100,9 @@ class _PeerGroupHeader extends StatelessWidget {
         border: Border(
           bottom: BorderSide(color: theme.colorScheme.outlineVariant),
         ),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(6)),
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(AppTokens.radiusSm),
+        ),
       ),
       child: Row(
         children: [
@@ -116,7 +118,7 @@ class _PeerGroupHeader extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppTokens.space8),
           StatusBadge(label: formatInt(group.peers.length), tone: group.tone),
         ],
       ),
@@ -159,7 +161,7 @@ class _PeerListRow extends StatelessWidget {
     final menu = _actionsMenu(ipKey, pingKey);
     final speedTestAction = _speedTestAction();
     final rowColor = selected
-        ? theme.colorScheme.surfaceContainerHigh
+        ? P2WlanColors.of(context).selectedSurface
         : theme.colorScheme.surface;
     return Material(
       color: rowColor,
@@ -304,7 +306,7 @@ class _RowContent extends StatelessWidget {
           flex: 3,
           child: _PeerPrimaryText(peer: peer, strings: strings),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: AppTokens.space12),
         SizedBox(
           width: 92,
           child: Align(
@@ -312,7 +314,7 @@ class _RowContent extends StatelessWidget {
             child: _LatencyText(peer: peer),
           ),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: AppTokens.space12),
         SizedBox(
           width: 116,
           child: Align(
@@ -320,7 +322,7 @@ class _RowContent extends StatelessWidget {
             child: _PathBadge(peer: peer, strings: strings),
           ),
         ),
-        const SizedBox(width: 4),
+        const SizedBox(width: AppTokens.space4),
         speedTestAction,
         menu,
       ],
@@ -352,16 +354,16 @@ class _CompactRowContent extends StatelessWidget {
             Expanded(
               child: _PeerPrimaryText(peer: peer, strings: strings),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: AppTokens.space8),
             speedTestAction,
             menu,
           ],
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: AppTokens.space6),
         Row(
           children: [
             _LatencyText(peer: peer),
-            const SizedBox(width: 10),
+            const SizedBox(width: AppTokens.space10),
             Expanded(
               child: Align(
                 alignment: Alignment.centerRight,
@@ -442,21 +444,19 @@ class _PeerPrimaryText extends StatelessWidget {
               ),
             ),
             if (error != null && error.isNotEmpty) ...[
-              const SizedBox(width: 6),
+              const SizedBox(width: AppTokens.space6),
               Tooltip(
                 message: error,
                 child: Icon(
                   Icons.warning_amber_rounded,
                   size: 15,
-                  color: theme.brightness == Brightness.dark
-                      ? AppTokens.colorDarkWarnText
-                      : AppTokens.colorWarnText,
+                  color: P2WlanColors.of(context).probing,
                 ),
               ),
             ],
           ],
         ),
-        const SizedBox(height: 4),
+        const SizedBox(height: AppTokens.space4),
         Text(
           detail,
           maxLines: 1,
@@ -500,7 +500,7 @@ class _NodesEmptyState extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, size: 34, color: theme.colorScheme.onSurfaceVariant),
-            const SizedBox(height: 10),
+            const SizedBox(height: AppTokens.space10),
             Text(
               title,
               textAlign: TextAlign.center,
@@ -510,7 +510,7 @@ class _NodesEmptyState extends StatelessWidget {
                 fontWeight: FontWeight.w700,
               ),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: AppTokens.space4),
             Text(
               body,
               textAlign: TextAlign.center,
@@ -521,7 +521,7 @@ class _NodesEmptyState extends StatelessWidget {
               ),
             ),
             if (actionLabel != null && onAction != null) ...[
-              const SizedBox(height: 12),
+              const SizedBox(height: AppTokens.space12),
               OutlinedButton.icon(
                 onPressed: onAction,
                 icon: const Icon(Icons.clear_rounded, size: 17),

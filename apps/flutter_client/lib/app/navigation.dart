@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import '../app/app_constants.dart';
 import '../app/app_strings.dart';
 import '../app/app_tokens.dart';
+import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
@@ -478,7 +479,7 @@ class _RailBrandHeader extends StatelessWidget {
               color: theme.colorScheme.onPrimary,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Text(
             p2wlanAppName,
             style: TextStyle(
@@ -545,17 +546,16 @@ class _RailItem extends StatelessWidget {
         child: InkWell(
           onTap: onTap,
           borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-          hoverColor: selected
-              ? null
-              : theme.colorScheme.surfaceContainerHighest.withValues(
-                  alpha: 0.55,
-                ),
+          hoverColor: selected ? null : P2WlanColors.of(context).hoverSurface,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppTokens.space10,
+              vertical: AppTokens.space8,
+            ),
             child: Row(
               children: [
                 Icon(icon, size: 20, color: foreground),
-                const SizedBox(width: 10),
+                const SizedBox(width: AppTokens.space10),
                 Expanded(
                   child: Text(
                     label,
@@ -622,12 +622,12 @@ class _ShellStatusActions extends StatelessWidget {
               tooltip: strings.refresh,
               onPressed: statusStore.refreshing ? null : statusStore.refresh,
               icon: statusStore.refreshing
-                  ? const SizedBox.square(
+                  ? SizedBox.square(
                       dimension: 16,
                       child: CircularProgressIndicator(
                         strokeWidth: 2,
                         valueColor: AlwaysStoppedAnimation<Color>(
-                          AppTokens.colorTextMuted,
+                          P2WlanColors.of(context).textMuted,
                         ),
                       ),
                     )

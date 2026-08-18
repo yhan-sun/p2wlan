@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
@@ -178,22 +179,22 @@ class _OnboardingPageState extends State<OnboardingPage> {
                       Icon(
                         Icons.router_rounded,
                         size: 40,
-                        color: AppTokens.colorAccent,
+                        color: Theme.of(context).colorScheme.primary,
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: AppTokens.space16),
                       Text(
                         isZh
                             ? '把这台设备接入 P2WLAN'
                             : 'Connect this device to P2WLAN',
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: AppTokens.space8),
                       Text(
                         isZh
                             ? '几步完成本地节点设置；中途退出可随时从这里继续。'
                             : 'A few steps to set up your local node; you can resume here anytime.',
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: AppTokens.colorTextMuted,
+                          color: P2WlanColors.of(context).textMuted,
                         ),
                       ),
                       const SizedBox(height: 28),
@@ -212,13 +213,15 @@ class _OnboardingPageState extends State<OnboardingPage> {
                         preflight: _preflight,
                       ),
                       if (_error != null) ...[
-                        const SizedBox(height: 16),
+                        const SizedBox(height: AppTokens.space16),
                         Text(
                           _error!,
-                          style: const TextStyle(color: Colors.redAccent),
+                          style: TextStyle(
+                            color: P2WlanColors.of(context).dangerText,
+                          ),
                         ),
                       ],
-                      const SizedBox(height: 24),
+                      const SizedBox(height: AppTokens.space24),
                       _PrimaryAction(
                         step: step,
                         isZh: isZh,
@@ -335,10 +338,11 @@ class _StepDot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     final color = switch (state) {
-      _DotState.done => AppTokens.colorAccent,
-      _DotState.current => AppTokens.colorAccent,
-      _DotState.pending => AppTokens.colorTextMuted,
+      _DotState.done => c.relay,
+      _DotState.current => c.relay,
+      _DotState.pending => c.textMuted,
     };
     return Column(
       children: [
@@ -347,7 +351,7 @@ class _StepDot extends StatelessWidget {
           size: 20,
           color: color,
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: AppTokens.space6),
         Text(
           label,
           style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color),
@@ -416,20 +420,20 @@ class _StepBody extends StatelessWidget {
                 dimension: 16,
                 child: CircularProgressIndicator(strokeWidth: 2),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: AppTokens.space10),
             ],
             Text(title, style: Theme.of(context).textTheme.titleMedium),
           ],
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: AppTokens.space6),
         Text(
           subtitle,
-          style: Theme.of(
-            context,
-          ).textTheme.bodyMedium?.copyWith(color: AppTokens.colorTextMuted),
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            color: P2WlanColors.of(context).textMuted,
+          ),
         ),
         if (step == OnboardingStep.permission && preflight != null) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: AppTokens.space12),
           _PermissionSummary(preflight: preflight!),
         ],
       ],
@@ -447,15 +451,16 @@ class _PermissionSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     final tone = preflight.bad
-        ? Colors.redAccent
+        ? c.dangerText
         : preflight.warn
-        ? Colors.orange
-        : AppTokens.colorAccent;
+        ? c.probing
+        : c.relay;
     final label = preflight.satisfied ? '权限已满足' : '需要授权';
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(AppTokens.space12),
       decoration: BoxDecoration(
         color: AppTokens.colorSurfaceSubtle,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),
@@ -467,7 +472,7 @@ class _PermissionSummary extends StatelessWidget {
           Row(
             children: [
               Icon(Icons.security_rounded, size: 16, color: tone),
-              const SizedBox(width: 6),
+              const SizedBox(width: AppTokens.space6),
               Text(
                 '$label · ${preflight.canCreateTun == true
                     ? '可创建 TUN'
@@ -482,13 +487,13 @@ class _PermissionSummary extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: AppTokens.space6),
           Text(
             preflight.recommendedAction,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12,
               height: 1.4,
-              color: AppTokens.colorTextSecondary,
+              color: P2WlanColors.of(context).textSecondary,
             ),
           ),
         ],
@@ -533,10 +538,10 @@ class _PrimaryAction extends StatelessWidget {
             dimension: 16,
             child: CircularProgressIndicator(strokeWidth: 2),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Text(
             isZh ? '正在连接…' : 'Connecting…',
-            style: TextStyle(color: AppTokens.colorTextMuted),
+            style: TextStyle(color: P2WlanColors.of(context).textMuted),
           ),
           const Spacer(),
         ] else ...[

@@ -73,7 +73,7 @@ class _NodeToolbar extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: AppTokens.space10),
             PopupMenuButton<_NodeSort>(
               key: const Key('nodes-sort-button'),
               tooltip: _sortLabel(strings, sort),
@@ -106,7 +106,7 @@ class _NodeToolbar extends StatelessWidget {
                       size: 18,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
-                    const SizedBox(width: 6),
+                    const SizedBox(width: AppTokens.space6),
                     Text(
                       _sortLabel(strings, sort),
                       style: TextStyle(
@@ -121,7 +121,7 @@ class _NodeToolbar extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: AppTokens.space10),
         LayoutBuilder(
           builder: (context, constraints) {
             final chipsRow = SingleChildScrollView(
@@ -141,13 +141,17 @@ class _NodeToolbar extends StatelessWidget {
             if (constraints.maxWidth < 560) {
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
-                children: [chipsRow, const SizedBox(height: 8), summary],
+                children: [
+                  chipsRow,
+                  const SizedBox(height: AppTokens.space8),
+                  summary,
+                ],
               );
             }
             return Row(
               children: [
                 Expanded(child: chipsRow),
-                const SizedBox(width: 12),
+                const SizedBox(width: AppTokens.space12),
                 summary,
               ],
             );

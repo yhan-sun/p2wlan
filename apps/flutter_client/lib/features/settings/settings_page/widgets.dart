@@ -13,13 +13,19 @@ class _ResponsiveFieldRow extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         if (constraints.maxWidth < 560) {
-          return Column(children: [first, const SizedBox(height: 12), second]);
+          return Column(
+            children: [
+              first,
+              const SizedBox(height: AppTokens.space12),
+              second,
+            ],
+          );
         }
         return Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(child: first),
-            const SizedBox(width: 12),
+            const SizedBox(width: AppTokens.space12),
             Expanded(child: second),
           ],
         );
@@ -105,7 +111,7 @@ class _SettingsSection extends StatelessWidget {
             ),
           ),
         ],
-        const SizedBox(height: 10),
+        const SizedBox(height: AppTokens.space10),
         Container(
           decoration: BoxDecoration(
             color: theme.colorScheme.surface,
@@ -176,7 +182,7 @@ class _SettingsRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 labelColumn,
-                const SizedBox(height: 8),
+                const SizedBox(height: AppTokens.space8),
                 SizedBox(width: double.infinity, child: control),
               ],
             ),
@@ -188,7 +194,7 @@ class _SettingsRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Expanded(child: labelColumn),
-              const SizedBox(width: 16),
+              const SizedBox(width: AppTokens.space16),
               SizedBox(width: 260, child: control),
             ],
           ),
@@ -234,7 +240,10 @@ class _SettingsDisclosure extends StatelessWidget {
             borderRadius: BorderRadius.circular(AppTokens.radiusLg),
             onTap: onToggle,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space16,
+                vertical: AppTokens.space14,
+              ),
               decoration: BoxDecoration(
                 color: theme.colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(AppTokens.radiusLg),
@@ -268,7 +277,7 @@ class _SettingsDisclosure extends StatelessWidget {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: AppTokens.space12),
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -280,7 +289,7 @@ class _SettingsDisclosure extends StatelessWidget {
                           color: theme.colorScheme.primary,
                         ),
                       ),
-                      const SizedBox(width: 4),
+                      const SizedBox(width: AppTokens.space4),
                       Icon(
                         open ? Icons.expand_less : Icons.expand_more,
                         size: 20,
@@ -327,7 +336,7 @@ class _ErrorBanner extends StatelessWidget {
         border: Border.all(color: theme.colorScheme.error),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(AppTokens.space12),
         child: Text(
           message,
           style: TextStyle(
@@ -363,7 +372,7 @@ class _PendingRestartNotice extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(AppTokens.space12),
         child: LayoutBuilder(
           builder: (context, constraints) {
             final message = Column(
@@ -406,13 +415,17 @@ class _PendingRestartNotice extends StatelessWidget {
             if (constraints.maxWidth < 540) {
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [message, const SizedBox(height: 10), action],
+                children: [
+                  message,
+                  const SizedBox(height: AppTokens.space10),
+                  action,
+                ],
               );
             }
             return Row(
               children: [
                 Expanded(child: message),
-                const SizedBox(width: 14),
+                const SizedBox(width: AppTokens.space14),
                 action,
               ],
             );

@@ -82,20 +82,20 @@ class _PlatformPanelState extends State<_PlatformPanel> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: AppTokens.space4),
                     for (final check in permission.checks)
                       _PermissionCheckRow(check: check),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: AppTokens.space10),
                     Text(
                       permission.recommendedAction,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 13,
                         height: 1.4,
-                        color: AppTokens.colorTextSecondary,
+                        color: themeTextSecondary(context),
                       ),
                     ),
                     if (permission.sudoCommand != null) ...[
-                      const SizedBox(height: 8),
+                      const SizedBox(height: AppTokens.space8),
                       _CommandLine(command: permission.sudoCommand!),
                     ],
                   ],
@@ -142,10 +142,10 @@ class _PermissionCheckRow extends StatelessWidget {
               const SizedBox(height: 2),
               Text(
                 check.detail,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 12,
                   height: 1.35,
-                  color: AppTokens.colorTextSecondary,
+                  color: themeTextSecondary(context),
                 ),
               ),
             ],
@@ -155,7 +155,7 @@ class _PermissionCheckRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 StatusBadge(label: label, tone: tone),
-                const SizedBox(height: 6),
+                const SizedBox(height: AppTokens.space6),
                 details,
               ],
             );
@@ -167,7 +167,7 @@ class _PermissionCheckRow extends StatelessWidget {
                 width: 76,
                 child: StatusBadge(label: label, tone: tone),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: AppTokens.space10),
               Expanded(child: details),
             ],
           );
@@ -187,7 +187,7 @@ class _CommandLine extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(AppTokens.space10),
       decoration: BoxDecoration(
         color: AppTokens.colorConsoleBg,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),

@@ -72,7 +72,7 @@ class _IssueRow extends StatelessWidget {
               size: 18,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

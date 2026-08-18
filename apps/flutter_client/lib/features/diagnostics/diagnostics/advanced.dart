@@ -32,7 +32,10 @@ class _AdvancedDisclosure extends StatelessWidget {
             borderRadius: BorderRadius.circular(AppTokens.radiusLg),
             onTap: onToggle,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space16,
+                vertical: AppTokens.space14,
+              ),
               decoration: BoxDecoration(
                 color: theme.colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(AppTokens.radiusLg),
@@ -64,7 +67,7 @@ class _AdvancedDisclosure extends StatelessWidget {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: AppTokens.space12),
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -76,7 +79,7 @@ class _AdvancedDisclosure extends StatelessWidget {
                           color: theme.colorScheme.primary,
                         ),
                       ),
-                      const SizedBox(width: 4),
+                      const SizedBox(width: AppTokens.space4),
                       Icon(
                         open ? Icons.expand_less : Icons.expand_more,
                         size: 20,

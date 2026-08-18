@@ -32,7 +32,7 @@ class _OverviewCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppTokens.radiusLg),
         border: Border.all(color: colors.border),
       ),
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(AppTokens.space16),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -40,7 +40,7 @@ class _OverviewCard extends StatelessWidget {
             padding: const EdgeInsets.only(top: 1),
             child: Icon(icon, size: 26, color: colors.text),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: AppTokens.space12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
