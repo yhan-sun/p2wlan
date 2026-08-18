@@ -62,11 +62,14 @@ class DiagnosticsModel {
 
 /// Builds the complete user-facing diagnostics model from store facts.
 ///
-/// State rules (never inferred from virtual IP / peer counts / relay alone):
-///  - stale: an existing snapshot is older than the freshness window;
+/// State rules (never inferred from virtual IP / peer counts / relay alone),
+/// evaluated in priority order:
 ///  - unavailable: no snapshot and the health endpoint is unreachable;
-///  - attention: any actionable issue (reauth, fatal task, disconnected
-///    control plane, status unavailable, path warnings, ...);
+///  - attention (bad): any bad actionable issue (reauth, fatal task, ...)
+///    outranks staleness so it is never hidden behind a stale banner;
+///  - stale: an existing snapshot is older than the freshness window;
+///  - attention: any remaining actionable issue (control plane disconnected,
+///    status unavailable, path warnings, ...);
 ///  - healthy: nothing needs the user's attention.
 DiagnosticsModel buildDiagnosticsModel({
   required AppStrings strings,
@@ -89,12 +92,14 @@ DiagnosticsModel buildDiagnosticsModel({
   );
 
   final DiagnosticOverall overall;
-  if (snapshotStale && snapshot != null) {
-    overall = DiagnosticOverall.stale;
-  } else if (!healthReachable && snapshot == null) {
+  if (!healthReachable && snapshot == null) {
     overall = DiagnosticOverall.unavailable;
   } else if (issues.any((issue) => issue.severity == DiagnosticSeverity.bad)) {
+    // Actionable bad issues outrank staleness: reauth / fatal task etc. must
+    // surface as "needs attention", never be hidden behind a stale banner.
     overall = DiagnosticOverall.attention;
+  } else if (snapshotStale && snapshot != null) {
+    overall = DiagnosticOverall.stale;
   } else if (issues.isNotEmpty) {
     overall = DiagnosticOverall.attention;
   } else {
@@ -136,22 +141,30 @@ List<DiagnosticCheck> _buildChecks({
 }) {
   if (snapshot == null && !healthReachable) return const [];
 
+  // Without a status snapshot we only know the health endpoint is reachable,
+  // which is a fact, not "running normally": label it as such.
   final health = snapshot?.health;
-  final serviceSeverity =
-      health == null || health.status.toLowerCase() == 'healthy'
-      ? DiagnosticSeverity.good
-      : _fatalServiceStatus(health.status)
-      ? DiagnosticSeverity.bad
-      : DiagnosticSeverity.warning;
-  final serviceCheck = DiagnosticCheck(
-    title: strings.p2wlanService,
-    value: !healthReachable
-        ? strings.unavailable
-        : serviceSeverity == DiagnosticSeverity.good
-        ? strings.runningNormally
-        : strings.needsAction,
-    severity: !healthReachable ? DiagnosticSeverity.bad : serviceSeverity,
-  );
+  final serviceCheck = health == null
+      ? DiagnosticCheck(
+          title: strings.p2wlanService,
+          value: !healthReachable ? strings.unavailable : strings.reachable,
+          severity: !healthReachable
+              ? DiagnosticSeverity.bad
+              : DiagnosticSeverity.neutral,
+        )
+      : health.status.toLowerCase() == 'healthy'
+      ? DiagnosticCheck(
+          title: strings.p2wlanService,
+          value: strings.runningNormally,
+          severity: DiagnosticSeverity.good,
+        )
+      : DiagnosticCheck(
+          title: strings.p2wlanService,
+          value: strings.needsAction,
+          severity: _fatalServiceStatus(health.status)
+              ? DiagnosticSeverity.bad
+              : DiagnosticSeverity.warning,
+        );
 
   final controlCheck = snapshot == null
       ? DiagnosticCheck(

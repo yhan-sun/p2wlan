@@ -196,6 +196,10 @@ void _registerDiagnosticsTests() {
       findsOneWidget,
     );
     expect(find.text('P2WLAN is running normally'), findsNothing);
+    // With no status snapshot the service check reports the reachable fact
+    // instead of claiming full health.
+    expect(find.text('reachable'), findsOneWidget);
+    expect(find.text('Running normally'), findsNothing);
     expect(find.textContaining('status exploded'), findsNothing);
     expect(tester.takeException(), isNull);
   });
@@ -227,6 +231,34 @@ void _registerDiagnosticsTests() {
     );
     expect(find.text('Running normally'), findsOneWidget);
     expect(find.text('Try refreshing the status.'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('bad issues outrank staleness in the overview', (tester) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final reauth = _mutateSnapshot(snapshot, (raw) {
+      raw['health']['reauth_required'] = true;
+      return raw;
+    });
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: reauth),
+        enableFreshnessTimer: true,
+        maxSnapshotAge: const Duration(milliseconds: 300),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+    await tester.pump(const Duration(milliseconds: 600));
+
+    await tester.pumpWidget(
+      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
+    );
+
+    // Stale data plus a real bad issue: attention wins, never the stale hero.
+    expect(find.text('P2WLAN needs attention'), findsOneWidget);
+    expect(find.text('Diagnostics data is stale'), findsNothing);
+    expect(find.text('Re-authentication required'), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 
