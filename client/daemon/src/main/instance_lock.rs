@@ -38,12 +38,20 @@ impl DaemonInstanceLock {
 
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error)
-                if error.kind() == ErrorKind::WouldBlock
-                    || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied) =>
-            {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 return Err(DaemonError::Config(format!(
                     "another P2WLAN daemon is already running for config {}",
+                    config_path.display()
+                )));
+            }
+            #[cfg(windows)]
+            Err(error) => {
+                // Windows maps LockFileEx contention and some sharing
+                // violations to platform-specific errors instead of
+                // WouldBlock. The safe interpretation is still "an owner is
+                // present": fail closed before any session file is touched.
+                return Err(DaemonError::Config(format!(
+                    "another P2WLAN daemon is already running for config {} ({error})",
                     config_path.display()
                 )));
             }
