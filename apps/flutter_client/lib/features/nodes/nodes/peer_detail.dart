@@ -49,9 +49,10 @@ class _DetailLine extends StatelessWidget {
 }
 
 class _PathBadge extends StatelessWidget {
-  const _PathBadge({required this.peer});
+  const _PathBadge({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
+  final AppStrings strings;
 
   @override
   Widget build(BuildContext context) {
@@ -63,10 +64,7 @@ class _PathBadge extends StatelessWidget {
             'direct_trial' || 'probing' => StatusTone.warn,
             _ => StatusTone.neutral,
           };
-    return StatusBadge(
-      label: _connectionLabel(stringsOf(context), peer),
-      tone: tone,
-    );
+    return StatusBadge(label: _connectionLabel(strings, peer), tone: tone);
   }
 }
 
@@ -232,7 +230,7 @@ class _DetailHeader extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 10),
-        _PathBadge(peer: peer),
+        _PathBadge(peer: peer, strings: strings),
       ],
     );
   }

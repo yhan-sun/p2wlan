@@ -317,7 +317,7 @@ class _RowContent extends StatelessWidget {
           width: 116,
           child: Align(
             alignment: Alignment.centerRight,
-            child: _PathBadge(peer: peer),
+            child: _PathBadge(peer: peer, strings: strings),
           ),
         ),
         const SizedBox(width: 4),
@@ -365,7 +365,7 @@ class _CompactRowContent extends StatelessWidget {
             Expanded(
               child: Align(
                 alignment: Alignment.centerRight,
-                child: _PathBadge(peer: peer),
+                child: _PathBadge(peer: peer, strings: strings),
               ),
             ),
           ],

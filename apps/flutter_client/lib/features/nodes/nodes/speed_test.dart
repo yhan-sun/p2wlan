@@ -122,7 +122,7 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  _PathBadge(peer: widget.peer),
+                  _PathBadge(peer: widget.peer, strings: widget.strings),
                   IconButton(
                     tooltip: strings.close,
                     onPressed: () => Navigator.of(context).pop(),

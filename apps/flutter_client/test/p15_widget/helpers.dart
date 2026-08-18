@@ -184,15 +184,16 @@ class _FakeControlApi extends ControlApi {
 }
 
 class _TestApp extends StatelessWidget {
-  const _TestApp({required this.child});
+  const _TestApp({required this.child, this.strings});
 
   final Widget child;
+  final AppStrings? strings;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       home: AppStringsScope(
-        strings: AppStrings.fromCode(AppLanguage.english.code),
+        strings: strings ?? AppStrings.fromCode(AppLanguage.english.code),
         child: ScaffoldMessenger(child: Scaffold(body: child)),
       ),
     );

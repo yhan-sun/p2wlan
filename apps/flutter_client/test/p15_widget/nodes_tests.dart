@@ -1071,6 +1071,131 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('node-row-node-ghost')), findsNothing);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'Nodes badges inside detail surfaces use explicit locale strings',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+
+      // English scope: the badge must stay English inside the dialog route even
+      // though that route is outside the home AppStringsScope (whose fallback is
+      // the default language, zh-Hans).
+      final enStores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(enStores.dispose);
+      await enStores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: NodesPage(
+            key: const ValueKey('nodes-badge-en'),
+            settingsStore: enStores.settingsStore,
+            statusStore: enStores.statusStore,
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('node-row-node-direct')));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      final enBadge = tester.widget<StatusBadge>(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(StatusBadge),
+        ),
+      );
+      expect(enBadge.label, 'Direct');
+      await tester.tap(find.byTooltip('Cancel'));
+      await tester.pumpAndSettle();
+
+      // Chinese scope: explicit zh strings must reach the dialog badge.
+      final zhStores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(zhStores.dispose);
+      await zhStores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          strings: AppStrings.fromCode('zh'),
+          child: NodesPage(
+            key: const ValueKey('nodes-badge-zh'),
+            settingsStore: zhStores.settingsStore,
+            statusStore: zhStores.statusStore,
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('node-row-node-direct')));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      final zhBadge = tester.widget<StatusBadge>(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(StatusBadge),
+        ),
+      );
+      expect(zhBadge.label, '直连');
+      expect(
+        find.descendant(of: find.byType(Dialog), matching: find.text('Direct')),
+        findsNothing,
+      );
+      await tester.tap(find.byTooltip('取消'));
+      await tester.pumpAndSettle();
+
+      // Verified relay peer keeps its localized label inside the dialog too.
+      final relayRow = find.byKey(const Key('node-row-node-relay'));
+      await tester.ensureVisible(relayRow);
+      await tester.pumpAndSettle();
+      await tester.tap(relayRow);
+      await tester.pumpAndSettle();
+      final zhRelayBadge = tester.widget<StatusBadge>(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(StatusBadge),
+        ),
+      );
+      expect(zhRelayBadge.label, '中继');
+      await tester.tap(find.byTooltip('取消'));
+      await tester.pumpAndSettle();
+
+      // Compact mobile detail route preserves the explicit locale strings.
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      await tester.pumpWidget(
+        _TestApp(
+          strings: AppStrings.fromCode('zh'),
+          child: NodesPage(
+            key: const ValueKey('nodes-badge-zh-mobile'),
+            settingsStore: zhStores.settingsStore,
+            statusStore: zhStores.statusStore,
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('node-row-node-direct')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+      final mobileBadge = tester.widget<StatusBadge>(
+        find.descendant(
+          of: find.byKey(const Key('nodes-mobile-detail')),
+          matching: find.byType(StatusBadge),
+        ),
+      );
+      expect(mobileBadge.label, '直连');
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('nodes-mobile-detail')),
+          matching: find.text('Direct'),
+        ),
+        findsNothing,
+      );
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+      expect(tester.takeException(), isNull);
+    },
+  );
 }
 
 /// Three peers for search coverage: Laptop / NAS / Office PC with distinct
