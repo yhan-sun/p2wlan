@@ -91,7 +91,7 @@ class _PeerDetailsContent extends StatelessWidget {
   final bool busy;
   final Future<void> Function(String value, String key)? onCopy;
   final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<void> Function(PeerSnapshot peer)? onDelete;
+  final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
 
   @override
@@ -338,7 +338,7 @@ class _DetailActions extends StatelessWidget {
   final bool busy;
   final Future<void> Function(String value, String key)? onCopy;
   final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<void> Function(PeerSnapshot peer)? onDelete;
+  final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
 
   @override
@@ -434,7 +434,7 @@ class _PeerDetailPane extends StatelessWidget {
   final String? busyPeerId;
   final Future<void> Function(String value, String key)? onCopy;
   final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<void> Function(PeerSnapshot peer)? onDelete;
+  final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
 
   @override
@@ -489,7 +489,7 @@ class _PeerDetailsDialog extends StatelessWidget {
   final String? busyPeerId;
   final Future<void> Function(String value, String key)? onCopy;
   final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<void> Function(PeerSnapshot peer)? onDelete;
+  final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
 
   @override
@@ -557,7 +557,12 @@ class _PeerDetailsDialog extends StatelessWidget {
                       busy: busyPeerId == peer.nodeId,
                       onCopy: onCopy,
                       onEdit: onEdit,
-                      onDelete: onDelete,
+                      onDelete: onDelete == null
+                          ? null
+                          : (selected) => _closeDetailOnRemoved(
+                              context,
+                              () => onDelete!(selected),
+                            ),
                       onSpeedTest: onSpeedTest,
                     ),
                   ),
@@ -575,6 +580,7 @@ class _PeerDetailsDialog extends StatelessWidget {
 class _MobilePeerDetails extends StatelessWidget {
   const _MobilePeerDetails({
     required this.peer,
+    required this.strings,
     this.onCopy,
     this.onEdit,
     this.onDelete,
@@ -582,14 +588,14 @@ class _MobilePeerDetails extends StatelessWidget {
   });
 
   final PeerSnapshot peer;
+  final AppStrings strings;
   final Future<void> Function(String value, String key)? onCopy;
+  final Future<bool> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<void> Function(PeerSnapshot peer)? onDelete;
   final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
 
   @override
   Widget build(BuildContext context) {
-    final strings = stringsOf(context);
     return Scaffold(
       key: const Key('nodes-mobile-detail'),
       appBar: AppBar(
@@ -608,7 +614,12 @@ class _MobilePeerDetails extends StatelessWidget {
               strings: strings,
               onCopy: onCopy,
               onEdit: onEdit,
-              onDelete: onDelete,
+              onDelete: onDelete == null
+                  ? null
+                  : (selected) => _closeDetailOnRemoved(
+                      context,
+                      () => onDelete!(selected),
+                    ),
               onSpeedTest: onSpeedTest,
             ),
           ],
@@ -616,4 +627,18 @@ class _MobilePeerDetails extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Closes the enclosing detail surface (dialog or mobile route) only when the
+/// remove operation actually succeeded. Cancelling or a failed deletion keeps
+/// the detail open. Returns whether the device was removed.
+Future<bool> _closeDetailOnRemoved(
+  BuildContext context,
+  Future<bool> Function() remove,
+) async {
+  final removed = await remove();
+  if (removed && context.mounted) {
+    Navigator.of(context).pop();
+  }
+  return removed;
 }

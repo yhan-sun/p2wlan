@@ -27,7 +27,7 @@ List<_PeerGroup> _buildPeerGroups(
     if (attention.isNotEmpty)
       _PeerGroup(
         title: strings.attentionDevices,
-        tone: StatusTone.bad,
+        tone: StatusTone.warn,
         peers: attention,
       ),
     if (direct.isNotEmpty)
@@ -39,7 +39,7 @@ List<_PeerGroup> _buildPeerGroups(
     if (relay.isNotEmpty)
       _PeerGroup(
         title: strings.relayDevices,
-        tone: StatusTone.warn,
+        tone: StatusTone.neutral,
         peers: relay,
       ),
     if (offline.isNotEmpty)

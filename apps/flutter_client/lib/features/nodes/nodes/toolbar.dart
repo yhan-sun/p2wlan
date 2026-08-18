@@ -27,7 +27,9 @@ class _NodeToolbar extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = stringsOf(context);
     final theme = Theme.of(context);
-    final onlineCount = allPeers.where((peer) => peer.online).length;
+    // Single source of truth for the "online" semantic: the same predicate the
+    // Online filter chip uses, so summary and chip can never disagree.
+    final onlineCount = _filterCount(allPeers, _NodeFilter.online);
     final chips = _NodeFilter.values.map((item) {
       return Padding(
         padding: const EdgeInsets.only(right: 8),

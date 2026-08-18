@@ -33,18 +33,23 @@ class NodesPage extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.showHeader = true,
+    this.controlApi,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final bool showHeader;
 
+  /// Control-plane API override (primarily for tests); defaults to a real
+  /// [ControlApi].
+  final ControlApi? controlApi;
+
   @override
   State<NodesPage> createState() => _NodesPageState();
 }
 
 class _NodesPageState extends State<NodesPage> {
-  final _controlApi = ControlApi();
+  late final ControlApi _controlApi;
   final _hiddenPeerIds = <String>{};
   final _searchController = TextEditingController();
   final _searchFocusNode = FocusNode();
@@ -57,6 +62,7 @@ class _NodesPageState extends State<NodesPage> {
   @override
   void initState() {
     super.initState();
+    _controlApi = widget.controlApi ?? ControlApi();
     widget.statusStore.addListener(_pruneHiddenPeers);
   }
 
@@ -122,7 +128,7 @@ class _NodesPageState extends State<NodesPage> {
               _applySearch(allPeers, query),
               _sort,
             ).where((peer) => _filterMatches(_filter, peer)).toList();
-            final selectedPeer = _resolveSelectedPeer(allPeers, visiblePeers);
+            final selectedPeer = _resolveSelectedPeer(visiblePeers);
             final settings = widget.settingsStore.settings;
             return PageScaffold(
               title: stringsOf(context).nodes,
@@ -249,13 +255,14 @@ class _NodesPageState extends State<NodesPage> {
     );
   }
 
-  PeerSnapshot? _resolveSelectedPeer(
-    List<PeerSnapshot> allPeers,
-    List<PeerSnapshot> visiblePeers,
-  ) {
+  /// Derived selection: the effective detail peer must always belong to the
+  /// current search/filter results. `_selectedPeerId` stays as a persistent
+  /// preference so clearing the filter can restore it, but a hidden peer is
+  /// never rendered as selected.
+  PeerSnapshot? _resolveSelectedPeer(List<PeerSnapshot> visiblePeers) {
     final id = _selectedPeerId;
     if (id != null) {
-      for (final peer in allPeers) {
+      for (final peer in visiblePeers) {
         if (peer.nodeId == id) return peer;
       }
     }
@@ -382,8 +389,11 @@ class _NodesPageState extends State<NodesPage> {
     }
   }
 
-  Future<void> _deletePeer(PeerSnapshot peer) async {
-    if (_busyPeerId != null) return;
+  /// Removes a device from the control plane. Returns true only when the
+  /// control-plane deletion succeeded and the peer is now hidden; false when
+  /// the user cancelled or the deletion failed.
+  Future<bool> _deletePeer(PeerSnapshot peer) async {
+    if (_busyPeerId != null) return false;
     final strings = stringsOf(context);
     final confirmed = await showDialog<bool>(
       context: context,
@@ -407,7 +417,7 @@ class _NodesPageState extends State<NodesPage> {
         ],
       ),
     );
-    if (confirmed != true) return;
+    if (confirmed != true) return false;
     final settings = widget.settingsStore.settings;
     setState(() => _busyPeerId = peer.nodeId);
     try {
@@ -418,15 +428,17 @@ class _NodesPageState extends State<NodesPage> {
       );
       if (mounted) setState(() => _hiddenPeerIds.add(peer.nodeId));
       await widget.statusStore.refresh();
-      if (!mounted) return;
+      if (!mounted) return true;
       _showSnack(
         strings.isZh
             ? '设备已移除：${peer.displayName}'
             : 'Device removed: ${peer.displayName}',
       );
+      return true;
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted) return false;
       _showSnack(error.toString());
+      return false;
     } finally {
       if (mounted && _busyPeerId == peer.nodeId) {
         setState(() => _busyPeerId = null);
@@ -444,6 +456,7 @@ class _NodesPageState extends State<NodesPage> {
           fullscreenDialog: true,
           builder: (_) => _MobilePeerDetails(
             peer: peer,
+            strings: stringsOf(context),
             onCopy: _copy,
             onEdit: _editPeer,
             onDelete: _deletePeer,

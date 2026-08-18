@@ -166,6 +166,23 @@ class _FakeDaemonController extends DaemonController {
   }
 }
 
+class _FakeControlApi extends ControlApi {
+  _FakeControlApi({this.failDelete = false});
+
+  final bool failDelete;
+  var deleteCalls = 0;
+
+  @override
+  Future<void> deleteDevice({
+    required String controlServer,
+    required String authToken,
+    required String deviceId,
+  }) async {
+    deleteCalls += 1;
+    if (failDelete) throw const ControlApiException('fake delete failed');
+  }
+}
+
 class _TestApp extends StatelessWidget {
   const _TestApp({required this.child});
 

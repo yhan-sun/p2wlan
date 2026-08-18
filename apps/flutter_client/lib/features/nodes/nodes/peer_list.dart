@@ -23,7 +23,7 @@ class _PeerList extends StatelessWidget {
   final bool compact;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onEdit;
-  final Future<void> Function(PeerSnapshot peer) onDelete;
+  final Future<bool> Function(PeerSnapshot peer) onDelete;
   final Future<void> Function(PeerSnapshot peer) onSpeedTest;
   final ValueChanged<PeerSnapshot> onTap;
 
@@ -147,7 +147,7 @@ class _PeerListRow extends StatelessWidget {
   final bool busy;
   final Future<void> Function(String value, String key) onCopy;
   final Future<void> Function(PeerSnapshot peer) onEdit;
-  final Future<void> Function(PeerSnapshot peer) onDelete;
+  final Future<bool> Function(PeerSnapshot peer) onDelete;
   final Future<void> Function(PeerSnapshot peer) onSpeedTest;
   final ValueChanged<PeerSnapshot> onTap;
 
