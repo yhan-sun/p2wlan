@@ -55,6 +55,7 @@ impl DaemonInstanceLock {
                     config_path.display()
                 )));
             }
+            #[cfg(not(windows))]
             Err(error) => {
                 return Err(DaemonError::Config(format!(
                     "failed to lock daemon instance file {}: {error}",
