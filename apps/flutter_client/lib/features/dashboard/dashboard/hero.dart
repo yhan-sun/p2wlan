@@ -58,9 +58,11 @@ class _NetworkHero extends StatelessWidget {
       ],
     );
 
-    // Full stop guidance only when we can start the daemon; otherwise
-    // (mobile, or health-up/status-down) the state is unavailable.
-    final showStartGuide = canControlLocalDaemon && !daemonAvailable;
+    // Full stop guidance only when the network is truly stopped and this device
+    // can start the daemon; unavailable (health up / status down) and mobile
+    // get the "unavailable" message instead.
+    final showStartGuide =
+        status == _NetworkStatus.stopped && canControlLocalDaemon;
     final infoBlock = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -206,14 +208,26 @@ class _HeroCounts extends StatelessWidget {
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         _HeroCount(
+          key: const Key('dashboard-count-online'),
           label: strings.onlineDevices,
           value: counts.online,
           color: good,
         ),
-        _HeroCount(label: strings.direct, value: counts.direct, color: good),
-        _HeroCount(label: strings.relay, value: counts.relay, color: relay),
+        _HeroCount(
+          key: const Key('dashboard-count-direct'),
+          label: strings.direct,
+          value: counts.direct,
+          color: good,
+        ),
+        _HeroCount(
+          key: const Key('dashboard-count-relay'),
+          label: strings.relay,
+          value: counts.relay,
+          color: relay,
+        ),
         if (counts.probing > 0)
           _HeroCount(
+            key: const Key('dashboard-count-probing'),
             label: strings.probing,
             value: counts.probing,
             color: warn,
@@ -225,6 +239,7 @@ class _HeroCounts extends StatelessWidget {
 
 class _HeroCount extends StatelessWidget {
   const _HeroCount({
+    super.key,
     required this.label,
     required this.value,
     required this.color,

@@ -52,6 +52,7 @@ class DashboardPage extends StatelessWidget {
         final status = _networkStatus(
           snapshot,
           snapshotStale: statusStore.snapshotStale,
+          healthReachable: statusStore.healthReachable,
         );
         final daemonAvailable =
             statusStore.daemonReachable || statusStore.statusReachable;
@@ -90,55 +91,56 @@ class DashboardPage extends StatelessWidget {
               onStopDaemon: statusStore.stopDaemon,
               onRefresh: statusStore.refresh,
             ),
-            const SizedBox(height: 16),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                if (constraints.maxWidth >= AppBreakpoints.expandedMinWidth) {
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+            if (snapshot != null) ...[
+              const SizedBox(height: 16),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  if (constraints.maxWidth >= AppBreakpoints.expandedMinWidth) {
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          flex: 2,
+                          child: _PeerOverview(
+                            peers: overviewPeers,
+                            totalPeers: peers.length,
+                            showMap:
+                                daemonAvailable && overviewPeers.isNotEmpty,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          flex: 1,
+                          child: _NetworkEnvironment(
+                            snapshot: snapshot,
+                            lastFetchedAt: statusStore.lastSuccessfulStatusAt,
+                            requestDuration: statusStore.lastRequestDuration,
+                            snapshotStale: statusStore.snapshotStale,
+                          ),
+                        ),
+                      ],
+                    );
+                  }
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Expanded(
-                        flex: 2,
-                        child: _PeerOverview(
-                          snapshot: snapshot,
-                          peers: overviewPeers,
-                          totalPeers: peers.length,
-                          showMap: daemonAvailable && overviewPeers.isNotEmpty,
-                        ),
+                      _PeerOverview(
+                        peers: overviewPeers,
+                        totalPeers: peers.length,
+                        showMap: false,
                       ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        flex: 1,
-                        child: _NetworkEnvironment(
-                          snapshot: snapshot,
-                          lastFetchedAt: statusStore.lastSuccessfulStatusAt,
-                          requestDuration: statusStore.lastRequestDuration,
-                          snapshotStale: statusStore.snapshotStale,
-                        ),
+                      const SizedBox(height: 16),
+                      _NetworkEnvironment(
+                        snapshot: snapshot,
+                        lastFetchedAt: statusStore.lastSuccessfulStatusAt,
+                        requestDuration: statusStore.lastRequestDuration,
+                        snapshotStale: statusStore.snapshotStale,
                       ),
                     ],
                   );
-                }
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    _PeerOverview(
-                      snapshot: snapshot,
-                      peers: overviewPeers,
-                      totalPeers: peers.length,
-                      showMap: false,
-                    ),
-                    const SizedBox(height: 16),
-                    _NetworkEnvironment(
-                      snapshot: snapshot,
-                      lastFetchedAt: statusStore.lastSuccessfulStatusAt,
-                      requestDuration: statusStore.lastRequestDuration,
-                      snapshotStale: statusStore.snapshotStale,
-                    ),
-                  ],
-                );
-              },
-            ),
+                },
+              ),
+            ],
             if (issueMessage != null && daemonAvailable) ...[
               const SizedBox(height: 16),
               _DashboardIssues(

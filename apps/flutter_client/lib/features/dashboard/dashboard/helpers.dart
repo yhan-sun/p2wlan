@@ -1,22 +1,40 @@
 part of '../dashboard_page.dart';
 
-/// Overall virtual-network state derived ONLY from the daemon's own signals
-/// (snapshot presence, staleness, health.status). No inferred states.
-enum _NetworkStatus { stopped, healthy, degraded, stale }
+/// Overall virtual-network state derived ONLY from the daemon's own reachability
+/// signals (health reachability, snapshot presence, staleness, health.status).
+/// No inferred states.
+enum _NetworkStatus {
+  /// No health endpoint and no snapshot: the local daemon is not running (or
+  /// entirely unreachable).
+  stopped,
+
+  /// Health is reachable but no snapshot is available (e.g. GET /status is
+  /// failing): the daemon is running but its runtime state is unavailable.
+  unavailable,
+
+  healthy,
+  degraded,
+  stale,
+}
 
 _NetworkStatus _networkStatus(
   DiagnosticsSnapshot? snapshot, {
   required bool snapshotStale,
+  required bool healthReachable,
 }) {
   if (snapshotStale) return _NetworkStatus.stale;
-  if (snapshot == null) return _NetworkStatus.stopped;
+  if (snapshot == null) {
+    return healthReachable
+        ? _NetworkStatus.unavailable
+        : _NetworkStatus.stopped;
+  }
   return snapshot.health.status.toLowerCase() == 'healthy'
       ? _NetworkStatus.healthy
       : _NetworkStatus.degraded;
 }
 
 StatusTone _networkStatusTone(_NetworkStatus status) => switch (status) {
-  _NetworkStatus.stopped => StatusTone.neutral,
+  _NetworkStatus.stopped || _NetworkStatus.unavailable => StatusTone.neutral,
   _NetworkStatus.healthy => StatusTone.good,
   _NetworkStatus.degraded || _NetworkStatus.stale => StatusTone.warn,
 };
@@ -28,6 +46,7 @@ String _networkStatusLabel(
 ) => switch (status) {
   _NetworkStatus.stopped =>
     canControlLocalDaemon ? strings.virtualNetworkStopped : strings.unavailable,
+  _NetworkStatus.unavailable => strings.unavailable,
   _NetworkStatus.healthy => strings.healthy,
   _NetworkStatus.degraded => strings.degraded,
   _NetworkStatus.stale => strings.stale,
@@ -169,7 +188,11 @@ String? _dashboardIssueMessage({
   if (!healthReachable && healthError != null) {
     return strings.statusMessage(healthError) ?? healthError;
   }
-  final status = _networkStatus(snapshot, snapshotStale: snapshotStale);
+  final status = _networkStatus(
+    snapshot,
+    snapshotStale: snapshotStale,
+    healthReachable: healthReachable,
+  );
   if (status != _NetworkStatus.healthy && error != null) {
     return strings.statusMessage(error) ?? error;
   }

@@ -29,6 +29,9 @@ void _registerDashboardTests() {
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
+    expect(find.text('Connection overview'), findsNothing);
+    expect(find.text('Network environment'), findsNothing);
+    expect(find.byKey(const Key('dashboard-connection-map')), findsNothing);
   });
 
   testWidgets('Dashboard shows stop only when daemon is reachable', (
@@ -117,9 +120,18 @@ void _registerDashboardTests() {
       ),
     );
 
+    // Health is up but no snapshot: this is "unavailable", never "stopped".
     expect(find.textContaining('GET /status failed'), findsWidgets);
+    expect(find.text('Virtual network stopped'), findsNothing);
+    expect(find.text('Unavailable'), findsOneWidget);
+    expect(find.text('Network status unavailable'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
+    // No snapshot means no empty data regions.
+    expect(find.text('Connection overview'), findsNothing);
+    expect(find.text('Network environment'), findsNothing);
+    expect(find.byKey(const Key('dashboard-connection-map')), findsNothing);
   });
 
   testWidgets('Dashboard keeps actions usable on narrow screens', (
@@ -217,6 +229,38 @@ void _registerDashboardTests() {
     expect(find.text('8 ms'), findsNothing);
   });
 
+  testWidgets('Dashboard shows exact hero connection counts', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    // 1 direct + 1 relay + 1 probing + 1 offline: offline never counts as
+    // online. Counts come from peer state, not from text occurrence counts.
+    expect(_heroCount(tester, 'dashboard-count-online'), '3');
+    expect(_heroCount(tester, 'dashboard-count-direct'), '1');
+    expect(_heroCount(tester, 'dashboard-count-relay'), '1');
+    expect(_heroCount(tester, 'dashboard-count-probing'), '1');
+    expect(find.byKey(const Key('dashboard-count-probing')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-count-online')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-count-direct')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-count-relay')), findsOneWidget);
+  });
+
   testWidgets('Dashboard hides daemon controls on mobile capabilities', (
     tester,
   ) async {
@@ -291,6 +335,85 @@ void _registerDashboardTests() {
     }
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
+  });
+
+  testWidgets('Connection map draws single peer with no dangling branches', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, [_fourPeerFixtures().first]);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+
+    // One peer on the left, none on the right: only the central trunk and the
+    // local row are drawn — no right-side branch for a missing peer.
+    final lines = _mapLinePairs(tester, const Size(120, 80));
+    expect(lines, {
+      (const Offset(60, 0), const Offset(60, 80)),
+      (const Offset(0, 40), const Offset(120, 40)),
+    });
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Connection map matches branches to existing peers', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fivePeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump();
+
+    // 5 peers -> 3 left rows + 2 right rows, local row in the middle. Row 2
+    // has a left peer but no right peer, so no right branch is drawn for it.
+    final lines = _mapLinePairs(tester, const Size(120, 240));
+    expect(lines, {
+      (const Offset(60, 0), const Offset(60, 240)),
+      (const Offset(0, 120), const Offset(120, 120)),
+      (const Offset(0, 40), const Offset(60, 40)),
+      (const Offset(60, 40), const Offset(120, 40)),
+      (const Offset(0, 200), const Offset(60, 200)),
+    });
+    expect(tester.takeException(), isNull);
   });
 }
 
@@ -441,6 +564,70 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
     relay: _emptyPathHealth(),
   );
   return [directPeer, relayPeer, probingPeer, offlinePeer];
+}
+
+/// Five peers (4 fixtures + one extra verified direct peer) to exercise map
+/// rows with asymmetric left/right occupancy (3 left, 2 right).
+List<Map<String, dynamic>> _fivePeerFixtures() {
+  return [
+    ..._fourPeerFixtures(),
+    _peerJson(
+      nodeId: 'node-direct2',
+      deviceName: 'direct-desktop',
+      virtualIp: '10.20.0.15',
+      online: true,
+      state: 'direct',
+      activePath: 'direct',
+      relayConfirmedEndpoint: null,
+      direct: {
+        'last_success_age_ms': 60,
+        'last_failure_age_ms': null,
+        'consecutive_failures': 0,
+        'last_error': null,
+        'last_error_code': null,
+        'latency_ms': 18,
+        'rtt_ewma_ms': null,
+      },
+      relay: _emptyPathHealth(),
+      currentPathSelection: {
+        'path': 'direct',
+        'direct_endpoint': '198.51.100.23:61113',
+        'reason_code': 'path_direct_confirmed',
+        'reason': 'public UDP pair confirmed',
+        'direct_confirmed': true,
+        'relay_hedged': false,
+      },
+    ),
+  ];
+}
+
+String _heroCount(WidgetTester tester, String key) {
+  final text = tester.widget<Text>(
+    find
+        .descendant(of: find.byKey(Key(key)), matching: find.byType(Text))
+        .first,
+  );
+  return text.data!;
+}
+
+/// Paints the connection-map painter from the widget tree onto a recording
+/// canvas and returns the drawn line segments as offset pairs.
+Set<(Offset, Offset)> _mapLinePairs(WidgetTester tester, Size paintSize) {
+  final customPaint = tester.widget<CustomPaint>(
+    find.descendant(
+      of: find.byKey(const Key('dashboard-connection-map')),
+      matching: find.byType(CustomPaint),
+    ),
+  );
+  final canvas = TestRecordingCanvas();
+  customPaint.painter!.paint(canvas, paintSize);
+  final lines = <(Offset, Offset)>{};
+  for (final recorded in canvas.invocations) {
+    if (recorded.invocation.memberName != #drawLine) continue;
+    final args = recorded.invocation.positionalArguments;
+    lines.add((args[0] as Offset, args[1] as Offset));
+  }
+  return lines;
 }
 
 DiagnosticsSnapshot _snapshotWithPeers(

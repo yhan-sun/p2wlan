@@ -65,6 +65,8 @@ class _ConnectionMap extends StatelessWidget {
                   painter: _ConnectionMapPainter(
                     rows: rows,
                     rowHeight: rowHeight,
+                    leftCount: leftCount,
+                    rightCount: rightCount,
                     lineColor: lineColor,
                   ),
                   child: Center(child: _MapLocalCell(label: strings.localNode)),
@@ -93,8 +95,12 @@ class _MapPeerCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final color = _peerStatusColor(context, peer);
+    final statusLabel = _peerStatusLabel(strings, peer);
+    final latency = _peerLatencyLabel(strings, peer);
+    final statusText = latency == '—' ? statusLabel : '$statusLabel · $latency';
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 260),
       child: Column(
@@ -112,12 +118,12 @@ class _MapPeerCell extends StatelessWidget {
               const SizedBox(width: 6),
               Flexible(
                 child: Text(
-                  peer.displayName,
+                  statusText,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color: theme.colorScheme.onSurface,
-                    fontSize: 12.5,
+                    color: color,
+                    fontSize: 12,
                     fontWeight: FontWeight.w600,
                     height: 1.2,
                   ),
@@ -129,15 +135,27 @@ class _MapPeerCell extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.only(left: 14),
             child: Text(
-              dash(peer.virtualIp),
+              peer.displayName,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontSize: 11,
+                color: theme.colorScheme.onSurface,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
                 height: 1.2,
-                fontFeatures: AppTokens.tabularFontFeatures,
               ),
+            ),
+          ),
+          const SizedBox(height: 1),
+          Text(
+            dash(peer.virtualIp),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 11,
+              height: 1.2,
+              fontFeatures: AppTokens.tabularFontFeatures,
             ),
           ),
         ],
@@ -188,11 +206,15 @@ class _ConnectionMapPainter extends CustomPainter {
   const _ConnectionMapPainter({
     required this.rows,
     required this.rowHeight,
+    required this.leftCount,
+    required this.rightCount,
     required this.lineColor,
   });
 
   final int rows;
   final double rowHeight;
+  final int leftCount;
+  final int rightCount;
   final Color lineColor;
 
   @override
@@ -203,14 +225,20 @@ class _ConnectionMapPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
     final midX = size.width / 2;
     final localY = size.height / 2;
+    final localRow = rows ~/ 2;
 
+    // Central trunk plus this-device row always exist.
     canvas.drawLine(Offset(midX, 0), Offset(midX, size.height), paint);
     canvas.drawLine(Offset(0, localY), Offset(size.width, localY), paint);
     for (var index = 0; index < rows; index++) {
+      if (index == localRow) continue;
       final y = index * rowHeight + rowHeight / 2;
-      if ((y - localY).abs() < 0.5) continue;
-      canvas.drawLine(Offset(0, y), Offset(midX, y), paint);
-      canvas.drawLine(Offset(midX, y), Offset(size.width, y), paint);
+      if (index < leftCount) {
+        canvas.drawLine(Offset(0, y), Offset(midX, y), paint);
+      }
+      if (index < rightCount) {
+        canvas.drawLine(Offset(midX, y), Offset(size.width, y), paint);
+      }
     }
   }
 
@@ -218,6 +246,8 @@ class _ConnectionMapPainter extends CustomPainter {
   bool shouldRepaint(_ConnectionMapPainter oldDelegate) {
     return oldDelegate.rows != rows ||
         oldDelegate.rowHeight != rowHeight ||
+        oldDelegate.leftCount != leftCount ||
+        oldDelegate.rightCount != rightCount ||
         oldDelegate.lineColor != lineColor;
   }
 }

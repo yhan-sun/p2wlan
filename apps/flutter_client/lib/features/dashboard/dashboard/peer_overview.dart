@@ -2,13 +2,11 @@ part of '../dashboard_page.dart';
 
 class _PeerOverview extends StatelessWidget {
   const _PeerOverview({
-    required this.snapshot,
     required this.peers,
     required this.totalPeers,
     required this.showMap,
   });
 
-  final DiagnosticsSnapshot? snapshot;
   final List<PeerSnapshot> peers;
   final int totalPeers;
   final bool showMap;
