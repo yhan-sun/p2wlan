@@ -38,7 +38,10 @@ impl DaemonInstanceLock {
 
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied) =>
+            {
                 return Err(DaemonError::Config(format!(
                     "another P2WLAN daemon is already running for config {}",
                     config_path.display()
