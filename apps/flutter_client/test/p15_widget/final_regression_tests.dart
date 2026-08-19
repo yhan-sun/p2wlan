@@ -477,9 +477,10 @@ Future<_Stores> _completionStepStores(WidgetTester tester) async {
   final tempDir = await tester.runAsync(
     () => Directory.systemTemp.createTemp('p2wlan_completion_test_'),
   );
+  final tokenRepository = _ThrowingCompletionTokenRepository();
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir!.path}/settings.json'),
-    tokenRepository: _ThrowingCompletionTokenRepository(),
+    tokenRepository: tokenRepository,
   );
   await tester.runAsync(settingsStore.load);
   await tester.runAsync(
@@ -497,7 +498,7 @@ Future<_Stores> _completionStepStores(WidgetTester tester) async {
     autoRefreshInterval: const Duration(minutes: 5),
   );
   await statusStore.refresh();
-  return _Stores(tempDir, settingsStore, statusStore);
+  return _Stores(tempDir, settingsStore, statusStore, tokenRepository);
 }
 
 class _FailingDaemonController extends DaemonController {

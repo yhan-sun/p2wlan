@@ -95,6 +95,9 @@ extension _SettingsPageActions on _SettingsPageState {
         case SettingsCategory.application:
           closeBehavior = _closeBehavior;
         case SettingsCategory.advancedNetwork:
+          // Empty delegates credential preservation/clearing to SettingsStore:
+          // managed mode preserves, manual mode clears.
+          authToken = '';
           manualMode = _manualMode;
           overlayCidr = _overlayCidrController.text;
           tunInterface = _tunInterfaceController.text;

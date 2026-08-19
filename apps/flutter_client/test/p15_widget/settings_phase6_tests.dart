@@ -463,6 +463,162 @@ void _registerSettingsPhase6Tests() {
     expect(find.text('Interface name'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  // -- Phase 6.1: manual-mode credential semantics regression tests --
+
+  testWidgets('manual mode: enabling clears existing managed credential', (
+    tester,
+  ) async {
+    final repo = InMemorySecureTokenRepository();
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: false),
+        tokenRepository: repo,
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(authToken: 'existing-secret'),
+      ),
+    );
+    expect(
+      (await repo.read())?.isNotEmpty ?? false,
+      isTrue,
+      reason: 'Precondition: credential should be stored.',
+    );
+
+    await pump(tester, stores, size: const Size(800, 2400));
+
+    await tester.tap(find.text('Advanced Network'));
+    await tester.pumpAndSettle();
+
+    final manualSwitch = find.byType(Switch).first;
+    expect(tester.widget<Switch>(manualSwitch).value, isFalse);
+    await tester.tap(manualSwitch);
+    await tester.pump();
+    expect(find.text('Unsaved changes'), findsOneWidget);
+    await _tapSave(tester);
+    await _waitFor(tester, () => stores.settingsStore.settings.manualMode);
+
+    expect(stores.settingsStore.settings.manualMode, isTrue);
+    expect(stores.settingsStore.settings.authToken, isEmpty);
+    final secureValue = await tester.runAsync(() => repo.read());
+    expect(
+      secureValue,
+      isNull,
+      reason: 'Manual mode must clear the secure credential store.',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'advanced network save with manual off preserves existing credential',
+    (tester) async {
+      final repo = InMemorySecureTokenRepository();
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: false),
+          tokenRepository: repo,
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await tester.runAsync(
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(authToken: 'existing-secret'),
+        ),
+      );
+
+      await pump(tester, stores, size: const Size(800, 2400));
+
+      await tester.tap(find.text('Advanced Network'));
+      await tester.pumpAndSettle();
+
+      final manualSwitch = find.byType(Switch).first;
+      expect(tester.widget<Switch>(manualSwitch).value, isFalse);
+      await tester.enterText(_settingsTextField('MTU'), '1400');
+      await tester.pump();
+      expect(find.text('Unsaved changes'), findsOneWidget);
+      await _tapSave(tester);
+      await _waitFor(tester, () => stores.settingsStore.settings.mtu == 1400);
+
+      expect(stores.settingsStore.settings.manualMode, isFalse);
+      expect(stores.settingsStore.settings.authToken, 'existing-secret');
+      expect(await tester.runAsync(() => repo.read()), 'existing-secret');
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('manual mode toggle while daemon running requires restart', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = await storesWith(
+      tester,
+      _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+    );
+    await pump(tester, stores, size: const Size(800, 2400));
+    await stores.statusStore.refresh();
+    expect(stores.statusStore.daemonReachable, isTrue);
+
+    await tester.tap(find.text('Advanced Network'));
+    await tester.pumpAndSettle();
+
+    final manualSwitch = find.byType(Switch).first;
+    await tester.tap(manualSwitch);
+    await tester.pump();
+    await _tapSave(tester);
+    await _waitFor(tester, () => stores.settingsStore.settings.manualMode);
+    await _waitFor(
+      tester,
+      () => find.text('P2WLAN restart required').evaluate().isNotEmpty,
+    );
+
+    expect(stores.settingsStore.settings.manualMode, isTrue);
+    expect(find.text('P2WLAN restart required'), findsOneWidget);
+    expect(find.text('Restart and apply'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'credential summary shows Manual mode after enabling manual mode save',
+    (tester) async {
+      final repo = InMemorySecureTokenRepository();
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: false),
+          tokenRepository: repo,
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await tester.runAsync(
+        () => stores.settingsStore.updateSettings(
+          stores.settingsStore.settings.copyWith(authToken: 'existing-secret'),
+        ),
+      );
+
+      await pump(tester, stores, size: const Size(800, 2400));
+
+      expect(find.text('Securely saved'), findsOneWidget);
+
+      await tester.tap(find.text('Advanced Network'));
+      await tester.pumpAndSettle();
+
+      final manualSwitch = find.byType(Switch).first;
+      await tester.tap(manualSwitch);
+      await tester.pump();
+      await _tapSave(tester);
+      await _waitFor(tester, () => stores.settingsStore.settings.manualMode);
+
+      // Return to the settings root to check the Account credential summary.
+      await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Manual mode, no credential needed'), findsOneWidget);
+      expect(find.text('Securely saved'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 }
 
 /// Pumps the full shell (rail/sidebar/bottom-nav) with healthy diagnostics so

@@ -25,11 +25,13 @@ Future<_Stores> _makeStores({
   Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
   DaemonController? daemonController,
   bool manualMode = false,
+  SecureTokenRepository? tokenRepository,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
+  final repo = tokenRepository ?? InMemorySecureTokenRepository();
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
-    tokenRepository: InMemorySecureTokenRepository(),
+    tokenRepository: repo,
   );
   await settingsStore.load();
   await settingsStore.updateSettings(
@@ -48,15 +50,21 @@ Future<_Stores> _makeStores({
     enableFreshnessTimer: enableFreshnessTimer,
     maxSnapshotAge: maxSnapshotAge,
   );
-  return _Stores(tempDir, settingsStore, statusStore);
+  return _Stores(tempDir, settingsStore, statusStore, repo);
 }
 
 class _Stores {
-  _Stores(this.tempDir, this.settingsStore, this.statusStore);
+  _Stores(
+    this.tempDir,
+    this.settingsStore,
+    this.statusStore,
+    this.tokenRepository,
+  );
 
   final Directory tempDir;
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final SecureTokenRepository tokenRepository;
 
   void dispose() {
     statusStore.dispose();
