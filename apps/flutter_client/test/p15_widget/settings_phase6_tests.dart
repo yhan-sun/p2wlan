@@ -631,10 +631,16 @@ void _registerSettingsPhase6Tests() {
 /// `find`/`tap` calls will still locate the mobile widgets that were built
 /// during the pump. Tests that need to *re-pump* with a mobile platform
 /// should set the override themselves.
+///
+/// When [textScale] > 1.0, wraps the shell in a [MediaQuery] with a linear
+/// text scaler to exercise large-text accessibility at initial pump time, so
+/// the platform override, capabilities, and navigation state are all
+/// consistent — no re-pump is needed.
 Future<_Stores> _pumpSettingsShell(
   WidgetTester tester,
   Size size, {
   PlatformCapabilities? capabilities,
+  double textScale = 1.0,
 }) async {
   // Reset the element tree so a previous pump's shell state (section /
   // selected category) does not leak into this new shell instance.
@@ -659,16 +665,18 @@ Future<_Stores> _pumpSettingsShell(
     () => _makeStores(api: _FakeDiagnosticsApi(health: true, snapshot: clean)),
   ))!;
   await stores.statusStore.refresh();
-  await tester.pumpWidget(
-    _DesignSystemHost(
-      dark: false,
-      child: P2WlanShell(
-        settingsStore: stores.settingsStore,
-        statusStore: stores.statusStore,
-        capabilities: caps,
-      ),
-    ),
+  Widget shell = P2WlanShell(
+    settingsStore: stores.settingsStore,
+    statusStore: stores.statusStore,
+    capabilities: caps,
   );
+  if (textScale != 1.0) {
+    shell = MediaQuery(
+      data: MediaQueryData(textScaler: TextScaler.linear(textScale)),
+      child: shell,
+    );
+  }
+  await tester.pumpWidget(_DesignSystemHost(dark: false, child: shell));
   await tester.pumpAndSettle();
   // Navigate to Settings (sidebar on expanded, rail on medium, bottom bar
   // on compact mobile).

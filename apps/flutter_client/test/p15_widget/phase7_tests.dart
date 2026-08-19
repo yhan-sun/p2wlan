@@ -624,6 +624,227 @@ void _registerPhase7Tests() {
       }
     }
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 7.6  Settings category detail at large text scale — strict.
+  //
+  // Phase 7.1 covered the shell-level Settings root at 1.3/1.5 but never
+  // entered a real category detail. These tests pump the full P2WlanShell,
+  // navigate to Settings, open a category, and verify strict no-overflow at
+  // 1.5× text scale.
+  //
+  // The helper [_pumpSettingsShell] accepts a [textScale] parameter that
+  // wraps the shell in a [MediaQuery] with a linear text scaler at initial
+  // pump time, so the platform override, capabilities, and navigation state
+  // are all consistent — no re-pump is needed.
+  // ──────────────────────────────────────────────────────────────────────
+
+  group('Phase 7.2 Settings detail large text', () {
+    testWidgets(
+      '390x844 iOS scale 1.5 Account & Network detail renders without overflow',
+      (tester) async {
+        final stores = await _pumpSettingsShell(
+          tester,
+          const Size(390, 844),
+          capabilities: PlatformCapabilities.fromPlatform('ios'),
+          textScale: 1.5,
+        );
+        addTearDown(stores.dispose);
+
+        // Open the Account & Network category.
+        await tester.tap(find.text('Account & Network'));
+        await tester.pumpAndSettle();
+
+        // Verify key Account fields are present (possibly off-screen →
+        // scroll into view).
+        await tester.ensureVisible(find.text('Control server'));
+        expect(find.text('Control server'), findsOneWidget);
+        await tester.ensureVisible(find.text('Network ID'));
+        expect(find.text('Network ID'), findsOneWidget);
+        await tester.ensureVisible(find.text('Requested virtual IP'));
+        expect(find.text('Requested virtual IP'), findsOneWidget);
+        // Credential section is visible.
+        expect(find.text('Authentication'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      '390x844 scale 1.5 Advanced Network detail renders without overflow',
+      (tester) async {
+        // Advanced Network requires canActAsLocalVpnNode == true. On macOS
+        // the shell uses the rail layout at 390px (_isDesktopShell is true),
+        // and Settings uses the rootDetail layout (< 880px breakpoint).
+        const caps = PlatformCapabilities(
+          canControlLocalDaemon: true,
+          canRequestElevation: true,
+          canVerifyRoutes: true,
+          canRepairRoutes: true,
+          canOpenLocalLogs: true,
+          canCreateSupportBundle: true,
+          canUseSystemTray: true,
+          canActAsLocalVpnNode: true,
+          canManageRemoteDevices: true,
+        );
+        final stores = await _pumpSettingsShell(
+          tester,
+          const Size(390, 844),
+          capabilities: caps,
+          textScale: 1.5,
+        );
+        addTearDown(stores.dispose);
+
+        // Open the Advanced Network category.
+        await tester.tap(find.text('Advanced Network'));
+        await tester.pumpAndSettle();
+
+        // Verify Advanced Network fields are reachable via scroll.
+        await tester.ensureVisible(find.text('Manual/offline mode'));
+        expect(find.text('Manual/offline mode'), findsOneWidget);
+        await tester.ensureVisible(find.text('Interface name'));
+        expect(find.text('Interface name'), findsOneWidget);
+        await tester.ensureVisible(find.text('MTU'));
+        expect(find.text('MTU'), findsOneWidget);
+        await tester.ensureVisible(find.text('Overlay CIDR'));
+        expect(find.text('Overlay CIDR'), findsOneWidget);
+        await tester.ensureVisible(find.text('UDP bind'));
+        expect(find.text('UDP bind'), findsOneWidget);
+        await tester.ensureVisible(find.text('Socket pool'));
+        expect(find.text('Socket pool'), findsOneWidget);
+        await tester.ensureVisible(find.text('Relay candidates'));
+        expect(find.text('Relay candidates'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      '390x844 scale 1.5 Advanced Network Save bar remains reachable',
+      (tester) async {
+        const caps = PlatformCapabilities(
+          canControlLocalDaemon: true,
+          canRequestElevation: true,
+          canVerifyRoutes: true,
+          canRepairRoutes: true,
+          canOpenLocalLogs: true,
+          canCreateSupportBundle: true,
+          canUseSystemTray: true,
+          canActAsLocalVpnNode: true,
+          canManageRemoteDevices: true,
+        );
+        tester.view.physicalSize = const Size(390, 844);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+        final clean = _mutateSnapshot(snapshot, _clearPeerErrors);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(health: true, snapshot: clean),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+        await stores.statusStore.refresh();
+
+        await tester.pumpWidget(
+          _TestApp(
+            child: MediaQuery(
+              data: MediaQueryData(textScaler: TextScaler.linear(1.5)),
+              child: SettingsPage(
+                settingsStore: stores.settingsStore,
+                statusStore: stores.statusStore,
+                capabilities: caps,
+                onLogout: () {},
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Open the Advanced Network category.
+        await tester.tap(find.text('Advanced Network'));
+        await tester.pumpAndSettle();
+
+        // Modify a safe field (MTU) to produce unsaved changes.
+        final mtuField = _settingsTextField('MTU');
+        expect(mtuField, findsOneWidget);
+        await tester.ensureVisible(mtuField);
+        await tester.pumpAndSettle();
+        await tester.enterText(mtuField, '1280');
+        await tester.pump();
+
+        // Verify the text was actually entered.
+        expect(tester.widget<TextField>(mtuField).controller?.text, '1280');
+
+        // In a narrow viewport at 1.5× text scale, the _SaveBar (added only
+        // when dirty) is below the viewport + cache extent and may not be
+        // built yet. Scroll down until it appears, then verify reachability.
+        // Find the Scrollable that contains the MTU field (the category
+        // detail's ListView).
+        final detailScrollable = find.ancestor(
+          of: mtuField,
+          matching: find.byType(Scrollable),
+        );
+        expect(detailScrollable, findsOneWidget);
+        var scrollAttempts = 0;
+        while (find
+                .byKey(const Key('settings-save-button'))
+                .evaluate()
+                .isEmpty &&
+            scrollAttempts < 30) {
+          await tester.drag(detailScrollable, const Offset(0, -400));
+          await tester.pump();
+          scrollAttempts++;
+        }
+
+        // The dirty bar with "Unsaved changes" appears.
+        expect(find.text('Unsaved changes'), findsOneWidget);
+
+        // The Save button must be reachable — either already visible or
+        // reachable via scroll/ensureVisible. It must NOT be clipped or
+        // permanently unreachable.
+        final saveButton = find.byKey(const Key('settings-save-button'));
+        expect(saveButton, findsOneWidget);
+        await tester.ensureVisible(saveButton);
+        await tester.pumpAndSettle();
+        // After ensureVisible, the Save button is on-screen.
+        expect(
+          tester.getCenter(saveButton).dy,
+          lessThanOrEqualTo(
+            tester.view.physicalSize.height / tester.view.devicePixelRatio,
+          ),
+        );
+        expect(tester.getCenter(saveButton).dy, greaterThanOrEqualTo(0.0));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      '360x800 scale 1.5 Account & Network detail renders without overflow',
+      (tester) async {
+        final stores = await _pumpSettingsShell(
+          tester,
+          const Size(360, 800),
+          capabilities: PlatformCapabilities.fromPlatform('android'),
+          textScale: 1.5,
+        );
+        addTearDown(stores.dispose);
+
+        // Open the Account & Network category.
+        await tester.tap(find.text('Account & Network'));
+        await tester.pumpAndSettle();
+
+        await tester.ensureVisible(find.text('Control server'));
+        expect(find.text('Control server'), findsOneWidget);
+        await tester.ensureVisible(find.text('Network ID'));
+        expect(find.text('Network ID'), findsOneWidget);
+        await tester.ensureVisible(find.text('Requested virtual IP'));
+        expect(find.text('Requested virtual IP'), findsOneWidget);
+        expect(find.text('Authentication'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  });
 }
 
 /// Pumps the full [P2WlanShell] at [size] with strict exception checking.
