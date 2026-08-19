@@ -63,11 +63,15 @@ void _registerDashboardTests() {
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
 
-    // Device preview.
+    // Device preview section is titled "Devices" (it may show offline peers).
+    expect(find.text('Devices'), findsOneWidget);
     expect(find.text('Online devices'), findsWidgets);
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
+
+    // Healthy hero: no duplicate inline refresh — the shell owns refresh.
+    expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
 
     // Network components: only rows the fixture can judge. The fixture has no
     // ready_phase, so the Overlay route row is honestly omitted.
@@ -473,7 +477,8 @@ void _registerDashboardTests() {
 
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
+    // Healthy: refresh stays in the shell; the hero does not repeat it.
+    expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
     expect(tester.takeException(), isNull);
   });
 

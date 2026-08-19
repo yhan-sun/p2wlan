@@ -160,7 +160,8 @@ void _registerDesignSystemTests() {
     expect(find.byType(DesktopSidebar), findsOneWidget);
     expect(find.text('P2WLAN'), findsWidgets);
     expect(find.text('Home'), findsOneWidget);
-    expect(find.text('Devices'), findsOneWidget);
+    // Sidebar item and the Home section title share the Devices label.
+    expect(find.text('Devices'), findsWidgets);
     expect(find.text('Troubleshooting'), findsOneWidget);
     expect(find.text('Settings'), findsOneWidget);
     // Footer: the smoke store reports a healthy snapshot with peers.

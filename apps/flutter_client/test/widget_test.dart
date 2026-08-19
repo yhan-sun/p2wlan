@@ -24,7 +24,9 @@ void main() {
     await _pumpTestApp(tester);
 
     expect(find.text('首页'), findsWidgets);
-    expect(find.text('离线'), findsWidgets);
+    // Home section title renders in Chinese (the status badge is hidden on
+    // Home at this size, so the section copy itself is asserted).
+    expect(find.text('设备'), findsWidgets);
   });
 
   testWidgets('opens settings and shows diagnostics URL field', (tester) async {
@@ -117,8 +119,16 @@ void main() {
     expect(find.text('故障排查'), findsOneWidget);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
-    // Medium has no sidebar footer: the top bar keeps its status badge.
-    expect(find.byType(StatusBadge), findsNWidgets(2));
+    // Medium has no sidebar footer; Home itself carries the strong status, so
+    // the top bar hides its duplicate badge: only the hero badge remains.
+    expect(find.byType(StatusBadge), findsOneWidget);
+    // Other sections keep the global badge in the top bar.
+    await tester.tap(find.text('设备'));
+    await tester.pumpAndSettle();
+    expect(find.byType(StatusBadge), findsOneWidget);
+    await tester.tap(find.text('首页'));
+    await tester.pumpAndSettle();
+    expect(find.byType(StatusBadge), findsOneWidget);
 
     // Expanded desktop: real sidebar with brand header and status footer.
     tester.view.physicalSize = const Size(1280, 900);

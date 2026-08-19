@@ -134,11 +134,13 @@ class _P2WlanShellState extends State<P2WlanShell> {
     bool isMobileLayout,
     AppBreakpoint breakpoint,
   ) {
-    // Expanded desktop: the sidebar footer already carries the network status,
-    // so the top bar keeps only refresh and window controls (no duplicated
-    // strong status badge). Medium / compact desktop keep the badge because
-    // they have no footer.
-    final showStatusBadge = breakpoint != AppBreakpoint.expanded;
+    // Expanded desktop: the sidebar footer already carries the network status.
+    // Home: the hero itself is the strong status expression, so the top bar
+    // adds no duplicate badge there either. Other sections (Devices,
+    // Troubleshooting, Settings, Tunnels) keep the global badge on medium and
+    // compact desktop because they have no footer.
+    final showStatusBadge =
+        breakpoint != AppBreakpoint.expanded && _section != P2WlanSection.home;
     return AppBar(
       leading: _usesMacosChrome ? const SizedBox.shrink() : null,
       leadingWidth: _usesMacosChrome ? 76 : null,

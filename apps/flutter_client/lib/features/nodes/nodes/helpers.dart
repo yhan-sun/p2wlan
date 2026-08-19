@@ -1,56 +1,5 @@
 part of '../nodes_page.dart';
 
-List<_PeerGroup> _buildPeerGroups(
-  List<PeerSnapshot> peers,
-  AppStrings strings,
-) {
-  final attention = <PeerSnapshot>[];
-  final direct = <PeerSnapshot>[];
-  final relay = <PeerSnapshot>[];
-  final offline = <PeerSnapshot>[];
-
-  for (final peer in peers) {
-    if (_peerIsOffline(peer)) {
-      offline.add(peer);
-    } else if (_peerNeedsAttention(peer)) {
-      attention.add(peer);
-    } else if (peer.path == 'direct') {
-      direct.add(peer);
-    } else if (peer.path == 'relay') {
-      relay.add(peer);
-    } else {
-      offline.add(peer);
-    }
-  }
-
-  return [
-    if (attention.isNotEmpty)
-      _PeerGroup(
-        title: strings.attentionDevices,
-        tone: StatusTone.warn,
-        peers: attention,
-      ),
-    if (direct.isNotEmpty)
-      _PeerGroup(
-        title: strings.directDevices,
-        tone: StatusTone.good,
-        peers: direct,
-      ),
-    if (relay.isNotEmpty)
-      _PeerGroup(
-        title: strings.relayDevices,
-        tone: StatusTone.neutral,
-        peers: relay,
-      ),
-    if (offline.isNotEmpty)
-      _PeerGroup(
-        title: strings.offlineDevices,
-        tone: StatusTone.neutral,
-        peers: offline,
-      ),
-  ];
-}
-
 List<PeerSnapshot> _dedupeAndSortPeers(List<PeerSnapshot> peers) {
   final byKey = <String, PeerSnapshot>{};
   for (final peer in peers) {
@@ -79,6 +28,9 @@ int _comparePeers(PeerSnapshot left, PeerSnapshot right) {
   return left.displayName.compareTo(right.displayName);
 }
 
+/// Recommended order: needs attention, online direct, online relay,
+/// connecting/probing, offline — the same ranking the network home preview
+/// uses. No group headers in the list; the rank is the structure.
 int _peerSortRank(PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return 3;
   if (_peerNeedsAttention(peer)) return 0;
@@ -122,6 +74,38 @@ String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
     };
   }
   return strings.pathLabel(peer.path);
+}
+
+/// First-level path label: short, and never a stale direct/relay claim for an
+/// offline device. Offline always wins.
+String _rowPathLabel(AppStrings strings, PeerSnapshot peer) {
+  if (_peerIsOffline(peer)) return strings.offline;
+  if (peer.path == 'probing' || peer.path == 'direct_trial') {
+    return strings.probing;
+  }
+  if (peer.path == 'relay') return strings.relay;
+  if (peer.path == 'direct' && peer.isDirectVerified) return strings.direct;
+  return strings.probing;
+}
+
+/// Compact "path · latency" summary used on mobile rows and the detail header.
+String _pathSummaryLabel(AppStrings strings, PeerSnapshot peer) {
+  final path = _rowPathLabel(strings, peer);
+  final latency = formatLatency(peer.latencyMs);
+  return '$path · $latency';
+}
+
+/// Semantic but low-saturation dot color: direct=good, relay=neutral accent,
+/// probing=warn, offline=neutral. Text always accompanies the dot.
+Color _rowStatusColor(BuildContext context, PeerSnapshot peer) {
+  final c = P2WlanColors.of(context);
+  if (_peerIsOffline(peer)) return c.offline;
+  return switch (peer.path) {
+    'direct' => c.direct,
+    'relay' => c.relay,
+    'probing' || 'direct_trial' => c.probing,
+    _ => c.offline,
+  };
 }
 
 String _formatLastSeen(PeerSnapshot peer) {
@@ -201,7 +185,3 @@ int _filterCount(List<PeerSnapshot> peers, _NodeFilter filter) {
   }
   return count;
 }
-
-/// True when the list should render smart group headers. Only the "all" filter
-/// groups; specific filters already narrow the set and would repeat the header.
-bool _showGroupsForFilter(_NodeFilter filter) => filter == _NodeFilter.all;

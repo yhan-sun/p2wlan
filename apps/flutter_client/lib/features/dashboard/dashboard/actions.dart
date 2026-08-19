@@ -108,7 +108,10 @@ class _HomeActions extends StatelessWidget {
     final actions = switch (status) {
       _NetworkStatus.stopped when canControlLocalDaemon => [start, refresh],
       _NetworkStatus.stopped || _NetworkStatus.unavailable => [checkAgain],
-      // Healthy / degraded / stale: network is up — Stop is secondary only.
+      // Healthy: the shell already owns refresh; only Stop stays as a quiet
+      // secondary action. Degraded / stale keep an inline refresh because it
+      // is a contextual recovery action there.
+      _NetworkStatus.healthy => [if (canControlLocalDaemon) stop],
       _ => [if (canControlLocalDaemon) stop, refresh],
     };
 

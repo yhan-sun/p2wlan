@@ -1,9 +1,11 @@
 part of '../nodes_page.dart';
 
+/// One continuous device list. The recommended sort already structures the
+/// set (attention → direct → relay → probing → offline), so no group headers
+/// or per-group badges are needed on the first level.
 class _PeerList extends StatelessWidget {
   const _PeerList({
     required this.peers,
-    required this.showGroups,
     this.selectedPeerId,
     required this.copiedKey,
     required this.busyPeerId,
@@ -16,7 +18,6 @@ class _PeerList extends StatelessWidget {
   });
 
   final List<PeerSnapshot> peers;
-  final bool showGroups;
   final String? selectedPeerId;
   final String? copiedKey;
   final String? busyPeerId;
@@ -30,98 +31,25 @@ class _PeerList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = stringsOf(context);
-    final groups = showGroups ? _buildPeerGroups(peers, strings) : null;
-    final items = <_PeerListItem>[
-      if (groups != null)
-        for (final group in groups) ...[
-          _PeerListItem.group(group),
-          for (final peer in group.peers) _PeerListItem.peer(peer),
-        ]
-      else
-        for (final peer in peers) _PeerListItem.peer(peer),
-    ];
     return Column(
       children: [
-        for (final item in items)
-          if (item.group != null)
-            _PeerGroupHeader(group: item.group!)
-          else
-            _PeerListRow(
-              peer: item.peer!,
-              strings: strings,
-              compact: compact,
-              selected: selectedPeerId == item.peer!.nodeId,
-              copiedKey: copiedKey,
-              busy: busyPeerId == item.peer!.nodeId,
-              onCopy: onCopy,
-              onEdit: onEdit,
-              onDelete: onDelete,
-              onSpeedTest: onSpeedTest,
-              onTap: onTap,
-            ),
-      ],
-    );
-  }
-}
-
-class _PeerListItem {
-  const _PeerListItem.group(this.group) : peer = null;
-  const _PeerListItem.peer(this.peer) : group = null;
-
-  final _PeerGroup? group;
-  final PeerSnapshot? peer;
-}
-
-class _PeerGroup {
-  const _PeerGroup({
-    required this.title,
-    required this.tone,
-    required this.peers,
-  });
-
-  final String title;
-  final StatusTone tone;
-  final List<PeerSnapshot> peers;
-}
-
-class _PeerGroupHeader extends StatelessWidget {
-  const _PeerGroupHeader({required this.group});
-
-  final _PeerGroup group;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      key: Key('nodes-group-${group.title.hashCode}'),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest,
-        border: Border(
-          bottom: BorderSide(color: theme.colorScheme.outlineVariant),
-        ),
-        borderRadius: const BorderRadius.vertical(
-          top: Radius.circular(AppTokens.radiusSm),
-        ),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              group.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
+        for (var index = 0; index < peers.length; index++) ...[
+          if (index > 0) const Divider(height: 1),
+          _PeerListRow(
+            peer: peers[index],
+            strings: strings,
+            compact: compact,
+            selected: selectedPeerId == peers[index].nodeId,
+            copiedKey: copiedKey,
+            busy: busyPeerId == peers[index].nodeId,
+            onCopy: onCopy,
+            onEdit: onEdit,
+            onDelete: onDelete,
+            onSpeedTest: onSpeedTest,
+            onTap: onTap,
           ),
-          const SizedBox(width: AppTokens.space8),
-          StatusBadge(label: formatInt(group.peers.length), tone: group.tone),
         ],
-      ),
+      ],
     );
   }
 }
@@ -155,65 +83,95 @@ class _PeerListRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final ipKey = '${peer.nodeId}:ip';
-    final pingKey = '${peer.nodeId}:ping';
-    final menu = _actionsMenu(ipKey, pingKey);
-    final speedTestAction = _speedTestAction();
     final rowColor = selected
         ? P2WlanColors.of(context).selectedSurface
-        : theme.colorScheme.surface;
+        : Colors.transparent;
     return Material(
       color: rowColor,
       child: InkWell(
         key: Key('node-row-${peer.nodeId}'),
         onTap: () => onTap(peer),
-        child: Container(
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: theme.colorScheme.outlineVariant),
-            ),
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: 14,
+            vertical: compact ? 11 : 9,
           ),
-          child: IntrinsicHeight(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Container(
-                  width: 3,
-                  color: selected
-                      ? theme.colorScheme.primary
-                      : Colors.transparent,
+          child: compact
+              ? _CompactRowContent(peer: peer, strings: strings)
+              : _RowContent(
+                  peer: peer,
+                  strings: strings,
+                  busy: busy,
+                  copiedKey: copiedKey,
+                  onCopy: onCopy,
+                  onEdit: onEdit,
+                  onDelete: onDelete,
+                  onSpeedTest: onSpeedTest,
                 ),
-                Expanded(
-                  child: Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: compact ? 8 : 6,
-                    ),
-                    child: compact
-                        ? _CompactRowContent(
-                            peer: peer,
-                            strings: strings,
-                            speedTestAction: speedTestAction,
-                            menu: menu,
-                          )
-                        : _RowContent(
-                            peer: peer,
-                            strings: strings,
-                            speedTestAction: speedTestAction,
-                            menu: menu,
-                          ),
-                  ),
-                ),
-              ],
-            ),
-          ),
         ),
       ),
     );
   }
+}
 
-  Widget _actionsMenu(String ipKey, String pingKey) {
+/// Desktop row: status dot, name + IP, path, latency, overflow menu. Only the
+/// judgment columns — nothing technical on the first level.
+class _RowContent extends StatelessWidget {
+  const _RowContent({
+    required this.peer,
+    required this.strings,
+    required this.busy,
+    required this.copiedKey,
+    required this.onCopy,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onSpeedTest,
+  });
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+  final bool busy;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+  final Future<void> Function(PeerSnapshot peer) onEdit;
+  final Future<bool> Function(PeerSnapshot peer) onDelete;
+  final Future<void> Function(PeerSnapshot peer) onSpeedTest;
+
+  @override
+  Widget build(BuildContext context) {
+    final ipKey = '${peer.nodeId}:ip';
+    final menu = _actionsMenu(ipKey);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        _StatusDot(peer: peer),
+        const SizedBox(width: AppTokens.space10),
+        Expanded(
+          child: _PeerPrimaryText(peer: peer, strings: strings),
+        ),
+        const SizedBox(width: AppTokens.space12),
+        SizedBox(
+          width: 76,
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: _PathText(peer: peer, strings: strings),
+          ),
+        ),
+        const SizedBox(width: AppTokens.space12),
+        SizedBox(
+          width: 56,
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: _LatencyText(peer: peer),
+          ),
+        ),
+        const SizedBox(width: AppTokens.space4),
+        menu,
+      ],
+    );
+  }
+
+  Widget _actionsMenu(String ipKey) {
     if (busy) {
       return SizedBox.square(
         dimension: AppTokens.minTouchTarget,
@@ -231,9 +189,6 @@ class _PeerListRow extends StatelessWidget {
             case 'copy_ip':
               onCopy(peer.virtualIp, ipKey);
               break;
-            case 'copy_ping':
-              onCopy('ping ${peer.virtualIp}', pingKey);
-              break;
             case 'edit':
               onEdit(peer);
               break;
@@ -241,9 +196,6 @@ class _PeerListRow extends StatelessWidget {
               WidgetsBinding.instance.addPostFrameCallback((_) {
                 onDelete(peer);
               });
-              break;
-            case 'details':
-              onTap(peer);
               break;
             case 'speed_test':
               WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -253,7 +205,6 @@ class _PeerListRow extends StatelessWidget {
           }
         },
         itemBuilder: (context) => [
-          PopupMenuItem(value: 'details', child: Text(strings.viewDetails)),
           PopupMenuItem(
             key: ValueKey('node-speedtest-action-${peer.nodeId}'),
             value: 'speed_test',
@@ -261,118 +212,117 @@ class _PeerListRow extends StatelessWidget {
             child: Text(strings.speedTest),
           ),
           PopupMenuItem(value: 'copy_ip', child: Text(strings.copyVirtualIp)),
-          PopupMenuItem(
-            value: 'copy_ping',
-            child: Text(strings.copyPingCommand),
-          ),
           PopupMenuItem(value: 'edit', child: Text(strings.renameDevice)),
           PopupMenuItem(value: 'delete', child: Text(strings.removeDevice)),
         ],
       ),
     );
   }
+}
 
-  Widget _speedTestAction() {
-    return SizedBox.square(
-      dimension: AppTokens.minTouchTarget,
-      child: IconButton(
-        key: Key('node-speedtest-button-${peer.nodeId}'),
-        tooltip: strings.speedTestTooltip,
-        onPressed: _canRunSpeedTest(peer) ? () => onSpeedTest(peer) : null,
-        icon: const Icon(Icons.speed_rounded, size: 19),
+/// Mobile row: status dot, name, IP, and a right-aligned "path · latency"
+/// summary. Actions live on the full-screen detail page, keeping the row
+/// dense and whole-row tappable.
+class _CompactRowContent extends StatelessWidget {
+  const _CompactRowContent({required this.peer, required this.strings});
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        _StatusDot(peer: peer),
+        const SizedBox(width: AppTokens.space10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                dash(peer.displayName),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                dash(peer.virtualIp),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontFeatures: AppTokens.tabularFontFeatures,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: AppTokens.space10),
+        Text(
+          _pathSummaryLabel(strings, peer),
+          maxLines: 1,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: theme.colorScheme.onSurfaceVariant,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatusDot extends StatelessWidget {
+  const _StatusDot({required this.peer});
+
+  final PeerSnapshot peer;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 8,
+      height: 8,
+      decoration: BoxDecoration(
+        color: _rowStatusColor(context, peer),
+        shape: BoxShape.circle,
       ),
     );
   }
 }
 
-class _RowContent extends StatelessWidget {
-  const _RowContent({
-    required this.peer,
-    required this.strings,
-    required this.speedTestAction,
-    required this.menu,
-  });
+class _PathText extends StatelessWidget {
+  const _PathText({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
   final AppStrings strings;
-  final Widget speedTestAction;
-  final Widget menu;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Expanded(
-          flex: 3,
-          child: _PeerPrimaryText(peer: peer, strings: strings),
-        ),
-        const SizedBox(width: AppTokens.space12),
-        SizedBox(
-          width: 92,
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: _LatencyText(peer: peer),
-          ),
-        ),
-        const SizedBox(width: AppTokens.space12),
-        SizedBox(
-          width: 116,
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: _PathBadge(peer: peer, strings: strings),
-          ),
-        ),
-        const SizedBox(width: AppTokens.space4),
-        speedTestAction,
-        menu,
-      ],
-    );
-  }
-}
-
-class _CompactRowContent extends StatelessWidget {
-  const _CompactRowContent({
-    required this.peer,
-    required this.strings,
-    required this.speedTestAction,
-    required this.menu,
-  });
-
-  final PeerSnapshot peer;
-  final AppStrings strings;
-  final Widget speedTestAction;
-  final Widget menu;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: _PeerPrimaryText(peer: peer, strings: strings),
-            ),
-            const SizedBox(width: AppTokens.space8),
-            speedTestAction,
-            menu,
-          ],
-        ),
-        const SizedBox(height: AppTokens.space6),
-        Row(
-          children: [
-            _LatencyText(peer: peer),
-            const SizedBox(width: AppTokens.space10),
-            Expanded(
-              child: Align(
-                alignment: Alignment.centerRight,
-                child: _PathBadge(peer: peer, strings: strings),
-              ),
-            ),
-          ],
-        ),
-      ],
+    final theme = Theme.of(context);
+    final label = _rowPathLabel(strings, peer);
+    return Text(
+      label,
+      textAlign: TextAlign.right,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+        color: _peerIsOffline(peer)
+            ? theme.colorScheme.onSurfaceVariant
+            : theme.colorScheme.onSurface,
+        fontFeatures: AppTokens.tabularFontFeatures,
+      ),
     );
   }
 }
@@ -422,11 +372,7 @@ class _PeerPrimaryText extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final error = peer.lastError?.trim();
-    final detail = peer.appVersion.trim().isEmpty
-        ? dash(peer.virtualIp)
-        : '${dash(peer.virtualIp)} · v${peer.appVersion.trim()}';
     return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
@@ -456,9 +402,9 @@ class _PeerPrimaryText extends StatelessWidget {
             ],
           ],
         ),
-        const SizedBox(height: AppTokens.space4),
+        const SizedBox(height: 3),
         Text(
-          detail,
+          dash(peer.virtualIp),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(

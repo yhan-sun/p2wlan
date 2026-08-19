@@ -367,12 +367,11 @@ class AppStrings {
   String get recentDaemonLogs => isZh ? '最近 daemon 日志' : 'Recent daemon logs';
 
   String get nodesSubtitle => isZh
-      ? '查看本机节点和网络中的其他设备，管理名称、IP 与连接路径。'
+      ? '查看本机和网络中的其他设备，管理名称、IP 与连接方式。'
       : 'View this device and other devices in the network, including names, IPs, and paths.';
   String get noPeers => isZh
       ? '当前没有发现其他设备。'
       : 'No other devices are present in the current snapshot.';
-  String get peerSummary => isZh ? '设备概览' : 'Device summary';
   String get device => isZh ? '设备' : 'Device';
   String get peerId => isZh ? '节点 ID' : 'Node ID';
   String get state => isZh ? '状态' : 'State';
@@ -385,16 +384,13 @@ class AppStrings {
   String get direct => isZh ? '直连' : 'Direct';
   String get directTrial => isZh ? '直连试探' : 'Direct trial';
   String get probing => isZh ? '探测中' : 'probing';
-  String get attentionDevices => isZh ? '异常/需确认' : 'Attention';
-  String get directDevices => isZh ? '直连设备' : 'Direct devices';
-  String get relayDevices => isZh ? '中继设备' : 'Relay devices';
-  String get offlineDevices => isZh ? '离线设备' : 'Offline devices';
+  String get filter => isZh ? '筛选' : 'Filter';
 
   String get searchDevicesPlaceholder => isZh
       ? '搜索设备名称、虚拟 IP 或 Node ID'
       : 'Search device name, virtual IP, or Node ID';
   String get filterAll => isZh ? '全部' : 'All';
-  String get sortRecommended => isZh ? '推荐' : 'Recommended';
+  String get sortRecommended => isZh ? '默认排序' : 'Default';
   String get sortByName => isZh ? '名称' : 'Name';
   String get sortByLatency => isZh ? '延迟' : 'Latency';
   String deviceCountSummary(int total, int online) => isZh
@@ -406,21 +402,22 @@ class AppStrings {
   String get clearFilter => isZh ? '清除筛选' : 'Clear filters';
   String get noPeersTitle => isZh ? '还没有其他设备' : 'No other devices yet';
   String get noPeersBody => isZh
-      ? '登录另一台设备后，它会显示在这里。'
-      : 'Sign in on another device and it will appear here.';
-  String get noSearchResultsTitle => isZh ? '没有找到匹配设备' : 'No matching devices';
+      ? '当其他设备加入 P2WLAN 后，它们会出现在这里。'
+      : 'When another device joins P2WLAN, it will appear here.';
+  String get noSearchResultsTitle => isZh ? '没有找到设备' : 'No devices found';
   String get noSearchResultsBody => isZh
-      ? '换个关键词，或清除搜索查看全部设备。'
-      : 'Try a different query, or clear the search to see all devices.';
-  String get noFilterResultsTitle => isZh ? '没有匹配的设备' : 'No matching devices';
-  String get noFilterResultsBody => isZh
-      ? '当前筛选条件下没有设备，清除筛选查看全部。'
-      : 'No devices match this filter. Clear it to see everything.';
+      ? '检查名称、虚拟 IP 或 Node ID。'
+      : 'Check the name, virtual IP, or Node ID.';
+  String get noFilterResultsTitle =>
+      isZh ? '没有符合当前筛选条件的设备' : 'No devices match this filter';
+  String get noFilterResultsBody =>
+      isZh ? '清除筛选后即可查看全部设备。' : 'Clear the filter to see all devices.';
   String get sectionConnection => isZh ? '连接' : 'Connection';
   String get sectionNetwork => isZh ? '网络' : 'Network';
   String get sectionDevice => isZh ? '设备' : 'Device';
   String get sectionIssues => isZh ? '问题' : 'Issues';
   String get sectionActions => isZh ? '操作' : 'Actions';
+  String get advancedInfo => isZh ? '高级信息' : 'Advanced';
   String get onlineState => isZh ? '在线状态' : 'Online state';
   String get lastSeen => isZh ? '最后在线' : 'Last seen';
   String get pathDecision => isZh ? '路径判定' : 'Path decision';
@@ -752,7 +749,7 @@ class AppStrings {
       : 'This removes the device from the control plane. It must sign in or register again to rejoin.';
   String get deviceNameRequired =>
       isZh ? '设备名称不能为空' : 'Device name is required';
-  String get editThisDevice => isZh ? '编辑本机节点' : 'Edit this device';
+  String get editThisDevice => isZh ? '编辑本机' : 'Edit this device';
   String get requestedVirtualIp => isZh ? '期望虚拟 IP' : 'Requested virtual IP';
   String get requestedVirtualIpHelper => isZh
       ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
@@ -761,7 +758,7 @@ class AppStrings {
       ? '虚拟 IP 格式不正确，例如 10.20.0.42'
       : 'Virtual IP must look like 10.20.0.42';
   String get version => isZh ? '版本' : 'Version';
-  String get thisDeviceTitle => isZh ? '本机节点' : 'This device';
+  String get thisDeviceTitle => isZh ? '本机' : 'This device';
   String get controlSyncReady => isZh ? '控制面同步就绪' : 'Control sync ready';
   String get savedLocally => isZh ? '本地保存' : 'Saved locally';
   String get directTypePublic => isZh ? '公网直连' : 'Public direct';

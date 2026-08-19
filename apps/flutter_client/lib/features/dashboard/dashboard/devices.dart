@@ -22,7 +22,7 @@ class _OnlineDevicesSection extends StatelessWidget {
           children: [
             Expanded(
               child: Text(
-                strings.onlineDevices,
+                strings.devices,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(

@@ -16,7 +16,6 @@ import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
-import '../../shared/widgets/status_badge.dart';
 
 part 'nodes/local_node.dart';
 part 'nodes/toolbar.dart';
@@ -137,13 +136,6 @@ class _NodesPageState extends State<NodesPage> {
               showHeader: widget.showHeader,
               maxWidth: nodesPageMaxWidth,
               children: [
-                _LocalNodePanel(
-                  snapshot: snapshot,
-                  settings: settings,
-                  daemonReachable: widget.statusStore.daemonReachable,
-                  onEdit: () => _editLocalNode(snapshot),
-                ),
-                const SizedBox(height: AppTokens.space14),
                 _NodeToolbar(
                   searchController: _searchController,
                   searchFocusNode: _searchFocusNode,
@@ -154,6 +146,37 @@ class _NodesPageState extends State<NodesPage> {
                   onSortChanged: (sort) => setState(() => _sort = sort),
                   onQueryChanged: () => setState(() {}),
                   onClearSearch: () => setState(_searchController.clear),
+                ),
+                if (widget.statusStore.snapshotStale) ...[
+                  const SizedBox(height: AppTokens.space8),
+                  Row(
+                    children: [
+                      Container(
+                        width: 7,
+                        height: 7,
+                        decoration: BoxDecoration(
+                          color: P2WlanColors.of(context).warningDot,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 7),
+                      Text(
+                        stringsOf(context).stale,
+                        style: TextStyle(
+                          color: P2WlanColors.of(context).warningText,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: AppTokens.space14),
+                _LocalNodePanel(
+                  snapshot: snapshot,
+                  settings: settings,
+                  daemonReachable: widget.statusStore.daemonReachable,
+                  onEdit: () => _editLocalNode(snapshot),
                 ),
                 const SizedBox(height: AppTokens.space12),
                 if (allPeers.isEmpty)
@@ -199,9 +222,6 @@ class _NodesPageState extends State<NodesPage> {
                               flex: 6,
                               child: _PeerList(
                                 peers: visiblePeers,
-                                showGroups:
-                                    _showGroupsForFilter(_filter) &&
-                                    _sort == _NodeSort.recommended,
                                 selectedPeerId: selectedPeer?.nodeId,
                                 copiedKey: _copiedKey,
                                 busyPeerId: _busyPeerId,
@@ -213,7 +233,8 @@ class _NodesPageState extends State<NodesPage> {
                                 onTap: (peer) => _openPeer(peer, layout),
                               ),
                             ),
-                            const SizedBox(width: AppTokens.space16),
+                            const VerticalDivider(width: 1),
+                            const SizedBox(width: AppTokens.space12),
                             Expanded(
                               flex: 4,
                               child: _PeerDetailPane(
@@ -233,9 +254,6 @@ class _NodesPageState extends State<NodesPage> {
                       }
                       return _PeerList(
                         peers: visiblePeers,
-                        showGroups:
-                            _showGroupsForFilter(_filter) &&
-                            _sort == _NodeSort.recommended,
                         selectedPeerId: null,
                         copiedKey: _copiedKey,
                         busyPeerId: _busyPeerId,

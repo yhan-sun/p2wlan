@@ -48,29 +48,9 @@ class _DetailLine extends StatelessWidget {
   }
 }
 
-class _PathBadge extends StatelessWidget {
-  const _PathBadge({required this.peer, required this.strings});
-
-  final PeerSnapshot peer;
-  final AppStrings strings;
-
-  @override
-  Widget build(BuildContext context) {
-    final tone = _peerNeedsAttention(peer)
-        ? StatusTone.warn
-        : switch (peer.path) {
-            'direct' => StatusTone.good,
-            'relay' => StatusTone.neutral,
-            'direct_trial' || 'probing' => StatusTone.warn,
-            _ => StatusTone.neutral,
-          };
-    return StatusBadge(label: _connectionLabel(strings, peer), tone: tone);
-  }
-}
-
 /// Shared device detail content used by the expanded detail pane, the medium
-/// dialog, and the compact full-screen detail. Information is grouped by
-/// section instead of a flat list of every field.
+/// dialog, and the compact full-screen detail. Common information first
+/// (connection, network), technical metadata behind the Advanced disclosure.
 class _PeerDetailsContent extends StatelessWidget {
   const _PeerDetailsContent({
     required this.peer,
@@ -106,16 +86,12 @@ class _PeerDetailsContent extends StatelessWidget {
           title: strings.sectionConnection,
           rows: [
             _DetailLine(
-              label: strings.latency,
-              value: formatLatency(peer.latencyMs),
-            ),
-            _DetailLine(
               label: strings.connectionType,
               value: _connectionLabel(strings, peer),
             ),
             _DetailLine(
-              label: strings.onlineState,
-              value: peer.online ? strings.online : strings.offline,
+              label: strings.latency,
+              value: formatLatency(peer.latencyMs),
             ),
             _DetailLine(label: strings.lastSeen, value: _formatLastSeen(peer)),
           ],
@@ -126,19 +102,6 @@ class _PeerDetailsContent extends StatelessWidget {
             _DetailLine(label: strings.virtualIp, value: dash(peer.virtualIp)),
             _DetailLine(label: strings.endpoint, value: dash(peer.endpoint)),
             _DetailLine(label: strings.relay, value: dash(peer.relayServer)),
-            if (peer.currentPathSelection?.reason.isNotEmpty == true)
-              _DetailLine(
-                label: strings.pathDecision,
-                value: peer.currentPathSelection!.reason,
-              ),
-          ],
-        ),
-        _DetailSection(
-          title: strings.sectionDevice,
-          rows: [
-            _DetailLine(label: strings.nodeId, value: peer.nodeId),
-            _DetailLine(label: strings.version, value: dash(peer.appVersion)),
-            _DetailLine(label: strings.state, value: dash(peer.state)),
           ],
         ),
         if (error != null && error.isNotEmpty) ...[
@@ -147,6 +110,12 @@ class _PeerDetailsContent extends StatelessWidget {
             rows: [_DetailIssueNote(message: error, strings: strings)],
           ),
         ],
+        _AdvancedSection(
+          peer: peer,
+          strings: strings,
+          copiedKey: copiedKey,
+          onCopy: onCopy,
+        ),
         const SizedBox(height: AppTokens.space4),
         const Divider(height: 1),
         const SizedBox(height: AppTokens.space12),
@@ -165,6 +134,8 @@ class _PeerDetailsContent extends StatelessWidget {
   }
 }
 
+/// Header answers the three first questions: who is it, is it online, how is
+/// it connected. No Node ID, no version, no raw state on the first level.
 class _DetailHeader extends StatelessWidget {
   const _DetailHeader({required this.peer, required this.strings});
 
@@ -174,59 +145,207 @@ class _DetailHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final onlineColor = P2WlanColors.of(context).direct;
-    return Row(
+    final statusColor = _rowStatusColor(context, peer);
+    final statusLabel = peer.online ? strings.online : strings.offline;
+    return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Flexible(
-                    child: Text(
-                      dash(peer.displayName),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurface,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: AppTokens.space8),
-                  Text(
-                    peer.online ? strings.online : strings.offline,
-                    style: TextStyle(
-                      color: peer.online
-                          ? onlineColor
-                          : theme.colorScheme.onSurfaceVariant,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: AppTokens.space4),
-              Text(
-                dash(peer.virtualIp),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                dash(peer.displayName),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: AppTokens.tabularFontFeatures,
+                  color: theme.colorScheme.onSurface,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-            ],
+            ),
+            const SizedBox(width: AppTokens.space10),
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: statusColor,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              statusLabel,
+              style: TextStyle(
+                color: statusColor,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: AppTokens.space4),
+        Text(
+          dash(peer.virtualIp),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 12.5,
+            fontWeight: FontWeight.w600,
+            fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
-        const SizedBox(width: AppTokens.space10),
-        _PathBadge(peer: peer, strings: strings),
+        const SizedBox(height: AppTokens.space4),
+        Text(
+          _pathSummaryLabel(strings, peer),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurface,
+            fontSize: 12.5,
+            fontWeight: FontWeight.w600,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
       ],
+    );
+  }
+}
+
+/// Collapsed by default: Node ID, version, state, path decision, and the
+/// copy-ping command stay out of the way until explicitly requested.
+class _AdvancedSection extends StatefulWidget {
+  const _AdvancedSection({
+    required this.peer,
+    required this.strings,
+    this.copiedKey,
+    this.onCopy,
+  });
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key)? onCopy;
+
+  @override
+  State<_AdvancedSection> createState() => _AdvancedSectionState();
+}
+
+class _AdvancedSectionState extends State<_AdvancedSection> {
+  var _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final peer = widget.peer;
+    final strings = widget.strings;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          key: const Key('nodes-advanced-toggle'),
+          onTap: () => setState(() => _expanded = !_expanded),
+          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    strings.advancedInfo,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.4,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                AnimatedRotation(
+                  turns: _expanded ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 150),
+                  child: Icon(
+                    Icons.expand_more_rounded,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          alignment: Alignment.topCenter,
+          child: _expanded
+              ? Padding(
+                  padding: const EdgeInsets.only(top: 2, bottom: 4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _DetailLine(label: strings.nodeId, value: peer.nodeId),
+                      _DetailLine(
+                        label: strings.version,
+                        value: dash(peer.appVersion),
+                      ),
+                      _DetailLine(
+                        label: strings.state,
+                        value: dash(peer.state),
+                      ),
+                      if (peer.currentPathSelection?.reason.isNotEmpty == true)
+                        _DetailLine(
+                          label: strings.pathDecision,
+                          value: peer.currentPathSelection!.reason,
+                        ),
+                      if (widget.onCopy != null) ...[
+                        const SizedBox(height: AppTokens.space6),
+                        _CopyPingAction(
+                          peer: peer,
+                          strings: strings,
+                          copiedKey: widget.copiedKey,
+                          onCopy: widget.onCopy!,
+                        ),
+                      ],
+                    ],
+                  ),
+                )
+              : const SizedBox(width: double.infinity),
+        ),
+      ],
+    );
+  }
+}
+
+class _CopyPingAction extends StatelessWidget {
+  const _CopyPingAction({
+    required this.peer,
+    required this.strings,
+    required this.copiedKey,
+    required this.onCopy,
+  });
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+  final String? copiedKey;
+  final Future<void> Function(String value, String key) onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final pingKey = '${peer.nodeId}:ping';
+    final copied = copiedKey == pingKey;
+    return TextButton.icon(
+      onPressed: () => onCopy('ping ${peer.virtualIp}', pingKey),
+      style: TextButton.styleFrom(
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+      ),
+      icon: Icon(
+        copied ? Icons.check_circle_outline : Icons.terminal_outlined,
+        size: 15,
+      ),
+      label: Text(strings.copyPingCommand),
     );
   }
 }
@@ -300,6 +419,8 @@ class _DetailIssueNote extends StatelessWidget {
   }
 }
 
+/// One prominent action (speed test when usable); everything else is a quiet
+/// text action. Remove keeps its danger semantics.
 class _DetailActions extends StatelessWidget {
   const _DetailActions({
     required this.peer,
@@ -325,73 +446,65 @@ class _DetailActions extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final ipKey = '${peer.nodeId}:ip';
-    final pingKey = '${peer.nodeId}:ping';
     final ipCopied = copiedKey == ipKey;
-    final pingCopied = copiedKey == pingKey;
-    final primaryActions = Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        FilledButton.tonalIcon(
-          key: Key('node-detail-speedtest-${peer.nodeId}'),
-          onPressed: _canRunSpeedTest(peer) && onSpeedTest != null
-              ? () => onSpeedTest!(peer)
-              : null,
-          icon: const Icon(Icons.speed_rounded, size: 17),
-          label: Text(strings.speedTest),
-        ),
-        if (onCopy != null) ...[
-          OutlinedButton.icon(
-            onPressed: () => onCopy!(peer.virtualIp, ipKey),
-            icon: Icon(
-              ipCopied ? Icons.check_circle_outline : Icons.copy_outlined,
-              size: 16,
-            ),
-            label: Text(strings.copyVirtualIp),
-          ),
-          OutlinedButton.icon(
-            onPressed: () => onCopy!('ping ${peer.virtualIp}', pingKey),
-            icon: Icon(
-              pingCopied ? Icons.check_circle_outline : Icons.terminal_outlined,
-              size: 16,
-            ),
-            label: Text(strings.copyPingCommand),
-          ),
-        ],
-        if (onEdit != null)
-          OutlinedButton.icon(
-            onPressed: busy ? null : () => onEdit!(peer),
-            icon: const Icon(Icons.edit_outlined, size: 16),
-            label: Text(strings.renameDevice),
-          ),
-      ],
-    );
-    final remove = onDelete == null
-        ? null
-        : Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              onPressed: busy ? null : () => onDelete!(peer),
-              icon: Icon(
-                Icons.delete_outline_rounded,
-                size: 16,
-                color: theme.colorScheme.error,
-              ),
-              label: Text(
-                strings.removeDevice,
-                style: TextStyle(color: theme.colorScheme.error),
-              ),
-            ),
-          );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        primaryActions,
-        if (remove != null) ...[
-          const SizedBox(height: AppTokens.space6),
-          remove,
-        ],
+        if (_canRunSpeedTest(peer) && onSpeedTest != null)
+          FilledButton.tonalIcon(
+            key: Key('node-detail-speedtest-${peer.nodeId}'),
+            onPressed: () => onSpeedTest!(peer),
+            icon: const Icon(Icons.speed_rounded, size: 17),
+            label: Text(strings.speedTest),
+          ),
+        const SizedBox(height: AppTokens.space8),
+        Wrap(
+          spacing: 4,
+          runSpacing: 2,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            if (onCopy != null)
+              TextButton.icon(
+                onPressed: () => onCopy!(peer.virtualIp, ipKey),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                ),
+                icon: Icon(
+                  ipCopied ? Icons.check_circle_outline : Icons.copy_outlined,
+                  size: 15,
+                ),
+                label: Text(strings.copyVirtualIp),
+              ),
+            if (onEdit != null)
+              TextButton.icon(
+                onPressed: busy ? null : () => onEdit!(peer),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                ),
+                icon: const Icon(Icons.edit_outlined, size: 15),
+                label: Text(strings.renameDevice),
+              ),
+            if (onDelete != null)
+              TextButton.icon(
+                onPressed: busy ? null : () => onDelete!(peer),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                ),
+                icon: Icon(
+                  Icons.delete_outline_rounded,
+                  size: 15,
+                  color: theme.colorScheme.error,
+                ),
+                label: Text(
+                  strings.removeDevice,
+                  style: TextStyle(color: theme.colorScheme.error),
+                ),
+              ),
+          ],
+        ),
       ],
     );
   }
