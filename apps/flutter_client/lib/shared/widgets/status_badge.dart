@@ -18,41 +18,44 @@ class StatusBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (bg, border, text, dot) = _colors(context);
-    return Container(
-      constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
-      padding: const EdgeInsets.symmetric(
-        horizontal: AppTokens.space8,
-        vertical: AppTokens.space4,
-      ),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-        border: Border.all(color: border, width: 1),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 6,
-            height: 6,
-            decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: AppTokens.space6),
-          Flexible(
-            child: Text(
-              label,
-              overflow: TextOverflow.ellipsis,
-              maxLines: 1,
-              style: TextStyle(
-                color: text,
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0,
-                fontFeatures: AppTokens.tabularFontFeatures,
+    return Semantics(
+      label: label,
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 24, maxWidth: 200),
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppTokens.space8,
+          vertical: AppTokens.space4,
+        ),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+          border: Border.all(color: border, width: 1),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 6,
+              height: 6,
+              decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: AppTokens.space6),
+            Flexible(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+                style: TextStyle(
+                  color: text,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0,
+                  fontFeatures: AppTokens.tabularFontFeatures,
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

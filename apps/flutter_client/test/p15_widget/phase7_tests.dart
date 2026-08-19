@@ -1,8 +1,10 @@
 part of '../p15_widget_test.dart';
 
-/// Phase 7 cross-platform polish coverage: settings error ownership,
-/// leave-guard discard dialog, responsive matrix smoke, and text-scale
-/// accessibility smoke.
+/// Phase 7 strict responsive, text-scale, and accessibility closure.
+///
+/// All tests in this file use strict `expect(tester.takeException(), isNull)`
+/// — no layout error is tolerated.  If a RenderFlex overflow surfaces, the
+/// test fails and the underlying widget must be fixed.
 void _registerPhase7Tests() {
   // ──────────────────────────────────────────────────────────────────────
   // 7.1  Settings error ownership: errors must not leak across categories.
@@ -231,6 +233,47 @@ void _registerPhase7Tests() {
       expect(tester.takeException(), isNull);
     });
 
+    testWidgets(
+      'mobile overflow menu: dirty Settings → Troubleshooting guard',
+      (tester) async {
+        final stores = await _pumpSettingsShell(
+          tester,
+          const Size(390, 844),
+          capabilities: PlatformCapabilities.fromPlatform('android'),
+        );
+        addTearDown(stores.dispose);
+
+        // Dirty a category.
+        await tester.tap(find.text('Account & Network'));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          _settingsTextField('Control server'),
+          'https://ctrl.example',
+        );
+        await tester.pump();
+        expect(find.text('Unsaved changes'), findsOneWidget);
+
+        // Open the mobile overflow menu and tap Troubleshooting.
+        await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+        await tester.pumpAndSettle();
+        // The overflow menu shows Troubleshooting.
+        final tsItem = find.text('Troubleshooting');
+        expect(tsItem, findsWidgets);
+        await tester.tap(tsItem.last);
+        await tester.pumpAndSettle();
+
+        // Guard dialog appears.
+        expect(find.text('Discard changes'), findsOneWidget);
+        expect(find.text('Continue editing'), findsOneWidget);
+
+        // Discard → navigate to Troubleshooting.
+        await tester.tap(find.text('Discard changes'));
+        await tester.pumpAndSettle();
+        expect(find.text('Unsaved changes'), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
     testWidgets('language switch does not trigger leave guard', (tester) async {
       final stores = await _pumpSettingsShell(tester, const Size(900, 1000));
       addTearDown(stores.dispose);
@@ -256,16 +299,171 @@ void _registerPhase7Tests() {
       expect(find.text('放弃更改'), findsNothing);
       expect(tester.takeException(), isNull);
     });
+
+    // ───────────────────────────────────────────────────────────────────
+    // Expanded desktop (1280) Settings leave guard via DesktopSidebar.
+    // ───────────────────────────────────────────────────────────────────
+
+    // In the expanded desktop layout (1280×800) the _SaveBar lives at the
+    // bottom of the category detail ListView and may be outside the viewport.
+    // The leave-guard is driven by the onDirtyChanged callback (not by the
+    // SaveBar's visibility), so the guard dialog fires regardless. Tests
+    // therefore verify the guard dialog and dirty draft state rather than
+    // the SaveBar's off-screen Text widget.
+
+    testWidgets('expanded desktop: dirty Settings → sidebar Home → guard', (
+      tester,
+    ) async {
+      final stores = await _pumpSettingsShell(
+        tester,
+        const Size(1280, 800),
+        capabilities: PlatformCapabilities.fromPlatform('macos'),
+      );
+      addTearDown(stores.dispose);
+
+      // Verify we're on expanded layout with DesktopSidebar.
+      expect(find.byType(DesktopSidebar), findsOneWidget);
+      expect(find.byType(NavigationBar), findsNothing);
+
+      // Open Advanced Network and dirty it.
+      await tester.tap(find.text('Advanced Network').last);
+      await tester.pumpAndSettle();
+      await tester.enterText(_settingsTextField('MTU'), '1280');
+      await tester.pump();
+      // The dirty state is tracked via onDirtyChanged regardless of whether
+      // the SaveBar is in the viewport.
+
+      // Click Home in the DesktopSidebar.
+      final sidebarHome = find.descendant(
+        of: find.byType(DesktopSidebar),
+        matching: find.text('Home'),
+      );
+      expect(sidebarHome, findsOneWidget);
+      await tester.tap(sidebarHome);
+      await tester.pumpAndSettle();
+
+      // Discard dialog appears — the leave guard fired.
+      expect(find.text('Discard changes'), findsOneWidget);
+      expect(find.text('Continue editing'), findsOneWidget);
+
+      // Continue editing → stay on Settings. The guard dialog is dismissed
+      // and we're back on the Advanced Network detail page. The dirty draft
+      // persists (the MTU field still shows the edited value).
+      await tester.tap(find.text('Continue editing'));
+      await tester.pumpAndSettle();
+      expect(find.text('Interface name'), findsOneWidget);
+      // The MTU field still holds the unsaved draft value.
+      expect(
+        tester.widget<TextField>(_settingsTextField('MTU')).controller?.text,
+        '1280',
+      );
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('expanded desktop: dirty Settings → Discard → navigates Home, '
+        'draft cleared on return', (tester) async {
+      final stores = await _pumpSettingsShell(
+        tester,
+        const Size(1280, 800),
+        capabilities: PlatformCapabilities.fromPlatform('macos'),
+      );
+      addTearDown(stores.dispose);
+
+      // Dirty Advanced Network.
+      await tester.tap(find.text('Advanced Network').last);
+      await tester.pumpAndSettle();
+      await tester.enterText(_settingsTextField('MTU'), '1280');
+      await tester.pump();
+
+      // Navigate via sidebar Home → Discard.
+      final sidebarHome = find.descendant(
+        of: find.byType(DesktopSidebar),
+        matching: find.text('Home'),
+      );
+      await tester.tap(sidebarHome);
+      await tester.pumpAndSettle();
+      // The guard fired because onDirtyChanged set _settingsDirty.
+      expect(find.text('Discard changes'), findsOneWidget);
+      await tester.tap(find.text('Discard changes'));
+      await tester.pumpAndSettle();
+
+      // We're on Home now — no unsaved changes, no dirty bar.
+      expect(find.text('Unsaved changes'), findsNothing);
+      expect(find.text('Interface name'), findsNothing);
+
+      // Navigate back to Settings — the old SettingsPage was disposed,
+      // so the draft should not exist.
+      final sidebarSettings = find.descendant(
+        of: find.byType(DesktopSidebar),
+        matching: find.text('Settings'),
+      );
+      await tester.tap(sidebarSettings);
+      await tester.pumpAndSettle();
+      expect(find.text('Unsaved changes'), findsNothing);
+      // The MTU field should show the persisted value, not '1280'.
+      final mtuField = _settingsTextField('MTU');
+      if (mtuField.evaluate().isNotEmpty) {
+        expect(
+          tester.widget<TextField>(mtuField).controller?.text,
+          isNot('1280'),
+        );
+      }
+      expect(tester.takeException(), isNull);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 7.3  Responsive matrix: smoke at representative window sizes.
+  // 7.3  Responsive matrix: strict — no layout error at any size.
   // ──────────────────────────────────────────────────────────────────────
 
   group('Phase 7 responsive matrix', () {
+    // Mobile platform sizes (compact, phone bottom-bar navigation).
+    for (final entry in const <(Size, TargetPlatform)>[
+      (Size(360, 800), TargetPlatform.android),
+      (Size(390, 844), TargetPlatform.iOS),
+      (Size(844, 390), TargetPlatform.android),
+    ]) {
+      final size = entry.$1;
+      final platform = entry.$2;
+      testWidgets('shell ${size.width.toInt()}x${size.height.toInt()} '
+          '${platform.name} renders without layout error', (tester) async {
+        await _pumpStrictShell(tester, size, platform: platform);
+        expect(tester.takeException(), isNull);
+      });
+    }
+
+    // Compact desktop: rail, never phone bottom-bar.
+    for (final platform in [TargetPlatform.windows, TargetPlatform.linux]) {
+      testWidgets('500x700 ${platform.name} compact desktop renders without '
+          'BottomNavigation', (tester) async {
+        await _pumpStrictShell(
+          tester,
+          const Size(500, 700),
+          platform: platform,
+        );
+        expect(find.byType(NavigationBar), findsNothing);
+        expect(find.byType(AppNavRail), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      });
+    }
+
+    // macOS expanded.
+    testWidgets(
+      '1280x800 macOS expanded renders DesktopSidebar without layout error',
+      (tester) async {
+        await _pumpStrictShell(
+          tester,
+          const Size(1280, 800),
+          platform: TargetPlatform.macOS,
+        );
+        expect(find.byType(DesktopSidebar), findsOneWidget);
+        expect(find.byType(NavigationBar), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    // Medium and expanded desktop sizes.
     for (final size in const [
-      Size(390, 844),
-      Size(500, 700),
       Size(700, 1000),
       Size(900, 1000),
       Size(1024, 768),
@@ -275,78 +473,108 @@ void _registerPhase7Tests() {
       Size(1920, 1080),
     ]) {
       testWidgets(
-        'shell ${size.width.toInt()}x${size.height.toInt()} renders without error',
+        'shell ${size.width.toInt()}x${size.height.toInt()} renders without '
+        'layout error',
         (tester) async {
-          await tester.binding.setSurfaceSize(size);
-          addTearDown(() => tester.binding.setSurfaceSize(null));
-          final stores = await _smokeStores(tester);
-          addTearDown(stores.dispose);
-          await tester.pumpWidget(
-            _DesignSystemHost(
-              dark: false,
-              child: P2WlanShell(
-                settingsStore: stores.settingsStore,
-                statusStore: stores.statusStore,
-                capabilities: PlatformCapabilities.fromPlatform('macos'),
-              ),
-            ),
-          );
-          await tester.pumpAndSettle();
-          // Smoke: no fatal crash (overflow warnings in edge layouts are a
-          // known layout limitation, not a Phase 7 regression).
-          final exception = tester.takeException();
-          if (exception != null) {
-            expect(exception, isA<FlutterError>());
-          }
+          await _pumpStrictShell(tester, size);
+          expect(tester.takeException(), isNull);
         },
       );
     }
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 7.4  Text-scale accessibility smoke.
+  // 7.4  Text-scale accessibility: strict — no overflow at large scales.
   // ──────────────────────────────────────────────────────────────────────
 
   group('Phase 7 text scale', () {
-    for (final scale in [1.3, 1.5]) {
-      for (final size in const [Size(390, 844), Size(1280, 900)]) {
-        testWidgets(
-          '${scale}x text at ${size.width.toInt()}x${size.height.toInt()} '
-          'renders without fatal error',
-          (tester) async {
-            await tester.binding.setSurfaceSize(size);
-            addTearDown(() => tester.binding.setSurfaceSize(null));
-            final stores = await _smokeStores(tester);
-            addTearDown(stores.dispose);
-            await tester.pumpWidget(
-              MediaQuery(
-                data: MediaQueryData(textScaler: TextScaler.linear(scale)),
-                child: _DesignSystemHost(
-                  dark: false,
-                  child: P2WlanShell(
-                    settingsStore: stores.settingsStore,
-                    statusStore: stores.statusStore,
-                    capabilities: PlatformCapabilities.fromPlatform('macos'),
-                  ),
-                ),
-              ),
-            );
-            await tester.pumpAndSettle();
-            // Accessibility smoke: no fatal crash at large text scales.
-            // Minor flex overflow in dense toolbars is a known layout
-            // limitation, not a Phase 7 regression.
-            final exception = tester.takeException();
-            if (exception != null) {
-              expect(exception, isA<FlutterError>());
-            }
-          },
+    // 360×800 at various text scales — the smallest phone size.
+    for (final scale in [1.0, 1.3, 1.5]) {
+      testWidgets('360x800 scale $scale Home renders without layout error', (
+        tester,
+      ) async {
+        await _pumpStrictShell(
+          tester,
+          const Size(360, 800),
+          platform: TargetPlatform.android,
+          textScale: scale,
         );
-      }
+        expect(tester.takeException(), isNull);
+        // Verify mobile bottom navigation has exactly 3 destinations.
+        final navBar = tester.widget<NavigationBar>(find.byType(NavigationBar));
+        expect(navBar.destinations.length, 3);
+      });
+    }
+
+    // 390×844 — four-page real-shell coverage at 1.3 and 1.5.
+    for (final scale in [1.3, 1.5]) {
+      testWidgets('390x844 scale $scale Home renders without layout error', (
+        tester,
+      ) async {
+        await _pumpStrictShell(
+          tester,
+          const Size(390, 844),
+          platform: TargetPlatform.iOS,
+          textScale: scale,
+        );
+        expect(tester.takeException(), isNull);
+      });
+
+      testWidgets('390x844 scale $scale Devices renders without layout error', (
+        tester,
+      ) async {
+        await _pumpStrictShell(
+          tester,
+          const Size(390, 844),
+          platform: TargetPlatform.iOS,
+          textScale: scale,
+          section: P2WlanSection.devices,
+        );
+        expect(tester.takeException(), isNull);
+      });
+
+      testWidgets(
+        '390x844 scale $scale Troubleshooting renders without layout error',
+        (tester) async {
+          await _pumpStrictShell(
+            tester,
+            const Size(390, 844),
+            platform: TargetPlatform.iOS,
+            textScale: scale,
+            section: P2WlanSection.troubleshooting,
+          );
+          expect(tester.takeException(), isNull);
+        },
+      );
+
+      testWidgets(
+        '390x844 scale $scale Settings renders without layout error',
+        (tester) async {
+          await _pumpStrictShell(
+            tester,
+            const Size(390, 844),
+            platform: TargetPlatform.iOS,
+            textScale: scale,
+            section: P2WlanSection.settings,
+          );
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+
+    // Desktop text-scale coverage.
+    for (final scale in [1.3, 1.5]) {
+      testWidgets('1280x900 scale $scale renders without layout error', (
+        tester,
+      ) async {
+        await _pumpStrictShell(tester, const Size(1280, 900), textScale: scale);
+        expect(tester.takeException(), isNull);
+      });
     }
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 7.5  Four-page representative coverage at compact/medium/expanded.
+  // 7.5  Page coverage at normal scale — strict, no layout error.
   // ──────────────────────────────────────────────────────────────────────
 
   group('Phase 7 page coverage', () {
@@ -390,13 +618,130 @@ void _registerPhase7Tests() {
               _DesignSystemHost(dark: dark, child: entry.value(stores)),
             );
             await tester.pumpAndSettle();
-            final exception = tester.takeException();
-            if (exception != null) {
-              expect(exception, isA<FlutterError>());
-            }
+            expect(tester.takeException(), isNull);
           });
         }
       }
     }
   });
+}
+
+/// Pumps the full [P2WlanShell] at [size] with strict exception checking.
+///
+/// When [platform] is set, [debugDefaultTargetPlatformOverride] is used so
+/// the shell's `_isDesktopShell` logic resolves correctly for desktop vs
+/// mobile platforms.
+///
+/// When [textScale] > 1.0, wraps the shell in a [MediaQuery] with a linear
+/// text scaler to exercise large-text accessibility.
+///
+/// When [section] is provided, the shell is pumped and then navigated to
+/// that section via the shell's own navigation (bottom bar, rail, or sidebar).
+Future<void> _pumpStrictShell(
+  WidgetTester tester,
+  Size size, {
+  TargetPlatform? platform,
+  double textScale = 1.0,
+  P2WlanSection? section,
+}) async {
+  // Reset the element tree so a previous pump's shell state does not leak.
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.binding.setSurfaceSize(size);
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+
+  if (platform != null) {
+    debugDefaultTargetPlatformOverride = platform;
+    // Must be reset before the test body ends — the framework's
+    // _verifyInvariants asserts that foundation debug variables are unset
+    // before it runs addTearDown callbacks.
+  }
+
+  final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+  final clean = _mutateSnapshot(snapshot, _clearPeerErrors);
+  final stores = (await tester.runAsync(
+    () => _makeStores(api: _FakeDiagnosticsApi(health: true, snapshot: clean)),
+  ))!;
+  addTearDown(stores.dispose);
+  await stores.statusStore.refresh();
+
+  final platformCapabilities = platform != null
+      ? PlatformCapabilities.fromPlatform(platform.name)
+      : PlatformCapabilities.fromPlatform('macos');
+
+  Widget shell = P2WlanShell(
+    settingsStore: stores.settingsStore,
+    statusStore: stores.statusStore,
+    capabilities: platformCapabilities,
+  );
+
+  if (textScale != 1.0) {
+    shell = MediaQuery(
+      data: MediaQueryData(textScaler: TextScaler.linear(textScale)),
+      child: shell,
+    );
+  }
+
+  await tester.pumpWidget(_DesignSystemHost(dark: false, child: shell));
+  await tester.pumpAndSettle();
+
+  // Navigate to the requested section if not Home.
+  if (section != null && section != P2WlanSection.home) {
+    // Try sidebar first (expanded desktop), then rail (medium), then
+    // bottom nav (compact mobile).
+    final sidebarFinder = find.descendant(
+      of: find.byType(DesktopSidebar),
+      matching: find.text(
+        section.name == 'troubleshooting'
+            ? 'Troubleshooting'
+            : section.name[0].toUpperCase() + section.name.substring(1),
+      ),
+    );
+    final railFinder = find.descendant(
+      of: find.byType(AppNavRail),
+      matching: find.text(
+        section.name == 'troubleshooting'
+            ? 'Troubleshooting'
+            : section.name[0].toUpperCase() + section.name.substring(1),
+      ),
+    );
+    final bottomFinder = find.descendant(
+      of: find.byType(NavigationBar),
+      matching: find.text(
+        section.name == 'troubleshooting'
+            ? 'Troubleshooting'
+            : section.name[0].toUpperCase() + section.name.substring(1),
+      ),
+    );
+
+    // For Troubleshooting on mobile (not in bottom nav), use overflow menu.
+    if (section == P2WlanSection.troubleshooting &&
+        sidebarFinder.evaluate().isEmpty &&
+        railFinder.evaluate().isEmpty &&
+        bottomFinder.evaluate().isEmpty) {
+      // Mobile: open the overflow menu.
+      final menu = find.byType(PopupMenuButton);
+      if (menu.evaluate().isNotEmpty) {
+        await tester.tap(menu);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Troubleshooting').last);
+        await tester.pumpAndSettle();
+      }
+    } else {
+      final target = sidebarFinder.evaluate().isNotEmpty
+          ? sidebarFinder
+          : railFinder.evaluate().isNotEmpty
+          ? railFinder
+          : bottomFinder;
+      if (target.evaluate().isNotEmpty) {
+        await tester.ensureVisible(target);
+        await tester.pumpAndSettle();
+        await tester.tap(target);
+        await tester.pumpAndSettle();
+      }
+    }
+  }
+
+  // Reset before returning — the framework's _verifyInvariants asserts that
+  // foundation debug variables are unset before it runs addTearDown callbacks.
+  debugDefaultTargetPlatformOverride = null;
 }

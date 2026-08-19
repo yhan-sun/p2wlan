@@ -127,16 +127,18 @@ class _ComponentRow extends StatelessWidget {
           decoration: BoxDecoration(color: text, shape: BoxShape.circle),
         ),
         const SizedBox(width: 7),
-        Text(
-          value,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: text,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-            height: 1.3,
-            fontFeatures: AppTokens.tabularFontFeatures,
+        Flexible(
+          child: Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: text,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              height: 1.3,
+              fontFeatures: AppTokens.tabularFontFeatures,
+            ),
           ),
         ),
       ],

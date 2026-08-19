@@ -111,12 +111,15 @@ class _DeviceRow extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: statusColor,
-                  shape: BoxShape.circle,
+              Semantics(
+                label: statusLabel,
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
                 ),
               ),
               const SizedBox(width: AppTokens.space10),
@@ -150,26 +153,32 @@ class _DeviceRow extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: AppTokens.space12),
-              Text(
-                statusLabel,
-                maxLines: 1,
-                style: TextStyle(
-                  color: statusColor,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  height: 1.2,
+              Flexible(
+                child: Text(
+                  statusLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: statusColor,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    height: 1.2,
+                  ),
                 ),
               ),
               const SizedBox(width: AppTokens.space8),
-              Text(
-                _peerLatencyLabel(strings, peer),
-                maxLines: 1,
-                style: TextStyle(
-                  color: theme.colorScheme.onSurface,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  height: 1.2,
-                  fontFeatures: AppTokens.tabularFontFeatures,
+              Flexible(
+                child: Text(
+                  _peerLatencyLabel(strings, peer),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    height: 1.2,
+                    fontFeatures: AppTokens.tabularFontFeatures,
+                  ),
                 ),
               ),
             ],

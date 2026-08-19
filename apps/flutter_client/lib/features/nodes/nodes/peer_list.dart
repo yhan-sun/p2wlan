@@ -144,7 +144,7 @@ class _RowContent extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        _StatusDot(peer: peer),
+        _StatusDot(peer: peer, strings: strings),
         const SizedBox(width: AppTokens.space10),
         Expanded(
           child: _PeerPrimaryText(peer: peer, strings: strings),
@@ -235,7 +235,7 @@ class _CompactRowContent extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        _StatusDot(peer: peer),
+        _StatusDot(peer: peer, strings: strings),
         const SizedBox(width: AppTokens.space10),
         Expanded(
           child: Column(
@@ -283,18 +283,22 @@ class _CompactRowContent extends StatelessWidget {
 }
 
 class _StatusDot extends StatelessWidget {
-  const _StatusDot({required this.peer});
+  const _StatusDot({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
+  final AppStrings strings;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(
-        color: _rowStatusColor(context, peer),
-        shape: BoxShape.circle,
+    return Semantics(
+      label: _rowPathLabel(strings, peer),
+      child: Container(
+        width: 8,
+        height: 8,
+        decoration: BoxDecoration(
+          color: _rowStatusColor(context, peer),
+          shape: BoxShape.circle,
+        ),
       ),
     );
   }

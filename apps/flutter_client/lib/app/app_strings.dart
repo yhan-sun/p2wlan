@@ -92,6 +92,7 @@ class AppStrings {
   String get stopP2wlan => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
   String get cancel => isZh ? '取消' : 'Cancel';
+  String get back => isZh ? '返回' : 'Back';
   String get close => isZh ? '关闭' : 'Close';
   String get closeWindow => isZh ? '退出应用' : 'Close window';
   String get continueAction => isZh ? '继续' : 'Continue';
@@ -791,7 +792,7 @@ class AppStrings {
   String get settingsSaveFailed =>
       isZh ? '无法保存配置，请重试。' : 'Could not save settings. Please try again.';
 
-  // --- Settings leave guard (Phase 7) ---
+  // --- Settings leave guard ---
   String get discardSettingsTitle =>
       isZh ? '放弃未保存的更改？' : 'Discard unsaved changes?';
   String get discardSettingsBody =>

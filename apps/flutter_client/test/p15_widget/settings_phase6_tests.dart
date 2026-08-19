@@ -623,6 +623,14 @@ void _registerSettingsPhase6Tests() {
 
 /// Pumps the full shell (rail/sidebar/bottom-nav) with healthy diagnostics so
 /// Settings can be exercised at real window widths.
+///
+/// When [capabilities] indicate a mobile platform (no local daemon control),
+/// [debugDefaultTargetPlatformOverride] is set so the shell renders the mobile
+/// bottom-nav layout. The override is reset before returning — the shell's
+/// widget tree is already built with the correct platform, and subsequent
+/// `find`/`tap` calls will still locate the mobile widgets that were built
+/// during the pump. Tests that need to *re-pump* with a mobile platform
+/// should set the override themselves.
 Future<_Stores> _pumpSettingsShell(
   WidgetTester tester,
   Size size, {
@@ -633,6 +641,18 @@ Future<_Stores> _pumpSettingsShell(
   await tester.pumpWidget(const SizedBox.shrink());
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
+
+  final caps = capabilities ?? PlatformCapabilities.fromPlatform('macos');
+  final isMobilePlatform = !caps.canControlLocalDaemon;
+  if (isMobilePlatform) {
+    // Infer android vs iOS from the size — android tests use 360 width,
+    // iOS tests use 390 width. Both produce identical capabilities, so
+    // the platform is inferred from the test's viewport size.
+    debugDefaultTargetPlatformOverride = size.width < 375
+        ? TargetPlatform.android
+        : TargetPlatform.iOS;
+  }
+
   final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
   final clean = _mutateSnapshot(snapshot, _clearPeerErrors);
   final stores = (await tester.runAsync(
@@ -645,13 +665,17 @@ Future<_Stores> _pumpSettingsShell(
       child: P2WlanShell(
         settingsStore: stores.settingsStore,
         statusStore: stores.statusStore,
-        capabilities:
-            capabilities ?? PlatformCapabilities.fromPlatform('macos'),
+        capabilities: caps,
       ),
     ),
   );
   await tester.pumpAndSettle();
-  // Navigate to Settings (rail text on medium, bottom bar on compact).
+  // Navigate to Settings (sidebar on expanded, rail on medium, bottom bar
+  // on compact mobile).
+  final sidebar = find.descendant(
+    of: find.byType(DesktopSidebar),
+    matching: find.text('Settings'),
+  );
   final rail = find.descendant(
     of: find.byType(AppNavRail),
     matching: find.text('Settings'),
@@ -660,9 +684,21 @@ Future<_Stores> _pumpSettingsShell(
     of: find.byType(NavigationBar),
     matching: find.text('Settings'),
   );
-  final target = rail.evaluate().isNotEmpty ? rail : bottom;
+  final target = sidebar.evaluate().isNotEmpty
+      ? sidebar
+      : rail.evaluate().isNotEmpty
+      ? rail
+      : bottom;
   expect(target, findsOneWidget);
   await tester.tap(target);
   await tester.pumpAndSettle();
+
+  // Reset if we set it (mobile platforms). The framework's
+  // _verifyInvariants asserts that foundation debug variables are unset
+  // before it runs addTearDown callbacks.
+  if (isMobilePlatform) {
+    debugDefaultTargetPlatformOverride = null;
+  }
+
   return stores;
 }

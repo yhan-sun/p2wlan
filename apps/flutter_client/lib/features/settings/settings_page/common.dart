@@ -129,10 +129,11 @@ class _DetailHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final strings = AppStringsScope.of(context);
     final leading = onBack == null
         ? null
         : IconButton(
-            tooltip: 'Back',
+            tooltip: strings.back,
             icon: const Icon(Icons.arrow_back_rounded),
             onPressed: onBack,
           );

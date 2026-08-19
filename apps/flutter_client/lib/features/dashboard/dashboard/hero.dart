@@ -257,16 +257,18 @@ class _VirtualIpBlock extends StatelessWidget {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    dash(virtualIp),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: theme.colorScheme.onSurface,
-                      fontSize: 28,
-                      fontWeight: FontWeight.w700,
-                      height: 1.1,
-                      fontFeatures: AppTokens.tabularFontFeatures,
+                  Flexible(
+                    child: Text(
+                      dash(virtualIp),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700,
+                        height: 1.1,
+                        fontFeatures: AppTokens.tabularFontFeatures,
+                      ),
                     ),
                   ),
                   const SizedBox(width: AppTokens.space8),
@@ -317,7 +319,10 @@ class _StaleNote extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final c = P2WlanColors.of(context);
-    return Row(
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 7,
+      runSpacing: 4,
       children: [
         Container(
           width: 7,
@@ -327,7 +332,6 @@ class _StaleNote extends StatelessWidget {
             shape: BoxShape.circle,
           ),
         ),
-        const SizedBox(width: 7),
         Text(
           strings.homeStaleNote,
           style: TextStyle(
@@ -337,7 +341,6 @@ class _StaleNote extends StatelessWidget {
             height: 1.2,
           ),
         ),
-        const SizedBox(width: AppTokens.space8),
         TextButton.icon(
           key: const Key('home-stale-refresh'),
           onPressed: refreshing ? null : onRefresh,
