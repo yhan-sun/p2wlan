@@ -16,6 +16,5 @@ const dashboardPageMaxWidth = 1200.0;
 /// inspector in — those windows keep the medium List + Dialog presentation.
 const nodesInspectorMinWidth = 960.0;
 const nodesPageMaxWidth = 1360.0;
-const tunnelsPageMaxWidth = 1100.0;
 const diagnosticsPageMaxWidth = 1120.0;
 const settingsPageMaxWidth = 960.0;

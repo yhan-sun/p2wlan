@@ -38,7 +38,6 @@ class AppStrings {
   String get nodes => isZh ? '节点' : 'Nodes';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
-  String get tunnels => isZh ? '隧道' : 'Tunnels';
 
   /// User-level navigation labels (Phase 1 IA).
   String get home => isZh ? '首页' : 'Home';
@@ -245,6 +244,13 @@ class AppStrings {
   String get diagnosticsSubtitle => isZh
       ? '检查 P2WLAN 服务状态，并查看需要处理的问题。'
       : 'Check P2WLAN service status and see what needs attention.';
+  String get systemStatus => isZh ? '系统状态' : 'System status';
+  String get rechecking => isZh ? '正在检查…' : 'Checking…';
+  String get openDevices => isZh ? '查看设备' : 'View devices';
+  String get openSettings => isZh ? '打开设置' : 'Open settings';
+  String get networkAndRoutes => isZh ? '网络与路由' : 'Network & routes';
+  String get virtualNetwork => isZh ? '虚拟网络' : 'Virtual network';
+  String get supportTools => isZh ? '支持工具' : 'Support tools';
   String get diagnosticsOverview => isZh ? '诊断概览' : 'Diagnostics overview';
   String get healthChecks => isZh ? '状态检查' : 'Health checks';
   String get p2wlanService => isZh ? 'P2WLAN 服务' : 'P2WLAN service';
@@ -693,11 +699,7 @@ class AppStrings {
   String get onboardingStartFailed => isZh
       ? '无法启动 P2WLAN，请检查权限后重试。'
       : 'Could not start P2WLAN. Check permissions and try again.';
-  // --- Tunnels (Phase 8 localization) ---
-  String get tunnelsSubtitle => isZh
-      ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
-      : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.';
-  String get tunnelSummary => isZh ? '隧道摘要' : 'Tunnel summary';
+  // --- Network & routes (Troubleshooting advanced; migrated from Tunnels) ---
   String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
   String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
   String get virtualAdapter => isZh ? '虚拟网卡' : 'Virtual Adapter';
@@ -716,6 +718,7 @@ class AppStrings {
       isZh ? '权威状态：$state。' : 'Authoritative state: $state.';
   String get checkRoutes => isZh ? '检查路由' : 'Check routes';
   String get repairRoutes => isZh ? '修复路由' : 'Repair routes';
+  String get noFixNeeded => isZh ? '无需修复' : 'No fix needed';
   String get restartNetworkService =>
       isZh ? '重启网络服务（会短暂断开）' : 'Restart network service (brief disconnect)';
   String tunnelRouteRepaired(String after) => isZh
@@ -862,7 +865,6 @@ class AppStrings {
       'devices' => devices,
       'troubleshooting' => troubleshooting,
       'settings' => settings,
-      'tunnels' => tunnels,
       _ => sectionName,
     };
   }

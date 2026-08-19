@@ -73,7 +73,9 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     this.speedTestResult,
     this.speedTestError,
     this.repairRoutesError,
-  });
+    RoutesResponse? routes,
+    this.repairResult,
+  }) : routes = routes ?? _fakeRoutes;
 
   final bool health;
   DiagnosticsSnapshot? snapshot;
@@ -81,6 +83,14 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   final SpeedTestResult? speedTestResult;
   final Object? speedTestError;
   final Object? repairRoutesError;
+
+  /// Route verification response (default: installed); tests swap this to
+  /// exercise missing/conflict/unverified states.
+  RoutesResponse routes;
+  Object? verifyRoutesError;
+
+  /// Repair response; default performs a successful in-place change.
+  RouteRepairResponse? repairResult;
   var statusFetchCount = 0;
   var speedTestCount = 0;
   var verifyRoutesCount = 0;
@@ -127,7 +137,9 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   @override
   Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
     verifyRoutesCount += 1;
-    return _fakeRoutes;
+    final error = verifyRoutesError;
+    if (error != null) throw error;
+    return routes;
   }
 
   @override
@@ -135,7 +147,7 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     repairRoutesCount += 1;
     final error = repairRoutesError;
     if (error != null) throw error;
-    return _fakeRepair;
+    return repairResult ?? _fakeRepair;
   }
 
   @override

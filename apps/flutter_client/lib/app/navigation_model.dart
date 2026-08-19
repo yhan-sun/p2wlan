@@ -7,18 +7,16 @@ import 'package:flutter/material.dart';
 ///   Desktop primary:  Home / Devices / Troubleshooting / Settings
 ///   Mobile primary:   Home / Devices / Settings
 ///
-/// `tunnels` is an implementation-detail section (TUN interface, UDP bind,
-/// overlay routes, MTU, lifecycle). It stays fully functional and routable,
-/// but is deliberately NOT part of the primary navigation; later phases
-/// surface it from Troubleshooting → Advanced diagnostics.
+/// Troubleshooting carries the full technical surface (route verification,
+/// repair, daemon restart, permissions, logs, raw data) behind its Advanced
+/// section — there is intentionally no separate Tunnels section.
 ///
 /// "Hide complexity, don't remove capability."
 enum P2WlanSection {
   home(Icons.home_outlined),
   devices(Icons.hub_outlined),
   troubleshooting(Icons.monitor_heart_outlined),
-  settings(Icons.settings_outlined),
-  tunnels(Icons.cable_outlined);
+  settings(Icons.settings_outlined);
 
   const P2WlanSection(this.icon);
 
@@ -31,10 +29,6 @@ enum P2WlanSection {
     troubleshooting,
     settings,
   ];
-
-  /// Sections not shown in the primary navigation but still routable.
-  /// [P2WlanSection.tunnels] is the only secondary section today.
-  static const List<P2WlanSection> secondary = [tunnels];
 
   /// Permanent compact (phone) bottom-bar destinations — exactly three.
   /// Troubleshooting is deliberately absent: it is entered from the shell

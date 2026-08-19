@@ -29,7 +29,7 @@ class AppNavRail extends StatelessWidget {
   /// Rail width for compact desktop windows (icon-only).
   static const compactWidth = 60.0;
 
-  /// Current section; secondary sections (tunnels) render no selection.
+  /// Current section; secondary/non-primary sections render no selection.
   final P2WlanSection? selected;
   final bool iconOnly;
   final AppStrings strings;

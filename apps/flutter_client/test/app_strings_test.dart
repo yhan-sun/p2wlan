@@ -47,7 +47,7 @@ void main() {
         expect(s.createAccount.trim(), isNotEmpty);
         expect(s.diagnosticsSubtitle.trim(), isNotEmpty);
         expect(s.onboardingTitle.trim(), isNotEmpty);
-        expect(s.tunnelsSubtitle.trim(), isNotEmpty);
+        expect(s.networkAndRoutes.trim(), isNotEmpty);
         expect(s.overviewHealthyTitle.trim(), isNotEmpty);
         expect(s.loginErrorUnknownTitle.trim(), isNotEmpty);
         expect(s.settingsSaveFailed.trim(), isNotEmpty);

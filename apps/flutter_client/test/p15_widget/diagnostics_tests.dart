@@ -1,47 +1,79 @@
 part of '../p15_widget_test.dart';
 
 void _registerDiagnosticsTests() {
-  testWidgets('healthy page shows clean overview, checks, and no issues', (
-    tester,
-  ) async {
-    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final clean = _mutateSnapshot(snapshot, _clearPeerErrors);
-    final stores = (await tester.runAsync(
-      () =>
-          _makeStores(api: _FakeDiagnosticsApi(health: true, snapshot: clean)),
-    ))!;
-    addTearDown(stores.dispose);
-    await stores.statusStore.refresh();
+  testWidgets(
+    'healthy page: system status + checks, no redundant issues card',
+    (tester) async {
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final clean = _mutateSnapshot(snapshot, _clearPeerErrors);
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: clean),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
 
-    await tester.pumpWidget(
-      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
-    );
+      await tester.pumpWidget(
+        _TestApp(
+          child: DiagnosticsPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('macos'),
+          ),
+        ),
+      );
 
-    expect(find.text('P2WLAN is running normally'), findsOneWidget);
-    expect(
-      find.text('No issues found that need your attention.'),
-      findsOneWidget,
-    );
-    expect(find.text('Health checks'), findsOneWidget);
-    expect(find.text('P2WLAN service'), findsOneWidget);
-    expect(find.text('Running normally'), findsOneWidget);
-    expect(find.text('Control service'), findsOneWidget);
-    expect(find.text('connected'), findsOneWidget);
-    expect(find.text('Device connections'), findsOneWidget);
-    expect(find.text('2 online, no path anomalies'), findsOneWidget);
-    expect(find.text('No action needed'), findsWidgets);
-    expect(find.text('Advanced diagnostics'), findsOneWidget);
+      // Troubleshooting is the user-facing page name, not "Diagnostics".
+      expect(find.text('Troubleshooting'), findsOneWidget);
+      // System status is the first visual.
+      expect(find.text('System status'), findsOneWidget);
+      expect(find.text('P2WLAN is running normally'), findsOneWidget);
+      expect(
+        find.text('No issues found that need your attention.'),
+        findsOneWidget,
+      );
+      expect(find.text('Check again'), findsOneWidget);
 
-    // Advanced (and everything technical) stays collapsed by default.
-    expect(find.text('Platform permissions'), findsNothing);
-    expect(find.text('Protocol and MTU'), findsNothing);
-    expect(find.text('Critical tasks'), findsNothing);
-    expect(find.text('Recent daemon logs'), findsNothing);
-    expect(find.text('Raw /status JSON'), findsNothing);
-    expect(find.textContaining('GET /health'), findsNothing);
-    expect(find.textContaining('GET /status'), findsNothing);
-    expect(tester.takeException(), isNull);
-  });
+      // Basic checks are present and user-value only.
+      expect(find.text('Health checks'), findsOneWidget);
+      expect(find.text('P2WLAN service'), findsOneWidget);
+      expect(find.text('Running normally'), findsOneWidget);
+      expect(find.text('Control service'), findsOneWidget);
+      expect(find.text('connected'), findsOneWidget);
+      expect(find.text('Device connections'), findsOneWidget);
+      expect(find.text('2 online, no path anomalies'), findsOneWidget);
+
+      // Healthy page must NOT re-render a redundant "no issues" panel.
+      expect(find.text('No action needed'), findsNothing);
+      expect(find.text('Needs attention'), findsNothing);
+
+      // Advanced (and everything technical) stays collapsed by default.
+      expect(find.text('Advanced diagnostics'), findsOneWidget);
+      expect(find.text('Network & routes'), findsNothing);
+      expect(find.text('Platform permissions'), findsNothing);
+      expect(find.text('Protocol and MTU'), findsNothing);
+      expect(find.text('Critical tasks'), findsNothing);
+      expect(find.text('Recent daemon logs'), findsNothing);
+      expect(find.text('Raw /status JSON'), findsNothing);
+      expect(find.textContaining('GET /health'), findsNothing);
+      expect(find.textContaining('GET /status'), findsNothing);
+
+      // None of the technical surface leaks into the default view.
+      for (final technical in [
+        'UDP sockets',
+        'Virtual Adapter',
+        'Virtual IP',
+        'Check routes',
+        'Repair routes',
+        'Restart network service',
+        'Copy diagnostics summary',
+      ]) {
+        expect(find.text(technical), findsNothing);
+      }
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('relay disconnected is not an issue when paths are healthy', (
     tester,
@@ -68,7 +100,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: _noopLogPreviewLoader,
         ),
@@ -76,7 +110,7 @@ void _registerDiagnosticsTests() {
     );
 
     expect(find.text('P2WLAN is running normally'), findsOneWidget);
-    expect(find.text('No action needed'), findsWidgets);
+    expect(find.text('No action needed'), findsNothing);
     expect(find.textContaining('Relay'), findsNothing);
 
     // Relay is only described (neutrally) in the advanced runtime details.
@@ -88,7 +122,7 @@ void _registerDiagnosticsTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('advanced section shows runtime details and raw JSON', (
+  testWidgets('advanced section shows network, runtime details, and raw JSON', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -103,7 +137,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: _noopLogPreviewLoader,
         ),
@@ -112,12 +148,17 @@ void _registerDiagnosticsTests() {
 
     await _expandAdvanced(tester);
 
+    // Network & routes is the first advanced item (former Tunnels home).
+    expect(find.text('Network & routes'), findsOneWidget);
+    expect(find.text('Virtual Adapter'), findsOneWidget);
     expect(find.text('Runtime details'), findsOneWidget);
     expect(find.text('Health endpoint'), findsOneWidget);
     expect(find.text('Status endpoint'), findsOneWidget);
     expect(find.text('Critical tasks'), findsOneWidget);
     expect(find.text('Recent daemon logs'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
+    expect(find.text('Support tools'), findsOneWidget);
+    expect(find.text('Copy diagnostics summary'), findsOneWidget);
 
     tester
         .widget<OutlinedButton>(
@@ -144,7 +185,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: _noopLogPreviewLoader,
         ),
@@ -204,7 +247,7 @@ void _registerDiagnosticsTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('stale snapshot keeps old checks and recommends refresh', (
+  testWidgets('stale snapshot keeps old checks and offers recheck', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -231,6 +274,8 @@ void _registerDiagnosticsTests() {
     );
     expect(find.text('Running normally'), findsOneWidget);
     expect(find.text('Try refreshing the status.'), findsOneWidget);
+    // The stale issue offers a real recheck action.
+    expect(find.text('Check again'), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 
@@ -278,8 +323,16 @@ void _registerDiagnosticsTests() {
     addTearDown(stores.dispose);
     await stores.statusStore.refresh();
 
+    var openedSettings = false;
     await tester.pumpWidget(
-      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
+      _TestApp(
+        child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+          onOpenSettings: () => openedSettings = true,
+        ),
+      ),
     );
 
     expect(find.text('Re-authentication required'), findsWidgets);
@@ -288,6 +341,11 @@ void _registerDiagnosticsTests() {
       findsOneWidget,
     );
     expect(find.textContaining('control_auth_token_expired'), findsNothing);
+
+    // Reauth maps to a real action: open settings (no invented auto-fix).
+    expect(find.text('Open settings'), findsOneWidget);
+    await tester.tap(find.text('Open settings'));
+    expect(openedSettings, isTrue);
     expect(tester.takeException(), isNull);
   });
 
@@ -311,7 +369,9 @@ void _registerDiagnosticsTests() {
       await tester.pumpWidget(
         _TestApp(
           child: DiagnosticsPage(
+            settingsStore: stores.settingsStore,
             statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('macos'),
             permissionCheck: _noopPermissionCheck,
             logPreviewLoader: _noopLogPreviewLoader,
           ),
@@ -326,6 +386,8 @@ void _registerDiagnosticsTests() {
         find.text('A background network task is failing.'),
         findsOneWidget,
       );
+      // No fabricated "auto fix" for a critical task — explanation only.
+      expect(find.text('Open settings'), findsNothing);
       expect(find.textContaining('SocketException'), findsNothing);
       expect(find.textContaining('SUPER_SECRET'), findsNothing);
 
@@ -337,7 +399,7 @@ void _registerDiagnosticsTests() {
     },
   );
 
-  testWidgets('peer warnings are summarized, raw peer errors stay hidden', (
+  testWidgets('peer warnings are summarized with a real devices action', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -354,8 +416,16 @@ void _registerDiagnosticsTests() {
     addTearDown(stores.dispose);
     await stores.statusStore.refresh();
 
+    var openedDevices = false;
     await tester.pumpWidget(
-      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
+      _TestApp(
+        child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+          onOpenDevices: () => openedDevices = true,
+        ),
+      ),
     );
 
     expect(find.text('1 device needs path review'), findsOneWidget);
@@ -364,18 +434,49 @@ void _registerDiagnosticsTests() {
       findsOneWidget,
     );
     expect(find.textContaining('endpoint unreachable'), findsNothing);
+
+    expect(find.text('View devices'), findsOneWidget);
+    await tester.tap(find.text('View devices'));
+    expect(openedDevices, isTrue);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('issue recheck action triggers a store refresh', (tester) async {
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(
+          health: true,
+          statusError: const DiagnosticsApiException('temporarily unavailable'),
+        ),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+
+    await tester.pumpWidget(
+      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
+    );
+
+    // Status-unavailable issue exposes a real recheck action.
+    expect(find.text('Runtime status temporarily unavailable'), findsOneWidget);
+    final before = stores.statusStore.statusReachable;
+    await tester.tap(find.text('Check again').first);
+    await tester.pumpAndSettle();
+    // The action maps to statusStore.refresh(), so it keeps the last-known
+    // data readable instead of locking the page.
+    expect(stores.statusStore.refreshing, isFalse);
+    expect(stores.statusStore.statusReachable, before);
     expect(tester.takeException(), isNull);
   });
 
   testWidgets('advanced content is lazily mounted', (tester) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
+    final api = _FakeDiagnosticsApi(health: true, snapshot: snapshot);
+    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
     addTearDown(stores.dispose);
     await stores.statusStore.refresh();
+    // The store's own refresh performs one authoritative verify.
+    final baselineVerify = api.verifyRoutesCount;
 
     var permissionCalls = 0;
     var logCalls = 0;
@@ -383,7 +484,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: () async {
             permissionCalls += 1;
             return _noopPreflight;
@@ -400,17 +503,23 @@ void _registerDiagnosticsTests() {
       ),
     );
 
+    // Collapsed: nothing technical runs, including network route verify.
     expect(permissionCalls, 0);
     expect(logCalls, 0);
+    expect(api.verifyRoutesCount, baselineVerify);
     expect(find.text('Platform permissions'), findsNothing);
     expect(find.text('Recent daemon logs'), findsNothing);
+    expect(find.text('Network & routes'), findsNothing);
 
     await _expandAdvanced(tester);
 
     expect(permissionCalls, 1);
     expect(logCalls, 1);
+    // The network section performs exactly one one-shot verify on mount.
+    expect(api.verifyRoutesCount, baselineVerify + 1);
     expect(find.text('Platform permissions'), findsOneWidget);
     expect(find.text('Recent daemon logs'), findsOneWidget);
+    expect(find.text('Network & routes'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -429,6 +538,7 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
@@ -441,6 +551,12 @@ void _registerDiagnosticsTests() {
     expect(find.text('Protocol and MTU'), findsOneWidget);
     expect(find.text('Critical tasks'), findsOneWidget);
     expect(find.text('Raw /status JSON'), findsOneWidget);
+    // Local-only surfaces are hidden entirely on remote-only mobile, never
+    // rendered as a row of disabled controls.
+    expect(find.text('Network & routes'), findsNothing);
+    expect(find.text('Check routes'), findsNothing);
+    expect(find.text('Repair routes'), findsNothing);
+    expect(find.text('Restart network service'), findsNothing);
     expect(find.text('Platform permissions'), findsNothing);
     expect(find.text('Create TUN'), findsNothing);
     expect(find.text('Modify routes'), findsNothing);
@@ -449,7 +565,9 @@ void _registerDiagnosticsTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('copy diagnostics summary is redacted', (tester) async {
+  testWidgets('copy diagnostics summary is redacted (from support tools)', (
+    tester,
+  ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
     final secret = _mutateSnapshot(snapshot, (raw) {
       raw['health']['reason'] =
@@ -464,8 +582,21 @@ void _registerDiagnosticsTests() {
     await stores.statusStore.refresh();
 
     await tester.pumpWidget(
-      _TestApp(child: DiagnosticsPage(statusStore: stores.statusStore)),
+      _TestApp(
+        child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
+        ),
+      ),
     );
+
+    // Copy is demoted to Advanced → Support tools, not the page's first action.
+    expect(find.text('Copy diagnostics summary'), findsNothing);
+    await _expandAdvanced(tester);
+    expect(find.text('Copy diagnostics summary'), findsOneWidget);
 
     String? captured;
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
@@ -485,6 +616,8 @@ void _registerDiagnosticsTests() {
       );
     });
 
+    await tester.ensureVisible(find.text('Copy diagnostics summary'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Copy diagnostics summary'));
     await tester.pump();
 
@@ -513,7 +646,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: _noopLogPreviewLoader,
         ),
@@ -548,7 +683,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: () async {
             return const DiagnosticsLogPreview(
@@ -584,7 +721,9 @@ void _registerDiagnosticsTests() {
     await tester.pumpWidget(
       _TestApp(
         child: DiagnosticsPage(
+          settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
           permissionCheck: _noopPermissionCheck,
           logPreviewLoader: () async {
             return const DiagnosticsLogPreview(
@@ -616,7 +755,12 @@ void _registerDiagnosticsTests() {
     expect(tester.takeException(), isNull);
   });
 
-  for (final size in const [Size(390, 844), Size(700, 1000), Size(1280, 900)]) {
+  for (final size in const [
+    Size(390, 844),
+    Size(700, 1000),
+    Size(1280, 900),
+    Size(1440, 900),
+  ]) {
     testWidgets(
       'diagnostics fits ${size.width.toInt()}x${size.height.toInt()}',
       (tester) async {
@@ -635,7 +779,9 @@ void _registerDiagnosticsTests() {
         await tester.pumpWidget(
           _TestApp(
             child: DiagnosticsPage(
+              settingsStore: stores.settingsStore,
               statusStore: stores.statusStore,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
               permissionCheck: _noopPermissionCheck,
               logPreviewLoader: _noopLogPreviewLoader,
             ),

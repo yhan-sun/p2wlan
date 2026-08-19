@@ -16,9 +16,11 @@ void main() {
       },
     );
 
-    test('tunnels is secondary, never primary', () {
-      expect(P2WlanSection.secondary, [P2WlanSection.tunnels]);
-      expect(P2WlanSection.primary, isNot(contains(P2WlanSection.tunnels)));
+    test('there is no separate tunnels section', () {
+      // Phase 5: Tunnels was fully absorbed into Troubleshooting → Advanced.
+      for (final section in P2WlanSection.values) {
+        expect(section.name, isNot('tunnels'));
+      }
     });
 
     test('every primary section has a sidebar group slot', () {
@@ -58,11 +60,12 @@ void main() {
       expect(P2WlanSection.primary, contains(P2WlanSection.troubleshooting));
     });
 
-    test('primary plus secondary covers every section exactly once', () {
-      final covered = [...P2WlanSection.primary, ...P2WlanSection.secondary];
-      expect(covered.toSet().length, covered.length);
-      expect(covered, containsAll(P2WlanSection.primary));
-      expect(covered, containsAll(P2WlanSection.secondary));
+    test('primary covers every section exactly once', () {
+      expect(
+        P2WlanSection.primary.toSet().length,
+        P2WlanSection.primary.length,
+      );
+      expect(P2WlanSection.primary, containsAll(P2WlanSection.values));
     });
   });
 

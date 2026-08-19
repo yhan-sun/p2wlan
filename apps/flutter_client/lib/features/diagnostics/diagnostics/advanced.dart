@@ -105,8 +105,9 @@ class _AdvancedDisclosure extends StatelessWidget {
   }
 }
 
-/// Technical endpoint/runtime metrics moved into the advanced section. Raw
-/// error strings only appear here (redacted), never in the default view.
+/// Technical endpoint/runtime metrics in a compact KV layout — a quiet
+/// technical runtime, not an instrumentation dashboard. Raw error strings only
+/// appear here (redacted), never in the default view.
 class _RuntimeDetailsPanel extends StatelessWidget {
   const _RuntimeDetailsPanel({
     required this.statusStore,
@@ -120,76 +121,106 @@ class _RuntimeDetailsPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final health = snapshot?.health;
-    return AppPanel(
-      title: strings.runtimeDetails,
-      child: Wrap(
-        spacing: 24,
-        runSpacing: 4,
-        children: [
-          MetricTile(
-            label: strings.healthEndpoint,
-            value: statusStore.healthReachable
-                ? strings.reachable
-                : strings.offline,
-            detail: _redactedError(statusStore.lastHealthError),
-          ),
-          MetricTile(
-            label: strings.statusEndpoint,
-            value: strings.endpointStatusLabel(
-              statusReachable: statusStore.statusReachable,
-              healthReachable: statusStore.healthReachable,
-            ),
-            detail: _redactedError(statusStore.lastStatusError),
-          ),
-          MetricTile(
-            label: strings.serviceHealth,
-            value: health == null
-                ? '—'
-                : strings.healthStatusLabel(health.status),
-          ),
-          MetricTile(
-            label: strings.controlConnected,
-            value: strings.optionalBoolLabel(health?.controlConnected),
-          ),
-          MetricTile(
-            label: strings.udpSockets,
-            value: snapshot == null ? '—' : formatInt(snapshot!.udpSocketCount),
-          ),
-          MetricTile(
-            label: strings.socketPoolActive,
-            value: strings.optionalBoolLabel(snapshot?.udpSocketPoolActive),
-          ),
-          MetricTile(
-            label: strings.relay,
-            value: snapshot?.relayConnected == true
-                ? strings.connected
-                : strings.notConnected,
-          ),
-          MetricTile(
-            label: strings.lastRefresh,
-            value: formatDateTime(statusStore.lastFetchedAt),
-          ),
-          MetricTile(
-            label: strings.requestDuration,
-            value: formatDuration(statusStore.lastRequestDuration),
-          ),
-          if (statusStore.lastError != null)
-            MetricTile(
-              label: strings.lastError,
-              value: redactSensitive(statusStore.lastError!),
-            ),
-          if (health?.reason != null)
-            MetricTile(
-              label: strings.healthReason,
-              value: redactSensitive(health!.reason!),
-            ),
-        ],
+    final rows = <Widget>[
+      _KvRow(
+        label: strings.healthEndpoint,
+        value: statusStore.healthReachable
+            ? strings.reachable
+            : strings.offline,
       ),
+      if (statusStore.lastHealthError != null)
+        _KvRow(
+          label: strings.isZh ? '健康端点错误' : 'Health endpoint error',
+          value: redactSensitive(statusStore.lastHealthError!),
+        ),
+      _KvRow(
+        label: strings.statusEndpoint,
+        value: strings.endpointStatusLabel(
+          statusReachable: statusStore.statusReachable,
+          healthReachable: statusStore.healthReachable,
+        ),
+      ),
+      if (statusStore.lastStatusError != null)
+        _KvRow(
+          label: strings.isZh ? '状态端点错误' : 'Status endpoint error',
+          value: redactSensitive(statusStore.lastStatusError!),
+        ),
+      _KvRow(
+        label: strings.serviceHealth,
+        value: health == null ? '—' : strings.healthStatusLabel(health.status),
+      ),
+      _KvRow(
+        label: strings.controlConnected,
+        value: strings.optionalBoolLabel(health?.controlConnected),
+      ),
+      _KvRow(
+        label: strings.udpSockets,
+        value: snapshot == null ? '—' : formatInt(snapshot!.udpSocketCount),
+      ),
+      _KvRow(
+        label: strings.socketPoolActive,
+        value: strings.optionalBoolLabel(snapshot?.udpSocketPoolActive),
+      ),
+      _KvRow(
+        label: strings.relay,
+        value: snapshot?.relayConnected == true
+            ? strings.connected
+            : strings.notConnected,
+      ),
+      _KvRow(
+        label: strings.lastRefresh,
+        value: formatDateTime(statusStore.lastFetchedAt),
+      ),
+      _KvRow(
+        label: strings.requestDuration,
+        value: formatDuration(statusStore.lastRequestDuration),
+      ),
+      if (statusStore.lastError != null)
+        _KvRow(
+          label: strings.lastError,
+          value: redactSensitive(statusStore.lastError!),
+        ),
+      if (health?.reason != null)
+        _KvRow(
+          label: strings.healthReason,
+          value: redactSensitive(health!.reason!),
+        ),
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _AdvancedSectionHeader(title: strings.runtimeDetails),
+        const SizedBox(height: AppTokens.space10),
+        _AdvancedSubsection(rows: rows),
+      ],
     );
   }
+}
 
-  static String? _redactedError(String? value) {
-    if (value == null) return null;
-    return redactSensitive(value);
+/// Support tools: the diagnostics summary copy, demoted out of the default
+/// view. Everything is redacted before it reaches the clipboard.
+class _SupportTools extends StatelessWidget {
+  const _SupportTools({required this.statusStore});
+
+  final StatusStore statusStore;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _AdvancedSectionHeader(title: strings.supportTools),
+        const SizedBox(height: AppTokens.space10),
+        _AdvancedSubsection(
+          rows: const [],
+          footer: OutlinedButton.icon(
+            onPressed: () => _copySummary(context, statusStore),
+            icon: const Icon(Icons.copy_all_outlined, size: 17),
+            label: Text(strings.copyDiagnosticsSummary),
+          ),
+        ),
+      ],
+    );
   }
 }

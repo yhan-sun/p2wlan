@@ -15,7 +15,6 @@ import '../features/dashboard/dashboard_page.dart';
 import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/settings/settings_page.dart';
-import '../features/tunnels/tunnels_page.dart';
 import '../shared/layout/app_breakpoints.dart';
 import '../shared/widgets/app_nav_rail.dart';
 import '../shared/widgets/desktop_sidebar.dart';
@@ -137,8 +136,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
     // Expanded desktop: the sidebar footer already carries the network status.
     // Home: the hero itself is the strong status expression, so the top bar
     // adds no duplicate badge there either. Other sections (Devices,
-    // Troubleshooting, Settings, Tunnels) keep the global badge on medium and
-    // compact desktop because they have no footer.
+    // Troubleshooting, Settings) keep the global badge on medium and compact
+    // desktop because they have no footer.
     final showStatusBadge =
         breakpoint != AppBreakpoint.expanded && _section != P2WlanSection.home;
     return AppBar(
@@ -183,20 +182,17 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: false,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
+        settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
         showHeader: false,
+        onOpenDevices: () => _select(P2WlanSection.devices),
+        onOpenSettings: () => _select(P2WlanSection.settings),
       ),
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         onLogout: widget.onLogout,
-        showHeader: false,
-      ),
-      P2WlanSection.tunnels => TunnelsPage(
-        settingsStore: widget.settingsStore,
-        statusStore: widget.statusStore,
-        capabilities: widget.capabilities,
         showHeader: false,
       ),
     };
