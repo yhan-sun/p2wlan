@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
-import 'package:p2wlan_flutter_client/app/navigation.dart';
+import 'package:p2wlan_flutter_client/app/navigation_model.dart';
 
 void main() {
   group('P2WlanSection — primary IA', () {

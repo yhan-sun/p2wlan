@@ -26,14 +26,16 @@ void main() {
     test('navigation labels are consistent', () {
       final zh = AppStrings.fromCode('zh-Hans');
       final en = AppStrings.fromCode('en');
-      expect(zh.dashboard, '仪表盘');
-      expect(en.dashboard, 'Dashboard');
+      expect(zh.home, '首页');
+      expect(en.home, 'Home');
       expect(zh.nodes, '节点');
       expect(en.nodes, 'Nodes');
       expect(zh.settings, isNotEmpty);
       expect(en.settings, isNotEmpty);
       expect(zh.diagnostics, isNotEmpty);
       expect(en.diagnostics, isNotEmpty);
+      expect(zh.troubleshooting, '故障排查');
+      expect(en.troubleshooting, 'Troubleshooting');
     });
   });
 
@@ -60,8 +62,8 @@ void main() {
       expect(en.deviceCountSummary(2, 1), '2 devices · 1 online');
       expect(en.devicesNeedPathReview(1), '1 device needs path review');
       expect(en.devicesNeedPathReview(2), '2 devices need path review');
-      expect(en.moreDevices(1), startsWith('1 more device'));
-      expect(en.moreDevices(2), startsWith('2 more devices'));
+      expect(en.shellPeersOnline(1), '1 device online');
+      expect(en.shellPeersOnline(2), '2 devices online');
     });
 
     test('Chinese does not inflect', () {

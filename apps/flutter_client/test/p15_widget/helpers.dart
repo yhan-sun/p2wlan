@@ -69,7 +69,6 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   _FakeDiagnosticsApi({
     required this.health,
     this.snapshot,
-    this.snapshots,
     this.statusError,
     this.speedTestResult,
     this.speedTestError,
@@ -78,7 +77,6 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
 
   final bool health;
   DiagnosticsSnapshot? snapshot;
-  final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
   final SpeedTestResult? speedTestResult;
   final Object? speedTestError;
@@ -119,12 +117,6 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     statusFetchCount += 1;
     final error = statusError;
     if (error != null) throw error;
-    final sequence = snapshots;
-    if (sequence != null && sequence.isNotEmpty) {
-      final index = statusFetchCount - 1;
-      if (index < sequence.length) return sequence[index];
-      return sequence.last;
-    }
     final value = snapshot;
     if (value == null) {
       throw const DiagnosticsApiException('missing fixture snapshot');

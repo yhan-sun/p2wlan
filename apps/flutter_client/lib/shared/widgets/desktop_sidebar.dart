@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
-import '../../app/navigation.dart';
+import '../../app/navigation_model.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/state/status_store.dart';
 import 'status_badge.dart';

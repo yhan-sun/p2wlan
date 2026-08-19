@@ -35,7 +35,6 @@ class AppStrings {
 
   String get appName => 'P2WLAN';
 
-  String get dashboard => isZh ? '仪表盘' : 'Dashboard';
   String get nodes => isZh ? '节点' : 'Nodes';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
@@ -116,55 +115,51 @@ class AppStrings {
   String get copyLaunchCommand => isZh ? '复制命令' : 'Copy command';
   String get copiedLaunchCommand => isZh ? '启动命令已复制' : 'Launch command copied';
 
-  String get dashboardSubtitle => isZh
-      ? '启动、停止并监控本机 P2WLAN 虚拟网络。'
-      : 'Start, stop, and monitor the local P2WLAN virtual network.';
-  String get networkCockpit => isZh ? '虚拟内网驾驶舱' : 'Virtual network cockpit';
-  String get virtualNetwork => isZh ? '虚拟内网' : 'Virtual network';
-  String get virtualNetworkRunning =>
-      isZh ? '虚拟内网运行中' : 'Virtual network running';
-  String get virtualNetworkStopped =>
-      isZh ? '虚拟内网未启动' : 'Virtual network stopped';
-  String get virtualNetworkRunningDetail => isZh
-      ? '本机已加入虚拟内网，可查看控制面、设备路径和中继状态。'
-      : 'This device is on the virtual network; control-plane, device paths, and relay status are available.';
-  String get virtualNetworkStoppedDetail => isZh
-      ? '启动后会显示虚拟 IP、控制面和设备路径状态。'
-      : 'Start P2WLAN to see virtual IP, control-plane, and device path status.';
-  String get networkTitle => isZh ? 'P2WLAN 网络' : 'P2WLAN network';
-  String get connectionOverview => isZh ? '连接概览' : 'Connection overview';
-  String get networkEnvironment => isZh ? '网络环境' : 'Network environment';
-  String get localNode => isZh ? '本机' : 'This device';
-  String get udp => isZh ? 'UDP' : 'UDP';
-  String get udpAvailable => isZh ? 'UDP 可用' : 'UDP available';
-  String get udpUnavailable => isZh ? 'UDP 不可用' : 'UDP unavailable';
-  String get dashboardStoppedTitle =>
-      isZh ? 'P2WLAN 尚未运行' : 'P2WLAN is not running';
-  String get dashboardStoppedDetail => isZh
-      ? '启动 P2WLAN 后，这里会显示你的设备和连接状态。'
-      : 'Start P2WLAN to see your devices and connection status here.';
-  String get dashboardUnavailableTitle =>
-      isZh ? '暂时无法获取网络状态' : 'Network status unavailable';
-  String get dashboardUnavailableDetail => isZh
-      ? '连接控制服务器后，这里会显示你的设备和连接状态。'
-      : 'Connect to the control server to see your devices and connection status here.';
+  // --- Home (network overview) ---
+  String get homePageSubtitle =>
+      isZh ? '网络状态与在线设备一览。' : 'Network status and online devices.';
+  String get homeNetworkTitle => isZh ? '网络状态' : 'Network status';
+  String get homeJoinedSubtitle =>
+      isZh ? '你的设备已加入 P2WLAN 网络' : 'Your device is on the P2WLAN network';
+  String get virtualIpLabel => isZh ? '虚拟 IP 地址' : 'Virtual IP address';
+  String get homeLoading => isZh ? '正在获取网络状态…' : 'Fetching network status…';
+  String get homeStoppedTitle => isZh ? 'P2WLAN 未运行' : 'P2WLAN is not running';
+  String get homeStoppedDetail =>
+      isZh ? '启动后即可加入虚拟网络。' : 'Start it to join the virtual network.';
+  String get homeUnavailableTitle =>
+      isZh ? '无法连接 P2WLAN' : 'Cannot reach P2WLAN';
+  String get homeUnavailableDetail => isZh
+      ? '本地网络服务当前不可用。'
+      : 'The local network service is currently unavailable.';
+  String get statusNormal => isZh ? '正常' : 'Normal';
+  String get notRunning => isZh ? '未运行' : 'Not running';
+  String get checkAgain => isZh ? '重新检查' : 'Check again';
+  String get homeStaleNote => isZh ? '数据可能已过期' : 'Data may be out of date';
+  String get viewAllDevices => isZh ? '查看全部' : 'View all';
+  String get noDevicesOnline => isZh ? '暂无其他设备在线' : 'No other devices online';
+  String get noDevicesOnlineDetail =>
+      isZh ? '设备上线后会显示在这里。' : 'Devices appear here when they come online.';
+  String get networkComponents => isZh ? '网络组件状态' : 'Network components';
+  String get componentControlServer => isZh ? '控制服务器' : 'Control server';
+  String get componentOverlayRoute => isZh ? 'Overlay 路由' : 'Overlay route';
+  String get componentPeerConnectivity => isZh ? '设备连接' : 'Device connectivity';
+  String get componentStatusNormal => isZh ? '正常' : 'Normal';
+  String get componentStatusDisconnected => isZh ? '未连接' : 'Disconnected';
+  String get componentStatusConnecting => isZh ? '连接中' : 'Connecting';
+  String get componentStatusError => isZh ? '异常' : 'Error';
+  String get componentStatusUnknown => isZh ? '未知' : 'Unknown';
+  String get homeIssueTitle => isZh ? '发现网络问题' : 'Network issue found';
+  String get checkIssues => isZh ? '检查问题' : 'Check issues';
+  String get manualStartNeeded =>
+      isZh ? '需要手动启动 P2WLAN' : 'Manual start needed';
+  String get viewCommand => isZh ? '查看命令' : 'View command';
+  String get hideCommand => isZh ? '收起' : 'Hide';
+
   String probeRtt(int probeRttMs) =>
       isZh ? '探测 RTT $probeRttMs ms' : 'probe RTT $probeRttMs ms';
-  String moreDevices(int count) => isZh
-      ? '还有 $count 台设备，可在「设备」页查看。'
-      : count == 1
-      ? '1 more device — see the Devices page.'
-      : '$count more devices — see the Devices page.';
-  String get daemonStatus => isZh ? '守护进程' : 'Daemon';
-  String get controlPlane => isZh ? '控制面' : 'Control plane';
   String get onlineDevices => isZh ? '在线设备' : 'Online devices';
-  String get pathOverview => isZh ? '路径概况' : 'Path overview';
   String get needsAttention => isZh ? '需要处理' : 'Needs attention';
-  String get reviewRecommended => isZh ? '建议确认' : 'Review recommended';
   String get noActionNeeded => isZh ? '当前无需处理' : 'No action needed';
-  String get dashboardAllGood => isZh
-      ? '守护进程、控制面和设备路径没有上报需要处理的问题。'
-      : 'Daemon, control-plane, and device paths are not reporting anything that needs action.';
   String get issueControlDisconnected => isZh
       ? '控制面未连接，设备目录和配置同步可能不可用。'
       : 'Control plane is disconnected; device catalog and config sync may be unavailable.';
@@ -183,9 +178,6 @@ class AppStrings {
   String get requestDuration => isZh ? '请求耗时' : 'Request duration';
   String get lastError => isZh ? '最近错误' : 'Last error';
   String get snapshot => isZh ? '快照' : 'Snapshot';
-  String get offlineSnapshotMessage => isZh
-      ? '当前没有运行快照。点击“启动 P2WLAN”启动本机 p2wlan-daemon。'
-      : 'No runtime snapshot is available. Click Start P2WLAN to launch the local p2wlan-daemon.';
   String get staleSnapshotMessage => isZh
       ? '运行状态已超过 90 秒未更新。请检查本机 daemon 后手动刷新。'
       : 'Runtime status has not updated for over 90 seconds. Check the local daemon, then refresh.';

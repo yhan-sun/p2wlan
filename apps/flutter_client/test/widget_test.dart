@@ -15,6 +15,7 @@ import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
+import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
 
 void main() {
   testWidgets('renders the P2WLAN client shell in Chinese by default', (
@@ -96,6 +97,8 @@ void main() {
     expect(find.text('设置'), findsOneWidget);
     // No permanent "More" destination.
     expect(find.text('更多'), findsNothing);
+    // Mobile: no top-bar status badge; only the hero carries one.
+    expect(find.byType(StatusBadge), findsOneWidget);
 
     // Medium tablet / small window: a labeled rail with the four primary
     // sections.
@@ -114,6 +117,8 @@ void main() {
     expect(find.text('故障排查'), findsOneWidget);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
+    // Medium has no sidebar footer: the top bar keeps its status badge.
+    expect(find.byType(StatusBadge), findsNWidgets(2));
 
     // Expanded desktop: real sidebar with brand header and status footer.
     tester.view.physicalSize = const Size(1280, 900);
@@ -128,8 +133,10 @@ void main() {
     expect(find.text('故障排查'), findsOneWidget);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
-    // Sidebar status footer renders (daemon is offline in this harness).
+    // Sidebar status footer renders (daemon is offline in this harness), and
+    // the top bar no longer duplicates it: only the hero badge remains.
     expect(find.text('无法连接本地服务'), findsOneWidget);
+    expect(find.byType(StatusBadge), findsOneWidget);
   });
 
   testWidgets(

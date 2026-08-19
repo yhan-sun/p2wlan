@@ -1,9 +1,7 @@
 part of '../p15_widget_test.dart';
 
 void _registerDashboardTests() {
-  testWidgets('Dashboard renders stopped state with start action', (
-    tester,
-  ) async {
+  testWidgets('Home renders stopped state with start action', (tester) async {
     final stores = (await tester.runAsync(
       () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
     ))!;
@@ -20,21 +18,18 @@ void _registerDashboardTests() {
     );
 
     expect(find.text('P2WLAN is not running'), findsOneWidget);
-    expect(
-      find.text('Start P2WLAN to see your devices and connection status here.'),
-      findsOneWidget,
-    );
-    expect(find.text('Virtual network stopped'), findsOneWidget);
-    expect(find.text('Needs attention'), findsNothing);
+    expect(find.text('Start it to join the virtual network.'), findsOneWidget);
+    expect(find.text('Not running'), findsOneWidget);
+    expect(find.text('Check issues'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
-    expect(find.text('Connection overview'), findsNothing);
-    expect(find.text('Network environment'), findsNothing);
-    expect(find.byKey(const Key('dashboard-connection-map')), findsNothing);
+    // No snapshot: no data regions at all.
+    expect(find.text('Online devices'), findsNothing);
+    expect(find.text('Network components'), findsNothing);
   });
 
-  testWidgets('Dashboard shows stop only when daemon is reachable', (
+  testWidgets('Home shows healthy network from a real fixture snapshot', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -55,49 +50,108 @@ void _registerDashboardTests() {
       ),
     );
 
+    // Healthy hero: status + Virtual IP first.
+    expect(find.text('Network status'), findsOneWidget);
+    expect(find.text('Normal'), findsWidgets);
+    expect(find.text('Your device is on the P2WLAN network'), findsOneWidget);
     expect(find.text('10.20.0.10'), findsOneWidget);
-    expect(find.text('Network type'), findsOneWidget);
-    expect(find.textContaining('Restricted'), findsWidgets);
-    expect(find.textContaining('Max probability'), findsNothing);
-    expect(find.text('NAT probabilities'), findsNothing);
-    expect(find.byIcon(Icons.info_outline_rounded), findsNothing);
-    expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+    expect(find.text('Virtual IP address'), findsOneWidget);
+    expect(find.textContaining('Network ID'), findsOneWidget);
+
+    // Key metrics from peer state: online / direct / relay.
+    expect(_heroCount(tester, 'dashboard-count-online'), '2');
+    expect(_heroCount(tester, 'dashboard-count-direct'), '1');
+    expect(_heroCount(tester, 'dashboard-count-relay'), '1');
+
+    // Device preview.
+    expect(find.text('Online devices'), findsWidgets);
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.text('10.20.0.11'), findsOneWidget);
+
+    // Network components: only rows the fixture can judge. The fixture has no
+    // ready_phase, so the Overlay route row is honestly omitted.
+    expect(find.text('Control server'), findsOneWidget);
+    expect(find.text('Device connectivity'), findsOneWidget);
+    expect(find.text('2 / 2'), findsOneWidget);
+    expect(find.text('Overlay route'), findsNothing);
+
+    // Healthy → no issue CTA.
+    expect(find.text('Check issues'), findsNothing);
   });
 
-  testWidgets('StatusStore settles peer catalog after daemon start', (
+  testWidgets('Home keeps technical noise off the default page', (
     tester,
   ) async {
-    final fullSnapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final partialSnapshot = _snapshotWithPeerCount(fullSnapshot, 1);
-    final api = _FakeDiagnosticsApi(
-      health: true,
-      snapshots: [partialSnapshot, fullSnapshot, fullSnapshot],
-    );
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
     final stores = (await tester.runAsync(
       () => _makeStores(
-        api: api,
-        startupCatalogRefreshInterval: Duration.zero,
-        startupCatalogRefreshTimeout: const Duration(seconds: 1),
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
       ),
     ))!;
     addTearDown(stores.dispose);
 
-    await tester.runAsync(
-      () => stores.settingsStore.updateSettings(
-        stores.settingsStore.settings.copyWith(
-          authToken: 'token',
-          manualMode: false,
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
         ),
       ),
     );
-    await tester.runAsync(stores.statusStore.startDaemon);
 
-    expect(stores.statusStore.snapshot?.peers, hasLength(2));
-    expect(api.statusFetchCount, greaterThanOrEqualTo(3));
+    for (final technical in [
+      'UDP',
+      'Network type',
+      'Request duration',
+      'Last refresh',
+      'Snapshot',
+      'Endpoint state',
+      'Peer ID',
+      'MTU',
+      'NAT probabilities',
+    ]) {
+      expect(
+        find.text(technical),
+        findsNothing,
+        reason: 'technical field "$technical" must not appear on Home',
+      );
+    }
   });
 
-  testWidgets('Dashboard separates status endpoint errors from health', (
+  testWidgets('Home shows last-known data with a stale note', (tester) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        enableFreshnessTimer: true,
+        maxSnapshotAge: const Duration(milliseconds: 50),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 120));
+
+    // Last-known data kept, stale note shown, refresh available.
+    expect(find.text('10.20.0.10'), findsOneWidget);
+    expect(find.text('Data may be out of date'), findsOneWidget);
+    expect(find.byKey(const Key('home-stale-refresh')), findsOneWidget);
+    expect(find.text('Stale'), findsOneWidget);
+    // Staleness is not an issue banner.
+    expect(find.text('Check issues'), findsNothing);
+  });
+
+  testWidgets('Home separates status endpoint errors from health', (
     tester,
   ) async {
     final stores = (await tester.runAsync(
@@ -120,23 +174,280 @@ void _registerDashboardTests() {
       ),
     );
 
-    // Health is up but no snapshot: this is "unavailable", never "stopped".
-    expect(find.textContaining('GET /status failed'), findsWidgets);
-    expect(find.text('Virtual network stopped'), findsNothing);
+    // Health is up but no snapshot: unavailable, never stopped.
+    expect(find.text('Cannot reach P2WLAN'), findsOneWidget);
+    expect(
+      find.text('The local network service is currently unavailable.'),
+      findsOneWidget,
+    );
+    expect(find.text('Not running'), findsNothing);
     expect(find.text('Unavailable'), findsOneWidget);
-    expect(find.text('Network status unavailable'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
-    // No snapshot means no empty data regions.
-    expect(find.text('Connection overview'), findsNothing);
-    expect(find.text('Network environment'), findsNothing);
-    expect(find.byKey(const Key('dashboard-connection-map')), findsNothing);
+    expect(find.byKey(const Key('dashboard-check-button')), findsOneWidget);
+    expect(find.text('Online devices'), findsNothing);
   });
 
-  testWidgets('Dashboard keeps actions usable on narrow screens', (
+  testWidgets('Home shows peer connection states with real latency', (
     tester,
   ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.text('probing-phone'), findsOneWidget);
+    expect(find.text('offline-printer'), findsOneWidget);
+    // Metric labels add one more occurrence each.
+    expect(find.text('Direct'), findsNWidgets(2));
+    expect(find.text('Relay'), findsNWidgets(2));
+    expect(find.text('probing'), findsOneWidget);
+    expect(find.text('Offline'), findsOneWidget);
+    // Verified latency, relay latency, and explicitly labeled probe RTT.
+    expect(find.text('12 ms'), findsOneWidget);
+    expect(find.text('43 ms'), findsOneWidget);
+    expect(find.text('probe RTT 8 ms'), findsOneWidget);
+    expect(find.text('8 ms'), findsNothing);
+  });
+
+  testWidgets('Home shows exact hero connection counts', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    // 1 direct + 1 relay + 1 probing = 3 online; offline never counts.
+    // Probing is deliberately not a fourth metric.
+    expect(_heroCount(tester, 'dashboard-count-online'), '3');
+    expect(_heroCount(tester, 'dashboard-count-direct'), '1');
+    expect(_heroCount(tester, 'dashboard-count-relay'), '1');
+    expect(find.byKey(const Key('dashboard-count-probing')), findsNothing);
+  });
+
+  testWidgets('Home previews at most five devices', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _peerFixturesForCount(6));
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    // Attention first, then relay, direct, offline last — the offline peer is
+    // the one pushed past the preview limit.
+    expect(find.text('probing-phone'), findsOneWidget);
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.text('relay-server2'), findsOneWidget);
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('direct-desktop'), findsOneWidget);
+    expect(find.text('offline-printer'), findsNothing);
+  });
+
+  testWidgets('Home handles a healthy network with no peers', (tester) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeerCount(base, 0);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('No other devices online'), findsOneWidget);
+    expect(
+      find.text('Devices appear here when they come online.'),
+      findsOneWidget,
+    );
+    expect(find.text('0 / 0'), findsOneWidget);
+    expect(_heroCount(tester, 'dashboard-count-online'), '0');
+  });
+
+  testWidgets('Home shows an issue banner with troubleshooting CTA', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+    (raw['health'] as Map<String, dynamic>)['status'] = 'degraded';
+    (raw['health'] as Map<String, dynamic>)['reason'] =
+        'Overlay route or connection state needs review';
+    final snapshot = DiagnosticsSnapshot.fromJson(raw);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    var opened = false;
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          onOpenTroubleshooting: () => opened = true,
+        ),
+      ),
+    );
+
+    expect(find.text('Network issue found'), findsOneWidget);
+    expect(
+      find.text('Overlay route or connection state needs review'),
+      findsOneWidget,
+    );
+    expect(find.text('Check issues'), findsOneWidget);
+    expect(find.text('Degraded'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('home-check-issues')));
+    expect(opened, isTrue);
+  });
+
+  testWidgets('Shell: View all devices opens the Devices section', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: P2WlanShell(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(DesktopSidebar), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('home-view-all-devices')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(NodesPage), findsOneWidget);
+    expect(find.byType(DashboardPage), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Shell: issue CTA opens Troubleshooting on mobile', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+    (raw['health'] as Map<String, dynamic>)['status'] = 'degraded';
+    (raw['health'] as Map<String, dynamic>)['reason'] =
+        'Overlay route or connection state needs review';
+    final snapshot = DiagnosticsSnapshot.fromJson(raw);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: P2WlanShell(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Check issues'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(NavigationBar),
+        matching: find.byType(NavigationDestination),
+      ),
+      findsNWidgets(3),
+    );
+
+    await tester.tap(find.byKey(const Key('home-check-issues')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DiagnosticsPage), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(NavigationBar),
+        matching: find.byType(NavigationDestination),
+      ),
+      findsNWidgets(3),
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Home keeps actions usable on narrow screens', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -160,108 +471,13 @@ void _registerDashboardTests() {
       ),
     );
 
+    expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Dashboard shows healthy network with peer connection states', (
-    tester,
-  ) async {
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    expect(find.text('10.20.0.5'), findsOneWidget);
-    expect(find.text('Online devices'), findsOneWidget);
-    expect(find.text('direct-laptop'), findsOneWidget);
-    expect(find.text('relay-nas'), findsOneWidget);
-    expect(find.text('probing-phone'), findsOneWidget);
-    expect(find.text('offline-printer'), findsOneWidget);
-    expect(find.text('Direct'), findsNWidgets(2));
-    expect(find.text('Relay'), findsNWidgets(3));
-    expect(find.text('probing'), findsNWidgets(2));
-    expect(find.text('Offline'), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
-  });
-
-  testWidgets('Dashboard distinguishes verified latency from probe RTT', (
-    tester,
-  ) async {
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    expect(find.text('12 ms'), findsOneWidget);
-    expect(find.text('43 ms'), findsOneWidget);
-    expect(find.text('probe RTT 8 ms'), findsOneWidget);
-    expect(find.text('8 ms'), findsNothing);
-  });
-
-  testWidgets('Dashboard shows exact hero connection counts', (tester) async {
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: DashboardPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    // 1 direct + 1 relay + 1 probing + 1 offline: offline never counts as
-    // online. Counts come from peer state, not from text occurrence counts.
-    expect(_heroCount(tester, 'dashboard-count-online'), '3');
-    expect(_heroCount(tester, 'dashboard-count-direct'), '1');
-    expect(_heroCount(tester, 'dashboard-count-relay'), '1');
-    expect(_heroCount(tester, 'dashboard-count-probing'), '1');
-    expect(find.byKey(const Key('dashboard-count-probing')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-count-online')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-count-direct')), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-count-relay')), findsOneWidget);
-  });
-
-  testWidgets('Dashboard hides daemon controls on mobile capabilities', (
+  testWidgets('Home hides daemon controls on mobile capabilities', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -297,10 +513,45 @@ void _registerDashboardTests() {
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
   });
 
-  testWidgets('Dashboard adapts layout across breakpoints', (tester) async {
+  testWidgets('Home with no local daemon control never offers Start', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(
+      () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
+    ))!;
+    addTearDown(stores.dispose);
+
+    const mobileCapabilities = PlatformCapabilities(
+      canControlLocalDaemon: false,
+      canRequestElevation: false,
+      canVerifyRoutes: false,
+      canRepairRoutes: false,
+      canOpenLocalLogs: false,
+      canCreateSupportBundle: false,
+      canUseSystemTray: false,
+      canActAsLocalVpnNode: false,
+      canManageRemoteDevices: true,
+    );
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: mobileCapabilities,
+        ),
+      ),
+    );
+
+    expect(find.text('Cannot reach P2WLAN'), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+    expect(find.text('Start P2WLAN'), findsNothing);
+    expect(find.byKey(const Key('dashboard-check-button')), findsOneWidget);
+  });
+
+  testWidgets('Home adapts layout across breakpoints', (tester) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
     final stores = (await tester.runAsync(
       () => _makeStores(
@@ -326,75 +577,50 @@ void _registerDashboardTests() {
       await tester.pump();
 
       expect(tester.takeException(), isNull, reason: 'size $size');
-      final map = find.byKey(const Key('dashboard-connection-map'));
-      if (size.width >= 1024) {
-        expect(map, findsOneWidget, reason: 'size $size');
-      } else {
-        expect(map, findsNothing, reason: 'size $size');
-      }
+      expect(find.text('10.20.0.10'), findsOneWidget, reason: 'size $size');
+      expect(find.text('direct-laptop'), findsOneWidget, reason: 'size $size');
+      expect(find.text('Control server'), findsOneWidget, reason: 'size $size');
+      expect(
+        find.text('Network components'),
+        findsOneWidget,
+        reason: 'size $size',
+      );
     }
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
   });
 
-  testWidgets('Connection map draws one branch per real peer (1..6)', (
-    tester,
-  ) async {
+  testWidgets('Home dark theme renders the full healthy page', (tester) async {
     tester.view.physicalSize = const Size(1280, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    for (var count = 1; count <= 6; count++) {
-      final snapshot = _snapshotWithPeers(base, _peerFixturesForCount(count));
-      final stores = (await tester.runAsync(
-        () => _makeStores(
-          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-        ),
-      ))!;
-      addTearDown(stores.dispose);
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
 
-      await stores.statusStore.refresh();
-      await tester.pumpWidget(
-        _TestApp(
-          child: DashboardPage(
-            settingsStore: stores.settingsStore,
-            statusStore: stores.statusStore,
-          ),
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _DesignSystemHost(
+        dark: true,
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
         ),
-      );
-      await tester.pump();
+      ),
+    );
+    await tester.pumpAndSettle();
 
-      final lines = _mapLinePairs(
-        tester,
-        Size(120, _mapRowCount(count) * 80.0),
-      );
-      // One vertical trunk plus exactly one branch per real peer: no missing
-      // branches and no dangling branches for empty rows.
-      expect(
-        lines.length,
-        1 + count,
-        reason: 'peers=$count (${_mapRowCount(count)} rows)',
-      );
-      final verticals = lines.where((line) => line.$1.dx == line.$2.dx);
-      expect(verticals, hasLength(1), reason: 'peers=$count');
-      final horizontals = lines.where((line) => line.$1.dy == line.$2.dy);
-      expect(horizontals, hasLength(count), reason: 'peers=$count');
-      for (final (a, b) in horizontals) {
-        final touchesEdge =
-            a.dx == 0 || a.dx == 120 || b.dx == 0 || b.dx == 120;
-        final touchesTrunk = a.dx == 60 || b.dx == 60;
-        expect(
-          touchesEdge && touchesTrunk,
-          isTrue,
-          reason: 'peers=$count branch $a -> $b',
-        );
-      }
-      expect(tester.takeException(), isNull, reason: 'peers=$count');
-    }
-    tester.view.resetPhysicalSize();
-    tester.view.resetDevicePixelRatio();
+    expect(find.text('10.20.0.10'), findsOneWidget);
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('Control server'), findsOneWidget);
+    expect(find.text('Network components'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }
 
@@ -547,8 +773,7 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
   return [directPeer, relayPeer, probingPeer, offlinePeer];
 }
 
-/// Five peers (4 fixtures + one extra verified direct peer) to exercise map
-/// rows with asymmetric left/right occupancy (3 left, 2 right).
+/// Five peers (4 fixtures + one extra verified direct peer).
 List<Map<String, dynamic>> _fivePeerFixtures() {
   return [
     ..._fourPeerFixtures(),
@@ -622,9 +847,6 @@ List<Map<String, dynamic>> _peerFixturesForCount(int count) {
   return pool.take(count).toList();
 }
 
-/// Number of map rows for a peer count (peers are split left / right).
-int _mapRowCount(int peerCount) => (peerCount + 1) ~/ 2;
-
 String _heroCount(WidgetTester tester, String key) {
   final text = tester.widget<Text>(
     find
@@ -632,26 +854,6 @@ String _heroCount(WidgetTester tester, String key) {
         .first,
   );
   return text.data!;
-}
-
-/// Paints the connection-map painter from the widget tree onto a recording
-/// canvas and returns the drawn line segments as offset pairs.
-Set<(Offset, Offset)> _mapLinePairs(WidgetTester tester, Size paintSize) {
-  final customPaint = tester.widget<CustomPaint>(
-    find.descendant(
-      of: find.byKey(const Key('dashboard-connection-map')),
-      matching: find.byType(CustomPaint),
-    ),
-  );
-  final canvas = TestRecordingCanvas();
-  customPaint.painter!.paint(canvas, paintSize);
-  final lines = <(Offset, Offset)>{};
-  for (final recorded in canvas.invocations) {
-    if (recorded.invocation.memberName != #drawLine) continue;
-    final args = recorded.invocation.positionalArguments;
-    lines.add((args[0] as Offset, args[1] as Offset));
-  }
-  return lines;
 }
 
 DiagnosticsSnapshot _snapshotWithPeers(

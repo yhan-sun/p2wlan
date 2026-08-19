@@ -45,9 +45,9 @@ String _networkStatusLabel(
   bool canControlLocalDaemon,
 ) => switch (status) {
   _NetworkStatus.stopped =>
-    canControlLocalDaemon ? strings.virtualNetworkStopped : strings.unavailable,
+    canControlLocalDaemon ? strings.notRunning : strings.unavailable,
   _NetworkStatus.unavailable => strings.unavailable,
-  _NetworkStatus.healthy => strings.healthy,
+  _NetworkStatus.healthy => strings.statusNormal,
   _NetworkStatus.degraded => strings.degraded,
   _NetworkStatus.stale => strings.stale,
 };
@@ -101,12 +101,12 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   );
 }
 
-/// Most relevant peers for the dashboard overview: attention first, then
-/// relay, direct, remaining online, offline last. Capped so offline devices
-/// never fill the page.
+/// Most relevant peers for the home overview: attention first, then relay,
+/// direct, remaining online, offline last. Capped so offline devices never
+/// fill the page.
 List<PeerSnapshot> _topOverviewPeers(
   List<PeerSnapshot> peers, {
-  int limit = 6,
+  int limit = 5,
 }) {
   final sorted = [...peers]..sort(_compareDashboardPeers);
   if (sorted.length <= limit) return sorted;
@@ -179,8 +179,10 @@ String? _dashboardIssueMessage({
   required String? error,
   required DiagnosticsSnapshot? snapshot,
 }) {
-  if (!daemonAvailable) return strings.offlineSnapshotMessage;
-  if (snapshotStale) return strings.staleSnapshotMessage;
+  // Stopped / offline / stale are first-class states handled by the hero
+  // itself; the banner exists only for real network problems.
+  if (!daemonAvailable) return null;
+  if (snapshotStale) return null;
   if (!statusReachable && statusError != null) {
     return strings.statusMessage(statusError) ?? statusError;
   }

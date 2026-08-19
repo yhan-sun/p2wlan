@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../app/app_strings.dart';
+import '../app/navigation_model.dart';
 import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/state/settings_store.dart';
@@ -19,55 +20,6 @@ import '../shared/layout/app_breakpoints.dart';
 import '../shared/widgets/app_nav_rail.dart';
 import '../shared/widgets/desktop_sidebar.dart';
 import '../shared/widgets/status_badge.dart';
-
-/// User-level sections of the P2WLAN client.
-///
-/// Information architecture:
-///
-///   Desktop primary:  Home / Devices / Troubleshooting / Settings
-///   Mobile primary:   Home / Devices / Settings
-///
-/// `tunnels` is an implementation-detail section (TUN interface, UDP bind,
-/// overlay routes, MTU, lifecycle). It stays fully functional and routable,
-/// but is deliberately NOT part of the primary navigation; later phases
-/// surface it from Troubleshooting → Advanced diagnostics.
-///
-/// "Hide complexity, don't remove capability."
-enum P2WlanSection {
-  home(Icons.home_outlined),
-  devices(Icons.hub_outlined),
-  troubleshooting(Icons.monitor_heart_outlined),
-  settings(Icons.settings_outlined),
-  tunnels(Icons.cable_outlined);
-
-  const P2WlanSection(this.icon);
-
-  final IconData icon;
-
-  /// Primary user-level destinations, in display order.
-  static const List<P2WlanSection> primary = [
-    home,
-    devices,
-    troubleshooting,
-    settings,
-  ];
-
-  /// Sections not shown in the primary navigation but still routable.
-  /// [P2WlanSection.tunnels] is the only secondary section today.
-  static const List<P2WlanSection> secondary = [tunnels];
-
-  /// Permanent compact (phone) bottom-bar destinations — exactly three.
-  /// Troubleshooting is deliberately absent: it is entered from the shell
-  /// overflow menu today and from Home's "check issues" path in Phase 3.
-  static const List<P2WlanSection> mobilePrimary = [home, devices, settings];
-
-  /// Desktop sidebar grouping.
-  static const List<List<P2WlanSection>> sidebarGroups = [
-    [home, devices],
-    [troubleshooting],
-    [settings],
-  ];
-}
 
 class P2WlanShell extends StatefulWidget {
   const P2WlanShell({
@@ -136,7 +88,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
 
         return Scaffold(
-          appBar: _buildTopBar(strings, useBottomNav),
+          appBar: _buildTopBar(strings, useBottomNav, breakpoint),
           body: useBottomNav
               ? _buildBody()
               : Row(
@@ -177,7 +129,16 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
   }
 
-  PreferredSizeWidget _buildTopBar(AppStrings strings, bool isMobileLayout) {
+  PreferredSizeWidget _buildTopBar(
+    AppStrings strings,
+    bool isMobileLayout,
+    AppBreakpoint breakpoint,
+  ) {
+    // Expanded desktop: the sidebar footer already carries the network status,
+    // so the top bar keeps only refresh and window controls (no duplicated
+    // strong status badge). Medium / compact desktop keep the badge because
+    // they have no footer.
+    final showStatusBadge = breakpoint != AppBreakpoint.expanded;
     return AppBar(
       leading: _usesMacosChrome ? const SizedBox.shrink() : null,
       leadingWidth: _usesMacosChrome ? 76 : null,
@@ -195,7 +156,10 @@ class _P2WlanShellState extends State<P2WlanShell> {
               ),
             ]
           : [
-              _ShellStatusActions(statusStore: widget.statusStore),
+              _ShellStatusActions(
+                statusStore: widget.statusStore,
+                showStatusBadge: showStatusBadge,
+              ),
               if (_showsInAppCloseButton) const _WindowsCloseButton(),
               const SizedBox(width: 8),
             ],
@@ -208,6 +172,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
+        onOpenDevices: () => _select(P2WlanSection.devices),
+        onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
       ),
       P2WlanSection.devices => NodesPage(
         settingsStore: widget.settingsStore,
@@ -377,9 +343,13 @@ Future<void> _destroyWindow() async {
 }
 
 class _ShellStatusActions extends StatelessWidget {
-  const _ShellStatusActions({required this.statusStore});
+  const _ShellStatusActions({
+    required this.statusStore,
+    this.showStatusBadge = true,
+  });
 
   final StatusStore statusStore;
+  final bool showStatusBadge;
 
   @override
   Widget build(BuildContext context) {
@@ -392,12 +362,13 @@ class _ShellStatusActions extends StatelessWidget {
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Center(
-                child: StatusBadge(label: label, tone: tone),
+            if (showStatusBadge)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Center(
+                  child: StatusBadge(label: label, tone: tone),
+                ),
               ),
-            ),
             IconButton(
               tooltip: strings.refresh,
               onPressed: statusStore.refreshing ? null : statusStore.refresh,
