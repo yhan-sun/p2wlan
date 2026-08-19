@@ -42,11 +42,13 @@ class AppStrings {
   String get settings => isZh ? '设置' : 'Settings';
   String get more => isZh ? '更多' : 'More';
   String get navGroupOverview => isZh ? '概览' : 'Overview';
-  String get navGroupNetwork => isZh ? '网络' : 'Network';
-  String get navGroupTools => isZh ? '工具' : 'Tools';
+
+  /// User-level navigation labels (Phase 1 IA).
+  String get home => isZh ? '首页' : 'Home';
+  String get troubleshooting => isZh ? '故障排查' : 'Troubleshooting';
   String get moreDescription => isZh
-      ? '诊断与设置等低频功能。'
-      : 'Diagnostics, settings, and other less frequent features.';
+      ? '故障排查与隧道等低频功能。'
+      : 'Troubleshooting, tunnels, and other less frequent features.';
   String get restartRequired =>
       isZh ? '需要重启 P2WLAN' : 'P2WLAN restart required';
   String get restartRequiredDetail => isZh
@@ -856,11 +858,11 @@ class AppStrings {
 
   String sectionLabel(String sectionName) {
     return switch (sectionName) {
-      'dashboard' => dashboard,
-      'nodes' => nodes,
-      'tunnels' => tunnels,
-      'diagnostics' => diagnostics,
+      'home' => home,
+      'devices' => devices,
+      'troubleshooting' => troubleshooting,
       'settings' => settings,
+      'tunnels' => tunnels,
       _ => sectionName,
     };
   }

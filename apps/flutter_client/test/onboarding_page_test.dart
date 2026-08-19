@@ -375,7 +375,7 @@ void main() {
       if (find.text('把这台设备接入 P2WLAN').evaluate().isNotEmpty) break;
     }
     expect(find.text('把这台设备接入 P2WLAN'), findsOneWidget);
-    expect(find.text('仪表盘'), findsNothing);
+    expect(find.text('首页'), findsNothing);
   });
 
   testWidgets('P2WlanApp shows the shell once onboarding is completed', (
@@ -396,9 +396,9 @@ void main() {
         () => Future<void>.delayed(const Duration(milliseconds: 30)),
       );
       await tester.pump();
-      if (find.text('仪表盘').evaluate().isNotEmpty) break;
+      if (find.text('首页').evaluate().isNotEmpty) break;
     }
-    expect(find.text('仪表盘'), findsWidgets);
+    expect(find.text('首页'), findsWidgets);
     expect(find.text('把这台设备接入 P2WLAN'), findsNothing);
   });
 
@@ -455,9 +455,9 @@ void main() {
           () => Future<void>.delayed(const Duration(milliseconds: 30)),
         );
         await tester.pump();
-        if (find.text('仪表盘').evaluate().isNotEmpty) break;
+        if (find.text('首页').evaluate().isNotEmpty) break;
       }
-      expect(find.text('仪表盘'), findsWidgets);
+      expect(find.text('首页'), findsWidgets);
       expect(find.text('把这台设备接入 P2WLAN'), findsNothing);
 
       status.dispose();

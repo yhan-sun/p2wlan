@@ -20,16 +20,58 @@ import '../features/tunnels/tunnels_page.dart';
 import '../shared/layout/app_breakpoints.dart';
 import '../shared/widgets/status_badge.dart';
 
+/// User-level sections of the P2WLAN client.
+///
+/// Information architecture (target):
+///
+///   Desktop primary:  Home / Devices / Troubleshooting / Settings
+///   Mobile primary:   Home / Devices / Settings
+///
+/// `tunnels` is an implementation-detail section (TUN interface, UDP bind,
+/// overlay routes, MTU, lifecycle). It stays fully functional and routable,
+/// but is deliberately NOT part of the primary navigation; later phases
+/// surface it from Troubleshooting → Advanced diagnostics.
+///
+/// "Hide complexity, don't remove capability."
 enum P2WlanSection {
-  dashboard(Icons.dashboard_outlined),
-  nodes(Icons.hub_outlined),
-  tunnels(Icons.cable_outlined),
-  diagnostics(Icons.monitor_heart_outlined),
-  settings(Icons.settings_outlined);
+  home(Icons.home_outlined),
+  devices(Icons.hub_outlined),
+  troubleshooting(Icons.monitor_heart_outlined),
+  settings(Icons.settings_outlined),
+  tunnels(Icons.cable_outlined);
 
   const P2WlanSection(this.icon);
 
   final IconData icon;
+
+  /// Primary user-level destinations, in display order.
+  static const List<P2WlanSection> primary = [
+    home,
+    devices,
+    troubleshooting,
+    settings,
+  ];
+
+  /// Sections not shown in the primary navigation but still routable.
+  /// [P2WlanSection.tunnels] is the only secondary section today.
+  static const List<P2WlanSection> secondary = [tunnels];
+
+  /// Permanent compact (phone) bottom-bar destinations. Troubleshooting is
+  /// deliberately absent: it is entered from Home when a problem is detected
+  /// (or from the More hub during the transition), not a permanent tab.
+  static const List<P2WlanSection> mobilePrimary = [home, devices, settings];
+
+  /// Compact secondary hub entries behind the "More" destination. Keeps
+  /// troubleshooting/tunnels reachable on phones until Home wires its
+  /// "check issues" entry (Phase 3).
+  static const List<P2WlanSection> mobileSecondary = [troubleshooting, tunnels];
+
+  /// Desktop sidebar grouping (visual polish lands in Phase 2).
+  static const List<List<P2WlanSection>> sidebarGroups = [
+    [home, devices],
+    [troubleshooting],
+    [settings],
+  ];
 }
 
 class P2WlanShell extends StatefulWidget {
@@ -54,10 +96,11 @@ class P2WlanShell extends StatefulWidget {
 }
 
 class _P2WlanShellState extends State<P2WlanShell> {
-  var _section = P2WlanSection.dashboard;
+  var _section = P2WlanSection.home;
 
-  /// Compact phones: "More" is a hub listing diagnostics/settings instead of
-  /// a fifth bottom tab. Rail layouts never open the hub.
+  /// Compact phones: "More" is a hub listing secondary sections
+  /// (troubleshooting/tunnels) instead of crowding the bottom bar. Rail
+  /// layouts never open the hub.
   var _showMoreHub = false;
 
   @override
@@ -147,23 +190,17 @@ class _P2WlanShellState extends State<P2WlanShell> {
       return _MoreHub(onOpenSection: _openFromMoreHub);
     }
     return switch (_section) {
-      P2WlanSection.dashboard => DashboardPage(
+      P2WlanSection.home => DashboardPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
       ),
-      P2WlanSection.nodes => NodesPage(
+      P2WlanSection.devices => NodesPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
       ),
-      P2WlanSection.tunnels => TunnelsPage(
-        settingsStore: widget.settingsStore,
-        statusStore: widget.statusStore,
-        capabilities: widget.capabilities,
-        showHeader: false,
-      ),
-      P2WlanSection.diagnostics => DiagnosticsPage(
+      P2WlanSection.troubleshooting => DiagnosticsPage(
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
         showHeader: false,
@@ -172,6 +209,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         onLogout: widget.onLogout,
+        showHeader: false,
+      ),
+      P2WlanSection.tunnels => TunnelsPage(
+        settingsStore: widget.settingsStore,
+        statusStore: widget.statusStore,
+        capabilities: widget.capabilities,
         showHeader: false,
       ),
     };
@@ -198,15 +241,19 @@ class _P2WlanShellState extends State<P2WlanShell> {
     });
   }
 
+  /// Rail selection index. Secondary sections (tunnels) have no rail slot; a
+  /// viewport growing past compact must still render a valid selection.
+  int _railIndex() {
+    final index = P2WlanSection.primary.indexOf(_section);
+    return index == -1 ? 0 : index;
+  }
+
   int _bottomNavIndex(bool showMoreHub) {
     if (showMoreHub) return 3;
-    return switch (_section) {
-      P2WlanSection.dashboard => 0,
-      P2WlanSection.nodes => 1,
-      P2WlanSection.tunnels => 2,
-      P2WlanSection.diagnostics => 3,
-      P2WlanSection.settings => 3,
-    };
+    final index = P2WlanSection.mobilePrimary.indexOf(_section);
+    // Troubleshooting can only be open through the More hub on phones; if
+    // somehow reached without the hub, the bar falls back to the hub slot.
+    return index == -1 ? 3 : index;
   }
 
   void _onBottomNavSelected(int index) {
@@ -214,7 +261,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       if (!_showMoreHub) setState(() => _showMoreHub = true);
       return;
     }
-    _select(P2WlanSection.values[index]);
+    _select(P2WlanSection.mobilePrimary[index]);
   }
 
   Widget _buildRail(AppBreakpoint breakpoint, AppStrings strings) {
@@ -230,14 +277,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
     // phone bottom bar.
     final iconOnly = breakpoint == AppBreakpoint.compact;
     return NavigationRail(
-      selectedIndex: _section.index,
-      onDestinationSelected: (index) => _select(P2WlanSection.values[index]),
+      selectedIndex: _railIndex(),
+      onDestinationSelected: (index) => _select(P2WlanSection.primary[index]),
       labelType: iconOnly
           ? NavigationRailLabelType.none
           : NavigationRailLabelType.all,
       minWidth: iconOnly ? 64 : 88,
       destinations: [
-        for (final item in P2WlanSection.values)
+        for (final item in P2WlanSection.primary)
           NavigationRailDestination(
             icon: MouseRegion(
               cursor: SystemMouseCursors.click,
@@ -254,9 +301,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
       selectedIndex: _bottomNavIndex(showMoreHub),
       onDestinationSelected: _onBottomNavSelected,
       destinations: [
-        _bottomDestination(strings.dashboard, P2WlanSection.dashboard.icon),
-        _bottomDestination(strings.nodes, P2WlanSection.nodes.icon),
-        _bottomDestination(strings.tunnels, P2WlanSection.tunnels.icon),
+        for (final item in P2WlanSection.mobilePrimary)
+          _bottomDestination(strings.sectionLabel(item.name), item.icon),
         NavigationDestination(
           icon: MouseRegion(
             cursor: SystemMouseCursors.click,
@@ -292,8 +338,9 @@ bool get _canDragWindowFromAppBar {
 
 bool get _showsInAppCloseButton => !kIsWeb && Platform.isWindows;
 
-/// Compact phones only: a hub for low-frequency sections (diagnostics,
-/// settings) instead of a crowded five-item bottom bar.
+/// Compact phones only: a hub for low-frequency secondary sections
+/// (troubleshooting, tunnels) instead of crowding the bottom bar. This is a
+/// transitional entry point until Home wires its "check issues" path.
 class _MoreHub extends StatelessWidget {
   const _MoreHub({required this.onOpenSection});
 
@@ -318,22 +365,27 @@ class _MoreHub extends StatelessWidget {
               ),
             ),
           ),
-          _MoreEntry(
-            icon: P2WlanSection.diagnostics.icon,
-            title: strings.diagnostics,
-            subtitle: strings.diagnosticsSubtitle,
-            onTap: () => onOpenSection(P2WlanSection.diagnostics),
-          ),
-          const Divider(height: 1, indent: 18, endIndent: 18),
-          _MoreEntry(
-            icon: P2WlanSection.settings.icon,
-            title: strings.settings,
-            subtitle: strings.settingsSubtitle,
-            onTap: () => onOpenSection(P2WlanSection.settings),
-          ),
+          for (final (index, section)
+              in P2WlanSection.mobileSecondary.indexed) ...[
+            if (index > 0) const Divider(height: 1, indent: 18, endIndent: 18),
+            _MoreEntry(
+              icon: section.icon,
+              title: strings.sectionLabel(section.name),
+              subtitle: _subtitle(strings, section),
+              onTap: () => onOpenSection(section),
+            ),
+          ],
         ],
       ),
     );
+  }
+
+  String _subtitle(AppStrings strings, P2WlanSection section) {
+    return switch (section) {
+      P2WlanSection.troubleshooting => strings.diagnosticsSubtitle,
+      P2WlanSection.tunnels => strings.tunnelsSubtitle,
+      _ => '',
+    };
   }
 }
 
@@ -383,8 +435,10 @@ class _MoreEntry extends StatelessWidget {
 }
 
 /// Expanded desktop: a real side navigation with brand header and visual
-/// grouping. Secondary (tool) sections are visually separated instead of
-/// flattened into one five-item list.
+/// grouping. Items are derived from [P2WlanSection.sidebarGroups]; only the
+/// first group carries a label (Overview), later groups are separated by
+/// dividers. The complete Phase 2 sidebar (status footer, final spacing)
+/// lands separately.
 class _GroupedNavRail extends StatelessWidget {
   const _GroupedNavRail({
     required this.selected,
@@ -414,39 +468,22 @@ class _GroupedNavRail extends StatelessWidget {
               child: ListView(
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 children: [
-                  _RailGroupLabel(strings.navGroupOverview),
-                  _RailItem(
-                    icon: P2WlanSection.dashboard.icon,
-                    label: strings.dashboard,
-                    selected: selected == P2WlanSection.dashboard,
-                    onTap: () => onSelect(P2WlanSection.dashboard),
-                  ),
-                  _RailItem(
-                    icon: P2WlanSection.nodes.icon,
-                    label: strings.nodes,
-                    selected: selected == P2WlanSection.nodes,
-                    onTap: () => onSelect(P2WlanSection.nodes),
-                  ),
-                  _RailGroupLabel(strings.navGroupNetwork),
-                  _RailItem(
-                    icon: P2WlanSection.tunnels.icon,
-                    label: strings.tunnels,
-                    selected: selected == P2WlanSection.tunnels,
-                    onTap: () => onSelect(P2WlanSection.tunnels),
-                  ),
-                  _RailGroupLabel(strings.navGroupTools),
-                  _RailItem(
-                    icon: P2WlanSection.diagnostics.icon,
-                    label: strings.diagnostics,
-                    selected: selected == P2WlanSection.diagnostics,
-                    onTap: () => onSelect(P2WlanSection.diagnostics),
-                  ),
-                  _RailItem(
-                    icon: P2WlanSection.settings.icon,
-                    label: strings.settings,
-                    selected: selected == P2WlanSection.settings,
-                    onTap: () => onSelect(P2WlanSection.settings),
-                  ),
+                  for (final (index, group)
+                      in P2WlanSection.sidebarGroups.indexed) ...[
+                    if (index > 0)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: const Divider(height: 1, indent: 16),
+                      ),
+                    if (index == 0) _RailGroupLabel(strings.navGroupOverview),
+                    for (final section in group)
+                      _RailItem(
+                        icon: section.icon,
+                        label: strings.sectionLabel(section.name),
+                        selected: selected == section,
+                        onTap: () => onSelect(section),
+                      ),
+                  ],
                 ],
               ),
             ),

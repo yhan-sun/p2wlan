@@ -16,7 +16,7 @@ void main() {
   ) async {
     await _pumpTestApp(tester);
 
-    expect(find.text('仪表盘'), findsWidgets);
+    expect(find.text('首页'), findsWidgets);
     expect(find.text('离线'), findsWidgets);
   });
 
@@ -67,7 +67,7 @@ void main() {
   });
 
   testWidgets('uses three-tier responsive navigation', (tester) async {
-    // Compact phone: four-item bottom bar, no rail.
+    // Compact phone: Home/Devices/Settings bottom bar plus More hub, no rail.
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -84,9 +84,12 @@ void main() {
       ),
       findsNWidgets(4),
     );
+    expect(find.text('首页'), findsWidgets);
+    expect(find.text('设备'), findsWidgets);
     expect(find.text('更多'), findsOneWidget);
 
-    // Medium tablet / small window: a plain rail with all five labels.
+    // Medium tablet / small window: a plain rail with the four primary
+    // sections.
     tester.view.physicalSize = const Size(700, 1000);
     await tester.pump();
     await tester.pump();
@@ -94,6 +97,7 @@ void main() {
     expect(find.byType(NavigationRail), findsOneWidget);
     expect(find.byType(NavigationBar), findsNothing);
     expect(find.text('设置'), findsOneWidget);
+    expect(find.text('故障排查'), findsOneWidget);
 
     // Expanded desktop: grouped rail with brand header.
     tester.view.physicalSize = const Size(1280, 900);
@@ -103,31 +107,32 @@ void main() {
     expect(find.byType(NavigationRail), findsNothing);
     expect(find.text('P2WLAN'), findsWidgets);
     expect(find.text('概览'), findsOneWidget);
-    expect(find.text('网络'), findsOneWidget);
-    expect(find.text('工具'), findsOneWidget);
+    expect(find.text('网络'), findsNothing);
+    expect(find.text('工具'), findsNothing);
   });
 
-  testWidgets('compact navigation routes diagnostics and settings via More', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(390, 844);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
+  testWidgets(
+    'compact navigation routes troubleshooting and tunnels via More',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
-    await _pumpTestApp(tester);
+      await _pumpTestApp(tester);
 
-    await tester.tap(find.text('更多'));
-    await tester.pump();
+      await tester.tap(find.text('更多'));
+      await tester.pump();
 
-    expect(find.text('诊断'), findsOneWidget);
-    expect(find.text('设置'), findsOneWidget);
+      expect(find.text('故障排查'), findsOneWidget);
+      expect(find.text('隧道'), findsOneWidget);
 
-    await tester.tap(find.text('设置'));
-    await tester.pump();
+      await tester.tap(find.text('故障排查'));
+      await tester.pump();
 
-    expect(find.text('开发与诊断'), findsOneWidget);
-  });
+      expect(find.byKey(const Key('diagnostics-advanced')), findsOneWidget);
+    },
+  );
 
   testWidgets(
     'More hub resolves when the viewport grows to a rail breakpoint',
@@ -142,11 +147,11 @@ void main() {
       // Compact: open the More hub.
       await tester.tap(find.text('更多'));
       await tester.pump();
-      expect(find.text('诊断'), findsOneWidget);
-      expect(find.text('设置'), findsOneWidget);
+      expect(find.text('故障排查'), findsOneWidget);
+      expect(find.text('隧道'), findsOneWidget);
 
       // Grow to Medium: the rail replaces the bottom bar and the More hub must
-      // resolve back to the current business section (dashboard).
+      // resolve back to the current business section (home).
       tester.view.physicalSize = const Size(700, 1000);
       await tester.pump();
       await tester.pump();
@@ -156,7 +161,7 @@ void main() {
       expect(find.text('更多'), findsNothing);
       expect(find.byType(ListTile), findsNothing);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
-      expect(find.text('仪表盘'), findsWidgets);
+      expect(find.text('首页'), findsWidgets);
 
       // Shrink back to Compact: the bottom bar returns with the More hub
       // selected — never an illegal navigation state.
@@ -167,7 +172,7 @@ void main() {
       expect(find.byType(NavigationBar), findsOneWidget);
       expect(find.byType(NavigationRail), findsNothing);
       expect(find.byType(ListTile), findsNWidgets(2));
-      expect(find.text('诊断'), findsOneWidget);
+      expect(find.text('故障排查'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -233,7 +238,7 @@ Future<void> _waitForBootstrap(WidgetTester tester) async {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     });
     await tester.pump();
-    if (find.text('仪表盘').evaluate().isNotEmpty ||
+    if (find.text('首页').evaluate().isNotEmpty ||
         find.text('登录控制面后启动本机 TUN').evaluate().isNotEmpty) {
       return;
     }
