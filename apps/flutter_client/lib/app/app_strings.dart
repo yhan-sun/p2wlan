@@ -644,7 +644,7 @@ class AppStrings {
   String get loginErrorUnknownTitle =>
       isZh ? '登录失败，请重试。' : 'Sign in failed. Please try again.';
 
-  // --- Onboarding (Phase 8 localization) ---
+  // --- Onboarding ---
   String get onboardingTitle =>
       isZh ? '把这台设备接入 P2WLAN' : 'Connect this device to P2WLAN';
   String get onboardingSubtitle => isZh
@@ -742,7 +742,7 @@ class AppStrings {
       ? '已通过重启 daemon 触发 Overlay 路由重装。'
       : 'Daemon restarted to reinstall overlay routes.';
 
-  // --- Nodes (Phase 8 localization) ---
+  // --- Nodes ---
   String nodeSynced(String name, String virtualIp) => isZh
       ? '本机节点已同步：$name / $virtualIp。重启 P2WLAN 后 IP 生效。'
       : 'This device synced: $name / $virtualIp. Restart P2WLAN to apply IP changes.';
@@ -777,7 +777,7 @@ class AppStrings {
       ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
       : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.';
 
-  // --- Settings (Phase 8 localization) ---
+  // --- Settings ---
   String get controlServerHelper => isZh
       ? '用户注册、设备认证和节点目录同步地址。'
       : 'Used for account auth, device registration, and peer catalog sync.';
@@ -806,10 +806,10 @@ class AppStrings {
   String get deviceRemoveFailed =>
       isZh ? '无法移除设备，请重试。' : 'Could not remove the device. Please try again.';
 
-  // --- Diagnostics (Phase 8 localization) ---
+  // --- Diagnostics ---
   String get logExcerptCopied => isZh ? '日志片段已复制' : 'Log excerpt copied';
 
-  // --- Permissions presentation (Phase 8 follow-up) ---
+  // --- Permissions presentation ---
   String permActionElevationRequired() => isZh
       ? '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。'
       : 'Administrator authorization is required to create the TUN; P2WLAN uses the system prompt and never reads or stores your password.';
