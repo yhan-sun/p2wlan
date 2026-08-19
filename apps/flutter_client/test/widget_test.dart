@@ -58,6 +58,9 @@ void main() {
 
     await tester.tap(find.text('设置').last);
     await tester.pump(const Duration(milliseconds: 250));
+    // Language lives inside the General category detail.
+    await tester.tap(find.text('常规'));
+    await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('简体中文').last);
     await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('English').last);
@@ -67,6 +70,9 @@ void main() {
     await tester.pump();
 
     expect(find.text('Settings'), findsWidgets);
+    // Back to the settings root, then open Developer & Diagnostics.
+    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+    await tester.pump(const Duration(milliseconds: 250));
     expect(find.text('Developer & Diagnostics'), findsOneWidget);
     await tester.ensureVisible(find.text('Developer & Diagnostics'));
     await tester.pump();

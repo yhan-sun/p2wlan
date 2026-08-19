@@ -489,6 +489,11 @@ class AppStrings {
       isZh ? '高级网络' : 'Advanced Network';
   String get settingsSectionDeveloperDiagnostics =>
       isZh ? '开发与诊断' : 'Developer & Diagnostics';
+  // --- Settings category / IA (Phase 6) ---
+  String get settingsCategoryApplication => isZh ? '应用' : 'App';
+  String get unsavedChanges => isZh ? '有未保存的更改' : 'Unsaved changes';
+  String get udpSubsection => 'UDP';
+  String get relaySubsection => 'Relay';
 
   String get saveChanges => isZh ? '保存更改' : 'Save changes';
   String get saveChangesRestartRequired =>

@@ -192,6 +192,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        capabilities: widget.capabilities,
         onLogout: widget.onLogout,
         showHeader: false,
       ),

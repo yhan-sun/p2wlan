@@ -1,0 +1,74 @@
+part of '../settings_page.dart';
+
+/// Developer & Diagnostics: Diagnostics URL (with the running-daemon guard and
+/// a secondary restore-default action), local service state and config path as
+/// compact rows. A deliberately quiet technical page — not a dashboard.
+class _DeveloperSection extends StatelessWidget {
+  const _DeveloperSection({required this.state, required this.strings});
+
+  final _SettingsPageState state;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final saving = state._saving;
+    final statusStore = state.widget.statusStore;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _SettingsField(
+          controller: state._diagnosticsUrlController,
+          label: strings.diagnosticsUrl,
+          hintText: defaultDiagnosticsUrl,
+          helper: strings.diagnosticsUrlHelper,
+          errorText: state._diagnosticsError,
+          keyboardType: TextInputType.url,
+          onSubmitted: (_) => state._saveCategory(SettingsCategory.developer),
+        ),
+        const SizedBox(height: AppTokens.space10),
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            OutlinedButton.icon(
+              onPressed: statusStore.refreshing ? null : statusStore.refresh,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: Text(strings.refreshNow),
+            ),
+            // Restore is a secondary action, never primary next to Save.
+            TextButton.icon(
+              onPressed: saving ? null : state._resetDiagnosticsUrl,
+              icon: const Icon(Icons.restore, size: 16),
+              label: Text(strings.restoreDefaultUrl),
+            ),
+          ],
+        ),
+        const SizedBox(height: AppTokens.space10),
+        const Divider(height: 1),
+        const SizedBox(height: AppTokens.space6),
+        _PreferenceRow(
+          label: strings.localService,
+          value: statusStore.daemonReachable
+              ? strings.daemonRunning
+              : strings.daemonStopped,
+        ),
+        _PreferenceRow(
+          label: strings.localSettingsFileLabel,
+          value: state.widget.settingsStore.configPath ?? '—',
+        ),
+        if (state.widget.settingsStore.lastError != null) ...[
+          const SizedBox(height: AppTokens.space8),
+          Text(
+            state.widget.settingsStore.lastError!,
+            style: TextStyle(
+              fontSize: 12,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}

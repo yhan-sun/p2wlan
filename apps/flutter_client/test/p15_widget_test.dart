@@ -30,6 +30,7 @@ import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
 
 part 'p15_widget/dashboard_tests.dart';
 part 'p15_widget/settings_tests.dart';
+part 'p15_widget/settings_phase6_tests.dart';
 part 'p15_widget/nodes_tests.dart';
 part 'p15_widget/nodes_shell_tests.dart';
 part 'p15_widget/network_tests.dart';
@@ -43,6 +44,7 @@ part 'p15_widget/helpers.dart';
 void main() {
   _registerDashboardTests();
   _registerSettingsTests();
+  _registerSettingsPhase6Tests();
   _registerNodesTests();
   _registerNodesShellTests();
   _registerNetworkTests();
