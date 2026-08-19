@@ -83,11 +83,14 @@ class _PlatformPanelState extends State<_PlatformPanel> {
                       ],
                     ),
                     const SizedBox(height: AppTokens.space4),
-                    for (final check in permission.checks)
-                      _PermissionCheckRow(check: check),
+                    for (final check in permissionCheckPresentations(
+                      strings,
+                      permission,
+                    ))
+                      _PermissionCheckRow(presentation: check),
                     const SizedBox(height: AppTokens.space10),
                     Text(
-                      permission.recommendedAction,
+                      permissionRecommendedAction(strings, permission),
                       style: TextStyle(
                         fontSize: 13,
                         height: 1.4,
@@ -113,18 +116,17 @@ class _PlatformPanelState extends State<_PlatformPanel> {
 }
 
 class _PermissionCheckRow extends StatelessWidget {
-  const _PermissionCheckRow({required this.check});
+  const _PermissionCheckRow({required this.presentation});
 
-  final _PermissionCheck check;
+  final PermissionCheckPresentation presentation;
 
   @override
   Widget build(BuildContext context) {
-    final tone = switch (check.status) {
+    final tone = switch (presentation.status) {
       'pass' => StatusTone.good,
       'warn' => StatusTone.warn,
       _ => StatusTone.bad,
     };
-    final label = check.status.toUpperCase();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: LayoutBuilder(
@@ -133,7 +135,7 @@ class _PermissionCheckRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                check.label,
+                presentation.title,
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -141,7 +143,7 @@ class _PermissionCheckRow extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                check.detail,
+                presentation.detail,
                 style: TextStyle(
                   fontSize: 12,
                   height: 1.35,
@@ -154,7 +156,7 @@ class _PermissionCheckRow extends StatelessWidget {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                StatusBadge(label: label, tone: tone),
+                StatusBadge(label: presentation.statusLabel, tone: tone),
                 const SizedBox(height: AppTokens.space6),
                 details,
               ],
@@ -165,7 +167,7 @@ class _PermissionCheckRow extends StatelessWidget {
             children: [
               SizedBox(
                 width: 76,
-                child: StatusBadge(label: label, tone: tone),
+                child: StatusBadge(label: presentation.statusLabel, tone: tone),
               ),
               const SizedBox(width: AppTokens.space10),
               Expanded(child: details),

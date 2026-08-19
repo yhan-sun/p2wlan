@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -21,6 +22,7 @@ import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
+import 'package:p2wlan_flutter_client/features/onboarding/onboarding_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/features/tunnels/tunnels_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
@@ -32,6 +34,7 @@ part 'p15_widget/tunnels_tests.dart';
 part 'p15_widget/diagnostics_tests.dart';
 part 'p15_widget/design_system_tests.dart';
 part 'p15_widget/localization_tests.dart';
+part 'p15_widget/final_regression_tests.dart';
 part 'p15_widget/helpers.dart';
 
 void main() {
@@ -42,4 +45,5 @@ void main() {
   _registerDiagnosticsTests();
   _registerDesignSystemTests();
   _registerLocalizationTests();
+  _registerFinalRegressionTests();
 }

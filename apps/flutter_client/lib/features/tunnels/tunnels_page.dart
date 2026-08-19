@@ -4,6 +4,7 @@ import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
+import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -17,11 +18,17 @@ class TunnelsPage extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.showHeader = true,
+    this.capabilities,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final bool showHeader;
+
+  /// Platform capability override (primarily for tests); defaults to the
+  /// current runtime platform. Local route actions are gated on the real
+  /// capabilities so remote-only platforms never see local-only controls.
+  final PlatformCapabilities? capabilities;
 
   @override
   State<TunnelsPage> createState() => _TunnelsPageState();
@@ -35,15 +42,20 @@ class _TunnelsPageState extends State<TunnelsPage> {
   Map<String, dynamic>? _routeState;
   var _verifying = false;
   var _repairing = false;
+  late final PlatformCapabilities _capabilities;
 
   @override
   void initState() {
     super.initState();
-    _verifyRoutes();
+    _capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    if (_capabilities.canVerifyRoutes) {
+      _verifyRoutes();
+    }
   }
 
   /// Read-only authoritative check of the live system routing table.
   Future<void> _verifyRoutes() async {
+    if (!_capabilities.canVerifyRoutes) return;
     final url = widget.settingsStore.settings.diagnosticsUrl;
     if (!widget.statusStore.daemonReachable) return;
     setState(() {
@@ -62,6 +74,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
 
   /// Repair the overlay route in place — no daemon/TUN/session restart.
   Future<void> _repairRoutes() async {
+    if (!_capabilities.canRepairRoutes) return;
     final strings = AppStringsScope.of(context);
     final url = widget.settingsStore.settings.diagnosticsUrl;
     setState(() {
@@ -81,7 +94,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
       });
     } catch (error) {
       if (mounted) {
-        setState(() => _message = strings.tunnelRouteRepairFailed('$error'));
+        setState(() => _message = strings.tunnelRouteRepairFailed);
       }
     } finally {
       if (mounted) setState(() => _repairing = false);
@@ -128,6 +141,9 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   verifying: _verifying,
                   repairing: _repairing,
                   rebuilding: _rebuilding,
+                  canVerify: _capabilities.canVerifyRoutes,
+                  canRepair: _capabilities.canRepairRoutes,
+                  canRestart: _capabilities.canControlLocalDaemon,
                   onVerify: _verifyRoutes,
                   onRepair: _repairRoutes,
                   onRebuild: _rebuildRoutes,
@@ -158,6 +174,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
   }
 
   Future<void> _rebuildRoutes() async {
+    if (!_capabilities.canControlLocalDaemon) return;
     final strings = AppStringsScope.of(context);
     setState(() {
       _rebuilding = true;
@@ -165,13 +182,17 @@ class _TunnelsPageState extends State<TunnelsPage> {
     });
     try {
       final stop = await widget.statusStore.stopDaemon();
+      if (!mounted) return;
       if (!stop.ok) {
-        setState(() => _message = stop.message);
+        setState(() => _message = strings.tunnelRestartFailed);
         return;
       }
       final start = await widget.statusStore.startDaemon();
+      if (!mounted) return;
       setState(() {
-        _message = start.ok ? strings.daemonRestartedReinstall : start.message;
+        _message = start.ok
+            ? strings.daemonRestartedReinstall
+            : strings.tunnelRestartFailed;
       });
     } finally {
       if (mounted) setState(() => _rebuilding = false);
@@ -270,6 +291,9 @@ class _RoutePanel extends StatelessWidget {
     required this.verifying,
     required this.repairing,
     required this.rebuilding,
+    required this.canVerify,
+    required this.canRepair,
+    required this.canRestart,
     required this.onVerify,
     required this.onRepair,
     required this.onRebuild,
@@ -282,6 +306,9 @@ class _RoutePanel extends StatelessWidget {
   final bool verifying;
   final bool repairing;
   final bool rebuilding;
+  final bool canVerify;
+  final bool canRepair;
+  final bool canRestart;
   final Future<void> Function() onVerify;
   final Future<void> Function() onRepair;
   final Future<void> Function() onRebuild;
@@ -343,54 +370,62 @@ class _RoutePanel extends StatelessWidget {
                   ),
           ),
           const SizedBox(height: AppTokens.space12),
-          // Check (read-only, safe anytime) + Repair (in place, no restart).
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: running && !verifying ? onVerify : null,
-                  icon: verifying
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.check_circle_outline_rounded),
-                  label: Text(strings.checkRoutes),
-                ),
-              ),
-              const SizedBox(width: AppTokens.space10),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: running && !repairing ? onRepair : null,
-                  icon: repairing
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.build_rounded),
-                  label: Text(strings.repairRoutes),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: AppTokens.space8),
-          // Restarting the daemon is a heavier, distinct action — keep it
-          // available but clearly secondary (it interrupts the connection).
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              onPressed: running && !(verifying || repairing)
-                  ? onRebuild
-                  : null,
-              icon: rebuilding
-                  ? const SizedBox.square(
-                      dimension: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.restart_alt_rounded, size: 16),
-              label: Text(strings.restartNetworkService),
+          // Local route actions are hidden entirely when the platform cannot
+          // perform them (remote-only mobile never sees local-only controls).
+          if (canVerify || canRepair) ...[
+            Row(
+              children: [
+                if (canVerify) ...[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: running && !verifying ? onVerify : null,
+                      icon: verifying
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.check_circle_outline_rounded),
+                      label: Text(strings.checkRoutes),
+                    ),
+                  ),
+                  if (canRepair) const SizedBox(width: AppTokens.space10),
+                ],
+                if (canRepair)
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: running && !repairing ? onRepair : null,
+                      icon: repairing
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.build_rounded),
+                      label: Text(strings.repairRoutes),
+                    ),
+                  ),
+              ],
             ),
-          ),
+          ],
+          if (canRestart) ...[
+            const SizedBox(height: AppTokens.space8),
+            // Restarting the daemon is a heavier, distinct action — keep it
+            // available but clearly secondary (it interrupts the connection).
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: running && !(verifying || repairing)
+                    ? onRebuild
+                    : null,
+                icon: rebuilding
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.restart_alt_rounded, size: 16),
+                label: Text(strings.restartNetworkService),
+              ),
+            ),
+          ],
         ],
       ),
     );

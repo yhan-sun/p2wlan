@@ -7,6 +7,7 @@ import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../shared/permission_copy.dart';
 import 'onboarding_model.dart';
 
 /// Resumable first-run / node-setup flow for a local P2WLAN node.
@@ -24,12 +25,17 @@ class OnboardingPage extends StatefulWidget {
     required this.statusStore,
     this.capabilities,
     this.onCompleted,
+    this.permissionCheck,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final PlatformCapabilities? capabilities;
   final VoidCallback? onCompleted;
+
+  /// Test seam: replaces the live permission preflight. When null the real
+  /// preflight runs.
+  final Future<PermissionPreflight> Function()? permissionCheck;
 
   @override
   State<OnboardingPage> createState() => _OnboardingPageState();
@@ -54,7 +60,8 @@ class _OnboardingPageState extends State<OnboardingPage> {
   /// Re-run the live permission preflight. The result (not an in-memory
   /// boolean) is what drives the permission step.
   Future<void> _refreshPreflight() async {
-    final preflight = await runPermissionPreflight();
+    final preflight =
+        await (widget.permissionCheck ?? runPermissionPreflight)();
     if (!mounted) return;
     setState(() => _preflight = preflight);
   }
@@ -114,7 +121,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
       widget.onCompleted?.call();
     } catch (error) {
       if (mounted) {
-        setState(() => _error = strings.onboardingCompleteFailed('$error'));
+        setState(() => _error = strings.onboardingCompleteFailed);
       }
     } finally {
       _completing = false;
@@ -131,10 +138,13 @@ class _OnboardingPageState extends State<OnboardingPage> {
   Future<void> _startDaemon() async {
     setState(() => _busy = true);
     try {
+      final strings = AppStringsScope.of(context);
       final result = await widget.statusStore.startDaemon();
       await widget.statusStore.refresh();
       await _refreshPreflight();
-      if (!result.ok && mounted) setState(() => _error = result.message);
+      if (!result.ok && mounted) {
+        setState(() => _error = strings.onboardingStartFailed);
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -168,72 +178,75 @@ class _OnboardingPageState extends State<OnboardingPage> {
         return Scaffold(
           body: SafeArea(
             child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 560),
-                child: Padding(
-                  padding: const EdgeInsets.all(32),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(
-                        Icons.router_rounded,
-                        size: 40,
-                        color: Theme.of(context).colorScheme.primary,
-                      ),
-                      const SizedBox(height: AppTokens.space16),
-                      Text(
-                        strings.onboardingTitle,
-                        style: Theme.of(context).textTheme.headlineSmall,
-                      ),
-                      const SizedBox(height: AppTokens.space8),
-                      Text(
-                        strings.onboardingSubtitle,
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: P2WlanColors.of(context).textMuted,
+              child: SingleChildScrollView(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.router_rounded,
+                          size: 40,
+                          color: Theme.of(context).colorScheme.primary,
                         ),
-                      ),
-                      const SizedBox(height: 28),
-                      _OnboardingStepper(
-                        model: _model,
-                        step: step,
-                        visible: _visibleSteps,
-                        facts: facts,
-                        permissionGranted: facts.permissionGranted,
-                      ),
-                      const SizedBox(height: 28),
-                      _StepBody(
-                        step: step,
-                        strings: strings,
-                        busy: _busy,
-                        preflight: _preflight,
-                      ),
-                      if (_error != null) ...[
                         const SizedBox(height: AppTokens.space16),
                         Text(
-                          _error!,
-                          style: TextStyle(
-                            color: P2WlanColors.of(context).dangerText,
+                          strings.onboardingTitle,
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        const SizedBox(height: AppTokens.space8),
+                        Text(
+                          strings.onboardingSubtitle,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: P2WlanColors.of(context).textMuted,
+                              ),
+                        ),
+                        const SizedBox(height: 28),
+                        _OnboardingStepper(
+                          model: _model,
+                          step: step,
+                          visible: _visibleSteps,
+                          facts: facts,
+                          permissionGranted: facts.permissionGranted,
+                        ),
+                        const SizedBox(height: 28),
+                        _StepBody(
+                          step: step,
+                          strings: strings,
+                          busy: _busy,
+                          preflight: _preflight,
+                        ),
+                        if (_error != null) ...[
+                          const SizedBox(height: AppTokens.space16),
+                          Text(
+                            _error!,
+                            style: TextStyle(
+                              color: P2WlanColors.of(context).dangerText,
+                            ),
                           ),
+                        ],
+                        const SizedBox(height: AppTokens.space24),
+                        _PrimaryAction(
+                          step: step,
+                          strings: strings,
+                          busy: _busy,
+                          skippable: _model.canSkip(step),
+                          onPrimary: () => _onPrimaryAction(step),
+                          onSkip: () {
+                            if (step == OnboardingStep.virtualIp) {
+                              // A VIP may take a moment; virtual IP step is not
+                              // skippable but we allow "keep waiting" (no-op).
+                            } else if (_model.canSkip(step)) {
+                              _completeOnce();
+                            }
+                          },
                         ),
                       ],
-                      const SizedBox(height: AppTokens.space24),
-                      _PrimaryAction(
-                        step: step,
-                        strings: strings,
-                        busy: _busy,
-                        skippable: _model.canSkip(step),
-                        onPrimary: () => _onPrimaryAction(step),
-                        onSkip: () {
-                          if (step == OnboardingStep.virtualIp) {
-                            // A VIP may take a moment; virtual IP step is not
-                            // skippable but we allow "keep waiting" (no-op).
-                          } else if (_model.canSkip(step)) {
-                            _completeOnce();
-                          }
-                        },
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -290,9 +303,12 @@ class _OnboardingStepper extends StatelessWidget {
             Expanded(
               child: Container(height: 2, color: AppTokens.colorBorderSubtle),
             ),
-          _StepDot(
-            label: _label(visible[i], strings),
-            state: _dotState(visible[i], current),
+          Flexible(
+            fit: FlexFit.loose,
+            child: _StepDot(
+              label: _label(visible[i], strings),
+              state: _dotState(visible[i], current),
+            ),
           ),
         ],
       ],
@@ -348,9 +364,17 @@ class _StepDot extends StatelessWidget {
           color: color,
         ),
         const SizedBox(height: AppTokens.space6),
-        Text(
-          label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 72),
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: color),
+          ),
         ),
       ],
     );
@@ -410,7 +434,12 @@ class _StepBody extends StatelessWidget {
               ),
               const SizedBox(width: AppTokens.space10),
             ],
-            Text(title, style: Theme.of(context).textTheme.titleMedium),
+            Expanded(
+              child: Text(
+                title,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
           ],
         ),
         const SizedBox(height: AppTokens.space6),
@@ -464,23 +493,27 @@ class _PermissionSummary extends StatelessWidget {
             children: [
               Icon(Icons.security_rounded, size: 16, color: tone),
               const SizedBox(width: AppTokens.space6),
-              Text(
-                '$label · ${preflight.canCreateTun == true
-                    ? strings.onboardingTunAvailable
-                    : preflight.canCreateTun == null
-                    ? strings.onboardingTunRuntimeVerify
-                    : strings.onboardingTunUnavailable} · ${preflight.canModifyRoutes == true
-                    ? strings.onboardingRoutesAvailable
-                    : preflight.canModifyRoutes == null
-                    ? strings.onboardingRoutesRuntimeVerify
-                    : strings.onboardingRoutesUnavailable}',
-                style: TextStyle(fontSize: 12, color: tone),
+              Expanded(
+                child: Text(label, style: TextStyle(fontSize: 12, color: tone)),
               ),
             ],
           ),
           const SizedBox(height: AppTokens.space6),
           Text(
-            preflight.recommendedAction,
+            '${preflight.canCreateTun == true
+                ? strings.onboardingTunAvailable
+                : preflight.canCreateTun == null
+                ? strings.onboardingTunRuntimeVerify
+                : strings.onboardingTunUnavailable} · ${preflight.canModifyRoutes == true
+                ? strings.onboardingRoutesAvailable
+                : preflight.canModifyRoutes == null
+                ? strings.onboardingRoutesRuntimeVerify
+                : strings.onboardingRoutesUnavailable}',
+            style: TextStyle(fontSize: 12, height: 1.35, color: tone),
+          ),
+          const SizedBox(height: AppTokens.space6),
+          Text(
+            permissionRecommendedAction(strings, preflight),
             style: TextStyle(
               fontSize: 12,
               height: 1.4,

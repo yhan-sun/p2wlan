@@ -20,7 +20,6 @@ class DiagnosticsLogPreview {
 // (core/capabilities/permission_preflight.dart). Private aliases keep the
 // panel widgets stable.
 typedef _PermissionSnapshot = PermissionPreflight;
-typedef _PermissionCheck = PermissionCheck;
 
 Future<_PermissionSnapshot> _checkPermissions() => runPermissionPreflight();
 

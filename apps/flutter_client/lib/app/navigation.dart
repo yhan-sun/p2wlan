@@ -160,6 +160,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.tunnels => TunnelsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        capabilities: widget.capabilities,
         showHeader: false,
       ),
       P2WlanSection.diagnostics => DiagnosticsPage(

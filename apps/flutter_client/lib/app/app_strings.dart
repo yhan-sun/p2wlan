@@ -685,9 +685,12 @@ class AppStrings {
   String get onboardingFinish => isZh ? '完成' : 'Finish';
   String get onboardingConnecting => isZh ? '正在连接…' : 'Connecting…';
   String get onboardingSkip => isZh ? '跳过' : 'Skip';
-  String onboardingCompleteFailed(String error) =>
-      isZh ? '无法完成本机设置：$error' : 'Could not finish local setup: $error';
-
+  String get onboardingCompleteFailed => isZh
+      ? '无法完成本机设置，请重试。'
+      : 'Could not finish local setup. Please try again.';
+  String get onboardingStartFailed => isZh
+      ? '无法启动 P2WLAN，请检查权限后重试。'
+      : 'Could not start P2WLAN. Check permissions and try again.';
   // --- Tunnels (Phase 8 localization) ---
   String get tunnelsSubtitle => isZh
       ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
@@ -719,8 +722,11 @@ class AppStrings {
   String get tunnelRouteAlreadyInstalled => isZh
       ? '路由已正确安装，无需修复。'
       : 'Route was already correctly installed; no change needed.';
-  String tunnelRouteRepairFailed(String error) =>
-      isZh ? '路由修复失败：$error' : 'Route repair failed: $error';
+  String get tunnelRouteRepairFailed =>
+      isZh ? '无法修复路由，请重试。' : 'Could not repair routes. Please try again.';
+  String get tunnelRestartFailed => isZh
+      ? '无法重启网络服务，请重试。'
+      : 'Could not restart the network service. Please try again.';
   String get daemonRestartedReinstall => isZh
       ? '已通过重启 daemon 触发 Overlay 路由重装。'
       : 'Daemon restarted to reinstall overlay routes.';
@@ -783,6 +789,70 @@ class AppStrings {
 
   // --- Diagnostics (Phase 8 localization) ---
   String get logExcerptCopied => isZh ? '日志片段已复制' : 'Log excerpt copied';
+
+  // --- Permissions presentation (Phase 8 follow-up) ---
+  String permActionElevationRequired() => isZh
+      ? '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。'
+      : 'Administrator authorization is required to create the TUN; P2WLAN uses the system prompt and never reads or stores your password.';
+  String permActionTunRuntimeVerification() => isZh
+      ? '已获得管理员权限；macOS utun 创建需要 daemon 运行时验证。'
+      : 'Elevated privileges are active; macOS utun creation is verified at daemon runtime.';
+  String permActionTunDeviceMissing() => isZh
+      ? '当前权限已满足，但缺少 /dev/net/tun，无法创建 Linux TUN。'
+      : 'Permissions are satisfied, but /dev/net/tun is missing so a Linux TUN cannot be created.';
+  String permActionReady() => isZh
+      ? '权限已满足，daemon 可以创建 TUN 并维护路由。'
+      : 'Permissions are satisfied; the daemon can create the TUN and maintain routes.';
+  String permActionWintunMissing() => isZh
+      ? '请把 wintun.dll 放到客户端/daemon 同级目录，或设置 P2WLAN_WINTUN_DLL。'
+      : 'Place wintun.dll next to the client/daemon, or set P2WLAN_WINTUN_DLL.';
+  String permActionPlatformUnsupported() => isZh
+      ? '此平台暂不支持本地 TUN 控制，请在 macOS、Linux 或 Windows 上使用。'
+      : 'Local TUN control is not supported on this platform; use macOS, Linux, or Windows.';
+  String permActionGeneric(String platform) => isZh
+      ? '$platform 平台需要进一步检查权限。'
+      : 'Additional permission checks are required on $platform.';
+  String get permCheckTitleGeneric => isZh ? '权限检查' : 'Permission check';
+  String get permCheckEuid => isZh ? '有效用户权限' : 'Effective user permissions';
+  String get permCheckTunNode => isZh ? 'TUN 设备节点' : 'TUN device node';
+  String get permCheckDevNetTun =>
+      isZh ? '/dev/net/tun 设备' : '/dev/net/tun device';
+  String get permCheckDaemonCap => isZh ? 'daemon 能力' : 'daemon capability';
+  String get permCheckAdmin => isZh ? '管理员权限' : 'Administrator rights';
+  String get permCheckWintun => isZh ? 'Wintun 运行库' : 'Wintun runtime';
+  String get permCheckPlatform => isZh ? '桌面平台' : 'Desktop platform';
+  String permCheckEuidPass() =>
+      isZh ? '已以管理员/root 身份运行。' : 'Running with elevated privileges.';
+  String permCheckEuidFail() =>
+      isZh ? '需要管理员权限。' : 'Elevated privileges are required.';
+  String permCheckEuidWarn() => isZh ? '权限有限。' : 'Limited privileges.';
+  String permCheckTunNodePass() =>
+      isZh ? 'TUN 设备节点可访问。' : 'TUN device node is available.';
+  String permCheckTunNodeWarn() => isZh
+      ? 'macOS 通常动态创建 utun，无需静态节点。'
+      : 'macOS usually creates utun dynamically; no static node needed.';
+  String permCheckDevNetTunPass() =>
+      isZh ? '/dev/net/tun 可访问。' : '/dev/net/tun is available.';
+  String permCheckDevNetTunFail() => isZh
+      ? '缺少 /dev/net/tun，无法创建 TUN。'
+      : '/dev/net/tun is missing; cannot create a TUN.';
+  String permCheckDaemonCapPass() =>
+      isZh ? 'daemon 具备 CAP_NET_ADMIN。' : 'daemon has CAP_NET_ADMIN.';
+  String permCheckDaemonCapWarn() =>
+      isZh ? '未检测到 CAP_NET_ADMIN。' : 'CAP_NET_ADMIN was not detected.';
+  String permCheckAdminPass() =>
+      isZh ? '已具备管理员权限。' : 'Running with administrator rights.';
+  String permCheckAdminFail() =>
+      isZh ? '需要管理员权限。' : 'Administrator rights are required.';
+  String permCheckWintunPass() =>
+      isZh ? '已找到 wintun.dll。' : 'wintun.dll found.';
+  String permCheckWintunFail() =>
+      isZh ? '缺少 wintun.dll。' : 'wintun.dll is missing.';
+  String permCheckPlatformFail() =>
+      isZh ? '请使用 macOS、Linux 或 Windows。' : 'Use macOS, Linux, or Windows.';
+  String permCheckStatusPass() => isZh ? '已通过' : 'Pass';
+  String permCheckStatusFail() => isZh ? '未通过' : 'Fail';
+  String permCheckStatusWarn() => isZh ? '需确认' : 'Review';
 
   String sectionLabel(String sectionName) {
     return switch (sectionName) {
