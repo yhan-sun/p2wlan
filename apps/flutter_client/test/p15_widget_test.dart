@@ -25,12 +25,14 @@ import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/onboarding/onboarding_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/features/tunnels/tunnels_page.dart';
+import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
 
 part 'p15_widget/dashboard_tests.dart';
 part 'p15_widget/settings_tests.dart';
 part 'p15_widget/nodes_tests.dart';
+part 'p15_widget/nodes_shell_tests.dart';
 part 'p15_widget/tunnels_tests.dart';
 part 'p15_widget/diagnostics_tests.dart';
 part 'p15_widget/design_system_tests.dart';
@@ -42,6 +44,7 @@ void main() {
   _registerDashboardTests();
   _registerSettingsTests();
   _registerNodesTests();
+  _registerNodesShellTests();
   _registerTunnelsTests();
   _registerDiagnosticsTests();
   _registerDesignSystemTests();

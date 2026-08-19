@@ -207,8 +207,7 @@ class _NodesPageState extends State<NodesPage> {
                   LayoutBuilder(
                     builder: (context, constraints) {
                       final layout =
-                          constraints.maxWidth >=
-                              AppBreakpoints.expandedMinWidth
+                          constraints.maxWidth >= nodesInspectorMinWidth
                           ? _NodesLayout.expanded
                           : constraints.maxWidth <
                                 AppBreakpoints.compactMaxWidth
