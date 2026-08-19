@@ -25,6 +25,7 @@ import 'package:p2wlan_flutter_client/features/nodes/nodes_page.dart';
 import 'package:p2wlan_flutter_client/features/onboarding/onboarding_page.dart';
 import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/features/tunnels/tunnels_page.dart';
+import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
 
 part 'p15_widget/dashboard_tests.dart';

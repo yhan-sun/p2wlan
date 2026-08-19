@@ -36,13 +36,16 @@ void main() {
   });
 
   group('P2WlanSection — mobile model', () {
-    test('permanent bottom-bar destinations are Home, Devices, Settings', () {
-      expect(P2WlanSection.mobilePrimary, [
-        P2WlanSection.home,
-        P2WlanSection.devices,
-        P2WlanSection.settings,
-      ]);
-    });
+    test(
+      'permanent bottom-bar destinations are exactly Home, Devices, Settings',
+      () {
+        expect(P2WlanSection.mobilePrimary, [
+          P2WlanSection.home,
+          P2WlanSection.devices,
+          P2WlanSection.settings,
+        ]);
+      },
+    );
 
     test('troubleshooting is not a permanent mobile tab', () {
       expect(
@@ -51,18 +54,12 @@ void main() {
       );
     });
 
-    test('troubleshooting and tunnels stay routable via the secondary hub', () {
-      expect(P2WlanSection.mobileSecondary, [
-        P2WlanSection.troubleshooting,
-        P2WlanSection.tunnels,
-      ]);
+    test('troubleshooting stays a primary (routable) section on mobile', () {
+      expect(P2WlanSection.primary, contains(P2WlanSection.troubleshooting));
     });
 
-    test('mobile bar plus hub covers every section exactly once', () {
-      final covered = [
-        ...P2WlanSection.mobilePrimary,
-        ...P2WlanSection.mobileSecondary,
-      ];
+    test('primary plus secondary covers every section exactly once', () {
+      final covered = [...P2WlanSection.primary, ...P2WlanSection.secondary];
       expect(covered.toSet().length, covered.length);
       expect(covered, containsAll(P2WlanSection.primary));
       expect(covered, containsAll(P2WlanSection.secondary));

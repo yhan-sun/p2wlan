@@ -37,18 +37,29 @@ class AppStrings {
 
   String get dashboard => isZh ? '仪表盘' : 'Dashboard';
   String get nodes => isZh ? '节点' : 'Nodes';
-  String get tunnels => isZh ? '隧道' : 'Tunnels';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
-  String get more => isZh ? '更多' : 'More';
-  String get navGroupOverview => isZh ? '概览' : 'Overview';
+  String get tunnels => isZh ? '隧道' : 'Tunnels';
 
   /// User-level navigation labels (Phase 1 IA).
   String get home => isZh ? '首页' : 'Home';
   String get troubleshooting => isZh ? '故障排查' : 'Troubleshooting';
-  String get moreDescription => isZh
-      ? '故障排查与隧道等低频功能。'
-      : 'Troubleshooting, tunnels, and other less frequent features.';
+  String get menu => isZh ? '菜单' : 'Menu';
+
+  // --- Shell status summary (desktop sidebar footer) ---
+  String get shellStatusHealthy => isZh ? '网络正常' : 'Network OK';
+  String get shellStatusAttention => isZh ? '网络异常' : 'Network issue';
+  String get shellStatusOffline => isZh ? '当前离线' : 'Offline';
+  String get shellStatusOfflineDetail =>
+      isZh ? '无法连接本地服务' : 'Cannot reach local service';
+  String get shellStatusStaleDetail =>
+      isZh ? '刷新查看最新状态' : 'Refresh to see latest status';
+  String shellPeersOnline(int count) => isZh
+      ? '$count 台设备在线'
+      : count == 1
+      ? '1 device online'
+      : '$count devices online';
+  String get openTroubleshooting => isZh ? '打开故障排查' : 'Open troubleshooting';
   String get restartRequired =>
       isZh ? '需要重启 P2WLAN' : 'P2WLAN restart required';
   String get restartRequiredDetail => isZh
