@@ -1,7 +1,9 @@
 part of '../diagnostics_page.dart';
 
-class _LogPreview {
-  const _LogPreview({
+/// Bounded log preview used by the Recent Logs panel. Exposed so tests can
+/// inject a loader via `DiagnosticsPage.logPreviewLoader`.
+class DiagnosticsLogPreview {
+  const DiagnosticsLogPreview({
     required this.path,
     required this.content,
     required this.shownLineCount,
@@ -18,33 +20,40 @@ class _LogPreview {
 // (core/capabilities/permission_preflight.dart). Private aliases keep the
 // panel widgets stable.
 typedef _PermissionSnapshot = PermissionPreflight;
-typedef _PermissionCheck = PermissionCheck;
 
 Future<_PermissionSnapshot> _checkPermissions() => runPermissionPreflight();
 
-Future<_LogPreview> _loadLogPreview() async {
+Future<void> _openLogsDefault() async {
+  final dir = defaultP2WlanLogDir();
+  await dir.create(recursive: true);
+  if (Platform.isMacOS) {
+    await Process.start('open', [dir.path]);
+  } else if (Platform.isWindows) {
+    await Process.start('explorer', [dir.path]);
+  } else {
+    await Process.start('xdg-open', [dir.path]);
+  }
+}
+
+Future<DiagnosticsLogPreview> _loadLogPreview() async {
   const previewLines = 120;
   final path =
       '${defaultP2WlanLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
   final file = File(path);
   try {
     if (!await file.exists()) {
-      return _LogPreview(path: path, content: '', shownLineCount: 0);
+      return DiagnosticsLogPreview(path: path, content: '', shownLineCount: 0);
     }
     // Bounded tail read: memory cost is O(preview window), never O(file size).
-    // A 100 MB log previews identically cheaply to a small one.
     final content = await tailLines(file, lines: previewLines);
-    // We only read a bounded window, so we do not (and cannot, without an
-    // O(size) scan) report the total file line count. The shown count is
-    // bounded by the window; the UI labels it accordingly.
     final shownLines = content.isEmpty ? 0 : content.split('\n').length;
-    return _LogPreview(
+    return DiagnosticsLogPreview(
       path: path,
-      content: redactLines(content.split('\n')),
+      content: content,
       shownLineCount: shownLines,
     );
   } catch (error) {
-    return _LogPreview(
+    return DiagnosticsLogPreview(
       path: path,
       content: '',
       shownLineCount: 0,
@@ -67,3 +76,41 @@ String _value(dynamic value) {
   final text = value.toString().trim();
   return text.isEmpty ? '—' : text;
 }
+
+/// Tone surface colors for overview/issue surfaces. Reuses the same semantic
+/// status palette as StatusBadge / dashboard via [P2WlanColors].
+({Color bg, Color border, Color text}) _tonePanelColors(
+  BuildContext context,
+  StatusTone tone,
+) {
+  final c = P2WlanColors.of(context);
+  return switch (tone) {
+    StatusTone.good => (
+      bg: c.successSurface,
+      border: c.successBorder,
+      text: c.successText,
+    ),
+    StatusTone.warn => (
+      bg: c.warningSurface,
+      border: c.warningBorder,
+      text: c.warningText,
+    ),
+    StatusTone.bad => (
+      bg: c.dangerSurface,
+      border: c.dangerBorder,
+      text: c.dangerText,
+    ),
+    StatusTone.neutral => (
+      bg: c.neutralSurface,
+      border: c.neutralBorder,
+      text: c.neutralText,
+    ),
+  };
+}
+
+StatusTone _severityTone(DiagnosticSeverity severity) => switch (severity) {
+  DiagnosticSeverity.good => StatusTone.good,
+  DiagnosticSeverity.warning => StatusTone.warn,
+  DiagnosticSeverity.bad => StatusTone.bad,
+  DiagnosticSeverity.neutral => StatusTone.neutral,
+};

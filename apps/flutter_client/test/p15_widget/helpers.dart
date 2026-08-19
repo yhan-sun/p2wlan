@@ -21,6 +21,10 @@ Future<_Stores> _makeStores({
       StatusStore.defaultStartupCatalogRefreshInterval,
   Duration startupCatalogRefreshTimeout =
       StatusStore.defaultStartupCatalogRefreshTimeout,
+  bool enableFreshnessTimer = false,
+  Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
+  DaemonController? daemonController,
+  bool manualMode = false,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
   final settingsStore = SettingsStore(
@@ -29,15 +33,20 @@ Future<_Stores> _makeStores({
   );
   await settingsStore.load();
   await settingsStore.updateSettings(
-    settingsStore.settings.copyWith(languageCode: AppLanguage.english.code),
+    settingsStore.settings.copyWith(
+      languageCode: AppLanguage.english.code,
+      manualMode: manualMode,
+    ),
   );
   final statusStore = StatusStore(
     settingsStore: settingsStore,
     diagnosticsApi: api,
-    daemonController: _FakeDaemonController(api),
+    daemonController: daemonController ?? _FakeDaemonController(api),
     autoRefreshInterval: const Duration(minutes: 5),
     startupCatalogRefreshInterval: startupCatalogRefreshInterval,
     startupCatalogRefreshTimeout: startupCatalogRefreshTimeout,
+    enableFreshnessTimer: enableFreshnessTimer,
+    maxSnapshotAge: maxSnapshotAge,
   );
   return _Stores(tempDir, settingsStore, statusStore);
 }
@@ -64,16 +73,20 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     this.statusError,
     this.speedTestResult,
     this.speedTestError,
+    this.repairRoutesError,
   });
 
   final bool health;
-  final DiagnosticsSnapshot? snapshot;
+  DiagnosticsSnapshot? snapshot;
   final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
   final SpeedTestResult? speedTestResult;
   final Object? speedTestError;
+  final Object? repairRoutesError;
   var statusFetchCount = 0;
   var speedTestCount = 0;
+  var verifyRoutesCount = 0;
+  var repairRoutesCount = 0;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => health;
@@ -120,6 +133,20 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
+    verifyRoutesCount += 1;
+    return _fakeRoutes;
+  }
+
+  @override
+  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async {
+    repairRoutesCount += 1;
+    final error = repairRoutesError;
+    if (error != null) throw error;
+    return _fakeRepair;
+  }
+
+  @override
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
@@ -141,16 +168,36 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   }) async => throw UnimplementedError();
 
   @override
-  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
-      throw UnimplementedError();
-
-  @override
-  Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
-      throw UnimplementedError();
-
-  @override
   void close() {}
 }
+
+const _fakeRoutes = RoutesResponse(
+  contractVersion: 1,
+  interfaceName: 'p2wlan0',
+  mtu: 1420,
+  healthy: true,
+  conflictCount: 0,
+  entries: [
+    RouteEntryResponse(
+      cidr: '10.20.0.0/16',
+      expectedInterface: 'p2wlan0',
+      actualInterface: 'p2wlan0',
+      state: 'installed',
+      owned: true,
+    ),
+  ],
+);
+
+const _fakeRepair = RouteRepairResponse(
+  contractVersion: 1,
+  cidr: '10.20.0.0/16',
+  changed: true,
+  attempted: true,
+  before: 'missing',
+  after: 'installed',
+  reason: 'fixed',
+  restartedDaemon: false,
+);
 
 class _FakeDaemonController extends DaemonController {
   _FakeDaemonController(DiagnosticsApi api) : super(diagnosticsApi: api);
@@ -166,16 +213,34 @@ class _FakeDaemonController extends DaemonController {
   }
 }
 
+class _FakeControlApi extends ControlApi {
+  _FakeControlApi({this.failDelete = false});
+
+  final bool failDelete;
+  var deleteCalls = 0;
+
+  @override
+  Future<void> deleteDevice({
+    required String controlServer,
+    required String authToken,
+    required String deviceId,
+  }) async {
+    deleteCalls += 1;
+    if (failDelete) throw const ControlApiException('fake delete failed');
+  }
+}
+
 class _TestApp extends StatelessWidget {
-  const _TestApp({required this.child});
+  const _TestApp({required this.child, this.strings});
 
   final Widget child;
+  final AppStrings? strings;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       home: AppStringsScope(
-        strings: AppStrings.fromCode(AppLanguage.english.code),
+        strings: strings ?? AppStrings.fromCode(AppLanguage.english.code),
         child: ScaffoldMessenger(child: Scaffold(body: child)),
       ),
     );

@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
+import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -15,11 +18,17 @@ class TunnelsPage extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.showHeader = true,
+    this.capabilities,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final bool showHeader;
+
+  /// Platform capability override (primarily for tests); defaults to the
+  /// current runtime platform. Local route actions are gated on the real
+  /// capabilities so remote-only platforms never see local-only controls.
+  final PlatformCapabilities? capabilities;
 
   @override
   State<TunnelsPage> createState() => _TunnelsPageState();
@@ -33,15 +42,20 @@ class _TunnelsPageState extends State<TunnelsPage> {
   Map<String, dynamic>? _routeState;
   var _verifying = false;
   var _repairing = false;
+  late final PlatformCapabilities _capabilities;
 
   @override
   void initState() {
     super.initState();
-    _verifyRoutes();
+    _capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    if (_capabilities.canVerifyRoutes) {
+      _verifyRoutes();
+    }
   }
 
   /// Read-only authoritative check of the live system routing table.
   Future<void> _verifyRoutes() async {
+    if (!_capabilities.canVerifyRoutes) return;
     final url = widget.settingsStore.settings.diagnosticsUrl;
     if (!widget.statusStore.daemonReachable) return;
     setState(() {
@@ -60,6 +74,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
 
   /// Repair the overlay route in place — no daemon/TUN/session restart.
   Future<void> _repairRoutes() async {
+    if (!_capabilities.canRepairRoutes) return;
     final strings = AppStringsScope.of(context);
     final url = widget.settingsStore.settings.diagnosticsUrl;
     setState(() {
@@ -74,16 +89,12 @@ class _TunnelsPageState extends State<TunnelsPage> {
       setState(() {
         _routeState = result.toJson();
         _message = changed
-            ? (strings.isZh
-                  ? '路由已就地修复（状态：$after），未重启 daemon。'
-                  : 'Route repaired in place (state: $after) without restarting the daemon.')
-            : (strings.isZh
-                  ? '路由已正确安装，无需修复。'
-                  : 'Route was already correctly installed; no change needed.');
+            ? strings.tunnelRouteRepaired(after)
+            : strings.tunnelRouteAlreadyInstalled;
       });
     } catch (error) {
       if (mounted) {
-        setState(() => _message = '路由修复失败：$error');
+        setState(() => _message = strings.tunnelRouteRepairFailed);
       }
     } finally {
       if (mounted) setState(() => _repairing = false);
@@ -101,21 +112,20 @@ class _TunnelsPageState extends State<TunnelsPage> {
         final running = widget.statusStore.daemonReachable && snapshot != null;
         return PageScaffold(
           title: strings.tunnels,
-          subtitle: strings.isZh
-              ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
-              : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.',
+          subtitle: strings.tunnelsSubtitle,
           showHeader: widget.showHeader,
+          maxWidth: tunnelsPageMaxWidth,
           children: [
             if (_message != null) ...[
               _InfoBanner(message: _message!),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
             _SummaryStrip(
               running: running,
               snapshot: snapshot,
               settings: settings,
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: AppTokens.space14),
             LayoutBuilder(
               builder: (context, constraints) {
                 final tunnelPanel = _TunnelPanel(
@@ -131,6 +141,9 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   verifying: _verifying,
                   repairing: _repairing,
                   rebuilding: _rebuilding,
+                  canVerify: _capabilities.canVerifyRoutes,
+                  canRepair: _capabilities.canRepairRoutes,
+                  canRestart: _capabilities.canControlLocalDaemon,
                   onVerify: _verifyRoutes,
                   onRepair: _repairRoutes,
                   onRebuild: _rebuildRoutes,
@@ -139,7 +152,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   return Column(
                     children: [
                       tunnelPanel,
-                      const SizedBox(height: 14),
+                      const SizedBox(height: AppTokens.space14),
                       routePanel,
                     ],
                   );
@@ -148,7 +161,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Expanded(child: tunnelPanel),
-                    const SizedBox(width: 14),
+                    const SizedBox(width: AppTokens.space14),
                     Expanded(child: routePanel),
                   ],
                 );
@@ -161,6 +174,7 @@ class _TunnelsPageState extends State<TunnelsPage> {
   }
 
   Future<void> _rebuildRoutes() async {
+    if (!_capabilities.canControlLocalDaemon) return;
     final strings = AppStringsScope.of(context);
     setState(() {
       _rebuilding = true;
@@ -168,17 +182,17 @@ class _TunnelsPageState extends State<TunnelsPage> {
     });
     try {
       final stop = await widget.statusStore.stopDaemon();
+      if (!mounted) return;
       if (!stop.ok) {
-        setState(() => _message = stop.message);
+        setState(() => _message = strings.tunnelRestartFailed);
         return;
       }
       final start = await widget.statusStore.startDaemon();
+      if (!mounted) return;
       setState(() {
         _message = start.ok
-            ? (strings.isZh
-                  ? '已通过重启 daemon 触发 Overlay 路由重装。'
-                  : 'Daemon restarted to reinstall overlay routes.')
-            : start.message;
+            ? strings.daemonRestartedReinstall
+            : strings.tunnelRestartFailed;
       });
     } finally {
       if (mounted) setState(() => _rebuilding = false);
@@ -201,25 +215,22 @@ class _SummaryStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: strings.isZh ? '隧道摘要' : 'Tunnel summary',
+      title: strings.tunnelSummary,
       child: Wrap(
         spacing: 24,
         runSpacing: 10,
         children: [
           MetricTile(
-            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
+            label: strings.startupInterface,
             value: settings.effectiveTunInterface,
           ),
           MetricTile(
             label: strings.virtualIp,
             value: _dash(snapshot?.virtualIp),
           ),
+          MetricTile(label: strings.startupMtu, value: settings.mtu.toString()),
           MetricTile(
-            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
-            value: settings.mtu.toString(),
-          ),
-          MetricTile(
-            label: strings.isZh ? '状态' : 'State',
+            label: strings.state,
             value: running ? strings.connected : strings.offline,
           ),
         ],
@@ -243,7 +254,7 @@ class _TunnelPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return AppPanel(
-      title: strings.isZh ? '虚拟网卡' : 'Virtual Adapter',
+      title: strings.virtualAdapter,
       trailing: StatusBadge(
         label: running ? 'UP' : 'DOWN',
         tone: running ? StatusTone.good : StatusTone.bad,
@@ -251,21 +262,18 @@ class _TunnelPanel extends StatelessWidget {
       child: Column(
         children: [
           _Kv(
-            label: strings.isZh ? '启动网卡配置' : 'Startup interface',
+            label: strings.startupInterface,
             value: settings.effectiveTunInterface,
           ),
           _Kv(label: 'Overlay CIDR', value: settings.overlayCidr),
           _Kv(label: strings.virtualIp, value: _dash(snapshot?.virtualIp)),
-          _Kv(
-            label: strings.isZh ? '启动 MTU 配置' : 'Startup MTU',
-            value: settings.mtu.toString(),
-          ),
+          _Kv(label: strings.startupMtu, value: settings.mtu.toString()),
           _Kv(
             label: strings.udpLocalAddr,
             value: _dash(snapshot?.udpLocalAddr ?? settings.udpBind),
           ),
           _Kv(
-            label: strings.isZh ? 'UDP sockets' : 'UDP sockets',
+            label: 'UDP sockets',
             value: (snapshot?.udpSocketCount ?? 0).toString(),
           ),
         ],
@@ -283,6 +291,9 @@ class _RoutePanel extends StatelessWidget {
     required this.verifying,
     required this.repairing,
     required this.rebuilding,
+    required this.canVerify,
+    required this.canRepair,
+    required this.canRestart,
     required this.onVerify,
     required this.onRepair,
     required this.onRebuild,
@@ -295,6 +306,9 @@ class _RoutePanel extends StatelessWidget {
   final bool verifying;
   final bool repairing;
   final bool rebuilding;
+  final bool canVerify;
+  final bool canRepair;
+  final bool canRestart;
   final Future<void> Function() onVerify;
   final Future<void> Function() onRepair;
   final Future<void> Function() onRebuild;
@@ -302,7 +316,6 @@ class _RoutePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final isZh = strings.isZh;
 
     // Authoritative state comes from the daemon when available; otherwise we
     // report "unknown" rather than guessing from daemon-running + virtual IP.
@@ -319,19 +332,19 @@ class _RoutePanel extends StatelessWidget {
     String badgeLabel;
     StatusTone badgeTone;
     if (!running) {
-      badgeLabel = isZh ? '离线' : 'Offline';
+      badgeLabel = strings.offline;
       badgeTone = StatusTone.neutral;
     } else if (state == null) {
-      badgeLabel = isZh ? '未知（未校验）' : 'Unknown (unverified)';
+      badgeLabel = strings.routeUnknown;
       badgeTone = StatusTone.warn;
     } else if (routeOk) {
-      badgeLabel = isZh ? '已安装' : 'Installed';
+      badgeLabel = strings.routeInstalled;
       badgeTone = StatusTone.good;
     } else if (routeConflict) {
-      badgeLabel = isZh ? '冲突' : 'Conflict';
+      badgeLabel = strings.routeConflict;
       badgeTone = StatusTone.bad;
     } else {
-      badgeLabel = isZh ? '缺失' : 'Missing';
+      badgeLabel = strings.routeMissing;
       badgeTone = StatusTone.bad;
     }
 
@@ -341,82 +354,78 @@ class _RoutePanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _Kv(label: strings.routeDestination, value: settings.overlayCidr),
           _Kv(
-            label: isZh ? '目标网段' : 'Destination',
-            value: settings.overlayCidr,
-          ),
-          _Kv(
-            label: isZh ? '期望网卡' : 'Expected interface',
+            label: strings.routeExpectedInterface,
             value: expected ?? settings.effectiveTunInterface,
           ),
           if (actual != null)
-            _Kv(
-              label: isZh ? '系统实际网卡' : 'Actual (system table)',
-              value: actual,
-            ),
+            _Kv(label: strings.routeActualInterface, value: actual),
           _Kv(
-            label: isZh ? '状态说明' : 'Detail',
+            label: strings.routeDetail,
             value: state == null
-                ? (isZh
-                      ? '尚未从 daemon 读取系统路由表；点击"检查路由"。'
-                      : 'Not yet read from the daemon; tap "Check routes".')
-                : (isZh
-                      ? '权威状态：${routeState?['state'] ?? state['state']}。'
-                      : 'Authoritative state: ${routeState?['state'] ?? state['state']}.'),
+                ? strings.routeNotRead
+                : strings.routeAuthoritative(
+                    routeState?['state'] ?? state['state'],
+                  ),
           ),
-          const SizedBox(height: 12),
-          // Check (read-only, safe anytime) + Repair (in place, no restart).
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: running && !verifying ? onVerify : null,
-                  icon: verifying
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.check_circle_outline_rounded),
-                  label: Text(isZh ? '检查路由' : 'Check routes'),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: running && !repairing ? onRepair : null,
-                  icon: repairing
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.build_rounded),
-                  label: Text(isZh ? '修复路由' : 'Repair routes'),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          // Restarting the daemon is a heavier, distinct action — keep it
-          // available but clearly secondary (it interrupts the connection).
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              onPressed: running && !(verifying || repairing)
-                  ? onRebuild
-                  : null,
-              icon: rebuilding
-                  ? const SizedBox.square(
-                      dimension: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.restart_alt_rounded, size: 16),
-              label: Text(
-                isZh
-                    ? '重启网络服务（会短暂断开）'
-                    : 'Restart network service (brief disconnect)',
+          const SizedBox(height: AppTokens.space12),
+          // Local route actions are hidden entirely when the platform cannot
+          // perform them (remote-only mobile never sees local-only controls).
+          if (canVerify || canRepair) ...[
+            Row(
+              children: [
+                if (canVerify) ...[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: running && !verifying ? onVerify : null,
+                      icon: verifying
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.check_circle_outline_rounded),
+                      label: Text(strings.checkRoutes),
+                    ),
+                  ),
+                  if (canRepair) const SizedBox(width: AppTokens.space10),
+                ],
+                if (canRepair)
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: running && !repairing ? onRepair : null,
+                      icon: repairing
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.build_rounded),
+                      label: Text(strings.repairRoutes),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+          if (canRestart) ...[
+            const SizedBox(height: AppTokens.space8),
+            // Restarting the daemon is a heavier, distinct action — keep it
+            // available but clearly secondary (it interrupts the connection).
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: running && !(verifying || repairing)
+                    ? onRebuild
+                    : null,
+                icon: rebuilding
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.restart_alt_rounded, size: 16),
+                label: Text(strings.restartNetworkService),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -431,23 +440,24 @@ class _Kv extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final labelText = Text(
             label,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12,
-              color: AppTokens.colorTextSecondary,
+              color: c.textSecondary,
               fontWeight: FontWeight.w600,
             ),
           );
           final valueText = Text(
             value,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 13,
-              color: AppTokens.colorTextPrimary,
+              color: c.textPrimary,
               fontFeatures: AppTokens.tabularFontFeatures,
             ),
           );
@@ -478,21 +488,18 @@ class _InfoBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: AppTokens.colorWarnBg,
+        color: c.warningSurface,
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        border: Border.all(color: AppTokens.colorWarnBorder),
+        border: Border.all(color: c.warningBorder),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(AppTokens.space12),
         child: Text(
           message,
-          style: const TextStyle(
-            color: AppTokens.colorWarnText,
-            fontSize: 13,
-            height: 1.35,
-          ),
+          style: TextStyle(color: c.warningText, fontSize: 13, height: 1.35),
         ),
       ),
     );

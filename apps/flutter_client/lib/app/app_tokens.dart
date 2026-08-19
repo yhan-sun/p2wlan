@@ -32,9 +32,11 @@ abstract final class AppTokens {
   static const colorAccent = Color(0xFF173E3C);
   static const colorAccentMuted = Color(0xFF2A5653);
 
-  // Dark Brand accent
-  static const colorDarkAccent = Color(0xFF38BDF8);
-  static const colorDarkAccentMuted = Color(0xFF1E3A4C);
+  // Dark Brand accent. Same hue family as the light accent (teal ≈ 176°):
+  // dark mode only raises lightness/saturation for contrast, never shifts to
+  // a different brand (previously a sky blue).
+  static const colorDarkAccent = Color(0xFF35B5AD);
+  static const colorDarkAccentMuted = Color(0xFF1E3E3B);
 
   // Status Tones (Semantic, strictly scoped)
   // Good / Online / Direct
@@ -42,17 +44,17 @@ abstract final class AppTokens {
   static const colorGoodBorder = Color(0xFFB9DFC9);
   static const colorGoodText = Color(0xFF276044);
 
-  // Warning / Degraded / Relay
+  // Warning / Degraded / Probing
   static const colorWarnBg = Color(0xFFFCF7EA);
   static const colorWarnBorder = Color(0xFFE6CD8F);
   static const colorWarnText = Color(0xFF755622);
 
-  // Bad / Offline / Unhealthy
+  // Bad / Unhealthy / Actual failures
   static const colorBadBg = Color(0xFFFCF3F1);
   static const colorBadBorder = Color(0xFFE7B8AE);
   static const colorBadText = Color(0xFF8B372D);
 
-  // Neutral / Skipped / Idle
+  // Neutral / Offline / Skipped / Idle
   static const colorNeutralBg = Color(0xFFF1F4F3);
   static const colorNeutralBorder = Color(0xFFD3DCDA);
   static const colorNeutralText = Color(0xFF4C585D);
@@ -98,6 +100,22 @@ abstract final class AppTokens {
   static const radiusSm = 6.0;
   static const radiusMd = 8.0;
   static const radiusLg = 12.0;
+
+  // --- Spacing scale (visual rhythm) ---
+  // page/section/card rhythm uses these; per-row or painter-specific offsets
+  // may stay local literals.
+  static const space2 = 2.0;
+  static const space4 = 4.0;
+  static const space6 = 6.0;
+  static const space8 = 8.0;
+  static const space10 = 10.0;
+  static const space12 = 12.0;
+  static const space14 = 14.0;
+  static const space16 = 16.0;
+  static const space20 = 20.0;
+  static const space24 = 24.0;
+  static const space32 = 32.0;
+  static const space40 = 40.0;
 
   // Touch Targets
   static const minTouchTarget = 44.0;

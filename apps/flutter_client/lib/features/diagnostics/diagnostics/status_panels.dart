@@ -1,7 +1,7 @@
 part of '../diagnostics_page.dart';
 
-class _BoundaryPanel extends StatelessWidget {
-  const _BoundaryPanel({required this.snapshot});
+class _ProtocolMtuPanel extends StatelessWidget {
+  const _ProtocolMtuPanel({required this.snapshot});
 
   final DiagnosticsSnapshot? snapshot;
 
@@ -17,10 +17,7 @@ class _BoundaryPanel extends StatelessWidget {
           strings.isZh
               ? '当前快照未上报协议边界或 MTU 策略。'
               : 'The current snapshot has no protocol boundary or MTU policy data.',
-          style: const TextStyle(
-            fontSize: 13,
-            color: AppTokens.colorTextSecondary,
-          ),
+          style: TextStyle(fontSize: 13, color: themeTextSecondary(context)),
         ),
       );
     }
@@ -86,9 +83,9 @@ class _TaskPanel extends StatelessWidget {
               strings.isZh
                   ? '当前快照没有关键任务明细。'
                   : 'No critical task details in the current snapshot.',
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 13,
-                color: AppTokens.colorTextSecondary,
+                color: themeTextSecondary(context),
               ),
             )
           : Column(children: [for (final task in tasks) _TaskRow(task: task)]),
@@ -116,7 +113,9 @@ class _TaskRow extends StatelessWidget {
             task.name,
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
           );
-          final error = task.error;
+          final error = task.error == null
+              ? null
+              : redactSensitive(task.error!);
           if (constraints.maxWidth < 380 && error != null) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -124,16 +123,16 @@ class _TaskRow extends StatelessWidget {
                 Row(
                   children: [
                     Expanded(child: name),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: AppTokens.space10),
                     badge,
                   ],
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: AppTokens.space4),
                 Text(
                   error,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 12,
-                    color: AppTokens.colorBadText,
+                    color: P2WlanColors.of(context).dangerText,
                   ),
                 ),
               ],
@@ -148,9 +147,9 @@ class _TaskRow extends StatelessWidget {
                     error,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 12,
-                      color: AppTokens.colorBadText,
+                      color: P2WlanColors.of(context).dangerText,
                     ),
                   ),
                 ),

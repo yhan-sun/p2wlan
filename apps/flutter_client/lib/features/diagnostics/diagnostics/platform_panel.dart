@@ -1,7 +1,10 @@
 part of '../diagnostics_page.dart';
 
 class _PlatformPanel extends StatefulWidget {
-  const _PlatformPanel();
+  const _PlatformPanel({this.permissionCheck});
+
+  /// Test seam: replaces the real platform permission preflight.
+  final Future<PermissionPreflight> Function()? permissionCheck;
 
   @override
   State<_PlatformPanel> createState() => _PlatformPanelState();
@@ -13,7 +16,7 @@ class _PlatformPanelState extends State<_PlatformPanel> {
   @override
   void initState() {
     super.initState();
-    _permissionFuture = _checkPermissions();
+    _permissionFuture = (widget.permissionCheck ?? _checkPermissions)();
   }
 
   @override
@@ -79,20 +82,23 @@ class _PlatformPanelState extends State<_PlatformPanel> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 4),
-                    for (final check in permission.checks)
-                      _PermissionCheckRow(check: check),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: AppTokens.space4),
+                    for (final check in permissionCheckPresentations(
+                      strings,
+                      permission,
+                    ))
+                      _PermissionCheckRow(presentation: check),
+                    const SizedBox(height: AppTokens.space10),
                     Text(
-                      permission.recommendedAction,
-                      style: const TextStyle(
+                      permissionRecommendedAction(strings, permission),
+                      style: TextStyle(
                         fontSize: 13,
                         height: 1.4,
-                        color: AppTokens.colorTextSecondary,
+                        color: themeTextSecondary(context),
                       ),
                     ),
                     if (permission.sudoCommand != null) ...[
-                      const SizedBox(height: 8),
+                      const SizedBox(height: AppTokens.space8),
                       _CommandLine(command: permission.sudoCommand!),
                     ],
                   ],
@@ -104,24 +110,23 @@ class _PlatformPanelState extends State<_PlatformPanel> {
 
   void _refresh() {
     setState(() {
-      _permissionFuture = _checkPermissions();
+      _permissionFuture = (widget.permissionCheck ?? _checkPermissions)();
     });
   }
 }
 
 class _PermissionCheckRow extends StatelessWidget {
-  const _PermissionCheckRow({required this.check});
+  const _PermissionCheckRow({required this.presentation});
 
-  final _PermissionCheck check;
+  final PermissionCheckPresentation presentation;
 
   @override
   Widget build(BuildContext context) {
-    final tone = switch (check.status) {
+    final tone = switch (presentation.status) {
       'pass' => StatusTone.good,
       'warn' => StatusTone.warn,
       _ => StatusTone.bad,
     };
-    final label = check.status.toUpperCase();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: LayoutBuilder(
@@ -130,7 +135,7 @@ class _PermissionCheckRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                check.label,
+                presentation.title,
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -138,11 +143,11 @@ class _PermissionCheckRow extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                check.detail,
-                style: const TextStyle(
+                presentation.detail,
+                style: TextStyle(
                   fontSize: 12,
                   height: 1.35,
-                  color: AppTokens.colorTextSecondary,
+                  color: themeTextSecondary(context),
                 ),
               ),
             ],
@@ -151,8 +156,8 @@ class _PermissionCheckRow extends StatelessWidget {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                StatusBadge(label: label, tone: tone),
-                const SizedBox(height: 6),
+                StatusBadge(label: presentation.statusLabel, tone: tone),
+                const SizedBox(height: AppTokens.space6),
                 details,
               ],
             );
@@ -162,9 +167,9 @@ class _PermissionCheckRow extends StatelessWidget {
             children: [
               SizedBox(
                 width: 76,
-                child: StatusBadge(label: label, tone: tone),
+                child: StatusBadge(label: presentation.statusLabel, tone: tone),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: AppTokens.space10),
               Expanded(child: details),
             ],
           );
@@ -184,7 +189,7 @@ class _CommandLine extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(AppTokens.space10),
       decoration: BoxDecoration(
         color: AppTokens.colorConsoleBg,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),

@@ -41,9 +41,9 @@ extension _SettingsPageActions on _SettingsPageState {
         udpAdvertise: _udpAdvertiseController.text,
         socketPool: _socketPool,
         relayServers: _relayServersController.text,
-        closeBehavior: currentSettings.closeBehavior,
+        closeBehavior: _closeBehavior,
       );
-      final restartRequired =
+      final restartRequiredNow =
           daemonWasRunning &&
           _daemonLaunchSettingsChanged(
             currentSettings,
@@ -52,14 +52,14 @@ extension _SettingsPageActions on _SettingsPageState {
       await widget.statusStore.refresh();
       if (mounted) {
         _updateState(() {
-          _restartRequired = restartRequired;
-          // Re-derive the credential status without ever reading the token
-          // back into a text field.
-          _credentialState = _describeCredential(widget.settingsStore.settings);
+          // A pending restart must survive unrelated saves: once a
+          // daemon-launch setting changed while the daemon was running, it
+          // stays sticky until the daemon is actually restarted.
+          _restartRequired = _restartRequired || restartRequiredNow;
         });
       }
       _showSnackBar(
-        restartRequired
+        _restartRequired
             ? strings.settingsSavedRestartRequired
             : strings.diagnosticsUrlSaved,
       );
@@ -78,7 +78,7 @@ extension _SettingsPageActions on _SettingsPageState {
             : strings.failedToSaveLocalSettings,
       );
     } catch (error) {
-      _updateState(() => _formError = error.toString());
+      _updateState(() => _formError = strings.settingsSaveFailed);
       _showSnackBar(strings.failedToSaveLocalSettings);
     } finally {
       if (mounted) {

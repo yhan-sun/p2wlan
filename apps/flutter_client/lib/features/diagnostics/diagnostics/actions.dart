@@ -1,13 +1,9 @@
 part of '../diagnostics_page.dart';
 
 class _DiagnosticsActions extends StatelessWidget {
-  const _DiagnosticsActions({
-    required this.statusStore,
-    required this.snapshot,
-  });
+  const _DiagnosticsActions({required this.statusStore});
 
   final StatusStore statusStore;
-  final DiagnosticsSnapshot? snapshot;
 
   @override
   Widget build(BuildContext context) {
@@ -19,12 +15,7 @@ class _DiagnosticsActions extends StatelessWidget {
         OutlinedButton.icon(
           onPressed: () => _copySummary(context),
           icon: const Icon(Icons.copy_all_outlined, size: 17),
-          label: Text(strings.isZh ? '复制摘要' : 'Copy summary'),
-        ),
-        OutlinedButton.icon(
-          onPressed: () => _openLogs(context),
-          icon: const Icon(Icons.folder_open_outlined, size: 17),
-          label: Text(strings.openLogs),
+          label: Text(strings.copyDiagnosticsSummary),
         ),
         FilledButton.icon(
           onPressed: statusStore.refreshing ? null : statusStore.refresh,
@@ -42,8 +33,11 @@ class _DiagnosticsActions extends StatelessWidget {
     );
   }
 
+  /// Support-friendly summary. Everything that could carry a credential is
+  /// passed through [redactSensitive] before it reaches the clipboard.
   Future<void> _copySummary(BuildContext context) async {
     final strings = AppStringsScope.of(context);
+    final snapshot = statusStore.snapshot;
     final health = snapshot?.health;
     final stats = snapshot?.stats;
     final lines = [
@@ -62,29 +56,11 @@ class _DiagnosticsActions extends StatelessWidget {
       if (statusStore.lastError != null) 'last_error=${statusStore.lastError}',
       if (health?.reason != null) 'health_reason=${health!.reason}',
     ];
-    await Clipboard.setData(ClipboardData(text: lines.join('\n')));
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(strings.isZh ? '诊断摘要已复制' : 'Diagnostics summary copied'),
-      ),
-    );
-  }
-
-  Future<void> _openLogs(BuildContext context) async {
-    final strings = AppStringsScope.of(context);
-    final dir = defaultP2WlanLogDir();
-    await dir.create(recursive: true);
-    if (Platform.isMacOS) {
-      await Process.start('open', [dir.path]);
-    } else if (Platform.isWindows) {
-      await Process.start('explorer', [dir.path]);
-    } else {
-      await Process.start('xdg-open', [dir.path]);
-    }
+    final safeSummary = redactSensitive(lines.join('\n'));
+    await Clipboard.setData(ClipboardData(text: safeSummary));
     if (!context.mounted) return;
     ScaffoldMessenger.of(
       context,
-    ).showSnackBar(SnackBar(content: Text('${strings.openLogs}: ${dir.path}')));
+    ).showSnackBar(SnackBar(content: Text(strings.diagnosticsSummaryCopied)));
   }
 }

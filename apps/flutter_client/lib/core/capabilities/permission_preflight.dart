@@ -14,11 +14,17 @@ class PermissionCheck {
     required this.label,
     required this.status,
     required this.detail,
+    this.code,
   });
 
   final String label;
   final String status;
   final String detail;
+
+  /// Stable machine-readable key for this check (e.g. `euid`, `dev_net_tun`,
+  /// `admin`). The UI uses it to render localized copy instead of [label] /
+  /// [detail], which may carry raw technical text in any language.
+  final String? code;
 }
 
 enum PermissionPreflightState {
@@ -107,7 +113,8 @@ Future<PermissionPreflight> runPermissionPreflight() async {
       PermissionCheck(
         label: 'Desktop platform',
         status: 'fail',
-        detail: 'Use macOS, Linux, or Windows for local TUN control.',
+        detail: 'unsupported',
+        code: 'platform',
       ),
     ],
   );
@@ -133,18 +140,16 @@ PermissionPreflight _checkMacosPermissions() {
     sudoCommand: isRoot ? null : _suggestedSudoCommand(),
     checks: [
       PermissionCheck(
-        label: '有效用户权限',
+        label: 'Effective user permissions',
         status: isRoot ? 'pass' : 'fail',
-        detail: isRoot
-            ? '已以 root 身份运行 (euid=$euid)。'
-            : '当前是普通用户 (euid=${euid ?? 'unknown'})。',
+        detail: 'euid=$euid',
+        code: 'euid',
       ),
       PermissionCheck(
-        label: 'TUN 设备节点',
+        label: 'TUN device node',
         status: hasDevTun ? 'pass' : 'warn',
-        detail: hasDevTun
-            ? '/dev 中存在 TUN 设备节点。'
-            : 'macOS 通常动态创建 utun；未找到静态 /dev/net/tun 属于正常情况。',
+        detail: hasDevTun ? 'found' : 'dynamic utun expected',
+        code: 'tun_node',
       ),
     ],
   );
@@ -185,33 +190,28 @@ PermissionPreflight _checkLinuxPermissions() {
     sudoCommand: privileged ? null : _suggestedSudoCommand(),
     checks: [
       PermissionCheck(
-        label: '有效用户权限',
+        label: 'Effective user permissions',
         status: isRoot
             ? 'pass'
             : hasCapNetAdmin
             ? 'warn'
             : 'fail',
-        detail: isRoot
-            ? '已以 root 身份运行 (euid=$euid)。'
-            : hasCapNetAdmin
-            ? '当前不是 root，但 daemon 二进制带 cap_net_admin。'
-            : '当前是普通用户 (euid=${euid ?? 'unknown'})，需要提权或 setcap。',
+        detail: 'euid=$euid',
+        code: 'euid',
       ),
       PermissionCheck(
         label: '/dev/net/tun',
         status: hasDevTun ? 'pass' : 'fail',
-        detail: hasDevTun
-            ? '/dev/net/tun 设备节点可访问。'
-            : '未找到 /dev/net/tun，无法创建 Linux TUN。',
+        detail: hasDevTun ? 'found' : 'missing',
+        code: 'dev_net_tun',
       ),
       PermissionCheck(
         label: 'daemon capability',
         status: hasCapNetAdmin ? 'pass' : 'warn',
-        detail: daemonBinary == null
-            ? '未定位到 p2wlan-daemon，无法检查 cap_net_admin。'
-            : hasCapNetAdmin
-            ? '${daemonBinary.path} 具备 cap_net_admin。'
-            : '${daemonBinary.path} 未检测到 cap_net_admin。',
+        detail: hasCapNetAdmin
+            ? 'cap_net_admin present'
+            : 'cap_net_admin absent',
+        code: 'daemon_cap',
       ),
     ],
   );
@@ -242,16 +242,16 @@ PermissionPreflight _checkWindowsPermissions() {
         : '请把 wintun.dll 放到客户端/daemon 同级目录，或设置 P2WLAN_WINTUN_DLL。',
     checks: [
       PermissionCheck(
-        label: 'Windows 管理员权限',
+        label: 'Windows administrator',
         status: isAdmin ? 'pass' : 'fail',
-        detail: isAdmin ? '当前已具备管理员权限。' : '安装 Wintun 虚拟网卡和更新路由需要管理员权限。',
+        detail: isAdmin ? 'granted' : 'required',
+        code: 'admin',
       ),
       PermissionCheck(
-        label: 'Wintun 运行库',
+        label: 'Wintun runtime',
         status: wintun == null ? 'fail' : 'pass',
-        detail: wintun == null
-            ? '未在客户端/daemon 同级目录、P2WLAN_WINTUN_DLL 或 PATH 中找到 wintun.dll。'
-            : '已找到 ${wintun.path}',
+        detail: wintun == null ? 'not found' : wintun.path,
+        code: 'wintun',
       ),
     ],
   );

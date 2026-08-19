@@ -1,173 +1,5 @@
 part of '../nodes_page.dart';
 
-class _PeerDetailsDialog extends StatelessWidget {
-  const _PeerDetailsDialog({required this.peer, required this.strings});
-
-  final PeerSnapshot peer;
-  final AppStrings strings;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-    final size = MediaQuery.sizeOf(context);
-    final usableWidth = size.width > 64 ? size.width - 32 : size.width;
-    final usableHeight = size.height > 96 ? size.height - 48 : size.height;
-    final dialogWidth = usableWidth < 520 ? usableWidth : 520.0;
-    final maxDialogHeight = usableHeight < 620 ? usableHeight : 620.0;
-
-    return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-      backgroundColor: Colors.transparent,
-      surfaceTintColor: Colors.transparent,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: dialogWidth,
-          maxHeight: maxDialogHeight,
-        ),
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: colorScheme.surface,
-            borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-            border: Border.all(color: colorScheme.outlineVariant),
-            boxShadow: AppTokens.shadowBorder,
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 16, 10, 14),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              dash(peer.displayName),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: colorScheme.onSurface,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 5),
-                            Text(
-                              dash(peer.virtualIp),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: colorScheme.onSurfaceVariant,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                fontFeatures: AppTokens.tabularFontFeatures,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Padding(
-                        padding: const EdgeInsets.only(top: 1),
-                        child: _PathBadge(peer: peer),
-                      ),
-                      const SizedBox(width: 2),
-                      IconButton(
-                        tooltip: strings.cancel,
-                        onPressed: () => Navigator.of(context).pop(),
-                        icon: const Icon(Icons.close_rounded, size: 20),
-                      ),
-                    ],
-                  ),
-                ),
-                const Divider(height: 1),
-                Flexible(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _DetailLine(
-                          label: strings.virtualIp,
-                          value: dash(peer.virtualIp),
-                        ),
-                        _DetailLine(
-                          label: strings.isZh ? '版本' : 'Version',
-                          value: dash(peer.appVersion),
-                        ),
-                        _DetailLine(label: strings.nodeId, value: peer.nodeId),
-                        _DetailLine(
-                          label: strings.connectionType,
-                          value: _connectionLabel(strings, peer),
-                        ),
-                        _DetailLine(
-                          label: strings.latency,
-                          value: formatLatency(peer.latencyMs),
-                        ),
-                        _DetailLine(
-                          label: strings.isZh ? '在线状态' : 'Online state',
-                          value: peer.online ? strings.online : strings.offline,
-                        ),
-                        _DetailLine(
-                          label: strings.isZh ? '最后在线' : 'Last seen',
-                          value: _formatLastSeen(peer),
-                        ),
-                        _DetailLine(
-                          label: strings.state,
-                          value: dash(peer.state),
-                        ),
-                        _DetailLine(
-                          label: strings.type,
-                          value: dash(peer.connectionType),
-                        ),
-                        _DetailLine(
-                          label: strings.endpoint,
-                          value: dash(peer.endpoint),
-                        ),
-                        _DetailLine(
-                          label: strings.relay,
-                          value: dash(peer.relayServer),
-                        ),
-                        if (peer.currentPathSelection?.reason.isNotEmpty ==
-                            true)
-                          _DetailLine(
-                            label: strings.isZh ? '路径判定' : 'Path decision',
-                            value: peer.currentPathSelection!.reason,
-                          ),
-                        if (peer.lastError != null)
-                          _DetailLine(
-                            label: strings.lastError,
-                            value: peer.lastError!,
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-                const Divider(height: 1),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      child: Text(strings.cancel),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class _RemoveDeviceDialogContent extends StatelessWidget {
   const _RemoveDeviceDialogContent({required this.peer, required this.strings});
 
@@ -177,6 +9,7 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final c = P2WlanColors.of(context);
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 420),
       child: Column(
@@ -185,28 +18,26 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
         children: [
           DecoratedBox(
             decoration: BoxDecoration(
-              color: AppTokens.colorBadBg,
+              color: c.dangerSurface,
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-              border: Border.all(color: AppTokens.colorBadBorder),
+              border: Border.all(color: c.dangerBorder),
             ),
             child: Padding(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(AppTokens.space12),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Icon(
+                  Icon(
                     Icons.warning_amber_rounded,
                     size: 20,
-                    color: AppTokens.colorBadText,
+                    color: c.dangerText,
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: AppTokens.space10),
                   Expanded(
                     child: Text(
-                      strings.isZh
-                          ? '该设备会从控制面移除，之后需要重新登录/注册才能加入网络。'
-                          : 'This removes the device from the control plane. It must sign in or register again to rejoin.',
-                      style: const TextStyle(
-                        color: AppTokens.colorBadText,
+                      strings.removeDeviceConfirmation,
+                      style: TextStyle(
+                        color: c.dangerText,
                         fontSize: 13,
                         height: 1.35,
                         fontWeight: FontWeight.w600,
@@ -217,11 +48,8 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 14),
-          _RemoveDeviceMetaRow(
-            label: strings.isZh ? '设备名称' : 'Device',
-            value: peer.displayName,
-          ),
+          const SizedBox(height: AppTokens.space14),
+          _RemoveDeviceMetaRow(label: strings.device, value: peer.displayName),
           _RemoveDeviceMetaRow(
             label: strings.virtualIp,
             value: dash(peer.virtualIp),
@@ -230,11 +58,9 @@ class _RemoveDeviceDialogContent extends StatelessWidget {
             label: strings.nodeId,
             value: shortId(peer.nodeId),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: AppTokens.space4),
           Text(
-            strings.isZh
-                ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
-                : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.',
+            strings.removeDeviceOfflineHint,
             style: TextStyle(
               color: theme.colorScheme.onSurfaceVariant,
               fontSize: 12,
@@ -272,7 +98,7 @@ class _RemoveDeviceMetaRow extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: AppTokens.space8),
           Expanded(
             child: Text(
               value,

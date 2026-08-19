@@ -67,10 +67,10 @@ class _RawJsonState extends State<_RawJson> {
           ? _RawJsonConsole(raw: _rawJson())
           : Text(
               strings.rawJsonCollapsed,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 13,
                 height: 1.35,
-                color: AppTokens.colorTextSecondary,
+                color: themeTextSecondary(context),
               ),
             ),
     );
@@ -140,7 +140,7 @@ class _RawJsonConsole extends StatelessWidget {
     return Container(
       width: double.infinity,
       constraints: const BoxConstraints(minHeight: 220),
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(AppTokens.space12),
       decoration: BoxDecoration(
         color: AppTokens.colorConsoleBg,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),

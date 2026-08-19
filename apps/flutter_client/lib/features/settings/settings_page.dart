@@ -1,25 +1,27 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/api/diagnostics_api.dart';
+import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
-import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 
 part 'settings_page/widgets.dart';
 part 'settings_page/actions.dart';
 
 /// Describes credential state for display without ever revealing the token.
-String _describeCredential(AppSettings settings) {
+String _describeCredential(AppSettings settings, AppStrings strings) {
   if (settings.manualMode) {
-    return 'Manual / offline mode (no control token needed)';
+    return strings.credentialManualMode;
   }
   return settings.authToken.trim().isEmpty
-      ? 'No control token stored — sign in to authenticate'
-      : 'Control token stored';
+      ? strings.credentialNotSaved
+      : strings.credentialSaved;
 }
 
 class SettingsPage extends StatefulWidget {
@@ -27,12 +29,18 @@ class SettingsPage extends StatefulWidget {
     super.key,
     required this.settingsStore,
     required this.statusStore,
+    this.capabilities,
     this.onLogout,
     this.showHeader = true,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+
+  /// Platform capability override (used by tests to simulate mobile). Defaults
+  /// to the current runtime platform.
+  final PlatformCapabilities? capabilities;
+
   final VoidCallback? onLogout;
   final bool showHeader;
 
@@ -41,6 +49,7 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
+  late final PlatformCapabilities _capabilities;
   late final TextEditingController _diagnosticsUrlController;
   late final TextEditingController _controlServerController;
   late final TextEditingController _authTokenController;
@@ -60,15 +69,20 @@ class _SettingsPageState extends State<SettingsPage> {
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
   var _restartRequired = false;
-  // Human-readable credential status (e.g. "valid" / "missing"). The raw token
-  // is never shown; this only describes whether one is stored.
-  late String _credentialState;
+  var _closeBehavior = defaultCloseBehavior;
+  // Progressive-disclosure state. Advanced / Developer groups start collapsed;
+  // the change-credential field starts hidden so the token input is not a
+  // permanent fixture of the account section.
+  var _showAdvancedNetwork = false;
+  var _showDeveloper = false;
+  var _showTokenField = false;
 
   void _updateState(VoidCallback fn) => setState(fn);
 
   @override
   void initState() {
     super.initState();
+    _capabilities = widget.capabilities ?? PlatformCapabilities.current();
     final settings = widget.settingsStore.settings;
     _diagnosticsUrlController = TextEditingController(
       text: settings.diagnosticsUrl,
@@ -81,7 +95,6 @@ class _SettingsPageState extends State<SettingsPage> {
     // empty on save (managed mode) preserves the current token, while
     // re-entering a value updates it. Clearing is a separate logout action.
     _authTokenController = TextEditingController();
-    _credentialState = _describeCredential(settings);
     _networkIdController = TextEditingController(text: settings.networkId);
     _virtualIpController = TextEditingController(text: settings.virtualIp);
     _deviceNameController = TextEditingController(text: settings.deviceName);
@@ -99,6 +112,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     _manualMode = settings.manualMode;
     _socketPool = normalizeSocketPool(settings.socketPool);
+    _closeBehavior = normalizeCloseBehavior(settings.closeBehavior);
   }
 
   @override
@@ -126,210 +140,51 @@ class _SettingsPageState extends State<SettingsPage> {
         final strings = AppStrings.fromCode(
           widget.settingsStore.settings.languageCode,
         );
+        final languageCode = widget.settingsStore.settings.languageCode;
+        final themeCode = widget.settingsStore.settings.themeMode;
+        final theme = Theme.of(context);
+        // Derived from the live store + current strings so a language switch
+        // (or any other store update) re-renders the status correctly. The raw
+        // token is never read back into a text field.
+        final credentialState = _describeCredential(
+          widget.settingsStore.settings,
+          strings,
+        );
         return PageScaffold(
           title: strings.settings,
           subtitle: strings.settingsSubtitle,
           showHeader: widget.showHeader,
+          maxWidth: settingsPageMaxWidth,
           children: [
             if (_formError != null) ...[
               _ErrorBanner(message: _formError!),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
             if (_restartRequired) ...[
               _PendingRestartNotice(
                 busy: _saving || widget.statusStore.daemonBusy,
+                canRestart: _capabilities.canControlLocalDaemon,
                 onRestart: _restartDaemonToApply,
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: AppTokens.space14),
             ],
-            AppPanel(
-              title: strings.diagnosticsEndpoint,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: _diagnosticsUrlController,
-                    decoration: InputDecoration(
-                      labelText: strings.diagnosticsUrl,
-                      hintText: defaultDiagnosticsUrl,
-                      helperText: strings.diagnosticsUrlHelper,
-                      errorText: _diagnosticsError,
-                    ),
-                    keyboardType: TextInputType.url,
-                    onSubmitted: (_) => _saveAll(),
-                  ),
-                  const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 12,
-                    runSpacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: widget.statusStore.refreshing
-                            ? null
-                            : () => widget.statusStore.refresh(),
-                        icon: const Icon(Icons.refresh, size: 16),
-                        label: Text(strings.refreshNow),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: _saving ? null : _resetDiagnosticsUrl,
-                        icon: const Icon(Icons.restore, size: 16),
-                        label: Text(strings.restoreDefaultUrl),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            AppPanel(
-              title: strings.connectionSettings,
-              child: Column(
-                children: [
-                  _SettingsTextField(
-                    controller: _controlServerController,
-                    label: strings.controlServer,
-                    helper: strings.isZh
-                        ? '用户注册、设备认证和节点目录同步地址。'
-                        : 'Used for account auth, device registration, and peer catalog sync.',
-                    keyboardType: TextInputType.url,
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _authTokenController,
-                    label: strings.authToken,
-                    helper: '${strings.authTokenHelper} · $_credentialState',
-                    obscureText: true,
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _networkIdController,
-                    label: strings.networkId,
-                    helper: strings.isZh
-                        ? '加入的专用虚拟内网标识。'
-                        : 'Virtual network identifier to join.',
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _virtualIpController,
-                    label: strings.isZh ? '期望虚拟 IP' : 'Requested virtual IP',
-                    helper: strings.isZh
-                        ? '可选；留空由控制面自动分配，例如 10.20.0.42。保存后重启 P2WLAN 生效。'
-                        : 'Optional; leave blank for control-plane assignment, e.g. 10.20.0.42. Restart P2WLAN after saving.',
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _deviceNameController,
-                    label: strings.deviceName,
-                    helper: strings.isZh
-                        ? '留空保存时会使用当前主机名。'
-                        : 'If left empty, the current hostname is used.',
-                  ),
-                  Material(
-                    type: MaterialType.transparency,
-                    child: SwitchListTile.adaptive(
-                      contentPadding: EdgeInsets.zero,
-                      value: _manualMode,
-                      onChanged: _saving
-                          ? null
-                          : (value) => setState(() => _manualMode = value),
-                      title: Text(strings.manualMode),
-                      subtitle: Text(strings.manualModeHelper),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            AppPanel(
-              title: strings.isZh ? '网络与隧道' : 'Network and Tunnel',
-              child: Column(
-                children: [
-                  _ResponsiveFieldRow(
-                    first: _SettingsTextField(
-                      controller: _tunInterfaceController,
-                      label: strings.isZh ? '网卡设备名称' : 'Interface name',
-                      helper: defaultTunInterface,
-                    ),
-                    second: _SettingsTextField(
-                      controller: _mtuController,
-                      label: 'MTU',
-                      helper: strings.isZh
-                          ? '建议 1420；Relay 路径异常时可尝试 1280。'
-                          : '1420 is recommended; try 1280 for relay path issues.',
-                      keyboardType: TextInputType.number,
-                    ),
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _overlayCidrController,
-                    label: 'Overlay CIDR',
-                    helper: defaultOverlayCidr,
-                  ),
-                  _gap,
-                  _ResponsiveFieldRow(
-                    first: _SettingsTextField(
-                      controller: _udpBindController,
-                      label: strings.isZh ? 'UDP 监听地址' : 'UDP bind',
-                      helper: '0.0.0.0:0',
-                    ),
-                    second: _SettingsTextField(
-                      controller: _udpAdvertiseController,
-                      label: strings.isZh ? '公网 UDP 地址' : 'UDP advertise',
-                      helper: strings.isZh
-                          ? '云主机固定入口，例如 203.0.113.10:60207。'
-                          : 'Fixed cloud endpoint such as 203.0.113.10:60207.',
-                    ),
-                  ),
-                  _gap,
-                  DropdownButtonFormField<String>(
-                    initialValue: _socketPool,
-                    decoration: InputDecoration(
-                      labelText: strings.isZh
-                          ? '增强打洞 socket pool'
-                          : 'Socket pool',
-                      helperText: strings.isZh
-                          ? '困难 NAT 下增加受控 UDP 映射，推荐 3。'
-                          : 'Adds bounded UDP mappings for hard NATs; 3 is recommended.',
-                    ),
-                    items: const [
-                      DropdownMenuItem(value: 'off', child: Text('off')),
-                      DropdownMenuItem(value: '2', child: Text('2 sockets')),
-                      DropdownMenuItem(value: '3', child: Text('3 sockets')),
-                      DropdownMenuItem(value: '4', child: Text('4 sockets')),
-                    ],
-                    onChanged: _saving || widget.statusStore.daemonBusy
-                        ? null
-                        : (value) {
-                            if (value != null) {
-                              setState(() => _socketPool = value);
-                            }
-                          },
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _relayServersController,
-                    label: strings.isZh ? 'Relay 候选' : 'Relay candidates',
-                    helper: strings.isZh
-                        ? '可选，逗号分隔，格式 region@ip:port 或 ip:port。'
-                        : 'Optional comma-separated region@ip:port or ip:port entries.',
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            AppPanel(
-              title: strings.isZh ? '系统与行为' : 'System Behavior',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  DropdownButtonFormField<String>(
-                    initialValue: AppLanguage.fromCode(
-                      widget.settingsStore.settings.languageCode,
-                    ).code,
-                    decoration: InputDecoration(
-                      labelText: strings.language,
-                      helperText: strings.languageHelper,
-                    ),
+            _SettingsSection(
+              title: strings.settingsSectionGeneral,
+              children: [
+                _SettingsTextField(
+                  controller: _deviceNameController,
+                  label: strings.deviceName,
+                  helper: strings.deviceNameHelper,
+                ),
+                _gap,
+                _SettingsRow(
+                  label: strings.language,
+                  subtitle: strings.languageHelper,
+                  control: DropdownButtonFormField<String>(
+                    key: ValueKey('language-$languageCode'),
+                    initialValue: AppLanguage.fromCode(languageCode).code,
+                    isExpanded: true,
+                    decoration: InputDecoration(labelText: strings.language),
                     items: [
                       for (final language in AppLanguage.values)
                         DropdownMenuItem(
@@ -343,15 +198,15 @@ class _SettingsPageState extends State<SettingsPage> {
                             if (value != null) _saveLanguage(value);
                           },
                   ),
-                  _gap,
-                  DropdownButtonFormField<String>(
-                    initialValue: AppThemeMode.fromCode(
-                      widget.settingsStore.settings.themeMode,
-                    ).code,
-                    decoration: InputDecoration(
-                      labelText: strings.themeMode,
-                      helperText: strings.themeModeHelper,
-                    ),
+                ),
+                _SettingsRow(
+                  label: strings.themeMode,
+                  subtitle: strings.themeModeHelper,
+                  control: DropdownButtonFormField<String>(
+                    key: ValueKey('theme-$themeCode'),
+                    initialValue: AppThemeMode.fromCode(themeCode).code,
+                    isExpanded: true,
+                    decoration: InputDecoration(labelText: strings.themeMode),
                     items: [
                       DropdownMenuItem(
                         value: AppThemeMode.system.code,
@@ -372,74 +227,312 @@ class _SettingsPageState extends State<SettingsPage> {
                             if (value != null) _saveThemeMode(value);
                           },
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            AppPanel(
-              title: strings.daemonControl,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    strings.daemonControlText,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      color: AppTokens.colorTextSecondary,
-                      height: 1.4,
+                ),
+                if (_capabilities.canUseSystemTray)
+                  _SettingsRow(
+                    label: strings.closeBehavior,
+                    subtitle: strings.closeBehaviorHelper,
+                    control: DropdownButtonFormField<String>(
+                      key: ValueKey('close-behavior-$_closeBehavior'),
+                      initialValue: _closeBehavior,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: strings.closeBehavior,
+                      ),
+                      items: [
+                        DropdownMenuItem(
+                          value: 'keep-running',
+                          child: Text(strings.closeBehaviorKeepRunning),
+                        ),
+                        DropdownMenuItem(
+                          value: 'stop-and-quit',
+                          child: Text(strings.closeBehaviorStopAndQuit),
+                        ),
+                      ],
+                      onChanged: _saving
+                          ? null
+                          : (value) {
+                              if (value != null) {
+                                setState(() => _closeBehavior = value);
+                              }
+                            },
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  Text(
-                    strings.localSettingsFile(
-                      widget.settingsStore.configPath ?? '—',
+              ],
+            ),
+            const SizedBox(height: 18),
+            _SettingsSection(
+              title: strings.settingsSectionAccountNetwork,
+              helper: strings.settingsSubtitleAccountNetwork,
+              children: [
+                _SettingsRow(
+                  label: strings.credentialSectionTitle,
+                  subtitle: credentialState,
+                  control: TextButton.icon(
+                    onPressed: _saving
+                        ? null
+                        : () => setState(
+                            () => _showTokenField = !_showTokenField,
+                          ),
+                    icon: Icon(
+                      _showTokenField ? Icons.expand_less : Icons.edit_outlined,
+                      size: 16,
                     ),
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: AppTokens.colorTextMuted,
-                      fontFeatures: AppTokens.tabularFontFeatures,
+                    label: Text(
+                      _showTokenField
+                          ? strings.hideCredential
+                          : strings.changeCredential,
+                    ),
+                  ),
+                ),
+                if (_showTokenField) ...[
+                  _SettingsTextField(
+                    controller: _authTokenController,
+                    label: strings.authToken,
+                    helper: strings.credentialChangeHelper,
+                    obscureText: true,
+                  ),
+                  _gap,
+                ],
+                _SettingsTextField(
+                  controller: _controlServerController,
+                  label: strings.controlServer,
+                  helper: strings.controlServerHelper,
+                  keyboardType: TextInputType.url,
+                ),
+                _gap,
+                _SettingsTextField(
+                  controller: _networkIdController,
+                  label: strings.networkId,
+                  helper: strings.networkIdHelper,
+                ),
+                _gap,
+                _SettingsTextField(
+                  controller: _virtualIpController,
+                  label: strings.requestedVirtualIp,
+                  helper: strings.requestedVirtualIpHelperSettings,
+                ),
+                if (widget.onLogout != null) ...[
+                  _gap,
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: OutlinedButton.icon(
+                      onPressed: _saving ? null : widget.onLogout,
+                      icon: const Icon(Icons.logout_outlined, size: 16),
+                      label: Text(strings.signOut),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: theme.colorScheme.error,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 18),
+            if (_capabilities.canActAsLocalVpnNode)
+              _SettingsDisclosure(
+                title: strings.settingsSectionAdvancedNetwork,
+                subtitle: strings.advancedNetworkSubtitle,
+                open: _showAdvancedNetwork,
+                onToggle: () => setState(
+                  () => _showAdvancedNetwork = !_showAdvancedNetwork,
+                ),
+                children: [
+                  _SettingsRow(
+                    label: strings.manualMode,
+                    subtitle: strings.manualModeHelper,
+                    control: Switch.adaptive(
+                      value: _manualMode,
+                      onChanged: _saving
+                          ? null
+                          : (value) => setState(() => _manualMode = value),
+                    ),
+                  ),
+                  _ResponsiveFieldRow(
+                    first: _SettingsTextField(
+                      controller: _tunInterfaceController,
+                      label: strings.interfaceName,
+                      helper: defaultTunInterface,
+                    ),
+                    second: _SettingsTextField(
+                      controller: _mtuController,
+                      label: strings.mtu,
+                      helper: strings.mtuHelper,
+                      keyboardType: TextInputType.number,
+                    ),
+                  ),
+                  _gap,
+                  _SettingsTextField(
+                    controller: _overlayCidrController,
+                    label: strings.overlayCidr,
+                    helper: defaultOverlayCidr,
+                  ),
+                  _gap,
+                  _ResponsiveFieldRow(
+                    first: _SettingsTextField(
+                      controller: _udpBindController,
+                      label: strings.udpBind,
+                      helper: '0.0.0.0:0',
+                    ),
+                    second: _SettingsTextField(
+                      controller: _udpAdvertiseController,
+                      label: strings.udpAdvertise,
+                      helper: strings.udpAdvertiseHelper,
+                    ),
+                  ),
+                  _gap,
+                  _SettingsRow(
+                    label: strings.socketPool,
+                    subtitle: strings.socketPoolHelper,
+                    control: DropdownButtonFormField<String>(
+                      key: ValueKey('socket-pool-$_socketPool'),
+                      initialValue: _socketPool,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: strings.socketPool,
+                      ),
+                      items: const [
+                        DropdownMenuItem(value: 'off', child: Text('off')),
+                        DropdownMenuItem(value: '2', child: Text('2 sockets')),
+                        DropdownMenuItem(value: '3', child: Text('3 sockets')),
+                        DropdownMenuItem(value: '4', child: Text('4 sockets')),
+                      ],
+                      onChanged: _saving || widget.statusStore.daemonBusy
+                          ? null
+                          : (value) {
+                              if (value != null) {
+                                setState(() => _socketPool = value);
+                              }
+                            },
+                    ),
+                  ),
+                  _SettingsTextField(
+                    controller: _relayServersController,
+                    label: strings.relayCandidates,
+                    helper: strings.relayCandidatesHelper,
+                  ),
+                ],
+              ),
+            const SizedBox(height: 18),
+            if (_capabilities.canControlLocalDaemon)
+              _SettingsDisclosure(
+                title: strings.settingsSectionDeveloperDiagnostics,
+                subtitle: strings.developerSectionSubtitle,
+                open: _showDeveloper,
+                onToggle: () =>
+                    setState(() => _showDeveloper = !_showDeveloper),
+                children: [
+                  _SettingsTextField(
+                    controller: _diagnosticsUrlController,
+                    label: strings.diagnosticsUrl,
+                    hintText: defaultDiagnosticsUrl,
+                    helper: strings.diagnosticsUrlHelper,
+                    errorText: _diagnosticsError,
+                    keyboardType: TextInputType.url,
+                    onSubmitted: (_) => _saveAll(),
+                  ),
+                  const SizedBox(height: AppTokens.space10),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 8,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: widget.statusStore.refreshing
+                            ? null
+                            : () => widget.statusStore.refresh(),
+                        icon: const Icon(Icons.refresh, size: 16),
+                        label: Text(strings.refreshNow),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _saving ? null : _resetDiagnosticsUrl,
+                        icon: const Icon(Icons.restore, size: 16),
+                        label: Text(strings.restoreDefaultUrl),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: AppTokens.space4),
+                  const Divider(height: 24),
+                  _SettingsRow(
+                    label: strings.localService,
+                    subtitle: strings.localServiceSubtitle,
+                    control: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: widget.statusStore.daemonReachable
+                                ? theme.colorScheme.primary
+                                : theme.colorScheme.outline,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: AppTokens.space6),
+                        Text(
+                          widget.statusStore.daemonReachable
+                              ? strings.daemonRunning
+                              : strings.daemonStopped,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Text(
+                      strings.localSettingsFile(
+                        widget.settingsStore.configPath ?? '—',
+                      ),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onSurfaceVariant,
+                        fontFeatures: AppTokens.tabularFontFeatures,
+                      ),
                     ),
                   ),
                   if (widget.settingsStore.lastError != null) ...[
-                    const SizedBox(height: 8),
                     Text(
                       widget.settingsStore.lastError!,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
-                        color: AppTokens.colorBadText,
+                        color: P2WlanColors.of(context).dangerText,
                       ),
                     ),
+                    const SizedBox(height: AppTokens.space8),
                   ],
                 ],
               ),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                if (widget.onLogout != null)
-                  OutlinedButton.icon(
-                    onPressed: _saving ? null : widget.onLogout,
-                    icon: const Icon(Icons.logout_outlined, size: 16),
-                    label: Text(strings.isZh ? '退出登录' : 'Sign out'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: AppTokens.colorBadText,
+            const SizedBox(height: AppTokens.space16),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 520;
+                return Align(
+                  alignment: narrow ? Alignment.center : Alignment.centerRight,
+                  child: SizedBox(
+                    width: narrow ? double.infinity : null,
+                    child: FilledButton.icon(
+                      key: const Key('settings-save-button'),
+                      onPressed: _saving ? null : _saveAll,
+                      icon: _saving
+                          ? const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.save_outlined, size: 16),
+                      label: Text(
+                        _restartRequired
+                            ? strings.saveChangesRestartRequired
+                            : strings.saveChanges,
+                      ),
                     ),
-                  )
-                else
-                  const SizedBox.shrink(),
-                FilledButton.icon(
-                  key: const Key('settings-save-button'),
-                  onPressed: _saving ? null : _saveAll,
-                  icon: _saving
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.save_outlined, size: 16),
-                  label: Text(strings.save),
-                ),
-              ],
+                  ),
+                );
+              },
             ),
           ],
         );
@@ -447,5 +540,5 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  static const _gap = SizedBox(height: 12);
+  static const _gap = SizedBox(height: AppTokens.space12);
 }

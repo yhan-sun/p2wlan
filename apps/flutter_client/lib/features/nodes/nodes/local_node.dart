@@ -14,16 +14,18 @@ class _LocalNodePanel extends StatelessWidget {
   const _LocalNodePanel({
     required this.snapshot,
     required this.settings,
+    required this.daemonReachable,
     required this.onEdit,
   });
 
   final DiagnosticsSnapshot? snapshot;
   final AppSettings settings;
+  final bool daemonReachable;
   final VoidCallback onEdit;
 
   @override
   Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
+    final strings = stringsOf(context);
     final theme = Theme.of(context);
     final deviceName = settings.deviceName.trim();
     final nodeId = snapshot?.nodeId.trim() ?? '';
@@ -32,94 +34,75 @@ class _LocalNodePanel extends StatelessWidget {
         !settings.manualMode &&
         settings.authToken.trim().isNotEmpty &&
         nodeId.isNotEmpty;
-    final syncText = canSync
-        ? (strings.isZh ? '服务端同步已就绪' : 'Control sync ready')
-        : (strings.isZh
-              ? '本地保存，启动并登录后同步'
-              : 'Saved locally; sync after sign-in');
+    final syncText = canSync ? strings.controlSyncReady : strings.savedLocally;
+    // Real daemon reachability signals only; never claim "offline" when the
+    // daemon is actually reachable but the snapshot is unavailable.
+    final statusLabel = snapshot != null
+        ? strings.connected
+        : daemonReachable
+        ? strings.unavailable
+        : strings.offline;
+    final statusTone = snapshot != null ? StatusTone.good : StatusTone.neutral;
 
     return AppPanel(
-      title: strings.isZh ? '本机节点' : 'This device',
+      title: strings.thisDeviceTitle,
       trailing: OutlinedButton.icon(
         onPressed: onEdit,
         icon: const Icon(Icons.edit_outlined, size: 16),
-        label: Text(strings.isZh ? '修改名称' : 'Rename'),
+        label: Text(strings.renameDevice),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Row(
-            children: [
-              Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  border: Border.all(color: theme.colorScheme.outlineVariant),
-                ),
-                child: Icon(
-                  Icons.computer_rounded,
-                  size: 20,
-                  color: theme.colorScheme.primary,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      dash(deviceName),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                        color: theme.colorScheme.onSurface,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      strings.isZh
-                          ? '修改后会同步到控制面，其他设备刷新后会看到新名称。'
-                          : 'Renames sync to the control plane and appear on other devices after refresh.',
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              StatusBadge(
-                label: snapshot == null ? strings.offline : strings.connected,
-                tone: snapshot == null ? StatusTone.neutral : StatusTone.good,
-              ),
-            ],
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: Icon(
+              Icons.computer_rounded,
+              size: 19,
+              color: theme.colorScheme.primary,
+            ),
           ),
-          const SizedBox(height: 14),
-          Wrap(
-            spacing: 24,
-            runSpacing: 2,
-            children: [
-              MetricTile(
-                label: strings.virtualIp,
-                value: virtualIp.isEmpty ? '—' : virtualIp,
-              ),
-              MetricTile(
-                label: strings.nodeId,
-                value: nodeId.isEmpty ? '—' : shortId(nodeId),
-              ),
-              MetricTile(
-                label: strings.isZh ? '同步状态' : 'Sync',
-                value: syncText,
-                minWidth: 210,
-              ),
-            ],
+          const SizedBox(width: AppTokens.space12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  dash(deviceName),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  [
+                    '${strings.nodeId} ${nodeId.isEmpty ? '—' : shortId(nodeId)}',
+                    '${strings.virtualIp} ${virtualIp.isEmpty ? '—' : virtualIp}',
+                    syncText,
+                  ].join(' · '),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontFeatures: AppTokens.tabularFontFeatures,
+                  ),
+                ),
+              ],
+            ),
           ),
+          const SizedBox(width: AppTokens.space12),
+          StatusBadge(label: statusLabel, tone: statusTone),
         ],
       ),
     );

@@ -48,7 +48,7 @@ class _DashboardActions extends StatelessWidget {
             children: [
               if (canControlLocalDaemon) ...[
                 primaryAction,
-                const SizedBox(height: 8),
+                const SizedBox(height: AppTokens.space8),
               ],
               refreshAction,
             ],

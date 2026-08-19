@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../../app/app_tokens.dart';
+import '../layout/app_breakpoints.dart';
+
 class PageScaffold extends StatelessWidget {
   const PageScaffold({
     super.key,
@@ -7,12 +10,16 @@ class PageScaffold extends StatelessWidget {
     required this.subtitle,
     required this.children,
     this.showHeader = true,
+    this.maxWidth = defaultPageMaxWidth,
   });
+
+  static const defaultPageMaxWidth = 980.0;
 
   final String title;
   final String subtitle;
   final List<Widget> children;
   final bool showHeader;
+  final double maxWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -20,21 +27,28 @@ class PageScaffold extends StatelessWidget {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final isNarrow = constraints.maxWidth < 640;
-          final horizontalPadding = isNarrow ? 14.0 : 22.0;
-          final verticalPadding = isNarrow ? 14.0 : 20.0;
+          // Content density follows the shell's compact breakpoint: below it
+          // (phones / very narrow windows) the page uses tighter padding.
+          final isNarrow =
+              constraints.maxWidth < AppBreakpoints.compactMaxWidth;
+          final horizontalPadding = isNarrow
+              ? AppTokens.space14
+              : AppTokens.space24;
+          final verticalPadding = isNarrow
+              ? AppTokens.space14
+              : AppTokens.space20;
 
           return ListView(
             padding: EdgeInsets.fromLTRB(
               horizontalPadding,
               verticalPadding,
               horizontalPadding,
-              verticalPadding + 8,
+              verticalPadding + AppTokens.space8,
             ),
             children: [
               Center(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 980),
+                  constraints: BoxConstraints(maxWidth: maxWidth),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -74,7 +88,7 @@ class PageScaffold extends StatelessWidget {
                             ],
                           ),
                         ),
-                        const SizedBox(height: 16),
+                        const SizedBox(height: AppTokens.space16),
                       ],
                       ...children,
                     ],

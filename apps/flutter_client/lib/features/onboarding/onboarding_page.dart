@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
+import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/permission_preflight.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../shared/permission_copy.dart';
 import 'onboarding_model.dart';
 
 /// Resumable first-run / node-setup flow for a local P2WLAN node.
@@ -23,12 +25,17 @@ class OnboardingPage extends StatefulWidget {
     required this.statusStore,
     this.capabilities,
     this.onCompleted,
+    this.permissionCheck,
   });
 
   final SettingsStore settingsStore;
   final StatusStore statusStore;
   final PlatformCapabilities? capabilities;
   final VoidCallback? onCompleted;
+
+  /// Test seam: replaces the live permission preflight. When null the real
+  /// preflight runs.
+  final Future<PermissionPreflight> Function()? permissionCheck;
 
   @override
   State<OnboardingPage> createState() => _OnboardingPageState();
@@ -53,7 +60,8 @@ class _OnboardingPageState extends State<OnboardingPage> {
   /// Re-run the live permission preflight. The result (not an in-memory
   /// boolean) is what drives the permission step.
   Future<void> _refreshPreflight() async {
-    final preflight = await runPermissionPreflight();
+    final preflight =
+        await (widget.permissionCheck ?? runPermissionPreflight)();
     if (!mounted) return;
     setState(() => _preflight = preflight);
   }
@@ -91,6 +99,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
 
   Future<void> _completeOnce() async {
     if (_completing || _completionNotified) return;
+    final strings = AppStringsScope.of(context);
 
     if (widget.settingsStore.settings.onboardingCompleted) {
       _completionNotified = true;
@@ -112,7 +121,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
       widget.onCompleted?.call();
     } catch (error) {
       if (mounted) {
-        setState(() => _error = '无法完成本机设置：$error');
+        setState(() => _error = strings.onboardingCompleteFailed);
       }
     } finally {
       _completing = false;
@@ -129,10 +138,13 @@ class _OnboardingPageState extends State<OnboardingPage> {
   Future<void> _startDaemon() async {
     setState(() => _busy = true);
     try {
+      final strings = AppStringsScope.of(context);
       final result = await widget.statusStore.startDaemon();
       await widget.statusStore.refresh();
       await _refreshPreflight();
-      if (!result.ok && mounted) setState(() => _error = result.message);
+      if (!result.ok && mounted) {
+        setState(() => _error = strings.onboardingStartFailed);
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -157,84 +169,84 @@ class _OnboardingPageState extends State<OnboardingPage> {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     return AnimatedBuilder(
       animation: Listenable.merge([widget.settingsStore, widget.statusStore]),
       builder: (context, _) {
         final facts = _facts();
         final step = _model.step(facts);
-        final strings = AppStringsScope.of(context);
-        final isZh = strings.isZh;
         return Scaffold(
           body: SafeArea(
             child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 560),
-                child: Padding(
-                  padding: const EdgeInsets.all(32),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(
-                        Icons.router_rounded,
-                        size: 40,
-                        color: AppTokens.colorAccent,
-                      ),
-                      const SizedBox(height: 16),
-                      Text(
-                        isZh
-                            ? '把这台设备接入 P2WLAN'
-                            : 'Connect this device to P2WLAN',
-                        style: Theme.of(context).textTheme.headlineSmall,
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        isZh
-                            ? '几步完成本地节点设置；中途退出可随时从这里继续。'
-                            : 'A few steps to set up your local node; you can resume here anytime.',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: AppTokens.colorTextMuted,
+              child: SingleChildScrollView(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.router_rounded,
+                          size: 40,
+                          color: Theme.of(context).colorScheme.primary,
                         ),
-                      ),
-                      const SizedBox(height: 28),
-                      _OnboardingStepper(
-                        model: _model,
-                        step: step,
-                        visible: _visibleSteps,
-                        facts: facts,
-                        permissionGranted: facts.permissionGranted,
-                      ),
-                      const SizedBox(height: 28),
-                      _StepBody(
-                        step: step,
-                        isZh: isZh,
-                        busy: _busy,
-                        preflight: _preflight,
-                      ),
-                      if (_error != null) ...[
-                        const SizedBox(height: 16),
+                        const SizedBox(height: AppTokens.space16),
                         Text(
-                          _error!,
-                          style: const TextStyle(color: Colors.redAccent),
+                          strings.onboardingTitle,
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        const SizedBox(height: AppTokens.space8),
+                        Text(
+                          strings.onboardingSubtitle,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: P2WlanColors.of(context).textMuted,
+                              ),
+                        ),
+                        const SizedBox(height: 28),
+                        _OnboardingStepper(
+                          model: _model,
+                          step: step,
+                          visible: _visibleSteps,
+                          facts: facts,
+                          permissionGranted: facts.permissionGranted,
+                        ),
+                        const SizedBox(height: 28),
+                        _StepBody(
+                          step: step,
+                          strings: strings,
+                          busy: _busy,
+                          preflight: _preflight,
+                        ),
+                        if (_error != null) ...[
+                          const SizedBox(height: AppTokens.space16),
+                          Text(
+                            _error!,
+                            style: TextStyle(
+                              color: P2WlanColors.of(context).dangerText,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: AppTokens.space24),
+                        _PrimaryAction(
+                          step: step,
+                          strings: strings,
+                          busy: _busy,
+                          skippable: _model.canSkip(step),
+                          onPrimary: () => _onPrimaryAction(step),
+                          onSkip: () {
+                            if (step == OnboardingStep.virtualIp) {
+                              // A VIP may take a moment; virtual IP step is not
+                              // skippable but we allow "keep waiting" (no-op).
+                            } else if (_model.canSkip(step)) {
+                              _completeOnce();
+                            }
+                          },
                         ),
                       ],
-                      const SizedBox(height: 24),
-                      _PrimaryAction(
-                        step: step,
-                        isZh: isZh,
-                        busy: _busy,
-                        skippable: _model.canSkip(step),
-                        onPrimary: () => _onPrimaryAction(step),
-                        onSkip: () {
-                          if (step == OnboardingStep.virtualIp) {
-                            // A VIP may take a moment; virtual IP step is not
-                            // skippable but we allow "keep waiting" (no-op).
-                          } else if (_model.canSkip(step)) {
-                            _completeOnce();
-                          }
-                        },
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -283,7 +295,7 @@ class _OnboardingStepper extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final current = step;
-    final isZh = AppStringsScope.of(context).isZh;
+    final strings = AppStringsScope.of(context);
     return Row(
       children: [
         for (var i = 0; i < visible.length; i++) ...[
@@ -291,33 +303,36 @@ class _OnboardingStepper extends StatelessWidget {
             Expanded(
               child: Container(height: 2, color: AppTokens.colorBorderSubtle),
             ),
-          _StepDot(
-            label: _label(visible[i], isZh),
-            state: _dotState(visible[i], current, isZh),
+          Flexible(
+            fit: FlexFit.loose,
+            child: _StepDot(
+              label: _label(visible[i], strings),
+              state: _dotState(visible[i], current),
+            ),
           ),
         ],
       ],
     );
   }
 
-  String _label(OnboardingStep s, bool isZh) {
+  String _label(OnboardingStep s, AppStrings strings) {
     switch (s) {
       case OnboardingStep.permission:
-        return isZh ? '权限' : 'Permission';
+        return strings.onboardingStepPermission;
       case OnboardingStep.daemon:
-        return isZh ? '启动' : 'Start';
+        return strings.onboardingStepStart;
       case OnboardingStep.virtualIp:
-        return isZh ? '虚拟 IP' : 'Virtual IP';
+        return strings.onboardingStepVirtualIp;
       case OnboardingStep.discover:
-        return isZh ? '发现设备' : 'Discover';
+        return strings.onboardingStepDiscover;
       case OnboardingStep.auth:
-        return isZh ? '登录' : 'Sign in';
+        return strings.signIn;
       case OnboardingStep.done:
-        return isZh ? '完成' : 'Done';
+        return strings.onboardingStepDone;
     }
   }
 
-  _DotState _dotState(OnboardingStep s, OnboardingStep current, bool isZh) {
+  _DotState _dotState(OnboardingStep s, OnboardingStep current) {
     final done = _done(s);
     if (done && s != current) return _DotState.done;
     if (s == current) return _DotState.current;
@@ -335,10 +350,11 @@ class _StepDot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     final color = switch (state) {
-      _DotState.done => AppTokens.colorAccent,
-      _DotState.current => AppTokens.colorAccent,
-      _DotState.pending => AppTokens.colorTextMuted,
+      _DotState.done => c.relay,
+      _DotState.current => c.relay,
+      _DotState.pending => c.textMuted,
     };
     return Column(
       children: [
@@ -347,10 +363,18 @@ class _StepDot extends StatelessWidget {
           size: 20,
           color: color,
         ),
-        const SizedBox(height: 6),
-        Text(
-          label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color),
+        const SizedBox(height: AppTokens.space6),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 72),
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: color),
+          ),
         ),
       ],
     );
@@ -360,13 +384,13 @@ class _StepDot extends StatelessWidget {
 class _StepBody extends StatelessWidget {
   const _StepBody({
     required this.step,
-    required this.isZh,
+    required this.strings,
     required this.busy,
     this.preflight,
   });
 
   final OnboardingStep step;
-  final bool isZh;
+  final AppStrings strings;
   final bool busy;
   final PermissionPreflight? preflight;
 
@@ -374,36 +398,28 @@ class _StepBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final (title, subtitle) = switch (step) {
       OnboardingStep.auth => (
-        isZh ? '登录控制面' : 'Sign in to the control plane',
-        isZh ? '使用账号登录以加入你的网络。' : 'Use your account to join your network.',
+        strings.onboardingAuthTitle,
+        strings.onboardingAuthSubtitle,
       ),
       OnboardingStep.permission => (
-        isZh ? '授予本机权限' : 'Grant local permissions',
-        isZh
-            ? 'P2WLAN 需要创建虚拟网卡并安装路由，可能需要管理员权限。'
-            : 'P2WLAN creates a virtual adapter and installs routes; this may need admin rights.',
+        strings.onboardingPermissionTitle,
+        strings.onboardingPermissionSubtitle,
       ),
       OnboardingStep.daemon => (
-        isZh ? '启动本地守护进程' : 'Start the local daemon',
-        isZh
-            ? '启动 p2wlan-daemon 以建立虚拟网卡与加密会话。'
-            : 'Start p2wlan-daemon to create the virtual adapter and secure sessions.',
+        strings.onboardingDaemonTitle,
+        strings.onboardingDaemonSubtitle,
       ),
       OnboardingStep.virtualIp => (
-        isZh ? '等待分配虚拟 IP' : 'Waiting for a virtual IP',
-        isZh
-            ? '正在加入网络并获取 10.20.x.x 地址…'
-            : 'Joining the network and getting a 10.20.x.x address…',
+        strings.onboardingVirtualIpTitle,
+        strings.onboardingVirtualIpSubtitle,
       ),
       OnboardingStep.discover => (
-        isZh ? '发现其他设备' : 'Discover other devices',
-        isZh
-            ? '正在同步节点目录。可以现在完成，之后在"设备"页继续查看。'
-            : 'Syncing the node catalog. You can finish now and check "Devices" later.',
+        strings.onboardingDiscoverTitle,
+        strings.onboardingDiscoverSubtitle,
       ),
       OnboardingStep.done => (
-        isZh ? '准备就绪' : 'Ready',
-        isZh ? '本地节点已配置完成。' : 'Your local node is set up.',
+        strings.onboardingReadyTitle,
+        strings.onboardingReadySubtitle,
       ),
     };
     return Column(
@@ -416,20 +432,25 @@ class _StepBody extends StatelessWidget {
                 dimension: 16,
                 child: CircularProgressIndicator(strokeWidth: 2),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: AppTokens.space10),
             ],
-            Text(title, style: Theme.of(context).textTheme.titleMedium),
+            Expanded(
+              child: Text(
+                title,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
           ],
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: AppTokens.space6),
         Text(
           subtitle,
-          style: Theme.of(
-            context,
-          ).textTheme.bodyMedium?.copyWith(color: AppTokens.colorTextMuted),
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            color: P2WlanColors.of(context).textMuted,
+          ),
         ),
         if (step == OnboardingStep.permission && preflight != null) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: AppTokens.space12),
           _PermissionSummary(preflight: preflight!),
         ],
       ],
@@ -447,15 +468,19 @@ class _PermissionSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = P2WlanColors.of(context);
     final tone = preflight.bad
-        ? Colors.redAccent
+        ? c.dangerText
         : preflight.warn
-        ? Colors.orange
-        : AppTokens.colorAccent;
-    final label = preflight.satisfied ? '权限已满足' : '需要授权';
+        ? c.probing
+        : c.relay;
+    final strings = AppStringsScope.of(context);
+    final label = preflight.satisfied
+        ? strings.onboardingPermissionSatisfied
+        : strings.onboardingPermissionNeeded;
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(AppTokens.space12),
       decoration: BoxDecoration(
         color: AppTokens.colorSurfaceSubtle,
         borderRadius: BorderRadius.circular(AppTokens.radiusSm),
@@ -467,28 +492,32 @@ class _PermissionSummary extends StatelessWidget {
           Row(
             children: [
               Icon(Icons.security_rounded, size: 16, color: tone),
-              const SizedBox(width: 6),
-              Text(
-                '$label · ${preflight.canCreateTun == true
-                    ? '可创建 TUN'
-                    : preflight.canCreateTun == null
-                    ? 'TUN: 运行时验证'
-                    : 'TUN: 不可用'} · ${preflight.canModifyRoutes == true
-                    ? '可修改路由'
-                    : preflight.canModifyRoutes == null
-                    ? '路由: 运行时验证'
-                    : '路由: 不可用'}',
-                style: TextStyle(fontSize: 12, color: tone),
+              const SizedBox(width: AppTokens.space6),
+              Expanded(
+                child: Text(label, style: TextStyle(fontSize: 12, color: tone)),
               ),
             ],
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: AppTokens.space6),
           Text(
-            preflight.recommendedAction,
-            style: const TextStyle(
+            '${preflight.canCreateTun == true
+                ? strings.onboardingTunAvailable
+                : preflight.canCreateTun == null
+                ? strings.onboardingTunRuntimeVerify
+                : strings.onboardingTunUnavailable} · ${preflight.canModifyRoutes == true
+                ? strings.onboardingRoutesAvailable
+                : preflight.canModifyRoutes == null
+                ? strings.onboardingRoutesRuntimeVerify
+                : strings.onboardingRoutesUnavailable}',
+            style: TextStyle(fontSize: 12, height: 1.35, color: tone),
+          ),
+          const SizedBox(height: AppTokens.space6),
+          Text(
+            permissionRecommendedAction(strings, preflight),
+            style: TextStyle(
               fontSize: 12,
               height: 1.4,
-              color: AppTokens.colorTextSecondary,
+              color: P2WlanColors.of(context).textSecondary,
             ),
           ),
         ],
@@ -500,7 +529,7 @@ class _PermissionSummary extends StatelessWidget {
 class _PrimaryAction extends StatelessWidget {
   const _PrimaryAction({
     required this.step,
-    required this.isZh,
+    required this.strings,
     required this.busy,
     required this.skippable,
     required this.onPrimary,
@@ -508,19 +537,19 @@ class _PrimaryAction extends StatelessWidget {
   });
 
   final OnboardingStep step;
-  final bool isZh;
+  final AppStrings strings;
   final bool busy;
   final bool skippable;
   final VoidCallback onPrimary;
   final VoidCallback onSkip;
 
   String get _label => switch (step) {
-    OnboardingStep.permission => isZh ? '授予并继续' : 'Grant & continue',
-    OnboardingStep.daemon => isZh ? '启动 P2WLAN' : 'Start P2WLAN',
-    OnboardingStep.virtualIp => isZh ? '继续' : 'Continue',
-    OnboardingStep.discover => isZh ? '完成' : 'Finish',
-    OnboardingStep.done => isZh ? '完成' : 'Finish',
-    _ => isZh ? '继续' : 'Continue',
+    OnboardingStep.permission => strings.onboardingGrantContinue,
+    OnboardingStep.daemon => strings.startP2wlan,
+    OnboardingStep.virtualIp => strings.continueAction,
+    OnboardingStep.discover => strings.onboardingFinish,
+    OnboardingStep.done => strings.onboardingFinish,
+    _ => strings.continueAction,
   };
 
   @override
@@ -533,17 +562,17 @@ class _PrimaryAction extends StatelessWidget {
             dimension: 16,
             child: CircularProgressIndicator(strokeWidth: 2),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: AppTokens.space10),
           Text(
-            isZh ? '正在连接…' : 'Connecting…',
-            style: TextStyle(color: AppTokens.colorTextMuted),
+            strings.onboardingConnecting,
+            style: TextStyle(color: P2WlanColors.of(context).textMuted),
           ),
           const Spacer(),
         ] else ...[
           if (skippable)
             TextButton(
               onPressed: busy ? null : onSkip,
-              child: Text(isZh ? '跳过' : 'Skip'),
+              child: Text(strings.onboardingSkip),
             ),
           const Spacer(),
           FilledButton(
