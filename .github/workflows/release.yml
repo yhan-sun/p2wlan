@@ -59,11 +59,7 @@ jobs:
       # checkout.  Restore before the daemon build so the binary is not
       # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
       - name: Build Android arm64 release APK
         working-directory: apps/flutter_client
@@ -114,11 +110,7 @@ jobs:
       # checkout.  Restore before the daemon build so the binary is not
       # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
       - name: Build unsigned iOS release app
         working-directory: apps/flutter_client
@@ -191,11 +183,7 @@ jobs:
       # checkout.  Restore before the daemon build so the binary is not
       # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
       - name: Build macOS release app
         working-directory: apps/flutter_client
@@ -205,22 +193,12 @@ jobs:
           --split-debug-info build/symbols/macos
 
       - name: Restore SDK-migrated files (pre-daemon-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
-          apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj
+        run: bash scripts/release/hermetic_build.sh restore --macos
 
       - name: Build macOS daemon for ${{ matrix.arch }}
         run: cargo build -p p2wlan-daemon --release --target ${{ matrix.rust_target }}
       - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
-          apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj
+        run: bash scripts/release/hermetic_build.sh restore --macos
 
 
       - name: Diagnose checkout dirt
@@ -323,11 +301,7 @@ jobs:
       # checkout.  Restore before the daemon build so the binary is not
       # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
       - name: Build Linux daemon
         run: cargo build -p p2wlan-daemon --release
@@ -340,11 +314,7 @@ jobs:
           --target-platform ${{ matrix.target_platform }}
           --split-debug-info build/symbols/linux-${{ matrix.arch }}
       - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
 
       - name: Diagnose checkout dirt
@@ -418,11 +388,7 @@ jobs:
       # checkout.  Restore before the daemon build so the binary is not
       # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
       - name: Build Windows daemon
         run: cargo build -p p2wlan-daemon --release
@@ -438,11 +404,7 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
       - name: Restore SDK-migrated files
-        run: >
-          git checkout --
-          apps/flutter_client/pubspec.lock
-          apps/flutter_client/analysis_options.yaml
-          apps/flutter_client/.metadata
+        run: bash scripts/release/hermetic_build.sh restore
 
 
       - name: Diagnose checkout dirt

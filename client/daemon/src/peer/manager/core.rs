@@ -84,9 +84,9 @@ impl PeerManager {
                 continue;
             }
             if required {
-                if conn.relay_first_gate_generation != Some(generation) {
-                    conn.relay_first_gate_generation = Some(generation);
-                    conn.relay_first_gate_started_at = Some(now);
+                if conn.relay_first.gate_generation != Some(generation) {
+                    conn.relay_first.gate_generation = Some(generation);
+                    conn.relay_first.gate_started_at = Some(now);
                     self.emit_timeline(
                         "relay_first_gate_armed",
                         Some("relay"),
@@ -98,8 +98,8 @@ impl PeerManager {
                     );
                 }
             } else if conn.relay_confirmed_generation != Some(generation) {
-                conn.relay_first_gate_generation = None;
-                conn.relay_first_gate_started_at = None;
+                conn.relay_first.gate_generation = None;
+                conn.relay_first.gate_started_at = None;
             }
         }
     }

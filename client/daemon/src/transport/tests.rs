@@ -1963,7 +1963,7 @@ mod tests {
             connection.relay_confirmed_connection_id,
             Some(relay_connection_id)
         );
-        assert_eq!(connection.relay_first_business_received_generation, Some(0));
+        assert_eq!(connection.relay_first.business_received_generation, Some(0));
         assert_eq!(connection.first_usable_generation, Some(0));
         assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 

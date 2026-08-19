@@ -125,13 +125,13 @@ impl PeerManager {
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
             let relay_first_required = self.relay_first_required();
-            if relay_first_required && conn.relay_first_gate_generation != Some(generation) {
+            if relay_first_required && conn.relay_first.gate_generation != Some(generation) {
                 // Direct validation can complete before the relay supervisor
                 // publishes its transport. Arm the gate here as well as at
                 // catalog/peer admission so an inbound peer cannot use this
                 // ACK to become the first business path.
-                conn.relay_first_gate_generation = Some(generation);
-                conn.relay_first_gate_started_at = Some(Instant::now());
+                conn.relay_first.gate_generation = Some(generation);
+                conn.relay_first.gate_started_at = Some(Instant::now());
                 self.emit_timeline(
                     "relay_first_gate_armed",
                     Some("relay"),

@@ -38,6 +38,7 @@ pub mod control;
 pub mod dataplane;
 pub mod diagnostics;
 pub mod dns;
+pub(crate) mod dplpmtud;
 pub mod error;
 pub mod gateway_mapping;
 pub mod incarnation;

@@ -381,26 +381,26 @@ impl PeerConnection {
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
             self.relay_ready_connection_id = None;
-            self.relay_first_business_sent_generation = None;
-            self.relay_first_business_received_generation = None;
-            self.relay_first_business_exchange_generation = None;
-            self.relay_first_business_pathcommit_generation = None;
-            self.relay_preconfirmation_business = None;
+            self.relay_first.business_sent_generation = None;
+            self.relay_first.business_received_generation = None;
+            self.relay_first.business_exchange_generation = None;
+            self.relay_first.business_pathcommit_generation = None;
+            self.relay_first.preconfirmation = None;
         }
-        if self.relay_first_gate_generation != Some(local_generation) {
-            self.relay_first_gate_generation = None;
-            self.relay_first_gate_started_at = None;
+        if self.relay_first.gate_generation != Some(local_generation) {
+            self.relay_first.gate_generation = None;
+            self.relay_first.gate_started_at = None;
         }
         if self.relay_confirmed_generation != Some(local_generation) {
             self.relay_confirmed_generation = None;
             self.relay_confirmed_at = None;
             self.relay_confirmed_endpoint = None;
             self.relay_confirmed_connection_id = None;
-            self.relay_first_business_sent_generation = None;
-            self.relay_first_business_received_generation = None;
-            self.relay_first_business_exchange_generation = None;
-            self.relay_first_business_pathcommit_generation = None;
-            self.relay_preconfirmation_business = None;
+            self.relay_first.business_sent_generation = None;
+            self.relay_first.business_received_generation = None;
+            self.relay_first.business_exchange_generation = None;
+            self.relay_first.business_pathcommit_generation = None;
+            self.relay_first.preconfirmation = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
             if self.state == ConnectionState::Relay {
                 self.transition(ConnectionState::FallbackToRelay);
@@ -471,25 +471,25 @@ impl PeerConnection {
             self.relay_confirmed_generation = Some(local_generation);
             self.relay_ready_generation = Some(local_generation);
             self.relay_ready_connection_id = self.relay_confirmed_connection_id;
-            self.relay_first_business_sent_generation = None;
-            self.relay_first_business_received_generation = None;
-            self.relay_first_business_exchange_generation = None;
-            self.relay_first_business_pathcommit_generation = None;
-            self.relay_preconfirmation_business = None;
-            self.relay_first_gate_generation = None;
-            self.relay_first_gate_started_at = None;
+            self.relay_first.business_sent_generation = None;
+            self.relay_first.business_received_generation = None;
+            self.relay_first.business_exchange_generation = None;
+            self.relay_first.business_pathcommit_generation = None;
+            self.relay_first.preconfirmation = None;
+            self.relay_first.gate_generation = None;
+            self.relay_first.gate_started_at = None;
         } else {
             self.relay_ready_generation = None;
             self.relay_ready_at = None;
             self.relay_ready_endpoint = None;
             self.relay_ready_connection_id = None;
-            self.relay_first_business_sent_generation = None;
-            self.relay_first_business_received_generation = None;
-            self.relay_first_business_exchange_generation = None;
-            self.relay_first_business_pathcommit_generation = None;
-            self.relay_preconfirmation_business = None;
-            self.relay_first_gate_generation = None;
-            self.relay_first_gate_started_at = None;
+            self.relay_first.business_sent_generation = None;
+            self.relay_first.business_received_generation = None;
+            self.relay_first.business_exchange_generation = None;
+            self.relay_first.business_pathcommit_generation = None;
+            self.relay_first.preconfirmation = None;
+            self.relay_first.gate_generation = None;
+            self.relay_first.gate_started_at = None;
         }
         let retained_confirmed_direct = (self.state == ConnectionState::Direct)
             .then(|| {

@@ -112,6 +112,60 @@ class ReleaseIdentityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("dirty", result.stdout + result.stderr)
 
+    def test_emit_manifest_roundtrip(self):
+        # P2/ENG (audit §20.3): --emit-manifest writes an artifact identity
+        # manifest that the same gate can later validate, and it records the
+        # reproducible identity (commit, toolchain, binary sha) correctly.
+        with tempfile.TemporaryDirectory() as directory:
+            info_path = Path(directory) / "build-info.json"
+            manifest_path = Path(directory) / "artifact.json"
+            info_path.write_text(json.dumps(self.info), encoding="utf-8")
+
+            emit = subprocess.run(
+                [
+                    "python3",
+                    str(VERIFY),
+                    "--build-info-file",
+                    str(info_path),
+                    "--daemon",
+                    str(DAEMON),
+                    "--emit-manifest",
+                    str(manifest_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(emit.returncode, 0, msg=emit.stderr)
+            self.assertTrue(manifest_path.is_file(), "manifest must be written")
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertIn("git_commit", manifest)
+            self.assertIn("daemon_sha256", manifest)
+            self.assertIn("toolchain", manifest)
+            self.assertIn("cargo", manifest["toolchain"])
+            self.assertIn("flutter", manifest["toolchain"])
+            self.assertEqual(manifest["daemon_sha256"], self.info["binary_sha256"])
+            self.assertEqual(manifest["git_commit"].lower(), self.info["git_commit"].lower())
+
+            # The written manifest must be consumable by --manifest validation.
+            validate = subprocess.run(
+                [
+                    "python3",
+                    str(VERIFY),
+                    "--build-info-file",
+                    str(info_path),
+                    "--daemon",
+                    str(DAEMON),
+                    "--manifest",
+                    str(manifest_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(validate.returncode, 0, msg=validate.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

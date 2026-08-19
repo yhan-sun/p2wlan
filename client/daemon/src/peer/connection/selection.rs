@@ -259,8 +259,8 @@ impl PeerConnection {
     ) -> bool {
         let gate_started_at = if self.relay_ready_generation == Some(local_generation) {
             self.relay_ready_at
-        } else if self.relay_first_gate_generation == Some(local_generation) {
-            self.relay_first_gate_started_at
+        } else if self.relay_first.gate_generation == Some(local_generation) {
+            self.relay_first.gate_started_at
         } else {
             None
         };
@@ -283,8 +283,8 @@ impl PeerConnection {
         if !relay_available
             || self.relay_ready_generation != Some(local_generation)
             || !self.relay_peer_confirmed_for_generation(local_generation)
-            || self.relay_first_business_exchange_generation == Some(local_generation)
-            || self.relay_first_business_pathcommit_generation == Some(local_generation)
+            || self.relay_first.business_exchange_generation == Some(local_generation)
+            || self.relay_first.business_pathcommit_generation == Some(local_generation)
         {
             return false;
         }
