@@ -256,7 +256,7 @@ class _AdvancedSectionState extends State<_AdvancedSection> {
                     strings.advancedInfo,
                     style: TextStyle(
                       fontSize: 11,
-                      fontWeight: FontWeight.w800,
+                      fontWeight: FontWeight.w600,
                       letterSpacing: 0.4,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
@@ -368,7 +368,7 @@ class _DetailSection extends StatelessWidget {
             title,
             style: TextStyle(
               fontSize: 11,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.w600,
               letterSpacing: 0.4,
               color: theme.colorScheme.onSurfaceVariant,
             ),

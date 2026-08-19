@@ -119,50 +119,53 @@ class _RailItemSurface extends StatelessWidget {
       fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
       color: foreground,
     );
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-      child: AnimatedContainer(
-        duration: AppTokens.durationMedium,
-        curve: AppTokens.curveEase,
-        decoration: BoxDecoration(
-          color: selected ? colors.selectedSurface : Colors.transparent,
-          borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-        ),
-        child: Material(
-          type: MaterialType.transparency,
-          child: InkWell(
-            onTap: onTap,
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        child: AnimatedContainer(
+          duration: AppTokens.durationMedium,
+          curve: AppTokens.curveEase,
+          decoration: BoxDecoration(
+            color: selected ? colors.selectedSurface : Colors.transparent,
             borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-            hoverColor: selected ? null : colors.hoverSurface,
-            child: SizedBox(
-              height: iconOnly ? 44 : 56,
-              child: Stack(
-                children: [
-                  if (selected)
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Container(
-                        width: 3,
-                        height: 18,
-                        margin: const EdgeInsets.only(left: 3),
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primary,
-                          borderRadius: BorderRadius.circular(2),
+          ),
+          child: Material(
+            type: MaterialType.transparency,
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              hoverColor: selected ? null : colors.hoverSurface,
+              child: SizedBox(
+                height: iconOnly ? 44 : 56,
+                child: Stack(
+                  children: [
+                    if (selected)
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Container(
+                          width: 3,
+                          height: 18,
+                          margin: const EdgeInsets.only(left: 3),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.primary,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
                         ),
                       ),
-                    ),
-                  if (iconOnly)
-                    Center(child: Icon(icon, size: 20, color: foreground))
-                  else
-                    Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(icon, size: 20, color: foreground),
-                        const SizedBox(height: AppTokens.space4),
-                        Text(label, maxLines: 1, style: labelStyle),
-                      ],
-                    ),
-                ],
+                    if (iconOnly)
+                      Center(child: Icon(icon, size: 20, color: foreground))
+                    else
+                      Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(icon, size: 20, color: foreground),
+                          const SizedBox(height: AppTokens.space4),
+                          Text(label, maxLines: 1, style: labelStyle),
+                        ],
+                      ),
+                  ],
+                ),
               ),
             ),
           ),

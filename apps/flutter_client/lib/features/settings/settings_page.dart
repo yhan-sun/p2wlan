@@ -27,6 +27,7 @@ class SettingsPage extends StatefulWidget {
     required this.statusStore,
     this.capabilities,
     this.onLogout,
+    this.onDirtyChanged,
     this.showHeader = true,
   });
 
@@ -38,6 +39,12 @@ class SettingsPage extends StatefulWidget {
   final PlatformCapabilities? capabilities;
 
   final VoidCallback? onLogout;
+
+  /// Notifies the host shell when the page transitions between clean and dirty
+  /// (any category has unsaved drafts). The shell uses this to guard against
+  /// silently losing settings when the user navigates away.
+  final ValueChanged<bool>? onDirtyChanged;
+
   final bool showHeader;
 
   @override
@@ -61,6 +68,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   String? _diagnosticsError;
   String? _formError;
+  SettingsCategory? _formErrorCategory;
   var _saving = false;
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
@@ -127,11 +135,35 @@ class _SettingsPageState extends State<SettingsPage> {
     ]) {
       controller.addListener(_onDraftChanged);
     }
+    // Notify the host shell of the initial dirty state (always false on init).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _notifyDirty();
+    });
   }
 
   void _onDraftChanged() {
     if (!mounted) return;
+    _notifyDirty();
     setState(() {});
+  }
+
+  bool _lastNotifiedDirty = false;
+
+  void _notifyDirty() {
+    final dirty = _anyCategoryDirty;
+    if (dirty != _lastNotifiedDirty) {
+      _lastNotifiedDirty = dirty;
+      widget.onDirtyChanged?.call(dirty);
+    }
+  }
+
+  /// True when any visible category has unsaved drafts (excludes immediate-save
+  /// language/theme which never count as dirty).
+  bool get _anyCategoryDirty {
+    for (final category in _visibleCategories) {
+      if (_categoryDirty(category)) return true;
+    }
+    return false;
   }
 
   @override

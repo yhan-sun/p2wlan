@@ -151,32 +151,35 @@ class _SidebarItem extends StatelessWidget {
         ),
         child: Material(
           type: MaterialType.transparency,
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-            hoverColor: selected ? null : colors.hoverSurface,
-            child: SizedBox(
-              height: 38,
-              child: Row(
-                children: [
-                  const SizedBox(width: AppTokens.space10),
-                  Icon(icon, size: 20, color: foreground),
-                  const SizedBox(width: AppTokens.space10),
-                  Expanded(
-                    child: Text(
-                      label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: selected
-                            ? FontWeight.w600
-                            : FontWeight.w500,
-                        color: foreground,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              hoverColor: selected ? null : colors.hoverSurface,
+              child: SizedBox(
+                height: 38,
+                child: Row(
+                  children: [
+                    const SizedBox(width: AppTokens.space10),
+                    Icon(icon, size: 20, color: foreground),
+                    const SizedBox(width: AppTokens.space10),
+                    Expanded(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: selected
+                              ? FontWeight.w600
+                              : FontWeight.w500,
+                          color: foreground,
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),

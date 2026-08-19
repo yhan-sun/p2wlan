@@ -51,6 +51,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
   /// fourth destination, never an out-of-range index.
   var _lastPrimarySection = P2WlanSection.home;
 
+  /// Whether the Settings page currently has unsaved drafts across any
+  /// category. Set by the SettingsPage via [onDirtyChanged]; when true,
+  /// navigating away from Settings prompts a discard confirmation.
+  var _settingsDirty = false;
+
   @override
   void initState() {
     super.initState();
@@ -194,11 +199,14 @@ class _P2WlanShellState extends State<P2WlanShell> {
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
         onLogout: widget.onLogout,
+        onDirtyChanged: (dirty) => _settingsDirty = dirty,
         showHeader: false,
       ),
     };
     return AnimatedSwitcher(
-      duration: _sectionFadeDuration,
+      duration: MediaQuery.disableAnimationsOf(context)
+          ? Duration.zero
+          : _sectionFadeDuration,
       switchInCurve: Curves.easeOut,
       switchOutCurve: Curves.easeIn,
       child: KeyedSubtree(key: ValueKey(_section), child: page),
@@ -210,12 +218,54 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 
   void _select(P2WlanSection section) {
+    // Leave guard: if Settings has unsaved drafts and the user is navigating
+    // to a different section, confirm before discarding.
+    if (_section == P2WlanSection.settings &&
+        section != P2WlanSection.settings &&
+        _settingsDirty) {
+      _showDiscardGuard(section);
+      return;
+    }
+    _doSelect(section);
+  }
+
+  void _doSelect(P2WlanSection section) {
     setState(() {
       _section = section;
       if (P2WlanSection.mobilePrimary.contains(section)) {
         _lastPrimarySection = section;
       }
     });
+  }
+
+  void _showDiscardGuard(P2WlanSection targetSection) {
+    final strings = AppStrings.fromCode(
+      widget.settingsStore.settings.languageCode,
+    );
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(strings.discardSettingsTitle),
+        content: Text(strings.discardSettingsBody),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(strings.continueEditing),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () {
+              Navigator.of(context).pop();
+              _settingsDirty = false;
+              _doSelect(targetSection);
+            },
+            child: Text(strings.discardChanges),
+          ),
+        ],
+      ),
+    );
   }
 
   int _bottomNavIndex() {
@@ -261,7 +311,7 @@ bool get _showsInAppCloseButton => !kIsWeb && Platform.isWindows;
 
 /// Compact mobile only: low-weight overflow menu in the top bar. Keeps the
 /// shell quiet — the bottom bar stays at exactly three destinations and
-/// troubleshooting is entered from here (and, in Phase 3, from Home).
+/// troubleshooting is entered from here and from Home's issue banner.
 class _MobileShellMenu extends StatelessWidget {
   const _MobileShellMenu({
     required this.statusStore,

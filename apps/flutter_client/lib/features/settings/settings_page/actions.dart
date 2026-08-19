@@ -61,8 +61,16 @@ extension _SettingsPageActions on _SettingsPageState {
     );
     _updateState(() {
       _saving = true;
-      _diagnosticsError = null;
-      _formError = null;
+      // Only clear errors belonging to the category being saved. Other
+      // categories' errors stay visible so the user can navigate back and
+      // see what went wrong.
+      if (category == SettingsCategory.developer) {
+        _diagnosticsError = null;
+      }
+      if (_formErrorCategory == category) {
+        _formError = null;
+        _formErrorCategory = null;
+      }
     });
     try {
       final current = widget.settingsStore.settings;
@@ -148,6 +156,14 @@ extension _SettingsPageActions on _SettingsPageState {
           // daemon-launch setting changed while the daemon was running, it
           // stays sticky until the daemon is actually restarted.
           _restartRequired = _restartRequired || restartRequiredNow;
+          // Clear this category's errors on successful save.
+          if (category == SettingsCategory.developer) {
+            _diagnosticsError = null;
+          }
+          if (_formErrorCategory == category) {
+            _formError = null;
+            _formErrorCategory = null;
+          }
         });
       }
       _showSnackBar(
@@ -162,6 +178,7 @@ extension _SettingsPageActions on _SettingsPageState {
           _diagnosticsError = strings.diagnosticsUrlError(message);
         } else {
           _formError = message;
+          _formErrorCategory = category;
         }
       });
       _showSnackBar(
@@ -170,11 +187,15 @@ extension _SettingsPageActions on _SettingsPageState {
             : strings.failedToSaveLocalSettings,
       );
     } catch (error) {
-      _updateState(() => _formError = strings.settingsSaveFailed);
+      _updateState(() {
+        _formError = strings.settingsSaveFailed;
+        _formErrorCategory = category;
+      });
       _showSnackBar(strings.failedToSaveLocalSettings);
     } finally {
       if (mounted) {
         _updateState(() => _saving = false);
+        _notifyDirty();
       }
     }
   }

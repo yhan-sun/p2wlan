@@ -39,7 +39,7 @@ class AppStrings {
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
 
-  /// User-level navigation labels (Phase 1 IA).
+  /// User-level navigation labels.
   String get home => isZh ? '首页' : 'Home';
   String get troubleshooting => isZh ? '故障排查' : 'Troubleshooting';
   String get menu => isZh ? '菜单' : 'Menu';
@@ -481,7 +481,7 @@ class AppStrings {
   String get failedToSaveLocalSettings =>
       isZh ? '保存本地设置失败' : 'Failed to save local settings';
 
-  // --- Settings information architecture (Phase 4) ---
+  // --- Settings information architecture ---
   String get settingsSectionGeneral => isZh ? '常规' : 'General';
   String get settingsSectionAccountNetwork =>
       isZh ? '账号与网络' : 'Account & Network';
@@ -489,7 +489,7 @@ class AppStrings {
       isZh ? '高级网络' : 'Advanced Network';
   String get settingsSectionDeveloperDiagnostics =>
       isZh ? '开发与诊断' : 'Developer & Diagnostics';
-  // --- Settings category / IA (Phase 6) ---
+  // --- Settings category / IA ---
   String get settingsCategoryApplication => isZh ? '应用' : 'App';
   String get unsavedChanges => isZh ? '有未保存的更改' : 'Unsaved changes';
   String get udpSubsection => 'UDP';
@@ -575,7 +575,7 @@ class AppStrings {
       ? '登录凭据、控制面与网络标识。'
       : 'Credentials, control plane, and network identity.';
 
-  // --- Login / authentication (Phase 5) ---
+  // --- Login / authentication ---
   String get loginSubtitleDesktop => isZh
       ? '登录后连接这台设备到你的 P2WLAN 网络。'
       : 'Sign in to connect this device to your P2WLAN network.';
@@ -704,7 +704,7 @@ class AppStrings {
   String get onboardingStartFailed => isZh
       ? '无法启动 P2WLAN，请检查权限后重试。'
       : 'Could not start P2WLAN. Check permissions and try again.';
-  // --- Network & routes (Troubleshooting advanced; migrated from Tunnels) ---
+  // --- Network & routes (Troubleshooting advanced) ---
   String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
   String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
   String get virtualAdapter => isZh ? '虚拟网卡' : 'Virtual Adapter';
@@ -790,6 +790,14 @@ class AppStrings {
       : 'Local daemon behind the diagnostics endpoint.';
   String get settingsSaveFailed =>
       isZh ? '无法保存配置，请重试。' : 'Could not save settings. Please try again.';
+
+  // --- Settings leave guard (Phase 7) ---
+  String get discardSettingsTitle =>
+      isZh ? '放弃未保存的更改？' : 'Discard unsaved changes?';
+  String get discardSettingsBody =>
+      isZh ? '你有尚未保存的设置。' : 'You have unsaved settings.';
+  String get continueEditing => isZh ? '继续编辑' : 'Continue editing';
+  String get discardChanges => isZh ? '放弃更改' : 'Discard changes';
   String get deviceSaveFailed =>
       isZh ? '无法保存本机节点，请重试。' : 'Could not save this device. Please try again.';
   String get deviceRenameFailed =>

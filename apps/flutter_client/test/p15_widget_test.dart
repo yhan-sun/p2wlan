@@ -39,6 +39,7 @@ part 'p15_widget/troubleshooting_shell_tests.dart';
 part 'p15_widget/design_system_tests.dart';
 part 'p15_widget/localization_tests.dart';
 part 'p15_widget/final_regression_tests.dart';
+part 'p15_widget/phase7_tests.dart';
 part 'p15_widget/helpers.dart';
 
 void main() {
@@ -53,4 +54,5 @@ void main() {
   _registerDesignSystemTests();
   _registerLocalizationTests();
   _registerFinalRegressionTests();
+  _registerPhase7Tests();
 }

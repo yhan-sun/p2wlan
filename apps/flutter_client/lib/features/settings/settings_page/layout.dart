@@ -89,48 +89,53 @@ class _CategoryRailItem extends StatelessWidget {
       child: Semantics(
         selected: selected,
         button: true,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-          child: AnimatedContainer(
-            duration: AppTokens.durationFast,
-            curve: AppTokens.curveEase,
-            padding: const EdgeInsets.symmetric(
-              horizontal: AppTokens.space12,
-              vertical: AppTokens.space10,
-            ),
-            decoration: BoxDecoration(
-              color: selected
-                  ? theme.colorScheme.secondaryContainer
-                  : Colors.transparent,
-              borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                      color: selected
-                          ? theme.colorScheme.onSecondaryContainer
-                          : theme.colorScheme.onSurfaceVariant,
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+            child: AnimatedContainer(
+              duration: AppTokens.durationFast,
+              curve: AppTokens.curveEase,
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppTokens.space12,
+                vertical: AppTokens.space10,
+              ),
+              decoration: BoxDecoration(
+                color: selected
+                    ? theme.colorScheme.secondaryContainer
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: selected
+                            ? FontWeight.w600
+                            : FontWeight.w500,
+                        color: selected
+                            ? theme.colorScheme.onSecondaryContainer
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
-                ),
-                if (selected)
-                  Container(
-                    width: 3,
-                    height: 14,
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary,
-                      borderRadius: BorderRadius.circular(2),
+                  if (selected)
+                    Container(
+                      width: 3,
+                      height: 14,
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
                     ),
-                  ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -168,7 +173,8 @@ class _CategoryDetailView extends StatelessWidget {
           onBack: onBack,
           subtitle: _categorySubtitle(category, strings),
         ),
-        if (state._formError != null) ...[
+        if (state._formErrorCategory == category &&
+            state._formError != null) ...[
           _SettingsErrorNotice(message: state._formError!),
           const SizedBox(height: AppTokens.space12),
         ],
