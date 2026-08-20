@@ -591,7 +591,7 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('nodes-sort-latency')), findsOneWidget);
 
     // Name sort: direct-laptop, offline-printer, probing-phone, relay-nas.
-    await tester.tap(find.text('Name').last);
+    await tester.tap(find.byKey(const Key('nodes-sort-name')));
     await tester.pumpAndSettle();
     expect(rowTop('node-direct'), lessThan(rowTop('node-offline')));
     expect(rowTop('node-offline'), lessThan(rowTop('node-probing')));
@@ -602,7 +602,7 @@ void _registerNodesTests() {
     // is not a latency and must not place probing-phone first.
     await tester.tap(find.byKey(const Key('nodes-sort-button')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Latency').last);
+    await tester.tap(find.byKey(const Key('nodes-sort-latency')));
     await tester.pumpAndSettle();
     expect(rowTop('node-direct'), lessThan(rowTop('node-relay')));
     expect(rowTop('node-relay'), lessThan(rowTop('node-offline')));
