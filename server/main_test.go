@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestWithCORSOnlyAllowsExplicitlyConfiguredOrigins(t *testing.T) {
@@ -54,6 +55,45 @@ func TestWithCORSRejectsLocalDevAndUnknownOrigins(t *testing.T) {
 		}
 		if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Fatalf("origin %s: unexpected allow-origin header: %q", origin, got)
+		}
+	}
+}
+
+func TestRateLimitIgnoresForwardedForFromUntrustedClient(t *testing.T) {
+	t.Setenv("CONTROL_TRUSTED_PROXY_CIDRS", "")
+	handler := rateLimit(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}, 1, time.Minute)
+
+	for attempt, spoofed := range []string{"198.51.100.1", "198.51.100.2"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
+		req.RemoteAddr = "203.0.113.10:43210"
+		req.Header.Set("X-Forwarded-For", spoofed)
+		recorder := httptest.NewRecorder()
+		handler(recorder, req)
+		if attempt == 0 && recorder.Code != http.StatusNoContent {
+			t.Fatalf("first request: got %d", recorder.Code)
+		}
+		if attempt == 1 && recorder.Code != http.StatusTooManyRequests {
+			t.Fatalf("spoofed forwarded-for bypassed limiter: got %d", recorder.Code)
+		}
+	}
+}
+
+func TestRateLimitUsesForwardedForOnlyFromTrustedProxy(t *testing.T) {
+	t.Setenv("CONTROL_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
+	handler := rateLimit(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}, 1, time.Minute)
+
+	for _, clientIP := range []string{"198.51.100.1", "198.51.100.2"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
+		req.RemoteAddr = "127.0.0.1:43210"
+		req.Header.Set("X-Forwarded-For", clientIP)
+		recorder := httptest.NewRecorder()
+		handler(recorder, req)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("independent client %s was merged at proxy: got %d", clientIP, recorder.Code)
 		}
 	}
 }

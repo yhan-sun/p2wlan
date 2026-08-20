@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -200,16 +201,23 @@ func rateLimit(next http.HandlerFunc, maxEvents int, window time.Duration) http.
 		reset time.Time
 	}
 	var (
-		mu   sync.Mutex
-		buck = map[string]*bucket{}
+		mu             sync.Mutex
+		buck           = map[string]*bucket{}
+		nextCleanup    = time.Now().Add(window)
+		trustedProxies = parseTrustedProxyCIDRs(getEnv("CONTROL_TRUSTED_PROXY_CIDRS", ""))
 	)
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			ip = strings.Split(fwd, ",")[0]
-		}
+		ip := rateLimitClientIP(r, trustedProxies)
 		now := time.Now()
 		mu.Lock()
+		if !now.Before(nextCleanup) {
+			for key, candidate := range buck {
+				if !now.Before(candidate.reset) {
+					delete(buck, key)
+				}
+			}
+			nextCleanup = now.Add(window)
+		}
 		b, ok := buck[ip]
 		if !ok || now.After(b.reset) {
 			b = &bucket{count: 0, reset: now.Add(window)}
@@ -224,6 +232,60 @@ func rateLimit(next http.HandlerFunc, maxEvents int, window time.Duration) http.
 		}
 		next(w, r)
 	}
+}
+
+func parseTrustedProxyCIDRs(raw string) []*net.IPNet {
+	trusted := make([]*net.IPNet, 0)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if ip := net.ParseIP(item); ip != nil {
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+			}
+			item = fmt.Sprintf("%s/%d", ip.String(), bits)
+		}
+		if _, network, err := net.ParseCIDR(item); err == nil {
+			trusted = append(trusted, network)
+		}
+	}
+	return trusted
+}
+
+func rateLimitClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
+	remote := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	remoteIP := net.ParseIP(strings.Trim(remote, "[]"))
+	if remoteIP == nil {
+		return remote
+	}
+	isTrusted := func(ip net.IP) bool {
+		for _, network := range trustedProxies {
+			if network.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if !isTrusted(remoteIP) {
+		return remoteIP.String()
+	}
+
+	// Walk right-to-left: a trusted proxy appends its predecessor, while a
+	// client-controlled leftmost value must never override that nearer hop.
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		candidate := net.ParseIP(strings.TrimSpace(forwarded[index]))
+		if candidate != nil && !isTrusted(candidate) {
+			return candidate.String()
+		}
+	}
+	return remoteIP.String()
 }
 
 func getEnv(key, defaultVal string) string {

@@ -3,6 +3,8 @@ package database
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -339,6 +341,40 @@ func TestDatabase_ChallengeSecurity(t *testing.T) {
 		t.Log("challenge is expired as expected")
 	} else {
 		t.Log("challenge still valid (time granularity)")
+	}
+}
+
+func TestCreateChallengePrunesTerminalRows(t *testing.T) {
+	db, _ := tmpDB(t)
+	user := newUser(t, db, "challenge-prune@test")
+	dev := newDevice(t, db, user.ID, "default")
+	now := time.Now().Unix()
+
+	active, err := db.CreateChallenge(dev.ID, []byte("active-challenge"), now+300)
+	if err != nil {
+		t.Fatalf("create active challenge: %v", err)
+	}
+	consumed, err := db.CreateChallenge(dev.ID, []byte("consumed-challenge"), now+300)
+	if err != nil {
+		t.Fatalf("create consumed challenge: %v", err)
+	}
+	if err := db.ConsumeChallenge(consumed.ID); err != nil {
+		t.Fatalf("consume challenge: %v", err)
+	}
+	expired, err := db.CreateChallenge(dev.ID, []byte("expired-challenge"), now-1)
+	if err != nil {
+		t.Fatalf("create expired challenge: %v", err)
+	}
+	if _, err := db.CreateChallenge(dev.ID, []byte("new-challenge"), now+300); err != nil {
+		t.Fatalf("create new challenge: %v", err)
+	}
+	if _, err := db.GetChallenge(active.ID); err != nil {
+		t.Fatalf("live challenge must be retained: %v", err)
+	}
+	for _, id := range []string{consumed.ID, expired.ID} {
+		if _, err := db.GetChallenge(id); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("terminal challenge %s should be pruned, got %v", id, err)
+		}
 	}
 }
 

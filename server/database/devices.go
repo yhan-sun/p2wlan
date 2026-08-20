@@ -319,6 +319,16 @@ func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string, relayRTTM
 	return err
 }
 
+// UpdateDeviceEndpointMetadata updates advertised metadata without asserting a
+// live daemon lease. It is used for user-JWT management requests once a device
+// has an active device credential; only device-authenticated heartbeats may
+// refresh last_seen/online in that state.
+func (db *DB) UpdateDeviceEndpointMetadata(deviceID, endpoint, natType string, relayRTTMS *int64) error {
+	_, err := db.Exec(`UPDATE devices SET endpoint = ?, nat_type = ?, relay_rtt_ms = ? WHERE id = ?`,
+		endpoint, natType, relayRTTMS, deviceID)
+	return err
+}
+
 // UpdateDeviceName changes the user-visible name of a registered device.
 func (db *DB) UpdateDeviceName(deviceID, deviceName string) error {
 	_, err := db.Exec(`UPDATE devices SET device_name = ? WHERE id = ?`, deviceName, deviceID)

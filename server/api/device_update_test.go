@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
 	"github.com/yhan-sun/p2wlan/server/database"
@@ -220,6 +221,92 @@ func TestUpdateDeviceEndpointStoresRelayRTT(t *testing.T) {
 	}
 	if len(response.Nodes) != 1 || response.Nodes[0].RelayRTTMS == nil || *response.Nodes[0].RelayRTTMS != 42 {
 		t.Fatalf("expected listed relay RTT 42, got %+v", response.Nodes)
+	}
+}
+
+func TestUserJWTEndpointUpdateCannotReviveCredentialedDevice(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("endpoint-presence@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "endpoint-presence-key", "device", "macos", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	if _, _, err := db.CreateDeviceCredential(device.ID, 3600); err != nil {
+		t.Fatalf("CreateDeviceCredential: %v", err)
+	}
+	const staleLastSeen = int64(1234)
+	if _, err := db.Exec(`UPDATE devices SET last_seen = ?, online = 0 WHERE id = ?`, staleLastSeen, device.ID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/devices/"+device.ID+"/endpoint",
+		strings.NewReader(`{"endpoint":"198.51.100.20:52000","nat_type":"restricted"}`))
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.UserClaimsKey, &auth.Claims{UserID: user.ID}))
+	recorder := httptest.NewRecorder()
+	server.UpdateDeviceEndpoint(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	updated, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if updated.Online || updated.LastSeen != staleLastSeen {
+		t.Fatalf("user JWT must not refresh device presence: %+v", updated)
+	}
+	if updated.Endpoint != "198.51.100.20:52000" {
+		t.Fatalf("metadata update was lost: %+v", updated)
+	}
+}
+
+func TestDeviceCredentialEndpointUpdateRefreshesPresence(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("endpoint-heartbeat@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "endpoint-heartbeat-key", "device", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE devices SET last_seen = 0, online = 0 WHERE id = ?`, device.ID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/devices/"+device.ID+"/endpoint",
+		strings.NewReader(`{"endpoint":"","nat_type":"unknown"}`))
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  device.ID,
+		UserID:    user.ID,
+		NetworkID: device.NetworkID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	recorder := httptest.NewRecorder()
+	server.UpdateDeviceEndpoint(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	updated, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if !updated.Online || updated.LastSeen <= 0 {
+		t.Fatalf("device credential heartbeat must refresh presence: %+v", updated)
 	}
 }
 

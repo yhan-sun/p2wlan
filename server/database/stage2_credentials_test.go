@@ -142,6 +142,30 @@ func TestDatabase_RelayRevocationSnapshotSurvivesDeviceDelete(t *testing.T) {
 	}
 }
 
+func TestDatabase_RelayRevocationVersionAdvancesWithinSameSecond(t *testing.T) {
+	db, _ := tmpDB(t)
+	const createdAt = int64(1_700_000_000)
+	if _, err := db.Exec(`INSERT INTO relay_revocations (kind, value, created_at) VALUES (?, ?, ?)`,
+		RelayRevocationJTI, "jti-a", createdAt); err != nil {
+		t.Fatalf("insert first tombstone: %v", err)
+	}
+	first, err := db.RelayRevocationSnapshot()
+	if err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO relay_revocations (kind, value, created_at) VALUES (?, ?, ?)`,
+		RelayRevocationJTI, "jti-b", createdAt); err != nil {
+		t.Fatalf("insert second tombstone: %v", err)
+	}
+	second, err := db.RelayRevocationSnapshot()
+	if err != nil {
+		t.Fatalf("second snapshot: %v", err)
+	}
+	if second.Version <= first.Version {
+		t.Fatalf("same-second append must advance version: first=%d second=%d", first.Version, second.Version)
+	}
+}
+
 func stringSliceContains(values []string, needle string) bool {
 	for _, value := range values {
 		if value == needle {

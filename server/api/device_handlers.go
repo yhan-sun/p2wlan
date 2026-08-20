@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
 )
@@ -109,7 +110,12 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 
 	// If Ed25519 challenge is provided, verify it
 	if req.ChallengeID != "" && req.ChallengeSignature != "" && ed25519PubKey != "" {
-		if verifyChallenge(s.db, req.ChallengeID, ed25519PubKey, req.ChallengeSignature) != nil {
+		existingDevice, err := s.db.GetDeviceByPublicKey(networkID, req.PublicKey)
+		if err != nil || existingDevice.UserID != userID {
+			http.Error(w, `{"error":"challenge verification failed"}`, http.StatusUnauthorized)
+			return
+		}
+		if verifyChallenge(s.db, req.ChallengeID, existingDevice.ID, ed25519PubKey, req.ChallengeSignature) != nil {
 			http.Error(w, `{"error":"challenge verification failed"}`, http.StatusUnauthorized)
 			return
 		}
@@ -221,8 +227,10 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	// Accept either device credential or user JWT
 	authorized := false
+	deviceAuthenticated := false
 	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
 		authorized = pathDeviceID == deviceClaims.DeviceID
+		deviceAuthenticated = authorized
 	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
 		belongs, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
 		authorized = err == nil && belongs
@@ -261,7 +269,24 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.UpdateDeviceEndpoint(pathDeviceID, req.Endpoint, req.NATType, req.RelayRTTMS); err != nil {
+	refreshLease := deviceAuthenticated
+	if !deviceAuthenticated {
+		hasActiveCredential, err := s.db.HasActiveDeviceCredential(pathDeviceID, time.Now().Unix())
+		if err != nil {
+			http.Error(w, `{"error":"device credential lookup failed"}`, http.StatusInternalServerError)
+			return
+		}
+		// Preserve user-JWT heartbeat compatibility only for legacy devices
+		// that do not yet have a usable device credential.
+		refreshLease = !hasActiveCredential
+	}
+	var updateErr error
+	if refreshLease {
+		updateErr = s.db.UpdateDeviceEndpoint(pathDeviceID, req.Endpoint, req.NATType, req.RelayRTTMS)
+	} else {
+		updateErr = s.db.UpdateDeviceEndpointMetadata(pathDeviceID, req.Endpoint, req.NATType, req.RelayRTTMS)
+	}
+	if updateErr != nil {
 		http.Error(w, `{"error":"endpoint update failed"}`, http.StatusInternalServerError)
 		return
 	}

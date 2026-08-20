@@ -86,7 +86,10 @@ func (s *Service) Register(email, password string) (string, *database.User, erro
 func (s *Service) ValidateToken(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
 		return s.jwtSecret, nil
-	})
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer("p2pnet"),
+	)
 	if err != nil {
 		return nil, ErrInvalidToken
 	}

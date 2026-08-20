@@ -211,6 +211,31 @@ func TestHubConnectionLimitAndPointerSafeReplacement(t *testing.T) {
 	}
 }
 
+func TestHubAllowsSameDeviceReplacementAtCapacity(t *testing.T) {
+	hub := NewHubWithLimit(1)
+	first := &Client{nodeID: "node-a", done: make(chan struct{}), send: make(chan []byte, 1), closeReq: make(chan closeRequest, 1)}
+	replacement := &Client{nodeID: "node-a", done: make(chan struct{}), send: make(chan []byte, 1), closeReq: make(chan closeRequest, 1)}
+	reconnectStorm := &Client{nodeID: "node-a", done: make(chan struct{}), send: make(chan []byte, 1), closeReq: make(chan closeRequest, 1)}
+	other := &Client{nodeID: "node-b", done: make(chan struct{}), send: make(chan []byte, 1), closeReq: make(chan closeRequest, 1)}
+
+	if _, err := hub.register(first); err != nil {
+		t.Fatalf("register first: %v", err)
+	}
+	previous, err := hub.register(replacement)
+	if err != nil || previous != first {
+		t.Fatalf("same-device reconnect at capacity: previous=%v err=%v", previous, err)
+	}
+	if _, err := hub.register(other); !errors.Is(err, ErrConnectionLimit) {
+		t.Fatalf("different device must still respect capacity, got %v", err)
+	}
+	if _, err := hub.register(reconnectStorm); !errors.Is(err, ErrConnectionLimit) {
+		t.Fatalf("replacement overlap must stay bounded, got %v", err)
+	}
+	if hub.activeClients != 2 {
+		t.Fatalf("replacement overlap must remain accounted, got %d", hub.activeClients)
+	}
+}
+
 func TestHubBackpressureIsBounded(t *testing.T) {
 	hub := NewHubWithLimit(1)
 	client := &Client{

@@ -109,7 +109,7 @@ func (s *Server) SubmitDeviceCredential(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Verify the Ed25519 signature
-	if err := verifyChallenge(s.db, req.ChallengeID, req.Ed25519PublicKey, req.ChallengeSignature); err != nil {
+	if err := verifyChallenge(s.db, req.ChallengeID, req.DeviceID, req.Ed25519PublicKey, req.ChallengeSignature); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 		return
 	}
@@ -148,22 +148,11 @@ func (s *Server) RevokeCurrentDeviceCredential(w http.ResponseWriter, r *http.Re
 }
 
 // verifyChallenge checks the Ed25519 signature of a challenge.
-func verifyChallenge(db *database.DB, challengeID, ed25519PubKeyHex, signatureHex string) error {
-	challengeRecord, err := db.GetChallenge(challengeID)
+func verifyChallenge(db *database.DB, challengeID, expectedDeviceID, ed25519PubKeyHex, signatureHex string) error {
+	challengeRecord, err := db.ClaimChallenge(challengeID, expectedDeviceID, time.Now().Unix())
 	if err != nil {
-		return fmt.Errorf("challenge not found: %w", err)
+		return fmt.Errorf("challenge unavailable: %w", err)
 	}
-
-	if challengeRecord.Consumed {
-		return fmt.Errorf("challenge already consumed")
-	}
-
-	if time.Now().Unix() > challengeRecord.ExpiresAt {
-		return fmt.Errorf("challenge expired")
-	}
-
-	// Mark consumed (one-time use; even if verification fails, don't replay)
-	defer db.ConsumeChallenge(challengeID)
 
 	pubKey, err := hex.DecodeString(ed25519PubKeyHex)
 	if err != nil || len(pubKey) != ed25519.PublicKeySize {

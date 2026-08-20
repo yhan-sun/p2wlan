@@ -113,10 +113,16 @@ func (h *Hub) register(client *Client) (*Client, error) {
 	if h.closed {
 		return nil, ErrHubClosed
 	}
-	if h.activeClients >= h.maxConnections {
-		return nil, ErrConnectionLimit
-	}
 	previous := h.clients[client.nodeID]
+	// A reconnect for the same authenticated device may use one temporary
+	// global overlap slot while its stale socket exits. Without the upper bound,
+	// one credential could reconnect faster than the old pumps close and grow
+	// activeClients (and goroutines/sockets) without limit.
+	if h.activeClients >= h.maxConnections {
+		if previous == nil || h.activeClients > h.maxConnections {
+			return nil, ErrConnectionLimit
+		}
+	}
 	h.clients[client.nodeID] = client
 	h.activeClients++
 	h.connections.Add(1)

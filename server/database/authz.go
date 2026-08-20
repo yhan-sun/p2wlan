@@ -3,7 +3,9 @@ package database
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,6 +48,8 @@ const (
 	RelayRevocationJTI          = "jti"
 )
 
+var ErrChallengeUnavailable = errors.New("challenge unavailable")
+
 // NetworkMembership links a user to a network.
 type NetworkMembership struct {
 	ID        string `json:"id"`
@@ -61,6 +65,15 @@ type NetworkMembership struct {
 func (db *DB) CreateChallenge(deviceID string, challenge []byte, expiresAt int64) (*DeviceChallenge, error) {
 	id := fmt.Sprintf("challenge-%d", time.Now().UnixNano())
 	now := time.Now().Unix()
+	// Challenges are short-lived one-time records.  Prune terminal rows for
+	// this device on the write path so repeated enrollment/credential refresh
+	// cannot grow `device_challenges` without bound.  Live challenges remain
+	// available, including multiple outstanding challenges from a caller that
+	// legitimately has concurrent enrollment attempts.
+	if _, err := db.Exec(`DELETE FROM device_challenges
+		WHERE device_id = ? AND (consumed = 1 OR expires_at < ?)`, deviceID, now); err != nil {
+		return nil, fmt.Errorf("prune device challenges: %w", err)
+	}
 	_, err := db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
         VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, challenge, expiresAt, now)
 	if err != nil {
@@ -90,6 +103,36 @@ func (db *DB) GetChallenge(challengeID string) (*DeviceChallenge, error) {
 func (db *DB) ConsumeChallenge(challengeID string) error {
 	_, err := db.Exec(`UPDATE device_challenges SET consumed = 1 WHERE id = ?`, challengeID)
 	return err
+}
+
+// ClaimChallenge atomically consumes a live challenge belonging to the
+// expected device and returns its contents. Exactly one concurrent caller can
+// claim a challenge; a mismatched, expired, missing, or consumed challenge is
+// reported uniformly as unavailable.
+func (db *DB) ClaimChallenge(challengeID, expectedDeviceID string, now int64) (*DeviceChallenge, error) {
+	var challenge DeviceChallenge
+	var consumed int
+	err := db.QueryRow(`UPDATE device_challenges
+		SET consumed = 1
+		WHERE id = ? AND device_id = ? AND consumed = 0 AND expires_at >= ?
+		RETURNING id, device_id, challenge, expires_at, consumed, created_at`,
+		challengeID, expectedDeviceID, now,
+	).Scan(
+		&challenge.ID,
+		&challenge.DeviceID,
+		&challenge.Challenge,
+		&challenge.ExpiresAt,
+		&consumed,
+		&challenge.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrChallengeUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim challenge: %w", err)
+	}
+	challenge.Consumed = consumed == 1
+	return &challenge, nil
 }
 
 // ---- Credential operations ----
@@ -152,6 +195,18 @@ func (db *DB) ValidateDeviceCredential(token string) (*DeviceCredential, *Device
 	}
 
 	return &cred, device, nil
+}
+
+// HasActiveDeviceCredential reports whether a device has moved to the modern
+// device-auth flow. User-JWT endpoint updates for such a device are management
+// metadata changes, not proof that its daemon is currently alive.
+func (db *DB) HasActiveDeviceCredential(deviceID string, now int64) (bool, error) {
+	var exists int
+	err := db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM device_credentials
+		WHERE device_id = ? AND revoked = 0 AND expires_at >= ?
+	)`, deviceID, now).Scan(&exists)
+	return exists == 1, err
 }
 
 // RevokeDeviceCredential revokes a device credential.
@@ -226,15 +281,18 @@ func (db *DB) RelayRevocationSnapshot() (*RelayRevocationSnapshot, error) {
 		RevokedCredentialIDs: []string{},
 		RevokedJTIs:          []string{},
 	}
+	var maxCreatedAt int64
+	var tombstoneCount int64
 	for rows.Next() {
 		var kind, value string
 		var createdAt int64
 		if err := rows.Scan(&kind, &value, &createdAt); err != nil {
 			return nil, err
 		}
-		if createdAt > snapshot.Version {
-			snapshot.Version = createdAt
+		if createdAt > maxCreatedAt {
+			maxCreatedAt = createdAt
 		}
+		tombstoneCount++
 		switch kind {
 		case RelayRevocationDeviceID:
 			snapshot.RevokedDeviceIDs = append(snapshot.RevokedDeviceIDs, value)
@@ -246,6 +304,13 @@ func (db *DB) RelayRevocationSnapshot() (*RelayRevocationSnapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// Tombstones are append-only. Include the row count so two revocations
+	// created in the same Unix second still advance the snapshot version; using
+	// only MAX(created_at) allowed a relay to mistake a newer snapshot for the
+	// same generation and made rollback protection impossible.
+	if tombstoneCount > 0 {
+		snapshot.Version = maxCreatedAt*1_000_000 + tombstoneCount
 	}
 	return snapshot, nil
 }
