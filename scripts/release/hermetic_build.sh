@@ -3,7 +3,7 @@
 #
 # Flutter `pub get` / `flutter build` re-resolves SDK-pinned transitive files
 # (apps/flutter_client/pubspec.lock, analysis_options.yaml, .metadata and, on
-# macOS, Runner.xcodeproj/project.pbxproj), stamping the source checkout dirty
+# macOS, the CocoaPods/Xcode project files), stamping the source checkout dirty
 # AFTER each release build.  The release workflow historically compensated
 # with repeated `git checkout --` blocks (9 sites).  This helper centralizes
 # that compensation and — more usefully — lets a job assert the invariant the
@@ -54,10 +54,19 @@ do_restore() {
     fi
   done
   if [ "$macos" -eq 1 ]; then
-    local pbx="apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj"
-    if [ -e "$pbx" ]; then
-      files+=("$pbx")
-    fi
+    # `flutter build macos` may run pod install and update both the Podfile
+    # inputs and the generated lockfile in addition to the Xcode project.
+    # Restore every tracked macOS integration file that Flutter/CocoaPods can
+    # migrate so the release identity gate sees the original checkout.
+    local macos_file
+    for macos_file in \
+      "apps/flutter_client/macos/Podfile" \
+      "apps/flutter_client/macos/Podfile.lock" \
+      "apps/flutter_client/macos/Runner.xcodeproj/project.pbxproj"; do
+      if [ -e "$macos_file" ]; then
+        files+=("$macos_file")
+      fi
+    done
   fi
   if [ "${#files[@]}" -gt 0 ]; then
     git checkout -- "${files[@]}"
