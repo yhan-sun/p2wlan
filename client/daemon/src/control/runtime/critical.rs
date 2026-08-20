@@ -19,8 +19,8 @@
 ///   deadline, so a successful round can never become a 3 x 5 s sequence.
 #[allow(clippy::too_many_arguments)]
 async fn run_critical_control_loop(
-    http: Arc<reqwest::Client>,
-    candidate_http: Arc<reqwest::Client>,
+    http: RouteAwareControlHttpClient,
+    candidate_http: RouteAwareControlHttpClient,
     mut answer_rx: mpsc::Receiver<CriticalAnswerCommand>,
     mut offer_rx: mpsc::Receiver<CriticalOfferCommand>,
     mut ctrl_rx: mpsc::Receiver<CriticalControlCommand>,
@@ -158,7 +158,7 @@ async fn run_critical_control_loop(
 /// parallel, while this receiver preserves the strict order for one peer.
 async fn run_candidate_offer_worker(
     mut rx: mpsc::Receiver<CandidateOfferCommand>,
-    http: Arc<reqwest::Client>,
+    http: RouteAwareControlHttpClient,
     mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
 ) {
@@ -176,12 +176,8 @@ async fn run_candidate_offer_worker(
         } = command;
         let mut response_tx = response_tx;
         let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
-        let Some(auth) = wait_for_critical_control_auth(
-            auth_rx.clone(),
-            &mut response_tx,
-            deadline,
-        )
-        .await
+        let Some(auth) =
+            wait_for_critical_control_auth(auth_rx.clone(), &mut response_tx, deadline).await
         else {
             continue;
         };
@@ -197,9 +193,10 @@ async fn run_candidate_offer_worker(
         // duplicate publication of an unchanged token cannot cancel the
         // request before it reaches the control server.
         let current_auth = auth_rx.borrow_and_update().clone();
-        if current_auth.as_ref().is_some_and(|current| {
-            !auth.same_identity_as(current)
-        }) {
+        if current_auth
+            .as_ref()
+            .is_some_and(|current| !auth.same_identity_as(current))
+        {
             let _ = response_tx.send(PeerOfferSendOutcome::Failed);
             continue;
         }
@@ -229,12 +226,12 @@ async fn run_candidate_offer_worker(
         };
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = if remaining.is_zero() {
-            Err(DaemonError::ControlPlane(
+        let result = match http.current() {
+            Err(error) => Err(error),
+            Ok(current_http) if remaining.is_zero() => Err(DaemonError::ControlPlane(
                 "candidate offer deadline exceeded before delivery".into(),
-            ))
-        } else {
-            loop {
+            )),
+            Ok(current_http) => loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break Err(DaemonError::ControlPlane(
@@ -243,7 +240,7 @@ async fn run_candidate_offer_worker(
                 }
                 let result = tokio::select! {
                     result = timeout(remaining, send_prepared_signal(
-                        &http,
+                        &current_http,
                         &auth.base_url,
                         &auth.token,
                         &payload,
@@ -277,7 +274,7 @@ async fn run_candidate_offer_worker(
                     }
                 };
                 break result;
-            }
+            },
         };
         let outcome = match result {
             Ok(()) => {
@@ -314,7 +311,7 @@ async fn acquire_critical_permit_or_skip<T>(
 }
 
 async fn run_critical_answer_command(
-    http: Arc<reqwest::Client>,
+    http: RouteAwareControlHttpClient,
     command: CriticalAnswerCommand,
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
@@ -363,7 +360,7 @@ async fn run_critical_answer_command(
 }
 
 async fn run_critical_offer_command(
-    http: Arc<reqwest::Client>,
+    http: RouteAwareControlHttpClient,
     command: CriticalOfferCommand,
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
@@ -415,7 +412,7 @@ async fn run_critical_offer_command(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_critical_endpoint_command(
-    http: Arc<reqwest::Client>,
+    http: RouteAwareControlHttpClient,
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     endpoint: String,
     nat_type: String,
@@ -428,12 +425,8 @@ async fn run_critical_endpoint_command(
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
-    let Some(auth) = wait_for_critical_control_auth(
-        auth_rx.clone(),
-        &mut response_tx,
-        deadline,
-    )
-    .await
+    let Some(auth) =
+        wait_for_critical_control_auth(auth_rx.clone(), &mut response_tx, deadline).await
     else {
         return;
     };
@@ -444,24 +437,29 @@ async fn run_critical_endpoint_command(
             "critical lane deadline exceeded before endpoint publish".into(),
         ))
     } else {
-        tokio::select! {
-            result = timeout(remaining, update_endpoint(
-                &http,
-                &auth.base_url,
-                &auth.token,
-                &auth.self_node_id,
-                &endpoint,
-                &nat_type,
-                relay_rtt_ms,
-            )) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err(DaemonError::ControlPlane(
-                        "critical lane deadline exceeded during endpoint publish".into(),
-                    )),
+        match http.current() {
+            Err(error) => Err(error),
+            Ok(current_http) => {
+                tokio::select! {
+                    result = timeout(remaining, update_endpoint(
+                        &current_http,
+                        &auth.base_url,
+                        &auth.token,
+                        &auth.self_node_id,
+                        &endpoint,
+                        &nat_type,
+                        relay_rtt_ms,
+                    )) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(DaemonError::ControlPlane(
+                                "critical lane deadline exceeded during endpoint publish".into(),
+                            )),
+                        }
+                    }
+                    _ = response_tx.closed() => return,
                 }
             }
-            _ = response_tx.closed() => return,
         }
     };
     match &result {
@@ -525,7 +523,7 @@ async fn wait_for_critical_control_auth<T>(
 /// the old node id/token.
 #[allow(clippy::too_many_arguments)]
 async fn send_critical_signal<T>(
-    http: &reqwest::Client,
+    http: &RouteAwareControlHttpClient,
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     response_tx: &mut oneshot::Sender<T>,
     deadline: Instant,
@@ -581,29 +579,36 @@ async fn send_critical_signal<T>(
         // The registration loop may have replaced the identity while this
         // owner waited in the queue.  Never send a new session's answer (or
         // any handshake signal) with an old node id/token.
-        if auth_rx.borrow().as_ref().is_some_and(|current| {
-            !auth.same_identity_as(current)
-        }) {
+        if auth_rx
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| !auth.same_identity_as(current))
+        {
             return Some(Err(DaemonError::ControlPlane(format!(
                 "critical {signal_type} to {to_node_id} aborted: control identity was replaced by re-registration"
             ))));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = tokio::select! {
-            result = timeout(remaining, send_prepared_signal(
-                http,
-                &auth.base_url,
-                &auth.token,
-                &payload,
-            )) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err(DaemonError::ControlPlane(format!(
-                        "critical {signal_type} to {to_node_id} exceeded the lane deadline during the request"
-                    ))),
+        let result = match http.current() {
+            Err(error) => Err(error),
+            Ok(current_http) => {
+                tokio::select! {
+                    result = timeout(remaining, send_prepared_signal(
+                        &current_http,
+                        &auth.base_url,
+                        &auth.token,
+                        &payload,
+                    )) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(DaemonError::ControlPlane(format!(
+                                "critical {signal_type} to {to_node_id} exceeded the lane deadline during the request"
+                            ))),
+                        }
+                    }
+                    _ = response_tx.closed() => return None,
                 }
             }
-            _ = response_tx.closed() => return None,
         };
         match result {
             Ok(()) => return Some(Ok(())),

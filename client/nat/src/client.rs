@@ -110,22 +110,44 @@ impl StunClient {
             .await
             .map_err(|e| NatError::Network(format!("send_to failed: {e}")))?;
 
-        // Receive with timeout
-        let mut buf = vec![0u8; RECV_BUF_SIZE];
-        let recv_result = timeout(self.timeout, socket.recv_from(&mut buf)).await;
-
-        match recv_result {
-            Ok(Ok((len, from_addr))) => {
+        // Receive with one total timeout. A live UDP socket can also carry
+        // responses for an earlier STUN transaction (or unrelated tunnel
+        // traffic), so a single `recv_from` followed by an immediate error is
+        // unsafe: it turns harmless reordering into a failed gather. Keep
+        // reading until the response for this transaction arrives or the
+        // request's timeout expires.
+        let recv_result = timeout(self.timeout, async {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            loop {
+                let (len, from_addr) = socket
+                    .recv_from(&mut buf)
+                    .await
+                    .map_err(|e| NatError::Network(format!("recv_from failed: {e}")))?;
                 let data = &buf[..len];
-                let message = StunMessage::decode(data)?;
+                let message = match StunMessage::decode(data) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        debug!(
+                            "Ignoring non-STUN UDP packet from {} while waiting for transaction {:02x?}: {}",
+                            from_addr,
+                            &transaction_id[..4],
+                            error
+                        );
+                        continue;
+                    }
+                };
 
-                // Verify transaction ID matches
+                // A delayed response for another request is expected when a
+                // socket is shared by candidate gathering and liveness. It is
+                // not a protocol failure for the request currently in flight.
                 if message.transaction_id != transaction_id {
-                    return Err(NatError::Stun(format!(
-                        "transaction ID mismatch: sent {:02x?}, got {:02x?}",
+                    debug!(
+                        "Ignoring STUN transaction mismatch from {}: sent {:02x?}, got {:02x?}",
+                        from_addr,
                         &transaction_id[..4],
                         &message.transaction_id[..4]
-                    )));
+                    );
+                    continue;
                 }
 
                 // Check for error response
@@ -154,13 +176,17 @@ impl StunClient {
                     from_addr, reflexive_address
                 );
 
-                Ok(BindingResponse {
+                return Ok(BindingResponse {
                     reflexive_address,
                     from_addr,
                     message,
-                })
+                });
             }
-            Ok(Err(e)) => Err(NatError::Network(format!("recv_from failed: {e}"))),
+        })
+        .await;
+
+        match recv_result {
+            Ok(result) => result,
             Err(_) => {
                 warn!(
                     "STUN request to {} timed out after {:?}",
@@ -292,11 +318,35 @@ mod tests {
         });
 
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let stun = StunClient::with_timeout(Duration::from_secs(2));
+        let stun = StunClient::with_timeout(Duration::from_millis(50));
 
         let result = stun.binding_request(&client_socket, addr).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(NatError::Stun(_))));
+        assert!(matches!(result, Err(NatError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn test_ignores_stale_transaction_until_matching_response() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            let (len, client_addr) = socket.recv_from(&mut buf).await.unwrap();
+            let req = StunMessage::decode(&buf[..len]).unwrap();
+
+            let mut stale = StunMessage::with_transaction_id(BINDING_RESPONSE, [0xEE; 12]);
+            stale.add_attribute(StunAttribute::XorMappedAddress(client_addr));
+            socket.send_to(&stale.encode(), client_addr).await.unwrap();
+
+            let mut response =
+                StunMessage::with_transaction_id(BINDING_RESPONSE, req.transaction_id);
+            response.add_attribute(StunAttribute::XorMappedAddress(client_addr));
+            socket.send_to(&response.encode(), client_addr).await.unwrap();
+        });
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun = StunClient::with_timeout(Duration::from_secs(1));
+        let response = stun.binding_request(&client_socket, addr).await.unwrap();
+        assert_eq!(response.reflexive_address, Some(client_socket.local_addr().unwrap()));
     }
 
     #[tokio::test]

@@ -93,6 +93,21 @@ impl PeerManager {
             timeout,
             retries: cfg.udp_liveness_retries,
         };
+        let proxy_environment =
+            tokio::task::spawn_blocking(|| crate::netenv::direct_route_snapshot(&[]))
+                .await
+                .unwrap_or_default();
+        let (outbound_interface, tun_bypass_unavailable) =
+            match proxy_environment.direct_socket_interface() {
+                Ok(interface) => (interface, false),
+                Err(_) => (None, true),
+            };
+        if let Some(interface) = outbound_interface.as_deref() {
+            tracing::debug!(
+                interface,
+                "Binding UDP liveness probe to the physical interface"
+            );
+        };
         // Per (round, target): bind a FRESH socket so `recv_from` is isolated to
         // that target — a shared socket would let target A's answer be consumed
         // by target B's recv, corrupting the per-target attribution (the verdict
@@ -101,8 +116,17 @@ impl PeerManager {
         // owned data inside the async block so the returned future is 'static.
         let outcome = p2pnet_nat::outbound_liveness::probe(&probe_cfg, |_round, target| {
             let data = p2pnet_nat::outbound_liveness::build_dns_a_query(0xdead, "a"); // owned per call
+            let outbound_interface = outbound_interface.clone();
             async move {
-                let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+                if tun_bypass_unavailable {
+                    return p2pnet_nat::outbound_liveness::TargetProbeResult::SocketError;
+                }
+                let Ok(socket) = p2pnet_netbind::bind_udp(
+                    "0.0.0.0:0".parse().expect("static UDP bind address"),
+                    outbound_interface.as_deref(),
+                )
+                .await
+                else {
                     return p2pnet_nat::outbound_liveness::TargetProbeResult::SocketError;
                 };
                 let send_start = std::time::Instant::now();

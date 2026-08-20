@@ -30,6 +30,9 @@ pub struct UdpTransport {
     /// for bounded symmetric-NAT traversal experiments.
     socket: Arc<UdpSocket>,
     sockets: Arc<Vec<Arc<UdpSocket>>>,
+    /// Physical interface used to bypass a foreign system TUN. `None` keeps
+    /// ordinary multi-interface routing when no capture route is present.
+    outbound_interface: Option<Arc<str>>,
     peers: Arc<PeerManager>,
     pending_probes: PendingProbes,
     stun_waiters: StunWaiters,
@@ -131,9 +134,22 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// Bind a UDP socket for direct peer traffic.
     pub async fn bind(bind_addr: SocketAddr, peers: Arc<PeerManager>) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            DaemonError::Network(format!("failed to bind UDP socket at {bind_addr}: {e}"))
-        })?;
+        Self::bind_to_interface(bind_addr, peers, None).await
+    }
+
+    /// Bind direct UDP to a physical interface. The kernel option is applied
+    /// before bind so more-specific routes installed by a foreign TUN cannot
+    /// capture STUN, punch, or encrypted peer traffic.
+    pub async fn bind_to_interface(
+        bind_addr: SocketAddr,
+        peers: Arc<PeerManager>,
+        outbound_interface: Option<String>,
+    ) -> Result<Self> {
+        let socket = p2pnet_netbind::bind_udp(bind_addr, outbound_interface.as_deref())
+            .await
+            .map_err(|e| {
+                DaemonError::Network(format!("failed to bind UDP socket at {bind_addr}: {e}"))
+            })?;
         let network_epoch_gate = peers.network_epoch_gate();
 
         let direct_validation = DirectValidationRegistry::new();
@@ -144,6 +160,7 @@ impl UdpTransport {
         Ok(Self {
             socket: Arc::new(socket),
             sockets: Arc::new(Vec::new()),
+            outbound_interface: outbound_interface.map(Arc::<str>::from),
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
             stun_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -188,6 +205,11 @@ impl UdpTransport {
         })
     }
 
+    /// Interface currently enforced for public UDP egress, if any.
+    pub fn outbound_interface(&self) -> Option<&str> {
+        self.outbound_interface.as_deref()
+    }
+
     #[cfg(test)]
     fn with_global_probe_budget(mut self, budget: Arc<GlobalOutboundProbeBudget>) -> Self {
         self.global_outbound_probe_budget = Some(budget);
@@ -222,11 +244,14 @@ impl UdpTransport {
         let mut sockets = vec![self.socket.clone()];
 
         for _ in 1..requested {
-            let socket = UdpSocket::bind(pool_bind_addr).await.map_err(|e| {
-                DaemonError::Network(format!(
-                    "failed to bind UDP socket pool member at {pool_bind_addr}: {e}"
-                ))
-            })?;
+            let socket =
+                p2pnet_netbind::bind_udp(pool_bind_addr, self.outbound_interface.as_deref())
+                    .await
+                    .map_err(|e| {
+                        DaemonError::Network(format!(
+                            "failed to bind UDP socket pool member at {pool_bind_addr}: {e}"
+                        ))
+                    })?;
             sockets.push(Arc::new(socket));
         }
 
@@ -289,9 +314,9 @@ impl UdpTransport {
     pub async fn probe_rx_snapshot(&self) -> UdpProbeRxSnapshot {
         let pool = self.socket_pool_diagnostics.lock().await.clone();
         let dynamic = self.dynamic_socket_diagnostics.lock().await.clone();
-        pool.into_iter()
-            .chain(dynamic.into_values())
-            .fold(UdpProbeRxSnapshot::default(), |mut snapshot, member| {
+        pool.into_iter().chain(dynamic.into_values()).fold(
+            UdpProbeRxSnapshot::default(),
+            |mut snapshot, member| {
                 snapshot.known_peer_ip_datagrams_received = snapshot
                     .known_peer_ip_datagrams_received
                     .saturating_add(member.known_peer_ip_datagrams_received);
@@ -454,9 +479,7 @@ impl UdpTransport {
             if state
                 .dynamic
                 .get(&pin.socket_index)
-                .is_some_and(|entry| {
-                    entry.peer_id == peer_id && entry.phase.is_usable()
-                })
+                .is_some_and(|entry| entry.peer_id == peer_id && entry.phase.is_usable())
             {
                 return pin.socket_index;
             }
@@ -787,7 +810,12 @@ impl UdpTransport {
     /// The peer's current affinity pin, for tests in other modules.
     #[cfg(test)]
     pub(crate) async fn affinity_pin_for_test(&self, peer_id: &str) -> Option<PeerSocketPin> {
-        self.socket_state.lock().await.affinity.get(peer_id).copied()
+        self.socket_state
+            .lock()
+            .await
+            .affinity
+            .get(peer_id)
+            .copied()
     }
 
     /// Attach the encrypted-packet inbound channel used by socket readers.
@@ -809,7 +837,8 @@ impl UdpTransport {
     /// deliberately reserved for unpublished transports.
     pub(crate) fn set_inbound_publication_owner(&self, owner: u64) {
         debug_assert_ne!(owner, 0, "UDP publication owner zero is reserved");
-        self.inbound_publication_owner.store(owner, Ordering::Release);
+        self.inbound_publication_owner
+            .store(owner, Ordering::Release);
     }
 
     /// Revoke an owner only when this transport still carries that exact
@@ -830,9 +859,7 @@ impl UdpTransport {
     /// Allocate a fresh dynamic socket index that never collides with the pool.
     pub(crate) fn next_dynamic_index(&self) -> usize {
         DYNAMIC_SOCKET_INDEX_BASE
-            + self
-                .dynamic_socket_counter
-                .fetch_add(1, Ordering::Relaxed)
+            + self.dynamic_socket_counter.fetch_add(1, Ordering::Relaxed)
                 % (usize::MAX - DYNAMIC_SOCKET_INDEX_BASE)
     }
 
@@ -869,9 +896,7 @@ impl UdpTransport {
             .await
             .retain(|_, pending| pending.peer_id.as_deref() != Some(peer_id));
         drop(state);
-        debug!(
-            "Cleared pending probes for peer {peer_id} (cleanup_epoch={cleanup_epoch})"
-        );
+        debug!("Cleared pending probes for peer {peer_id} (cleanup_epoch={cleanup_epoch})");
     }
 
     /// One atomic per-peer lifecycle cleanup: PeerLeft / offline /
@@ -1093,9 +1118,10 @@ impl UdpTransport {
             );
             return DirectValidationSessionStart::IgnoredInactive;
         }
-        if let Some((target_tx, current)) = sessions.get(peer_id).map(|session| {
-            (session.target_tx.clone(), *session.target_tx.borrow())
-        }) {
+        if let Some((target_tx, current)) = sessions
+            .get(peer_id)
+            .map(|session| (session.target_tx.clone(), *session.target_tx.borrow()))
+        {
             if !current.cancelled && current.generation == generation {
                 // Newest-wins selects the target for the next request. An
                 // already-sent request keeps its exact expectation until it
@@ -1348,10 +1374,11 @@ impl UdpTransport {
         if !active_owner {
             return false;
         }
-        self.direct_validation.expectations.lock().await.insert(
-            peer_id.to_string(),
-            expectation,
-        );
+        self.direct_validation
+            .expectations
+            .lock()
+            .await
+            .insert(peer_id.to_string(), expectation);
         true
     }
 
@@ -1466,8 +1493,7 @@ impl UdpTransport {
                 let index = pin.socket_index;
                 let socket = self.active_sockets().get(index).cloned();
                 drop(state);
-                return socket
-                    .map(|socket| (index, socket, DynamicSocketSendLease::noop(index)));
+                return socket.map(|socket| (index, socket, DynamicSocketSendLease::noop(index)));
             }
         }
         let index = 0usize;
@@ -1517,10 +1543,8 @@ impl UdpTransport {
         source: SocketAddr,
         socket_index: Option<usize>,
         endpoint_authenticated: bool,
-    ) -> std::result::Result<
-        DirectValidationExpectation,
-        crate::udp::DirectValidationAckRejectReason,
-    > {
+    ) -> std::result::Result<DirectValidationExpectation, crate::udp::DirectValidationAckRejectReason>
+    {
         if token_generation != current_generation {
             return Err(crate::udp::DirectValidationAckRejectReason::TokenGenerationMismatch);
         }
@@ -1571,9 +1595,7 @@ impl UdpTransport {
             return Err(crate::udp::DirectValidationAckRejectReason::TargetCancelled);
         }
         if target.generation != current_generation {
-            return Err(
-                crate::udp::DirectValidationAckRejectReason::TargetGenerationMismatch,
-            );
+            return Err(crate::udp::DirectValidationAckRejectReason::TargetGenerationMismatch);
         }
         if target.owner_token != token_owner {
             return Err(crate::udp::DirectValidationAckRejectReason::TargetOwnerMismatch);
@@ -1651,10 +1673,7 @@ impl UdpTransport {
     /// endpoint always replaces its pending value, even when other peers have
     /// filled the bound.  This keeps endpoint churn from either blocking the
     /// UDP reader or silently discarding the value needed for the next check.
-    pub fn with_peer_reflexive_observer(
-        mut self,
-        ingress: PeerReflexiveIngress,
-    ) -> Self {
+    pub fn with_peer_reflexive_observer(mut self, ingress: PeerReflexiveIngress) -> Self {
         self.peer_reflexive_ingress = Some(ingress);
         self
     }

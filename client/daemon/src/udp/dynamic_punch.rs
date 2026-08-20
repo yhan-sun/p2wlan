@@ -62,7 +62,8 @@ impl LearningCache {
     /// The peer-scope learner for `peer_id`, or `None` when no peer-scope
     /// evidence was ever observed for it.
     fn peer_scope(&self, peer_id: &str) -> Option<&(StepLearner, ReverseDetector)> {
-        self.entries.get(&DestinationScope::Peer(peer_id.to_string()))
+        self.entries
+            .get(&DestinationScope::Peer(peer_id.to_string()))
     }
 }
 
@@ -92,11 +93,13 @@ impl UdpTransport {
             Ok(addr) if !addr.ip().is_unspecified() => SocketAddr::new(addr.ip(), 0),
             _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         };
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|error| {
-            DaemonError::Network(format!(
-                "failed to bind fresh-mapping punch socket at {bind_addr}: {error}"
-            ))
-        })?;
+        let socket = p2pnet_netbind::bind_udp(bind_addr, self.outbound_interface.as_deref())
+            .await
+            .map_err(|error| {
+                DaemonError::Network(format!(
+                    "failed to bind fresh-mapping punch socket at {bind_addr}: {error}"
+                ))
+            })?;
         let socket_index = self.next_dynamic_index();
         Ok((socket_index, Arc::new(socket)))
     }
@@ -326,13 +329,17 @@ impl UdpTransport {
             // ACK grace: an ACK that has not arrived by now will never be
             // matched, so its pending entry can no longer block the reader
             // abort.
-            self.drop_pending_probes_for_socket(entry.socket_index).await;
+            self.drop_pending_probes_for_socket(entry.socket_index)
+                .await;
         }
         // Only now stop the reader: every ACK that could still arrive was
         // given its chance during the drain.
         entry.shutdown_tx.send_replace(true);
         entry.reader.abort();
-        self.dynamic_socket_diagnostics.lock().await.remove(&entry.socket_index);
+        self.dynamic_socket_diagnostics
+            .lock()
+            .await
+            .remove(&entry.socket_index);
         debug!(
             "Detached fresh-mapping punch socket index={} local={} peer={} network_generation={} punch_generation={} reason={reason}",
             entry.socket_index,
@@ -516,7 +523,11 @@ impl UdpTransport {
     pub(crate) async fn detach_all_dynamic_punch_sockets(&self, reason: &str) {
         let entries = {
             let mut state = self.socket_state.lock().await;
-            let entries = state.dynamic.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
+            let entries = state
+                .dynamic
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>();
             state
                 .affinity
                 .retain(|_, pin| pin.socket_index < DYNAMIC_SOCKET_INDEX_BASE);
@@ -567,24 +578,30 @@ impl UdpTransport {
                 .as_millis()
                 .saturating_sub(budget_elapsed_ms);
             let remaining_samples = observers.len().saturating_sub(sequence).max(1) as u128;
-            let per_sample_timeout = stun_timeout
-                .min(FRESH_MAPPING_STUN_TIMEOUT)
-                .min(Duration::from_millis(
-                    remaining_budget_ms.saturating_div(remaining_samples).min(u64::MAX as u128) as u64,
-                ));
+            let per_sample_timeout =
+                stun_timeout
+                    .min(FRESH_MAPPING_STUN_TIMEOUT)
+                    .min(Duration::from_millis(
+                        remaining_budget_ms
+                            .saturating_div(remaining_samples)
+                            .min(u64::MAX as u128) as u64,
+                    ));
 
             let mut request = StunMessage::binding_request();
-            request.add_attribute(StunAttribute::Software(MEASUREMENT_SOFTWARE_TAG.to_string()));
+            request.add_attribute(StunAttribute::Software(
+                MEASUREMENT_SOFTWARE_TAG.to_string(),
+            ));
             let transaction_id = request.transaction_id;
             let encoded = request.encode();
             let (response_tx, response_rx) = oneshot::channel();
-            self.stun_waiters.lock().await.insert(transaction_id, response_tx);
+            self.stun_waiters
+                .lock()
+                .await
+                .insert(transaction_id, response_tx);
             let sent_at_ms = monotonic_millis();
             if let Err(error) = socket.send_to(&encoded, observer).await {
                 self.stun_waiters.lock().await.remove(&transaction_id);
-                debug!(
-                    "Fresh-mapping STUN send {sequence} to {observer} failed: {error}"
-                );
+                debug!("Fresh-mapping STUN send {sequence} to {observer} failed: {error}");
                 continue;
             }
             if !keep_measuring() {
@@ -603,18 +620,16 @@ impl UdpTransport {
             }
             let responded_at_ms = monotonic_millis();
             let parsed = match result {
-                Ok(Ok((data, source))) if source == *observer => {
-                    match StunMessage::decode(&data) {
-                        Ok(response)
-                            if response.transaction_id == transaction_id
-                                && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
-                        {
-                            response.get_reflexive_address()
-                        }
-                        Ok(_) => None,
-                        Err(_) => None,
+                Ok(Ok((data, source))) if source == *observer => match StunMessage::decode(&data) {
+                    Ok(response)
+                        if response.transaction_id == transaction_id
+                            && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
+                    {
+                        response.get_reflexive_address()
                     }
-                }
+                    Ok(_) => None,
+                    Err(_) => None,
+                },
                 _ => None,
             };
             if let Some(observed) = parsed {
@@ -624,9 +639,10 @@ impl UdpTransport {
                     observed,
                     sent_at_ms,
                     responded_at_ms,
-                    local_endpoint: socket.local_addr().ok().unwrap_or_else(|| {
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-                    }),
+                    local_endpoint: socket
+                        .local_addr()
+                        .ok()
+                        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
                 });
             } else {
                 debug!(
@@ -690,12 +706,7 @@ impl UdpTransport {
     /// complex CGNAT can allocate toward STUN observers differently than toward
     /// the real peer, so once a peer's true direction is observed it must not
     /// be dragged back toward the STUN-learned stride (audit P1-B).
-    async fn observe_peer_scope(
-        &self,
-        peer_id: &str,
-        observed_port: u16,
-        network_generation: u64,
-    ) {
+    async fn observe_peer_scope(&self, peer_id: &str, observed_port: u16, network_generation: u64) {
         let mut cache = self.learning_cache.lock().await;
         cache.reset_if_generation_changed(network_generation);
         let (_, detector) = cache.entry(DestinationScope::Peer(peer_id.to_string()));
@@ -732,11 +743,7 @@ impl UdpTransport {
     /// learned state for the requested generation — i.e. the cache was reset or
     /// never fed.
     #[cfg(test)]
-    pub(crate) async fn has_learning_for(
-        &self,
-        ip: IpAddr,
-        network_generation: u64,
-    ) -> bool {
+    pub(crate) async fn has_learning_for(&self, ip: IpAddr, network_generation: u64) -> bool {
         let _ = ip;
         let mut cache = self.learning_cache.lock().await;
         cache.reset_if_generation_changed(network_generation);
@@ -770,10 +777,7 @@ impl UdpTransport {
         if cancellation.is_some_and(|c| c.is_cancelled()) {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
         }
-        let allow_loopback = self
-            .peers
-            .fresh_mapping_harness_loopback_enabled()
-            .await;
+        let allow_loopback = self.peers.fresh_mapping_harness_loopback_enabled().await;
         let stable_targets = stable_targets
             .iter()
             .copied()
@@ -782,9 +786,7 @@ impl UdpTransport {
         if stable_targets.is_empty() {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::NoStablePeerEndpoint);
         }
-        if self.local_node_id.is_none()
-            || self.peers.probe_key_for_peer(peer_id).await.is_none()
-        {
+        if self.local_node_id.is_none() || self.peers.probe_key_for_peer(peer_id).await.is_none() {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::MissingProbeKey);
         }
         if self.peers.is_direct(peer_id).await {
@@ -847,7 +849,8 @@ impl UdpTransport {
             .take(FRESH_MAPPING_OBSERVERS_PER_BATCH)
             .collect::<Vec<_>>();
         if observers.len() < 3 {
-            self.detach_dynamic_socket_by_index(socket_index, "insufficient_observers").await;
+            self.detach_dynamic_socket_by_index(socket_index, "insufficient_observers")
+                .await;
             return FreshMappingOutcome::Rejected(FreshMappingRejection::InsufficientSamples);
         }
 
@@ -873,16 +876,11 @@ impl UdpTransport {
         let started_ms = monotonic_millis();
         let measurement_peer_id = peer_id.to_string();
         let observations = self
-            .measure_fresh_mapping_batch(
-                &socket,
-                &observers,
-                stun_timeout,
-                || {
-                    !cancellation.is_some_and(|c| c.is_cancelled())
-                        && !self.peers.is_direct_sync(&measurement_peer_id)
-                        && self.peers.current_network_generation_sync() == network_generation
-                },
-            )
+            .measure_fresh_mapping_batch(&socket, &observers, stun_timeout, || {
+                !cancellation.is_some_and(|c| c.is_cancelled())
+                    && !self.peers.is_direct_sync(&measurement_peer_id)
+                    && self.peers.current_network_generation_sync() == network_generation
+            })
             .await;
         let finished_ms = monotonic_millis();
         if self
@@ -970,7 +968,8 @@ impl UdpTransport {
                     "insufficient STUN samples for a mapping model",
                 )
                 .await;
-            self.detach_dynamic_socket_by_index(socket_index, "insufficient_samples").await;
+            self.detach_dynamic_socket_by_index(socket_index, "insufficient_samples")
+                .await;
             return FreshMappingOutcome::Rejected(FreshMappingRejection::InsufficientSamples);
         }
 
@@ -985,7 +984,8 @@ impl UdpTransport {
                     "observed public IP changed across the measurement batch",
                 )
                 .await;
-            self.detach_dynamic_socket_by_index(socket_index, "public_ip_changed").await;
+            self.detach_dynamic_socket_by_index(socket_index, "public_ip_changed")
+                .await;
             return FreshMappingOutcome::Rejected(FreshMappingRejection::PublicIpChanged);
         }
 
@@ -993,19 +993,23 @@ impl UdpTransport {
         let model = match build_model_for_batch(&batch, FRESH_MAPPING_MODEL_MAX_AGE, now_ms) {
             Ok(model) => model,
             Err(ModelRejection::BatchStale) => {
-                self.detach_dynamic_socket_by_index(socket_index, "batch_stale").await;
+                self.detach_dynamic_socket_by_index(socket_index, "batch_stale")
+                    .await;
                 return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
             }
             Err(ModelRejection::InconsistentBatch) => {
-                self.detach_dynamic_socket_by_index(socket_index, "inconsistent_batch").await;
+                self.detach_dynamic_socket_by_index(socket_index, "inconsistent_batch")
+                    .await;
                 return FreshMappingOutcome::Rejected(FreshMappingRejection::InconsistentBatch);
             }
             Err(ModelRejection::InsufficientSamples) => {
-                self.detach_dynamic_socket_by_index(socket_index, "insufficient_samples").await;
+                self.detach_dynamic_socket_by_index(socket_index, "insufficient_samples")
+                    .await;
                 return FreshMappingOutcome::Rejected(FreshMappingRejection::InsufficientSamples);
             }
             Err(ModelRejection::PublicIpChanged) => {
-                self.detach_dynamic_socket_by_index(socket_index, "public_ip_changed").await;
+                self.detach_dynamic_socket_by_index(socket_index, "public_ip_changed")
+                    .await;
                 return FreshMappingOutcome::Rejected(FreshMappingRejection::PublicIpChanged);
             }
             Err(ModelRejection::NarrowRandom | ModelRejection::NoConsistentStep) => {
@@ -1023,20 +1027,22 @@ impl UdpTransport {
                         ),
                     )
                     .await;
-                self.detach_dynamic_socket_by_index(socket_index, "unpredictable_sequence").await;
-                return FreshMappingOutcome::Rejected(
-                    FreshMappingRejection::UnpredictableSequence,
-                );
+                self.detach_dynamic_socket_by_index(socket_index, "unpredictable_sequence")
+                    .await;
+                return FreshMappingOutcome::Rejected(FreshMappingRejection::UnpredictableSequence);
             }
         };
 
         let step = match &model.kind {
-            PortModelKind::FixedStep { step } | PortModelKind::Linear { step }
+            PortModelKind::FixedStep { step }
+            | PortModelKind::Linear { step }
             | PortModelKind::NoisyLinear { step } => Some(*step),
             PortModelKind::MonotonicWindow { direction } => Some(i16::from(*direction)),
             _ => None,
         };
-        if step.is_some_and(|step| u32::from(step.unsigned_abs()) > FRESH_MAPPING_MAX_ABS_STEP as u32) {
+        if step
+            .is_some_and(|step| u32::from(step.unsigned_abs()) > FRESH_MAPPING_MAX_ABS_STEP as u32)
+        {
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -1050,7 +1056,8 @@ impl UdpTransport {
                     ),
                 )
                 .await;
-            self.detach_dynamic_socket_by_index(socket_index, "unpredictable_sequence").await;
+            self.detach_dynamic_socket_by_index(socket_index, "unpredictable_sequence")
+                .await;
             return FreshMappingOutcome::Rejected(FreshMappingRejection::UnpredictableSequence);
         }
 
@@ -1079,16 +1086,14 @@ impl UdpTransport {
         // step learner is fed the model's deltas.  A network-generation change
         // resets both first, so a reading from a superseded allocator is never
         // applied here.
-        let _learner_ip = public_ip
-            .expect("a valid batch was checked for a single public IP above");
+        let _learner_ip =
+            public_ip.expect("a valid batch was checked for a single public IP above");
         let learning = self
             .observe_learning(&ports, &model, network_generation)
             .await;
-        let learner_used = learning
-            .step_estimate
-            .is_some_and(|estimate| {
-                u32::from(estimate.unsigned_abs()) <= FRESH_MAPPING_MAX_ABS_STEP as u32
-            });
+        let learner_used = learning.step_estimate.is_some_and(|estimate| {
+            u32::from(estimate.unsigned_abs()) <= FRESH_MAPPING_MAX_ABS_STEP as u32
+        });
         let effective_step = if learner_used {
             learning.step_estimate
         } else {
@@ -1113,7 +1118,10 @@ impl UdpTransport {
             effective_step,
             direction == DirectionPattern::Reverse,
         );
-        let predicted_ports = predicted.iter().map(|candidate| candidate.port).collect::<Vec<_>>();
+        let predicted_ports = predicted
+            .iter()
+            .map(|candidate| candidate.port)
+            .collect::<Vec<_>>();
 
         let sequence_label = format!("{:?}", ports);
         let deltas_label = format!("{:?}", model.deltas);
@@ -1339,12 +1347,14 @@ impl UdpTransport {
         // commit and the advertise can still roll the socket back.
         let still_owned = {
             let state = self.socket_state.lock().await;
-            state.dynamic.get(&socket_index).is_some_and(|entry| {
-                entry.phase.is_usable() && entry.peer_id == peer_id
-            }) && state
-                .affinity
-                .get(peer_id)
-                .is_some_and(|pin| pin.socket_index == socket_index)
+            state
+                .dynamic
+                .get(&socket_index)
+                .is_some_and(|entry| entry.phase.is_usable() && entry.peer_id == peer_id)
+                && state
+                    .affinity
+                    .get(peer_id)
+                    .is_some_and(|pin| pin.socket_index == socket_index)
         };
         if !still_owned {
             self.detach_dynamic_socket_by_index(socket_index, "ownership_lost_before_accept")
@@ -1443,9 +1453,7 @@ impl UdpTransport {
         // entry's reader alive until this whole sweep ends: a detach racing
         // the resolve can neither hand out a socket the peer must not use nor
         // kill the reader before the sweep's ACKs can arrive.
-        let Some((index, socket, _lease)) = self
-            .resolve_dynamic_socket_for_send(peer_id)
-            .await
+        let Some((index, socket, _lease)) = self.resolve_dynamic_socket_for_send(peer_id).await
         else {
             return Ok(PunchSendReport::default());
         };
@@ -1523,10 +1531,12 @@ impl UdpTransport {
                         if let Some(sent_at_ms) = sent.first_send_at_ms {
                             first_send_at_ms.get_or_insert(sent_at_ms);
                         }
-                        per_socket_sent = per_socket_sent
-                            .saturating_add(u32::from(sent.datagrams_sent));
+                        per_socket_sent =
+                            per_socket_sent.saturating_add(u32::from(sent.datagrams_sent));
                         sent_endpoints.insert(candidate);
-                        self.peers.record_direct_probe_sent(peer_id, candidate).await;
+                        self.peers
+                            .record_direct_probe_sent(peer_id, candidate)
+                            .await;
                         trace!(
                             "Sent dynamic-socket punch probe to peer {peer_id} candidate {} commit_seq={commit_seq_at_start:?}",
                             candidate
@@ -1648,7 +1658,9 @@ const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 fn watched_commit_outcome(
     commit_rx: &mut tokio::sync::watch::Receiver<Option<CommitOutcome>>,
 ) -> Option<CommitOutcome> {
-    (*commit_rx.borrow_and_update()).as_ref().map(|outcome| *outcome)
+    (*commit_rx.borrow_and_update())
+        .as_ref()
+        .map(|outcome| *outcome)
 }
 
 /// Cancellation-safe ownership for a provisional fresh-mapping punch socket.
@@ -1708,8 +1720,7 @@ impl ProvisionalSocketGuard {
         let watcher_transport = transport.clone();
         let watcher_cancellation = cancellation.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let (commit_tx, mut commit_rx) =
-            tokio::sync::watch::channel::<Option<CommitOutcome>>(None);
+        let (commit_tx, mut commit_rx) = tokio::sync::watch::channel::<Option<CommitOutcome>>(None);
         let (finalize_tx, mut finalize_rx) = tokio::sync::watch::channel(false);
         let (finalize_ack_tx, finalize_ack) = oneshot::channel();
         let watcher = tokio::spawn(async move {
@@ -1814,13 +1825,8 @@ impl ProvisionalSocketGuard {
                             // now; without it the commit is still in flight
                             // and the generation owns the socket.
                             match watched_commit_outcome(&mut commit_rx) {
-                                Some(outcome) if outcome.committed => {
-                                    watcher_transport.rollback_committed_entry(
-                                        &mut state,
-                                        &socket_index,
-                                        &outcome,
-                                    )
-                                }
+                                Some(outcome) if outcome.committed => watcher_transport
+                                    .rollback_committed_entry(&mut state, &socket_index, &outcome),
                                 _ => None,
                             }
                         }
@@ -2080,8 +2086,7 @@ impl ProvisionalSocketGuard {
             .expect("guard outcome mutex")
             .and_then(|outcome| outcome.predecessor);
         if let Some(predecessor) = predecessor.filter(|pin| {
-            pin.socket_index >= DYNAMIC_SOCKET_INDEX_BASE
-                && pin.socket_index != self.socket_index
+            pin.socket_index >= DYNAMIC_SOCKET_INDEX_BASE && pin.socket_index != self.socket_index
         }) {
             self.transport
                 .detach_predecessor_unless_repinned(

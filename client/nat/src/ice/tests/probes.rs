@@ -15,7 +15,11 @@ async fn test_probe_filtering_behavior_detects_address_dependent() {
         spawn_change_request_stun_server(ChangeResponseMode::ChangedPortForPortOnly).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-    let filtering = probe_filtering_behavior(&socket, server, Duration::from_millis(100)).await;
+    // The first (change-ip+port) probe is intentionally dropped by this
+    // fixture, so the second probe runs only after one full timeout. Keep the
+    // budget generous enough for the Tokio scheduler when the whole crate is
+    // running in parallel.
+    let filtering = probe_filtering_behavior(&socket, server, Duration::from_millis(500)).await;
 
     assert_eq!(filtering, Some(FilteringBehavior::AddressDependent));
 }

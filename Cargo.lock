@@ -2081,6 +2081,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2pnet-netbind"
+version = "0.1.119"
+dependencies = [
+ "libc",
+ "socket2",
+ "tokio",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "p2pnet-relay"
 version = "0.1.119"
 dependencies = [
@@ -2088,6 +2098,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "jsonwebtoken",
+ "p2pnet-netbind",
  "rand 0.8.7",
  "rcgen",
  "rustls",
@@ -2125,6 +2136,7 @@ dependencies = [
  "p2pnet-crypto",
  "p2pnet-tun",
  "rand 0.8.7",
+ "subtle",
  "thiserror 2.0.20",
  "tracing",
  "zeroize",
@@ -2158,6 +2170,7 @@ dependencies = [
  "libc",
  "p2pnet-crypto",
  "p2pnet-nat",
+ "p2pnet-netbind",
  "p2pnet-relay",
  "p2pnet-tun",
  "p2pnet-wireguard",

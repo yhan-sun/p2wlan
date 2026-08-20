@@ -18,8 +18,7 @@ impl ControlClient {
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let (critical_offer_tx, critical_offer_rx) =
-            mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
+        let (critical_offer_tx, critical_offer_rx) = mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
         let (critical_answer_tx, critical_answer_rx) =
             mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
         let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
@@ -45,44 +44,20 @@ impl ControlClient {
         };
 
         if enabled && has_control_credential(config) {
-            // ONE control-plane HTTP client backs both the ordinary loop and
-            // the independent critical lane, so the two lanes can never
-            // disagree on proxy policy.
-            let http = control_http_client(config.control.proxy_mode).unwrap_or_else(|err| {
-                // A `.no_proxy()` client cannot fail under normal settings.
-                // Fall back to a direct no_proxy client so control traffic
-                // never silently rides an ambient proxy.
-                warn!(
-                    "Control-plane HTTP client build failed for proxy mode {} ({err}); falling back to a direct no_proxy client",
-                    config.control.proxy_mode.as_label()
-                );
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .build()
-                    .expect("no_proxy control HTTP client must build")
-            });
-            // Keep candidate refresh on a separate connection pool.  The
-            // policy is identical to the ordinary/critical client, but a
-            // stalled signal connection must not consume its only HTTP/1
-            // connection slot while a handshake or another peer is trying
-            // to publish candidates.
-            let candidate_http = control_http_client(config.control.proxy_mode).unwrap_or_else(|err| {
-                warn!(
-                    "Candidate control HTTP client build failed for proxy mode {} ({err}); falling back to a direct no_proxy client",
-                    config.control.proxy_mode.as_label()
-                );
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .build()
-                    .expect("candidate no_proxy control HTTP client must build")
-            });
+            // The ordinary and critical lanes read the same route-aware
+            // primary pool. Candidate refresh has a separate pool to avoid
+            // head-of-line blocking, but both pools are rebuilt atomically
+            // after a stable network-route change.
+            let (http, candidate_http) = route_aware_control_http_clients(
+                config.control.proxy_mode,
+                &config.control.server_url,
+            );
             let config = config.clone();
             let event_tx = client.event_tx.clone();
             let cfg_path = config_path.clone();
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
-            let critical_http = Arc::new(http.clone());
-            let candidate_http = Arc::new(candidate_http);
+            let critical_http = http.clone();
             tokio::spawn(async move {
                 run_critical_control_loop(
                     critical_http,
@@ -130,8 +105,7 @@ impl ControlClient {
     pub(crate) fn disabled_for_test() -> Self {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let (critical_offer_tx, critical_offer_rx) =
-            mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
+        let (critical_offer_tx, critical_offer_rx) = mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
         let (critical_answer_tx, critical_answer_rx) =
             mpsc::channel(CRITICAL_ANSWER_QUEUE_CAPACITY);
         let (critical_ctrl_tx, critical_ctrl_rx) = mpsc::channel(CRITICAL_CTRL_QUEUE_CAPACITY);
@@ -397,9 +371,9 @@ impl ControlClient {
             Err(PeerOfferSendFailure::SendFailed) => {
                 Err(DaemonError::ControlPlane("peer offer send failed".into()))
             }
-            Err(PeerOfferSendFailure::ChannelClosed) => {
-                Err(DaemonError::ControlPlane("critical command channel closed".into()))
-            }
+            Err(PeerOfferSendFailure::ChannelClosed) => Err(DaemonError::ControlPlane(
+                "critical command channel closed".into(),
+            )),
         }
     }
 

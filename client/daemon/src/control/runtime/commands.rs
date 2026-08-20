@@ -6,7 +6,11 @@ match cmd {
                             // poll cadence, then re-arm the regular tick so
                             // this does not create a poll burst.
                             peer_roster_tick.reset();
-                            let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
+                            let poll_result = async {
+                                let current_http = http.current()?;
+                                poll_peers(&current_http, &base_url, &token, &config, &self_node_id, &state, event_tx).await
+                            }
+                            .await;
                             match &poll_result {
                                 Ok(_) => {
                                     poll_failures = 0;
@@ -19,7 +23,11 @@ match cmd {
                             }
                         }
                         ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
-                            let res = create_tunnel(&http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await;
+                            let res = async {
+                                let current_http = http.current()?;
+                                create_tunnel(&current_http, &base_url, &token, &self_node_id, &protocol, local_port, remote_port).await
+                            }
+                            .await;
                             match res {
                                 Ok((tunnel_id, public_endpoint)) => {
                                     let _ = event_tx.send(ControlEvent::TunnelCreated { tunnel_id, public_endpoint });
@@ -36,15 +44,19 @@ match cmd {
                         }
                         ControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
                             let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
-                            let res = update_endpoint(
-                                &http,
-                                &base_url,
-                                &token,
-                                &self_node_id,
-                                &endpoint,
-                                &nat_type,
-                                relay_rtt_ms,
-                            )
+                            let res = async {
+                                let current_http = http.current()?;
+                                update_endpoint(
+                                    &current_http,
+                                    &base_url,
+                                    &token,
+                                    &self_node_id,
+                                    &endpoint,
+                                    &nat_type,
+                                    relay_rtt_ms,
+                                )
+                                .await
+                            }
                             .await;
                             match &res {
                                 Ok(()) => {
@@ -68,7 +80,11 @@ match cmd {
                             let candidate_sources = HashMap::from([
                                 (observed_endpoint.clone(), "peer_reflexive".to_string())
                             ]);
-                            let res = send_signal(&http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms, None, None, None, None).await;
+                            let res = async {
+                                let current_http = http.current()?;
+                                send_signal(&current_http, &base_url, &token, &self_node_id, &to_node_id, "peer_reflexive", &candidates, &candidate_sources, &[], punch_at_ms, None, None, None, None).await
+                            }
+                            .await;
                             match &res {
                                 Ok(()) => {
                                     debug!(
@@ -89,7 +105,11 @@ match cmd {
                             debug!("Tunnel deletion queued locally for {tunnel_id}");
                         }
                         ControlCommand::FetchRelayTicket { audience, region, response_tx } => {
-                            let result = fetch_relay_ticket_http(&http, &base_url, &token, &audience, &region).await;
+                            let result = async {
+                                let current_http = http.current()?;
+                                fetch_relay_ticket_http(&current_http, &base_url, &token, &audience, &region).await
+                            }
+                            .await;
                             let _ = response_tx.send(result);
                         }
                         ControlCommand::Shutdown => {

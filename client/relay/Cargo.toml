@@ -6,6 +6,7 @@ license.workspace = true
 description = "DERP-like relay server and client for P2PNet"
 
 [dependencies]
+p2pnet-netbind = { path = "../netbind" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

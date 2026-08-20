@@ -1,7 +1,7 @@
 #[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
     mut config: Config,
-    http: reqwest::Client,
+    http: RouteAwareControlHttpClient,
     timeline: Arc<ConnectionTimeline>,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     state: Arc<RwLock<ClientState>>,
@@ -40,7 +40,12 @@ async fn run_control_loop(
         let self_node_id = {
             let mut attempt: u32 = 0;
             loop {
-                match register_device(&http, &base_url, &token, &config).await {
+                let registration = async {
+                    let current_http = http.current()?;
+                    register_device(&current_http, &base_url, &token, &config).await
+                }
+                .await;
+                match registration {
                     Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
                         timeline.emit(
                             "control_registered",
@@ -107,16 +112,20 @@ async fn run_control_loop(
                             && !config.node.ed25519_public_key.is_empty()
                         {
                             info!("Attempting Ed25519 challenge for device credential...");
-                            match obtain_device_credential(
-                                &http,
-                                &base_url,
-                                &user_token,
-                                &node_id,
-                                &config.node.ed25519_private_key,
-                                &config.node.ed25519_public_key,
-                            )
-                            .await
-                            {
+                            let credential_result = async {
+                                let current_http = http.current()?;
+                                obtain_device_credential(
+                                    &current_http,
+                                    &base_url,
+                                    &user_token,
+                                    &node_id,
+                                    &config.node.ed25519_private_key,
+                                    &config.node.ed25519_public_key,
+                                )
+                                .await
+                            }
+                            .await;
+                            match credential_result {
                                 Ok(device_credential) => {
                                     info!("Device credential obtained successfully");
                                     config.control.device_credential = device_credential.clone();
@@ -216,23 +225,41 @@ async fn run_control_loop(
 
         // ---- Polling cycle ----
         // Initial poll
-        if let Err(err) = poll_peers(
-            &http,
-            &base_url,
-            &token,
-            &config,
-            &self_node_id,
-            &state,
-            event_tx,
-        )
-        .await
-        {
+        let initial_peer_poll = async {
+            let current_http = http.current()?;
+            poll_peers(
+                &current_http,
+                &base_url,
+                &token,
+                &config,
+                &self_node_id,
+                &state,
+                event_tx,
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = initial_peer_poll {
             warn!("Initial peer polling failed: {err}");
             let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
-        if let Err(err) = poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await {
+        let initial_signal_poll = async {
+            let current_http = http.current()?;
+            poll_signals(
+                &current_http,
+                &base_url,
+                &token,
+                &self_node_id,
+                event_tx,
+                0,
+                &recent_signal_ids,
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = initial_signal_poll {
             warn!("Initial signal polling failed: {err}");
             let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
@@ -273,22 +300,30 @@ async fn run_control_loop(
             tokio::select! {
                 _ = heartbeat_tick.tick() => {
                     let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
-                    if let Err(err) = update_endpoint(
-                        &http,
-                        &base_url,
-                        &token,
-                        &self_node_id,
-                        &advertised_endpoint,
-                        &advertised_nat_type,
-                        relay_rtt_ms,
-                    )
-                    .await
-                    {
+                    let heartbeat_result = async {
+                        let current_http = http.current()?;
+                        update_endpoint(
+                            &current_http,
+                            &base_url,
+                            &token,
+                            &self_node_id,
+                            &advertised_endpoint,
+                            &advertised_nat_type,
+                            relay_rtt_ms,
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(err) = heartbeat_result {
                         warn!("Device lease refresh failed: {err}");
                     }
                 }
                 _ = peer_roster_tick.tick() => {
-                    let poll_result = poll_peers(&http, &base_url, &token, &config, &self_node_id, &state, event_tx).await;
+                    let poll_result = async {
+                        let current_http = http.current()?;
+                        poll_peers(&current_http, &base_url, &token, &config, &self_node_id, &state, event_tx).await
+                    }
+                    .await;
                     match &poll_result {
                         Err(e) => {
                             let err_str = e.to_string();
@@ -340,7 +375,12 @@ async fn run_control_loop(
                     }
                 }
                 Some(()) = signal_wake_rx.recv() => {
-                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await {
+                    let signal_result = async {
+                        let current_http = http.current()?;
+                        poll_signals(&current_http, &base_url, &token, &self_node_id, event_tx, 0, &recent_signal_ids).await
+                    }
+                    .await;
+                    match signal_result {
                         Ok(()) => {
                             signal_failures = 0;
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
@@ -368,7 +408,12 @@ async fn run_control_loop(
                     // accept WS connections but fail to emit a wake-up for a
                     // successfully queued signal.
                     let wait_ms = signal_poll_wait_ms(ws_connected);
-                    match poll_signals(&http, &base_url, &token, &self_node_id, event_tx, wait_ms, &recent_signal_ids).await {
+                    let signal_result = async {
+                        let current_http = http.current()?;
+                        poll_signals(&current_http, &base_url, &token, &self_node_id, event_tx, wait_ms, &recent_signal_ids).await
+                    }
+                    .await;
+                    match signal_result {
                         Ok(()) => {
                             signal_failures = 0;
                             let _ = event_tx.send(ControlEvent::ControlHealthy);

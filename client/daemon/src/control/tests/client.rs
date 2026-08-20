@@ -229,8 +229,10 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
         ),
         "a revoked fresh offer must be reported as Cancelled, got {result:?}"
     );
-    // Give the worker time to process the queue: it must never post.
-    sleep(Duration::from_millis(200)).await;
+    // Give the worker time to process the queue: it must never post.  The
+    // workspace runs multiple test binaries concurrently, so a 200ms sleep
+    // can end before the cancelled command has reached the lane dispatcher.
+    sleep(Duration::from_millis(500)).await;
     assert_eq!(
         signal_posts.load(std::sync::atomic::Ordering::Relaxed),
         0,
@@ -1078,7 +1080,26 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
                 .await
         }
     });
-    sleep(Duration::from_millis(250)).await;
+    // Wait for the stalled request to reach the mock before cancelling its
+    // owner.  A fixed sleep is flaky when the workspace runs several test
+    // binaries concurrently: the request can still be queued at 250ms, which
+    // would make the assertion below report zero in-flight requests.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("60001"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first answer must reach the stalled server before cancellation");
     first.abort();
     sleep(Duration::from_millis(300)).await;
 

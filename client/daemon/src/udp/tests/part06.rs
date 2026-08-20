@@ -512,7 +512,14 @@ async fn relay_backoff_heartbeat_global_budget_counts_actual_packets_across_peer
 
     let mut buf = [0u8; 256];
     let mut received_total = 0usize;
-    while let Ok(Ok(_)) = timeout(Duration::from_millis(20), receiver.recv_from(&mut buf)).await {
+    // Workspace runs several test binaries concurrently.  Under that load a
+    // 20ms Tokio timer can expire before the receiver task gets scheduled,
+    // even though the datagrams are already queued by the kernel.  Keep the
+    // quiet-period assertion bounded, but leave enough room for one scheduler
+    // turn so this test measures packet coverage rather than test-runner load.
+    while let Ok(Ok(_)) =
+        timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await
+    {
         received_total += 1;
     }
     let diagnostics_sent = transport

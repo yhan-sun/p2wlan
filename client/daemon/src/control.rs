@@ -49,8 +49,9 @@ pub use http::proxy_http_behavior_label;
 use http::register_device_payload;
 use http::{
     create_tunnel, fetch_relay_ticket_http, normalize_http_base_url, obtain_device_credential,
-    poll_peers, poll_signals, prepare_signal_payload, register_device, send_prepared_signal,
-    send_signal, update_endpoint, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
+    poll_peers, poll_signals, prepare_signal_payload, register_device,
+    route_aware_control_http_clients, send_prepared_signal, send_signal, update_endpoint,
+    RouteAwareControlHttpClient, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
 };
 use websocket::spawn_signal_websocket;
 /// Stable WebSocket proxy policy label (`direct_only`).  Signaling never rides

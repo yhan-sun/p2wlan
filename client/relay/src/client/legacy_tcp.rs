@@ -51,10 +51,13 @@ impl RelayClient {
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
         debug!("Connecting to relay server at {}", addr);
 
-        let stream = tokio::time::timeout(config.register_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| RelayError::Timeout("connect timed out".into()))?
-            .map_err(|e| RelayError::ConnectFailed(e.to_string()))?;
+        let stream = tokio::time::timeout(
+            config.connect_timeout,
+            p2pnet_netbind::connect_tcp_addr(addr, config.outbound_interface.as_deref()),
+        )
+        .await
+        .map_err(|_| RelayError::Timeout("connect timed out".into()))?
+        .map_err(|e| RelayError::ConnectFailed(e.to_string()))?;
 
         stream.set_nodelay(true).ok();
         let (mut reader, mut writer) = stream.into_split();
@@ -213,7 +216,8 @@ impl RelayClient {
         let mut reg_tx = Some(reg_tx);
         let read_close_tx = close_tx.clone();
         let mut read_close_rx = close_rx.clone();
-        let idle_timeout = config.idle_timeout;
+        let idle_timeout = effective_idle_timeout(config.idle_timeout, config.keepalive_interval);
+        let registration_timeout = config.register_timeout;
         let read_reason = close_reason.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
@@ -221,8 +225,16 @@ impl RelayClient {
             loop {
                 // Read header
                 let read_header_fut = reader.read_exact(&mut buf[..FRAME_HEADER_SIZE]);
+                // Registration may legitimately take longer than the
+                // steady-state idle window.  Switch to the idle deadline
+                // only after MSG_REGISTERED has been observed.
+                let read_timeout = if reg_tx.is_some() {
+                    registration_timeout
+                } else {
+                    idle_timeout
+                };
                 let read_res = tokio::select! {
-                    res = tokio::time::timeout(idle_timeout, read_header_fut) => match res {
+                    res = tokio::time::timeout(read_timeout, read_header_fut) => match res {
                         Ok(Ok(_)) => Ok(true),
                         Ok(Err(e)) => Err(e),
                         Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
@@ -251,12 +263,18 @@ impl RelayClient {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        warn!("Relay client idle timeout");
-                        note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
-                        let _ = msg_tx_clone.try_send(RelayMessage::Error {
-                            code: ERR_IDLE_TIMEOUT,
-                            message: "idle timeout".to_string(),
-                        });
+                        if let Some(tx) = reg_tx.take() {
+                            let _ = tx.send(Err(RelayError::Timeout(
+                                "registration confirmation timed out".into(),
+                            )));
+                        } else {
+                            warn!("Relay client idle timeout");
+                            note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
+                            let _ = msg_tx_clone.try_send(RelayMessage::Error {
+                                code: ERR_IDLE_TIMEOUT,
+                                message: "idle timeout".to_string(),
+                            });
+                        }
                         break;
                     }
                     Err(e) => {
@@ -303,8 +321,13 @@ impl RelayClient {
                     }
                     let read_payload_fut = reader
                         .read_exact(&mut buf[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len]);
+                    let read_timeout = if reg_tx.is_some() {
+                        registration_timeout
+                    } else {
+                        idle_timeout
+                    };
                     let read_payload_res = tokio::select! {
-                        res = tokio::time::timeout(idle_timeout, read_payload_fut) => match res {
+                        res = tokio::time::timeout(read_timeout, read_payload_fut) => match res {
                             Ok(Ok(_)) => Ok(true),
                             Ok(Err(e)) => Err(e),
                             Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
@@ -318,12 +341,18 @@ impl RelayClient {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                            warn!("Relay client idle timeout during payload");
-                            note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
-                            let _ = msg_tx_clone.try_send(RelayMessage::Error {
-                                code: ERR_IDLE_TIMEOUT,
-                                message: "idle timeout during payload".to_string(),
-                            });
+                            if let Some(tx) = reg_tx.take() {
+                                let _ = tx.send(Err(RelayError::Timeout(
+                                    "registration confirmation timed out during payload".into(),
+                                )));
+                            } else {
+                                warn!("Relay client idle timeout during payload");
+                                note_close_reason(&read_reason, RelayCloseReason::IdleTimeout);
+                                let _ = msg_tx_clone.try_send(RelayMessage::Error {
+                                    code: ERR_IDLE_TIMEOUT,
+                                    message: "idle timeout during payload".to_string(),
+                                });
+                            }
                             break;
                         }
                         Err(e) => {

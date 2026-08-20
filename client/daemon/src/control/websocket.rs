@@ -4,12 +4,9 @@
 //! REST long-poll can wake immediately when a new signal lands, instead of
 //! waiting a full tick. Split out of `control.rs`.
 //!
-//! PROXY POLICY: WebSocket signaling is ALWAYS direct-only.  The pinned
-//! tokio-tungstenite client has no proxy support, so `connect_async` never
-//! reads `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` regardless of
-//! `ControlProxyMode`.  The daemon logs this explicitly at startup; the
-//! REST control loop's proxy policy (see `control::proxy`) is deliberately
-//! NOT mirrored here, so the two lanes can never silently disagree.
+//! PROXY POLICY: WebSocket signaling is ALWAYS direct-only. In addition to
+//! ignoring HTTP proxy variables, its TCP socket is pinned to the physical
+//! default interface so a kernel-level TUN route cannot capture it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +29,8 @@ const SIGNAL_WS_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SIGNAL_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNAL_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNAL_WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const SIGNAL_WS_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const SIGNAL_WS_ROUTE_STABILITY_SAMPLES: u8 = 2;
 pub(super) const SIGNAL_WS_PROTOCOL: &str = "p2wlan.signaling.v1";
 const SIGNAL_WS_PROTOCOL_VERSION: u8 = 1;
 
@@ -138,16 +137,47 @@ pub(super) async fn run_signal_websocket(
             HeaderValue::from_static(SIGNAL_WS_PROTOCOL),
         );
 
-        // Proxy policy: WebSocket signaling is ALWAYS direct-only.  The pinned
-        // tokio-tungstenite client has no proxy support, so `connect_async`
-        // never reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY regardless of
-        // `ControlProxyMode`.  The daemon logs this explicitly at startup;
-        // do not try to route WS through an ambient proxy here.
+        // Proxy policy: WebSocket signaling is ALWAYS direct-only. The raw
+        // TCP socket is created explicitly so direct-only also means bypassing
+        // a system TUN route, not merely ignoring HTTP_PROXY variables.
+        let target = websocket_tcp_target(&ws_url);
+        let route_snapshot =
+            tokio::task::spawn_blocking(|| crate::netenv::direct_route_snapshot(&[])).await;
+        let outbound_interface = if target
+            .as_ref()
+            .is_ok_and(|(host, _)| websocket_host_is_local(host))
+        {
+            Ok(None)
+        } else {
+            route_snapshot
+                .as_ref()
+                .map_err(|error| format!("route inspection task failed: {error}"))
+                .and_then(|snapshot| snapshot.direct_socket_interface())
+        };
+        let connected_route_signature = route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.signature.clone())
+            .unwrap_or_default();
 
-        match time::timeout(
-            SIGNAL_WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
-        )
+        match time::timeout(SIGNAL_WS_CONNECT_TIMEOUT, async {
+            let outbound_interface = outbound_interface.map_err(|error| {
+                tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    error,
+                ))
+            })?;
+            let (host, port) = target.map_err(|error| {
+                tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error,
+                ))
+            })?;
+            let stream =
+                p2pnet_netbind::connect_tcp_host(&host, port, outbound_interface.as_deref())
+                    .await
+                    .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+            tokio_tungstenite::client_async_tls(request, stream).await
+        })
         .await
         {
             Ok(Ok((mut socket, response))) => {
@@ -165,16 +195,48 @@ pub(super) async fn run_signal_websocket(
                     attempt = 0;
                     let mut ready = false;
                     let mut last_sequence = 0u64;
+                    let mut last_message_at = std::time::Instant::now();
+                    let mut next_route_check =
+                        std::time::Instant::now() + SIGNAL_WS_ROUTE_CHECK_INTERVAL;
+                    let mut pending_route_change = None;
                     loop {
-                        let message =
-                            match time::timeout(SIGNAL_WS_IDLE_TIMEOUT, socket.next()).await {
-                                Ok(Some(message)) => message,
-                                Ok(None) => break,
-                                Err(_) => {
-                                    debug!("WebSocket signaling connection became idle");
-                                    break;
-                                }
-                            };
+                        let now = std::time::Instant::now();
+                        let idle_remaining = SIGNAL_WS_IDLE_TIMEOUT
+                            .saturating_sub(now.saturating_duration_since(last_message_at));
+                        if idle_remaining.is_zero() {
+                            debug!("WebSocket signaling connection became idle");
+                            break;
+                        }
+                        let route_wait = next_route_check.saturating_duration_since(now);
+                        let wait = idle_remaining.min(route_wait);
+                        let next_message = time::timeout(wait, socket.next()).await;
+
+                        let now = std::time::Instant::now();
+                        if now >= next_route_check {
+                            next_route_check = now + SIGNAL_WS_ROUTE_CHECK_INTERVAL;
+                            let observed = tokio::task::spawn_blocking(|| {
+                                crate::netenv::network_route_signature(&[])
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if stable_websocket_route_change(
+                                &connected_route_signature,
+                                &mut pending_route_change,
+                                observed,
+                            ) {
+                                info!(
+                                    "WebSocket signaling route changed; reconnecting on the new physical path"
+                                );
+                                break;
+                            }
+                        }
+
+                        let message = match next_message {
+                            Ok(Some(message)) => message,
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        };
+                        last_message_at = now;
                         let message = match message {
                             Ok(message) => message,
                             Err(err) => {
@@ -287,6 +349,59 @@ pub(super) async fn run_signal_websocket(
     }
 }
 
+fn websocket_tcp_target(url: &str) -> std::result::Result<(String, u16), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "WebSocket URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "WebSocket URL has no port".to_string())?;
+    Ok((host.to_string(), port))
+}
+
+fn websocket_host_is_local(host: &str) -> bool {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    unbracketed.eq_ignore_ascii_case("localhost")
+        || unbracketed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn stable_websocket_route_change(
+    active: &[String],
+    pending: &mut Option<(Vec<String>, u8)>,
+    observed: Vec<String>,
+) -> bool {
+    if observed.is_empty() {
+        *pending = None;
+        return false;
+    }
+    if observed == active {
+        *pending = None;
+        return false;
+    }
+    match pending {
+        Some((candidate, samples)) if *candidate == observed => {
+            *samples = samples.saturating_add(1);
+            if *samples >= SIGNAL_WS_ROUTE_STABILITY_SAMPLES {
+                *pending = None;
+                true
+            } else {
+                false
+            }
+        }
+        _ => {
+            *pending = Some((observed, 1));
+            false
+        }
+    }
+}
+
 pub(super) fn signal_websocket_url(base_url: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(base_url).map_err(|err| {
         DaemonError::ControlPlane(format!(
@@ -311,4 +426,50 @@ pub(super) fn signal_websocket_url(base_url: &str) -> Result<String> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn local_websocket_hosts_are_recognized_without_interface_binding() {
+        assert!(websocket_host_is_local("localhost"));
+        assert!(websocket_host_is_local("127.0.0.1"));
+        assert!(websocket_host_is_local("[::1]"));
+        assert!(!websocket_host_is_local("control.example.com"));
+    }
+
+    #[test]
+    fn websocket_route_change_requires_two_stable_samples() {
+        let active = vec!["default:en0:192.168.1.1".to_string()];
+        let replacement = vec!["default:en1:192.168.2.1".to_string()];
+        let mut pending = None;
+        assert!(!stable_websocket_route_change(
+            &active,
+            &mut pending,
+            Vec::new(),
+        ));
+        assert!(!stable_websocket_route_change(
+            &active,
+            &mut pending,
+            replacement.clone(),
+        ));
+        assert!(!stable_websocket_route_change(
+            &active,
+            &mut pending,
+            active.clone(),
+        ));
+        assert!(pending.is_none());
+        assert!(!stable_websocket_route_change(
+            &active,
+            &mut pending,
+            replacement.clone(),
+        ));
+        assert!(stable_websocket_route_change(
+            &active,
+            &mut pending,
+            replacement,
+        ));
+    }
 }

@@ -4,6 +4,7 @@ members = [
     "client/crypto",
     "client/wireguard",
     "client/nat",
+    "client/netbind",
     "client/relay",
     "client/daemon",
     "client/cli",
@@ -35,7 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Networking
-socket2 = "0.5"
+socket2 = "0.6"
 
 # Crypto
 rand = "0.8"

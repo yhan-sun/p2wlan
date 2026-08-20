@@ -8,6 +8,10 @@ pub struct RelayTransport {
     relay_region: String,
     relay_endpoint: String,
     connect_latency_ms: u64,
+    /// Kernel route snapshot used when this connection was created. The
+    /// supervisor compares it with the live route view so a socket pinned to
+    /// an old Wi-Fi/Ethernet interface is replaced promptly after handover.
+    route_signature: Vec<String>,
     client: Arc<RelayClient>,
     peers: Arc<PeerManager>,
     /// Ticket audience of the connection's auth ticket, when authenticated.
@@ -90,6 +94,23 @@ impl RelayTransport {
             relay_ticket,
             ..Default::default()
         };
+        let routes = tokio::task::spawn_blocking(|| crate::netenv::direct_route_snapshot(&[]))
+            .await
+            .map_err(|error| {
+                p2pnet_relay::RelayError::ConnectFailed(format!(
+                    "relay route inspection task failed: {error}"
+                ))
+            })?;
+        let route_signature = routes.signature.clone();
+        config.outbound_interface = routes
+            .direct_socket_interface()
+            .map_err(p2pnet_relay::RelayError::ConnectFailed)?;
+        if let Some(interface) = config.outbound_interface.as_deref() {
+            debug!(
+                interface,
+                relay_endpoint, "Binding relay TCP connection to the physical interface"
+            );
+        }
 
         // Set CA cert path if provided
         if let Some(ca_path) = &ca_cert_path {
@@ -100,10 +121,8 @@ impl RelayTransport {
         let (client, relay_rx) =
             RelayClient::connect_with_endpoint(relay_endpoint, node_id, config).await?;
 
-        let relay_connection_id = NEXT_RELAY_CONNECTION_ID.fetch_add(
-            1,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let relay_connection_id =
+            NEXT_RELAY_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             event = "relay_transport_connected",
@@ -120,6 +139,7 @@ impl RelayTransport {
                 relay_region: relay_region.to_string(),
                 relay_endpoint: relay_endpoint.to_string(),
                 connect_latency_ms: duration_millis(started.elapsed()),
+                route_signature,
                 client: Arc::new(client),
                 peers,
                 ticket_audience: None,
@@ -167,13 +187,14 @@ impl RelayTransport {
         peers: Arc<PeerManager>,
     ) -> Self {
         Self {
-            relay_connection_id: NEXT_RELAY_CONNECTION_ID.fetch_add(
-                1,
-                std::sync::atomic::Ordering::Relaxed,
-            ),
+            relay_connection_id: NEXT_RELAY_CONNECTION_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             relay_region: relay_region.to_string(),
             relay_endpoint: relay_endpoint.to_string(),
             connect_latency_ms: 0,
+            // Unit-test transports have no kernel socket and therefore do
+            // not arm the production route watcher.
+            route_signature: Vec::new(),
             client: Arc::new(p2pnet_relay::client::RelayClient::new_for_test()),
             peers,
             ticket_audience: None,
@@ -201,6 +222,13 @@ impl RelayTransport {
     /// TCP connect plus relay registration latency.
     pub fn connect_latency_ms(&self) -> u64 {
         self.connect_latency_ms
+    }
+
+    /// Route signature captured immediately before this TCP connection was
+    /// created. Empty means route monitoring is unavailable on this platform
+    /// or intentionally disabled for a test transport.
+    pub(crate) fn route_signature(&self) -> &[String] {
+        &self.route_signature
     }
 
     /// Immediately invalidate this relay connection.  This is used only when

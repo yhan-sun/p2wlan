@@ -17,6 +17,7 @@ p2pnet-tun = { path = "../tun" }
 p2pnet-crypto = { path = "../crypto" }
 p2pnet-wireguard = { path = "../wireguard" }
 p2pnet-nat = { path = "../nat" }
+p2pnet-netbind = { path = "../netbind" }
 p2pnet-relay = { path = "../relay" }
 tokio = { workspace = true }
 clap = { workspace = true }

@@ -217,6 +217,10 @@ pub struct RelayClientConfig {
     /// relay supervisor can retry instead of burning the whole selection
     /// budget.  The registration handshake keeps its own `register_timeout`.
     pub connect_timeout: Duration,
+    /// Physical interface used for the TCP socket. When set, the socket is
+    /// pinned before connect so a system-wide TUN route cannot capture relay
+    /// traffic. Loopback relay endpoints ignore this option.
+    pub outbound_interface: Option<String>,
 }
 
 impl Default for RelayClientConfig {
@@ -238,6 +242,7 @@ impl Default for RelayClientConfig {
             allow_insecure_plaintext: false,
             relay_ticket: None,
             connect_timeout: Duration::from_millis(1500),
+            outbound_interface: None,
         }
     }
 }
