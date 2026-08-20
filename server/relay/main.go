@@ -37,4 +37,9 @@ func main() {
 	}()
 
 	server.Serve()
+	// Serve can also return because the listener failed or was closed by a
+	// signal.  Wait for the same Close path here so connection/metrics cleanup
+	// completes before the process exits; sync.Once makes a concurrent signal
+	// handler call safe and waits for it when necessary.
+	_ = server.Close()
 }

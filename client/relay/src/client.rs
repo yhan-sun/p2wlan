@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
@@ -39,6 +38,16 @@ use crate::RelayClientConfig;
 
 #[allow(dead_code)]
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Give a keepalive response three scheduling intervals of grace beyond the
+/// configured idle window. The writer and reader run in separate tasks, and a
+/// busy executor (or a temporarily stalled mobile event loop) can delay a
+/// ping/pong round past the nominal deadline even though the connection is
+/// healthy. A silent peer still expires promptly because no inbound frame
+/// refreshes this deadline.
+fn effective_idle_timeout(idle_timeout: Duration, keepalive_interval: Duration) -> Duration {
+    idle_timeout.saturating_add(keepalive_interval.saturating_mul(3))
+}
 
 /// Record the first close-reason attribution for a connection.
 ///

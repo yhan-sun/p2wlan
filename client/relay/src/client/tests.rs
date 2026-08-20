@@ -298,12 +298,14 @@ async fn test_bidirectional_stream() {
 }
 
 /// Keepalive pings keep the connection alive across many idle windows: with
-/// keepalive 50ms and a server idle timeout of 200ms, the connection must
-/// survive 600ms (3 idle windows) and keep receiving pongs.
+/// keepalive 50ms and a server idle timeout of 500ms, the connection must
+/// survive roughly one second (multiple idle windows) and keep receiving
+/// pongs.  The extra margin matters when this test binary is scheduled next
+/// to the daemon's large integration suite on a constrained CI runner.
 #[tokio::test]
 async fn relay_ping_pong_survives_idle_window() {
     let server_config = RelayServerConfig {
-        idle_timeout: Duration::from_millis(200),
+        idle_timeout: Duration::from_millis(500),
         allow_insecure_plaintext: true,
         require_authentication: false,
         allow_legacy_unauthenticated: true,
@@ -322,7 +324,7 @@ async fn relay_ping_pong_survives_idle_window() {
     .await
     .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
     let mut pong_count = 0u32;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

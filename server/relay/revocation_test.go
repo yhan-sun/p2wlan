@@ -193,7 +193,7 @@ func TestRevocationFeedFailurePreservesExistingSnapshot(t *testing.T) {
 	}
 }
 
-func TestRevocationFeedEmptySnapshotReplacesOnlineButKeepsLocalDenylist(t *testing.T) {
+func TestRevocationFeedEmptySnapshotCannotResurrectRevokedIdentity(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -230,11 +230,39 @@ func TestRevocationFeedEmptySnapshotReplacesOnlineButKeepsLocalDenylist(t *testi
 	if err := server.refreshRevocationFeed(context.Background()); err != nil {
 		t.Fatalf("refreshRevocationFeed: %v", err)
 	}
-	if _, err := server.verifyTicket(onlineTicket); err != nil {
-		t.Fatalf("empty feed snapshot should clear prior online revocation: %v", err)
+	if _, err := server.verifyTicket(onlineTicket); err == nil {
+		t.Fatal("empty feed snapshot must not resurrect a previously revoked device")
 	}
 	if _, err := server.verifyTicket(localTicket); err == nil {
 		t.Fatal("local static denylist should remain active after empty online snapshot")
+	}
+}
+
+func TestRevocationSnapshotRejectsRollbackAndMergesEqualVersion(t *testing.T) {
+	server := &RelayServer{}
+	if err := server.applyRevocationSnapshot(relayRevocationFeedSnapshot{
+		Version:          7,
+		RevokedDeviceIDs: []string{"device-a"},
+	}); err != nil {
+		t.Fatalf("apply initial snapshot: %v", err)
+	}
+	if err := server.applyRevocationSnapshot(relayRevocationFeedSnapshot{
+		Version:              7,
+		RevokedCredentialIDs: []string{"credential-b"},
+	}); err != nil {
+		t.Fatalf("equal-version additions must be merged: %v", err)
+	}
+	if !server.isDeviceRevoked("device-a") || !server.isCredentialRevoked("credential-b") {
+		t.Fatal("equal-version snapshot lost an already observed tombstone")
+	}
+	if err := server.applyRevocationSnapshot(relayRevocationFeedSnapshot{
+		Version:          6,
+		RevokedDeviceIDs: []string{},
+	}); err == nil {
+		t.Fatal("older revocation snapshot must be rejected")
+	}
+	if !server.isDeviceRevoked("device-a") || !server.isCredentialRevoked("credential-b") {
+		t.Fatal("rollback attempt changed the active revocation set")
 	}
 }
 

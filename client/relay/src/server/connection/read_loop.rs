@@ -1,3 +1,14 @@
+/// Avoid treating a busy executor as an idle peer. The read deadline is
+/// measured by Tokio's monotonic clock, so a relay task that is descheduled
+/// while a keepalive is already queued can observe the timeout before it gets
+/// a chance to consume that frame. Keep the grace bounded for normal (large)
+/// production timeouts while making sub-second timeouts tolerant of one
+/// scheduling hiccup.
+fn effective_idle_timeout(idle_timeout: Duration) -> Duration {
+    let grace = (idle_timeout / 2).min(Duration::from_secs(1));
+    idle_timeout.saturating_add(grace)
+}
+
 /// Read loop after successful registration. Forwards data between peers
 /// scoped to the source's network.
 #[allow(clippy::too_many_arguments)]
@@ -47,6 +58,7 @@ pub(super) async fn run_read_loop<R: AsyncRead + Unpin>(
     }
 
     let mut buf = vec![0u8; config.max_frame_payload + FRAME_HEADER_SIZE];
+    let idle_timeout = effective_idle_timeout(config.idle_timeout);
 
     loop {
         // ---- Read header with timeout, shutdown, duplicate, ticket expiry ----
@@ -73,7 +85,7 @@ pub(super) async fn run_read_loop<R: AsyncRead + Unpin>(
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 break;
             }
-            res = tokio::time::timeout(config.idle_timeout, read_header_fut) => match res {
+            res = tokio::time::timeout(idle_timeout, read_header_fut) => match res {
                 Ok(Ok(_)) => Ok(()),
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("Client '{}' disconnected", node_id);
@@ -151,7 +163,7 @@ pub(super) async fn run_read_loop<R: AsyncRead + Unpin>(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     break;
                 }
-                res = tokio::time::timeout(config.idle_timeout, read_payload_fut) => match res {
+                res = tokio::time::timeout(idle_timeout, read_payload_fut) => match res {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(e)) => Err(e),
                     Err(_) => {

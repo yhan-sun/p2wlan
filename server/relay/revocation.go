@@ -99,7 +99,9 @@ func (s *RelayServer) refreshRevocationFeed(ctx context.Context) error {
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return fmt.Errorf("decode revocation feed: trailing JSON data")
 	}
-	s.applyRevocationSnapshot(snapshot)
+	if err := s.applyRevocationSnapshot(snapshot); err != nil {
+		return err
+	}
 	atomic.AddUint64(&s.stats.revocationRefreshesTotal, 1)
 	log.Printf("relay revocation feed updated: version=%d devices=%d credentials=%d jtis=%d",
 		snapshot.Version,
@@ -110,10 +112,44 @@ func (s *RelayServer) refreshRevocationFeed(ctx context.Context) error {
 	return nil
 }
 
-func (s *RelayServer) applyRevocationSnapshot(snapshot relayRevocationFeedSnapshot) {
+func (s *RelayServer) applyRevocationSnapshot(snapshot relayRevocationFeedSnapshot) error {
+	if snapshot.Version < 0 {
+		return fmt.Errorf("revocation snapshot version must not be negative")
+	}
 	s.revocationMu.Lock()
 	defer s.revocationMu.Unlock()
-	s.onlineRevokedDeviceIDs = stringSetFromValues(snapshot.RevokedDeviceIDs)
-	s.onlineRevokedCredentialIDs = stringSetFromValues(snapshot.RevokedCredentialIDs)
-	s.onlineRevokedTicketJTIs = stringSetFromValues(snapshot.RevokedJTIs)
+	if snapshot.Version < s.revocationVersion {
+		return fmt.Errorf(
+			"revocation snapshot rollback: version %d is older than %d",
+			snapshot.Version,
+			s.revocationVersion,
+		)
+	}
+
+	// Control-plane revocations are tombstones, not a mutable allow/deny list.
+	// Merge every accepted full snapshot so a stale cache, temporarily empty
+	// database, or equal-version response can never resurrect a credential that
+	// this relay has already observed as revoked.
+	if s.onlineRevokedDeviceIDs == nil {
+		s.onlineRevokedDeviceIDs = make(map[string]struct{})
+	}
+	if s.onlineRevokedCredentialIDs == nil {
+		s.onlineRevokedCredentialIDs = make(map[string]struct{})
+	}
+	if s.onlineRevokedTicketJTIs == nil {
+		s.onlineRevokedTicketJTIs = make(map[string]struct{})
+	}
+	for value := range stringSetFromValues(snapshot.RevokedDeviceIDs) {
+		s.onlineRevokedDeviceIDs[value] = struct{}{}
+	}
+	for value := range stringSetFromValues(snapshot.RevokedCredentialIDs) {
+		s.onlineRevokedCredentialIDs[value] = struct{}{}
+	}
+	for value := range stringSetFromValues(snapshot.RevokedJTIs) {
+		s.onlineRevokedTicketJTIs[value] = struct{}{}
+	}
+	if snapshot.Version > s.revocationVersion {
+		s.revocationVersion = snapshot.Version
+	}
+	return nil
 }

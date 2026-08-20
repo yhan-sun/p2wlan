@@ -42,57 +42,32 @@ func TestWriteFullRejectsZeroProgress(t *testing.T) {
 }
 
 func TestSendQueueFullBackpressure(t *testing.T) {
-	config := testConfig()
-	config.SendQueueCapacity = 1
-	addr, cleanup := startTestServer(t, config)
-	defer cleanup()
-
-	bob, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial bob: %v", err)
+	// Exercise the queue-full branch directly.  Driving this through a real
+	// TCP connection is inherently racy: the destination writer can drain the
+	// one-slot application queue into the kernel send buffer before the next
+	// forward arrives, so the result depends on scheduler and socket-buffer
+	// timing rather than relay backpressure semantics.
+	h := newHub()
+	dstServer, dstClient := net.Pipe()
+	defer dstClient.Close()
+	dst := &peer{
+		id:        "bob",
+		networkID: "",
+		conn:      dstServer,
+		send:      make(chan []byte, 1),
+		done:      make(chan struct{}),
 	}
-	defer bob.Close()
-	_, _ = bob.Write(makeFrame(msgRegister, []byte("bob")))
+	h.register(dst, "", "bob")
+	// Occupy the only slot; the next frame must take the deterministic 4008
+	// path without relying on whether a writer goroutine happened to run.
+	dst.send <- []byte("already queued")
 
-	buf := make([]byte, 1024)
-	_, err = io.ReadAtLeast(bob, buf, frameHeader)
-	if err != nil {
-		t.Fatalf("read bob registered: %v", err)
+	code, message := h.forward("", "alice", "bob", []byte("payload"), 65535)
+	if code != 4008 {
+		t.Fatalf("forward code = %d, want 4008 (message=%q)", code, message)
 	}
-	if buf[5] != msgRegistered {
-		t.Fatalf("expected registered, got %d", buf[5])
-	}
-
-	alice, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial alice: %v", err)
-	}
-	defer alice.Close()
-	_, _ = alice.Write(makeFrame(msgRegister, []byte("alice")))
-	_, _ = io.ReadAtLeast(alice, buf, frameHeader)
-
-	payload := make([]byte, 60000)
-	payload[0] = byte(len("bob"))
-	copy(payload[1:], "bob")
-
-	gotBackpressure := false
-	for i := 0; i < 150; i++ {
-		_, err = alice.Write(makeFrame(msgForward, payload))
-		if err != nil {
-			break
-		}
-		_ = alice.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-		n, err := alice.Read(buf)
-		if err == nil && n >= frameHeader && buf[5] == msgError {
-			code := binary.BigEndian.Uint16(buf[8:10])
-			if code == 4008 {
-				gotBackpressure = true
-				break
-			}
-		}
-	}
-	if !gotBackpressure {
-		t.Error("expected backpressure error 4008")
+	if message != "peer backpressure: bob" {
+		t.Fatalf("forward message = %q, want peer backpressure", message)
 	}
 }
 

@@ -64,3 +64,21 @@ func TestHubUnregisterThenRegisterIsFresh(t *testing.T) {
 		t.Fatalf("expected 0 peers, got %d", h.count())
 	}
 }
+
+func TestHubLegacyPeerUnregistersWithEmptyNetworkID(t *testing.T) {
+	h := newHub()
+	server, client := net.Pipe()
+	defer client.Close()
+	p := &peer{id: "legacy-node", conn: server, send: make(chan []byte, 8), done: make(chan struct{})}
+	h.register(p, "", "legacy-node")
+	if h.lookup("", "legacy-node") != p {
+		t.Fatal("expected the legacy peer to be registered under the empty network key")
+	}
+	h.unregister(p)
+	if h.lookup("", "legacy-node") != nil {
+		t.Fatal("legacy peer must be removed when its connection closes")
+	}
+	if h.count() != 0 {
+		t.Fatalf("expected empty hub after legacy unregister, got %d peers", h.count())
+	}
+}

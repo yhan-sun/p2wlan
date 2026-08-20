@@ -81,6 +81,7 @@ type RelayServer struct {
 
 	// Online control-plane revocation feed snapshot.
 	revocationMu               sync.RWMutex
+	revocationVersion          int64
 	onlineRevokedTicketJTIs    map[string]struct{}
 	onlineRevokedDeviceIDs     map[string]struct{}
 	onlineRevokedCredentialIDs map[string]struct{}

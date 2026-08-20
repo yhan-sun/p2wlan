@@ -85,11 +85,12 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 	// registration phase, the ticket-expiry timer and the writer goroutine.
 	var closeCause atomic.Value
 	closeCause.Store("unknown")
+	var closeCauseOnce sync.Once
 
 	setCloseCause := func(cause string) {
-		if closeCause.Load() == "unknown" {
+		closeCauseOnce.Do(func() {
 			closeCause.Store(cause)
-		}
+		})
 	}
 
 	var writerWg sync.WaitGroup
@@ -120,6 +121,7 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				}
 				if err := writeFull(conn, frame); err != nil {
 					p.writeFailed.Store(true)
+					setCloseCause("write_failed")
 					_ = conn.Close()
 					return
 				}

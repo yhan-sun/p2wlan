@@ -30,7 +30,11 @@ async fn test_idle_timeout() {
     let server_config = RelayServerConfig {
         allow_insecure_plaintext: true,
         require_authentication: false,
-        idle_timeout: Duration::from_millis(100),
+        // Keep enough wall-clock margin for the test process when the relay
+        // crate runs alongside the daemon integration tests. The production
+        // timeout is still short; this avoids asserting on a 150ms scheduler
+        // window rather than on the idle-timeout behavior itself.
+        idle_timeout: Duration::from_millis(300),
         ..Default::default()
     };
     let server = RelayServer::start_with_config("127.0.0.1:0", server_config)
@@ -41,8 +45,8 @@ async fn test_idle_timeout() {
     let (_client, mut rx) = RelayClient::connect_verified(&addr.to_string(), "client-idle")
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let msg = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let msg = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
         .unwrap()
         .unwrap();

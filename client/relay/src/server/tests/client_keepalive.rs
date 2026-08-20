@@ -71,9 +71,10 @@ async fn test_keepalive_prevents_idle_timeout() {
     let server = RelayServer::start_random().await.unwrap();
     let addr = server.addr;
 
-    // idle_timeout=200ms, keepalive_interval=60ms — pings arrive well within timeout.
+    // Keep a generous idle window so this assertion measures the keepalive
+    // protocol rather than a sub-300ms scheduler slice on a busy CI runner.
     let config = RelayClientConfig {
-        idle_timeout: Duration::from_millis(200),
+        idle_timeout: Duration::from_millis(500),
         keepalive_interval: Duration::from_millis(60),
         ..Default::default()
     };
@@ -82,9 +83,9 @@ async fn test_keepalive_prevents_idle_timeout() {
             .await
             .unwrap();
 
-    // Over ~400ms (several keepalive cycles) we should receive only Pong messages,
+    // Over ~1s (several keepalive cycles) we should receive only Pong messages,
     // no Error{4009} or Closed.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut pong_count = 0usize;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

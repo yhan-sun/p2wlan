@@ -54,7 +54,11 @@ func (h *hub) register(p *peer, networkID, nodeID string) {
 func (h *hub) unregister(p *peer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if p.id != "" && p.networkID != "" {
+	// Legacy registrations intentionally use an empty network ID.  The hub
+	// key still includes that empty value, so requiring networkID != "" here
+	// leaves every legacy peer behind after disconnect and can route to a dead
+	// connection indefinitely.
+	if p.id != "" {
 		key := networkNodeKey{networkID: p.networkID, nodeID: p.id}
 		if h.peers[key] == p {
 			delete(h.peers, key)
